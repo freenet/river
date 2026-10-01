@@ -1312,79 +1312,164 @@ test.describe("A clamp to the end is not the reader", () => {
     await expectInPlace(page, parked!, "an arrival moved the reader after their small scroll", { hold: true });
   });
 
-  test("removing overflow clamps a parked reader without repinning them @fractional-geometry", async ({
+  // Parked with and without a wheel. After a synthetic `wheel`, WebKit delivers
+  // every later `scroll` event on the element twice (measured on a bare scroller
+  // outside the app, 2026-10-01; Chromium and Firefox send one), so the clamp's
+  // event comes again once the restore has recorded the clamped view. That copy
+  // must read as an echo, not as the reader arriving at the end.
+  for (const wheel of [false, true]) {
+    test(`removing overflow clamps a parked reader without repinning them${wheel ? " (parked with a wheel)" : ""} @fractional-geometry`, async ({
+      page,
+    }) => {
+      const OVERHANG_PX = 700;
+      // Into the overhang by more than the layout allowance, so this is a clamp no
+      // allowance could excuse, and still well outside the follow band.
+      const INTO_OVERHANG_PX = 300;
+      await openRoomAtBottom(page, "Team Chat Room");
+      await fillHistory(page, 12);
+      const created = await setOverhang(page, 0);
+      await afterLayoutSettles(page);
+      await setOverhang(page, OVERHANG_PX);
+      await afterLayoutSettles(page);
+
+      const contentEnd = created.before.max;
+      const target = contentEnd + INTO_OVERHANG_PX;
+      const landed = await readerScrollsToNow(page, target, { wheel });
+      expect(Math.abs(landed - target), "premise: the reader's scroll lands where it was aimed").toBeLessThanOrEqual(1);
+      await afterLayoutSettles(page);
+      expect(await distanceFromBottom(page), "premise: the reader is parked above the end").toBeGreaterThan(
+        BOTTOM_THRESHOLD_PX,
+      );
+      const before = await newestVisibleMessage(page);
+      expect(before, "premise: a message should be visible").not.toBeNull();
+
+      const removed = await setOverhang(page, null);
+      expectSameShape(removed.before, removed.after, "premise: removing the overhang resizes nothing the signature describes");
+      expect(
+        removed.before.top - removed.after.top,
+        "premise: removing the overhang clamps the view",
+      ).toBeGreaterThan(LAYOUT_SHIFT_ALLOWANCE_PX);
+      expect(
+        Math.abs(removed.after.max - removed.after.top),
+        "premise: the clamp lands at the new end",
+      ).toBeLessThanOrEqual(1);
+      await afterLayoutSettles(page);
+      // The old gap is out of reach until the history grows again: the view stays
+      // where the clamp put it.
+      await expectDriftWithin(
+        page,
+        () => offsetDrift(page, removed.after.top),
+        "the clamped view moved",
+        { hold: true },
+      );
+
+      // Tall enough to make the old gap reachable again, with room to spare.
+      const marker = "tall arrival after the overhang went";
+      await callRiverTest(
+        page,
+        "appendMessage",
+        `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`,
+      );
+      await expect(page.getByText(marker).last()).toBeAttached({ timeout: 5_000 });
+      const arrivalHeight = await page.evaluate(
+        (marker) =>
+          Array.from(document.querySelectorAll<HTMLElement>('[id^="msg-"]'))
+            .find((row) => row.textContent?.includes(marker))!
+            .getBoundingClientRect().height,
+        marker,
+      );
+      expect(
+        arrivalHeight,
+        "premise: the arrival restores more range than the clamp took, plus the follow band",
+      ).toBeGreaterThan(INTO_OVERHANG_PX + 2 * BOTTOM_THRESHOLD_PX);
+      await expectInPlace(page, before!, "the clamp made the parked reader follow the next arrival", {
+        newest: false,
+        hold: true,
+      });
+      expect(await distanceFromBottom(page), "the arrival was followed").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    });
+  }
+});
+
+// The scroll model's own writes (an anchor correction, a snap) fire `scroll`
+// events like any other. Arriving with nothing moved or resized since the write
+// was recorded, they are echoes: they must not re-measure what the reader meant
+// from a position the model chose.
+test.describe("Our own scroll's echo is not the reader", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("an anchor correction that leaves a parked reader inside the follow band does not repin them @fractional-geometry", async ({
     page,
   }) => {
-    const OVERHANG_PX = 700;
-    // Into the overhang by more than the layout allowance, so this is a clamp no
-    // allowance could excuse, and still well outside the follow band.
-    const INTO_OVERHANG_PX = 300;
+    // Rows above the reader grow by GROW_PX and content below them shrinks by
+    // SHRINK_PX, in one layout change. Their message goes back to its gap (a
+    // correction of GROW_PX), which leaves them SHRINK_PX nearer the end.
+    const GROW_PX = 200;
+    const SHRINK_PX = 80;
+    const PARKED_PX = 140;
+    const PADDING_PX = 300;
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page, 12);
-    const created = await setOverhang(page, 0);
-    await afterLayoutSettles(page);
-    await setOverhang(page, OVERHANG_PX);
+    // Room below the reader to take away later, without a clamp.
+    await page.evaluate((pad) => {
+      const rows = document.querySelectorAll<HTMLElement>('#chat-scroll-container [id^="msg-"]');
+      rows[rows.length - 1].style.paddingBottom = `${pad}px`;
+    }, PADDING_PX);
+    await expectSettledAtBottom(page, "premise: the padded newest row should have been followed");
     await afterLayoutSettles(page);
 
-    const contentEnd = created.before.max;
-    const target = contentEnd + INTO_OVERHANG_PX;
-    // No wheel: WebKit would then deliver the clamp's scroll event twice, and the
-    // second copy (same geometry as the restore just recorded, at the end) reads
-    // as the reader arriving at the end and repins them. That duplicate is an
-    // echo, which this clamp rule does not classify; see plan 08 / pass D.
-    const landed = await readerScrollsToNow(page, target, { wheel: false });
-    expect(Math.abs(landed - target), "premise: the reader's scroll lands where it was aimed").toBeLessThanOrEqual(1);
+    const parkAt = (await historyHeight(page)) - (await viewportHeight(page)) - PARKED_PX;
+    await readerScrollsTo(page, parkAt);
+    await expect
+      .poll(async () => Math.abs((await scrollTop(page)) - parkAt), {
+        timeout: 5_000,
+        message: "premise: the reader's scroll should land where it was aimed",
+      })
+      .toBeLessThanOrEqual(1);
     await afterLayoutSettles(page);
-    expect(await distanceFromBottom(page), "premise: the reader is parked above the end").toBeGreaterThan(
+    const parked = await distanceFromBottom(page);
+    expect(parked, "premise: the reader is parked just outside the follow band").toBeGreaterThan(
       BOTTOM_THRESHOLD_PX,
     );
+    expect(
+      parked - SHRINK_PX,
+      "premise: the shrink below leaves them inside the band, past rounding",
+    ).toBeLessThan(BOTTOM_THRESHOLD_PX - 2 * IN_PLACE_TOLERANCE_PX);
     const before = await newestVisibleMessage(page);
     expect(before, "premise: a message should be visible").not.toBeNull();
+    const above = fillerRows(await anchorRows(page)).find((row) => row.bottom < 0);
+    expect(above, "premise: a message sits entirely above the viewport").toBeDefined();
 
-    const removed = await setOverhang(page, null);
-    expectSameShape(removed.before, removed.after, "premise: removing the overhang resizes nothing the signature describes");
-    expect(
-      removed.before.top - removed.after.top,
-      "premise: removing the overhang clamps the view",
-    ).toBeGreaterThan(LAYOUT_SHIFT_ALLOWANCE_PX);
-    expect(
-      Math.abs(removed.after.max - removed.after.top),
-      "premise: the clamp lands at the new end",
-    ).toBeLessThanOrEqual(1);
+    const changed = await page.evaluate(
+      ({ id, grow, pad, shrink }) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const rows = c.querySelectorAll<HTMLElement>('[id^="msg-"]');
+        const top = c.scrollTop;
+        document.getElementById(id)!.style.paddingTop = `${grow}px`;
+        rows[rows.length - 1].style.paddingBottom = `${pad - shrink}px`;
+        // Read synchronously: any clamp would already have happened.
+        return { top, after: c.scrollTop };
+      },
+      { id: above!.id, grow: GROW_PX, pad: PADDING_PX, shrink: SHRINK_PX },
+    );
+    expect(Math.abs(changed.after - changed.top), "premise: the layout change does not clamp the view").toBeLessThanOrEqual(1);
     await afterLayoutSettles(page);
-    // The old gap is out of reach until the history grows again: the view stays
-    // where the clamp put it.
-    await expectDriftWithin(
-      page,
-      () => offsetDrift(page, removed.after.top),
-      "the clamped view moved",
-      { hold: true },
-    );
-
-    // Tall enough to make the old gap reachable again, with room to spare.
-    const marker = "tall arrival after the overhang went";
-    await callRiverTest(
-      page,
-      "appendMessage",
-      `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`,
-    );
-    await expect(page.getByText(marker).last()).toBeAttached({ timeout: 5_000 });
-    const arrivalHeight = await page.evaluate(
-      (marker) =>
-        Array.from(document.querySelectorAll<HTMLElement>('[id^="msg-"]'))
-          .find((row) => row.textContent?.includes(marker))!
-          .getBoundingClientRect().height,
-      marker,
-    );
     expect(
-      arrivalHeight,
-      "premise: the arrival restores more range than the clamp took, plus the follow band",
-    ).toBeGreaterThan(INTO_OVERHANG_PX + 2 * BOTTOM_THRESHOLD_PX);
-    await expectInPlace(page, before!, "the clamp made the parked reader follow the next arrival", {
-      newest: false,
+      Math.abs((await scrollTop(page)) - changed.top - GROW_PX),
+      "premise: the restore corrected the view by the growth above",
+    ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+    await expectInPlace(page, before!, "the correction did not keep the reader's message at its gap", {
       hold: true,
     });
-    expect(await distanceFromBottom(page), "the arrival was followed").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    expect(
+      await distanceFromBottom(page),
+      "premise: the correction left the reader inside the follow band",
+    ).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX - IN_PLACE_TOLERANCE_PX);
+
+    await deliver(page, `arrival after the correction: ${"w".repeat(200)}`);
+    await expectInPlace(page, before!, "the correction's own scroll event repinned the parked reader", {
+      hold: true,
+    });
   });
 });
 

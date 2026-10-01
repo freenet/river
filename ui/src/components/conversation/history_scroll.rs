@@ -102,10 +102,48 @@ struct LayoutSig {
 /// Who a `scroll` event belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ScrollCause {
+    /// Nothing moved or resized since the record: no unaccounted movement. Most
+    /// often our own write's event, but that is not something it can prove.
+    Echo,
     /// The reader moved the view: it becomes the new anchor.
     Reader,
     /// A layout change moved it (a browser clamp): put the anchor back.
     Layout,
+}
+
+/// Whether `top` is up past rounding from `from`, where the gesture started.
+/// Measured against the start, never the previous frame, so slow 1-2px frames
+/// add up.
+fn moved_up(from: i32, top: i32) -> bool {
+    top < from - SCROLL_TOP_SLACK_PX
+}
+
+/// Whether `top` is within rounding of the live end `max`.
+fn at_end(top: i32, max: i32) -> bool {
+    max - top <= SCROLL_TOP_SLACK_PX
+}
+
+/// What a reader-classified frame means while the scroll-to-latest animation
+/// is running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SeekStep {
+    /// Still on its way down (or stalled within rounding).
+    Travelling,
+    /// At the live end.
+    Arrived,
+    /// Up past rounding from the previous frame. The animation only moves
+    /// down, so that frame is the reader's.
+    TakenOver,
+}
+
+fn seek_step(prev_top: i32, top: i32, max: i32) -> SeekStep {
+    if at_end(top, max) {
+        SeekStep::Arrived
+    } else if top < prev_top - SCROLL_TOP_SLACK_PX {
+        SeekStep::TakenOver
+    } else {
+        SeekStep::Travelling
+    }
 }
 
 /// Indices of up to `n` rows, newest first, starting at the newest row that
@@ -144,10 +182,12 @@ fn newest_visible_rows(
     (0..=newest).rev().take(n).collect()
 }
 
-/// Read a `scroll` event as a layout change's doing or the reader's. `max` is
-/// the live scroll range (`max_scroll_top`), never a recorded one.
+/// Read a `scroll` event as an echo, a layout change's doing or the reader's.
+/// `max` is the live scroll range (`max_scroll_top`), never a recorded one.
 ///
-/// Layout if either:
+/// Echo first: the signature and `scrollTop` are both as recorded.
+///
+/// Otherwise layout if either:
 ///
 /// * **Final-end clamp**: the recorded `scrollTop` is now out of reach (past
 ///   `max` by more than rounding) and the view sits at `max` (within rounding,
@@ -166,6 +206,9 @@ fn classify_scroll(
     now_top: i32,
     max: i32,
 ) -> ScrollCause {
+    if recorded == now && recorded_top == now_top {
+        return ScrollCause::Echo;
+    }
     let clamped_to_end =
         recorded_top > max + SCROLL_TOP_SLACK_PX && (now_top - max).abs() <= SCROLL_TOP_SLACK_PX;
     let small_layout_move =
@@ -355,22 +398,28 @@ impl HistoryScroll {
         }
         self.sig.set(sig);
         self.top.set(top);
+        self.trim_at_bottom(&container);
+    }
 
-        // A capture landing AT the bottom is the ONE moment a window trim is
-        // provably invisible: the rows it removes are above the view, so the
-        // browser's clamp keeps the same tail glued to the bottom edge (and the
-        // ResizeObserver's restore keeps a pinned reader there). Gated at
-        // SCROLL_TOP_SLACK_PX, not BOTTOM_THRESHOLD_PX: a reader parked 100px up
-        // still counts as pinned, and a trim from there would yank them to the
-        // exact bottom. Skipped when the trimmed tail would leave the backfill
-        // sentinel in range of the bottom, or the two oscillate at render speed
-        // (#505; see `trim_would_rearm_backfill`).
+    /// A view landing AT the bottom is the ONE moment a window trim is provably
+    /// invisible: the rows it removes are above the view, so the browser's clamp
+    /// keeps the same tail glued to the bottom edge (and the ResizeObserver's
+    /// restore keeps a pinned reader there). Gated at SCROLL_TOP_SLACK_PX, not
+    /// BOTTOM_THRESHOLD_PX: a reader parked 100px up still counts as pinned, and
+    /// a trim from there would yank them to the exact bottom. Skipped when the
+    /// trimmed tail would leave the backfill sentinel in range of the bottom, or
+    /// the two oscillate at render speed (#505; see `trim_would_rearm_backfill`).
+    ///
+    /// Runs from a reader's capture, from an echo (a follower's snap), and from
+    /// the scroll-to-latest animation arriving.
+    fn trim_at_bottom(&self, container: &web_sys::Element) {
+        let distance = (max_scroll_top(container) - container.scroll_top()) as f64;
         if let Some(trim) = self.hooks.borrow().as_ref() {
             if distance <= SCROLL_TOP_SLACK_PX as f64
                 && trim.window_overgrown.get()
                 && !trim_would_rearm_backfill(
                     container.scroll_height(),
-                    sig.client_height,
+                    container.client_height(),
                     trim.window_rendered.get(),
                     INITIAL_WINDOW_ITEMS,
                 )
@@ -471,6 +520,9 @@ impl HistoryScroll {
             return;
         };
         match self.cause_now(&container) {
+            // Nothing to account for, so the reader's intent stays as it was.
+            // Still a bottom: a follower's snap trims here.
+            ScrollCause::Echo => self.trim_at_bottom(&container),
             ScrollCause::Layout => self.restore_now(),
             ScrollCause::Reader => self.capture(),
         }
@@ -673,7 +725,7 @@ mod tests {
         let same = sig(3000, 600, 1000);
         let at = |now_top: i32| classify_scroll(same, same, 2000, now_top, REACHABLE_MAX);
         assert_eq!(at(1999), ScrollCause::Reader);
-        assert_eq!(at(2000), ScrollCause::Reader);
+        assert_eq!(at(2001), ScrollCause::Reader);
         assert_eq!(at(100), ScrollCause::Reader);
         // Down to the end the old offset could reach: the reader going there.
         assert_eq!(at(REACHABLE_MAX), ScrollCause::Reader);
@@ -753,6 +805,81 @@ mod tests {
         );
         // And with nothing in the signature changed, it is the reader at any size.
         assert_eq!(classify_scroll(a, a, 2000, 1889, max), ScrollCause::Reader);
+    }
+
+    #[test]
+    fn nothing_moved_and_nothing_resized_is_an_echo() {
+        let same = sig(3000, 600, 1000);
+        // Unchanged layout, unchanged offset: whatever sent this event, the
+        // record already accounts for it.
+        assert_eq!(
+            classify_scroll(same, same, 2000, 2000, REACHABLE_MAX),
+            ScrollCause::Echo
+        );
+        // Even at the end, where the final-end clause looks.
+        assert_eq!(
+            classify_scroll(same, same, REACHABLE_MAX, REACHABLE_MAX, REACHABLE_MAX),
+            ScrollCause::Echo
+        );
+        // A changed layout with the offset left where it was is the layout's,
+        // not an echo: it still needs a restore.
+        assert_eq!(
+            classify_scroll(same, sig(3200, 600, 1000), 2000, 2000, REACHABLE_MAX),
+            ScrollCause::Layout
+        );
+        // One pixel of movement is not an echo.
+        assert_eq!(
+            classify_scroll(same, same, 2000, 1999, REACHABLE_MAX),
+            ScrollCause::Reader
+        );
+    }
+
+    #[test]
+    fn moving_up_is_measured_from_where_the_gesture_started() {
+        let from = 1000;
+        // Three 1px frames: none is past the slack on its own, the third is
+        // past it from where the gesture started.
+        assert!(!moved_up(from, from - 1));
+        assert!(!moved_up(from, from - SCROLL_TOP_SLACK_PX));
+        assert!(moved_up(from, from - SCROLL_TOP_SLACK_PX - 1));
+        // Jitter back within the slack, and any downward move, is not up.
+        assert!(!moved_up(from, from + 1));
+        assert!(!moved_up(from, from + 500));
+    }
+
+    #[test]
+    fn at_end_allows_rounding_slack_and_no_more() {
+        let max = 2400;
+        assert!(at_end(max, max));
+        assert!(at_end(max - SCROLL_TOP_SLACK_PX, max));
+        assert!(!at_end(max - SCROLL_TOP_SLACK_PX - 1, max));
+        // Past the end (a stale read against a range that just shrank).
+        assert!(at_end(max + 30, max));
+    }
+
+    #[test]
+    fn a_seek_step_travels_arrives_or_is_taken_over() {
+        let max = 2400;
+        // Our animation only moves down.
+        assert_eq!(seek_step(1000, 1180, max), SeekStep::Travelling);
+        // A frame that stalls or jitters within rounding is still travelling.
+        assert_eq!(seek_step(1000, 1000, max), SeekStep::Travelling);
+        assert_eq!(
+            seek_step(1000, 1000 - SCROLL_TOP_SLACK_PX, max),
+            SeekStep::Travelling
+        );
+        // At the live end, within rounding.
+        assert_eq!(
+            seek_step(2300, max - SCROLL_TOP_SLACK_PX, max),
+            SeekStep::Arrived
+        );
+        assert_eq!(seek_step(2300, max, max), SeekStep::Arrived);
+        // Up past rounding from the previous frame: the reader's.
+        assert_eq!(
+            seek_step(1000, 1000 - SCROLL_TOP_SLACK_PX - 1, max),
+            SeekStep::TakenOver
+        );
+        assert_eq!(seek_step(1000, 200, max), SeekStep::TakenOver);
     }
 
     #[test]
