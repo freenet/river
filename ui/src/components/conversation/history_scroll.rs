@@ -45,22 +45,38 @@
 //!   the reader's last move, never after our own work: a reader move restarts a
 //!   pending one, while corrections, their echoes and layout work leave it
 //!   where it is. Where the browser has no `scrollend`, every reader move arms
-//!   it; the deadline cannot tell a paused finger from a lifted one. A
-//!   `scrollend` exactly where our latest anchor correction in this gesture
-//!   left the view (one that actually moved it; a no-op restore records
-//!   nothing), with no reader move since, may be that write's own end, so it
-//!   does not settle: the gesture stays held and the deadline is armed instead
-//!   (if it is not already), and every such end is refused until the reader
-//!   moves or the gesture ends. That is a geometry match, not provenance: the
-//!   reader's last end coalesced with the correction looks the same, which is
-//!   what the deadline is for. A settle that does end the gesture first puts
-//!   back a reflow the ResizeObserver has not reported yet (the signature
-//!   differs from the record: an image loading above the view moves the rows,
-//!   not `scrollTop`), against the existing anchor, and only then measures.
-//!   With no gesture in progress a settle does nothing, which is what makes a
-//!   stale `scrollend` (another room's, an old gesture's, a seek frame's)
-//!   harmless: room switches, forced snaps and new seeks end the gesture, and
-//!   forget its correction and deadline.
+//!   it; the deadline cannot tell a paused finger from a lifted one. A deadline
+//!   that, taking in the pending scroll first, finds the reader has moved since
+//!   their last delivered `scroll` (a new reader revision) and the gesture still
+//!   going does not settle: it arms a fresh full interval from that move, in
+//!   either mode (with `scrollend`, the move's own intake cannot, since the
+//!   fired handle is gone by then). A move that came back to the end has made
+//!   the follow `Free` already. A `scrollend` with the view's top exactly where
+//!   our latest anchor correction in this gesture left it (one that actually
+//!   moved it; a no-op restore records nothing), with no reader move since, may
+//!   be that write's own end, so it does not settle: the gesture stays held and
+//!   the deadline is armed instead (if it is not already), and every such end is
+//!   refused until the reader moves or the gesture ends. The top only: a
+//!   container resized before the observer reports it (the composer growing)
+//!   moves the bottom edge, and nobody moved the view. That is a geometry match,
+//!   not provenance: the reader's last end coalesced with the correction looks
+//!   the same, which is what the deadline is for. A settle that does end the
+//!   gesture first puts back a reflow the ResizeObserver has not reported yet
+//!   (the signature differs from the record: an image loading above the view
+//!   moves the rows, not `scrollTop`), against the existing anchor, and only
+//!   then measures. However a gesture ends (a settle, or the reveal's restore
+//!   below), its deadline is cancelled with it, so no handle is left for the
+//!   next gesture to take for its own.
+//! * **Stale ends**: with no gesture in progress a settle does nothing, which
+//!   makes a stale `scrollend` (another room's, an old gesture's, a seek
+//!   frame's) harmless then: room switches, forced snaps and new seeks end the
+//!   gesture, and forget its correction and deadline. It is not harmless while
+//!   a gesture is in progress: an end that reaches the app then and does not
+//!   match the latest correction settles that gesture, whoever's it was. A seek
+//!   frame's end queued behind the reader's takeover would be one; the
+//!   engines in the suite were not seen to produce that order (see
+//!   `conversation-follow-state.spec.ts`, the seek takeover diagnostic), and
+//!   nothing here prevents it.
 //!
 //! # Where capture runs
 //!
