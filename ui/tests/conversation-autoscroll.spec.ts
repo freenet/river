@@ -47,6 +47,11 @@ const HISTORY_ROWS = '[data-testid="conversation-history"] > *';
 const BOTTOM_THRESHOLD_PX = 100;
 /// Slack for fractional layout after a scroll that did land at the bottom.
 const AT_BOTTOM_EPSILON_PX = 4;
+/// The scroll model's allowance for a layout move (LAYOUT_SHIFT_ALLOWANCE_PX in
+/// ui/src/components/conversation/history_scroll.rs). Only a fixture premise:
+/// the tests that need a clamp or a move on one side of it assert that side, so
+/// a policy change fails them at setup instead of leaving them vacuous.
+const LAYOUT_SHIFT_ALLOWANCE_PX = 200;
 
 /// A draft long enough to take more than BOTTOM_THRESHOLD_PX off the history.
 const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
@@ -556,7 +561,7 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await afterLayoutSettles(page);
-    const { clamp, laidOutAgain } = await page.evaluate(() => {
+    const { clamp, laidOutAgain, belowFinalEnd } = await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       const content = document.getElementById("chat-content")!;
       const rows = c.querySelectorAll('[data-testid="conversation-history"] > *');
@@ -572,11 +577,26 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
       // Read synchronously, so the layout has been redone before we look.
       const laidOutAgain =
         c.scrollHeight !== heightBefore || content.clientWidth !== widthBefore;
-      return { clamp: before - clamped, laidOutAgain };
+      return {
+        clamp: before - clamped,
+        laidOutAgain,
+        belowFinalEnd: c.scrollHeight - c.clientHeight - c.scrollTop,
+      };
     });
     expect(clamp, "premise: hiding the newest row must clamp the view").toBeGreaterThan(
       AT_BOTTOM_EPSILON_PX
     );
+    // An INTERMEDIATE clamp: it ends short of the final end, so only the
+    // allowance for a changed layout can tell it from the reader. A clamp to the
+    // final end is the other test's business.
+    expect(
+      clamp,
+      "premise: the intermediate clamp is within the layout allowance",
+    ).toBeLessThanOrEqual(LAYOUT_SHIFT_ALLOWANCE_PX);
+    expect(
+      belowFinalEnd,
+      "premise: the clamped view ends above the taller history's end",
+    ).toBeGreaterThan(AT_BOTTOM_EPSILON_PX);
     expect(
       laidOutAgain,
       "premise: the rewrap must change the history's height or the width it wraps at"
@@ -1066,6 +1086,250 @@ test.describe("The reader's place survives removed and late content (#507)", () 
       // Never leave the request hanging, even when an assertion failed first.
       await (held as import("@playwright/test").Route | null)?.abort().catch(() => {});
     }
+  });
+});
+
+/// The numbers the scroll model's layout signature describes (content and
+/// container sizes), plus the scroll range, which it does not.
+type Shape = {
+  top: number;
+  max: number;
+  contentHeight: number;
+  contentWidth: number;
+  viewport: number;
+  viewportWidth: number;
+};
+
+/// Set the height of a test-only box hanging absolutely positioned below the
+/// history's content, or remove it with `null`. It adds scrollable overflow
+/// without resizing the content wrapper or the container, the way an open
+/// popover near the end of the history does. Returns the shape before and
+/// after, the after read synchronously so any clamp has already happened.
+function setOverhang(page: Page, height: number | null): Promise<{ before: Shape; after: Shape }> {
+  return page.evaluate((height) => {
+    const c = document.getElementById("chat-scroll-container")!;
+    const content = document.getElementById("chat-content")!;
+    const shape = () => ({
+      top: c.scrollTop,
+      max: c.scrollHeight - c.clientHeight,
+      contentHeight: content.getBoundingClientRect().height,
+      contentWidth: content.clientWidth,
+      viewport: c.clientHeight,
+      viewportWidth: c.clientWidth,
+    });
+    const before = shape();
+    let box = document.getElementById("test-overhang");
+    if (height === null) {
+      box?.remove();
+    } else {
+      if (!box) {
+        // Positioned so the box's overflow belongs to the scroll container.
+        content.style.position = "relative";
+        box = document.createElement("div");
+        box.id = "test-overhang";
+        box.style.cssText = "position:absolute;top:100%;left:0;width:1px;pointer-events:none;";
+        content.appendChild(box);
+      }
+      box.style.height = `${height}px`;
+    }
+    return { before, after: shape() };
+  }, height);
+}
+
+/// The signature's dimensions did not change between `a` and `b`.
+function expectSameShape(a: Shape, b: Shape, why: string) {
+  for (const key of ["contentHeight", "contentWidth", "viewport", "viewportWidth"] as const) {
+    expect(Math.abs(a[key] - b[key]), `${why}: ${key} ${a[key]} -> ${b[key]}`).toBeLessThanOrEqual(0.5);
+  }
+}
+
+/// The reader sets `scrollTop` to `top`; returns where it landed, read in the
+/// same task, before any scroll event or restore can answer it. `wheel: false`
+/// leaves out the synthetic wheel `readerScrollsTo` sends: after one, WebKit
+/// dispatches every later `scroll` event on the element twice (measured on a
+/// bare scroller outside the app, 2026-10-01; Chromium and Firefox send one).
+function readerScrollsToNow(page: Page, top: number, { wheel = true } = {}): Promise<number> {
+  return page.evaluate(
+    ({ t, wheel }) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      if (wheel) c.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }));
+      c.scrollTop = t;
+      return c.scrollTop;
+    },
+    { t: top, wheel },
+  );
+}
+
+// The browser clamps `scrollTop` when the scroll range shrinks below it. A clamp
+// is not the reader moving, however far it goes and whether or not anything the
+// layout signature describes changed; a reader's own move is theirs, even right
+// after overflow the signature does not describe has changed.
+test.describe("A clamp to the end is not the reader", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("widening a history whose long rows above the reader shrink keeps their message @fractional-geometry", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    // Narrow first, so the long rows wrap tall; widening then shrinks them.
+    await page.evaluate(() => {
+      document.getElementById("chat-content")!.style.maxWidth = "360px";
+    });
+    await expectSettledAtBottom(page, "premise: narrowing the history should keep the view at its end");
+    for (let i = 0; i < 4; i++) {
+      await deliver(page, `long ${i}: ${"lorem ipsum dolor sit amet ".repeat(24)}`);
+    }
+    for (let i = 0; i < 10; i++) {
+      await deliver(page, `short ${i}`);
+    }
+    await expectSettledAtBottom(page, "premise: the fixture messages should have been followed");
+    // Among the short rows, which barely rewrap: the rows below the reader keep
+    // their height, so the reader's message can go back to its gap without
+    // running into the new end.
+    const shortRows = (await anchorRows(page)).filter(
+      (row) => row.id.startsWith("msg-") && /^short \d+/.test(row.text),
+    );
+    expect(shortRows.length, "premise: the short rows are on the page").toBe(10);
+    const before = await parkOnRow(page, shortRows[shortRows.length - 4].id);
+
+    const widened = await page.evaluate(
+      ({ id, gap }) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const content = document.getElementById("chat-content")!;
+        const row = document.getElementById(id)!;
+        const top = c.scrollTop;
+        content.style.maxWidth = "";
+        // Read synchronously: the layout and its clamp happen here.
+        const clamped = c.scrollTop;
+        const max = c.scrollHeight - c.clientHeight;
+        const gapNow = c.getBoundingClientRect().bottom - row.getBoundingClientRect().top;
+        return { clamp: top - clamped, atEnd: max - clamped, restoreTo: clamped + gap - gapNow, max };
+      },
+      before,
+    );
+    expect(
+      widened.clamp,
+      `premise: the browser's clamp is larger than the layout allowance (${JSON.stringify(widened)})`,
+    ).toBeGreaterThan(LAYOUT_SHIFT_ALLOWANCE_PX);
+    expect(Math.abs(widened.atEnd), "premise: the clamp lands at the new end").toBeLessThanOrEqual(1);
+    expect(
+      widened.restoreTo,
+      `premise: the reader's message can go back to its gap without a clamp (${JSON.stringify(widened)})`,
+    ).toBeLessThanOrEqual(widened.max - IN_PLACE_TOLERANCE_PX);
+
+    await expectInPlace(page, before, "the widening's clamp was read as the reader moving to the end", {
+      hold: true,
+    });
+    await deliver(page, "arrival after the widening");
+    await expectInPlace(page, before, "an arrival after the widening repinned the reader", {
+      hold: true,
+    });
+    expect(await distanceFromBottom(page), "the arrival was followed").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+  });
+
+  test("a small reader scroll after an overhang grew is kept", async ({ page }) => {
+    const SMALL_MOVE_PX = 150;
+    await parkMidHistory(page);
+    await setOverhang(page, 0);
+    await afterLayoutSettles(page);
+    const grown = await setOverhang(page, 800);
+    expect(
+      grown.after.max - grown.before.max,
+      "premise: the overhang adds scroll range",
+    ).toBeGreaterThan(LAYOUT_SHIFT_ALLOWANCE_PX);
+    expectSameShape(grown.before, grown.after, "premise: the overhang resizes nothing the signature describes");
+    await afterLayoutSettles(page);
+    expect(await scrollTop(page), "premise: the overhang does not move the view").toBeCloseTo(grown.before.top, 0);
+
+    const target = grown.after.top - SMALL_MOVE_PX;
+    const landed = await readerScrollsToNow(page, target);
+    expect(Math.abs(landed - target), "premise: the reader's scroll lands where it was aimed").toBeLessThanOrEqual(1);
+    await afterLayoutSettles(page);
+    await expectDriftWithin(
+      page,
+      () => offsetDrift(page, target),
+      "the reader's small scroll was put back as if the overhang had moved it",
+      { hold: true },
+    );
+    const parked = await newestVisibleMessage(page);
+    expect(parked, "premise: a message should be visible").not.toBeNull();
+    await deliver(page, "arrival after the overhang grew");
+    await expectInPlace(page, parked!, "an arrival moved the reader after their small scroll", { hold: true });
+  });
+
+  test("removing overflow clamps a parked reader without repinning them @fractional-geometry", async ({
+    page,
+  }) => {
+    const OVERHANG_PX = 700;
+    // Into the overhang by more than the layout allowance, so this is a clamp no
+    // allowance could excuse, and still well outside the follow band.
+    const INTO_OVERHANG_PX = 300;
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page, 12);
+    const created = await setOverhang(page, 0);
+    await afterLayoutSettles(page);
+    await setOverhang(page, OVERHANG_PX);
+    await afterLayoutSettles(page);
+
+    const contentEnd = created.before.max;
+    const target = contentEnd + INTO_OVERHANG_PX;
+    // No wheel: WebKit would then deliver the clamp's scroll event twice, and the
+    // second copy (same geometry as the restore just recorded, at the end) reads
+    // as the reader arriving at the end and repins them. That duplicate is an
+    // echo, which this clamp rule does not classify; see plan 08 / pass D.
+    const landed = await readerScrollsToNow(page, target, { wheel: false });
+    expect(Math.abs(landed - target), "premise: the reader's scroll lands where it was aimed").toBeLessThanOrEqual(1);
+    await afterLayoutSettles(page);
+    expect(await distanceFromBottom(page), "premise: the reader is parked above the end").toBeGreaterThan(
+      BOTTOM_THRESHOLD_PX,
+    );
+    const before = await newestVisibleMessage(page);
+    expect(before, "premise: a message should be visible").not.toBeNull();
+
+    const removed = await setOverhang(page, null);
+    expectSameShape(removed.before, removed.after, "premise: removing the overhang resizes nothing the signature describes");
+    expect(
+      removed.before.top - removed.after.top,
+      "premise: removing the overhang clamps the view",
+    ).toBeGreaterThan(LAYOUT_SHIFT_ALLOWANCE_PX);
+    expect(
+      Math.abs(removed.after.max - removed.after.top),
+      "premise: the clamp lands at the new end",
+    ).toBeLessThanOrEqual(1);
+    await afterLayoutSettles(page);
+    // The old gap is out of reach until the history grows again: the view stays
+    // where the clamp put it.
+    await expectDriftWithin(
+      page,
+      () => offsetDrift(page, removed.after.top),
+      "the clamped view moved",
+      { hold: true },
+    );
+
+    // Tall enough to make the old gap reachable again, with room to spare.
+    const marker = "tall arrival after the overhang went";
+    await callRiverTest(
+      page,
+      "appendMessage",
+      `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`,
+    );
+    await expect(page.getByText(marker).last()).toBeAttached({ timeout: 5_000 });
+    const arrivalHeight = await page.evaluate(
+      (marker) =>
+        Array.from(document.querySelectorAll<HTMLElement>('[id^="msg-"]'))
+          .find((row) => row.textContent?.includes(marker))!
+          .getBoundingClientRect().height,
+      marker,
+    );
+    expect(
+      arrivalHeight,
+      "premise: the arrival restores more range than the clamp took, plus the follow band",
+    ).toBeGreaterThan(INTO_OVERHANG_PX + 2 * BOTTOM_THRESHOLD_PX);
+    await expectInPlace(page, before!, "the clamp made the parked reader follow the next arrival", {
+      newest: false,
+      hold: true,
+    });
+    expect(await distanceFromBottom(page), "the arrival was followed").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
   });
 });
 
