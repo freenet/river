@@ -1631,12 +1631,12 @@ const TRIM_HEADROOM_PX: f64 = 200.0;
 /// viewport iff `content_height < client_height + BACKFILL_LEAD_PX`. A tail
 /// short enough for that (browser zoom-out, a tall portrait monitor over a
 /// modest window) would re-fire the backfill the moment the trim lands:
-/// grow → snap → capture → trim → grow, a silent render loop at full speed
-/// (#505 re-review). `HistoryScroll::capture` skips the trim when the retained
+/// grow → snap → trim → grow, a silent render loop at full speed
+/// (#505 re-review). `HistoryScroll::trim_at_bottom` skips the trim when the retained
 /// tail's ESTIMATED height (current height scaled by the retained fraction)
 /// would sit within the strip's reach; the window then simply stays grown,
 /// bounded by the ceiling as ever.
-/// Only the wasm capture calls this at runtime; natively it is
+/// Only the wasm trim calls this at runtime; natively it is
 /// exercised by the unit tests, hence the targeted allow.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn trim_would_rearm_backfill(
@@ -1802,8 +1802,8 @@ pub fn Conversation() -> Element {
     // can reveal zero new rows and dead-end paging (#505 review, blocker 2).
     let window_rendered = use_hook(|| Rc::new(std::cell::Cell::new(0usize)));
     // Whether the rendered window currently holds more than a fresh room-open
-    // would render — i.e. whether the bottom trim in `HistoryScroll::capture`
-    // has anything to do. Maintained by render, read from the raw scroll
+    // would render — i.e. whether the bottom trim in
+    // `HistoryScroll::trim_at_bottom` has anything to do. Maintained by render, read from the raw scroll
     // callback (which cannot touch signals).
     let window_overgrown = use_hook(|| Rc::new(std::cell::Cell::new(false)));
     // Whether the opening snap for the CURRENT room has landed. The backfill
@@ -2206,8 +2206,14 @@ pub fn Conversation() -> Element {
     // Reading `CURRENT_ROOM` (which holds only `owner_key`) re-runs this on every
     // room change and nothing else.
     //
-    // This only forces the snap; `restore` runs in the content effect above once
-    // the new room's groups render. The force persists until then.
+    // This only forces the snap. The force is spent by the first restore that has
+    // usable geometry, whoever runs it: usually the content effect above once the
+    // new room's groups render. A ResizeObserver restore before that render spends
+    // it against the old room's rows, harmlessly: `reset_for_room` has set the
+    // pin, so the content effect's restore of the new room still snaps, and
+    // `snapped_to_bottom`'s room check skips the early completion (the rendered
+    // room is still the old one), so only the new room's own snap releases its
+    // backfill gate. While the history is hidden nothing spends it.
     //
     // Guarded on an ACTUAL key change: re-selecting the already-open room rewrites
     // `CURRENT_ROOM` with the same key, and forcing a snap with no new content to
@@ -3174,8 +3180,8 @@ pub fn Conversation() -> Element {
                                     // (#505 blocker 2; see `grown_window`).
                                     window_rendered
                                         .set(groups.len() - history_window.start);
-                                    // Tell `HistoryScroll::capture` whether a
-                                    // bottom trim would shrink anything.
+                                    // Tell `HistoryScroll::trim_at_bottom`
+                                    // whether a trim would shrink anything.
                                     window_overgrown.set(
                                         requested_window > INITIAL_WINDOW_ITEMS
                                             || groups.len() - history_window.start
@@ -3434,6 +3440,9 @@ pub fn Conversation() -> Element {
                             // possible statement of intent, so this re-arms the
                             // pin (inside `snap_to_bottom`) even though the
                             // button itself renders off the IntersectionObserver.
+                            // The smooth scroll is a seek: its frames are not
+                            // read as the reader, and it re-aims at the end if
+                            // messages land on the way (history_scroll.rs).
                             #[cfg(target_arch = "wasm32")]
                             {
                                 let history = history.clone();
@@ -5146,8 +5155,8 @@ mod tests {
         }
     }
 
-    /// The trim — `HistoryScroll::capture` clearing the anchor and resetting the
-    /// requested window once the reader's own scroll lands at the bottom —
+    /// The trim — `HistoryScroll::trim_at_bottom` clearing the anchor and
+    /// resetting the requested window once the view lands at the bottom —
     /// resolves back to the plain tail.
     #[test]
     fn a_trim_resolves_back_to_the_plain_tail() {

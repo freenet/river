@@ -3,51 +3,103 @@
 //! We remember the newest row that is visible (`data-anchor-row`) plus up to
 //! `ANCHOR_FALLBACK_ROWS` above it, each with its `gap` (the container's bottom
 //! edge minus the row's top edge). Layout changes put that row back at its gap;
-//! they never re-measure what the reader meant.
+//! they never re-measure what the reader meant. Measured from the BOTTOM edge on
+//! purpose: a growing composer takes height off that edge, so a parked reader's
+//! text moves up with it rather than being covered.
 //!
-//! * **Pinned**: within `BOTTOM_THRESHOLD_PX` of the end, measured only in `capture`.
-//! * **Capture** runs only from the `scroll` listener, and only for a reader's
-//!   scroll. It sets the anchor, the pin, and the recorded layout signature and
-//!   `scrollTop`. It also runs the window trim, which is why a trim needs no
-//!   flag of its own: the rows it removes sit above the view.
-//! * **Restore** runs on every layout or content change (the ResizeObserver, the
-//!   content-change effect, and a `scroll` classified as layout). Forced or
-//!   pinned, it goes to the bottom; otherwise it scrolls the first surviving
-//!   anchor row back to its gap. It never changes the anchor or clears the pin.
-//! * **The one heuristic** (`classify_scroll`): a `scroll` event is layout's (a
-//!   browser clamp) if the recorded `scrollTop` is out of reach of the live
-//!   scroll range and the view now sits at its end, whether or not anything was
-//!   resized (removing a positioned overhang clamps with nothing resized); or if
-//!   the layout signature changed since it was recorded AND `scrollTop` moved no
-//!   more than `LAYOUT_SHIFT_ALLOWANCE_PX`, for a clamp taken during a shorter
-//!   intermediate layout that ends short of the end. Geometry, not provenance.
-//!   Residuals: a reader who moves less than the allowance in the very frame a
-//!   layout change lands loses that frame's movement (the pin can't latch on it,
-//!   since the next scroll event captures); an intermediate clamp larger than
-//!   the allowance is taken as the reader; and a reader who scrolls to the end in
-//!   the frame of a final-end clamp is indistinguishable from it.
-//!   The signature records the layout's shape (content and container sizes); the
-//!   scroll range is always read live. It can still be stale when an event is
-//!   classified: ResizeObserver delivery is asynchronous, a hidden history
-//!   records nothing, and the sizes read are client sizes, not exactly the boxes
-//!   the observer watches.
+//! Three things are kept apart. **Recording** notes the layout signature and
+//! `scrollTop` after anything moves the view, ours or not, so the next `scroll`
+//! event can be classified. **Capture** takes the reader's position as their
+//! intent: the anchor and the pin (within `BOTTOM_THRESHOLD_PX` of the end).
+//! **Restore** puts the view where that intent says after a layout or content
+//! change, and never changes the anchor or clears the pin.
+//!
+//! # Follow states
+//!
+//! | State | Restore does | Ends when |
+//! |---|---|---|
+//! | `Free` | pinned: snap to the bottom; else the anchor back at its gap | a reader gesture moves up (`Held`), or the button (`Seeking`) |
+//! | `Seeking` | re-aims the smooth scroll at the live end; never an anchor write | it reaches the end, the reader takes over, a touch, a force, a room switch |
+//! | `Held` | the anchor back at its gap, even when pinned; never a snap | the gesture settles, or comes back to the end |
+//!
+//! * **`Seeking`** is the scroll-to-latest button's smooth scroll. Its frames
+//!   are recorded, not captured, so they cannot unpin the reader who asked to
+//!   follow. Reaching the end finishes it (and trims, as a snap does). A frame
+//!   that moves up past rounding from the previous one is the reader taking over
+//!   (the animation only moves down), and enters `Held`. A `touchstart` stops it
+//!   where it is and captures. Re-aiming retargets the browser's animation, and
+//!   restarts one a hide cut short; how smooth that looks is the engine's.
+//!   Seeking never reports an opening snap: only an instant snap does.
+//! * **`Held`**: a reader gesture remembers where it started (`gesture_from`,
+//!   both edges of the view, as `main`'s `reader_moved_up_since`). Once both have
+//!   moved up past rounding from there, restores keep the anchor and do not
+//!   snap, so an arrival does not yank a reader who has started to look back
+//!   inside the band. Comparing with the start, not the previous frame, is what
+//!   lets slow 1-2px frames add up; a layout correction shifts the start by what
+//!   it moved; both edges, so a composer collapse that clamps the top up is not
+//!   the reader. Back at the end, it is `Free` again at once.
+//! * **Settle** (`scrollend`, or a 120ms debounce on `scroll` where it is
+//!   missing) ends a gesture: it measures the pin and anchor where the view came
+//!   to rest, as `main` did, and does not snap. The debounce cannot tell a
+//!   paused finger from a lifted one. A settle with no gesture in progress does
+//!   nothing, which is what makes a stale `scrollend` (another room's, an old
+//!   gesture's) harmless: room switches, forced snaps and new seeks clear the
+//!   gesture. During `Seeking`, a settle finishes or re-aims the seek.
+//!
+//! # Where capture runs
+//!
+//! * A `scroll` classified as the reader's, from the listener or taken in early
+//!   (below), outside `Seeking`, or the frame that takes over a seek.
+//! * A gesture's settle, and a touch that stops a seek. These are explicit
+//!   transitions and capture directly, never through `on_scroll`: the position
+//!   has usually been recorded already and would classify as an echo.
+//!
+//! # Classifying a `scroll` event (`classify_scroll`)
+//!
+//! A geometry heuristic, not provenance.
+//!
+//! * **Echo**: the signature and `scrollTop` are exactly as recorded. Nothing
+//!   moved that is not already accounted for, so the reader's intent stays as it
+//!   was. Usually our own write's event (or WebKit's duplicate of an event after
+//!   a `wheel`), but that is inferred, not proven. At the bottom it still trims.
+//! * **Layout** (a browser clamp): the recorded `scrollTop` is out of reach of
+//!   the live scroll range and the view now sits at its end, whether or not
+//!   anything was resized (removing a positioned overhang clamps with nothing
+//!   resized); or the signature changed since it was recorded AND `scrollTop`
+//!   moved no more than `LAYOUT_SHIFT_ALLOWANCE_PX`, for a clamp taken during a
+//!   shorter intermediate layout that ends short of the end. It restores.
+//! * **Reader**: anything else, handled by the follow state above.
+//!
+//! Residuals: a reader who moves less than the allowance in the very frame a
+//! layout change lands loses that frame's movement; an intermediate clamp larger
+//! than the allowance is taken as the reader; and a reader who scrolls to the end
+//! in the frame of a final-end clamp is indistinguishable from it. The signature
+//! records the layout's shape (content and container sizes); the scroll range is
+//! always read live. It can still be stale when an event is classified:
+//! ResizeObserver delivery is asynchronous, a hidden history records nothing, and
+//! the sizes read are client sizes, not exactly the boxes the observer watches.
+//!
+//! # Timing and visibility
+//!
 //! * **Late scroll events**: a `scroll` event arrives a frame after the scroll,
 //!   and a content change can land first. So `restore`, and the render before a
 //!   patch, first read a pending reader scroll (`take_in_undelivered_scroll`,
 //!   through `on_scroll`), or a stale pin would drag the reader back down, or an
 //!   anchor would be measured after the patch had moved the rows.
-//! * **Why this can't latch as #486 did**: the pin comes only from the reader's
-//!   own positions. Growing content, a growing composer or a rewrap restore
-//!   instead of measuring, so none of them can clear it.
-//!
 //! * **Hidden**: the mobile layout hides the history (`display:none`), and every
 //!   read is then 0. It stays observed, but nothing measures, records or
 //!   restores it until it has height again: the ResizeObserver's restore on
-//!   reveal picks up where it was.
+//!   reveal picks up where it was, re-aims a seek the hide cut short, and then
+//!   finishes the settle of a gesture the hide ended (engines send no
+//!   `scrollend` for it), after putting the anchor back.
+//! * **Touch momentum**: a restore that writes `scrollTop` (an anchor
+//!   correction) can cut a touch fling short. Holding follows during a gesture
+//!   avoids the snaps, not the corrections; this is untested on real devices.
 //!
-//! Known limit: the scroll-to-latest button scrolls smoothly, so captures during
-//! its animation read as the reader's, and a message arriving mid-animation
-//! lands one row short until the next change.
+//! **Why this can't latch as #486 did**: the pin comes only from the reader's
+//! own positions. Growing content, a growing composer or a rewrap restore
+//! instead of measuring, so none of them can clear it, and every gesture ends in
+//! a settle that measures again.
 //!
 //! State is `Cell`/`RefCell`, never signals: raw JS callbacks write it.
 

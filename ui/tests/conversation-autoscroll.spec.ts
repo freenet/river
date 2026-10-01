@@ -2155,7 +2155,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     }
 
     // Following six arrivals must not have cost the window its bound: each
-    // follow snap ends at the bottom, and the capture there trims the window
+    // follow snap ends at the bottom, and its echo there trims the window
     // back toward its initial size. Polled because the trim lands
     // asynchronously.
     //
