@@ -494,26 +494,10 @@ export async function gateScrollendGesture(page: Page, plan: GateScrollendPlan):
   }
 }
 
-/// The record as one line, a repeated event or cycle of up to three collapsed:
-/// `(input → scroll → held) ×4 → input → scroll → deliver → ...`.
+/// The record as one line, in order: `input → scroll → held → ... → settle`.
 export function gateScrollendTimeline(run: GateScrollendRun): string {
-  const e = run.events;
-  const same = (a: number, b: number, len: number) => e.slice(a, a + len).join("|") === e.slice(b, b + len).join("|");
-  const out: string[] = [];
-  for (let i = 0; i < e.length; ) {
-    let len = 1;
-    let reps = 1;
-    for (let l = 1; l <= 3; l++) {
-      let r = 1;
-      while (i + (r + 1) * l <= e.length && same(i, i + r * l, l)) r++;
-      if (r > 1 && r * l > len * reps) [len, reps] = [l, r];
-    }
-    const cycle = e.slice(i, i + len).join(" → ");
-    out.push(reps === 1 ? cycle : len === 1 ? `${cycle} ×${reps}` : `(${cycle}) ×${reps}`);
-    i += len * reps;
-  }
   const at = run.distanceAtRelease === null ? "" : ` (released ${run.distanceAtRelease.toFixed(1)}px above the end)`;
-  return `${out.join(" → ")}${at}`;
+  return `${run.events.join(" → ")}${at}`;
 }
 
 /// The order the controlled gesture exists to establish: the reader's input
