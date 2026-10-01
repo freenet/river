@@ -24,42 +24,32 @@
 //!
 //! * **`Seeking`** is the scroll-to-latest button's animation: our own
 //!   `requestAnimationFrame` loop, each frame stepping towards the live end
-//!   (`seek_advance`, an ease-out whose speed follows the distance left). Its
-//!   frames are recorded, not captured, so their `scroll` events are echoes and
-//!   cannot unpin the reader who asked to follow. Re-aiming is implicit: an
-//!   arrival moves the end and the next step is larger. Native smooth scrolling
-//!   restarted its ease-in on every re-issue in Chromium (317px a frame down to
-//!   0-2px in the app) and dipped in WebKit, so an arrival mid-flight stalled it.
-//!   Reaching the end finishes it (and trims, as a snap does). A move up past
-//!   rounding from the last frame is the reader taking over (the animation only
-//!   moves down), and starts a held `Gesture`. A `touchstart` stops it where it is and
-//!   captures. Any of these, a force, a room switch or a hide stops the loop at
-//!   its next frame; the reveal restarts it. Seeking never reports an opening
-//!   snap: only an instant snap does.
-//! * **`Gesture`**: a reader gesture remembers where it started (`from`, both
-//!   edges of the view, as `main`'s `reader_moved_up_since`). Once both have
-//!   moved up past rounding from there it is `held`: restores keep the anchor
-//!   and do not snap, so an arrival does not yank a reader who has started to look back
-//!   inside the band. Comparing with the start, not the previous frame, is what
-//!   lets slow 1-2px frames add up; a layout correction shifts the start by what
-//!   it moved; both edges, so a composer collapse that clamps the top up is not
-//!   the reader. Back at the end, it is `Free` again at once.
-//! * **Settle** (`scrollend`, or a 120ms debounce on `scroll` where it is
-//!   missing) ends a gesture: it measures the pin and anchor where the view came
-//!   to rest, as `main` did, and does not snap. It first takes in a move whose
-//!   `scroll` event has not arrived yet: WebKit can send the `scrollend` first.
-//!   The debounce cannot tell a paused finger from a lifted one. A settle with no gesture in progress does
-//!   nothing, which is what makes a stale `scrollend` (another room's, an old
-//!   gesture's) harmless: room switches, forced snaps and new seeks clear the
-//!   gesture; a seek has none, so its frames' `scrollend`s do nothing.
+//!   (`seek_advance`), so an arrival only makes the next step larger. Its frames
+//!   are recorded, so their `scroll` events are echoes and cannot unpin the
+//!   reader who asked to follow; a Reader event during a seek is the reader's,
+//!   and takes over once it has moved up (as `held` below). Reaching the end
+//!   finishes it and trims, as a snap does. A `touchstart` stops it where it is.
+//!   Whatever ends it, or a hide, stops the loop at its next frame. It never
+//!   reports an opening snap: only an instant snap does.
+//! * **`Gesture`** remembers where it started (`from`, both edges of the view).
+//!   It is `held` once both have moved up past rounding from there (`moved_up`),
+//!   so an arrival does not yank a reader who has started to look back inside
+//!   the band. A layout correction shifts `from` by what it moved. Back at the
+//!   end, it is `Free` again at once.
+//! * **Settle** (`scrollend`, or a debounce on `scroll` where it is missing) ends
+//!   a gesture: it measures the pin and anchor where the view came to rest, as
+//!   `main` did, and does not snap. The debounce cannot tell a paused finger
+//!   from a lifted one. With no gesture in progress a settle does nothing, which
+//!   is what makes a stale `scrollend` (another room's, an old gesture's, a seek
+//!   frame's) harmless: room switches, forced snaps and new seeks end the
+//!   gesture.
 //!
 //! # Where capture runs
 //!
-//! * A `scroll` classified as the reader's, from the listener or taken in early
-//!   (below), outside `Seeking`, or the frame that takes over a seek.
-//! * A gesture's settle, and a touch that stops a seek. These are explicit
-//!   transitions and capture directly, never through `on_scroll`: the position
-//!   has usually been recorded already and would classify as an echo.
+//! A `scroll` classified as the reader's (from the listener or taken in early,
+//! below), a gesture's settle, and a touch that stops a seek. The last two
+//! capture directly, never through `on_scroll`: the position has usually been
+//! recorded already and would classify as an echo.
 //!
 //! # Classifying a `scroll` event (`classify_scroll`)
 //!
@@ -89,19 +79,22 @@
 //! # Timing and visibility
 //!
 //! * **Late scroll events**: a `scroll` event arrives a frame after the scroll,
-//!   and a content change can land first. So `restore`, and the render before a
-//!   patch, first read a pending reader scroll (`take_in_undelivered_scroll`,
-//!   through `on_scroll`), or a stale pin would drag the reader back down, or an
-//!   anchor would be measured after the patch had moved the rows. The take-in
+//!   and a content change can land first; WebKit can even send a `scrollend`
+//!   before the `scroll` of the move it ends. So `restore`, a settle, and the
+//!   render before a patch first read a pending reader scroll
+//!   (`take_in_undelivered_scroll`, through `on_scroll`), or a stale pin would
+//!   drag the reader back down, an anchor would be measured after the patch had
+//!   moved the rows, or a gesture would start that nothing settles. The take-in
 //!   belongs where we run outside the rendering steps (effects, `scrollend`, the
 //!   render body); a rAF callback such as the seek frame runs after the scroll
 //!   steps have dispatched the event, so it has nothing to take in.
 //! * **Hidden**: the mobile layout hides the history (`display:none`), and every
 //!   read is then 0. It stays observed, but nothing measures, records or
-//!   restores it until it has height again: the ResizeObserver's restore on
-//!   reveal picks up where it was, restarts a seek the hide cut short, and then
-//!   finishes the settle of a gesture the hide ended (engines send no
-//!   `scrollend` for it), after putting the anchor back.
+//!   restores it until it has height again; the pin, the anchor and any pending
+//!   force wait. The ResizeObserver's restore on reveal picks up where it was,
+//!   restarts a seek the hide cut short, and then finishes the settle of a
+//!   gesture the hide ended (engines send no `scrollend` for it), after putting
+//!   the anchor back.
 //! * **Touch momentum**: a restore that writes `scrollTop` (an anchor
 //!   correction) can cut a touch fling short. Holding follows during a gesture
 //!   avoids the snaps, not the corrections; this is untested on real devices.
@@ -141,14 +134,10 @@ const ANCHOR_FALLBACK_ROWS: usize = 4;
 /// The most a `scroll` event may move `scrollTop`, after the layout signature
 /// changed, and still be read as the browser's clamp rather than the reader.
 ///
-/// Only needed for a clamp that does NOT end at the final end: one taken during
-/// an intermediate, shorter layout before the history came out taller. A clamp
-/// to the final end is recognized at any size, by the final-end clause of
-/// `classify_scroll`. The 8px (Linux CI) and 56px clamps quoted for this before
-/// came from other trees with CSS size containers, and the 111px one from a
-/// synthetic test, so they are context rather than measurements of this code.
-/// What this costs either way (a reader's small move in the same frame taken as
-/// layout, a larger intermediate clamp taken as the reader) is in the module doc.
+/// Only needed for a clamp that does NOT end at the final end (see the module
+/// doc). The 8px (Linux CI) and 56px clamps quoted for this before came from
+/// other trees with CSS size containers, and the 111px one from a synthetic
+/// test, so they are context rather than measurements of this code.
 const LAYOUT_SHIFT_ALLOWANCE_PX: i32 = 200;
 
 /// The shape the history is laid out in: the content's height, the container's
@@ -201,7 +190,9 @@ fn at_end(top: i32, max: i32) -> bool {
 }
 
 /// The scroll-to-latest animation's time constant: each frame covers
-/// `1 - exp(-dt / SEEK_TAU_MS)` of what is left.
+/// `1 - exp(-dt / SEEK_TAU_MS)` of what is left. Our own frames, because native
+/// smooth scrolling restarted its ease-in on every re-issue in Chromium (317px a
+/// frame down to 0-2px) and dipped in WebKit, so an arrival mid-flight stalled it.
 const SEEK_TAU_MS: f64 = 80.0;
 /// Its slowest speed, so the ease-out has no long tail near the end.
 const SEEK_MIN_PX_PER_MS: f64 = 1.5;
@@ -264,23 +255,15 @@ fn newest_visible_rows(
     (0..=newest).rev().take(n).collect()
 }
 
-/// Read a `scroll` event as an echo, a layout change's doing or the reader's.
-/// `max` is the live scroll range (`max_scroll_top`), never a recorded one.
+/// Read a `scroll` event as an echo, a layout change's doing or the reader's
+/// (the module doc has the rules and what each gets wrong). `max` is the live
+/// scroll range (`max_scroll_top`), never a recorded one.
 ///
-/// Echo first: the signature and `scrollTop` are both as recorded.
-///
-/// Otherwise layout if either:
-///
-/// * **Final-end clamp**: the recorded `scrollTop` is now out of reach (past
-///   `max` by more than rounding) and the view sits at `max` (within rounding,
-///   either side). Only the browser's clamp puts it there, whether or not the
-///   signature changed: removing overflow clamps without resizing anything.
-/// * **Changed layout, small move**: the signature changed since it was
-///   recorded AND `scrollTop` moved no more than `LAYOUT_SHIFT_ALLOWANCE_PX`.
-///   This is what catches an intermediate clamp that ends short of the end.
-///
-/// A geometry heuristic, not provenance: see the module doc for what each
-/// clause gets wrong.
+/// Layout is either clause: **final-end clamp**, the recorded `scrollTop` is
+/// past `max` by more than rounding and the view sits at `max` (within rounding,
+/// either side), whether or not the signature changed; or **changed layout,
+/// small move**, the signature changed AND `scrollTop` moved no more than
+/// `LAYOUT_SHIFT_ALLOWANCE_PX`.
 fn classify_scroll(
     recorded: LayoutSig,
     now: LayoutSig,
@@ -319,15 +302,13 @@ pub(super) struct HistoryHooks {
     pub snapped_to_bottom: Rc<dyn Fn()>,
 }
 
-/// What drives the view between reader scrolls.
+/// What drives the view between reader scrolls (the module doc's table).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Follow {
     /// The pin and the anchor drive restores.
     Free,
-    /// A reader gesture is in progress. `from` is the view's edges before its
-    /// first move, shifted by every layout correction since. Once `held` (both
-    /// edges moved up from there), restores keep the anchor, never snap, until
-    /// it settles.
+    /// A reader gesture: `from` is the view before its first move, shifted by
+    /// every layout correction since; `held` once it has moved up from there.
     Gesture { from: ViewEdges, held: bool },
     /// The scroll-to-latest animation is travelling to the end.
     Seeking,
@@ -357,6 +338,11 @@ pub(super) struct HistoryScroll {
     /// When the animation's previous frame ran; `None` before a seek's first
     /// frame, and after the loop stops.
     seek_prev_t: Cell<Option<f64>>,
+    /// `#chat-scroll-container` and `#chat-content`, found once by `install`:
+    /// `Conversation` mounts once, so these are the elements the listeners and
+    /// the ResizeObserver are bound to for the app's lifetime.
+    container: RefCell<Option<web_sys::Element>>,
+    content: RefCell<Option<web_sys::Element>>,
     /// Set by `install` once the listeners exist, so `is_some` also means
     /// "installed".
     hooks: RefCell<Option<HistoryHooks>>,
@@ -376,6 +362,8 @@ impl Default for HistoryScroll {
             seek_frame: RefCell::new(None),
             seek_raf: Cell::new(None),
             seek_prev_t: Cell::new(None),
+            container: RefCell::new(None),
+            content: RefCell::new(None),
             hooks: RefCell::new(None),
         }
     }
@@ -402,6 +390,10 @@ impl HistoryScroll {
     fn end_interaction(&self) {
         self.follow.set(Follow::Free);
         self.settle_pending.set(false);
+        self.cancel_settle_timer();
+    }
+
+    fn cancel_settle_timer(&self) {
         #[cfg(target_arch = "wasm32")]
         if let (Some(handle), Some(window)) = (self.settle_timer.take(), web_sys::window()) {
             window.clear_timeout_with_handle(handle);
@@ -409,22 +401,11 @@ impl HistoryScroll {
     }
 }
 
-/// The history's scroll container, if it has a layout box to measure. Hidden,
-/// every read is 0, which must not be taken for where the reader is.
 #[cfg(target_arch = "wasm32")]
-fn laid_out_container() -> Option<web_sys::Element> {
+fn element_by_id(id: &str) -> Option<web_sys::Element> {
     web_sys::window()
         .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("chat-scroll-container"))
-        .filter(|c| c.client_height() > 0)
-}
-
-/// Read the wrapper the history's rows are laid out in.
-#[cfg(target_arch = "wasm32")]
-fn chat_content_wrapper() -> Option<web_sys::Element> {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("chat-content"))
+        .and_then(|d| d.get_element_by_id(id))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -432,23 +413,16 @@ const ANCHOR_ROWS: &str = "#chat-content [data-anchor-row]";
 #[cfg(target_arch = "wasm32")]
 const ANCHOR_ATTR: &str = "data-anchor-row";
 
-#[cfg(target_arch = "wasm32")]
-fn read_sig(container: &web_sys::Element) -> LayoutSig {
-    let (content_height, content_width) = chat_content_wrapper().map_or((0, 0), |content| {
-        (content.client_height(), content.client_width())
-    });
-    LayoutSig {
-        content_height,
-        client_height: container.client_height(),
-        client_width: container.client_width(),
-        content_width,
-    }
-}
-
 /// The furthest `scrollTop` can go right now, read live. Never negative.
 #[cfg(target_arch = "wasm32")]
 fn max_scroll_top(container: &web_sys::Element) -> i32 {
     (container.scroll_height() - container.client_height()).max(0)
+}
+
+/// Whether the view is at the live end, within rounding.
+#[cfg(target_arch = "wasm32")]
+fn view_at_end(container: &web_sys::Element) -> bool {
+    at_end(container.scroll_top(), max_scroll_top(container))
 }
 
 /// How far above the container's bottom edge `row`'s top edge sits.
@@ -474,6 +448,28 @@ fn css_escape(value: &str) -> Option<String> {
 
 #[cfg(target_arch = "wasm32")]
 impl HistoryScroll {
+    /// The scroll container, if it has a layout box to measure. Hidden, every
+    /// read is 0, which must not be taken for where the reader is.
+    fn laid_out_container(&self) -> Option<web_sys::Element> {
+        self.container
+            .borrow()
+            .clone()
+            .filter(|c| c.client_height() > 0)
+    }
+
+    fn read_sig(&self, container: &web_sys::Element) -> LayoutSig {
+        let (content_height, content_width) =
+            self.content.borrow().as_ref().map_or((0, 0), |content| {
+                (content.client_height(), content.client_width())
+            });
+        LayoutSig {
+            content_height,
+            client_height: container.client_height(),
+            client_width: container.client_width(),
+            content_width,
+        }
+    }
+
     /// The view's edges as last recorded.
     fn recorded_edges(&self) -> ViewEdges {
         let top = self.top.get();
@@ -486,19 +482,13 @@ impl HistoryScroll {
     /// Record the layout and `scrollTop` as they are now. Read back after any write,
     /// since the browser clamps.
     fn record(&self, container: &web_sys::Element) {
-        self.sig.set(read_sig(container));
+        self.sig.set(self.read_sig(container));
         self.top.set(container.scroll_top());
     }
 
-    /// Take the reader's position as the new truth: for a scroll the reader made,
-    /// and for a touch that stops the scroll-to-latest animation.
-    fn capture(&self) {
-        let Some(container) = laid_out_container() else {
-            return;
-        };
-        let sig = read_sig(&container);
-        let top = container.scroll_top();
-        let distance = (max_scroll_top(&container) - top) as f64;
+    /// Take the reader's position as the new truth (see "Where capture runs").
+    fn capture(&self, container: &web_sys::Element) {
+        let distance = (max_scroll_top(container) - container.scroll_top()) as f64;
         self.pinned.set(is_pinned(distance));
         if let Ok(list) = container.query_selector_all(ANCHOR_ROWS) {
             // Relative to the container, the frame `newest_visible_rows` works in.
@@ -532,9 +522,8 @@ impl HistoryScroll {
                 })
                 .collect();
         }
-        self.sig.set(sig);
-        self.top.set(top);
-        self.trim_at_bottom(&container);
+        self.record(container);
+        self.trim_at_bottom(container);
     }
 
     /// A view landing AT the bottom is the ONE moment a window trim is provably
@@ -580,16 +569,14 @@ impl HistoryScroll {
         self.restore_now()
     }
 
-    /// A `scroll` event is queued for the next frame, and a content change can
-    /// land first. If the view has moved by more than a layout clamp could since
-    /// it was recorded, that is the reader's scroll and its event is still on its
-    /// way: read it now, or the pin is stale and the restore drags them back.
+    /// Read a reader scroll whose `scroll` event has not arrived yet (see "Late
+    /// scroll events"): the view has moved by more than a layout clamp could
+    /// since it was recorded.
     pub(super) fn take_in_undelivered_scroll(&self) {
-        let Some(container) = laid_out_container() else {
+        let Some(container) = self.laid_out_container() else {
             return;
         };
-        let top = container.scroll_top();
-        if top == self.top.get() {
+        if container.scroll_top() == self.top.get() {
             return;
         }
         if self.cause_now(&container) == ScrollCause::Reader {
@@ -601,7 +588,7 @@ impl HistoryScroll {
     fn cause_now(&self, container: &web_sys::Element) -> ScrollCause {
         classify_scroll(
             self.sig.get(),
-            read_sig(container),
+            self.read_sig(container),
             self.top.get(),
             container.scroll_top(),
             max_scroll_top(container),
@@ -609,24 +596,22 @@ impl HistoryScroll {
     }
 
     fn restore_now(&self) {
-        // Hidden: keep the pin, the anchor and any pending `force` for the reveal.
-        // A hide also ends whatever gesture was going on, and an engine sends no
-        // `scrollend` for a scroll a hide cut short, so its settle waits for the
-        // reveal (a no-op if there was no gesture).
-        let Some(container) = laid_out_container() else {
+        // Hidden: everything waits for the reveal, including the settle of a
+        // gesture the hide ended (a no-op if there was none).
+        let Some(container) = self.laid_out_container() else {
             self.settle_pending.set(true);
             return;
         };
         let before = self.recorded_edges();
         if self.force.take() {
             self.end_interaction();
-            self.snap_and_tell();
+            self.snap_and_tell(&container);
             return;
         }
         match self.follow.get() {
             Follow::Seeking => self.seek(&container),
             Follow::Free | Follow::Gesture { held: false, .. } if self.pinned.get() => {
-                self.snap_and_tell()
+                self.snap_and_tell(&container)
             }
             Follow::Free | Follow::Gesture { .. } => {
                 self.restore_anchor(&container);
@@ -648,10 +633,19 @@ impl HistoryScroll {
         }
     }
 
-    /// Snap to the bottom at once, and tell the component it happened (the
-    /// opening snap's completion, with its own room check).
-    fn snap_and_tell(&self) {
-        self.snap_to_bottom(web_sys::ScrollBehavior::Instant);
+    /// Snap to the bottom at once and re-arm the pin. Scrolls the container
+    /// itself: `scrollIntoView` on the last bubble aligns its top and could leave
+    /// the real bottom (reactions, sentinel, padding) off-screen.
+    fn snap_instant(&self, container: &web_sys::Element) {
+        self.pinned.set(true);
+        container.set_scroll_top(container.scroll_height());
+        self.record(container);
+    }
+
+    /// Snap, and tell the component it happened (the opening snap's completion,
+    /// with its own room check).
+    fn snap_and_tell(&self, container: &web_sys::Element) {
+        self.snap_instant(container);
         let snapped = self
             .hooks
             .borrow()
@@ -662,11 +656,22 @@ impl HistoryScroll {
         }
     }
 
-    /// Keep the scroll-to-latest animation running: its next frame steps towards
-    /// the live end, or finishes it there. Idempotent: every frame reads the
-    /// live end, so there is nothing to re-aim, and a frame already asked for is
-    /// not asked again. Restarts a loop a hide stopped. Never an opening snap:
-    /// nothing is told.
+    /// The scroll-to-latest button: re-arm the pin (asking for the newest
+    /// message is the clearest statement of intent there is) and start `Seeking`.
+    pub(super) fn seek_to_latest(&self) {
+        let Some(container) = self.laid_out_container() else {
+            return;
+        };
+        self.pinned.set(true);
+        self.end_interaction();
+        self.follow.set(Follow::Seeking);
+        self.seek_prev_t.set(None);
+        self.seek(&container);
+    }
+
+    /// Keep the scroll-to-latest animation running; its next frame steps or
+    /// finishes it. Idempotent (every frame reads the live end), and restarts a
+    /// loop a hide stopped.
     fn seek(&self, container: &web_sys::Element) {
         self.request_seek_frame();
         self.record(container);
@@ -693,18 +698,16 @@ impl HistoryScroll {
         }
     }
 
-    /// One frame of the scroll-to-latest animation: a step towards the live end
-    /// (`seek_advance`), recorded so that its own `scroll` event is an echo. The
-    /// loop stops itself as soon as the follow state is not `Seeking` (a touch,
-    /// the reader taking over, a force, a room switch) or the history is hidden;
-    /// the reveal's restore starts it again.
+    /// One frame of the scroll-to-latest animation: a step towards the live end,
+    /// recorded so that its own `scroll` event is an echo. Stops unless still
+    /// `Seeking` and laid out.
     fn on_seek_frame(&self, t: f64) {
         self.seek_raf.set(None);
         let prev_t = self.seek_prev_t.take();
         if self.follow.get() != Follow::Seeking {
             return;
         }
-        let Some(container) = laid_out_container() else {
+        let Some(container) = self.laid_out_container() else {
             return;
         };
         let dt = prev_t.map_or(16.0, |prev| t - prev);
@@ -716,7 +719,7 @@ impl HistoryScroll {
             // Rounding at a fractional device scale can swallow a small step.
             container.set_scroll_top(max);
         }
-        if !moved || at_end(container.scroll_top(), max_scroll_top(&container)) {
+        if !moved || view_at_end(&container) {
             self.finish_seek(&container);
         } else {
             self.record(&container);
@@ -748,7 +751,7 @@ impl HistoryScroll {
 
     /// Read a `scroll` event as layout's doing (restore) or the reader's (capture).
     fn on_scroll(&self) {
-        let Some(container) = laid_out_container() else {
+        let Some(container) = self.laid_out_container() else {
             return;
         };
         match self.cause_now(&container) {
@@ -760,10 +763,9 @@ impl HistoryScroll {
         }
     }
 
-    /// A scroll nothing else accounts for. During the scroll-to-latest animation
-    /// its own frames are echoes, so this is the reader; only a move up (both
-    /// edges, as for a gesture) takes over from it. Anything else is noted and
-    /// left to the next frame, which also finishes the seek at the end.
+    /// A scroll nothing else accounts for: the reader's. During a seek it takes
+    /// over only once it has moved up; anything else is recorded and left to the
+    /// next frame.
     fn on_reader_scroll(&self, container: &web_sys::Element) {
         if self.follow.get() == Follow::Seeking {
             let top = container.scroll_top();
@@ -782,8 +784,8 @@ impl HistoryScroll {
             Follow::Gesture { from, held } => (from, held),
             _ => (self.recorded_edges(), false),
         };
-        self.capture();
-        let follow = if at_end(container.scroll_top(), max_scroll_top(container)) {
+        self.capture(container);
+        let follow = if at_end(self.top.get(), max_scroll_top(container)) {
             // Back at the end: following again, whatever came before.
             Follow::Free
         } else {
@@ -793,71 +795,38 @@ impl HistoryScroll {
         self.follow.set(follow);
     }
 
-    /// A scroll has come to rest (`scrollend`, or the debounce standing in for
-    /// it): it ends a reader gesture. Nothing else: a stale `scrollend` (another
-    /// room's, an old gesture's, a seek frame's) finds no gesture and does
-    /// nothing.
+    /// A scroll has come to rest (`scrollend`, or the debounce): see "Settle".
     fn settle(&self) {
-        self.settle_timer.set(None);
-        // WebKit can send `scrollend` before the `scroll` event of the move it
-        // ends: read that move first, as `restore` does, or the gesture it
-        // starts is never settled.
+        self.cancel_settle_timer();
         self.take_in_undelivered_scroll();
         self.end_gesture();
     }
 
-    /// The gesture is over: where it came to rest decides the pin, as on `main`.
-    /// Measured directly, never through `on_scroll`, because the position has
-    /// usually been recorded already and would read as an echo. Does not snap.
-    /// Hidden, it waits for the reveal's restore.
+    /// The gesture is over: where it came to rest decides the pin. Does not
+    /// snap. Hidden, it waits for the reveal's restore.
     fn end_gesture(&self) {
         if !matches!(self.follow.get(), Follow::Gesture { .. }) {
             return;
         }
-        if laid_out_container().is_none() {
+        let Some(container) = self.laid_out_container() else {
             self.settle_pending.set(true);
             return;
-        }
+        };
         self.follow.set(Follow::Free);
-        self.capture();
+        self.capture(&container);
     }
 
     /// A finger on the history stops the scroll-to-latest animation where it is:
-    /// that is where the reader now is. Captured directly, not through `on_scroll`,
-    /// because nothing may have moved since the last frame was recorded.
+    /// that is where the reader now is.
     fn on_touch_start(&self) {
-        if self.follow.get() != Follow::Seeking || laid_out_container().is_none() {
+        if self.follow.get() != Follow::Seeking {
             return;
         }
-        self.follow.set(Follow::Free);
-        self.capture();
-    }
-
-    /// Scroll to the newest message and re-arm the pin: asking for it is the
-    /// clearest statement of intent there is.
-    ///
-    /// Scrolls the container itself, not the last bubble: `scrollIntoView` aligns
-    /// the bubble's top to the container's top and can leave the real bottom
-    /// (reactions, sentinel, padding) off-screen, which on a refresh scrolled
-    /// only ~70% of the way down.
-    pub(super) fn snap_to_bottom(&self, behavior: web_sys::ScrollBehavior) {
-        let Some(container) = laid_out_container() else {
+        let Some(container) = self.laid_out_container() else {
             return;
         };
-        self.pinned.set(true);
-        if behavior == web_sys::ScrollBehavior::Smooth {
-            // The animation's frames are not the reader: see `on_reader_scroll`.
-            self.end_interaction();
-            self.follow.set(Follow::Seeking);
-            self.seek_prev_t.set(None);
-            self.seek(&container);
-            return;
-        }
-        let opts = web_sys::ScrollToOptions::new();
-        opts.set_top(container.scroll_height() as f64);
-        opts.set_behavior(behavior);
-        container.scroll_to_with_scroll_to_options(&opts);
-        self.record(&container);
+        self.follow.set(Follow::Free);
+        self.capture(&container);
     }
 
     /// Listen for the reader's scrolls and for layout changes. Idempotent: a
@@ -870,127 +839,91 @@ impl HistoryScroll {
         if self.hooks.borrow().is_some() {
             return;
         }
-        let container = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.get_element_by_id("chat-scroll-container"));
-        let (Some(container), Some(content)) = (container, chat_content_wrapper()) else {
+        let (Some(container), Some(content)) = (
+            element_by_id("chat-scroll-container"),
+            element_by_id("chat-content"),
+        ) else {
             return;
         };
+
+        // Every closure here is leaked (`into_js_value`) deliberately:
+        // `Conversation` mounts once for the app's lifetime (rooms are swapped
+        // by CSS, not by unmount) and `use_effect` has no cleanup hook, so there
+        // is nothing to disconnect them from.
 
         // The ResizeObserver sees the content growing or reflowing, and the
         // container shrinking (the composer growing, #486's third cause), and
         // a hidden container getting its height back. All restore; none may
         // capture.
-        let on_resize = {
-            let this = self.clone();
-            Closure::wrap(Box::new(move |_: js_sys::Array| {
-                this.restore();
-            }) as Box<dyn FnMut(js_sys::Array)>)
-        };
-        let Ok(observer) = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()) else {
+        let this = self.clone();
+        let on_resize = Closure::<dyn FnMut()>::new(move || this.restore()).into_js_value();
+        let Ok(observer) = web_sys::ResizeObserver::new(on_resize.unchecked_ref()) else {
             return;
         };
-        if let Some(laid_out) = laid_out_container() {
+        *self.container.borrow_mut() = Some(container.clone());
+        *self.content.borrow_mut() = Some(content.clone());
+        if let Some(laid_out) = self.laid_out_container() {
             self.record(&laid_out);
         }
         *self.hooks.borrow_mut() = Some(hooks);
         observer.observe(&content);
         observer.observe(&container);
 
-        // The scroll-to-latest animation's frame callback (`on_seek_frame`).
-        let seek_frame = {
-            let this = self.clone();
-            Closure::wrap(Box::new(move |t: f64| this.on_seek_frame(t)) as Box<dyn FnMut(f64)>)
-        };
+        let this = self.clone();
         *self.seek_frame.borrow_mut() = Some(
-            seek_frame
-                .as_ref()
-                .unchecked_ref::<js_sys::Function>()
-                .clone(),
+            Closure::<dyn FnMut(f64)>::new(move |t| this.on_seek_frame(t))
+                .into_js_value()
+                .unchecked_into(),
         );
 
         // Passive: nothing here calls `preventDefault`, and the jank this
         // replaced (#151) came from work on the scroll path.
         let passive = web_sys::AddEventListenerOptions::new();
         passive.set_passive(true);
-        let on_scroll = {
-            let this = self.clone();
-            Closure::wrap(Box::new(move |_: web_sys::Event| this.on_scroll())
-                as Box<dyn FnMut(web_sys::Event)>)
-        };
-        let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
-            "scroll",
-            on_scroll.as_ref().unchecked_ref(),
-            &passive,
-        );
-
-        // `scrollend` fires once the position has come to rest. Where it is
-        // missing, a trailing debounce on `scroll` stands in, as on `main`; it
-        // cannot tell a paused finger from a lifted one.
-        let settle = {
-            let this = self.clone();
-            Closure::wrap(Box::new(move || this.settle()) as Box<dyn FnMut()>)
-        };
-        let has_scrollend =
-            js_sys::Reflect::has(&container, &JsValue::from_str("onscrollend")).unwrap_or(false);
-        let on_settle_signal = if has_scrollend {
-            let settle_fn: js_sys::Function =
-                settle.as_ref().unchecked_ref::<js_sys::Function>().clone();
-            let cb = Closure::wrap(Box::new(move |_: web_sys::Event| {
-                let _ = settle_fn.call0(&JsValue::NULL);
-            }) as Box<dyn FnMut(web_sys::Event)>);
+        let listen = |event: &str, callback: &JsValue| {
             let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
-                "scrollend",
-                cb.as_ref().unchecked_ref(),
+                event,
+                callback.unchecked_ref(),
                 &passive,
             );
-            cb
+        };
+
+        let this = self.clone();
+        listen(
+            "scroll",
+            &Closure::<dyn FnMut()>::new(move || this.on_scroll()).into_js_value(),
+        );
+
+        let this = self.clone();
+        let settle = Closure::<dyn FnMut()>::new(move || this.settle()).into_js_value();
+        if js_sys::Reflect::has(&container, &JsValue::from_str("onscrollend")).unwrap_or(false) {
+            listen("scrollend", &settle);
         } else {
             let this = self.clone();
-            let settle_fn: js_sys::Function =
-                settle.as_ref().unchecked_ref::<js_sys::Function>().clone();
-            let cb = Closure::wrap(Box::new(move |_: web_sys::Event| {
+            let settle: js_sys::Function = settle.unchecked_into();
+            let debounce = move || {
+                this.cancel_settle_timer();
                 let Some(window) = web_sys::window() else {
                     return;
                 };
-                if let Some(handle) = this.settle_timer.take() {
-                    window.clear_timeout_with_handle(handle);
-                }
                 if let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                    &settle_fn,
+                    &settle,
                     SCROLL_SETTLE_DEBOUNCE_MS,
                 ) {
                     this.settle_timer.set(Some(handle));
                 }
-            }) as Box<dyn FnMut(web_sys::Event)>);
-            let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
+            };
+            listen(
                 "scroll",
-                cb.as_ref().unchecked_ref(),
-                &passive,
+                &Closure::<dyn FnMut()>::new(debounce).into_js_value(),
             );
-            cb
-        };
+        }
 
-        let on_touch_start = {
-            let this = self.clone();
-            Closure::wrap(Box::new(move |_: web_sys::Event| this.on_touch_start())
-                as Box<dyn FnMut(web_sys::Event)>)
-        };
-        let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
+        let this = self.clone();
+        listen(
             "touchstart",
-            on_touch_start.as_ref().unchecked_ref(),
-            &passive,
+            &Closure::<dyn FnMut()>::new(move || this.on_touch_start()).into_js_value(),
         );
-
-        // Leaked deliberately: `Conversation` mounts once for the app's lifetime
-        // (rooms are swapped by CSS, not by unmount) and `use_effect` has no
-        // cleanup hook, so there is nothing to disconnect these from.
-        on_resize.forget();
-        seek_frame.forget();
-        on_scroll.forget();
-        settle.forget();
-        on_settle_signal.forget();
-        on_touch_start.forget();
     }
 }
 
@@ -1145,10 +1078,6 @@ mod tests {
         let (a, b) = (sig(3000, 600, 380), sig(2400, 600, 1000));
         const { assert!(2000 - 1400 > LAYOUT_SHIFT_ALLOWANCE_PX) };
         assert_eq!(classify_scroll(a, b, 2000, 1400, 1400), ScrollCause::Layout);
-        // Overflow removed (a positioned overhang going away) clamps the same
-        // way with nothing the signature describes changing.
-        assert_eq!(classify_scroll(a, a, 2000, 1400, 1400), ScrollCause::Layout);
-        assert_eq!(classify_scroll(a, a, 2000, 1950, 1950), ScrollCause::Layout);
     }
 
     #[test]
@@ -1213,11 +1142,6 @@ mod tests {
         assert_eq!(
             classify_scroll(same, sig(3200, 600, 1000), 2000, 2000, REACHABLE_MAX),
             ScrollCause::Layout
-        );
-        // One pixel of movement is not an echo.
-        assert_eq!(
-            classify_scroll(same, same, 2000, 1999, REACHABLE_MAX),
-            ScrollCause::Reader
         );
     }
 

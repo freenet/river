@@ -3438,7 +3438,7 @@ pub fn Conversation() -> Element {
                         onclick: move |_| {
                             // Asking for the newest message is the clearest
                             // possible statement of intent, so this re-arms the
-                            // pin (inside `snap_to_bottom`) even though the
+                            // pin (inside `seek_to_latest`) even though the
                             // button itself renders off the IntersectionObserver.
                             // The smooth scroll is a seek: its frames are not
                             // read as the reader, and each one steps towards the
@@ -3448,7 +3448,7 @@ pub fn Conversation() -> Element {
                             {
                                 let history = history.clone();
                                 crate::util::safe_spawn_local(async move {
-                                    history.snap_to_bottom(web_sys::ScrollBehavior::Smooth);
+                                    history.seek_to_latest();
                                 });
                             }
                         },
