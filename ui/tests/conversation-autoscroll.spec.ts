@@ -940,6 +940,87 @@ test.describe("The reader's place survives removed and late content (#507)", () 
   });
 });
 
+// freenet/river#723: the reader scrolls back down to the newest message, and an
+// arrival lands BEFORE that scroll's event is delivered. If the arrival's
+// restore went on the stale "parked" state it would hold the view where the
+// reader just left, and their scroll to the end would be lost.
+test.describe("An arrival ahead of the reader's scroll event (#723)", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("a reader who scrolled to the end follows a tall arrival that beat their scroll event", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await readerScrollsWithoutGesture(page, 0);
+    await afterLayoutSettles(page);
+    expect(
+      await distanceFromBottom(page),
+      "premise: the reader is parked well above the end",
+    ).toBeGreaterThan(4 * BOTTOM_THRESHOLD_PX);
+
+    const tall = `tall arrival ahead of the scroll event\n${Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n")}`;
+    // One sequence, in a frame callback: the scroll's event is then due in the
+    // NEXT frame, while the hook's delivery runs on a timer before it.
+    const race = await page.evaluate(
+      (text) =>
+        new Promise<{ order: string[]; arrivalHeight: number }>((resolve) => {
+          const c = document.getElementById("chat-scroll-container")!;
+          const history = document.querySelector('[data-testid="conversation-history"]')!;
+          const order: string[] = [];
+          let arrivalHeight = 0;
+          const marker = "tall arrival ahead of the scroll event";
+          const patched = new MutationObserver(() => {
+            const row = Array.from(history.querySelectorAll<HTMLElement>('[id^="msg-"]')).find((r) =>
+              r.textContent?.includes(marker),
+            );
+            if (row && !order.includes("patch")) {
+              order.push("patch");
+              arrivalHeight = row.getBoundingClientRect().height;
+            }
+            done();
+          });
+          const onScroll = () => {
+            if (!order.includes("scroll")) order.push("scroll");
+            done();
+          };
+          const timer = setTimeout(() => finish(), 3_000);
+          function done() {
+            if (order.length === 2) finish();
+          }
+          function finish() {
+            clearTimeout(timer);
+            patched.disconnect();
+            c.removeEventListener("scroll", onScroll);
+            resolve({ order, arrivalHeight });
+          }
+          patched.observe(history, { childList: true, subtree: true });
+          c.addEventListener("scroll", onScroll);
+          requestAnimationFrame(() => {
+            c.scrollTop = c.scrollHeight;
+            (window as any).__riverTest.appendMessage(text);
+          });
+        }),
+      tall,
+    );
+    expect(
+      race.order,
+      `premise: the arrival's patch must land before the scroll event (observed: ${race.order.join(" → ") || "nothing"})`,
+    ).toEqual(["patch", "scroll"]);
+    expect(
+      race.arrivalHeight,
+      "premise: the arrival is taller than the follow band",
+    ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    await expectSettledAtBottom(
+      page,
+      `the reader scrolled to the end and the arrival ahead of their scroll event was not followed (order: ${race.order.join(" → ")})`,
+    );
+    await deliver(page, "arrival after the race");
+    await expectSettledAtBottom(page, "the follow did not survive the race");
+  });
+});
+
 // Regression tests for freenet/river#501: the #498 windowed tail slid its
 // start index forward on every arrival, removing the oldest rendered rows in
 // the same patch that appended the new message. Browser scroll anchoring
