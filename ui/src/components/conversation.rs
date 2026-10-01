@@ -3328,7 +3328,7 @@ pub fn Conversation() -> Element {
                                                         div {
                                                             key: "{key}",
                                                             "data-anchor-row": "{key}",
-                                                            class: "flex justify-center py-2",
+                                                            class: "anchor-row flex justify-center py-2",
                                                             span {
                                                                 class: "text-xs font-medium text-text-muted bg-surface px-3 py-1 rounded-full",
                                                                 "{label}"
@@ -3344,7 +3344,7 @@ pub fn Conversation() -> Element {
                                                                 // Test hook: the autoscroll spec locates rows by it.
                                                                 "data-item-key": "{key}",
                                                                 "data-anchor-row": "{key}",
-                                                                class: "flex justify-center py-1",
+                                                                class: "anchor-row flex justify-center py-1",
                                                                 span {
                                                                     class: "text-xs text-text-muted italic",
                                                                     "{text}"
@@ -4006,7 +4006,7 @@ fn MessageGroupComponent(
                                 key: "{msg.id}",
                                 id: "msg-{msg.id}",
                                 "data-anchor-row": "{msg.id}",
-                                class: "flex flex-col group min-w-0 max-w-full",
+                                class: "anchor-row flex flex-col group min-w-0 max-w-full",
                                 // Container for message bubble + hover actions
                                 div {
                                     class: "relative",

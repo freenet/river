@@ -54,11 +54,13 @@ pub fn install_test_hooks() {
     let hooks = js_sys::Object::new();
 
     expose(&hooks, "appendMessage", move |text: String| {
-        crate::util::defer(move || deliver([(text, Delivery::Append)]));
+        crate::util::defer(move || deliver([(RoomMessageBody::public(text), Delivery::Append)]));
     });
 
     expose(&hooks, "insertMessageBeforeLast", move |text: String| {
-        crate::util::defer(move || deliver([(text, Delivery::BeforeLast)]));
+        crate::util::defer(move || {
+            deliver([(RoomMessageBody::public(text), Delivery::BeforeLast)])
+        });
     });
 
     // A burst in ONE state mutation — one delta application, one re-render —
@@ -67,8 +69,19 @@ pub fn install_test_hooks() {
     // paying per-delivery render round-trips (#505 blocker 2).
     expose(&hooks, "appendMessages", move |count: u32| {
         crate::util::defer(move || {
-            deliver((0..count).map(|i| (format!("batched arrival {i:02}"), Delivery::Append)))
+            deliver((0..count).map(|i| {
+                (
+                    RoomMessageBody::public(format!("batched arrival {i:02}")),
+                    Delivery::Append,
+                )
+            }))
         });
+    });
+
+    // A join event at the end, which renders as an event-summary row: no
+    // example room seeds one, and the anchor-row spec needs every row kind.
+    expose(&hooks, "appendJoinEvent", move |_: JsValue| {
+        crate::util::defer(move || deliver([(RoomMessageBody::join_event(), Delivery::Append)]));
     });
 
     // Drive the no-room screen's load states (freenet/river#509), which the
@@ -208,13 +221,13 @@ fn test_author(delivery: Delivery) -> (SigningKey, &'static str) {
     }
 }
 
-/// Insert `text` into `room` where `delivery` says, as that delivery's test
+/// Insert `content` into `room` where `delivery` says, as that delivery's test
 /// identity, registering the identity's nickname the first time it speaks so
 /// the bubble renders like any other member's rather than as "Unknown".
 fn push_test_message(
     room: &mut RoomData,
     room_key: &VerifyingKey,
-    text: String,
+    content: RoomMessageBody,
     delivery: Delivery,
 ) {
     let (sk, nickname) = test_author(delivery);
@@ -244,7 +257,7 @@ fn push_test_message(
         MessageV1 {
             room_owner: MemberId::from(room_key),
             author,
-            content: RoomMessageBody::public(text),
+            content,
             time: crate::util::get_current_system_time(),
         },
         &sk,
@@ -278,10 +291,10 @@ fn prune_to_cap(room: &mut RoomData) {
 
 /// Deliver every message to the current room in ONE `ROOMS` mutation, so one
 /// re-render, as a network delta does.
-fn deliver(messages: impl IntoIterator<Item = (String, Delivery)>) {
+fn deliver(messages: impl IntoIterator<Item = (RoomMessageBody, Delivery)>) {
     with_current_room(|room, room_key| {
-        for (text, delivery) in messages {
-            push_test_message(room, room_key, text, delivery);
+        for (content, delivery) in messages {
+            push_test_message(room, room_key, content, delivery);
         }
         prune_to_cap(room);
     });

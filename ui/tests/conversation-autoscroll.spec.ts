@@ -988,6 +988,49 @@ async function offsetDrift(page: Page, top: number): Promise<number> {
   return Math.abs((await scrollTop(page)) - top);
 }
 
+// `capture` reads the rows through a live `anchor-row` class collection, while
+// restore and these specs find them by `data-anchor-row`. A row with one and not
+// the other would be skipped by capture or unfindable by restore.
+test.describe("Anchor rows", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("the anchor-row class and data-anchor-row mark the same rows in the same order", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    // No example room seeds a join event, so add one between two messages.
+    await deliver(page, "before the join event");
+    await callRiverTest(page, "appendJoinEvent");
+    await expect(page.locator("#chat-content [data-anchor-row][data-item-key]")).not.toHaveCount(0, {
+      timeout: 5_000,
+    });
+    await deliver(page, "after the join event");
+
+    const { byAttr, byClass } = await page.evaluate(() => {
+      const kind = (row: Element) =>
+        row.id.startsWith("msg-")
+          ? "message"
+          : row.hasAttribute("data-item-key")
+            ? "event"
+            : "separator";
+      const read = (selector: string) =>
+        Array.from(document.querySelectorAll(selector)).map((row) => ({
+          key: row.getAttribute("data-anchor-row"),
+          kind: kind(row),
+        }));
+      return {
+        byAttr: read("#chat-content [data-anchor-row]"),
+        byClass: read("#chat-content .anchor-row"),
+      };
+    });
+    expect(
+      new Set(byAttr.map((row) => row.kind)),
+      "premise: the room shows a date separator, an event summary and messages",
+    ).toEqual(new Set(["separator", "event", "message"]));
+    expect(byClass, "the anchor-row class and data-anchor-row disagree").toEqual(byAttr);
+  });
+});
+
 // Content that changes ABOVE or AT the reader without them scrolling: a
 // moderator deleting messages, several messages dropped in one update, an image
 // that finishes loading late. With `overflow-anchor: none`, nothing but the

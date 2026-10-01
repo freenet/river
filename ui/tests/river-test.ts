@@ -7,6 +7,8 @@ export type RiverTestHooks = {
   appendMessage(text: string): void;
   insertMessageBeforeLast(text: string): void;
   appendMessages(count: number): void;
+  /// Appends a join event, which renders as an event-summary row.
+  appendJoinEvent(): void;
   setRoomsLoadState(state: RoomsLoadState): void;
   switchRoom(name: string): void;
   /// Removes the messages whose rows have these DOM ids (`msg-...`) in one
