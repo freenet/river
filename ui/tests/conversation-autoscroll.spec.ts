@@ -1,6 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { waitForApp, selectRoom } from "./example-room";
+import { waitForApp, selectRoom, selectListedRoom } from "./example-room";
 
 // Regression tests for freenet/river#486: new messages arrived and the view
 // did not follow them.
@@ -204,6 +204,33 @@ function newestVisibleMessage(page: Page): Promise<{ id: string; gap: number } |
     }
     return found;
   });
+}
+
+/// The message `newestVisibleMessage` returned is the newest visible one again,
+/// at the same gap.
+async function expectSameMessageInPlace(
+  page: Page,
+  before: { id: string; gap: number },
+  why: string,
+) {
+  await expect
+    .poll(
+      async () => {
+        const now = await newestVisibleMessage(page);
+        // Infinity: a different message is now the newest visible one.
+        return now && now.id === before.id ? Math.abs(now.gap - before.gap) : Infinity;
+      },
+      { timeout: 5_000, message: why },
+    )
+    .toBeLessThanOrEqual(2);
+}
+
+/// The fixture variant with rooms deeper than the render window.
+const DEEP_ROOM_PATH = "/?deep-history-room=1";
+
+/// Rendered history rows. A windowed tail is ~60 items plus a separator or two.
+function renderedRowCount(page: Page): Promise<number> {
+  return page.locator(HISTORY_ROWS).count();
 }
 
 /// Add enough history to have somewhere to scroll back through.
@@ -578,23 +605,6 @@ test.describe("The newest visible message stays in view", () => {
     return before!;
   }
 
-  async function expectSameMessageInPlace(
-    page: Page,
-    before: { id: string; gap: number },
-    why: string,
-  ) {
-    await expect
-      .poll(
-        async () => {
-          const now = await newestVisibleMessage(page);
-          // Infinity: a different message is now the newest visible one.
-          return now && now.id === before.id ? Math.abs(now.gap - before.gap) : Infinity;
-        },
-        { timeout: 5_000, message: why },
-      )
-      .toBeLessThanOrEqual(2);
-  }
-
   test("the same message is still in place after resizing there and back", async ({ page }) => {
     const before = await parkMidHistory(page);
     await page.setViewportSize({ width: 380, height: 900 });
@@ -681,13 +691,6 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   /// Seeded exactly at its max_recent_messages cap: every delivered arrival
   /// drains the oldest message, shifting every item index (#505 blocker 1).
   const CAPPED_ROOM = "Capped History Room";
-  const DEEP_ROOM_PATH = "/?deep-history-room=1";
-
-  /// A windowed tail is ~60 items + a separator or two; the whole fixture is
-  /// ~92 items.
-  function renderedRowCount(page: Page): Promise<number> {
-    return page.locator(HISTORY_ROWS).count();
-  }
 
   /// The premise all three tests stand on: the windowed render path is
   /// actually active. Without this, a fixture or window-size change could
@@ -1080,4 +1083,138 @@ test.describe("Windowed history follows arrivals (#501)", () => {
       "the room should still be at its newest message after settling"
     );
   });
+});
+
+// On mobile the chat column is `display:none` while the room list or the member
+// list is open. Every geometry read is then 0, and none of it is where the
+// reader is. The browser keeps `scrollTop` across the hide, so a plain round
+// trip comes back in place on its own; these change something while hidden.
+test.describe("The hidden mobile chat column", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  const chat = (page: Page) => page.locator("#chat-scroll-container");
+
+  /// Open another mobile panel and wait out the hide's own observer pass.
+  async function hideChat(page: Page, opener: "hamburger-rooms-button" | "header-members-button") {
+    await page.getByTestId(opener).filter({ visible: true }).click();
+    await expect(chat(page)).toBeHidden({ timeout: 5_000 });
+    await expect
+      .poll(() => viewportHeight(page), { message: "premise: the hidden chat has no height" })
+      .toBe(0);
+    await afterLayoutSettles(page);
+  }
+
+  test("a parked reader keeps their message when rows above it change while hidden", async ({
+    page,
+  }) => {
+    // At its cap, so every arrival drains the oldest message above the reader.
+    await openRoomAtBottom(page, "Capped History Room", DEEP_ROOM_PATH);
+    await readerScrollsTo(page, (await historyHeight(page)) - (await viewportHeight(page)) - 400);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    await afterLayoutSettles(page);
+    const before = await newestVisibleMessage(page);
+    expect(before, "premise: a message should be visible").not.toBeNull();
+
+    await hideChat(page, "header-members-button");
+    const beforeBatch = await renderedRowCount(page);
+    await callRiverTest(page, "appendMessages", 61);
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message: "premise: the batch should land while the chat is hidden",
+      })
+      .toBeGreaterThan(beforeBatch + 30);
+    await afterLayoutSettles(page);
+
+    await page.getByTestId("members-back-button").click();
+    await expect(chat(page)).toBeVisible();
+    await afterLayoutSettles(page);
+    await expectSameMessageInPlace(
+      page,
+      before!,
+      "the reader came back to a different place after the rows above them changed",
+    );
+  });
+
+  test("a following reader still follows after arrivals while hidden", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    expect(await scrollTop(page), "premise: the bottom is well down the history").toBeGreaterThan(400);
+
+    await hideChat(page, "hamburger-rooms-button");
+    for (let i = 1; i <= 3; i++) {
+      const text = `hidden arrival ${i}: ${"z".repeat(200)}`;
+      await callRiverTest(page, "appendMessage", text);
+      await expect(page.getByText(text)).toBeAttached({ timeout: 5_000 });
+    }
+    await afterLayoutSettles(page);
+
+    await selectListedRoom(page, "Team Chat Room");
+    await expectSettledAtBottom(page, "arrivals while the chat was hidden were not followed");
+    await deliver(page, "arrival after the chat came back");
+    await expectSettledAtBottom(page, "the follow did not survive the chat being hidden");
+  });
+
+  for (const reveal of [
+    {
+      by: "the back button",
+      run: (page: Page) => page.getByTestId("rooms-back-button").click(),
+    },
+    {
+      by: "widening to desktop",
+      run: (page: Page) => page.setViewportSize({ width: 1280, height: 900 }),
+    },
+  ]) {
+    test(`a room opened while hidden lands at its newest message and pages back, revealed by ${reveal.by}`, async ({
+      page,
+    }) => {
+      await openRoomAtBottom(page, "Team Chat Room", DEEP_ROOM_PATH);
+      await fillHistory(page);
+      // The deep room must not inherit this offset.
+      expect(await scrollTop(page), "premise: the old room sits well down its history").toBeGreaterThan(
+        400,
+      );
+
+      await hideChat(page, "hamburger-rooms-button");
+      await callRiverTest(page, "switchRoom", "Deep History Room");
+      await expect
+        .poll(() => renderedRowCount(page), {
+          timeout: 5_000,
+          message: "premise: the deep room should render while the chat is hidden",
+        })
+        .toBeGreaterThan(40);
+      await afterLayoutSettles(page);
+
+      await reveal.run(page);
+      await expect(chat(page)).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Deep History Room" })).toBeVisible();
+      await expectSettledAtBottom(page, "the room opened while hidden did not land at its newest message");
+
+      // Paging back has to work with no arrival to unlock it.
+      await afterLayoutSettles(page);
+      const initialRows = await renderedRowCount(page);
+      const head = await page.evaluate(() => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const head = c.querySelector('[data-testid="conversation-history"] > [data-item-key]');
+        c.scrollTop = 0;
+        return head!.getAttribute("data-item-key");
+      });
+      await expect
+        .poll(() => renderedRowCount(page), {
+          timeout: 5_000,
+          message: "scrolling to the top did not load older history",
+        })
+        .toBeGreaterThan(initialRows + 40);
+      const headNow = await page.evaluate(
+        (key) =>
+          Array.from(
+            document.querySelectorAll('[data-testid="conversation-history"] > [data-item-key]'),
+          ).findIndex((row) => row.getAttribute("data-item-key") === key),
+        head,
+      );
+      expect(headNow, "the older rows should land above the old head").toBeGreaterThan(0);
+    });
+  }
 });

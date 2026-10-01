@@ -28,9 +28,9 @@ mod message_actions;
 mod message_input;
 mod not_member_notification;
 use self::emoji_picker::FREQUENT_EMOJIS;
-use self::history_scroll::HistoryScroll;
 #[cfg(target_arch = "wasm32")]
-use self::history_scroll::TrimHooks;
+use self::history_scroll::HistoryHooks;
+use self::history_scroll::HistoryScroll;
 use self::not_member_notification::NotMemberNotification;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
@@ -1723,22 +1723,6 @@ impl HistoryWindow {
     }
 }
 
-/// Read the chat history's scroll container, if it is currently in the DOM.
-#[cfg(target_arch = "wasm32")]
-fn chat_scroll_container() -> Option<web_sys::Element> {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("chat-scroll-container"))
-}
-
-/// Read the wrapper the history's rows are laid out in.
-#[cfg(target_arch = "wasm32")]
-fn chat_content_wrapper() -> Option<web_sys::Element> {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("chat-content"))
-}
-
 /// Slack for comparing one scroll offset against another.
 ///
 /// `scrollTop` is fractional in every engine while `Element::scroll_top`
@@ -1845,14 +1829,16 @@ pub fn Conversation() -> Element {
     // during render; the signals (`window_items`, `opening_snap_done`) still
     // reset in the effect, so this render substitutes `INITIAL_WINDOW_ITEMS`
     // below and keeps the sentinel unmounted until they catch up.
+    //
+    // `Option<Option<..>>` so the very first render (no room recorded yet) also
+    // counts as a change and starts from a clean window. Also read by the
+    // opening-snap callback below, as the room whose history is in the DOM.
+    let prev_render_room = use_hook(|| {
+        Rc::new(std::cell::Cell::new(
+            None::<Option<ed25519_dalek::VerifyingKey>>,
+        ))
+    });
     let room_changed_this_render = {
-        // `Option<Option<..>>` so the very first render (no room recorded yet)
-        // also counts as a change and starts from a clean window.
-        let prev_render_room = use_hook(|| {
-            Rc::new(std::cell::Cell::new(
-                None::<Option<ed25519_dalek::VerifyingKey>>,
-            ))
-        });
         let room = CURRENT_ROOM.read().owner_key;
         let changed = prev_render_room.get() != Some(room);
         if changed {
@@ -2178,34 +2164,39 @@ pub fn Conversation() -> Element {
         // every re-render of the history, so `install` runs once and is a no-op
         // after. Calling it here (before the `!has_content` return) is what
         // retries it when the first attempt found no container yet.
-        let trim = TrimHooks {
+        let prev_render_room = prev_render_room.clone();
+        let hooks = HistoryHooks {
             window_items,
             window_anchor: window_anchor.clone(),
             window_overgrown: window_overgrown.clone(),
             window_rendered: window_rendered.clone(),
-        };
-        move || {
-            // A backfill or trim changes the window and not the messages.
-            let _ = window_items();
-            let has_content = message_groups.read().is_some();
-            history.install(trim.clone());
-            if !has_content {
-                return;
-            }
-            if history.restore() {
-                // The opening snap for this room has landed, so the
-                // backfill sentinel may mount (#501 H2). Deferred, and the
-                // signal is only written on the transition, so steady-state
-                // arrivals do not re-notify the render for nothing. The
-                // room is re-checked because this task can outlive a rapid
-                // room switch, and a stale set here would un-gate the new
-                // room's sentinel before ITS snap (#505 review).
-                let room_at_snap = CURRENT_ROOM.peek().owner_key;
+            // Whoever restored (this effect, the ResizeObserver on a reveal, a
+            // layout scroll), the opening snap for this room has landed, so the
+            // backfill sentinel may mount (#501 H2). Deferred, since the
+            // observers are raw JS callbacks, and the signal is only written on
+            // the transition, so steady-state arrivals do not re-notify the
+            // render for nothing. The room is re-checked because this task can
+            // outlive a rapid room switch, and a stale set here would un-gate
+            // the new room's sentinel before ITS snap (#505 review).
+            snapped_to_bottom: Rc::new(move || {
+                let Some(room_at_snap) = prev_render_room.get() else {
+                    return;
+                };
+                let mut opening_snap_done = opening_snap_done;
                 crate::util::defer(move || {
                     if CURRENT_ROOM.peek().owner_key == room_at_snap && !*opening_snap_done.peek() {
                         opening_snap_done.set(true);
                     }
                 });
+            }),
+        };
+        move || {
+            // A backfill or trim changes the window and not the messages.
+            let _ = window_items();
+            let has_content = message_groups.read().is_some();
+            history.install(hooks.clone());
+            if has_content {
+                history.restore();
             }
         }
     });
@@ -8018,10 +8009,6 @@ mod autoscroll_wiring_pins {
                  scroll-to-latest button's IntersectionObserver: found `{forbidden}`"
             );
         }
-        assert!(
-            dense(prod).contains("ifhistory.restore(){"),
-            "the content effect must restore through `history`, which owns the pin"
-        );
     }
 
     /// The trigger, not just the gate. An `onmounted` on the last bubble is
@@ -8110,16 +8097,10 @@ mod autoscroll_wiring_pins {
         );
     }
 
-    /// `restore`, and the render before a patch, take in a pending reader scroll
-    /// first (see the `history_scroll.rs` module doc).
+    /// The render before a patch takes in a pending reader scroll first (see
+    /// the `history_scroll.rs` module doc).
     #[test]
     fn a_pending_reader_scroll_is_taken_in_before_a_restore() {
-        assert!(
-            dense(history_source()).contains(
-                "pub(super)fnrestore(&self)->bool{self.take_in_undelivered_scroll();self.restore_now()}"
-            ),
-            "`restore` must take in an undelivered reader scroll before `restore_now`"
-        );
         assert!(
             dense(production_source()).contains("history.take_in_undelivered_scroll();"),
             "the render must read a pending reader scroll before the patch"

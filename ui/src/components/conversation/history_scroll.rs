@@ -28,6 +28,11 @@
 //!   own positions. Growing content, a growing composer or a rewrap restore
 //!   instead of measuring, so none of them can clear it.
 //!
+//! * **Hidden**: the mobile layout hides the history (`display:none`), and every
+//!   read is then 0. It stays observed, but nothing measures, records or
+//!   restores it until it has height again: the ResizeObserver's restore on
+//!   reveal picks up where it was.
+//!
 //! Known limit: the scroll-to-latest button scrolls smoothly, so captures during
 //! its animation read as the reader's, and a message arriving mid-animation
 //! lands one row short until the next change.
@@ -44,10 +49,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[cfg(target_arch = "wasm32")]
-use super::{
-    chat_content_wrapper, chat_scroll_container, trim_would_rearm_backfill, INITIAL_WINDOW_ITEMS,
-    SCROLL_TOP_SLACK_PX,
-};
+use super::{trim_would_rearm_backfill, INITIAL_WINDOW_ITEMS, SCROLL_TOP_SLACK_PX};
 #[cfg(target_arch = "wasm32")]
 use dioxus::prelude::WritableExt;
 #[cfg(target_arch = "wasm32")]
@@ -142,13 +144,16 @@ fn is_pinned(distance_from_bottom: f64) -> bool {
     distance_from_bottom <= BOTTOM_THRESHOLD_PX
 }
 
-/// What the trim (the window reset at the bottom) needs from the component.
+/// What the history needs from the component: the trim's window state (the
+/// window reset at the bottom), and who to tell when a restore snapped.
 #[derive(Clone)]
-pub(super) struct TrimHooks {
+pub(super) struct HistoryHooks {
     pub window_items: Signal<usize>,
     pub window_anchor: Rc<RefCell<Option<WindowAnchor>>>,
     pub window_overgrown: Rc<Cell<bool>>,
     pub window_rendered: Rc<Cell<usize>>,
+    /// Called from raw JS callbacks too, so it may only defer signal work.
+    pub snapped_to_bottom: Rc<dyn Fn()>,
 }
 
 /// The history's scroll state. See the module doc.
@@ -162,9 +167,9 @@ pub(super) struct HistoryScroll {
     /// The layout and `scrollTop` as last accounted for, to classify a `scroll`.
     sig: Cell<LayoutSig>,
     top: Cell<i32>,
-    /// What `capture` needs for the trim. Set by `install` once the listeners
-    /// exist, so `is_some` also means "installed".
-    trim: RefCell<Option<TrimHooks>>,
+    /// Set by `install` once the listeners exist, so `is_some` also means
+    /// "installed".
+    hooks: RefCell<Option<HistoryHooks>>,
 }
 
 impl Default for HistoryScroll {
@@ -175,7 +180,7 @@ impl Default for HistoryScroll {
             force: Cell::new(false),
             sig: Cell::new(LayoutSig::default()),
             top: Cell::new(0),
-            trim: RefCell::new(None),
+            hooks: RefCell::new(None),
         }
     }
 }
@@ -194,6 +199,24 @@ impl HistoryScroll {
         self.sig.set(LayoutSig::default());
         self.top.set(0);
     }
+}
+
+/// The history's scroll container, if it has a layout box to measure. Hidden,
+/// every read is 0, which must not be taken for where the reader is.
+#[cfg(target_arch = "wasm32")]
+fn laid_out_container() -> Option<web_sys::Element> {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("chat-scroll-container"))
+        .filter(|c| c.client_height() > 0)
+}
+
+/// Read the wrapper the history's rows are laid out in.
+#[cfg(target_arch = "wasm32")]
+fn chat_content_wrapper() -> Option<web_sys::Element> {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("chat-content"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -244,7 +267,7 @@ impl HistoryScroll {
     /// Take the reader's position as the new truth. Only ever called from
     /// `on_scroll`, for a scroll the reader made.
     fn capture(&self) {
-        let Some(container) = chat_scroll_container() else {
+        let Some(container) = laid_out_container() else {
             return;
         };
         let sig = read_sig(&container);
@@ -295,7 +318,7 @@ impl HistoryScroll {
         // exact bottom. Skipped when the trimmed tail would leave the backfill
         // sentinel in range of the bottom, or the two oscillate at render speed
         // (#505; see `trim_would_rearm_backfill`).
-        if let Some(trim) = self.trim.borrow().as_ref() {
+        if let Some(trim) = self.hooks.borrow().as_ref() {
             if distance <= SCROLL_TOP_SLACK_PX as f64
                 && trim.window_overgrown.get()
                 && !trim_would_rearm_backfill(
@@ -319,9 +342,8 @@ impl HistoryScroll {
         }
     }
 
-    /// Put the view where it belongs after a layout or content change. Returns
-    /// whether it snapped to the bottom.
-    pub(super) fn restore(&self) -> bool {
+    /// Put the view where it belongs after a layout or content change.
+    pub(super) fn restore(&self) {
         self.take_in_undelivered_scroll();
         self.restore_now()
     }
@@ -331,7 +353,7 @@ impl HistoryScroll {
     /// it was recorded, that is the reader's scroll and its event is still on its
     /// way: read it now, or the pin is stale and the restore drags them back.
     pub(super) fn take_in_undelivered_scroll(&self) {
-        let Some(container) = chat_scroll_container() else {
+        let Some(container) = laid_out_container() else {
             return;
         };
         let top = container.scroll_top();
@@ -353,17 +375,25 @@ impl HistoryScroll {
         )
     }
 
-    fn restore_now(&self) -> bool {
-        let Some(container) = chat_scroll_container() else {
-            return false;
+    fn restore_now(&self) {
+        // Hidden: keep the pin, the anchor and any pending `force` for the reveal.
+        let Some(container) = laid_out_container() else {
+            return;
         };
         if self.force.take() || self.pinned.get() {
             self.snap_to_bottom(web_sys::ScrollBehavior::Instant);
-            return true;
+            let snapped = self
+                .hooks
+                .borrow()
+                .as_ref()
+                .map(|h| h.snapped_to_bottom.clone());
+            if let Some(snapped) = snapped {
+                snapped();
+            }
+            return;
         }
         self.restore_anchor(&container);
         self.record(&container);
-        false
     }
 
     /// Scroll the first anchor row that still exists back to its gap. If none
@@ -389,13 +419,11 @@ impl HistoryScroll {
 
     /// Read a `scroll` event as layout's doing (restore) or the reader's (capture).
     fn on_scroll(&self) {
-        let Some(container) = chat_scroll_container() else {
+        let Some(container) = laid_out_container() else {
             return;
         };
         match self.cause_now(&container) {
-            ScrollCause::Layout => {
-                self.restore_now();
-            }
+            ScrollCause::Layout => self.restore_now(),
             ScrollCause::Reader => self.capture(),
         }
     }
@@ -408,7 +436,7 @@ impl HistoryScroll {
     /// (reactions, sentinel, padding) off-screen, which on a refresh scrolled
     /// only ~70% of the way down.
     pub(super) fn snap_to_bottom(&self, behavior: web_sys::ScrollBehavior) {
-        let Some(container) = chat_scroll_container() else {
+        let Some(container) = laid_out_container() else {
             return;
         };
         self.pinned.set(true);
@@ -422,18 +450,24 @@ impl HistoryScroll {
     /// Listen for the reader's scrolls and for layout changes. Idempotent: a
     /// no-op once installed; before the history is in the DOM it does nothing and
     /// the next call retries.
-    pub(super) fn install(self: &Rc<Self>, trim: TrimHooks) {
-        if self.trim.borrow().is_some() {
+    ///
+    /// A hidden history is installed too, so that its reveal is observed; only
+    /// its geometry is left unrecorded.
+    pub(super) fn install(self: &Rc<Self>, hooks: HistoryHooks) {
+        if self.hooks.borrow().is_some() {
             return;
         }
-        let (Some(container), Some(content)) = (chat_scroll_container(), chat_content_wrapper())
-        else {
+        let container = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("chat-scroll-container"));
+        let (Some(container), Some(content)) = (container, chat_content_wrapper()) else {
             return;
         };
 
         // The ResizeObserver sees the content growing or reflowing, and the
-        // container shrinking (the composer growing, #486's third cause). Both
-        // restore; neither may capture.
+        // container shrinking (the composer growing, #486's third cause), and
+        // a hidden container getting its height back. All restore; none may
+        // capture.
         let on_resize = {
             let this = self.clone();
             Closure::wrap(Box::new(move |_: js_sys::Array| {
@@ -443,8 +477,10 @@ impl HistoryScroll {
         let Ok(observer) = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()) else {
             return;
         };
-        self.record(&container);
-        *self.trim.borrow_mut() = Some(trim);
+        if let Some(laid_out) = laid_out_container() {
+            self.record(&laid_out);
+        }
+        *self.hooks.borrow_mut() = Some(hooks);
         observer.observe(&content);
         observer.observe(&container);
 
