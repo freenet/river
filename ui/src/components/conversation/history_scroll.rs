@@ -39,25 +39,28 @@
 //!   so an arrival does not yank a reader who has started to look back inside
 //!   the band. A layout correction shifts `from` by what it moved. Back at the
 //!   end, it is `Free` again at once.
-//! * **Settle** (`scrollend`, or the reader's quiet deadline) ends a gesture: it
-//!   measures the pin and anchor where the view came to rest, as `main` did,
+//! * **Settle** (`scrollend`, or the reader's quiet deadline) ends a gesture:
+//!   it measures the pin and anchor where the view came to rest, as `main` did,
 //!   and does not snap. The quiet deadline is `SCROLL_SETTLE_DEBOUNCE_MS` after
-//!   the reader's last move, never after our own work. Where the browser has no
-//!   `scrollend`, every reader move arms it; the deadline cannot tell a paused
-//!   finger from a lifted one. A `scrollend` exactly where our latest anchor
-//!   correction in this gesture left the view, with no reader move since, may be
-//!   that write's own end, so it does not settle: the gesture stays held and the
-//!   deadline is armed instead (if it is not already), and every such end is
-//!   refused until the reader moves or the gesture ends. That is a geometry
-//!   match, not provenance: the reader's last end coalesced with the correction
-//!   looks the same, which is what the deadline is for. A settle that does end
-//!   the gesture first puts back a reflow the ResizeObserver has not reported
-//!   yet (the signature differs from the record: an image loading above the
-//!   view moves the rows, not `scrollTop`), against the existing anchor, and
-//!   only then measures. With no gesture in progress a settle does nothing,
-//!   which is what makes a stale `scrollend` (another room's, an old gesture's,
-//!   a seek frame's) harmless: room switches, forced snaps and new seeks end the
-//!   gesture, and forget its correction and deadline.
+//!   the reader's last move, never after our own work: a reader move restarts a
+//!   pending one, while corrections, their echoes and layout work leave it
+//!   where it is. Where the browser has no `scrollend`, every reader move arms
+//!   it; the deadline cannot tell a paused finger from a lifted one. A
+//!   `scrollend` exactly where our latest anchor correction in this gesture
+//!   left the view (one that actually moved it; a no-op restore records
+//!   nothing), with no reader move since, may be that write's own end, so it
+//!   does not settle: the gesture stays held and the deadline is armed instead
+//!   (if it is not already), and every such end is refused until the reader
+//!   moves or the gesture ends. That is a geometry match, not provenance: the
+//!   reader's last end coalesced with the correction looks the same, which is
+//!   what the deadline is for. A settle that does end the gesture first puts
+//!   back a reflow the ResizeObserver has not reported yet (the signature
+//!   differs from the record: an image loading above the view moves the rows,
+//!   not `scrollTop`), against the existing anchor, and only then measures.
+//!   With no gesture in progress a settle does nothing, which is what makes a
+//!   stale `scrollend` (another room's, an old gesture's, a seek frame's)
+//!   harmless: room switches, forced snaps and new seeks end the gesture, and
+//!   forget its correction and deadline.
 //!
 //! # Where capture runs
 //!
@@ -116,7 +119,9 @@
 //!   force wait. The ResizeObserver's restore on reveal picks up where it was,
 //!   restarts a seek the hide cut short, and then finishes the settle of a
 //!   gesture the hide ended (engines send no `scrollend` for it), after putting
-//!   the anchor back.
+//!   the anchor back. A quiet deadline that passes while hidden waits the same
+//!   way. Desktop WebKit sends a `scroll` and `scrollend` of its own for the
+//!   reveal, which can settle first; it takes the same restore-first path.
 //! * **Touch momentum**: a restore that writes `scrollTop` (an anchor
 //!   correction) can cut a touch fling short. Holding follows during a gesture
 //!   avoids the snaps, not the corrections; this is untested on real devices.
