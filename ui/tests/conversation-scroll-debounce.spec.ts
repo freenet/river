@@ -206,6 +206,66 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     await expectHeld(page, at, "the settle re-measured the pin outside the band, so the arrival snapped");
   });
 
+  // An anchor correction is our own write, and its `scroll` event is an echo:
+  // it must neither settle the held gesture nor re-arm the deadline, which runs
+  // from the reader's last move. Before, every `scroll` re-armed the debounce,
+  // so the correction pushed the settle 120ms past its own write.
+  test("an anchor correction while held neither settles the gesture nor moves the reader's quiet deadline", async ({
+    page,
+  }) => {
+    const GROW_PX = 300;
+    const CORRECTION_AFTER_MS = 60;
+    await debounceOpenFilledRoom(page, "Team Chat Room");
+    await debounceExpectFallbackSelected(page);
+    const setup = await debouncePauseWhenQuiet(page);
+
+    const at = await readerScrollsUp(page, UP_PX, "the upward scroll");
+    const armed = await expectFreshDeadline(page, "premise: the upward scroll armed the debounce");
+    await debounceAdvance(page, CORRECTION_AFTER_MS);
+    const before = await page.evaluate((px) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const top = c.getBoundingClientRect().top;
+      const rows = Array.from(c.querySelectorAll<HTMLElement>('[id^="msg-"]'));
+      const row = rows.filter((r) => r.getBoundingClientRect().bottom < top).at(-1);
+      if (!row) throw new Error("no message row is entirely above the view");
+      const before = c.scrollTop;
+      row.style.paddingTop = `${px}px`;
+      return before;
+    }, GROW_PX);
+    await debounceFrames(page, 3);
+    const correction = (await debounceScrollTop(page)) - before;
+    expect(
+      Math.abs(correction - GROW_PX),
+      `premise: the restore corrected the view by the growth above (${correction}px)`,
+    ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+    await expectHeld(page, at, "premise: the correction put the reader's message back");
+    await debounceDeliverJoin(page);
+    await expectHeld(page, at, "the correction settled the held gesture, so the arrival snapped");
+
+    await debounceAdvance(page, armed.at + DEBOUNCE_SETTLE_MS - 1 - (await debounceState(page)).now);
+    expect(debounceFired(await debounceState(page), setup), "the gesture settled before the reader's deadline").toEqual([]);
+    await expectHeld(page, at, "the hold let go before the reader's deadline");
+    await debounceAdvance(page, 1);
+    expect(
+      await debounceDistanceFromBottom(page),
+      "premise: the reader settled inside the band",
+    ).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+    await expectFollowing(
+      page,
+      "arrival at the reader's deadline",
+      "the correction postponed the reader's quiet deadline, so the gesture was still held",
+    );
+
+    const state = await debounceState(page);
+    const fired = debounceFired(state, setup);
+    expect(fired.map((r) => r.handle), "the settle that ran is the reader's").toEqual([armed.handle]);
+    expect(fired[0].fired!.at - armed.at, "it ran 120ms after the reader's scroll").toBe(DEBOUNCE_SETTLE_MS);
+    expect(
+      state.registrations.filter((r) => r.seq > armed.seq && r.seq < fired[0].fired!.seq),
+      "the correction's scroll re-armed the deadline",
+    ).toEqual([]);
+  });
+
   // The new room's opening snap is itself a scroll, and the debounce clears
   // whatever handle it still holds before re-arming, so an old settle the switch
   // merely FORGOT to clear is cleared there anyway: the visible check bites when

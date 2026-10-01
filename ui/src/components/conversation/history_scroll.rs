@@ -39,13 +39,22 @@
 //!   so an arrival does not yank a reader who has started to look back inside
 //!   the band. A layout correction shifts `from` by what it moved. Back at the
 //!   end, it is `Free` again at once.
-//! * **Settle** (`scrollend`, or a debounce on `scroll` where it is missing) ends
-//!   a gesture: it measures the pin and anchor where the view came to rest, as
-//!   `main` did, and does not snap. The debounce cannot tell a paused finger
-//!   from a lifted one. With no gesture in progress a settle does nothing, which
-//!   is what makes a stale `scrollend` (another room's, an old gesture's, a seek
-//!   frame's) harmless: room switches, forced snaps and new seeks end the
-//!   gesture.
+//! * **Settle** (`scrollend`, or the reader's quiet deadline) ends a gesture: it
+//!   measures the pin and anchor where the view came to rest, as `main` did,
+//!   and does not snap. The quiet deadline is `SCROLL_SETTLE_DEBOUNCE_MS` after
+//!   the reader's last move, never after our own work. Where the browser has no
+//!   `scrollend`, every reader move arms it; the deadline cannot tell a paused
+//!   finger from a lifted one. A `scrollend` exactly where our latest anchor
+//!   correction in this gesture left the view, with no reader move since, may be
+//!   that write's own end, so it does not settle: the gesture stays held and the
+//!   deadline is armed instead (if it is not already), and every such end is
+//!   refused until the reader moves or the gesture ends. That is a geometry
+//!   match, not provenance: the reader's last end coalesced with the correction
+//!   looks the same, which is what the deadline is for. With no gesture in
+//!   progress a settle does nothing, which is what makes a stale `scrollend`
+//!   (another room's, an old gesture's, a seek frame's) harmless: room switches,
+//!   forced snaps and new seeks end the gesture, and forget its correction and
+//!   deadline.
 //!
 //! # Where capture runs
 //!
@@ -132,9 +141,9 @@ use dioxus::prelude::WritableExt;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{prelude::*, JsCast};
 
-/// Trailing delay that stands in for `scrollend` where the browser has none
-/// (Safari before 17.4), as on `main`.
-#[cfg(target_arch = "wasm32")]
+/// The quiet interval a gesture settles after when no native end does: after
+/// the reader's last move, where the browser has no `scrollend` (Safari before
+/// 17.4, as on `main`), and after a native end that may be our correction's own.
 const SCROLL_SETTLE_DEBOUNCE_MS: i32 = 120;
 
 /// How many rows above the newest visible one are remembered as fallbacks, for
@@ -213,6 +222,47 @@ fn seek_after_reader_scroll(from: ViewEdges, now: ViewEdges) -> Follow {
     } else {
         Follow::Seeking { from }
     }
+}
+
+/// Our latest anchor correction during a gesture: the view it left, and the
+/// reader revision (`HistoryScroll::reader_rev`) it was made in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Correction {
+    edges: ViewEdges,
+    reader_rev: u32,
+}
+
+/// What says a scroll has come to rest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettleCause {
+    /// The browser's `scrollend`.
+    Native,
+    /// The reader's quiet deadline: `SCROLL_SETTLE_DEBOUNCE_MS` after their last move.
+    Quiet,
+}
+
+/// Whether a settle from `cause` ends the gesture, with the view at `now` and
+/// `reader_rev` the current reader revision. A quiet deadline always does, even
+/// at the corrected view: the reader has stopped. A native end exactly where our
+/// latest correction left the view, with no reader move since, may be that
+/// correction's own, so it does not; it cannot be told from the reader's last
+/// end coalesced with it, which is why the quiet deadline backs it up.
+fn settle_ends_gesture(
+    cause: SettleCause,
+    correction: Option<Correction>,
+    now: ViewEdges,
+    reader_rev: u32,
+) -> bool {
+    cause == SettleCause::Quiet
+        || correction.is_none_or(|c| c.edges != now || c.reader_rev != reader_rev)
+}
+
+/// How long from `now_ms` until the quiet deadline of a reader whose last move
+/// was at `last_move_ms`: `SCROLL_SETTLE_DEBOUNCE_MS` after that move, so our
+/// own work since does not restart it. Never negative, never longer.
+fn quiet_deadline_in(last_move_ms: f64, now_ms: f64) -> i32 {
+    let full = f64::from(SCROLL_SETTLE_DEBOUNCE_MS);
+    (full - (now_ms - last_move_ms)).clamp(0.0, full).ceil() as i32
 }
 
 /// Whether `top` is within rounding of the live end `max`.
@@ -386,8 +436,19 @@ pub(super) struct HistoryScroll {
     /// A gesture ended while the history was hidden; finish it on the first
     /// laid-out restore.
     settle_pending: Cell<bool>,
-    /// The debounce standing in for `scrollend` where the browser lacks it.
+    /// The reader's quiet deadline (see "Settle"), while one is pending.
     settle_timer: Cell<Option<i32>>,
+    /// The deadline's callback, made once by `install`.
+    settle_quiet: RefCell<Option<js_sys::Function>>,
+    /// Whether the browser sends `scrollend`; without it every reader move arms
+    /// the quiet deadline.
+    native_settle: Cell<bool>,
+    /// Counts the reader's moves, so a correction can say which one it followed.
+    reader_rev: Cell<u32>,
+    /// When the reader last moved, on the page's clock (ms).
+    last_reader_move: Cell<f64>,
+    /// Our latest anchor correction in the gesture in progress.
+    correction: Cell<Option<Correction>>,
     /// The scroll-to-latest animation's frame callback, made once by `install`.
     seek_frame: RefCell<Option<js_sys::Function>>,
     /// The animation frame asked for and not run yet, so `seek` never asks twice.
@@ -419,6 +480,11 @@ impl Default for HistoryScroll {
             follow: Cell::new(Follow::Free),
             settle_pending: Cell::new(false),
             settle_timer: Cell::new(None),
+            settle_quiet: RefCell::new(None),
+            native_settle: Cell::new(true),
+            reader_rev: Cell::new(0),
+            last_reader_move: Cell::new(0.0),
+            correction: Cell::new(None),
             seek_frame: RefCell::new(None),
             seek_raf: Cell::new(None),
             seek_prev_t: Cell::new(None),
@@ -451,7 +517,30 @@ impl HistoryScroll {
     fn end_interaction(&self) {
         self.follow.set(Follow::Free);
         self.settle_pending.set(false);
+        self.correction.set(None);
         self.cancel_settle_timer();
+    }
+
+    /// The reader moved the view: a new revision, which no earlier correction
+    /// matches.
+    fn note_reader_move(&self) {
+        self.reader_rev.set(self.reader_rev.get().wrapping_add(1));
+    }
+
+    /// An anchor correction moved the view to `edges`. Only a gesture's: with
+    /// none in progress there is nothing for its end to settle.
+    fn note_correction(&self, edges: ViewEdges) {
+        if matches!(self.follow.get(), Follow::Gesture { .. }) {
+            self.correction.set(Some(Correction {
+                edges,
+                reader_rev: self.reader_rev.get(),
+            }));
+        }
+    }
+
+    /// Whether a settle from `cause`, with the view at `now`, ends the gesture.
+    fn settle_allowed(&self, cause: SettleCause, now: ViewEdges) -> bool {
+        settle_ends_gesture(cause, self.correction.get(), now, self.reader_rev.get())
     }
 
     fn cancel_settle_timer(&self) {
@@ -686,8 +775,11 @@ impl HistoryScroll {
                 self.snap_and_tell(&container)
             }
             Follow::Free | Follow::Gesture { .. } => {
-                self.restore_anchor(&container);
+                let moved = self.restore_anchor(&container);
                 self.record(&container);
+                if moved {
+                    self.note_correction(self.recorded_edges());
+                }
             }
         }
         // Everything that moved the view since the last record was layout (a
@@ -803,7 +895,8 @@ impl HistoryScroll {
 
     /// Scroll the first anchor row that still exists back to its gap. If none
     /// survives, leave the view alone: the next reader scroll captures a new one.
-    fn restore_anchor(&self, container: &web_sys::Element) {
+    /// Whether that moved the view.
+    fn restore_anchor(&self, container: &web_sys::Element) -> bool {
         let view = container.get_bounding_client_rect();
         // Newest first, so the first row found is the newest survivor.
         for (key, saved_gap) in self.anchor.borrow().iter() {
@@ -815,11 +908,14 @@ impl HistoryScroll {
                 continue;
             };
             let delta = saved_gap - gap(&view, &row);
-            if delta.abs() > SCROLL_TOP_SLACK_PX {
-                container.set_scroll_top(container.scroll_top() + delta);
+            if delta.abs() <= SCROLL_TOP_SLACK_PX {
+                return false;
             }
-            return;
+            let top = container.scroll_top();
+            container.set_scroll_top(top + delta);
+            return container.scroll_top() != top;
         }
+        false
     }
 
     /// Read a `scroll` event as layout's doing (restore) or the reader's (capture).
@@ -840,6 +936,13 @@ impl HistoryScroll {
     /// over only once it has moved up from the seek's origin; anything else is
     /// recorded and left to the next frame, the origin kept as it was.
     fn on_reader_scroll(&self, container: &web_sys::Element) {
+        self.note_reader_move();
+        self.last_reader_move.set(js_sys::Date::now());
+        // Without `scrollend` every move arms the quiet deadline; with it, only
+        // a deadline already pending (a correction's end was refused) restarts.
+        if !self.native_settle.get() || self.settle_timer.get().is_some() {
+            self.arm_quiet_deadline();
+        }
         if let Follow::Seeking { from } = self.follow.get() {
             let follow = seek_after_reader_scroll(from, self.live_edges(container));
             self.follow.set(follow);
@@ -856,6 +959,8 @@ impl HistoryScroll {
         self.capture(container);
         let follow = if at_end(self.top.get(), max_scroll_top(container)) {
             // Back at the end: following again, whatever came before.
+            self.correction.set(None);
+            self.cancel_settle_timer();
             Follow::Free
         } else {
             let held = held || moved_up(from, self.recorded_edges());
@@ -864,11 +969,47 @@ impl HistoryScroll {
         self.follow.set(follow);
     }
 
-    /// A scroll has come to rest (`scrollend`, or the debounce): see "Settle".
-    fn settle(&self) {
-        self.cancel_settle_timer();
+    /// The browser says a scroll has come to rest: see "Settle". Not if the end
+    /// may be our latest correction's own; then the gesture stays held until the
+    /// reader's quiet deadline, which is armed if it is not already (and is not
+    /// moved: it runs from the reader's last move).
+    fn settle_native(&self) {
         self.take_in_undelivered_scroll();
+        if let Some(container) = self.laid_out_container() {
+            if !self.settle_allowed(SettleCause::Native, self.live_edges(&container)) {
+                if self.settle_timer.get().is_none() {
+                    self.arm_quiet_deadline();
+                }
+                return;
+            }
+        }
+        self.cancel_settle_timer();
         self.end_gesture();
+    }
+
+    /// The reader's quiet deadline has passed: the gesture settles wherever the
+    /// view is. Hidden, it waits for the reveal's restore, as any settle does.
+    fn settle_quiet(&self) {
+        self.settle_timer.set(None);
+        self.take_in_undelivered_scroll();
+        self.cancel_settle_timer();
+        self.end_gesture();
+    }
+
+    /// Arm the quiet deadline, `SCROLL_SETTLE_DEBOUNCE_MS` after the reader's
+    /// last move, replacing any pending one.
+    fn arm_quiet_deadline(&self) {
+        self.cancel_settle_timer();
+        let callback = self.settle_quiet.borrow().clone();
+        let (Some(window), Some(callback)) = (web_sys::window(), callback) else {
+            return;
+        };
+        let delay = quiet_deadline_in(self.last_reader_move.get(), js_sys::Date::now());
+        if let Ok(handle) =
+            window.set_timeout_with_callback_and_timeout_and_arguments_0(&callback, delay)
+        {
+            self.settle_timer.set(Some(handle));
+        }
     }
 
     /// The gesture is over: where it came to rest decides the pin. Does not
@@ -882,6 +1023,7 @@ impl HistoryScroll {
             return;
         };
         self.follow.set(Follow::Free);
+        self.correction.set(None);
         self.capture(&container);
     }
 
@@ -965,27 +1107,19 @@ impl HistoryScroll {
         );
 
         let this = self.clone();
-        let settle = Closure::<dyn FnMut()>::new(move || this.settle()).into_js_value();
-        if js_sys::Reflect::has(&container, &JsValue::from_str("onscrollend")).unwrap_or(false) {
-            listen("scrollend", &settle);
-        } else {
+        *self.settle_quiet.borrow_mut() = Some(
+            Closure::<dyn FnMut()>::new(move || this.settle_quiet())
+                .into_js_value()
+                .unchecked_into(),
+        );
+        let native =
+            js_sys::Reflect::has(&container, &JsValue::from_str("onscrollend")).unwrap_or(false);
+        self.native_settle.set(native);
+        if native {
             let this = self.clone();
-            let settle: js_sys::Function = settle.unchecked_into();
-            let debounce = move || {
-                this.cancel_settle_timer();
-                let Some(window) = web_sys::window() else {
-                    return;
-                };
-                if let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                    &settle,
-                    SCROLL_SETTLE_DEBOUNCE_MS,
-                ) {
-                    this.settle_timer.set(Some(handle));
-                }
-            };
             listen(
-                "scroll",
-                &Closure::<dyn FnMut()>::new(debounce).into_js_value(),
+                "scrollend",
+                &Closure::<dyn FnMut()>::new(move || this.settle_native()).into_js_value(),
             );
         }
 
@@ -1537,6 +1671,93 @@ mod tests {
             seek_after_reader_scroll(from, run.view),
             Follow::Seeking { from }
         );
+    }
+
+    /// A held gesture whose view a correction has just moved to `CORRECTED`.
+    const CORRECTED: ViewEdges = ViewEdges {
+        top: 2300,
+        bottom: 2900,
+    };
+
+    fn corrected_gesture() -> HistoryScroll {
+        let history = HistoryScroll::default();
+        history.note_reader_move();
+        history.follow.set(Follow::Gesture {
+            from: edges(2000, 600),
+            held: true,
+        });
+        history.note_correction(CORRECTED);
+        history
+    }
+
+    #[test]
+    fn a_native_end_at_our_correction_does_not_settle_the_gesture() {
+        let history = corrected_gesture();
+        assert!(!history.settle_allowed(SettleCause::Native, CORRECTED));
+        // Every end that matches is refused, not just the first: an engine can
+        // send more than one for a write.
+        assert!(!history.settle_allowed(SettleCause::Native, CORRECTED));
+        // Anywhere else, it is an end the correction cannot have caused.
+        for other in [edges(2299, 600), edges(2301, 600), edges(2300, 601)] {
+            assert!(
+                history.settle_allowed(SettleCause::Native, other),
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reader_move_after_a_correction_lets_its_native_end_settle() {
+        let history = corrected_gesture();
+        // Away and back: the view is where the correction left it, but this end
+        // can be the reader's.
+        history.note_reader_move();
+        history.note_reader_move();
+        assert!(history.settle_allowed(SettleCause::Native, CORRECTED));
+    }
+
+    #[test]
+    fn the_quiet_deadline_settles_even_at_the_corrected_view() {
+        let history = corrected_gesture();
+        assert!(history.settle_allowed(SettleCause::Quiet, CORRECTED));
+    }
+
+    #[test]
+    fn stale_interaction_work_cannot_hold_a_later_gesture() {
+        // A room switch, a forced snap or a new seek ends the interaction.
+        let history = corrected_gesture();
+        history.end_interaction();
+        assert_eq!(history.correction.get(), None);
+        assert!(history.settle_allowed(SettleCause::Native, CORRECTED));
+        // So does the room reset, through it.
+        let history = corrected_gesture();
+        history.reset_for_room();
+        assert_eq!(history.correction.get(), None);
+        // A correction with no gesture in progress is no gesture's: a parked
+        // reader's restore installs nothing a later gesture could match.
+        let history = HistoryScroll::default();
+        history.note_correction(CORRECTED);
+        history.note_reader_move();
+        history.follow.set(Follow::Gesture {
+            from: edges(2000, 600),
+            held: true,
+        });
+        assert!(history.settle_allowed(SettleCause::Native, CORRECTED));
+    }
+
+    #[test]
+    fn the_quiet_deadline_runs_from_the_readers_last_move() {
+        let full = SCROLL_SETTLE_DEBOUNCE_MS;
+        assert_eq!(quiet_deadline_in(1_000.0, 1_000.0), full);
+        // A correction 60ms after the move does not restart the interval.
+        assert_eq!(quiet_deadline_in(1_000.0, 1_060.0), full - 60);
+        assert_eq!(quiet_deadline_in(1_000.0, 1_000.0 + f64::from(full)), 0);
+        // Already past it: at once, never a negative delay.
+        assert_eq!(quiet_deadline_in(1_000.0, 5_000.0), 0);
+        // A clock that went backwards never makes it longer than the interval.
+        assert_eq!(quiet_deadline_in(1_000.0, 900.0), full);
+        // Fractional clocks round up, so it is never early.
+        assert_eq!(quiet_deadline_in(1_000.0, 1_000.5), full);
     }
 
     #[test]

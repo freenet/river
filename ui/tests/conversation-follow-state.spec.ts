@@ -1,16 +1,27 @@
 import { test, expect, Page } from "@playwright/test";
+import { callRiverTest } from "./river-test";
 import { seekClockInstall, seekClockPause } from "./history-scroll-fixture";
 import {
   FollowEntry,
+  RowPosition,
+  followAwaitAfter,
+  followDeliver,
   followFrame,
+  followGate,
+  followGrowAbove,
+  followLog,
+  followMark,
+  followRealFrames,
   followReaderMove,
   followRecorderStart,
   followRecorderStop,
   followTimeline,
+  followUngate,
   newestVisibleRow,
   rowDrift,
 } from "./history-follow-fixture";
 import {
+  AT_BOTTOM_EPSILON_PX,
   afterLayoutSettles,
   deliver,
   distanceFromBottom,
@@ -19,6 +30,7 @@ import {
   openRoomAtBottom,
   readerScrollsWithoutGesture,
   scrollTop,
+  viewportHeight,
 } from "./history-scroll-helpers";
 
 // How the history's follow state moves between Free, Gesture and Seeking when
@@ -225,6 +237,434 @@ test.describe("A reader taking over the scroll-to-latest animation", () => {
       await expectSettledAtBottom(page, `the animation did not end at the newest message (${timeline})`);
       await deliver(page, "arrival after the wheel ticks");
       await expectSettledAtBottom(page, `the follow did not survive the wheel ticks (${timeline})`);
+    }
+  });
+});
+
+/// A tall inbound message: more than the follow band on its own.
+const TALL = (marker: string) => `${marker}\n${Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n")}`;
+
+/// The fixture variant with rooms deeper than the render window.
+const DEEP_ROOM_PATH = "/?deep-history-room=1";
+
+/// The quiet interval a gesture settles after when no native end does
+/// (SCROLL_SETTLE_DEBOUNCE_MS in history_scroll.rs).
+const QUIET_MS = 120;
+/// Up past rounding, and small enough that a short arrival keeps the reader
+/// inside the band.
+const CORRECTED_UP_PX = 20;
+/// Growth above the reader's row: the correction it needs.
+const GROW_PX = 300;
+/// Clock time between the reader's move and the growth.
+const READER_QUIET_MS = 60;
+
+// A layout change above a held reader is corrected by writing `scrollTop`, and
+// the browser answers that write with its own `scrollend`. Native events carry
+// no write token, so the app cannot prove whose end it is; before, it took it
+// for the reader's, settled the held gesture where it was, and the next short
+// arrival snapped a reader who was still scrolling up inside the band. A
+// matching end now leaves the gesture held, and the gesture settles at the
+// reader's own quiet deadline instead (QUIET_MS after their last move, however
+// much of our own work came after it).
+//
+// The clock is paused once the room is set up, so no app timer runs unless the
+// test advances it; native rendering, `scroll` and `scrollend` still come from
+// real frames. The reader's own move is a programmatic one, which every engine
+// ends at once: a gate consumes that end, so the gesture stays unsettled as a
+// held finger would, and is removed before the correction, whose end must reach
+// the app.
+
+/// Open a filled room, move up `upPx` with the move's native end gated away,
+/// then, `READER_QUIET_MS` later and with the gate removed, grow a row above the
+/// reader and wait for the correction's own end to reach the app. Leaves the
+/// clock paused and the recorder running: the caller stops both in a `finally`.
+async function correctedHeldGesture(page: Page, { path = "/", upPx = CORRECTED_UP_PX, fillers = 8 } = {}) {
+  await seekClockInstall(page);
+  await openRoomAtBottom(page, "Team Chat Room", path);
+  for (let i = 0; i < fillers; i++) await deliver(page, `filler ${i}: ${"y".repeat(200)}`);
+  await expectSettledAtBottom(page, "premise: the fillers should have been followed");
+  await afterLayoutSettles(page);
+  await seekClockPause(page);
+  await followRecorderStart(page, { gateEnds: true });
+
+  await followMark(page, "move");
+  const move = await followReaderMove(page, -upPx);
+  expect(move.delivered, "premise: the reader's scroll event reached the app").toBe(true);
+  expect(move.after - move.before, "premise: the reader moved up").toBeCloseTo(-upPx, 0);
+  expect(await followAwaitAfter(page, "move", "held"), "premise: the gate held the move's own end").toBe(true);
+  await followRealFrames(page, 3);
+  const at = await newestVisibleRow(page);
+  expect(at, "premise: a message should be visible").not.toBeNull();
+
+  await page.clock.runFor(READER_QUIET_MS);
+  expect(await followUngate(page), "premise: the gate was still in place").toBe(true);
+  await followRealFrames(page, 3);
+  const grow = await followGrowAbove(page, GROW_PX);
+  expect(Math.abs(grow.after - grow.before), "premise: the growth did not clamp the view").toBeLessThanOrEqual(1);
+  const ended = await followAwaitAfter(page, "grow", "end", 20);
+  const log = await followLog(page);
+  const correctedTop = await scrollTop(page);
+  const correction = correctedTop - grow.before;
+  const fromUngate = log.slice(log.lastIndexOf("ungated"));
+  expect(fromUngate, `premise: nothing gated or ended between the ungate and the growth (${log})`).toMatch(
+    /^ungated (scroll )*grow\b/,
+  );
+  expect(ended, `premise: the correction's own scrollend reached the app (${log})`).toBe(true);
+  expect(fromUngate, `premise: the correction scrolled before its end (${log})`).toMatch(/grow .*scroll.* end/);
+  expect(
+    Math.abs(correction - GROW_PX),
+    `premise: the restore corrected the view by the growth (${correction}px; ${log})`,
+  ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+  expect(await rowDrift(page, at!), `premise: the correction put the reader's message back (${log})`).toBeLessThanOrEqual(
+    IN_PLACE_TOLERANCE_PX,
+  );
+  test.info().annotations.push({
+    type: "correction",
+    description: `${correction}px; ${at!.id} at ${at!.gap.toFixed(1)}px; ${log}`,
+  });
+  return { at: at!, correctedTop };
+}
+
+/// Advance the clock to the reader's quiet deadline, QUIET_MS after their move.
+const toQuietDeadline = (page: Page) => page.clock.runFor(QUIET_MS - READER_QUIET_MS);
+
+async function expectInBand(page: Page, why: string) {
+  expect(await distanceFromBottom(page), why).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX - IN_PLACE_TOLERANCE_PX);
+}
+
+/// A short arrival after the correction's end is held, inside the band.
+async function expectShortArrivalHeld(page: Page, at: RowPosition) {
+  await followDeliver(page, "join");
+  const log = await followLog(page);
+  test.info().annotations.push({ type: "arrival", description: `${await distanceFromBottom(page)}px above the end; ${log}` });
+  await expectRowHeld(page, at, `the correction's own end released the held gesture, so the arrival snapped (${log})`);
+  await expectInBand(page, `premise: the arrival leaves the reader inside the band (${log})`);
+}
+
+/// Stop the recorder and give the clock back, whatever the test did.
+async function teardown(page: Page) {
+  await followRecorderStop(page);
+  await page.clock.resume();
+}
+
+test.describe("An anchor correction's own scrollend", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("a short arrival after the correction's end keeps a reader scrolling up inside the band (controlled order: move → correction → its end → arrival)", async ({
+    page,
+  }) => {
+    try {
+      const { at } = await correctedHeldGesture(page);
+      await expectShortArrivalHeld(page, at);
+    } finally {
+      await teardown(page);
+    }
+  });
+
+  test("the corrected gesture settles at the reader's quiet deadline, and inside the band the next arrival follows", async ({
+    page,
+  }) => {
+    try {
+      const { at } = await correctedHeldGesture(page);
+      await expectShortArrivalHeld(page, at);
+      await toQuietDeadline(page);
+      await followDeliver(page, "arrival after the quiet deadline");
+      await expectSettledAtBottom(
+        page,
+        `the corrected gesture did not settle at the reader's quiet deadline (${await followLog(page)})`,
+      );
+    } finally {
+      await teardown(page);
+    }
+  });
+
+  test("the corrected gesture settles at the reader's quiet deadline, and outside the band the reader stays parked", async ({
+    page,
+  }) => {
+    try {
+      const { at } = await correctedHeldGesture(page);
+      await followDeliver(page, TALL("tall arrival after the correction"));
+      await expectRowHeld(page, at, `the tall arrival moved the reader's message (${await followLog(page)})`);
+      expect(
+        await distanceFromBottom(page),
+        "premise: the tall arrival leaves the reader outside the band",
+      ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      await toQuietDeadline(page);
+      await followDeliver(page, `arrival after the quiet deadline: ${"r".repeat(200)}`);
+      await expectRowHeld(page, at, `the settle outside the band did not leave the reader parked (${await followLog(page)})`);
+    } finally {
+      await teardown(page);
+    }
+  });
+
+  test("a reader move after the correction settles on its own end, even back where the correction left the view", async ({
+    page,
+  }) => {
+    const AWAY_PX = 10;
+    try {
+      const { correctedTop } = await correctedHeldGesture(page);
+      expect(await followGate(page), "premise: the gate was removed for the correction").toBe(false);
+      await followMark(page, "away");
+      const away = await followReaderMove(page, -AWAY_PX);
+      expect(away.delivered, "premise: the move away reached the app").toBe(true);
+      expect(await followAwaitAfter(page, "away", "held"), "premise: the gate held the move away's end").toBe(true);
+      await followRealFrames(page, 3);
+      expect(await followUngate(page), "premise: the gate was in place").toBe(true);
+      await followRealFrames(page, 3);
+      await followMark(page, "back");
+      const back = await followReaderMove(page, AWAY_PX);
+      expect(back.delivered, "premise: the move back reached the app").toBe(true);
+      expect(back.after, "premise: the reader is back exactly where the correction left the view").toBe(correctedTop);
+      const ended = await followAwaitAfter(page, "back", "end", 20);
+      const log = await followLog(page);
+      expect(ended, `premise: the move back's own end reached the app (${log})`).toBe(true);
+      expect(log.slice(log.lastIndexOf("ungated")), `premise: nothing ended before the move back (${log})`).toMatch(
+        /^ungated (scroll )*back\b/,
+      );
+      await followDeliver(page, "join");
+      await expectSettledAtBottom(
+        page,
+        `the old correction's match refused the reader's own end, so the gesture stayed held (${log})`,
+      );
+    } finally {
+      await teardown(page);
+    }
+  });
+
+  test("a room switch with the correction's deadline pending leaves the new room's gesture its own", async ({
+    page,
+  }) => {
+    try {
+      await correctedHeldGesture(page, { path: DEEP_ROOM_PATH });
+      await callRiverTest(page, "switchRoom", "Deep History Room");
+      await page.clock.runFor(0);
+      await expect(page.getByRole("heading", { name: "Deep History Room" })).toBeVisible();
+      await followRealFrames(page, 3);
+      await page.clock.runFor(5);
+      await followRealFrames(page, 2);
+      expect(await distanceFromBottom(page), "premise: the new room opened at its newest message").toBeLessThanOrEqual(
+        AT_BOTTOM_EPSILON_PX,
+      );
+      // The newest message can be from yesterday in the browser's timezone; let
+      // one arrival bring the "Today" divider in first.
+      await followDeliver(page, "first arrival in the new room");
+      await expectSettledAtBottom(page, "premise: the new room follows before the gesture");
+
+      expect(await followGate(page), "premise: the gate was removed for the correction").toBe(false);
+      await followMark(page, "new room move");
+      const move = await followReaderMove(page, -CORRECTED_UP_PX);
+      expect(move.delivered, "premise: the new room's scroll event reached the app").toBe(true);
+      expect(await followAwaitAfter(page, "new room move", "held"), "premise: the gate held its end").toBe(true);
+      await followRealFrames(page, 3);
+      const at = await newestVisibleRow(page);
+      expect(at, "premise: a message should be visible").not.toBeNull();
+      // Past the old deadline, and a full quiet interval after the new move.
+      await page.clock.runFor(QUIET_MS + 1);
+      await followDeliver(page, "join");
+      await expectRowHeld(
+        page,
+        at!,
+        `work left from the old room's correction settled the new room's gesture (${await followLog(page)})`,
+      );
+    } finally {
+      await teardown(page);
+    }
+  });
+
+  test("a new seek with the correction's deadline pending reaches the newest message, then follows", async ({
+    page,
+  }) => {
+    try {
+      await correctedHeldGesture(page, { upPx: 1_200, fillers: 25 });
+      await page.clock.runFor(0);
+      await expect(page.getByTestId("scroll-to-bottom")).toBeVisible({ timeout: 5_000 });
+      await page.getByTestId("scroll-to-bottom").click();
+      // Past the old deadline on the way: the seek is not a gesture it could end.
+      for (let i = 0; i < 60 && (await distanceFromBottom(page)) > AT_BOTTOM_EPSILON_PX; i++) await followFrame(page);
+      await expectSettledAtBottom(page, `the seek did not reach the newest message (${await followLog(page)})`);
+      await followDeliver(page, "arrival after the seek");
+      await expectSettledAtBottom(page, "the follow did not survive the seek");
+    } finally {
+      await teardown(page);
+    }
+  });
+  // Native input, no gate, on the browser's own clock: a held finger on
+  // Chromium (it sends no end until it lifts) or small wheel ticks elsewhere,
+  // then growth above the reader and, once the correction's end has reached the
+  // app or 20 frames have gone by, a short arrival. Whatever order the engine
+  // chose, the outcome has to match it. This says nothing about how long a real
+  // wheel gesture lives; the controlled cases above own the behaviour.
+  test("native input probe: a gesture, growth above it, then a short arrival", async ({
+    page,
+    browserName,
+    isMobile,
+  }) => {
+    test.skip(browserName === "webkit" && isMobile, "mobile WebKit has no gesture input that stays unsettled between frames");
+    await openRoomAtBottom(page, "Team Chat Room");
+    for (let i = 0; i < 8; i++) await deliver(page, `filler ${i}: ${"y".repeat(200)}`);
+    await expectSettledAtBottom(page, "premise: the fillers should have been followed");
+    await afterLayoutSettles(page);
+    const box = (await page.locator("#chat-scroll-container").boundingBox())!;
+    const x = box.x + box.width / 2;
+    let y = box.y + box.height / 2;
+    const cdp = browserName === "chromium" ? await page.context().newCDPSession(page) : null;
+    const touch = (type: string) =>
+      cdp!.send("Input.dispatchTouchEvent", { type, touchPoints: type === "touchEnd" ? [] : [{ x, y }] });
+    await followRecorderStart(page, { ownClock: true });
+    await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const probe = { lastScroll: 0, live: true };
+      c.addEventListener("scroll", () => probe.live && (probe.lastScroll = Date.now()));
+      (window as unknown as { __followProbe: typeof probe }).__followProbe = probe;
+    });
+    try {
+      const start = await scrollTop(page);
+      const up = async () => start - (await scrollTop(page));
+      if (cdp) {
+        await touch("touchStart");
+        for (let i = 0; i < 40 && (await up()) <= 0; i++) {
+          y += 1;
+          await touch("touchMove");
+          await page.waitForTimeout(20);
+        }
+        for (let i = 0; i < 60 && (await up()) < CORRECTED_UP_PX; i++) {
+          y += 1;
+          await touch("touchMove");
+          await page.waitForTimeout(20);
+        }
+      } else {
+        await page.mouse.move(x, y);
+        for (let i = 0; i < 20 && (await up()) < CORRECTED_UP_PX; i++) {
+          await page.mouse.wheel(0, -5);
+          await page.waitForTimeout(20);
+        }
+      }
+      expect(await up(), "premise: the gesture moved the view up past rounding").toBeGreaterThan(SCROLL_TOP_SLACK_PX);
+      await followMark(page, "moved");
+      const run = await page.evaluate((grow) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const rec = window.__followRecorder!;
+        const probe = (window as unknown as { __followProbe: { lastScroll: number; live: boolean } }).__followProbe;
+        const box = c.getBoundingClientRect();
+        let at: { id: string; gap: number } | null = null;
+        for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
+          const r = row.getBoundingClientRect();
+          if (r.bottom > box.top && r.top < box.bottom) at = { id: row.id, gap: box.bottom - r.top };
+        }
+        const above = Array.from(c.querySelectorAll<HTMLElement>('[id^="msg-"]'))
+          .filter((r) => r.getBoundingClientRect().bottom < box.top)
+          .at(-1)!;
+        const endedBefore = rec.log.slice(rec.log.lastIndexOf("moved")).includes("end");
+        probe.live = false;
+        const lastReader = probe.lastScroll;
+        const before = c.scrollTop;
+        above.style.paddingTop = `${grow}px`;
+        rec.log.push("grow");
+        const grewAt = Date.now();
+        let endAt: number | null = null;
+        const onEnd = () => (endAt ??= Date.now());
+        c.addEventListener("scrollend", onEnd);
+        const events = () => document.querySelectorAll("#chat-content [data-anchor-row][data-item-key]").length;
+        return new Promise<{
+          at: typeof at;
+          endedBefore: boolean;
+          lastReader: number;
+          grewAt: number;
+          endAt: number | null;
+          patchAt: number;
+          correction: number;
+        }>((resolve) => {
+          let frames = 0;
+          const deliverNow = () => {
+            c.removeEventListener("scrollend", onEnd);
+            const correction = c.scrollTop - before;
+            const count = events();
+            rec.log.push("deliver");
+            window.__riverTest!.appendJoinEvent();
+            const observer = new MutationObserver(() => {
+              if (events() <= count) return;
+              observer.disconnect();
+              const patchAt = Date.now();
+              rec.log.push("patch");
+              rec.afterRealFrame(() =>
+                rec.afterRealFrame(() => resolve({ at, endedBefore, lastReader, grewAt, endAt, patchAt, correction })),
+              );
+            });
+            observer.observe(document.getElementById("chat-content")!, { childList: true, subtree: true });
+          };
+          const wait = () => rec.afterRealFrame(() => (endAt !== null || ++frames >= 20 ? deliverNow() : wait()));
+          wait();
+        });
+      }, GROW_PX);
+      await afterLayoutSettles(page);
+      const log = await followLog(page);
+      const drift = await rowDrift(page, run.at!);
+      const distance = await distanceFromBottom(page);
+      const t = (v: number | null) => (v === null ? "none" : `${v - run.lastReader}ms`);
+      const timeline =
+        `${log}; after the reader's last scroll: growth ${t(run.grewAt)}, correction end ${t(run.endAt)}, ` +
+        `patch ${t(run.patchAt)}; correction ${run.correction}px, then drift ${drift.toFixed(1)}px, ${distance.toFixed(1)}px above the end`;
+      test.info().annotations.push({ type: "native order", description: timeline });
+      expect(run.at, "premise: a message should be visible").not.toBeNull();
+      const held = drift <= IN_PLACE_TOLERANCE_PX;
+      const followed = distance <= AT_BOTTOM_EPSILON_PX;
+      expect(held || followed, `the arrival neither held the reader's message nor followed (${timeline})`).toBe(true);
+      // Settled before the growth: a pinned reader is snapped by it. Still held
+      // with no end at all: nothing settles it. Otherwise the quiet deadline
+      // decides, with 30ms either side of it left to the engine.
+      const quiet = run.patchAt - run.lastReader;
+      const expected = run.endedBefore
+        ? "followed"
+        : run.endAt === null || quiet < QUIET_MS - 30
+          ? "held"
+          : quiet > QUIET_MS + 30
+            ? "followed"
+            : null;
+      if (expected) expect(held ? "held" : "followed", `the outcome does not match the order (${timeline})`).toBe(expected);
+    } finally {
+      if (cdp) await touch("touchEnd").catch(() => {});
+      await followRecorderStop(page);
+    }
+  });
+});
+
+test.describe("An anchor correction's own scrollend, on the mobile layout", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  test("a hide with the correction's deadline pending settles on the reveal, and the next gesture is its own", async ({
+    page,
+  }) => {
+    const chat = page.locator("#chat-scroll-container");
+    try {
+      await correctedHeldGesture(page);
+      await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).click();
+      await page.clock.runFor(0);
+      await expect(chat).toBeHidden({ timeout: 5_000 });
+      await expect.poll(() => viewportHeight(page), { message: "premise: the hidden chat has no height" }).toBe(0);
+      await followRealFrames(page, 2);
+      // The deadline runs while the chat is hidden: the settle waits for the reveal.
+      await page.clock.runFor(QUIET_MS);
+      await followRealFrames(page, 2);
+      await page.getByTestId("rooms-back-button").click();
+      await page.clock.runFor(0);
+      await expect(chat).toBeVisible();
+      await followRealFrames(page, 3);
+      await followDeliver(page, "join");
+      await expectSettledAtBottom(page, `the gesture settled inside the band was not followed after the reveal (${await followLog(page)})`);
+
+      // A new gesture holds its own arrival: nothing of the old one is left to end it.
+      expect(await followGate(page), "premise: the gate was removed for the correction").toBe(false);
+      await followMark(page, "next move");
+      const move = await followReaderMove(page, -CORRECTED_UP_PX);
+      expect(move.delivered, "premise: the next gesture's scroll event reached the app").toBe(true);
+      expect(await followAwaitAfter(page, "next move", "held"), "premise: the gate held its end").toBe(true);
+      await followRealFrames(page, 3);
+      const at = await newestVisibleRow(page);
+      expect(at, "premise: a message should be visible").not.toBeNull();
+      await followDeliver(page, `arrival in the next gesture: ${"n".repeat(20)}`);
+      await expectRowHeld(page, at!, `the next gesture did not hold its arrival (${await followLog(page)})`);
+    } finally {
+      await teardown(page);
     }
   });
 });

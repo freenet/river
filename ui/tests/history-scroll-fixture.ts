@@ -521,9 +521,11 @@ export function gateScrollendExpectOrder(run: GateScrollendRun) {
 // ---- settle debounce ----
 //
 // Where a browser has no `scrollend` (Safari before 17.4), the history settles a
-// gesture with a 120ms debounce on `scroll` instead (`SCROLL_SETTLE_DEBOUNCE_MS`
-// in ui/src/components/conversation/history_scroll.rs). Every engine in the
-// suite has `scrollend`, so the fallback only runs when a test selects it:
+// gesture at the reader's quiet deadline instead: 120ms after their last move
+// (`SCROLL_SETTLE_DEBOUNCE_MS` in ui/src/components/conversation/history_scroll.rs),
+// re-armed by every scroll the app reads as the reader's and by nothing of its
+// own. Every engine in the suite has `scrollend`, so the fallback only runs
+// when a test selects it:
 //
 // * `install` asks `Reflect.has(container, "onscrollend")`. The init script
 //   below answers false for exactly that question, about exactly
@@ -532,9 +534,9 @@ export function gateScrollendExpectOrder(run: GateScrollendRun) {
 //   listener for it.
 // * The app's fallback registrations are recognised by where they come from: a
 //   `setTimeout(settle, 120)` made while a `scroll` event on that container is
-//   being dispatched, with the same callback every time (the one `settle`
-//   closure). Their clears and firings are recorded; every other timer passes
-//   straight through.
+//   being dispatched (the reader's move, read in the app's listener), with the
+//   same callback every time (the one quiet-deadline closure). Their clears and
+//   firings are recorded; every other timer passes straight through.
 // * Playwright's clock runs every timer, so the test decides when 120ms have
 //   passed. It also runs `crate::util::defer`'s `setTimeout(0)`: an inbound
 //   delivery and any deferred signal write wait for an explicit advance.
@@ -793,16 +795,18 @@ export async function debounceAdvance(page: Page, ms: number) {
   await debounceFrames(page);
 }
 
-/// The fallback is what `install` chose: the app asked, was told no, added a
-/// second `scroll` listener and no `scrollend` one, and the setup's own scrolls
-/// (follow snaps) have already gone through the debounce.
+/// The fallback is what `install` chose: the app asked, was told no, and added
+/// no `scrollend` listener. The setup's own scrolls are follow snaps, which are
+/// not the reader's and arm nothing; each test checks its own reader scroll
+/// armed the deadline (`expectFreshDeadline` and the like).
 export async function debounceExpectFallbackSelected(page: Page) {
   const state = await debounceState(page);
   expect(state.lookups, "premise: the app asked whether the container has onscrollend").toBeGreaterThanOrEqual(1);
   expect(state.otherLookupDelegated, "premise: the override answers only for the container").toBe(true);
-  expect(state.installListeners, "premise: install added the debounce's scroll listener").toContain("scroll");
+  expect(state.installListeners, "premise: the lookup was install's (its later listeners were seen)").toContain(
+    "touchstart",
+  );
   expect(state.installListeners, "premise: install added no scrollend listener").not.toContain("scrollend");
-  expect(state.registrations.length, "premise: the setup's scrolls armed the debounce").toBeGreaterThan(0);
   expect(state.strayCallbacks, "premise: every 120ms timer from a scroll is the one settle").toBe(0);
 }
 
