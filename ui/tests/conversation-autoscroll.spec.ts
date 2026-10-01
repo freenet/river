@@ -1473,6 +1473,151 @@ test.describe("Our own scroll's echo is not the reader", () => {
   });
 });
 
+/// How far above the end the scroll-to-latest animation must still be when a
+/// seek test interrupts it, so the interruption is mid-flight, not at the end.
+const SEEK_MID_FLIGHT_PX = 300;
+
+/// What a seek test does to the scroll-to-latest animation mid-flight.
+type SeekInterruption =
+  | { kind: "arrival"; text: string }
+  | { kind: "burst"; count: number }
+  | { kind: "growth-above"; px: number }
+  | { kind: "wheel-up"; px: number }
+  | { kind: "touch-stop" }
+  | { kind: "hide" };
+
+/// Scroll the reader to the top, press the scroll-to-latest button, and apply
+/// `interruption` from inside the first scroll event of its animation that has
+/// visibly started and is still more than SEEK_MID_FLIGHT_PX above the end. In
+/// the event, so nothing else runs between the check and the interruption; the
+/// app's own listener was installed first, so that frame is already recorded.
+async function seekAndInterrupt(page: Page, interruption: SeekInterruption) {
+  await readerScrollsWithoutGesture(page, 0);
+  await afterLayoutSettles(page);
+  await expect(page.getByTestId("scroll-to-bottom")).toBeVisible({ timeout: 5_000 });
+  const result = await page.evaluate(
+    ({ interruption, midFlight }) =>
+      new Promise<{ fired: boolean; distance: number; frames: number; why: string }>((resolve) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const start = c.scrollTop;
+        let frames = 0;
+        const finish = (r: { fired: boolean; distance: number; why: string }) => {
+          c.removeEventListener("scroll", onScroll);
+          clearTimeout(timer);
+          resolve({ ...r, frames });
+        };
+        const timer = setTimeout(() => finish({ fired: false, distance: NaN, why: "no animation frame came" }), 5_000);
+        const onScroll = () => {
+          frames++;
+          const top = c.scrollTop;
+          const distance = c.scrollHeight - c.clientHeight - top;
+          if (top < start + 50) return;
+          if (distance <= midFlight) {
+            finish({ fired: false, distance, why: "the animation was already near the end" });
+            return;
+          }
+          const hooks = (window as any).__riverTest;
+          switch (interruption.kind) {
+            case "arrival":
+              hooks.appendMessage(interruption.text);
+              break;
+            case "burst":
+              hooks.appendMessages(interruption.count);
+              break;
+            case "growth-above": {
+              const box = c.getBoundingClientRect();
+              const row = Array.from(c.querySelectorAll<HTMLElement>('[id^="msg-"]')).find(
+                (r) => r.getBoundingClientRect().bottom < box.top,
+              );
+              // Not yet a row wholly above the view: wait for a later frame.
+              if (!row) return;
+              row.style.paddingTop = `${interruption.px}px`;
+              break;
+            }
+            case "wheel-up":
+              c.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }));
+              c.scrollTop = top - interruption.px;
+              break;
+            case "touch-stop":
+              // A finger landing on the moving history: the browser stops the
+              // animation where it is. Synthetic, so the 1px write is what
+              // stops it here.
+              c.dispatchEvent(new Event("touchstart", { bubbles: true }));
+              c.scrollTop = top - 1;
+              break;
+            case "hide":
+              (document.querySelector('[data-testid="hamburger-rooms-button"]') as HTMLElement).click();
+              break;
+          }
+          finish({ fired: true, distance, why: "" });
+        };
+        c.addEventListener("scroll", onScroll);
+        (document.querySelector('[data-testid="scroll-to-bottom"]') as HTMLElement).click();
+      }),
+    { interruption, midFlight: SEEK_MID_FLIGHT_PX },
+  );
+  expect(
+    result.fired,
+    `premise: the interruption should land mid-flight (${result.why}; ${result.frames} frames, ${result.distance}px above the end)`,
+  ).toBe(true);
+  return result;
+}
+
+// The scroll-to-latest button scrolls smoothly. The reader asked to follow, and
+// nothing that happens during the animation (an arrival, growth above them, our
+// own frames) should take that back; only the reader taking over should.
+test.describe("The scroll-to-latest animation keeps following to the end", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  for (const interruption of [
+    { kind: "arrival", text: `arrival during the animation: ${"v".repeat(200)}` },
+    { kind: "burst", count: 5 },
+    { kind: "growth-above", px: 400 },
+  ] as const) {
+    test(`it ends at the newest message after ${interruption.kind} mid-flight, then follows`, async ({ page }) => {
+      await openRoomAtBottom(page, "Team Chat Room");
+      await fillHistory(page, 16);
+      const heightBefore = await historyHeight(page);
+      await seekAndInterrupt(page, interruption);
+      if (interruption.kind === "burst") {
+        await expect(page.getByText(`batched arrival 0${interruption.count - 1}`)).toBeAttached({ timeout: 5_000 });
+      }
+      if (interruption.kind !== "arrival") {
+        await expect
+          .poll(() => historyHeight(page), {
+            timeout: 5_000,
+            message: "premise: the interruption should grow the history by more than the follow band",
+          })
+          .toBeGreaterThan(heightBefore + BOTTOM_THRESHOLD_PX);
+      }
+      await expectSettledAtBottom(page, `the animation did not end at the newest message after ${interruption.kind}`);
+      await afterLayoutSettles(page);
+      await expectSettledAtBottom(page, "the view left the newest message after the animation ended");
+      await deliver(page, "arrival after the animation");
+      await expectSettledAtBottom(page, `the follow did not survive ${interruption.kind} during the animation`);
+    });
+  }
+
+  for (const interruption of [{ kind: "wheel-up", px: 400 }, { kind: "touch-stop" }] as const) {
+    test(`the reader taking over mid-flight (${interruption.kind}) stays parked through the next arrival`, async ({
+      page,
+    }) => {
+      await openRoomAtBottom(page, "Team Chat Room");
+      await fillHistory(page, 16);
+      await seekAndInterrupt(page, interruption);
+      await afterLayoutSettles(page);
+      expect(
+        await distanceFromBottom(page),
+        `the animation carried on to the end after ${interruption.kind}`,
+      ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      const parked = await newestVisibleMessage(page);
+      expect(parked, "premise: a message should be visible").not.toBeNull();
+      await deliver(page, `arrival after the reader took over: ${"u".repeat(200)}`);
+      await expectInPlace(page, parked!, `an arrival after ${interruption.kind} moved the reader`, { hold: true });
+    });
+  }
+});
+
 // freenet/river#723: the reader scrolls back down to the newest message, and an
 // arrival lands BEFORE that scroll's event is delivered. If the arrival's
 // restore went on the stale "parked" state it would hold the view where the
@@ -2043,6 +2188,21 @@ test.describe("The hidden mobile chat column", () => {
     await expectSettledAtBottom(page, "arrivals while the chat was hidden were not followed");
     await deliver(page, "arrival after the chat came back");
     await expectSettledAtBottom(page, "the follow did not survive the chat being hidden");
+  });
+
+  test("the scroll-to-latest animation cut short by hiding the chat finishes at the newest message on reveal", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page, 12);
+    await seekAndInterrupt(page, { kind: "hide" });
+    await expect(chat(page)).toBeHidden({ timeout: 5_000 });
+    await afterLayoutSettles(page);
+    await page.getByTestId("rooms-back-button").click();
+    await expect(chat(page)).toBeVisible();
+    await expectSettledAtBottom(page, "the hidden animation did not finish at the newest message on reveal");
+    await deliver(page, "arrival after the hidden animation");
+    await expectSettledAtBottom(page, "the follow did not survive the animation being hidden");
   });
 
   for (const reveal of [

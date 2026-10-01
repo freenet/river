@@ -8067,22 +8067,6 @@ mod autoscroll_wiring_pins {
         );
     }
 
-    /// `capture` may only run for a scroll the reader made; anything else calling
-    /// it lets a layout change move the pin (the #486 latch).
-    #[test]
-    fn capture_runs_only_from_the_scroll_listener() {
-        let hist = dense(history_source());
-        let on_scroll = hist
-            .split("fnon_scroll(")
-            .nth(1)
-            .and_then(|rest| rest.split("fnsnap_to_bottom(").next())
-            .expect("history_scroll.rs should define `on_scroll` before `snap_to_bottom`");
-        assert!(
-            hist.matches(".capture(").count() == 1 && on_scroll.contains(".capture("),
-            "`.capture(` must appear exactly once in history_scroll.rs, inside `on_scroll`"
-        );
-    }
-
     /// A trim is only invisible at the exact bottom, and only when the trimmed
     /// tail would not re-fire the backfill (#505). Loosening either gate yanks
     /// a reader parked in the pin band, or oscillates trim against backfill.

@@ -67,6 +67,11 @@ use dioxus::prelude::WritableExt;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{prelude::*, JsCast};
 
+/// Trailing delay that stands in for `scrollend` where the browser has none
+/// (Safari before 17.4), as on `main`.
+#[cfg(target_arch = "wasm32")]
+const SCROLL_SETTLE_DEBOUNCE_MS: i32 = 120;
+
 /// How many rows above the newest visible one are remembered as fallbacks, for
 /// when the anchor row itself is deleted or windowed out before the restore.
 const ANCHOR_FALLBACK_ROWS: usize = 4;
@@ -237,6 +242,16 @@ pub(super) struct HistoryHooks {
     pub snapped_to_bottom: Rc<dyn Fn()>,
 }
 
+/// What drives the view between reader scrolls.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Follow {
+    /// The pin and the anchor drive restores.
+    #[default]
+    Free,
+    /// The scroll-to-latest animation is travelling to the end.
+    Seeking,
+}
+
 /// The history's scroll state. See the module doc.
 pub(super) struct HistoryScroll {
     /// Newest visible row first, each with its gap. Empty until a reader scrolls.
@@ -248,6 +263,9 @@ pub(super) struct HistoryScroll {
     /// The layout and `scrollTop` as last accounted for, to classify a `scroll`.
     sig: Cell<LayoutSig>,
     top: Cell<i32>,
+    follow: Cell<Follow>,
+    /// The debounce standing in for `scrollend` where the browser lacks it.
+    settle_timer: Cell<Option<i32>>,
     /// Set by `install` once the listeners exist, so `is_some` also means
     /// "installed".
     hooks: RefCell<Option<HistoryHooks>>,
@@ -261,6 +279,8 @@ impl Default for HistoryScroll {
             force: Cell::new(false),
             sig: Cell::new(LayoutSig::default()),
             top: Cell::new(0),
+            follow: Cell::new(Follow::Free),
+            settle_timer: Cell::new(None),
             hooks: RefCell::new(None),
         }
     }
@@ -279,6 +299,16 @@ impl HistoryScroll {
         self.force.set(true);
         self.sig.set(LayoutSig::default());
         self.top.set(0);
+        self.end_interaction();
+    }
+
+    /// Forget any seek in flight: a room switch or a forced snap supersedes it.
+    fn end_interaction(&self) {
+        self.follow.set(Follow::Free);
+        #[cfg(target_arch = "wasm32")]
+        if let (Some(handle), Some(window)) = (self.settle_timer.take(), web_sys::window()) {
+            window.clear_timeout_with_handle(handle);
+        }
     }
 }
 
@@ -354,8 +384,8 @@ impl HistoryScroll {
         self.top.set(container.scroll_top());
     }
 
-    /// Take the reader's position as the new truth. Only ever called from
-    /// `on_scroll`, for a scroll the reader made.
+    /// Take the reader's position as the new truth: for a scroll the reader made,
+    /// and for a touch that stops the scroll-to-latest animation.
     fn capture(&self) {
         let Some(container) = laid_out_container() else {
             return;
@@ -477,20 +507,48 @@ impl HistoryScroll {
         let Some(container) = laid_out_container() else {
             return;
         };
-        if self.force.take() || self.pinned.get() {
-            self.snap_to_bottom(web_sys::ScrollBehavior::Instant);
-            let snapped = self
-                .hooks
-                .borrow()
-                .as_ref()
-                .map(|h| h.snapped_to_bottom.clone());
-            if let Some(snapped) = snapped {
-                snapped();
-            }
+        if self.force.take() {
+            self.end_interaction();
+            self.snap_and_tell();
             return;
         }
-        self.restore_anchor(&container);
-        self.record(&container);
+        match self.follow.get() {
+            Follow::Seeking => self.seek(&container),
+            Follow::Free if self.pinned.get() => self.snap_and_tell(),
+            Follow::Free => {
+                self.restore_anchor(&container);
+                self.record(&container);
+            }
+        }
+    }
+
+    /// Snap to the bottom at once, and tell the component it happened (the
+    /// opening snap's completion, with its own room check).
+    fn snap_and_tell(&self) {
+        self.snap_to_bottom(web_sys::ScrollBehavior::Instant);
+        let snapped = self
+            .hooks
+            .borrow()
+            .as_ref()
+            .map(|h| h.snapped_to_bottom.clone());
+        if let Some(snapped) = snapped {
+            snapped();
+        }
+    }
+
+    /// Aim the scroll-to-latest animation at the live end, or finish it when it is
+    /// already there. Re-issuing it retargets an animation in flight and restarts
+    /// one a hide cut short. Never an opening snap: nothing is told.
+    fn seek(&self, container: &web_sys::Element) {
+        if at_end(container.scroll_top(), max_scroll_top(container)) {
+            self.follow.set(Follow::Free);
+        } else {
+            let opts = web_sys::ScrollToOptions::new();
+            opts.set_top(container.scroll_height() as f64);
+            opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+            container.scroll_to_with_scroll_to_options(&opts);
+        }
+        self.record(container);
     }
 
     /// Scroll the first anchor row that still exists back to its gap. If none
@@ -524,8 +582,54 @@ impl HistoryScroll {
             // Still a bottom: a follower's snap trims here.
             ScrollCause::Echo => self.trim_at_bottom(&container),
             ScrollCause::Layout => self.restore_now(),
-            ScrollCause::Reader => self.capture(),
+            ScrollCause::Reader => self.on_reader_scroll(&container),
         }
+    }
+
+    /// A scroll nothing else accounts for. During the scroll-to-latest animation
+    /// that is mostly the animation itself, which must not unpin; otherwise it
+    /// is the reader.
+    fn on_reader_scroll(&self, container: &web_sys::Element) {
+        if self.follow.get() != Follow::Seeking {
+            self.capture();
+            return;
+        }
+        match seek_step(
+            self.top.get(),
+            container.scroll_top(),
+            max_scroll_top(container),
+        ) {
+            SeekStep::Travelling => self.record(container),
+            SeekStep::Arrived => {
+                self.follow.set(Follow::Free);
+                self.record(container);
+                self.trim_at_bottom(container);
+            }
+            SeekStep::TakenOver => {
+                self.follow.set(Follow::Free);
+                self.capture();
+            }
+        }
+    }
+
+    /// A scroll has come to rest (`scrollend`, or the debounce standing in for
+    /// it). Finishes or re-aims a seek whose animation ended short of the end.
+    fn settle(&self) {
+        self.settle_timer.set(None);
+        if self.follow.get() == Follow::Seeking {
+            self.restore_now();
+        }
+    }
+
+    /// A finger on the history stops the scroll-to-latest animation where it is:
+    /// that is where the reader now is. Captured directly, not through `on_scroll`,
+    /// because nothing may have moved since the last frame was recorded.
+    fn on_touch_start(&self) {
+        if self.follow.get() != Follow::Seeking || laid_out_container().is_none() {
+            return;
+        }
+        self.follow.set(Follow::Free);
+        self.capture();
     }
 
     /// Scroll to the newest message and re-arm the pin: asking for it is the
@@ -540,6 +644,13 @@ impl HistoryScroll {
             return;
         };
         self.pinned.set(true);
+        if behavior == web_sys::ScrollBehavior::Smooth {
+            // The animation's frames are not the reader: see `on_reader_scroll`.
+            self.end_interaction();
+            self.follow.set(Follow::Seeking);
+            self.seek(&container);
+            return;
+        }
         let opts = web_sys::ScrollToOptions::new();
         opts.set_top(container.scroll_height() as f64);
         opts.set_behavior(behavior);
@@ -599,11 +710,72 @@ impl HistoryScroll {
             &passive,
         );
 
+        // `scrollend` fires once the position has come to rest. Where it is
+        // missing, a trailing debounce on `scroll` stands in, as on `main`; it
+        // cannot tell a paused finger from a lifted one.
+        let settle = {
+            let this = self.clone();
+            Closure::wrap(Box::new(move || this.settle()) as Box<dyn FnMut()>)
+        };
+        let has_scrollend =
+            js_sys::Reflect::has(&container, &JsValue::from_str("onscrollend")).unwrap_or(false);
+        let on_settle_signal = if has_scrollend {
+            let settle_fn: js_sys::Function =
+                settle.as_ref().unchecked_ref::<js_sys::Function>().clone();
+            let cb = Closure::wrap(Box::new(move |_: web_sys::Event| {
+                let _ = settle_fn.call0(&JsValue::NULL);
+            }) as Box<dyn FnMut(web_sys::Event)>);
+            let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
+                "scrollend",
+                cb.as_ref().unchecked_ref(),
+                &passive,
+            );
+            cb
+        } else {
+            let this = self.clone();
+            let settle_fn: js_sys::Function =
+                settle.as_ref().unchecked_ref::<js_sys::Function>().clone();
+            let cb = Closure::wrap(Box::new(move |_: web_sys::Event| {
+                let Some(window) = web_sys::window() else {
+                    return;
+                };
+                if let Some(handle) = this.settle_timer.take() {
+                    window.clear_timeout_with_handle(handle);
+                }
+                if let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    &settle_fn,
+                    SCROLL_SETTLE_DEBOUNCE_MS,
+                ) {
+                    this.settle_timer.set(Some(handle));
+                }
+            }) as Box<dyn FnMut(web_sys::Event)>);
+            let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
+                "scroll",
+                cb.as_ref().unchecked_ref(),
+                &passive,
+            );
+            cb
+        };
+
+        let on_touch_start = {
+            let this = self.clone();
+            Closure::wrap(Box::new(move |_: web_sys::Event| this.on_touch_start())
+                as Box<dyn FnMut(web_sys::Event)>)
+        };
+        let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
+            "touchstart",
+            on_touch_start.as_ref().unchecked_ref(),
+            &passive,
+        );
+
         // Leaked deliberately: `Conversation` mounts once for the app's lifetime
         // (rooms are swapped by CSS, not by unmount) and `use_effect` has no
         // cleanup hook, so there is nothing to disconnect these from.
         on_resize.forget();
         on_scroll.forget();
+        settle.forget();
+        on_settle_signal.forget();
+        on_touch_start.forget();
     }
 }
 
@@ -889,10 +1061,12 @@ mod tests {
         history.anchor.borrow_mut().push(("m1".into(), 120));
         history.sig.set(sig(3000, 600, 1000));
         history.top.set(2000);
+        history.follow.set(Follow::Seeking);
 
         history.reset_for_room();
 
         assert!(history.pinned.get() && history.force.get());
+        assert_eq!(history.follow.get(), Follow::Free);
         assert!(history.anchor.borrow().is_empty());
         assert_eq!(history.sig.get(), LayoutSig::default());
         assert_eq!(history.top.get(), 0);
