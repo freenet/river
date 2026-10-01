@@ -1071,7 +1071,9 @@ impl HistoryScroll {
     }
 
     /// The gesture is over: where it came to rest decides the pin. Does not
-    /// snap. Hidden, it waits for the reveal's restore.
+    /// snap. Hidden, it waits for the reveal's restore. Completing it cancels
+    /// its quiet deadline: a reveal ends a gesture with no settle of its own,
+    /// and a handle left behind would be taken for the next gesture's.
     fn end_gesture(&self) {
         if !matches!(self.follow.get(), Follow::Gesture { .. }) {
             return;
@@ -1080,6 +1082,7 @@ impl HistoryScroll {
             self.settle_pending.set(true);
             return;
         };
+        self.cancel_settle_timer();
         self.follow.set(Follow::Free);
         self.correction.set(None);
         self.capture(&container);

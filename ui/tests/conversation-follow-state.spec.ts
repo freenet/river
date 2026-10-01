@@ -755,6 +755,89 @@ test.describe("An anchor correction's own scrollend, on the mobile layout", () =
       await teardown(page);
     }
   });
+
+  // The complement of the case above: the reveal comes back BEFORE the
+  // correction's deadline. Its restore completes the gesture the hide ended, and
+  // that completion now cancels the deadline. Before, the handle survived it, and
+  // the next gesture's first move took the stale handle for a deadline of its
+  // own and re-armed it (with `scrollend`, a reader move re-arms only a pending
+  // one), so a gesture still held under a finger settled 120ms later and the
+  // next short arrival snapped it. Ends are gated from the hide on, so the only
+  // thing that can complete the old gesture is the reveal's restore, and the
+  // new gesture's own end stands in for a finger still down.
+  test("a reveal before the correction's deadline ends that deadline with the gesture, so the next gesture stays held past 120ms", async ({
+    page,
+  }) => {
+    const chat = page.locator("#chat-scroll-container");
+    try {
+      await correctedHeldGesture(page, { observeSettle: true });
+      const armed = await followSettleRecord(page);
+      expect(armed.settle.length, `premise: the refused correction end armed one deadline (${JSON.stringify(armed)})`).toBe(1);
+      const old = armed.settle[0];
+      expect(old.cleared ?? old.fired, "premise: the correction's deadline is pending").toBeNull();
+      expect(await followGate(page), "premise: the gate was removed for the correction").toBe(false);
+
+      await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).click();
+      await page.clock.runFor(0);
+      await expect(chat).toBeHidden({ timeout: 5_000 });
+      await expect.poll(() => viewportHeight(page), { message: "premise: the hidden chat has no height" }).toBe(0);
+      await followRealFrames(page, 2);
+      await page.getByTestId("rooms-back-button").click();
+      await page.clock.runFor(0);
+      await expect(chat).toBeVisible();
+      await followRealFrames(page, 3);
+      const revealed = await followSettleRecord(page);
+      const oldAtReveal = revealed.settle.find((t) => t.handle === old.handle)!;
+      expect(revealed.now, "premise: the reveal came back before the old deadline was due").toBeLessThan(old.at + old.delay);
+      expect(oldAtReveal.fired, "premise: the old deadline has not fired").toBeNull();
+      await followDeliver(page, "arrival after the reveal");
+      await expectSettledAtBottom(page, `the gesture the reveal completed inside the band was not followed (${await followLog(page)})`);
+
+      await followMark(page, "next move");
+      const move = await followReaderMove(page, -CORRECTED_UP_PX);
+      expect(move.delivered, "premise: the next gesture's scroll event reached the app").toBe(true);
+      expect(await followAwaitAfter(page, "next move", "held"), "premise: the gate held its end").toBe(true);
+      await followRealFrames(page, 3);
+      const at = await newestVisibleRow(page);
+      expect(at, "premise: a message should be visible").not.toBeNull();
+      expect(await distanceFromBottom(page), "premise: the next gesture is inside the band").toBeLessThanOrEqual(
+        BOTTOM_THRESHOLD_PX - 40 - IN_PLACE_TOLERANCE_PX,
+      );
+      // Past a full quiet interval from the move, with the gesture still held.
+      await page.clock.runFor(QUIET_MS + 1);
+      await followRealFrames(page, 2);
+      await followDeliver(page, "join");
+      const what = `${JSON.stringify(await followSettleRecord(page))}; ${await followLog(page)}`;
+      await expectRowHeld(
+        page,
+        at!,
+        `the reveal left the old deadline attached, the next gesture re-armed it and settled at 120ms, so the arrival snapped (${what})`,
+      );
+      // Supporting record. Desktop WebKit's own reveal `scroll` can re-arm the
+      // old deadline before the restore completes the gesture; the completion
+      // then cancels whichever handle is pending.
+      expect(oldAtReveal.cleared, `the old deadline was not cancelled by the reveal (${what})`).not.toBeNull();
+      expect(
+        revealed.settle.filter((t) => t.cleared === null),
+        `a deadline was still pending after the reveal completed the gesture (${what})`,
+      ).toEqual([]);
+      expect(
+        (await followSettleRecord(page)).settle.length,
+        `the next gesture armed a deadline (${what})`,
+      ).toBe(revealed.settle.length);
+
+      // Its end, which the gate consumed, stands in as a synthetic one: the
+      // gesture settles inside the band and follows again.
+      expect(await followUngate(page), "premise: the gate was in place").toBe(true);
+      await followMark(page, "release");
+      await page.evaluate(() => document.getElementById("chat-scroll-container")!.dispatchEvent(new Event("scrollend")));
+      expect(await followAwaitAfter(page, "release", "end"), "premise: the released end reached the app").toBe(true);
+      await followDeliver(page, "arrival after the released end");
+      await expectSettledAtBottom(page, `the next gesture's own end did not restore following (${await followLog(page)})`);
+    } finally {
+      await teardown(page);
+    }
+  });
 });
 
 // Content can grow above a held reader with `scrollTop` unchanged (an image
