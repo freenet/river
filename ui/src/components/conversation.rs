@@ -1729,7 +1729,6 @@ impl HistoryWindow {
 /// rounds, so an exact comparison would report a 1px difference on a view that
 /// never moved. `conversation-autoscroll.spec.ts` is what catches this being
 /// too tight.
-#[cfg(target_arch = "wasm32")]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
 /// The two affordances the no-room screen must offer in EVERY load state

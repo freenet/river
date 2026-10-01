@@ -14,11 +14,23 @@
 //!   content-change effect, and a `scroll` classified as layout). Forced or
 //!   pinned, it goes to the bottom; otherwise it scrolls the first surviving
 //!   anchor row back to its gap. It never changes the anchor or clears the pin.
-//! * **The one heuristic**: a `scroll` event is layout's (a browser clamp) if the
-//!   layout signature changed since it was recorded AND `scrollTop` moved no more
-//!   than `LAYOUT_SHIFT_ALLOWANCE_PX`. Residual: a reader who moves less than
-//!   that in the very frame a layout change lands loses that frame's movement.
-//!   The pin can't latch on it, since the next scroll event captures.
+//! * **The one heuristic** (`classify_scroll`): a `scroll` event is layout's (a
+//!   browser clamp) if the recorded `scrollTop` is out of reach of the live
+//!   scroll range and the view now sits at its end, whether or not anything was
+//!   resized (removing a positioned overhang clamps with nothing resized); or if
+//!   the layout signature changed since it was recorded AND `scrollTop` moved no
+//!   more than `LAYOUT_SHIFT_ALLOWANCE_PX`, for a clamp taken during a shorter
+//!   intermediate layout that ends short of the end. Geometry, not provenance.
+//!   Residuals: a reader who moves less than the allowance in the very frame a
+//!   layout change lands loses that frame's movement (the pin can't latch on it,
+//!   since the next scroll event captures); an intermediate clamp larger than
+//!   the allowance is taken as the reader; and a reader who scrolls to the end in
+//!   the frame of a final-end clamp is indistinguishable from it.
+//!   The signature records the layout's shape (content and container sizes); the
+//!   scroll range is always read live. It can still be stale when an event is
+//!   classified: ResizeObserver delivery is asynchronous, a hidden history
+//!   records nothing, and the sizes read are client sizes, not exactly the boxes
+//!   the observer watches.
 //! * **Late scroll events**: a `scroll` event arrives a frame after the scroll,
 //!   and a content change can land first. So `restore`, and the render before a
 //!   patch, first read a pending reader scroll (`take_in_undelivered_scroll`,
@@ -43,13 +55,13 @@
 // the unit tests.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-use super::{WindowAnchor, BOTTOM_THRESHOLD_PX};
+use super::{WindowAnchor, BOTTOM_THRESHOLD_PX, SCROLL_TOP_SLACK_PX};
 use dioxus::prelude::Signal;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[cfg(target_arch = "wasm32")]
-use super::{trim_would_rearm_backfill, INITIAL_WINDOW_ITEMS, SCROLL_TOP_SLACK_PX};
+use super::{trim_would_rearm_backfill, INITIAL_WINDOW_ITEMS};
 #[cfg(target_arch = "wasm32")]
 use dioxus::prelude::WritableExt;
 #[cfg(target_arch = "wasm32")]
@@ -59,19 +71,29 @@ use wasm_bindgen::{prelude::*, JsCast};
 /// when the anchor row itself is deleted or windowed out before the restore.
 const ANCHOR_FALLBACK_ROWS: usize = 4;
 
-/// The most a `scroll` event may move `scrollTop` and still be read as the
-/// browser's clamp after a layout change rather than the reader.
+/// The most a `scroll` event may move `scrollTop`, after the layout signature
+/// changed, and still be read as the browser's clamp rather than the reader.
 ///
-/// The clamps measured so far were 8px (Linux CI), 56px (a spike) and 111px (the
-/// synthetic clamp test), so this leaves headroom over the largest. What a
-/// reader who moves less than this loses is in the module doc.
+/// Only needed for a clamp that does NOT end at the final end: one taken during
+/// an intermediate, shorter layout before the history came out taller. A clamp
+/// to the final end is recognized at any size, by the final-end clause of
+/// `classify_scroll`. The 8px (Linux CI) and 56px clamps quoted for this before
+/// came from other trees with CSS size containers, and the 111px one from a
+/// synthetic test, so they are context rather than measurements of this code.
+/// What this costs either way (a reader's small move in the same frame taken as
+/// layout, a larger intermediate clamp taken as the reader) is in the module doc.
 const LAYOUT_SHIFT_ALLOWANCE_PX: i32 = 200;
 
-/// The numbers that change when the history is laid out again, including the
-/// width it wraps at.
+/// The shape the history is laid out in: the content's height, the container's
+/// size, and the width the content wraps at.
+///
+/// Deliberately not the scroll range (`scrollHeight`), which is read live: an
+/// absolutely positioned popover changes the range without resizing any box the
+/// ResizeObserver watches, so a recorded range goes stale with nothing to
+/// refresh it.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 struct LayoutSig {
-    scroll_height: i32,
+    content_height: i32,
     client_height: i32,
     client_width: i32,
     content_width: i32,
@@ -122,17 +144,33 @@ fn newest_visible_rows(
     (0..=newest).rev().take(n).collect()
 }
 
-/// Read a `scroll` event as a layout change's doing or the reader's.
+/// Read a `scroll` event as a layout change's doing or the reader's. `max` is
+/// the live scroll range (`max_scroll_top`), never a recorded one.
 ///
-/// It is layout only if the layout changed since it was last recorded AND
-/// `scrollTop` moved no more than `LAYOUT_SHIFT_ALLOWANCE_PX`.
+/// Layout if either:
+///
+/// * **Final-end clamp**: the recorded `scrollTop` is now out of reach (past
+///   `max` by more than rounding) and the view sits at `max` (within rounding,
+///   either side). Only the browser's clamp puts it there, whether or not the
+///   signature changed: removing overflow clamps without resizing anything.
+/// * **Changed layout, small move**: the signature changed since it was
+///   recorded AND `scrollTop` moved no more than `LAYOUT_SHIFT_ALLOWANCE_PX`.
+///   This is what catches an intermediate clamp that ends short of the end.
+///
+/// A geometry heuristic, not provenance: see the module doc for what each
+/// clause gets wrong.
 fn classify_scroll(
     recorded: LayoutSig,
     now: LayoutSig,
     recorded_top: i32,
     now_top: i32,
+    max: i32,
 ) -> ScrollCause {
-    if recorded != now && (now_top - recorded_top).abs() <= LAYOUT_SHIFT_ALLOWANCE_PX {
+    let clamped_to_end =
+        recorded_top > max + SCROLL_TOP_SLACK_PX && (now_top - max).abs() <= SCROLL_TOP_SLACK_PX;
+    let small_layout_move =
+        recorded != now && (now_top - recorded_top).abs() <= LAYOUT_SHIFT_ALLOWANCE_PX;
+    if clamped_to_end || small_layout_move {
         ScrollCause::Layout
     } else {
         ScrollCause::Reader
@@ -226,12 +264,21 @@ const ANCHOR_ATTR: &str = "data-anchor-row";
 
 #[cfg(target_arch = "wasm32")]
 fn read_sig(container: &web_sys::Element) -> LayoutSig {
+    let (content_height, content_width) = chat_content_wrapper().map_or((0, 0), |content| {
+        (content.client_height(), content.client_width())
+    });
     LayoutSig {
-        scroll_height: container.scroll_height(),
+        content_height,
         client_height: container.client_height(),
         client_width: container.client_width(),
-        content_width: chat_content_wrapper().map_or(0, |content| content.client_width()),
+        content_width,
     }
+}
+
+/// The furthest `scrollTop` can go right now, read live. Never negative.
+#[cfg(target_arch = "wasm32")]
+fn max_scroll_top(container: &web_sys::Element) -> i32 {
+    (container.scroll_height() - container.client_height()).max(0)
 }
 
 /// How far above the container's bottom edge `row`'s top edge sits.
@@ -272,7 +319,7 @@ impl HistoryScroll {
         };
         let sig = read_sig(&container);
         let top = container.scroll_top();
-        let distance = (sig.scroll_height - sig.client_height - top) as f64;
+        let distance = (max_scroll_top(&container) - top) as f64;
         self.pinned.set(is_pinned(distance));
         if let Ok(list) = container.query_selector_all(ANCHOR_ROWS) {
             // Relative to the container, the frame `newest_visible_rows` works in.
@@ -322,7 +369,7 @@ impl HistoryScroll {
             if distance <= SCROLL_TOP_SLACK_PX as f64
                 && trim.window_overgrown.get()
                 && !trim_would_rearm_backfill(
-                    sig.scroll_height,
+                    container.scroll_height(),
                     sig.client_height,
                     trim.window_rendered.get(),
                     INITIAL_WINDOW_ITEMS,
@@ -372,6 +419,7 @@ impl HistoryScroll {
             read_sig(container),
             self.top.get(),
             container.scroll_top(),
+            max_scroll_top(container),
         )
     }
 
@@ -518,9 +566,9 @@ mod tests {
         newest_visible_rows(rows.len(), |i| rows[i], view_top, view_bottom, n)
     }
 
-    fn sig(scroll_height: i32, client_height: i32, client_width: i32) -> LayoutSig {
+    fn sig(content_height: i32, client_height: i32, client_width: i32) -> LayoutSig {
         LayoutSig {
-            scroll_height,
+            content_height,
             client_height,
             client_width,
             content_width: client_width,
@@ -599,11 +647,15 @@ mod tests {
         assert!(reads.get() <= 16, "read {} rects", reads.get());
     }
 
+    /// A live scroll maximum the recorded top of 2000 can still reach.
+    const REACHABLE_MAX: i32 = 2400;
+
     #[test]
     fn a_change_of_the_wrap_width_alone_is_a_layout_change() {
-        // Rewrapping can leave scrollHeight and the container as they were (the
-        // fixture's 1280 -> 700 grows by 0px), so the width the history wraps at
-        // has to be part of the signature or the clamp is read as the reader.
+        // Rewrapping can leave the content's height and the container as they
+        // were (the fixture's 1280 -> 700 grows by 0px), so the width the
+        // history wraps at has to be part of the signature or the clamp is read
+        // as the reader.
         let before = sig(3000, 600, 1000);
         let after = LayoutSig {
             content_width: 700,
@@ -611,23 +663,26 @@ mod tests {
         };
         assert_ne!(before, after);
         assert_eq!(
-            classify_scroll(before, after, 2000, 1944),
+            classify_scroll(before, after, 2000, 1944, REACHABLE_MAX),
             ScrollCause::Layout
         );
     }
 
     #[test]
-    fn any_move_with_an_unchanged_layout_is_the_reader() {
+    fn any_move_with_an_unchanged_layout_and_a_reachable_offset_is_the_reader() {
         let same = sig(3000, 600, 1000);
-        assert_eq!(classify_scroll(same, same, 2000, 1999), ScrollCause::Reader);
-        assert_eq!(classify_scroll(same, same, 2000, 2000), ScrollCause::Reader);
-        assert_eq!(classify_scroll(same, same, 2000, 100), ScrollCause::Reader);
+        let at = |now_top: i32| classify_scroll(same, same, 2000, now_top, REACHABLE_MAX);
+        assert_eq!(at(1999), ScrollCause::Reader);
+        assert_eq!(at(2000), ScrollCause::Reader);
+        assert_eq!(at(100), ScrollCause::Reader);
+        // Down to the end the old offset could reach: the reader going there.
+        assert_eq!(at(REACHABLE_MAX), ScrollCause::Reader);
     }
 
     #[test]
     fn the_allowance_boundary_is_layout() {
         let (a, b) = (sig(3000, 600, 1000), sig(3400, 600, 380));
-        let at = |now_top: i32| classify_scroll(a, b, 2000, now_top);
+        let at = |now_top: i32| classify_scroll(a, b, 2000, now_top, 2800);
         // Up to the allowance, in either direction, a changed layout is layout's.
         assert_eq!(at(2000 - 8), ScrollCause::Layout);
         assert_eq!(at(2000 + LAYOUT_SHIFT_ALLOWANCE_PX), ScrollCause::Layout);
@@ -642,6 +697,62 @@ mod tests {
             at(2000 - LAYOUT_SHIFT_ALLOWANCE_PX - 1),
             ScrollCause::Reader
         );
+    }
+
+    #[test]
+    fn a_clamp_to_the_new_end_is_layout_however_far_it_moved() {
+        // Widening a long history: the rows above the reader shrink, the range
+        // shrinks by 600px, and the browser clamps the view to the new end.
+        let (a, b) = (sig(3000, 600, 380), sig(2400, 600, 1000));
+        const { assert!(2000 - 1400 > LAYOUT_SHIFT_ALLOWANCE_PX) };
+        assert_eq!(classify_scroll(a, b, 2000, 1400, 1400), ScrollCause::Layout);
+        // Overflow removed (a positioned overhang going away) clamps the same
+        // way with nothing the signature describes changing.
+        assert_eq!(classify_scroll(a, a, 2000, 1400, 1400), ScrollCause::Layout);
+        assert_eq!(classify_scroll(a, a, 2000, 1950, 1950), ScrollCause::Layout);
+    }
+
+    #[test]
+    fn the_final_end_clause_needs_an_unreachable_offset_and_a_view_at_the_end() {
+        let same = sig(3000, 600, 1000);
+        let max = 1400;
+        let at = |recorded_top: i32, now_top: i32| {
+            classify_scroll(same, same, recorded_top, now_top, max)
+        };
+        let beyond = max + SCROLL_TOP_SLACK_PX + 1;
+        // Past the new end by more than rounding, and now at the end within it.
+        assert_eq!(at(beyond, max), ScrollCause::Layout);
+        assert_eq!(at(beyond, max - SCROLL_TOP_SLACK_PX), ScrollCause::Layout);
+        assert_eq!(at(beyond, max + SCROLL_TOP_SLACK_PX), ScrollCause::Layout);
+        // Materially above the end: the reader moved, clamp or not.
+        assert_eq!(
+            at(beyond, max - SCROLL_TOP_SLACK_PX - 1),
+            ScrollCause::Reader
+        );
+        assert_eq!(at(2000, 1000), ScrollCause::Reader);
+        // The distance to the end is bounded both ways: a reading past the end
+        // is not "at the end".
+        assert_eq!(at(2000, max + 50), ScrollCause::Reader);
+        // An old offset within rounding of the new end is not taken as
+        // unreachable: nothing provably clamped it.
+        assert_eq!(at(max + SCROLL_TOP_SLACK_PX, max), ScrollCause::Reader);
+    }
+
+    #[test]
+    fn an_intermediate_clamp_is_layout_only_within_the_allowance() {
+        // The view clamped during a short intermediate layout and the history
+        // then came out taller: it ends BELOW the final end, so the final-end
+        // clause cannot see it and only the allowance can.
+        let (a, b) = (sig(3000, 600, 1000), sig(3100, 600, 880));
+        let max = 2500;
+        assert_eq!(classify_scroll(a, b, 2000, 1889, max), ScrollCause::Layout);
+        // The documented residual: a larger intermediate clamp reads as the reader.
+        assert_eq!(
+            classify_scroll(a, b, 2000, 2000 - LAYOUT_SHIFT_ALLOWANCE_PX - 1, max),
+            ScrollCause::Reader
+        );
+        // And with nothing in the signature changed, it is the reader at any size.
+        assert_eq!(classify_scroll(a, a, 2000, 1889, max), ScrollCause::Reader);
     }
 
     #[test]
