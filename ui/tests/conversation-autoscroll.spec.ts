@@ -822,9 +822,10 @@ async function offsetDrift(page: Page, top: number): Promise<number> {
   return Math.abs((await scrollTop(page)) - top);
 }
 
-// Content that changes AT the reader without them scrolling: a moderator
-// deleting the messages they are looking at. With `overflow-anchor: none`,
-// nothing but the scroll model holds the reader's text still (#507).
+// Content that changes ABOVE or AT the reader without them scrolling: a
+// moderator deleting messages, several messages dropped in one update, an image
+// that finishes loading late. With `overflow-anchor: none`, nothing but the
+// scroll model holds the reader's text still (#507).
 //
 // The deletions use a test hook that only re-renders without the messages; it
 // says nothing about whether a removal would be authorized. Every fixture is
@@ -937,6 +938,95 @@ test.describe("The reader's place survives removed and late content (#507)", () 
     expect(await distanceFromBottom(page), "the arrival repinned the reader").toBeGreaterThan(
       BOTTOM_THRESHOLD_PX,
     );
+  });
+
+  test("several messages removed above the reader in one update leave their message in place @fractional-geometry", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page, 24);
+    const before = await parkOnRow(page, fillerRows(await anchorRows(page))[15].id);
+
+    const doomed = fillerRows(await anchorRows(page)).slice(1, 6);
+    expect(
+      Math.max(...doomed.map((row) => row.bottom)),
+      "premise: every removed message is entirely above the viewport",
+    ).toBeLessThan(0);
+    const top = await scrollTop(page);
+    const heightBefore = await historyHeight(page);
+    await removeMessages(page, doomed.map((row) => row.id));
+    const removed = heightBefore - (await historyHeight(page));
+    expect(removed, "premise: the removal takes a material height off the history").toBeGreaterThan(
+      BOTTOM_THRESHOLD_PX,
+    );
+    expect(top - removed, "premise: the corrected offset is reachable").toBeGreaterThan(
+      IN_PLACE_TOLERANCE_PX,
+    );
+
+    await expectInPlace(page, before, "messages removed above the reader moved their message", {
+      hold: true,
+    });
+    await deliver(page, "arrival after the bulk removal");
+    await expectInPlace(page, before, "an arrival after the bulk removal moved the reader", {
+      hold: true,
+    });
+  });
+
+  // No message-state change: only the image's own load re-lays the history out.
+  test("an image that loads late above the reader leaves their message in place @fractional-geometry", async ({
+    page,
+  }) => {
+    let held: import("@playwright/test").Route | null = null;
+    await page.route("**/late-image.svg", (route) => {
+      held = route;
+    });
+    try {
+      await openRoomAtBottom(page, "Team Chat Room");
+      await callRiverTest(page, "appendMessage", "late image ![late](/late-image.svg)");
+      await expect(page.locator('img[src$="late-image.svg"]')).toBeAttached({ timeout: 5_000 });
+      await expect.poll(() => held !== null, { message: "premise: the image was requested" }).toBe(true);
+      await fillHistory(page, 12);
+      const before = await parkOnRow(page, fillerRows(await anchorRows(page))[6].id);
+
+      const imageRow = () =>
+        page.evaluate(() => {
+          const c = document.getElementById("chat-scroll-container")!;
+          const img = c.querySelector<HTMLImageElement>('img[src$="late-image.svg"]')!;
+          const row = img.closest<HTMLElement>('[id^="msg-"]')!;
+          const r = row.getBoundingClientRect();
+          return {
+            bottom: r.bottom - c.getBoundingClientRect().top,
+            height: r.height,
+            loaded: img.complete && img.naturalHeight > 0,
+          };
+        });
+      const pending = await imageRow();
+      expect(pending.loaded, "premise: the image has not loaded yet").toBe(false);
+      expect(pending.bottom, "premise: the image's row is above the viewport").toBeLessThan(0);
+
+      await held!.fulfill({
+        contentType: "image/svg+xml",
+        body: '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240"><rect width="320" height="240" fill="#888"/></svg>',
+      });
+      held = null;
+      await expect
+        .poll(async () => (await imageRow()).height - pending.height, {
+          timeout: 5_000,
+          message: "premise: the loaded image should make its row materially taller",
+        })
+        .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+      await expectInPlace(page, before, "an image loading above the reader moved their message", {
+        hold: true,
+      });
+      await deliver(page, "arrival after the late image");
+      await expectInPlace(page, before, "an arrival after the late image moved the reader", {
+        hold: true,
+      });
+    } finally {
+      // Never leave the request hanging, even when an assertion failed first.
+      await (held as import("@playwright/test").Route | null)?.abort().catch(() => {});
+    }
   });
 });
 
