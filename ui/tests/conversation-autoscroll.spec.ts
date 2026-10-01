@@ -697,6 +697,45 @@ test.describe("The newest visible message stays in view", () => {
     );
   });
 
+  // The reader's position is measured from the container's BOTTOM edge, and the
+  // composer takes height off that edge. So a growing draft moves a parked
+  // reader's text up with it rather than covering it, and clearing the draft
+  // moves it back. Intentional: the newest line they could see stays in sight.
+  test("a parked reader's message keeps its gap from the bottom as the composer grows and clears @fractional-geometry", async ({
+    page,
+  }) => {
+    const before = await parkMidHistory(page);
+    const roomy = await viewportHeight(page);
+
+    await page.getByTestId("message-input").fill(LONG_DRAFT);
+    await expect
+      .poll(() => viewportHeight(page), {
+        timeout: 5_000,
+        message: "premise: the draft should take more than the follow band off the history",
+      })
+      .toBeLessThan(roomy - BOTTOM_THRESHOLD_PX);
+    await expectInPlace(
+      page,
+      before,
+      "the composer grew and the reader's message did not keep its gap from the bottom edge",
+      { hold: true },
+    );
+
+    await page.getByTestId("message-input").fill("");
+    await expect
+      .poll(() => viewportHeight(page), {
+        timeout: 5_000,
+        message: "premise: clearing the draft should give the history its height back",
+      })
+      .toBeGreaterThan(roomy - IN_PLACE_TOLERANCE_PX);
+    await expectInPlace(
+      page,
+      before,
+      "the draft was cleared and the reader's message did not return to its gap",
+      { hold: true },
+    );
+  });
+
   test("stops following when the reader scrolls up after a resize", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
