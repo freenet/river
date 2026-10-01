@@ -51,8 +51,7 @@
 //!   The debounce cannot tell a paused finger from a lifted one. A settle with no gesture in progress does
 //!   nothing, which is what makes a stale `scrollend` (another room's, an old
 //!   gesture's) harmless: room switches, forced snaps and new seeks clear the
-//!   gesture. During `Seeking`, a settle restores, which leaves the loop
-//!   running or finishes it.
+//!   gesture; a seek has none, so its frames' `scrollend`s do nothing.
 //!
 //! # Where capture runs
 //!
@@ -93,7 +92,10 @@
 //!   and a content change can land first. So `restore`, and the render before a
 //!   patch, first read a pending reader scroll (`take_in_undelivered_scroll`,
 //!   through `on_scroll`), or a stale pin would drag the reader back down, or an
-//!   anchor would be measured after the patch had moved the rows.
+//!   anchor would be measured after the patch had moved the rows. The take-in
+//!   belongs where we run outside the rendering steps (effects, `scrollend`, the
+//!   render body); a rAF callback such as the seek frame runs after the scroll
+//!   steps have dispatched the event, so it has nothing to take in.
 //! * **Hidden**: the mobile layout hides the history (`display:none`), and every
 //!   read is then 0. It stays observed, but nothing measures, records or
 //!   restores it until it has height again: the ResizeObserver's restore on
@@ -196,29 +198,6 @@ fn moved_up(from: ViewEdges, now: ViewEdges) -> bool {
 /// Whether `top` is within rounding of the live end `max`.
 fn at_end(top: i32, max: i32) -> bool {
     max - top <= SCROLL_TOP_SLACK_PX
-}
-
-/// What a reader-classified frame means while the scroll-to-latest animation
-/// is running.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SeekStep {
-    /// Still on its way down (or stalled within rounding).
-    Travelling,
-    /// At the live end.
-    Arrived,
-    /// Up past rounding from the previous frame. The animation only moves
-    /// down, so that frame is the reader's.
-    TakenOver,
-}
-
-fn seek_step(prev_top: i32, top: i32, max: i32) -> SeekStep {
-    if at_end(top, max) {
-        SeekStep::Arrived
-    } else if top < prev_top - SCROLL_TOP_SLACK_PX {
-        SeekStep::TakenOver
-    } else {
-        SeekStep::Travelling
-    }
 }
 
 /// The scroll-to-latest animation's time constant: each frame covers
@@ -684,17 +663,22 @@ impl HistoryScroll {
         }
     }
 
-    /// Keep the scroll-to-latest animation running, or finish it when it is
-    /// already at the end. Idempotent: every frame reads the live end, so there
-    /// is nothing to re-aim, and a frame already asked for is not asked again.
-    /// Restarts a loop a hide stopped. Never an opening snap: nothing is told.
+    /// Keep the scroll-to-latest animation running: its next frame steps towards
+    /// the live end, or finishes it there. Idempotent: every frame reads the
+    /// live end, so there is nothing to re-aim, and a frame already asked for is
+    /// not asked again. Restarts a loop a hide stopped. Never an opening snap:
+    /// nothing is told.
     fn seek(&self, container: &web_sys::Element) {
-        if at_end(container.scroll_top(), max_scroll_top(container)) {
-            self.follow.set(Follow::Free);
-        } else {
-            self.request_seek_frame();
-        }
+        self.request_seek_frame();
         self.record(container);
+    }
+
+    /// The scroll-to-latest animation has reached the end: following again, and
+    /// a bottom, so it trims as a snap does.
+    fn finish_seek(&self, container: &web_sys::Element) {
+        self.follow.set(Follow::Free);
+        self.record(container);
+        self.trim_at_bottom(container);
     }
 
     fn request_seek_frame(&self) {
@@ -716,13 +700,6 @@ impl HistoryScroll {
     /// the reader taking over, a force, a room switch) or the history is hidden;
     /// the reveal's restore starts it again.
     fn on_seek_frame(&self, t: f64) {
-        // A reader move since the last frame whose `scroll` event has not been
-        // handled yet would be erased by this frame's write, so read it first.
-        // Browsers dispatch `scroll` events before frame callbacks, so this is
-        // normally a no-op (taking it out failed no test); it is the same
-        // late-event step `restore` and `settle` take. Before the handle is
-        // cleared, so a restore it causes asks for no second frame.
-        self.take_in_undelivered_scroll();
         self.seek_raf.set(None);
         let prev_t = self.seek_prev_t.take();
         if self.follow.get() != Follow::Seeking {
@@ -740,11 +717,10 @@ impl HistoryScroll {
             // Rounding at a fractional device scale can swallow a small step.
             container.set_scroll_top(max);
         }
-        self.record(&container);
         if !moved || at_end(container.scroll_top(), max_scroll_top(&container)) {
-            self.follow.set(Follow::Free);
-            self.trim_at_bottom(&container);
+            self.finish_seek(&container);
         } else {
+            self.record(&container);
             self.seek_prev_t.set(Some(t));
             self.request_seek_frame();
         }
@@ -786,49 +762,41 @@ impl HistoryScroll {
     }
 
     /// A scroll nothing else accounts for. During the scroll-to-latest animation
-    /// that is mostly the animation itself, which must not unpin; otherwise it
-    /// is the reader.
+    /// its own frames are echoes, so this is the reader; only a move up (both
+    /// edges, as for a gesture) takes over from it. Anything else is noted and
+    /// left to the next frame, which also finishes the seek at the end.
     fn on_reader_scroll(&self, container: &web_sys::Element) {
-        if self.follow.get() != Follow::Seeking {
-            let from = self
-                .gesture_from
-                .get()
-                .unwrap_or_else(|| self.recorded_edges());
-            self.gesture_from.set(Some(from));
-            self.capture();
-            if at_end(container.scroll_top(), max_scroll_top(container)) {
-                // Back at the end: following again, whatever came before.
-                self.follow.set(Follow::Free);
-                self.gesture_from.set(None);
-            } else if moved_up(from, self.recorded_edges()) {
-                self.follow.set(Follow::Held);
-            }
-            return;
-        }
-        match seek_step(
-            self.top.get(),
-            container.scroll_top(),
-            max_scroll_top(container),
-        ) {
-            SeekStep::Travelling => self.record(container),
-            SeekStep::Arrived => {
-                self.follow.set(Follow::Free);
+        if self.follow.get() == Follow::Seeking {
+            let top = container.scroll_top();
+            let now = ViewEdges {
+                top,
+                bottom: top + container.client_height(),
+            };
+            if !moved_up(self.recorded_edges(), now) {
                 self.record(container);
-                self.trim_at_bottom(container);
+                return;
             }
-            SeekStep::TakenOver => {
-                // The reader's gesture, started where the last frame was.
-                self.follow.set(Follow::Held);
-                self.gesture_from.set(Some(self.recorded_edges()));
-                self.capture();
-            }
+            // Taken over: the gesture starts where the last frame was.
+            self.follow.set(Follow::Free);
+        }
+        let from = self
+            .gesture_from
+            .get()
+            .unwrap_or_else(|| self.recorded_edges());
+        self.gesture_from.set(Some(from));
+        self.capture();
+        if at_end(container.scroll_top(), max_scroll_top(container)) {
+            // Back at the end: following again, whatever came before.
+            self.follow.set(Follow::Free);
+            self.gesture_from.set(None);
+        } else if moved_up(from, self.recorded_edges()) {
+            self.follow.set(Follow::Held);
         }
     }
 
     /// A scroll has come to rest (`scrollend`, or the debounce standing in for
-    /// it). During a seek it only restores (the loop carries on, or finishes at
-    /// the end); otherwise it ends a reader gesture. Nothing else: a stale
-    /// `scrollend` (another room's, an old gesture's) finds no gesture and does
+    /// it): it ends a reader gesture. Nothing else: a stale `scrollend` (another
+    /// room's, an old gesture's, a seek frame's) finds no gesture and does
     /// nothing.
     fn settle(&self) {
         self.settle_timer.set(None);
@@ -836,25 +804,19 @@ impl HistoryScroll {
         // ends: read that move first, as `restore` does, or the gesture it
         // starts is never settled.
         self.take_in_undelivered_scroll();
-        if self.follow.get() == Follow::Seeking {
-            self.restore_now();
-            return;
-        }
-        if self.gesture_from.get().is_none() {
-            return;
-        }
-        if laid_out_container().is_none() {
-            self.settle_pending.set(true);
-            return;
-        }
         self.end_gesture();
     }
 
     /// The gesture is over: where it came to rest decides the pin, as on `main`.
     /// Measured directly, never through `on_scroll`, because the position has
     /// usually been recorded already and would read as an echo. Does not snap.
+    /// Hidden, it waits for the reveal's restore.
     fn end_gesture(&self) {
-        if self.follow.get() == Follow::Seeking || self.gesture_from.get().is_none() {
+        if self.gesture_from.get().is_none() {
+            return;
+        }
+        if laid_out_container().is_none() {
+            self.settle_pending.set(true);
             return;
         }
         self.follow.set(Follow::Free);
@@ -1302,31 +1264,6 @@ mod tests {
         assert!(!at_end(max - SCROLL_TOP_SLACK_PX - 1, max));
         // Past the end (a stale read against a range that just shrank).
         assert!(at_end(max + 30, max));
-    }
-
-    #[test]
-    fn a_seek_step_travels_arrives_or_is_taken_over() {
-        let max = 2400;
-        // Our animation only moves down.
-        assert_eq!(seek_step(1000, 1180, max), SeekStep::Travelling);
-        // A frame that stalls or jitters within rounding is still travelling.
-        assert_eq!(seek_step(1000, 1000, max), SeekStep::Travelling);
-        assert_eq!(
-            seek_step(1000, 1000 - SCROLL_TOP_SLACK_PX, max),
-            SeekStep::Travelling
-        );
-        // At the live end, within rounding.
-        assert_eq!(
-            seek_step(2300, max - SCROLL_TOP_SLACK_PX, max),
-            SeekStep::Arrived
-        );
-        assert_eq!(seek_step(2300, max, max), SeekStep::Arrived);
-        // Up past rounding from the previous frame: the reader's.
-        assert_eq!(
-            seek_step(1000, 1000 - SCROLL_TOP_SLACK_PX - 1, max),
-            SeekStep::TakenOver
-        );
-        assert_eq!(seek_step(1000, 200, max), SeekStep::TakenOver);
     }
 
     /// Frames of `dt_ms` until a seek that starts `remaining` px from the end
