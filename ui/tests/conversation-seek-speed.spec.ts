@@ -1,6 +1,4 @@
 import { test, expect, Page } from "@playwright/test";
-import { callRiverTest } from "./river-test";
-import { waitForApp, selectRoom } from "./example-room";
 import {
   SEEK_CLOCK_FRAME_MS,
   SeekClockGuard,
@@ -11,6 +9,17 @@ import {
   seekClockPause,
   seekClockRun,
 } from "./history-scroll-fixture";
+import {
+  AT_BOTTOM_EPSILON_PX,
+  afterLayoutSettles,
+  deliver,
+  distanceFromBottom,
+  endMinus,
+  expectSettledAtBottom,
+  openRoomAtBottom,
+  readerScrollsWithoutGesture,
+  scrollTop,
+} from "./history-scroll-helpers";
 
 // The scroll-to-latest button's animation must keep its speed when a message
 // lands mid-flight (moved here from conversation-autoscroll.spec.ts).
@@ -34,8 +43,6 @@ import {
 
 /// Matches BOTTOM_THRESHOLD_PX in ui/src/components/conversation.rs.
 const BOTTOM_THRESHOLD_PX = 100;
-/// Slack for fractional layout after a scroll that did land at the bottom.
-const AT_BOTTOM_EPSILON_PX = 4;
 
 /// Tall fillers, and how far above the end the reader parks before the press.
 const SEEK_SPEED_FILLERS = 30;
@@ -53,81 +60,6 @@ const SEEK_SPEED_MIN_RATIO = 1 / 4;
 const SEEK_SPEED_BUDGET_MS = 1_200;
 
 const ARRIVAL = (what: string) => `arrival during the ${what} animation: ${"v".repeat(200)}`;
-
-// The helpers below are copies of conversation-autoscroll.spec.ts's helpers of
-// the same names (a spec cannot import another without registering its tests).
-
-/// scrollHeight - scrollTop - clientHeight: 0 means the newest message is fully in view.
-function distanceFromBottom(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.getElementById("chat-scroll-container");
-    if (!el) return Number.NaN;
-    return el.scrollHeight - el.scrollTop - el.clientHeight;
-  });
-}
-
-function scrollTop(page: Page): Promise<number> {
-  return page.evaluate(() => document.getElementById("chat-scroll-container")?.scrollTop ?? Number.NaN);
-}
-
-/// The `scrollTop` that leaves the view `px` above its end.
-async function endMinus(page: Page, px: number) {
-  return page.evaluate((px) => {
-    const el = document.getElementById("chat-scroll-container")!;
-    return el.scrollHeight - el.clientHeight - px;
-  }, px);
-}
-
-async function expectSettledAtBottom(page: Page, why: string) {
-  await expect.poll(() => distanceFromBottom(page), { timeout: 5_000, message: why }).toBeLessThanOrEqual(
-    AT_BOTTOM_EPSILON_PX,
-  );
-}
-
-/// Deliver an inbound message and wait until it is on the page.
-async function deliver(page: Page, text: string) {
-  await callRiverTest(page, "appendMessage", text);
-  await expect(page.getByText(text, { exact: false }).last()).toBeVisible({ timeout: 5_000 });
-}
-
-async function openRoomAtBottom(page: Page, roomName: string) {
-  await page.goto("/");
-  await waitForApp(page);
-  await selectRoom(page, roomName);
-  await expect(page.locator("#chat-scroll-container")).toBeVisible({ timeout: 5_000 });
-  await expectSettledAtBottom(page, "opening a room should land on its newest message");
-}
-
-/// A reader scroll with no gesture event, resolved once its `scrollend` has been handled.
-function readerScrollsWithoutGesture(page: Page, top: number): Promise<number> {
-  return page.evaluate(
-    (t) =>
-      new Promise<number>((resolve, reject) => {
-        const el = document.getElementById("chat-scroll-container")!;
-        const timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
-        el.addEventListener(
-          "scrollend",
-          () => {
-            clearTimeout(timer);
-            resolve(el.scrollTop);
-          },
-          { once: true },
-        );
-        el.scrollTop = t;
-      }),
-    top,
-  );
-}
-
-/// Wait out the layout a test just provoked.
-async function afterLayoutSettles(page: Page) {
-  await page.evaluate(
-    () =>
-      new Promise<void>((resolve) =>
-        requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 300))),
-      ),
-  );
-}
 
 /// Fill Team Chat Room with tall rows and park the reader SEEK_SPEED_PARK_PX
 /// above the end, clear of the backfill strip at the top.
