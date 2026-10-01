@@ -756,18 +756,73 @@ test.describe("The newest visible message stays in view", () => {
     );
   });
 
-  test("stops following when the reader scrolls up after a resize", async ({ page }) => {
+  // After a settled resize the snap to the bottom must have been recorded:
+  // against a stale record, a small reader move reads as the layout's own move
+  // and is put back. So the move is SMALL on purpose, outside the follow band but
+  // inside the layout allowance, and the resize is chosen so the reader's offset
+  // stays within that allowance of the pre-resize one.
+  test("a small reader scroll after a settled resize is kept @fractional-geometry", async ({ page }) => {
+    // 1280 -> 1230 rewraps the filler rows a little: measured on this fixture,
+    // the reachable end moves by 20-60px across the five engine projects, where
+    // 1200 moves it up to the allowance and 1240 sometimes not at all.
+    const RESIZED_WIDTH = 1230;
+    const SMALL_MOVE_PX = 150;
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
-    await page.setViewportSize({ width: 380, height: 900 });
+    const layout = () =>
+      page.evaluate(() => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const content = document.getElementById("chat-content")!;
+        return {
+          top: c.scrollTop,
+          max: c.scrollHeight - c.clientHeight,
+          viewport: c.clientHeight,
+          wrapWidth: content.clientWidth,
+        };
+      });
+    const before = await layout();
+    await page.setViewportSize({ width: RESIZED_WIDTH, height: 900 });
     await expectSettledAtBottom(page, "the resize should have kept the view at the bottom");
+    await afterLayoutSettles(page);
+    const after = await layout();
+    expect(after.wrapWidth, "premise: the resize changes the width the history wraps at").not.toBe(
+      before.wrapWidth,
+    );
+    expect(Math.min(before.viewport, after.viewport), "premise: the history is laid out").toBeGreaterThan(0);
+    const endMoved = after.max - before.max;
+    expect(
+      Math.abs(endMoved),
+      `premise: the resize's own correction is a small move (the end moved ${endMoved}px)`,
+    ).toBeLessThanOrEqual(LAYOUT_SHIFT_ALLOWANCE_PX);
+    expect(
+      Math.abs(endMoved - SMALL_MOVE_PX),
+      `premise: the reader's offset stays within the allowance of the pre-resize one (the end moved ${endMoved}px)`,
+    ).toBeLessThanOrEqual(LAYOUT_SHIFT_ALLOWANCE_PX);
 
-    await readerScrollsTo(page, 0);
-    await expect
-      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
-      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    const target = after.top - SMALL_MOVE_PX;
+    expect(target, "premise: the reader's target is inside the history").toBeGreaterThan(0);
+    const landed = await page.evaluate((t) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }));
+      c.scrollTop = t;
+      return c.scrollTop;
+    }, target);
+    expect(Math.abs(landed - target), "premise: the reader's scroll lands where it was aimed").toBeLessThanOrEqual(1);
+    await afterLayoutSettles(page);
+    await expectDriftWithin(page, () => offsetDrift(page, target), "the reader's small scroll after a resize was put back", {
+      hold: true,
+    });
+    // Where it was kept: these hold once the scroll is kept, so they come after.
+    const distance = await distanceFromBottom(page);
+    expect(distance, "premise: the move leaves the follow band").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    expect(distance, "premise: the move is a small one").toBeLessThanOrEqual(LAYOUT_SHIFT_ALLOWANCE_PX);
+    const parked = await newestVisibleMessage(page);
+    expect(parked, "premise: a message should be visible").not.toBeNull();
+
     await deliver(page, "arrival after the reader left");
-    await expectStaysPut(page, "an arrival dragged a reader who scrolled up after a resize");
+    await expectInPlace(page, parked!, "an arrival dragged a reader who scrolled up a little after a resize", {
+      hold: true,
+    });
   });
 
   test("a reader scroll in the same frame as a width change is kept", async ({ page }) => {
