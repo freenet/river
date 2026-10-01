@@ -27,7 +27,10 @@
 //!   (`seek_advance`), so an arrival only makes the next step larger. Its frames
 //!   are recorded, so their `scroll` events are echoes and cannot unpin the
 //!   reader who asked to follow; a Reader event during a seek is the reader's,
-//!   and takes over once it has moved up (as `held` below). Reaching the end
+//!   and takes over once it has moved up (as `held` below) from the seek's own
+//!   `from`: the view at the press, shifted by every frame and layout
+//!   correction since but never by the reader, so their 1px moves between
+//!   frames add up. The gesture goes on from that `from`. Reaching the end
 //!   finishes it and trims, as a snap does. A `touchstart` stops it where it is.
 //!   Whatever ends it, or a hide, stops the loop at its next frame. It never
 //!   reports an opening snap: only an instant snap does.
@@ -191,6 +194,27 @@ fn moved_up(from: ViewEdges, now: ViewEdges) -> bool {
     now.top < from.top - SCROLL_TOP_SLACK_PX && now.bottom < from.bottom - SCROLL_TOP_SLACK_PX
 }
 
+/// `origin` with our own work taken out: shifted by what that work (a seek frame,
+/// a restore) moved the view, from `before` to `after`, edge by edge.
+fn shift_origin(origin: ViewEdges, before: ViewEdges, after: ViewEdges) -> ViewEdges {
+    ViewEdges {
+        top: origin.top + after.top - before.top,
+        bottom: origin.bottom + after.bottom - before.bottom,
+    }
+}
+
+/// A reader scroll to `now` during a seek whose direction origin is `from`:
+/// once it has moved up from there it is the reader's gesture, from that same
+/// origin and already held; until then the seek carries on with its origin
+/// unchanged, so the reader's next move adds to this one.
+fn seek_after_reader_scroll(from: ViewEdges, now: ViewEdges) -> Follow {
+    if moved_up(from, now) {
+        Follow::Gesture { from, held: true }
+    } else {
+        Follow::Seeking { from }
+    }
+}
+
 /// Whether `top` is within rounding of the live end `max`.
 fn at_end(top: i32, max: i32) -> bool {
     max - top <= SCROLL_TOP_SLACK_PX
@@ -324,8 +348,27 @@ enum Follow {
     /// A reader gesture: `from` is the view before its first move, shifted by
     /// every layout correction since; `held` once it has moved up from there.
     Gesture { from: ViewEdges, held: bool },
-    /// The scroll-to-latest animation is travelling to the end.
-    Seeking,
+    /// The scroll-to-latest animation is travelling to the end. `from` is the
+    /// view when it started, shifted by every frame and layout correction since,
+    /// so the reader's own moves are measured from it as a gesture's are.
+    Seeking { from: ViewEdges },
+}
+
+impl Follow {
+    /// Our own work (a seek frame, a restore) moved the view from `before` to
+    /// `after`: take that out of a gesture's or a seek's direction origin.
+    fn after_own_work(self, before: ViewEdges, after: ViewEdges) -> Self {
+        match self {
+            Follow::Gesture { from, held } => Follow::Gesture {
+                from: shift_origin(from, before, after),
+                held,
+            },
+            Follow::Seeking { from } => Follow::Seeking {
+                from: shift_origin(from, before, after),
+            },
+            Follow::Free => Follow::Free,
+        }
+    }
 }
 
 /// The history's scroll state. See the module doc.
@@ -495,11 +538,28 @@ impl HistoryScroll {
         }
     }
 
+    /// The view's edges as they are now.
+    fn live_edges(&self, container: &web_sys::Element) -> ViewEdges {
+        let top = container.scroll_top();
+        ViewEdges {
+            top,
+            bottom: top + container.client_height(),
+        }
+    }
+
     /// Record the layout and `scrollTop` as they are now. Read back after any write,
     /// since the browser clamps.
     fn record(&self, container: &web_sys::Element) {
         self.sig.set(self.read_sig(container));
         self.top.set(container.scroll_top());
+    }
+
+    /// Our own work moved the view from `before` to where it is now recorded:
+    /// take that out of the follow state's direction origin.
+    fn take_out_own_work(&self, before: ViewEdges) {
+        let after = self.recorded_edges();
+        self.follow
+            .set(self.follow.get().after_own_work(before, after));
     }
 
     /// Take the reader's position as the new truth (see "Where capture runs").
@@ -621,7 +681,7 @@ impl HistoryScroll {
             return;
         }
         match self.follow.get() {
-            Follow::Seeking => self.seek(&container),
+            Follow::Seeking { .. } => self.seek(&container),
             Follow::Free | Follow::Gesture { held: false, .. } if self.pinned.get() => {
                 self.snap_and_tell(&container)
             }
@@ -631,15 +691,9 @@ impl HistoryScroll {
             }
         }
         // Everything that moved the view since the last record was layout (a
-        // pending reader move was taken in first), so it is not the gesture's.
-        if let Follow::Gesture { from, held } = self.follow.get() {
-            let after = self.recorded_edges();
-            let from = ViewEdges {
-                top: from.top + after.top - before.top,
-                bottom: from.bottom + after.bottom - before.bottom,
-            };
-            self.follow.set(Follow::Gesture { from, held });
-        }
+        // pending reader move was taken in first), so it is not the gesture's
+        // or the seek's.
+        self.take_out_own_work(before);
         if self.settle_pending.take() {
             self.end_gesture();
         }
@@ -676,7 +730,9 @@ impl HistoryScroll {
         };
         self.pinned.set(true);
         self.end_interaction();
-        self.follow.set(Follow::Seeking);
+        self.follow.set(Follow::Seeking {
+            from: self.live_edges(&container),
+        });
         self.seek_prev_t.set(None);
         self.seek(&container);
     }
@@ -716,12 +772,16 @@ impl HistoryScroll {
     fn on_seek_frame(&self, t: f64) {
         self.seek_raf.set(None);
         let prev_t = self.seek_prev_t.take();
-        if self.follow.get() != Follow::Seeking {
+        if !matches!(self.follow.get(), Follow::Seeking { .. }) {
             return;
         }
         let Some(container) = self.laid_out_container() else {
             return;
         };
+        // From the record, as a restore does: a container resize since then is
+        // ours to take out too. The reader's moves are in it already, since
+        // their `scroll` events run before animation frames.
+        let before = self.recorded_edges();
         let dt = prev_t.map_or(16.0, |prev| t - prev);
         let top = container.scroll_top();
         let max = max_scroll_top(&container);
@@ -735,6 +795,7 @@ impl HistoryScroll {
             self.finish_seek(&container);
         } else {
             self.record(&container);
+            self.take_out_own_work(before);
             self.seek_prev_t.set(Some(t));
             self.request_seek_frame();
         }
@@ -776,21 +837,17 @@ impl HistoryScroll {
     }
 
     /// A scroll nothing else accounts for: the reader's. During a seek it takes
-    /// over only once it has moved up; anything else is recorded and left to the
-    /// next frame.
+    /// over only once it has moved up from the seek's origin; anything else is
+    /// recorded and left to the next frame, the origin kept as it was.
     fn on_reader_scroll(&self, container: &web_sys::Element) {
-        if self.follow.get() == Follow::Seeking {
-            let top = container.scroll_top();
-            let now = ViewEdges {
-                top,
-                bottom: top + container.client_height(),
-            };
-            if !moved_up(self.recorded_edges(), now) {
+        if let Follow::Seeking { from } = self.follow.get() {
+            let follow = seek_after_reader_scroll(from, self.live_edges(container));
+            self.follow.set(follow);
+            if matches!(follow, Follow::Seeking { .. }) {
                 self.record(container);
                 return;
             }
-            // Taken over: the gesture starts where the last frame was.
-            self.follow.set(Follow::Free);
+            // Taken over: the gesture goes on from the seek's origin.
         }
         let (from, held) = match self.follow.get() {
             Follow::Gesture { from, held } => (from, held),
@@ -831,7 +888,7 @@ impl HistoryScroll {
     /// A finger on the history stops the scroll-to-latest animation where it is:
     /// that is where the reader now is.
     fn on_touch_start(&self) {
-        if self.follow.get() != Follow::Seeking {
+        if !matches!(self.follow.get(), Follow::Seeking { .. }) {
             return;
         }
         let Some(container) = self.laid_out_container() else {
@@ -1349,6 +1406,137 @@ mod tests {
                 seek_advance(remaining, 64.0)
             );
         }
+    }
+
+    /// A seek on the pure half: the follow state and the view, through our own
+    /// work and the reader's moves in the order the DOM half would see them.
+    struct SeekRun {
+        follow: Follow,
+        view: ViewEdges,
+    }
+
+    impl SeekRun {
+        fn start(view: ViewEdges) -> Self {
+            Self {
+                follow: Follow::Seeking { from: view },
+                view,
+            }
+        }
+
+        /// Our own work (a frame, a restore) left the view at `after`.
+        fn own(&mut self, after: ViewEdges) {
+            self.follow = self.follow.after_own_work(self.view, after);
+            self.view = after;
+        }
+
+        /// A seek frame that moved the view down `px`.
+        fn frame(&mut self, px: i32) {
+            let height = self.view.bottom - self.view.top;
+            self.own(edges(self.view.top + px, height));
+        }
+
+        /// The reader moved the view by `px` (negative is up).
+        fn reader(&mut self, px: i32) {
+            self.view = ViewEdges {
+                top: self.view.top + px,
+                bottom: self.view.bottom + px,
+            };
+            if let Follow::Seeking { from } = self.follow {
+                self.follow = seek_after_reader_scroll(from, self.view);
+            }
+        }
+
+        fn seeking(&self) -> bool {
+            matches!(self.follow, Follow::Seeking { .. })
+        }
+    }
+
+    #[test]
+    fn small_reader_moves_between_seek_frames_add_up_to_a_takeover() {
+        let mut run = SeekRun::start(edges(1000, 600));
+        // Each 1px move is under the slack on its own, and every frame between
+        // them moves the view hundreds of pixels the other way.
+        for (i, frame) in [300, 250, 200].into_iter().enumerate() {
+            run.frame(frame);
+            run.reader(-1);
+            let moved = i as i32 + 1;
+            assert_eq!(
+                run.seeking(),
+                moved <= SCROLL_TOP_SLACK_PX,
+                "after {moved} 1px moves"
+            );
+        }
+        // Taken over: the gesture's origin is the seek's, with our frames taken
+        // out, and it is already held.
+        assert_eq!(
+            run.follow,
+            Follow::Gesture {
+                from: edges(1000 + 300 + 250 + 200, 600),
+                held: true,
+            }
+        );
+    }
+
+    #[test]
+    fn our_own_seek_frames_alone_never_take_over() {
+        let mut run = SeekRun::start(edges(1000, 600));
+        // Large and small steps, a 1px step, and a frame the end clamped short.
+        for px in [1200, 800, 3, 1, 450] {
+            run.frame(px);
+            assert!(run.seeking(), "a {px}px frame of our own took over");
+        }
+        // Nothing the reader did is in the origin.
+        assert_eq!(run.follow, Follow::Seeking { from: run.view });
+    }
+
+    #[test]
+    fn downward_or_rounding_sized_reader_movement_keeps_the_seek() {
+        let mut run = SeekRun::start(edges(1000, 600));
+        run.frame(300);
+        run.reader(-SCROLL_TOP_SLACK_PX);
+        run.frame(300);
+        assert!(run.seeking(), "a move of the slack itself took over");
+        // Down 5px and back up 5px: net, still only the slack.
+        run.reader(5);
+        run.frame(200);
+        run.reader(-5);
+        assert!(run.seeking(), "net movement within the slack took over");
+        run.reader(-1);
+        assert!(
+            !run.seeking(),
+            "net movement past the slack did not take over"
+        );
+    }
+
+    #[test]
+    fn a_container_change_during_a_seek_keeps_the_two_edge_rule() {
+        // The composer collapses under a seek: the container grows 250px and the
+        // browser clamps the top up by as much, so the bottom edge stays put. Our
+        // restore records it, and it is not the reader.
+        let mut run = SeekRun::start(edges(1000, 500));
+        run.frame(300);
+        run.own(edges(1300 - 250, 750));
+        assert!(run.seeking());
+        // The reader then moves 1px at a time: only past the slack, from the
+        // origin with the clamp taken out, does it take over.
+        run.reader(-1);
+        run.frame(100);
+        run.reader(-1);
+        assert!(run.seeking());
+        run.reader(-1);
+        assert!(!run.seeking());
+
+        // The same change read with a reader event (both edges in one
+        // `scroll`): the bottom edge held, so it is not moving up.
+        let mut run = SeekRun::start(edges(2000, 500));
+        run.view = edges(1750, 750);
+        let Follow::Seeking { from } = run.follow else {
+            unreachable!()
+        };
+        assert_eq!(
+            seek_after_reader_scroll(from, run.view),
+            Follow::Seeking { from }
+        );
     }
 
     #[test]
