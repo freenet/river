@@ -1,4 +1,6 @@
 import { expect, Page } from "@playwright/test";
+import { callRiverTest } from "./river-test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Browser-test utilities for the history-scroll specs. Each section belongs to
 // one scenario family; nothing here writes application state or implements a
@@ -510,4 +512,377 @@ export function gateScrollendExpectOrder(run: GateScrollendRun) {
     firsts,
     `premise: input → scroll → deliver → patch → settle, with no settle reaching the app before the patch (${timeline})`,
   ).toEqual(["input", "scroll", "deliver", "patch", "settle"]);
+}
+
+// ---- task 4: settle debounce ----
+//
+// Where a browser has no `scrollend` (Safari before 17.4), the history settles a
+// gesture with a 120ms debounce on `scroll` instead (`SCROLL_SETTLE_DEBOUNCE_MS`
+// in ui/src/components/conversation/history_scroll.rs). Every engine in the
+// suite has `scrollend`, so the fallback only runs when a test selects it:
+//
+// * `install` asks `Reflect.has(container, "onscrollend")`. The init script
+//   below answers false for exactly that question, about exactly
+//   `#chat-scroll-container`, and delegates every other lookup. No native
+//   property is removed: the engine still sends `scrollend`, the app just has no
+//   listener for it.
+// * The app's fallback registrations are recognised by where they come from: a
+//   `setTimeout(settle, 120)` made while a `scroll` event on that container is
+//   being dispatched, with the same callback every time (the one `settle`
+//   closure). Their clears and firings are recorded; every other timer passes
+//   straight through.
+// * Playwright's clock runs every timer, so the test decides when 120ms have
+//   passed. It also runs `crate::util::defer`'s `setTimeout(0)`: an inbound
+//   delivery and any deferred signal write wait for an explicit advance.
+//   Native events (scroll, ResizeObserver) still come from real frames, so
+//   `debounceFrames` waits on those, never on a timer or `requestAnimationFrame`
+//   (both are faked).
+
+/// The settle debounce's delay, as SCROLL_SETTLE_DEBOUNCE_MS.
+export const DEBOUNCE_SETTLE_MS = 120;
+
+/// One fallback registration the app made: when (on the page's clock), and what
+/// became of it. `seq` orders registrations, clears and firings against each
+/// other.
+export type DebounceRegistration = {
+  handle: number;
+  at: number;
+  seq: number;
+  cleared: { at: number; seq: number; duringScroll: boolean } | null;
+  fired: { at: number; seq: number } | null;
+};
+
+export type DebounceState = {
+  /// The page's clock now.
+  now: number;
+  /// How often the app asked whether the container has `onscrollend` (each
+  /// answered false).
+  lookups: number;
+  /// Event types the app added to the container after that lookup, during the
+  /// rest of `install`.
+  installListeners: string[];
+  registrations: DebounceRegistration[];
+  /// 120ms timers from the container's scroll dispatch with another callback:
+  /// should stay 0, or the recogniser above is matching something else.
+  strayCallbacks: number;
+  /// Reflect.has on a non-container element, overridden vs native, to show the
+  /// override is scoped.
+  otherLookupDelegated: boolean;
+};
+
+type DebounceRow = { id: string; gap: number };
+
+type DebounceDom = {
+  probe: Omit<DebounceState, "now" | "otherLookupDelegated">;
+  restore(): void;
+  /// Resolve after `n` native rendering updates.
+  frames(n: number): Promise<void>;
+  newestVisible(): DebounceRow | null;
+  /// Move the view to `top` as a reader would, and wait for its `scroll` event
+  /// to have been handled (this listener runs after the app's).
+  scrollTo(top: number): Promise<{ landed: number; at: DebounceRow | null; scrolled: boolean }>;
+};
+
+declare global {
+  interface Window {
+    __riverDebounce: DebounceDom;
+  }
+}
+
+/// Runs in the page before the app (`addInitScript`), so it is self-contained.
+export function debounceInitScript() {
+  const CONTAINER_ID = "chat-scroll-container";
+  const SETTLE_MS = 120;
+  const nativeHas = Reflect.has;
+  const undo: (() => void)[] = [];
+  const probe: DebounceDom["probe"] = {
+    lookups: 0,
+    installListeners: [],
+    registrations: [],
+    strayCallbacks: 0,
+  };
+  let seq = 0;
+  let armed = false;
+  const container = () => document.getElementById(CONTAINER_ID) as HTMLElement;
+  const duringContainerScroll = (c: Element) => {
+    const ev = (window as { event?: Event }).event;
+    return !!ev && ev.type === "scroll" && ev.currentTarget === c;
+  };
+
+  // Wrapped at the lookup, not at load: by then Playwright's clock has replaced
+  // the timer functions, so these wrap the clock's.
+  const arm = (c: Element) => {
+    if (armed) return;
+    armed = true;
+    // `install` adds the rest of its listeners synchronously after the lookup.
+    let installing = true;
+    queueMicrotask(() => (installing = false));
+    const nativeAdd = c.addEventListener;
+    c.addEventListener = function (this: Element, type: string, ...rest: unknown[]) {
+      if (installing) probe.installListeners.push(String(type));
+      return (nativeAdd as (...a: unknown[]) => void).call(this, type, ...rest);
+    } as typeof c.addEventListener;
+    undo.push(() => delete (c as { addEventListener?: unknown }).addEventListener);
+
+    // Playwright's clock numbers its timers from 10^12. The app keeps a timeout
+    // handle as an i32 (`settle_timer`), so that id arrives truncated and its
+    // `clearTimeout` would miss, and every superseded settle would still fire.
+    // A browser hands out small integers, so this does too, mapped to the clock's.
+    const nativeSet = window.setTimeout as (...a: unknown[]) => number;
+    const nativeClear = window.clearTimeout as (id?: number) => void;
+    const clockIds = new Map<number, number>();
+    let nextHandle = 1;
+    const schedule = (cb: unknown, delay: unknown, args: unknown[], onFire?: () => void) => {
+      const handle = nextHandle++;
+      const run =
+        typeof cb === "function"
+          ? function (this: unknown, ...a: unknown[]) {
+              clockIds.delete(handle);
+              onFire?.();
+              return (cb as (...a: unknown[]) => unknown).apply(this, a);
+            }
+          : cb;
+      clockIds.set(handle, nativeSet.call(window, run, delay, ...args));
+      return handle;
+    };
+    let settle: unknown = null;
+    window.setTimeout = function (cb: unknown, delay?: number, ...args: unknown[]) {
+      if (delay === SETTLE_MS && typeof cb === "function" && duringContainerScroll(c)) {
+        settle ??= cb;
+        if (cb === settle) {
+          const rec: DebounceRegistration = { handle: 0, at: Date.now(), seq: seq++, cleared: null, fired: null };
+          rec.handle = schedule(cb, delay, args, () => (rec.fired = { at: Date.now(), seq: seq++ }));
+          probe.registrations.push(rec);
+          return rec.handle;
+        }
+        probe.strayCallbacks++;
+      }
+      return schedule(cb, delay, args);
+    } as typeof window.setTimeout;
+    window.clearTimeout = function (handle?: number) {
+      const rec = probe.registrations.find((r) => r.handle === handle && !r.cleared && !r.fired);
+      if (rec) rec.cleared = { at: Date.now(), seq: seq++, duringScroll: duringContainerScroll(c) };
+      const id = handle === undefined ? undefined : clockIds.get(handle);
+      if (id === undefined) return nativeClear.call(window, handle);
+      clockIds.delete(handle!);
+      return nativeClear.call(window, id);
+    } as typeof window.clearTimeout;
+    undo.push(() => {
+      window.setTimeout = nativeSet;
+      window.clearTimeout = nativeClear;
+    });
+  };
+
+  Reflect.has = function (target: object, key: PropertyKey) {
+    if (key === "onscrollend" && target instanceof Element && target.id === CONTAINER_ID) {
+      probe.lookups++;
+      arm(target);
+      return false;
+    }
+    return nativeHas(target, key);
+  };
+  undo.push(() => (Reflect.has = nativeHas));
+
+  // One native rendering update: a ResizeObserver's first notification, which
+  // comes after that update's scroll events. Chained through a MessageChannel
+  // task, since observing from inside a notification would be skipped.
+  const frame = () =>
+    new Promise<void>((resolve) => {
+      const ro = new ResizeObserver(() => {
+        ro.disconnect();
+        const ch = new MessageChannel();
+        ch.port1.onmessage = () => {
+          ch.port1.close();
+          ch.port2.close();
+          resolve();
+        };
+        ch.port2.postMessage(0);
+      });
+      ro.observe(document.body);
+    });
+
+  const dom: DebounceDom = {
+    probe,
+    restore() {
+      while (undo.length) undo.pop()!();
+    },
+    async frames(n) {
+      for (let i = 0; i < n; i++) await frame();
+    },
+    newestVisible() {
+      const c = container();
+      const box = c.getBoundingClientRect();
+      let found: DebounceRow | null = null;
+      for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
+        const r = row.getBoundingClientRect();
+        if (r.bottom > box.top && r.top < box.bottom) found = { id: row.id, gap: box.bottom - r.top };
+      }
+      return found;
+    },
+    async scrollTo(top) {
+      const c = container();
+      let scrolled = false;
+      const seen = new Promise<void>((resolve) =>
+        c.addEventListener("scroll", () => ((scrolled = true), resolve()), { once: true }),
+      );
+      c.scrollTop = top;
+      const landed = c.scrollTop;
+      const at = dom.newestVisible();
+      await Promise.race([seen, dom.frames(10)]);
+      await dom.frames(1);
+      return { landed, at, scrolled };
+    },
+  };
+  window.__riverDebounce = dom;
+}
+
+/// Select the fallback and take over the clock. Call before the first navigation.
+export async function debounceUseFallback(page: Page) {
+  await page.addInitScript(debounceInitScript);
+  await page.clock.install();
+}
+
+/// Put everything back. The clock cannot be uninstalled; the page closes with
+/// the test.
+export async function debounceRestore(page: Page) {
+  await page.evaluate(() => window.__riverDebounce?.restore()).catch(() => {});
+}
+
+export function debounceState(page: Page): Promise<DebounceState> {
+  return page.evaluate(() => {
+    const { probe } = window.__riverDebounce;
+    const div = document.createElement("div");
+    return {
+      ...JSON.parse(JSON.stringify(probe)),
+      now: Date.now(),
+      otherLookupDelegated: Reflect.has(div, "onscrollend") === "onscrollend" in div,
+    };
+  });
+}
+
+/// Registrations neither cleared nor fired.
+export function debouncePending(state: DebounceState): DebounceRegistration[] {
+  return state.registrations.filter((r) => !r.cleared && !r.fired);
+}
+
+/// The one pending registration: the deadline that will settle the gesture.
+export function debounceOnlyPending(state: DebounceState, why: string): DebounceRegistration {
+  const pending = debouncePending(state);
+  expect(pending.length, `${why}: exactly one settle pending (${JSON.stringify(state.registrations)})`).toBe(1);
+  return pending[0];
+}
+
+/// Registrations that fired, from the `from`th on (`debouncePauseWhenQuiet`'s
+/// result: the setup's own settles are not the test's).
+export function debounceFired(state: DebounceState, from: number): DebounceRegistration[] {
+  return state.registrations.slice(from).filter((r) => r.fired);
+}
+
+export function debounceFrames(page: Page, n = 2): Promise<void> {
+  return page.evaluate((n) => window.__riverDebounce.frames(n), n);
+}
+
+/// Advance the page's clock by `ms`, running every timer due, then let the
+/// native frames that work causes go by.
+export async function debounceAdvance(page: Page, ms: number) {
+  await page.clock.runFor(ms);
+  await debounceFrames(page);
+}
+
+/// The fallback is what `install` chose: the app asked, was told no, added a
+/// second `scroll` listener and no `scrollend` one, and the setup's own scrolls
+/// (follow snaps) have already gone through the debounce.
+export async function debounceExpectFallbackSelected(page: Page) {
+  const state = await debounceState(page);
+  expect(state.lookups, "premise: the app asked whether the container has onscrollend").toBeGreaterThanOrEqual(1);
+  expect(state.otherLookupDelegated, "premise: the override answers only for the container").toBe(true);
+  expect(state.installListeners, "premise: install added the debounce's scroll listener").toContain("scroll");
+  expect(state.installListeners, "premise: install added no scrollend listener").not.toContain("scrollend");
+  expect(state.registrations.length, "premise: the setup's scrolls armed the debounce").toBeGreaterThan(0);
+  expect(state.strayCallbacks, "premise: every 120ms timer from a scroll is the one settle").toBe(0);
+}
+
+/// With the clock still running, wait until no settle is pending, then pause it.
+/// Returns how many registrations the setup made, for `debounceFired`.
+export async function debouncePauseWhenQuiet(page: Page): Promise<number> {
+  await expect
+    .poll(async () => debouncePending(await debounceState(page)).length, {
+      timeout: 5_000,
+      message: "premise: the setup's settles should have run",
+    })
+    .toBe(0);
+  const now = await page.evaluate(() => Date.now());
+  await page.clock.pauseAt(now + 1_000);
+  await debounceFrames(page, 3);
+  const state = await debounceState(page);
+  expect(debouncePending(state), "premise: nothing pending once paused").toEqual([]);
+  return state.registrations.length;
+}
+
+export function debounceDistanceFromBottom(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const c = document.getElementById("chat-scroll-container")!;
+    return c.scrollHeight - c.scrollTop - c.clientHeight;
+  });
+}
+
+export function debounceScrollTop(page: Page): Promise<number> {
+  return page.evaluate(() => document.getElementById("chat-scroll-container")!.scrollTop);
+}
+
+export function debounceScrollTo(page: Page, top: number) {
+  return page.evaluate((top) => window.__riverDebounce.scrollTo(top), top);
+}
+
+/// How far `before`'s row has moved from its gap; Infinity when it is gone or is
+/// no longer the newest visible message.
+export async function debounceDrift(page: Page, before: DebounceRow): Promise<number> {
+  const now = await page.evaluate(() => window.__riverDebounce.newestVisible());
+  return now?.id === before.id ? Math.abs(now.gap - before.gap) : Infinity;
+}
+
+/// Deliver an inbound message on a paused clock: request it, run the deferred
+/// delivery (`setTimeout(0)`, due now, so no time passes), and wait for its row.
+export async function debounceDeliver(page: Page, text: string) {
+  await callRiverTest(page, "appendMessage", text);
+  await page.clock.runFor(0);
+  const row = page.getByText(text.slice(0, 40), { exact: false }).last();
+  await expect(row, `premise: "${text.slice(0, 40)}" was delivered`).toBeAttached({ timeout: 5_000 });
+  await debounceFrames(page);
+}
+
+/// The history's event-summary rows (join events and the like).
+const DEBOUNCE_EVENT_ROWS = "#chat-content [data-anchor-row][data-item-key]";
+
+/// Deliver a join event on a paused clock, as `debounceDeliver` does: a short
+/// arrival (one event-summary row, 40px at 1280px wide, where a one-line
+/// message with its header is ~100px and alone would leave the follow band).
+/// Lands as a new row only when the history does not already end in one.
+export async function debounceDeliverJoin(page: Page) {
+  const rows = page.locator(DEBOUNCE_EVENT_ROWS);
+  const before = await rows.count();
+  await callRiverTest(page, "appendJoinEvent");
+  await page.clock.runFor(0);
+  await expect(rows, "premise: the join event was delivered as a new row").toHaveCount(before + 1, { timeout: 5_000 });
+  await debounceFrames(page);
+}
+
+/// Open `roomName` at its newest message and add `fillers` messages to scroll
+/// back through, on the running clock.
+export async function debounceOpenFilledRoom(page: Page, roomName: string, path = "/", fillers = 8) {
+  await page.goto(path);
+  await waitForApp(page);
+  await selectRoom(page, roomName);
+  await expect(page.locator("#chat-scroll-container")).toBeVisible({ timeout: 5_000 });
+  for (let i = 0; i < fillers; i++) {
+    const text = `filler ${i}: ${"y".repeat(200)}`;
+    await callRiverTest(page, "appendMessage", text);
+    await expect(page.getByText(text.slice(0, 40), { exact: false }).last()).toBeVisible({ timeout: 5_000 });
+  }
+  await expect
+    .poll(() => debounceDistanceFromBottom(page), {
+      timeout: 5_000,
+      message: "premise: the fillers should have been followed",
+    })
+    .toBeLessThanOrEqual(4);
 }
