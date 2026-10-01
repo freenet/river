@@ -30,7 +30,7 @@ use river_core::room_state::{
     privacy::SealedBytes,
 };
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen::convert::FromWasmAbi;
+use wasm_bindgen::convert::{FromWasmAbi, ReturnWasmAbi};
 use wasm_bindgen::JsValue;
 
 pub fn install_test_hooks() {
@@ -42,12 +42,12 @@ pub fn install_test_hooks() {
         return;
     }
 
-    fn expose<A: FromWasmAbi + 'static>(
+    fn expose<A: FromWasmAbi + 'static, R: ReturnWasmAbi + 'static>(
         hooks: &js_sys::Object,
         name: &str,
-        hook: impl FnMut(A) + 'static,
+        hook: impl FnMut(A) -> R + 'static,
     ) {
-        let hook = Closure::<dyn FnMut(A)>::new(hook).into_js_value();
+        let hook = Closure::<dyn FnMut(A) -> R>::new(hook).into_js_value();
         let _ = js_sys::Reflect::set(hooks, &JsValue::from_str(name), &hook);
     }
 
@@ -125,48 +125,41 @@ pub fn install_test_hooks() {
     // rendering is simulated: nothing here checks that a removal is authorized.
     // Resolves with the ids that matched no message, so a fixture that removes
     // nothing fails instead of passing quietly.
-    let remove_messages =
-        Closure::<dyn FnMut(JsValue) -> js_sys::Promise>::new(move |dom_ids: JsValue| {
-            let mut wanted: Vec<String> = js_sys::Array::from(&dom_ids)
-                .iter()
-                .filter_map(|id| id.as_string())
+    expose(&hooks, "removeMessages", move |dom_ids: JsValue| {
+        let wanted: Vec<String> = js_sys::Array::from(&dom_ids)
+            .iter()
+            .filter_map(|id| id.as_string())
+            .collect();
+        let mut resolve = None;
+        let promise = js_sys::Promise::new(&mut |res, _rej| resolve = Some(res));
+        let resolve = resolve.expect("Promise::new runs its executor synchronously");
+        // Reading ROOMS needs the Dioxus runtime, which a raw JS call lacks.
+        crate::util::defer(move || {
+            let unmatched: js_sys::Array = remove(wanted)
+                .into_iter()
+                .map(|id| JsValue::from_str(&id))
                 .collect();
-            wanted.sort();
-            wanted.dedup();
-            let mut resolve = None;
-            let promise = js_sys::Promise::new(&mut |res, _rej| resolve = Some(res));
-            let resolve = resolve.expect("Promise::new runs its executor synchronously");
-            // Reading ROOMS needs the Dioxus runtime, which a raw JS call lacks.
-            crate::util::defer(move || {
-                let unmatched: js_sys::Array = remove(wanted)
-                    .into_iter()
-                    .map(|id| JsValue::from_str(&id))
-                    .collect();
-                let _ = resolve.call1(&JsValue::NULL, &unmatched);
-            });
-            promise
-        })
-        .into_js_value();
-    let _ = js_sys::Reflect::set(
-        &hooks,
-        &JsValue::from_str("removeMessages"),
-        &remove_messages,
-    );
+            let _ = resolve.call1(&JsValue::NULL, &unmatched);
+        });
+        promise
+    });
 
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 
+/// Run `f` on the current room inside ONE `ROOMS` mutation; `None` if there is
+/// no current room or it is not loaded. Needs the Dioxus runtime: call it from
+/// inside `defer`.
+fn with_current_room<T>(f: impl FnOnce(&mut RoomData, &VerifyingKey) -> T) -> Option<T> {
+    let room_key = CURRENT_ROOM.peek().owner_key?;
+    ROOMS.with_mut(|rooms| rooms.map.get_mut(&room_key).map(|room| f(room, &room_key)))
+}
+
 /// Remove every message of the current room whose row id is in `dom_ids`, in one
-/// `ROOMS` mutation. Returns the ids that matched nothing.
+/// `ROOMS` mutation. Returns the ids that matched nothing, sorted and distinct.
 fn remove(dom_ids: Vec<String>) -> Vec<String> {
-    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
-        return dom_ids;
-    };
     let mut unmatched: std::collections::BTreeSet<String> = dom_ids.into_iter().collect();
-    ROOMS.with_mut(|rooms| {
-        let Some(room) = rooms.map.get_mut(&room_key) else {
-            return;
-        };
+    with_current_room(|room, _| {
         // The row id convention of the conversation's message rows.
         room.room_state
             .recent_messages
@@ -286,15 +279,9 @@ fn prune_to_cap(room: &mut RoomData) {
 /// Deliver every message to the current room in ONE `ROOMS` mutation, so one
 /// re-render, as a network delta does.
 fn deliver(messages: impl IntoIterator<Item = (String, Delivery)>) {
-    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
-        return;
-    };
-    ROOMS.with_mut(|rooms| {
-        let Some(room) = rooms.map.get_mut(&room_key) else {
-            return;
-        };
+    with_current_room(|room, room_key| {
         for (text, delivery) in messages {
-            push_test_message(room, &room_key, text, delivery);
+            push_test_message(room, room_key, text, delivery);
         }
         prune_to_cap(room);
     });
