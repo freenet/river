@@ -343,6 +343,9 @@ pub(super) struct HistoryScroll {
     /// the ResizeObserver are bound to for the app's lifetime.
     container: RefCell<Option<web_sys::Element>>,
     content: RefCell<Option<web_sys::Element>>,
+    /// `content`'s `anchor-row` elements: a live collection in tree order, so
+    /// nothing invalidates it; relies on `#chat-content` living as long as the app.
+    rows: RefCell<Option<web_sys::HtmlCollection>>,
     /// Set by `install` once the listeners exist, so `is_some` also means
     /// "installed".
     hooks: RefCell<Option<HistoryHooks>>,
@@ -364,6 +367,7 @@ impl Default for HistoryScroll {
             seek_prev_t: Cell::new(None),
             container: RefCell::new(None),
             content: RefCell::new(None),
+            rows: RefCell::new(None),
             hooks: RefCell::new(None),
         }
     }
@@ -408,8 +412,6 @@ fn element_by_id(id: &str) -> Option<web_sys::Element> {
         .and_then(|d| d.get_element_by_id(id))
 }
 
-#[cfg(target_arch = "wasm32")]
-const ANCHOR_ROWS: &str = "#chat-content [data-anchor-row]";
 #[cfg(target_arch = "wasm32")]
 const ANCHOR_ATTR: &str = "data-anchor-row";
 
@@ -490,16 +492,12 @@ impl HistoryScroll {
     fn capture(&self, container: &web_sys::Element) {
         let distance = (max_scroll_top(container) - container.scroll_top()) as f64;
         self.pinned.set(is_pinned(distance));
-        if let Ok(list) = container.query_selector_all(ANCHOR_ROWS) {
+        if let Some(list) = self.rows.borrow().as_ref() {
             // Relative to the container, the frame `newest_visible_rows` works in.
             // Each call is a layout read, and the search makes few of them.
             let view = container.get_bounding_client_rect();
             let view_bottom = (view.bottom() - view.top()).round() as i32;
-            let item = |i: usize| {
-                list.item(i as u32)
-                    .unwrap_throw()
-                    .unchecked_into::<web_sys::Element>()
-            };
+            let item = |i: usize| list.item(i as u32).unwrap_throw();
             let rect = |i: usize| {
                 let r = item(i).get_bounding_client_rect();
                 (
@@ -862,6 +860,7 @@ impl HistoryScroll {
         };
         *self.container.borrow_mut() = Some(container.clone());
         *self.content.borrow_mut() = Some(content.clone());
+        *self.rows.borrow_mut() = Some(content.get_elements_by_class_name("anchor-row"));
         if let Some(laid_out) = self.laid_out_container() {
             self.record(&laid_out);
         }
