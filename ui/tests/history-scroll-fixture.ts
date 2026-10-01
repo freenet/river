@@ -2,11 +2,24 @@ import { expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { waitForApp, selectRoom } from "./example-room";
 
-// Browser-test utilities for the history-scroll specs. Each section belongs to
-// one scenario family; nothing here writes application state or implements a
-// follow policy.
+// Browser-test utilities for the history-scroll specs, in three sections:
+//
+// * seek clock: drives the scroll-to-latest animation on Playwright's clock,
+//   one frame per step (conversation-seek-speed.spec.ts);
+// * settle ordering: holds a gesture's `scrollend` until an arrival has landed
+//   (conversation-autoscroll.spec.ts);
+// * settle debounce: selects the 120ms no-`scrollend` fallback and observes its
+//   timers (conversation-scroll-debounce.spec.ts).
+//
+// Nothing here writes application state or implements a follow policy. The
+// in-page parts (anything passed to `page.evaluate` or `addInitScript`) must be
+// self-contained, so each section keeps its own small DOM helpers. Their
+// frame waits differ on purpose: the seek clock captures the native
+// `requestAnimationFrame` before installing the clock, settle ordering runs on
+// the real clock, and the debounce section, whose clock fakes
+// `requestAnimationFrame`, waits on a ResizeObserver notification instead.
 
-// ---- task 2: seek clock ----
+// ---- seek clock ----
 //
 // The scroll-to-latest animation is the app's own `requestAnimationFrame` loop
 // (`on_seek_frame` in history_scroll.rs). Sampled at the host's cadence, how
@@ -280,7 +293,7 @@ export function seekClockLog(record: SeekClockRecord): string {
   return `${head}; per frame ms:px(left): ${body}`;
 }
 
-// ---- task 3: settle ordering ----
+// ---- settle ordering ----
 //
 // Calling `__riverTest.appendMessage` only REQUESTS a delivery (the hook defers
 // it), so an arrival asked for from a scroll listener can land after the
@@ -514,7 +527,7 @@ export function gateScrollendExpectOrder(run: GateScrollendRun) {
   ).toEqual(["input", "scroll", "deliver", "patch", "settle"]);
 }
 
-// ---- task 4: settle debounce ----
+// ---- settle debounce ----
 //
 // Where a browser has no `scrollend` (Safari before 17.4), the history settles a
 // gesture with a 120ms debounce on `scroll` instead (`SCROLL_SETTLE_DEBOUNCE_MS`
