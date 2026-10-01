@@ -1,4 +1,4 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect, Page, Route } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { seekClockInstall, seekClockPause } from "./history-scroll-fixture";
 import {
@@ -9,6 +9,7 @@ import {
   followFrame,
   followGate,
   followGrowAbove,
+  followGrowAboveThenEnd,
   followLog,
   followMark,
   followRealFrames,
@@ -274,11 +275,11 @@ const READER_QUIET_MS = 60;
 // held finger would, and is removed before the correction, whose end must reach
 // the app.
 
-/// Open a filled room, move up `upPx` with the move's native end gated away,
-/// then, `READER_QUIET_MS` later and with the gate removed, grow a row above the
-/// reader and wait for the correction's own end to reach the app. Leaves the
-/// clock paused and the recorder running: the caller stops both in a `finally`.
-async function correctedHeldGesture(page: Page, { path = "/", upPx = CORRECTED_UP_PX, fillers = 8 } = {}) {
+/// Open a filled room and move up `upPx` with the move's native end gated away,
+/// so the gesture is held and unsettled, as under a finger. Leaves the clock
+/// paused and the recorder running, gated: the caller stops both in a
+/// `finally`. The reader's newest visible message.
+async function heldGesture(page: Page, { path = "/", upPx = CORRECTED_UP_PX, fillers = 8 } = {}) {
   await seekClockInstall(page);
   await openRoomAtBottom(page, "Team Chat Room", path);
   for (let i = 0; i < fillers; i++) await deliver(page, `filler ${i}: ${"y".repeat(200)}`);
@@ -295,6 +296,15 @@ async function correctedHeldGesture(page: Page, { path = "/", upPx = CORRECTED_U
   await followRealFrames(page, 3);
   const at = await newestVisibleRow(page);
   expect(at, "premise: a message should be visible").not.toBeNull();
+  return at!;
+}
+
+/// A `heldGesture`, then, `READER_QUIET_MS` later and with the gate removed,
+/// growth above the reader, and wait for the correction's own end to reach the
+/// app. Leaves the clock paused and the recorder running: the caller stops both
+/// in a `finally`.
+async function correctedHeldGesture(page: Page, { path = "/", upPx = CORRECTED_UP_PX, fillers = 8 } = {}) {
+  const at = await heldGesture(page, { path, upPx, fillers });
 
   await page.clock.runFor(READER_QUIET_MS);
   expect(await followUngate(page), "premise: the gate was still in place").toBe(true);
@@ -315,14 +325,14 @@ async function correctedHeldGesture(page: Page, { path = "/", upPx = CORRECTED_U
     Math.abs(correction - GROW_PX),
     `premise: the restore corrected the view by the growth (${correction}px; ${log})`,
   ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
-  expect(await rowDrift(page, at!), `premise: the correction put the reader's message back (${log})`).toBeLessThanOrEqual(
+  expect(await rowDrift(page, at), `premise: the correction put the reader's message back (${log})`).toBeLessThanOrEqual(
     IN_PLACE_TOLERANCE_PX,
   );
   test.info().annotations.push({
     type: "correction",
-    description: `${correction}px; ${at!.id} at ${at!.gap.toFixed(1)}px; ${log}`,
+    description: `${correction}px; ${at.id} at ${at.gap.toFixed(1)}px; ${log}`,
   });
-  return { at: at!, correctedTop };
+  return { at, correctedTop };
 }
 
 /// Advance the clock to the reader's quiet deadline, QUIET_MS after their move.
@@ -668,3 +678,225 @@ test.describe("An anchor correction's own scrollend, on the mobile layout", () =
     }
   });
 });
+
+// Content can grow above a held reader with `scrollTop` unchanged (an image
+// loading; the container sets `overflow-anchor: none`), so no `scroll` event is
+// coming, only the ResizeObserver's report. A settle that reaches the app first
+// used to measure the reflowed rows as the reader's position: their message
+// was saved where the growth had pushed it, and nothing put it back. The settle
+// now restores the anchor first, then measures.
+//
+// The order is made, not waited for: the growth and a synthetic `scrollend` in
+// one task, so the settle runs before any observer can deliver. It says nothing
+// about whether an engine produces that order natively; the probe below asks.
+test.describe("A settle before the observer reports a reflow above the reader", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+  /// Far enough up that the reader is parked outside the band.
+  const PARKED_UP_PX = 200;
+
+  /// A held gesture `upPx` up, the gate removed, then the growth and the settle
+  /// in one task. Checks the order and that the growth moved the reader's
+  /// message before the app saw anything. Leaves the clock paused and the
+  /// recorder running.
+  async function settleBeforeObserver(page: Page, upPx: number) {
+    const at = await heldGesture(page, { upPx });
+    expect(await followUngate(page), "premise: the gate was still in place").toBe(true);
+    await followRealFrames(page, 3);
+    const run = await followGrowAboveThenEnd(page, GROW_PX, at.id);
+    const log = await followLog(page);
+    const what =
+      `${at.id} at ${at.gap.toFixed(1)}px, moved ${run.shift.toFixed(1)}px by the growth; ` +
+      `scrollTop ${run.before} → ${run.grown} grown → ${run.ended} after the settle; ${log}`;
+    test.info().annotations.push({ type: "ordered settle", description: what });
+    const beforeGrow = log.slice(log.lastIndexOf("move"), log.lastIndexOf("grow"));
+    expect(beforeGrow, `premise: no end reached the app between the move and the growth (${what})`).not.toMatch(
+      /\bend\b/,
+    );
+    expect(log.slice(log.lastIndexOf("grow")), `premise: the settle reached the app before the observer (${what})`).toMatch(
+      /^grow end\b.*\bobserved\b/,
+    );
+    expect(Math.abs(run.grown - run.before), `premise: the growth did not move the view (${what})`).toBeLessThanOrEqual(1);
+    expect(
+      Math.abs(run.shift - GROW_PX),
+      `premise: the growth pushed the reader's message down before the settle (${what})`,
+    ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+    return { at, what };
+  }
+
+  test("a reader parked outside the band keeps their message (controlled order: growth → settle → observer)", async ({
+    page,
+  }) => {
+    try {
+      const { at, what } = await settleBeforeObserver(page, PARKED_UP_PX);
+      await followRealFrames(page, 3);
+      expect(
+        await rowDrift(page, at),
+        `the settle measured the reflowed rows before putting the anchor back, so the reader's message moved (${what})`,
+      ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      expect(await distanceFromBottom(page), `premise: the reader is outside the band (${what})`).toBeGreaterThan(
+        BOTTOM_THRESHOLD_PX,
+      );
+      await followDeliver(page, `arrival after the reflow: ${"r".repeat(200)}`);
+      await expectRowHeld(page, at, `an arrival after the settle moved the reader's message (${await followLog(page)})`);
+    } finally {
+      await teardown(page);
+    }
+  });
+
+  test("a reader inside the band is still following (controlled order: growth → settle → observer)", async ({
+    page,
+  }) => {
+    try {
+      const { what } = await settleBeforeObserver(page, CORRECTED_UP_PX);
+      await followRealFrames(page, 3);
+      // Settled inside the band, so following: the observer's restore snaps.
+      expect(
+        await distanceFromBottom(page),
+        `the settle measured the pin in the reflowed view, so the reader stopped following (${what})`,
+      ).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
+      await followDeliver(page, "join");
+      await expectSettledAtBottom(page, `the next arrival was not followed (${await followLog(page)})`);
+    } finally {
+      await teardown(page);
+    }
+  });
+
+  // Native, ungated, on the browser's own clock: three wheel ticks up, then a
+  // real image above the reader finishes loading, its response sent each delay
+  // in PROBE_DELAYS_MS after the last tick. The page records every `scroll` and
+  // `scrollend` once the app has had it, the image's `load`, and every
+  // observer delivery, each with the image row's height. The order in question
+  // is a settle that first sees the grown row, before any observer has
+  // reported it, with no settle since the reader's last scroll. Whatever order
+  // the engine chose, the reader's message has to stay where their last scroll
+  // left it. Ordering evidence only: it says nothing about real wheel lifetime.
+  //
+  // Measured here (2026-10-02, headless): Chromium ends every wheel tick at
+  // once, and Firefox sent no end of its own before the correction's; WebKit
+  // ends the wheel ~100ms after its last scroll, in the same rendering pass as
+  // the observer and before it, so an image loading 75-85ms after the ticks
+  // produced the order natively (and, before the fix, lost the message). The
+  // delays straddle that window; elsewhere they only check the outcome.
+  test("native input probe: wheel ticks, then an image loading above the reader", async ({ page, isMobile }) => {
+    test.skip(isMobile, "no wheel input on the mobile projects (see the wheel smoke above)");
+    test.setTimeout(120_000);
+    const PROBE_DELAYS_MS = [25, 75, 80, 85, 110];
+    const WHEEL_PX = 60;
+    for (const [i, delay] of PROBE_DELAYS_MS.entries()) {
+      const url = `/late-probe-${i}.svg`;
+      let held: Route | null = null;
+      await page.route(`**${url}`, (route) => {
+        held = route;
+      });
+      try {
+        await openRoomAtBottom(page, "Team Chat Room");
+        await callRiverTest(page, "appendMessage", `late probe ![late](${url})`);
+        await expect.poll(() => held !== null, { message: "premise: the image was requested" }).toBe(true);
+        for (let f = 0; f < 16; f++) await deliver(page, `probe filler ${f}: ${"y".repeat(200)}`);
+        await expectSettledAtBottom(page, "premise: the fillers should have been followed");
+        await afterLayoutSettles(page);
+        const box = (await page.locator("#chat-scroll-container").boundingBox())!;
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await page.evaluate((url) => {
+          const c = document.getElementById("chat-scroll-container")!;
+          const img = c.querySelector<HTMLImageElement>(`img[src$="${url}"]`)!;
+          const row = img.closest<HTMLElement>('[id^="msg-"]')!;
+          const events: ProbeEvent[] = [];
+          const newest = () => {
+            const view = c.getBoundingClientRect();
+            let at: { id: string; gap: number } | null = null;
+            for (const r of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
+              const b = r.getBoundingClientRect();
+              if (b.bottom > view.top && b.top < view.bottom) at = { id: r.id, gap: view.bottom - b.top };
+            }
+            return at;
+          };
+          const push = (kind: string) =>
+            events.push({
+              kind,
+              t: performance.now(),
+              top: c.scrollTop,
+              rowHeight: row.getBoundingClientRect().height,
+              rowBottom: row.getBoundingClientRect().bottom - c.getBoundingClientRect().top,
+              at: newest(),
+            });
+          // At the target, after the app's own listeners.
+          c.addEventListener("scroll", () => push("scroll"));
+          c.addEventListener("scrollend", () => push("end"));
+          img.addEventListener("load", () => push("load"));
+          new ResizeObserver(() => push("observed")).observe(document.getElementById("chat-content")!);
+          (window as unknown as { __lateProbe: ProbeEvent[] }).__lateProbe = events;
+        }, url);
+        for (let tick = 0; tick < 3; tick++) {
+          await page.mouse.wheel(0, -WHEEL_PX);
+          await page.waitForTimeout(20);
+        }
+        await page.waitForTimeout(delay);
+        await held!.fulfill({
+          contentType: "image/svg+xml",
+          body: '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240"><rect width="320" height="240" fill="#888"/></svg>',
+        });
+        held = null;
+        await expect
+          .poll(() => page.evaluate(() => (window as unknown as { __lateProbe: ProbeEvent[] }).__lateProbe.some((e) => e.kind === "load")), {
+            message: "premise: the image loaded",
+          })
+          .toBe(true);
+        await afterLayoutSettles(page);
+        await afterLayoutSettles(page);
+        const events = await page.evaluate(() => (window as unknown as { __lateProbe: ProbeEvent[] }).__lateProbe);
+        const final = await newestVisibleRow(page);
+
+        const pendingHeight = events[0].rowHeight;
+        const grownAt = events.findIndex((e) => e.rowHeight > pendingHeight + 1);
+        expect(grownAt, "premise: the image made its row taller").toBeGreaterThan(-1);
+        const growth = events[grownAt].rowHeight - pendingHeight;
+        const before = events.slice(0, grownAt);
+        const lastScroll = before.map((e) => e.kind).lastIndexOf("scroll");
+        expect(lastScroll, "premise: the wheel scrolled before the image loaded").toBeGreaterThan(-1);
+        const base = before[lastScroll];
+        expect(base.rowBottom, "premise: the image's row was above the view").toBeLessThan(0);
+        const t0 = base.t;
+        const timeline = events
+          .map((e, n) => `${e.kind}${n === grownAt ? "*" : ""}@${Math.round(e.t - t0)}`)
+          .join(" ");
+        const endedBefore = before.slice(lastScroll).some((e) => e.kind === "end");
+        const afterGrowth = events.slice(grownAt);
+        const firstObserved = afterGrowth.findIndex((e) => e.kind === "observed");
+        const disputed =
+          !endedBefore && afterGrowth.slice(0, firstObserved < 0 ? undefined : firstObserved).some((e) => e.kind === "end");
+        // A scroll after the growth that is neither the growth's (no move) nor
+        // its correction is the reader still moving.
+        const readerAfter = afterGrowth.some(
+          (e) =>
+            e.kind === "scroll" &&
+            Math.abs(e.top - events[grownAt].top) > 1 &&
+            Math.abs(e.top - events[grownAt].top - growth) > 1,
+        );
+        const drift = final?.id === base.at?.id ? Math.abs(final!.gap - base.at!.gap) : Infinity;
+        const description =
+          `delay ${delay}ms: ${timeline} (* first sight of the ${growth.toFixed(0)}px growth); ` +
+          `settle before observer: ${disputed ? "OBSERVED" : "not observed"}${endedBefore ? " (settled before the growth)" : ""}; ` +
+          `reader moved after the growth: ${readerAfter}; drift ${drift.toFixed(1)}px`;
+        test.info().annotations.push({ type: "native late image", description });
+        if (!readerAfter) {
+          expect(drift, `the reader's message moved (${description})`).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+        }
+      } finally {
+        await (held as Route | null)?.abort().catch(() => {});
+        await page.unroute(`**${url}`);
+      }
+    }
+  });
+});
+
+/// One line of the late-image probe's record.
+type ProbeEvent = {
+  kind: string;
+  t: number;
+  top: number;
+  rowHeight: number;
+  /// The image row's bottom edge, from the container's top edge.
+  rowBottom: number;
+  at: { id: string; gap: number } | null;
+};

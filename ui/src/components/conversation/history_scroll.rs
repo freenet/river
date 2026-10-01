@@ -50,11 +50,14 @@
 //!   deadline is armed instead (if it is not already), and every such end is
 //!   refused until the reader moves or the gesture ends. That is a geometry
 //!   match, not provenance: the reader's last end coalesced with the correction
-//!   looks the same, which is what the deadline is for. With no gesture in
-//!   progress a settle does nothing, which is what makes a stale `scrollend`
-//!   (another room's, an old gesture's, a seek frame's) harmless: room switches,
-//!   forced snaps and new seeks end the gesture, and forget its correction and
-//!   deadline.
+//!   looks the same, which is what the deadline is for. A settle that does end
+//!   the gesture first puts back a reflow the ResizeObserver has not reported
+//!   yet (the signature differs from the record: an image loading above the
+//!   view moves the rows, not `scrollTop`), against the existing anchor, and
+//!   only then measures. With no gesture in progress a settle does nothing,
+//!   which is what makes a stale `scrollend` (another room's, an old gesture's,
+//!   a seek frame's) harmless: room switches, forced snaps and new seeks end the
+//!   gesture, and forget its correction and deadline.
 //!
 //! # Where capture runs
 //!
@@ -255,6 +258,17 @@ fn settle_ends_gesture(
 ) -> bool {
     cause == SettleCause::Quiet
         || correction.is_none_or(|c| c.edges != now || c.reader_rev != reader_rev)
+}
+
+/// Whether a settle that ends the gesture must put the view back first: a
+/// gesture is in progress, no forced snap is pending (the restore it is owed
+/// snaps anyway), and the layout is not the one last recorded. That is a reflow
+/// the ResizeObserver has not reported yet, such as an image loading above the
+/// view, which moves the reader's rows without moving `scrollTop`; measured as
+/// it is, the settle would save where the reflow pushed them. An unchanged
+/// layout has nothing to put back.
+fn settle_restores_first(follow: Follow, force: bool, recorded: LayoutSig, now: LayoutSig) -> bool {
+    matches!(follow, Follow::Gesture { .. }) && !force && recorded != now
 }
 
 /// How long from `now_ms` until the quiet deadline of a reader whose last move
@@ -763,20 +777,29 @@ impl HistoryScroll {
             self.settle_pending.set(true);
             return;
         };
-        let before = self.recorded_edges();
         if self.force.take() {
             self.end_interaction();
             self.snap_and_tell(&container);
             return;
         }
+        self.restore_position(&container);
+        if self.settle_pending.take() {
+            self.end_gesture();
+        }
+    }
+
+    /// The view where the follow state says, with what that moved taken out of
+    /// its direction origin. The caller owns a forced snap and a pending settle.
+    fn restore_position(&self, container: &web_sys::Element) {
+        let before = self.recorded_edges();
         match self.follow.get() {
-            Follow::Seeking { .. } => self.seek(&container),
+            Follow::Seeking { .. } => self.seek(container),
             Follow::Free | Follow::Gesture { held: false, .. } if self.pinned.get() => {
-                self.snap_and_tell(&container)
+                self.snap_and_tell(container)
             }
             Follow::Free | Follow::Gesture { .. } => {
-                let moved = self.restore_anchor(&container);
-                self.record(&container);
+                let moved = self.restore_anchor(container);
+                self.record(container);
                 if moved {
                     self.note_correction(self.recorded_edges());
                 }
@@ -786,9 +809,6 @@ impl HistoryScroll {
         // pending reader move was taken in first), so it is not the gesture's
         // or the seek's.
         self.take_out_own_work(before);
-        if self.settle_pending.take() {
-            self.end_gesture();
-        }
     }
 
     /// Snap to the bottom at once and re-arm the pin. Scrolls the container
@@ -983,8 +1003,7 @@ impl HistoryScroll {
                 return;
             }
         }
-        self.cancel_settle_timer();
-        self.end_gesture();
+        self.settle_eligible();
     }
 
     /// The reader's quiet deadline has passed: the gesture settles wherever the
@@ -992,7 +1011,27 @@ impl HistoryScroll {
     fn settle_quiet(&self) {
         self.settle_timer.set(None);
         self.take_in_undelivered_scroll();
+        self.settle_eligible();
+    }
+
+    /// A settle that ends the gesture, the reader's pending scroll taken in. A
+    /// reflow no observer has reported yet is put back first, against the
+    /// reader's existing anchor (`settle_restores_first`), so the capture
+    /// measures the reader's place and not where the reflow pushed their rows.
+    /// That restore may correct the view; the gesture ends right after, which
+    /// drops the record, so the correction's own end meets no gesture.
+    fn settle_eligible(&self) {
         self.cancel_settle_timer();
+        if let Some(container) = self.laid_out_container() {
+            if settle_restores_first(
+                self.follow.get(),
+                self.force.get(),
+                self.sig.get(),
+                self.read_sig(&container),
+            ) {
+                self.restore_position(&container);
+            }
+        }
         self.end_gesture();
     }
 
@@ -1758,6 +1797,33 @@ mod tests {
         assert_eq!(quiet_deadline_in(1_000.0, 900.0), full);
         // Fractional clocks round up, so it is never early.
         assert_eq!(quiet_deadline_in(1_000.0, 1_000.5), full);
+    }
+
+    #[test]
+    fn a_settle_puts_back_a_reflow_the_observer_has_not_reported() {
+        let recorded = sig(3000, 600, 1000);
+        let grown = sig(3300, 600, 1000);
+        for held in [true, false] {
+            let gesture = Follow::Gesture {
+                from: edges(2000, 600),
+                held,
+            };
+            assert!(settle_restores_first(gesture, false, recorded, grown));
+            // Nothing changed since the record: nothing to put back.
+            assert!(!settle_restores_first(gesture, false, recorded, recorded));
+            // A forced snap is owed: its restore goes to the bottom anyway.
+            assert!(!settle_restores_first(gesture, true, recorded, grown));
+        }
+        // With no gesture in progress a settle does nothing, so neither does
+        // this: a stale end stays harmless.
+        for idle in [
+            Follow::Free,
+            Follow::Seeking {
+                from: edges(2000, 600),
+            },
+        ] {
+            assert!(!settle_restores_first(idle, false, recorded, grown));
+        }
     }
 
     #[test]

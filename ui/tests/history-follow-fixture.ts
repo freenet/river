@@ -216,6 +216,48 @@ export function followGrowAbove(page: Page, px: number) {
   }, px);
 }
 
+/// In one task: grow the newest message row wholly above the view by `px`, then
+/// dispatch a synthetic `scrollend` on the container, so the settle reaches the
+/// app before any ResizeObserver can report the growth. Logs `grow`, `end` (the
+/// recorder's, after the app's listener) and `observed` (this helper's own
+/// observer on `#chat-content`, its first delivery). Resolves once it has
+/// delivered, with `scrollTop` before the growth, after it, and after the
+/// app handled the end, and how far row `id` moved in the growth (positive is
+/// down, before the app saw anything).
+export function followGrowAboveThenEnd(page: Page, px: number, id: string) {
+  return page.evaluate(
+    ({ px, id }) =>
+      new Promise<{ before: number; grown: number; ended: number; shift: number }>((resolve) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const rec = window.__followRecorder!;
+        const top = c.getBoundingClientRect().top;
+        const above = Array.from(c.querySelectorAll<HTMLElement>('[id^="msg-"]'))
+          .filter((r) => r.getBoundingClientRect().bottom < top)
+          .at(-1);
+        if (!above) throw new Error("follow: no message row is entirely above the view");
+        const tracked = document.getElementById(id)!;
+        const rowTop = () => tracked.getBoundingClientRect().top;
+        const before = c.scrollTop;
+        const rowBefore = rowTop();
+        above.style.paddingTop = `${(parseFloat(above.style.paddingTop) || 0) + px}px`;
+        rec.log.push("grow");
+        const grown = c.scrollTop;
+        const shift = rowTop() - rowBefore;
+        c.dispatchEvent(new Event("scrollend"));
+        const ended = c.scrollTop;
+        // Observers deliver in the next rendering pass, the app's (made first)
+        // before this one.
+        const observer = new ResizeObserver(() => {
+          observer.disconnect();
+          rec.log.push("observed");
+          rec.afterRealFrame(() => resolve({ before, grown, ended, shift }));
+        });
+        observer.observe(document.getElementById("chat-content")!);
+      }),
+    { px, id },
+  );
+}
+
 /// The history's event-summary rows (join events and the like).
 const EVENT_ROWS = "#chat-content [data-anchor-row][data-item-key]";
 
