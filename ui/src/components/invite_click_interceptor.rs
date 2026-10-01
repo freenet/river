@@ -27,9 +27,13 @@
 //! entry flow uses. The current room / open DM / draft text are
 //! preserved because the iframe never reloads.
 //!
-//! Scope: only intercepts clicks on anchors whose `href` contains
-//! `?invitation=`. Non-invite anchors (the `target="_blank"` Freenet
-//! web URLs we already shorten, freenet.org, etc.) are untouched.
+//! Scope: only intercepts clicks on anchors whose `href` is an invite URL
+//! for THIS River: same origin, same web-container contract id as the page
+//! (under `/v1/` or `/v2/contract/web/`),
+//! and `?invitation=` in the query (see [`invitation_code_to_intercept`]).
+//! Everything else (Freenet web URLs for other apps, including converted
+//! share links that happen to carry `?invitation=`, freenet.org, etc.) is
+//! untouched.
 
 use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
@@ -87,37 +91,24 @@ pub fn install_invite_click_interceptor() {
                 // same way.
                 let href = anchor.href();
 
-                // Skeptical-review (#260 P1): only intercept SAME-ORIGIN
-                // invite URLs. A foreign-gateway invite link
-                // (e.g. `https://other-gw.example/v1/.../?invitation=...`)
-                // should be left alone so the user can open it in a new
-                // tab (which works in the sandbox via the gateway shell
-                // for cross-origin destinations). If we intercepted
-                // those, the modal would either fail to parse the code
-                // or get stuck "preparing to subscribe" against a
-                // contract this gateway doesn't host.
-                let same_origin = web_sys::window()
-                    .and_then(|w| w.location().origin().ok())
-                    .map(|origin| href.starts_with(&origin) || href.starts_with('/'))
-                    .unwrap_or(false);
-                if !same_origin {
-                    return;
-                }
-
-                let Some(q_start) = href.find("?invitation=") else {
+                // Skeptical-review (#260 P1): only intercept invite URLs for
+                // THIS River (same origin AND same web-container contract).
+                // A foreign-gateway invite link, or a `?invitation=` link to
+                // some other Freenet app, is left alone so it opens in a new
+                // tab (which escapes the sandbox via the gateway shell). If
+                // we intercepted those, the modal would either fail to parse
+                // the code or get stuck "preparing to subscribe" against a
+                // contract this gateway doesn't host, and a share link naming
+                // app A would open River's invite dialog instead of A.
+                let Some(location) = web_sys::window().map(|w| w.location()) else {
                     return;
                 };
-                let code_with_tail = &href[q_start + "?invitation=".len()..];
-                // Strip URL fragment if any. We don't expect `&` in
-                // invite URLs but split on it too, defensively.
-                let code = code_with_tail
-                    .split(['#', '&'])
-                    .next()
-                    .unwrap_or(code_with_tail)
-                    .to_string();
-                if code.is_empty() {
+                let (Ok(origin), Ok(pathname)) = (location.origin(), location.pathname()) else {
                     return;
-                }
+                };
+                let Some(code) = invitation_code_to_intercept(&href, &origin, &pathname) else {
+                    return;
+                };
                 evt.prevent_default();
                 evt.stop_propagation();
                 // `defer` so the signal write happens off the JS event
@@ -142,5 +133,131 @@ pub fn install_invite_click_interceptor() {
         // Leak the closure intentionally — the listener lives for the
         // lifetime of the page.
         cb.forget();
+    }
+}
+
+/// The invitation code to handle in-app for a click on `href`, or `None` to
+/// let the browser follow the link.
+///
+/// `origin` and `pathname` are the page's own (`window.location`). The link is
+/// intercepted only when it points at this same River: the same origin and the
+/// web-container contract id as the page (under `/v1/` or `/v2/`), with
+/// `?invitation=<code>` in its query (not merely somewhere in its fragment).
+/// A `?invitation=` link to any other contract is some other app's business.
+pub(crate) fn invitation_code_to_intercept(
+    href: &str,
+    origin: &str,
+    pathname: &str,
+) -> Option<String> {
+    // The gateway serves webapps under `/v1/` and `/v2/`. Either route on
+    // either side names the same River, so match the contract id, not the
+    // route (a v1 invite clicked on a v2 page is still ours).
+    const MARKERS: [&str; 2] = ["/v1/contract/web/", "/v2/contract/web/"];
+    let strip_marker = |path: &'_ str| -> Option<String> {
+        MARKERS
+            .iter()
+            .find_map(|m| path.strip_prefix(m))
+            .map(str::to_string)
+    };
+    let page_rest = strip_marker(pathname)?;
+    let own_id = page_rest.split('/').next()?;
+    if own_id.is_empty() {
+        return None;
+    }
+    let href_rest = strip_marker(href.strip_prefix(origin)?)?;
+    let after_prefix = href_rest.strip_prefix(own_id)?;
+    // The id must end here, not merely share a prefix with a longer one.
+    if !after_prefix.starts_with(['/', '?']) {
+        return None;
+    }
+    let before_fragment = after_prefix.split('#').next().unwrap_or("");
+    let q_start = before_fragment.find("?invitation=")?;
+    // We don't expect `&` in invite URLs but split on it, defensively.
+    let code = before_fragment[q_start + "?invitation=".len()..]
+        .split('&')
+        .next()
+        .unwrap_or("");
+    if code.is_empty() {
+        return None;
+    }
+    Some(code.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::invitation_code_to_intercept;
+
+    const ORIGIN: &str = "http://127.0.0.1:7509";
+    const RIVER: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
+    const OTHER: &str = "6FzSeAUKcqJrveKyU8RJgGKc5jRB1Z2juvxXtwTA4Em9";
+
+    fn page() -> String {
+        format!("/v1/contract/web/{RIVER}/")
+    }
+
+    #[test]
+    fn own_river_invite_is_intercepted() {
+        for href in [
+            format!("{ORIGIN}/v1/contract/web/{RIVER}/?invitation=abc"),
+            format!("{ORIGIN}/v1/contract/web/{RIVER}/?invitation=abc#frag"),
+            format!("{ORIGIN}/v1/contract/web/{RIVER}/?invitation=abc&x=y"),
+            format!("{ORIGIN}/v1/contract/web/{RIVER}?invitation=abc"),
+        ] {
+            assert_eq!(
+                invitation_code_to_intercept(&href, ORIGIN, &page()).as_deref(),
+                Some("abc"),
+                "{href}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_apps_and_origins_are_not_intercepted() {
+        for href in [
+            // Another contract's `?invitation=` (e.g. a converted share link).
+            format!("{ORIGIN}/v1/contract/web/{OTHER}/?invitation=abc"),
+            // A longer id that merely starts with River's.
+            format!("{ORIGIN}/v1/contract/web/{RIVER}x/?invitation=abc"),
+            // Another gateway.
+            format!("https://gw.example/v1/contract/web/{RIVER}/?invitation=abc"),
+            // Only in the fragment, which the page's router owns.
+            format!("{ORIGIN}/v1/contract/web/{RIVER}/#?invitation=abc"),
+            // No code.
+            format!("{ORIGIN}/v1/contract/web/{RIVER}/?invitation="),
+            // Not an invite at all.
+            format!("{ORIGIN}/v1/contract/web/{RIVER}/?x=1"),
+        ] {
+            assert_eq!(
+                invitation_code_to_intercept(&href, ORIGIN, &page()),
+                None,
+                "{href}"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_and_v2_routes_name_the_same_river() {
+        let v2_page = format!("/v2/contract/web/{RIVER}/");
+        let v2 = format!("{ORIGIN}/v2/contract/web/{RIVER}/?invitation=abc");
+        let v1 = format!("{ORIGIN}/v1/contract/web/{RIVER}/?invitation=abc");
+        for (href, page) in [(&v2, &v2_page), (&v1, &v2_page), (&v2, &page())] {
+            assert_eq!(
+                invitation_code_to_intercept(href, ORIGIN, page).as_deref(),
+                Some("abc"),
+                "{href} on {page}"
+            );
+        }
+        let other = format!("{ORIGIN}/v2/contract/web/{OTHER}/?invitation=abc");
+        assert_eq!(invitation_code_to_intercept(&other, ORIGIN, &v2_page), None);
+    }
+
+    #[test]
+    fn nothing_is_intercepted_off_a_contract_page() {
+        let href = format!("{ORIGIN}/v1/contract/web/{RIVER}/?invitation=abc");
+        assert_eq!(invitation_code_to_intercept(&href, ORIGIN, "/"), None);
+        assert_eq!(
+            invitation_code_to_intercept(&href, ORIGIN, "/v1/contract/web/"),
+            None
+        );
     }
 }

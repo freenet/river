@@ -3709,8 +3709,7 @@ dependencies = [
 [[package]]
 name = "markdown"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5cab8f2cadc416a82d2e783a1946388b31654d391d1c7d92cc1f03e295b1deb"
+source = "git+https://github.com/freenet/markdown-rs?rev=4dcf957506808e39dbbd42aed8cfc874415ebc36#4dcf957506808e39dbbd42aed8cfc874415ebc36"
 dependencies = [
  "unicode-id",
 ]
@@ -4771,6 +4770,7 @@ dependencies = [
  "rand 0.8.6",
  "river-core",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.18",
  "tracing",

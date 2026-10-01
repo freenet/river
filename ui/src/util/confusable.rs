@@ -630,6 +630,35 @@ pub fn skeleton(name: &str) -> String {
     skeleton_with(name, Fold::Visual)
 }
 
+/// Fold `s` to the characters a reader would take it for, KEEPING case and
+/// every ASCII character as is: invisible and joiner characters dropped,
+/// fullwidth / mathematical / small-capital forms and combining accents folded,
+/// and cross-script homoglyphs mapped to the Latin letter they look like.
+///
+/// This is steps 1-5 of [`skeleton`] only, with no case, bar, digit or
+/// multi-character folds, for callers that must compare case-sensitive ASCII
+/// (a base58 contract id) against what is displayed.
+pub(crate) fn visual_ascii(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if is_display_hidden(c) {
+            if c.is_whitespace() {
+                out.push(' ');
+            }
+            continue;
+        }
+        if c == '\u{200C}' || c == '\u{200D}' || is_combining_mark(c) {
+            continue;
+        }
+        if let Some(ascii) = fold_presentation_form(c).or_else(|| fold_small_capital(c)) {
+            out.push(ascii);
+            continue;
+        }
+        out.push(fold_homoglyph(strip_latin_accent(c).unwrap_or(c)));
+    }
+    out
+}
+
 /// The space-stripped form of BOTH folds of `name`.
 ///
 /// This is the pair a *guard* must compare when it wants to answer "could this
@@ -1636,6 +1665,21 @@ fn damerau_within(a: &[char], b: &[char], cap: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visual_ascii_folds_what_the_reader_sees_and_keeps_case() {
+        assert_eq!(visual_ascii("raAqM"), "raAqM");
+        // Cyrillic homoglyphs, both cases.
+        assert_eq!(visual_ascii("\u{0430}\u{0410}"), "aA");
+        // Fullwidth forms, including punctuation.
+        assert_eq!(visual_ascii("\u{FF52}\u{FF1A}"), "r:");
+        // Mathematical bold.
+        assert_eq!(visual_ascii("\u{1D41F}\u{1D42B}"), "fr");
+        // Invisible and joiner characters dropped; hidden spaces become ' '.
+        assert_eq!(visual_ascii("fr\u{200B}ee\u{200D}net"), "freenet");
+        // Combining accents stripped, precomposed ones too.
+        assert_eq!(visual_ascii("e\u{0301}\u{00E9}"), "ee");
+    }
+
     use super::*;
 
     fn mid(n: i64) -> MemberId {
