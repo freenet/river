@@ -98,8 +98,8 @@
 //!   pending clamp and does not match the latest correction settles that
 //!   gesture, whoever's it was. A seek frame's end queued behind the reader's
 //!   takeover would be one; the engines in the suite were not seen to produce
-//!   that order (see `conversation-follow-state.spec.ts`, the seek takeover
-//!   diagnostic), and nothing here prevents it.
+//!   that order (see the opt-in `conversation-seek-takeover-diagnostic.spec.ts`,
+//!   run with `RIVER_SCROLL_DIAGNOSTICS=1`), and nothing here prevents it.
 //!
 //! # Where capture runs
 //!
