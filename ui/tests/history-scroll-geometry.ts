@@ -1,4 +1,4 @@
-import { Page } from "@playwright/test";
+import { expect, Page } from "@playwright/test";
 
 /// A message row and the gap from the scroll container's bottom edge to its top.
 export type RowPosition = { id: string; gap: number };
@@ -53,7 +53,8 @@ export function registerHistoryGeometry(page: Page): Promise<void> {
   return page.addInitScript(installHistoryGeometry);
 }
 
-function readNewest(page: Page): Promise<RowPosition | null> {
+/// The newest message intersecting the viewport, or null when none does.
+export function newestVisibleRow(page: Page): Promise<RowPosition | null> {
   return page.evaluate(() => {
     const geo = window.__riverHistoryGeometry;
     if (!geo) throw new Error("history geometry is not installed");
@@ -73,15 +74,20 @@ function readSaved(page: Page, id: string): Promise<SavedRow | null> {
   }, id);
 }
 
-/// The newest message intersecting the viewport, or null when none does.
-export function newestVisibleRow(page: Page): Promise<RowPosition | null> {
-  return readNewest(page);
+/// The newest message intersecting the viewport, required to exist.
+export async function requireNewestVisibleRow(
+  page: Page,
+  why = "premise: a message should be visible",
+): Promise<RowPosition> {
+  const row = await newestVisibleRow(page);
+  expect(row, why).not.toBeNull();
+  return row!;
 }
 
 /// Drift of the saved row while it is still the newest visible message.
 /// Missing, replaced, or no longer newest is Infinity, never zero.
 export async function newestMessageDrift(page: Page, before: RowPosition): Promise<number> {
-  const now = await readNewest(page);
+  const now = await newestVisibleRow(page);
   return now?.id === before.id ? Math.abs(now.gap - before.gap) : Infinity;
 }
 

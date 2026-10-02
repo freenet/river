@@ -5,6 +5,7 @@ import {
   newestMessageDrift,
   newestVisibleRow,
   registerHistoryGeometry,
+  requireNewestVisibleRow,
   savedRowDrift,
   type RowPosition,
 } from "./history-scroll-geometry";
@@ -179,19 +180,6 @@ async function expectStaysPut(page: Page, why: string) {
   expect(await scrollTop(page), why).toBeCloseTo(before, 0);
 }
 
-/// The newest history message with any part inside the scroll container, and
-/// how far its top sits above the container's bottom edge.
-function newestVisibleMessage(page: Page): Promise<RowPosition | null> {
-  return newestVisibleRow(page);
-}
-
-/// The newest visible message, required to exist.
-async function savedRow(page: Page): Promise<RowPosition> {
-  const row = await newestVisibleMessage(page);
-  expect(row, "premise: a message should be visible").not.toBeNull();
-  return row!;
-}
-
 /// How far a remembered position has drifted. Infinity when the row is gone, or
 /// (with `newest`) when another message is now the newest visible one: a
 /// missing row is a failure, never a zero drift.
@@ -216,7 +204,7 @@ async function expectInPlace(
   await expectDriftWithin(page, () => positionDrift(page, before, newest), why, { hold, tolerance });
 }
 
-/// The message `newestVisibleMessage` returned is the newest visible one again,
+/// The message `newestVisibleRow` returned is the newest visible one again,
 /// at the same gap. Keeps the 2px bound these older tests were written against.
 async function expectSameMessageInPlace(page: Page, before: RowPosition, why: string) {
   await expectInPlace(page, before, why, { tolerance: 2 });
@@ -238,7 +226,7 @@ async function parkAtEnd(page: Page): Promise<RowPosition> {
   await openRoomAtBottom(page, "Team Chat Room");
   await fillHistory(page);
   await afterLayoutSettles(page);
-  return savedRow(page);
+  return requireNewestVisibleRow(page);
 }
 
 /// Park at `top` and remember the newest message in that view. `0` is the
@@ -257,7 +245,7 @@ async function parkAt(page: Page, top: number | "half"): Promise<RowPosition> {
     .toBeGreaterThan(PARKED_ABOVE_END_PX);
   // The scroll has to have landed before we look at what is on screen.
   await afterLayoutSettles(page);
-  return savedRow(page);
+  return requireNewestVisibleRow(page);
 }
 
 /// The ways content can arrive at the end of the history.
@@ -299,7 +287,7 @@ test.describe("Arrivals at the end of the history do not move the view", () => {
     // here, and it is a starting position, not a mode.
     await openRoomAtBottom(page, "Team Chat Room");
     await afterLayoutSettles(page);
-    const placed = await savedRow(page);
+    const placed = await requireNewestVisibleRow(page);
     await deliver(page, `arrival after the first open: ${"o".repeat(200)}`);
     await expectNotFollowed(page, placed, "an arrival after the room's first placement moved the reader's row");
   });
@@ -335,7 +323,7 @@ test.describe("Arrivals at the end of the history do not move the view", () => {
     const distance = await distanceFromBottom(page);
     expect(distance, "premise: the reader rests inside the old follow band").toBeLessThan(PARKED_ABOVE_END_PX);
     expect(distance, "premise: and visibly above the end").toBeGreaterThan(ABOVE_END_PX / 2);
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
 
     await deliver(page, `arrival near the end: ${"n".repeat(200)}`);
     await expectNotFollowed(page, before, "a reader resting a little above the end was moved by an arrival");
@@ -346,7 +334,7 @@ test.describe("Arrivals at the end of the history do not move the view", () => {
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await afterLayoutSettles(page);
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
     const roomyViewport = await viewportHeight(page);
 
     // The gap is measured from the container's BOTTOM edge, which the composer
@@ -389,7 +377,7 @@ test.describe("Arrivals at the end of the history do not move the view", () => {
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await afterLayoutSettles(page);
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
 
     // Tag the last row so we can prove afterwards that it was diffed, not
     // remounted: only the content-change restore can have put it back then.
@@ -444,7 +432,7 @@ test.describe("Arrivals at the end of the history do not move the view", () => {
     await readerScrollsWithoutGesture(page, await historyHeight(page));
     await expectSettledAtBottom(page, "the reader's own scroll should reach the bottom");
     await afterLayoutSettles(page);
-    const atEnd = await savedRow(page);
+    const atEnd = await requireNewestVisibleRow(page);
     await deliver(page, "arrived after the reader scrolled back down");
     await expectNotFollowed(page, atEnd, "an arrival after the reader came back to the end moved their row");
   });
@@ -461,7 +449,7 @@ test.describe("Arrivals at the end of the history do not move the view", () => {
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
       .toBeGreaterThan(PARKED_ABOVE_END_PX);
     await afterLayoutSettles(page);
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
 
     await deliver(page, "arrived after a gesture-less scroll");
     await expectInPlace(page, before, "the reader scrolled up without a gesture event and an arrival moved them", {
@@ -682,7 +670,7 @@ test.describe("Layout changes at the end keep the newest row (#486)", () => {
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await afterLayoutSettles(page);
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
     const { clamp, laidOutAgain, belowFinalEnd } = await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       const content = document.getElementById("chat-content")!;
@@ -756,7 +744,7 @@ test.describe("Layout changes at the end keep the newest row (#486)", () => {
       undefined,
       { timeout: 5_000 },
     );
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
 
     // On `document`, so it runs after the app's own input handler has
     // collapsed the composer, before any frame.
@@ -972,7 +960,7 @@ test.describe("The newest visible message stays in place", () => {
     await expectDriftWithin(page, () => offsetDrift(page, target), "the reader's small scroll after a resize was put back", {
       hold: true,
     });
-    const parked = await savedRow(page);
+    const parked = await requireNewestVisibleRow(page);
 
     await deliver(page, "arrival after the reader left");
     await expectInPlace(page, parked, "an arrival moved a reader who scrolled up a little after a resize", {
@@ -1005,7 +993,7 @@ test.describe("The newest visible message stays in place", () => {
       await distanceFromBottom(page),
       "the reader's scroll was lost to the width change"
     ).toBeGreaterThan(PARKED_ABOVE_END_PX);
-    const parked = await savedRow(page);
+    const parked = await requireNewestVisibleRow(page);
 
     await deliver(page, "arrival after a same-frame scroll");
     await expectInPlace(page, parked, "an arrival moved a reader whose scroll shared a frame with a rewrap", {
@@ -1048,7 +1036,7 @@ test.describe("The newest visible message stays in place", () => {
       await distanceFromBottom(page),
       "premise: the history is taller than the view, so the reader is up in it",
     ).toBeGreaterThan(PARKED_ABOVE_END_PX);
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
     expect(before.id, `premise: the reader's newest visible row is not the one being edited (${ownId})`).not.toBe(ownId);
 
     const editArea = await openEditOn(page, ownId);
@@ -1143,7 +1131,7 @@ async function parkOnRow(page: Page, id: string, peek = 60): Promise<RowPosition
     await distanceFromBottom(page),
     "premise: the reader should be parked above the end",
   ).toBeGreaterThan(PARKED_ABOVE_END_PX);
-  const newest = await newestVisibleMessage(page);
+  const newest = await newestVisibleRow(page);
   expect(newest?.id, "premise: the aimed-at row should be the newest visible one").toBe(id);
   return newest!;
 }
@@ -1248,7 +1236,7 @@ test.describe("The reader's place survives removed and late content (#507)", () 
       page,
       "deleting the reading anchor should place at the latest message, not on the row above it",
     );
-    const landed = await newestVisibleMessage(page);
+    const landed = await newestVisibleRow(page);
     expect(landed, "premise: a message is visible at the landing").not.toBeNull();
     expect(landed!.id, "the landing is not the surviving neighbor").not.toBe(neighbor.id);
 
@@ -1498,7 +1486,7 @@ test.describe("A clamp to the end is not the reader", () => {
       "the reader's small scroll was put back as if the overhang had moved it",
       { hold: true },
     );
-    const parked = await savedRow(page);
+    const parked = await requireNewestVisibleRow(page);
     await deliver(page, "arrival after the overhang grew");
     await expectInPlace(page, parked, "an arrival moved the reader after their small scroll", { hold: true });
   });
@@ -1534,7 +1522,7 @@ test.describe("A clamp to the end is not the reader", () => {
       expect(await distanceFromBottom(page), "premise: the reader is parked above the end").toBeGreaterThan(
         PARKED_ABOVE_END_PX,
       );
-      const before = await savedRow(page);
+      const before = await requireNewestVisibleRow(page);
 
       const removed = await setOverhang(page, null);
       expectSameShape(removed.before, removed.after, "premise: removing the overhang resizes nothing the signature describes");
@@ -1754,7 +1742,7 @@ test.describe("A room switched to for the first time opens at its newest message
     await afterLayoutSettles(page);
     // The old room's animation, still running on the same container, would
     // carry the view away from the new room's placement.
-    const placed = await savedRow(page);
+    const placed = await requireNewestVisibleRow(page);
     await expectInPlace(page, placed, "the old room's animation carried over into the new room", { hold: true });
     await expectSettledAtBottom(page, "the new room's view left its newest message");
     await deliver(page, "arrival in the new room");
@@ -1770,7 +1758,7 @@ test.describe("A room switched to for the first time opens at its newest message
     await expect(page.getByRole("heading", { name: "Deep History Room" })).toBeVisible();
     await expectSettledAtBottom(page, "the new room did not open at its newest message");
     await afterLayoutSettles(page);
-    const placed = await savedRow(page);
+    const placed = await requireNewestVisibleRow(page);
     await deliver(page, "arrival in the new room");
     await expectNotFollowed(page, placed, "an arrival in the new room moved its placement");
   });
@@ -1865,7 +1853,7 @@ test.describe("Windowed history keeps the reader's row (#501)", () => {
     await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
     await expectWindowedRenderActive(page);
     await afterLayoutSettles(page);
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
     const initialRows = await renderedRowCount(page);
 
     // The #501 shape: each arrival grows the window while the reader sits at
@@ -1891,7 +1879,7 @@ test.describe("Windowed history keeps the reader's row (#501)", () => {
     // trim's gating is the source pin `the_trim_stays_gated_at_the_bottom` in
     // conversation.rs.
     await readerScrollsToEnd(page);
-    const landed = await savedRow(page);
+    const landed = await requireNewestVisibleRow(page);
     await expect
       .poll(() => renderedRowCount(page), {
         timeout: 5_000,
@@ -2197,7 +2185,7 @@ test.describe("Windowed history keeps the reader's row (#501)", () => {
     );
 
     // The placement happens once: the next arrival is preserved like any other.
-    const placed = await savedRow(page);
+    const placed = await requireNewestVisibleRow(page);
     await deliver(page, `arrival after opening the deep room: ${"d".repeat(200)}`);
     await expectNotFollowed(page, placed, "an arrival after the deep room's placement moved the reader's row");
   });
@@ -2232,7 +2220,7 @@ test.describe("The hidden mobile chat column", () => {
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
       .toBeGreaterThan(PARKED_ABOVE_END_PX);
     await afterLayoutSettles(page);
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
 
     await hideChat(page, "header-members-button");
     const beforeBatch = await renderedRowCount(page);
@@ -2260,7 +2248,7 @@ test.describe("The hidden mobile chat column", () => {
     await fillHistory(page);
     expect(await scrollTop(page), "premise: the bottom is well down the history").toBeGreaterThan(400);
     await afterLayoutSettles(page);
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
 
     await hideChat(page, "hamburger-rooms-button");
     await deliverWhileHidden(page, 3);
@@ -2289,7 +2277,7 @@ test.describe("The hidden mobile chat column", () => {
     await readerScrollsWithoutGesture(page, await endMinus(page, 2 * PARKED_ABOVE_END_PX));
     await readerScrollsToEnd(page);
     await afterLayoutSettles(page);
-    const before = await savedRow(page);
+    const before = await requireNewestVisibleRow(page);
 
     await page.setViewportSize({ width: 390, height: 844 });
     await chatHidden(page);

@@ -262,7 +262,7 @@ export async function revealChat(page: Page, back: "rooms-back-button" | "member
   await afterLayoutSettles(page);
 }
 
-export type ScrollRequests = { smooth: number; other: number };
+type ScrollRequests = { smooth: number; other: number };
 
 declare global {
   interface Window {

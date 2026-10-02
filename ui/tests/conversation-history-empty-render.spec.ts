@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { registerHistoryGeometry, type RowPosition } from "./history-scroll-geometry";
+import { registerHistoryGeometry, requireNewestVisibleRow, type RowPosition } from "./history-scroll-geometry";
 import {
   ARRIVAL,
   AT_BOTTOM_EPSILON_PX,
@@ -23,7 +23,6 @@ import {
   expectEmptyButVisible,
   registerEmptyRender,
   restoreHistory,
-  visibleRow,
 } from "./history-empty-render-fixture";
 
 const PARK_PX = 3_000;
@@ -41,7 +40,7 @@ test.describe("A render with no rows is not a deleted anchor", () => {
 
   test("restore: the parked message comes back at its gap when the rows return", async ({ page }) => {
     await parkAboveTheEnd(page, PARK_PX);
-    const saved = await visibleRow(page);
+    const saved = await requireNewestVisibleRow(page);
     try {
       const { before, after } = await emptyHistory(page, { keepHeight: false });
       expect(after, "premise: the empty render is much shorter than the history").toBeLessThan(before / 4);
@@ -65,7 +64,7 @@ test.describe("A render with no rows is not a deleted anchor", () => {
         await readerScrollsToEnd(page);
         await afterLayoutSettles(page);
       }
-      const saved = await visibleRow(page);
+      const saved = await requireNewestVisibleRow(page);
       let result: {
         before: number;
         after: number;
@@ -132,7 +131,7 @@ test.describe("A render with no rows is not a deleted anchor", () => {
 
   test("capture: a reader scroll while no rows render keeps the saved message for when they return", async ({ page }) => {
     await parkAboveTheEnd(page, PARK_PX);
-    const saved = await visibleRow(page);
+    const saved = await requireNewestVisibleRow(page);
     try {
       const { before, after } = await emptyHistory(page, { keepHeight: true });
       expect(Math.abs(after - before), "premise: the placeholder keeps the content's height").toBeLessThanOrEqual(1);
@@ -250,7 +249,7 @@ test.describe("A render with no rows is not a deleted anchor", () => {
 
   test("a click on scroll-to-latest while no rows render starts nothing", async ({ page }) => {
     await parkAboveTheEnd(page, PARK_PX);
-    const saved = await visibleRow(page);
+    const saved = await requireNewestVisibleRow(page);
     await recordScrollRequests(page);
     try {
       await emptyHistory(page, { keepHeight: true });

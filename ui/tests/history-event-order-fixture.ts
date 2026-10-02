@@ -83,7 +83,7 @@ export async function orderRecorderStop(page: Page) {
   });
 }
 
-export type MidflightArrival = {
+type MidflightArrival = {
   start: number;
   destination: number;
   atRequest: number;

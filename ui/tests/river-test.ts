@@ -3,7 +3,7 @@ import { Page } from "@playwright/test";
 export type RoomsLoadState = "loading" | "migrating" | "failed" | "loaded";
 
 // Mirrors the window.__riverTest hooks ui/src/test_hooks.rs installs.
-export type RiverTestHooks = {
+type RiverTestHooks = {
   /// Real controller callbacks, installed once the history has mounted.
   takeInPendingHistoryScroll(): void;
   restoreHistoryPosition(): void;

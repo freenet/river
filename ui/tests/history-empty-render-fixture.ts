@@ -1,5 +1,4 @@
 import { expect, Page } from "@playwright/test";
-import type { RowPosition } from "./history-scroll-geometry";
 import { afterLayoutSettles } from "./history-scroll-helpers";
 
 type EmptyRender = {
@@ -99,13 +98,4 @@ export async function afterObserverAndTask(page: Page) {
       }),
   );
   await afterLayoutSettles(page);
-}
-
-/// Read the visible message saved by the history geometry fixture.
-export async function visibleRow(page: Page, why = "premise: a message should be visible"): Promise<RowPosition> {
-  const row = await page.evaluate(() =>
-    window.__riverHistoryGeometry!.newestVisible(document.getElementById("chat-scroll-container")!),
-  );
-  expect(row, why).not.toBeNull();
-  return row!;
 }
