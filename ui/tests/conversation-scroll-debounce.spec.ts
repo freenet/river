@@ -109,41 +109,56 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     await debounceRestore(page);
   });
 
-  test("a signature-unchanged clamp before the quiet deadline preserves the parked reader (controlled order: clamp → deadline → scroll)", async ({ page }) => {
-    await debounceOpenFilledRoom(page, "Team Chat Room");
-    await debounceExpectFallbackSelected(page);
-    const overhang = await clampOverhang(page);
-    try {
-      await debounceScrollTo(page, overhang.after.max);
-      const setup = await debouncePauseWhenQuiet(page);
-      const at = await readerScrollsUp(page, 400, "the upward scroll into the overhang");
-      const armed = await expectFreshDeadline(page, "premise: the held gesture's deadline is pending");
-      expect(await debounceDistanceFromBottom(page), "premise: the reader is outside the follow band").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
-      await debounceBeforeSettleFire(page, "remove-overhang");
-      await debounceAdvance(page, DEBOUNCE_SETTLE_MS);
-      const state = await debounceState(page);
-      const removed = await page.evaluate(() => window.__historyClamp.removed);
-      expect(removed, "premise: the overhang was removed before the callback").not.toBeNull();
-      expectFinalEndClamp(removed!);
-      const late = state.beforeFire;
-      expect(late, "premise: exactly one geometry change ran before the deadline").toHaveLength(1);
-      expect(late[0].handle, "premise: it precedes the held gesture's deadline").toBe(armed.handle);
-      expect(late[0].at - armed.at, "premise: the callback runs after 120ms of reader quiet").toBe(DEBOUNCE_SETTLE_MS);
-      expect(state.scrollsDelivered, "premise: the clamp's scroll arrived after the deadline task").toBeGreaterThan(late[0].scrollsDelivered);
-      expect(debounceFired(state, setup).map((r) => r.handle), "premise: the original deadline fired").toEqual([armed.handle]);
-      expect(debouncePending(state), "the layout clamp must not re-arm the reader's deadline").toEqual([]);
-      expect(await debounceScrollTop(page), "the unreachable anchor leaves the view at the clamped end").toBeCloseTo(removed!.after.top, 0);
+  for (const deliveredFirst of [false, true]) {
+    test(`a signature-unchanged clamp before the quiet deadline preserves the parked reader (controlled order: ${deliveredFirst ? "clamp → scroll → deadline" : "clamp → deadline → scroll"})`, async ({ page }) => {
+      await debounceOpenFilledRoom(page, "Team Chat Room");
+      await debounceExpectFallbackSelected(page);
+      const overhang = await clampOverhang(page);
+      try {
+        await debounceScrollTo(page, overhang.after.max);
+        const setup = await debouncePauseWhenQuiet(page);
+        const at = await readerScrollsUp(page, 400, "the upward scroll into the overhang");
+        const armed = await expectFreshDeadline(page, "premise: the held gesture's deadline is pending");
+        expect(await debounceDistanceFromBottom(page), "premise: the reader is outside the follow band").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+        if (deliveredFirst) {
+          const removed = await page.evaluate(() => window.__historyClamp.remove());
+          expectFinalEndClamp(removed);
+          await debounceFrames(page, 3);
+          expect(await page.evaluate(() => window.__historyClamp.scrolls), "premise: the real clamp scroll reached the app before the deadline").toBeGreaterThan(removed.scrolls);
+          const same = await expectFreshDeadline(page, "the clamp leaves the reader's original deadline pending");
+          expect(same.handle).toBe(armed.handle);
+        } else {
+          await debounceBeforeSettleFire(page, "remove-overhang");
+        }
+        await debounceAdvance(page, DEBOUNCE_SETTLE_MS);
+        const state = await debounceState(page);
+        const removed = await page.evaluate(() => window.__historyClamp.removed);
+        expect(removed, "premise: the overhang was removed before the callback").not.toBeNull();
+        expectFinalEndClamp(removed!);
+        const late = state.beforeFire;
+        if (!deliveredFirst) {
+          expect(late, "premise: exactly one geometry change ran before the deadline").toHaveLength(1);
+          expect(late[0].handle, "premise: it precedes the held gesture's deadline").toBe(armed.handle);
+          expect(late[0].at - armed.at, "premise: the callback runs after 120ms of reader quiet").toBe(DEBOUNCE_SETTLE_MS);
+          expect(state.scrollsDelivered, "premise: the clamp's scroll arrived after the deadline task").toBeGreaterThan(late[0].scrollsDelivered);
+        } else {
+          expect(late, "the clamp was delivered without a before-fire action").toEqual([]);
+        }
+        expect(debounceFired(state, setup).map((r) => r.handle), "premise: the original deadline fired").toEqual([armed.handle]);
+        expect(debouncePending(state), "the layout clamp must not re-arm the reader's deadline").toEqual([]);
+        expect(await debounceScrollTop(page), "the unreachable anchor leaves the view at the clamped end").toBeCloseTo(removed!.after.top, 0);
 
-      const marker = "arrival after quiet clamp settle";
-      await debounceDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
-      const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
-      expect(height, "premise: the arrival restores the lost range plus the follow band").toBeGreaterThan(500);
-      expect(await clampRowDrift(page, at), "the quiet deadline captured the clamp and followed the tall arrival").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
-      expect(await debounceDistanceFromBottom(page), "the arrival must leave the reader parked").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
-    } finally {
-      await clampCleanup(page);
-    }
-  });
+        const marker = "arrival after quiet clamp settle";
+        await debounceDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
+        const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
+        expect(height, "premise: the arrival restores the lost range plus the follow band").toBeGreaterThan(500);
+        expect(await clampRowDrift(page, at), "the quiet deadline captured the clamp and followed the tall arrival").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+        expect(await debounceDistanceFromBottom(page), "the arrival must leave the reader parked").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      } finally {
+        await clampCleanup(page);
+      }
+    });
+  }
 
   test("an arrival inside the band is held until the quiet deadline, and the next one follows", async ({ page }) => {
     await debounceOpenFilledRoom(page, "Team Chat Room");

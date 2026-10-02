@@ -18,6 +18,7 @@ type ClampRecord = {
 declare global {
   interface Window {
     __historyClamp: {
+      snapshot(): Shape;
       remove(): ClampRecord;
       removed: ClampRecord | null;
       scrolls: number;
@@ -52,6 +53,7 @@ export function clampOverhang(page: Page, height = 700) {
     window.__historyClamp = {
       removed: null,
       scrolls: 0,
+      snapshot: shape,
       remove() {
         const before = shape();
         box.remove();
@@ -73,7 +75,7 @@ export function expectFinalEndClamp(record: ClampRecord) {
     expect(after[key], `premise: the clamp does not change ${key}`).toBe(before[key]);
   }
   expect(before.top - after.top, "premise: the clamp exceeds the 200px layout allowance").toBeGreaterThan(200);
-  expect(Math.abs(after.max - after.top), "premise: the clamp lands at the live end").toBeLessThanOrEqual(1);
+  expect(Math.abs(after.max - after.top), `premise: the clamp lands at the live end (${JSON.stringify(record)})`).toBeLessThanOrEqual(1);
   expect(before.top, "premise: the saved position cannot be restored in the shortened range").toBeGreaterThan(after.max + 4);
 }
 

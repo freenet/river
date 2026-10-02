@@ -3116,16 +3116,10 @@ pub fn Conversation() -> Element {
         None
     });
 
-    // Use IntersectionObserver to track whether the user is near the bottom of the
-    // chat scroll container.  This replaces the old `onscroll` handler that performed
-    // DOM queries (scrollTop / clientHeight / scrollHeight) on every scroll event,
-    // causing visible scroll-bar jank on mobile (issue #151).
-    //
-    // A 1px invisible sentinel div sits at the bottom of the scroll content.
-    // A rootMargin of "0px 0px 100px 0px" expands the detection zone 100px above
-    // the sentinel, so the user is considered "at the bottom" when within 100px of
-    // the end.  The observer fires only on intersection changes, so there is zero
-    // work during normal scrolling.
+    // IntersectionObserver drives only the scroll-to-latest button's visibility.
+    // HistoryScroll separately listens for scroll events to track reader intent.
+    // A 1px sentinel at the content's bottom and a 100px root margin make the
+    // button disappear near the end; this observer runs on intersection changes.
     #[cfg(target_arch = "wasm32")]
     use_effect(move || {
         use wasm_bindgen::prelude::*;

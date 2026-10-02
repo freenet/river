@@ -57,58 +57,150 @@ const IN_PLACE_TOLERANCE_PX = 4;
 test.describe("A pending layout clamp at settlement", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  test("a signature-unchanged clamp before scrollend preserves the parked reader (controlled order: clamp → end → scroll)", async ({ page }) => {
-    await seekClockInstall(page);
-    await openRoomAtBottom(page, "Team Chat Room");
-    for (let i = 0; i < 8; i++) await deliver(page, `clamp filler ${i}: ${"y".repeat(200)}`);
-    await afterLayoutSettles(page);
-    const overhang = await clampOverhang(page);
-    try {
-      await readerScrollsWithoutGesture(page, overhang.after.max);
+  for (const deliveredFirst of [false, true]) {
+    test(`a signature-unchanged clamp before scrollend preserves the parked reader (controlled order: ${deliveredFirst ? "clamp → scroll → end" : "clamp → end → scroll"})`, async ({ page }) => {
+      await seekClockInstall(page);
+      await openRoomAtBottom(page, "Team Chat Room");
+      for (let i = 0; i < 8; i++) await deliver(page, `clamp filler ${i}: ${"y".repeat(200)}`);
       await afterLayoutSettles(page);
-      await seekClockPause(page);
-      await followRecorderStart(page, { gateEnds: true });
-      await followMark(page, "park");
-      const move = await followReaderMove(page, -400);
-      expect(move.delivered, "premise: the reader's move reached the app").toBe(true);
-      expect(move.after - move.before, "premise: the upward move starts a held gesture").toBeCloseTo(-400, 0);
-      expect(await followAwaitAfter(page, "park", "held"), "premise: the move's end was gated").toBe(true);
-      expect(await distanceFromBottom(page), "premise: the reader is outside the follow band").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
-      const at = await newestVisibleRow(page);
-      expect(at, "premise: the original anchor row is visible").not.toBeNull();
+      const overhang = await clampOverhang(page);
+      try {
+        await readerScrollsWithoutGesture(page, overhang.after.max);
+        await afterLayoutSettles(page);
+        await seekClockPause(page);
+        await followRecorderStart(page, { gateEnds: true });
+        await followMark(page, "park");
+        const move = await followReaderMove(page, -400);
+        expect(move.delivered, "premise: the reader's move reached the app").toBe(true);
+        expect(move.after - move.before, "premise: the upward move starts a held gesture").toBeCloseTo(-400, 0);
+        expect(await followAwaitAfter(page, "park", "held"), "premise: the move's end was gated").toBe(true);
+        expect(await distanceFromBottom(page), "premise: the reader is outside the follow band").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+        const at = await newestVisibleRow(page);
+        expect(at, "premise: the original anchor row is visible").not.toBeNull();
 
-      const settled = await page.evaluate(() => {
-        const rec = window.__followRecorder!;
-        rec.setGate(false);
-        rec.log.push("clamp");
-        const removed = window.__historyClamp.remove();
-        const scrollsBeforeEnd = window.__historyClamp.scrolls;
-        document.getElementById("chat-scroll-container")!.dispatchEvent(new Event("scrollend"));
-        return { removed, scrollsBeforeEnd, scrollsAfterEnd: window.__historyClamp.scrolls, log: rec.log.slice() };
-      });
-      expectFinalEndClamp(settled.removed);
-      expect(settled.scrollsAfterEnd, "premise: the end ran before the clamp's scroll event").toBe(settled.scrollsBeforeEnd);
-      expect(settled.log.slice(settled.log.lastIndexOf("clamp")), "premise: the end reached the app immediately after the clamp").toEqual(["clamp", "end"]);
-      await followRealFrames(page, 3);
-      expect(await page.evaluate(() => window.__historyClamp.scrolls), "premise: the later scroll was delivered").toBeGreaterThan(settled.scrollsAfterEnd);
-      expect(await scrollTop(page), "the unreachable anchor leaves the view at the clamped end").toBeCloseTo(settled.removed.after.top, 0);
+        const settled = await page.evaluate(async (deliveredFirst) => {
+          const rec = window.__followRecorder!;
+          if (!deliveredFirst) rec.setGate(false);
+          rec.log.push("clamp");
+          const removed = window.__historyClamp.remove();
+          if (deliveredFirst) {
+            // Let the real scroll reach the app while its automatic end stays gated.
+            for (let i = 0; i < 3; i++) await new Promise<void>((r) => rec.afterRealFrame(r));
+            rec.setGate(false);
+          }
+          const scrollsBeforeEnd = window.__historyClamp.scrolls;
+          document.getElementById("chat-scroll-container")!.dispatchEvent(new Event("scrollend"));
+          return { removed, scrollsBeforeEnd, scrollsAfterEnd: window.__historyClamp.scrolls, log: rec.log.slice() };
+        }, deliveredFirst);
+        expectFinalEndClamp(settled.removed);
+        if (deliveredFirst) {
+          expect(settled.scrollsBeforeEnd, "premise: the clamp scroll arrived before the end").toBeGreaterThan(settled.removed.scrolls);
+        } else {
+          expect(settled.scrollsBeforeEnd, "premise: the end precedes the clamp scroll").toBe(settled.removed.scrolls);
+        }
+        expect(settled.scrollsAfterEnd, "premise: dispatching the end did not deliver another scroll").toBe(settled.scrollsBeforeEnd);
+        if (!deliveredFirst) {
+          expect(settled.log.slice(settled.log.lastIndexOf("clamp")), "premise: the end reached the app immediately after the clamp").toEqual(["clamp", "end"]);
+        } else {
+          expect(settled.log.slice(settled.log.lastIndexOf("clamp")).join(" "), "premise: the clamp scroll reached the app before settlement").toMatch(/^clamp scroll (held )*end$/);
+        }
+        await followRealFrames(page, 3);
+        if (!deliveredFirst) {
+          expect(await page.evaluate(() => window.__historyClamp.scrolls), "premise: the later scroll was delivered").toBeGreaterThan(settled.scrollsAfterEnd);
+        }
+        expect(await scrollTop(page), "the unreachable anchor leaves the view at the clamped end").toBeCloseTo(settled.removed.after.top, 0);
 
-      const marker = "arrival after native clamp settle";
-      await followDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
-      const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
-      expect(height, "premise: the arrival restores the lost range plus the follow band").toBeGreaterThan(500);
-      await expect.poll(() => clampRowDrift(page, at!), {
-        message: "settlement captured the clamp and followed the tall arrival",
-      }).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
-      await followRealFrames(page, 3);
-      expect(await clampRowDrift(page, at!), "the saved row stays at its gap after later events").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
-      expect(await distanceFromBottom(page), "the arrival must leave the reader parked").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
-    } finally {
-      await followRecorderStop(page);
-      await clampCleanup(page);
-      await page.clock.resume();
-    }
-  });
+        const marker = "arrival after native clamp settle";
+        await followDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
+        const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
+        expect(height, "premise: the arrival restores the lost range plus the follow band").toBeGreaterThan(500);
+        await expect.poll(() => clampRowDrift(page, at!), {
+          message: "settlement captured the clamp and followed the tall arrival",
+        }).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+        await followRealFrames(page, 3);
+        expect(await clampRowDrift(page, at!), "the saved row stays at its gap after later events").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+        expect(await distanceFromBottom(page), "the arrival must leave the reader parked").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      } finally {
+        await followRecorderStop(page);
+        await clampCleanup(page);
+        await page.clock.resume();
+      }
+    });
+  }
+});
+
+test.describe("An unreachable anchor on mobile reveal", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  for (const deadlinePassed of [false, true]) {
+    test(`a hidden clamp preserves the parked reader on reveal ${deadlinePassed ? "after" : "before"} the quiet deadline`, async ({ page }) => {
+      await seekClockInstall(page);
+      await openRoomAtBottom(page, "Team Chat Room");
+      for (let i = 0; i < 8; i++) await deliver(page, `hidden clamp filler ${i}: ${"y".repeat(200)}`);
+      await afterLayoutSettles(page);
+      const overhang = await clampOverhang(page);
+      try {
+        await readerScrollsWithoutGesture(page, overhang.after.max);
+        await afterLayoutSettles(page);
+        await seekClockPause(page);
+        await followRecorderStart(page, { gateEnds: true, observeSettle: true });
+        const move = await followReaderMove(page, -400);
+        expect(move.delivered, "premise: the held reader scroll reached the app").toBe(true);
+        expect(await distanceFromBottom(page)).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+        // Produce a real anchor correction, then refuse its end to arm the deadline.
+        await followGrowAbove(page, 300);
+        await followRealFrames(page, 3);
+        const at = await newestVisibleRow(page);
+        expect(at, "premise: the saved row is visible before hiding").not.toBeNull();
+        await page.evaluate(() => {
+          window.__followRecorder!.setGate(false);
+          document.getElementById("chat-scroll-container")!.dispatchEvent(new Event("scrollend"));
+          window.__followRecorder!.setGate(true);
+        });
+        const armed = await followSettleRecord(page);
+        expect(armed.settle.filter((t) => t.cleared === null && t.fired === null), "premise: refusing the correction end armed the reader's deadline").toHaveLength(1);
+        const before = await page.evaluate(() => window.__historyClamp.snapshot());
+        await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).click();
+        await page.clock.runFor(0);
+        await expect(page.locator("#chat-scroll-container")).toBeHidden();
+        expect(await viewportHeight(page), "premise: hidden geometry is not measured").toBe(0);
+        await followRealFrames(page, 2);
+        await page.evaluate(() => window.__historyClamp.remove());
+        if (deadlinePassed) await page.clock.runFor(120);
+        await page.getByTestId("rooms-back-button").click();
+        // Nested zero-delay work can be scheduled one clock millisecond later.
+        // Let the reveal render, then prove it still preceded the quiet deadline.
+        await expect.poll(async () => {
+          await page.clock.runFor(1);
+          return viewportHeight(page);
+        }, { message: "premise: the back button reveals the history" }).toBeGreaterThan(0);
+        await expect(page.locator("#chat-scroll-container")).toBeVisible();
+        await followRealFrames(page, 3);
+        const after = await page.evaluate(() => window.__historyClamp.snapshot());
+        test.info().annotations.push({
+          type: "hidden clamp geometry",
+          description: JSON.stringify({ before, after, log: await followLog(page), timers: await followSettleRecord(page) }),
+        });
+        expectFinalEndClamp({ before, after, scrolls: 0 });
+        const settled = await followSettleRecord(page);
+        if (!deadlinePassed) {
+          expect(settled.now, "premise: reveal finished before the old deadline").toBeLessThan(armed.settle[0].at + armed.settle[0].delay);
+        } else {
+          expect(settled.settle[0].fired, "premise: the old deadline fired while hidden").not.toBeNull();
+        }
+        expect(settled.settle.filter((t) => t.cleared === null && t.fired === null), "reveal completes the old gesture and cancels its deadline").toEqual([]);
+        const marker = "tall arrival after hidden clamp";
+        await followDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
+        expect(await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(500);
+        expect(await clampRowDrift(page, at!), "reveal captured the clamp and followed the tall arrival").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+        expect(await distanceFromBottom(page)).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      } finally {
+        await followRecorderStop(page);
+        await clampCleanup(page);
+        await page.clock.resume();
+      }
+    });
+  }
 });
 
 /// Fill Team Chat Room with tall rows and park the reader `px` above the end.
@@ -521,12 +613,20 @@ const READER_QUIET_MS = 60;
 /// `finally`. The reader's newest visible message.
 async function heldGesture(
   page: Page,
-  { path = "/", upPx = CORRECTED_UP_PX, fillers = 8, observeSettle = false } = {},
+  { path = "/", upPx = CORRECTED_UP_PX, fillers = 8, observeSettle = false, initialShrinkPx = 0 } = {},
 ) {
   await seekClockInstall(page);
   await openRoomAtBottom(page, "Team Chat Room", path);
   for (let i = 0; i < fillers; i++) await deliver(page, `filler ${i}: ${"y".repeat(200)}`);
   await expectSettledAtBottom(page, "premise: the fillers should have been followed");
+  if (initialShrinkPx) {
+    await page.evaluate((px) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.style.maxHeight = `${c.clientHeight - px}px`;
+    }, initialShrinkPx);
+    await afterLayoutSettles(page);
+    await expectSettledAtBottom(page, "premise: the initial height constraint was followed");
+  }
   await afterLayoutSettles(page);
   await seekClockPause(page);
   await followRecorderStart(page, { gateEnds: true, observeSettle });
@@ -778,6 +878,47 @@ test.describe("An anchor correction's own scrollend", () => {
       );
     } finally {
       await teardown(page);
+    }
+  });
+
+  test("a container-growth clamp before the correction's end keeps the gesture held (controlled order: correction → growth clamp → its end → observer)", async ({ page }) => {
+    const GROW_CONTAINER_PX = 60;
+    try {
+      const at = await heldGesture(page, { initialShrinkPx: 80, observeSettle: true });
+      await page.clock.runFor(READER_QUIET_MS);
+      await followUngate(page);
+      await followRealFrames(page, 3);
+      await followResizeBeforeEnd(page, -GROW_CONTAINER_PX);
+      const grow = await followGrowAbove(page, GROW_PX);
+      expect(Math.abs(grow.after - grow.before), "premise: row growth did not clamp the top").toBeLessThanOrEqual(1);
+      const ended = await followAwaitAfter(page, "grow", "end", 20);
+      await followRealFrames(page, 3);
+      const resize = await followResizeRecord(page);
+      const log = await followLog(page);
+      const what = `${JSON.stringify({ grow, resize })}; ${log}`;
+      test.info().annotations.push({ type: "growth clamp before correction end", description: what });
+      expect(ended, `premise: the correction's end reached the app (${what})`).toBe(true);
+      expect(resize.ran).toBe(true);
+      expect(log.slice(log.lastIndexOf("ungated")), `premise: the growth clamp precedes end and observer (${what})`).toMatch(/^ungated (scroll )*grow (scroll )+resize end\b.*\bobserved\b/);
+      expect(Math.abs(resize.before.top - grow.before - GROW_PX), "premise: the anchor correction moved the top").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      expect(resize.after.height - resize.before.height, "premise: the container grew").toBe(GROW_CONTAINER_PX);
+      expect(resize.before.top - resize.after.top, "premise: container growth clamped scrollTop").toBeGreaterThan(SCROLL_TOP_SLACK_PX);
+      expect(resize.after.top + resize.after.height - resize.before.top - resize.before.height, "premise: the bottom edge changed too").toBeGreaterThan(SCROLL_TOP_SLACK_PX);
+      expect(await distanceFromBottom(page), "premise: the reader remains inside the follow band").toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+      expect(await rowDrift(page, at), `the growth clamp accepted the correction's own end and released the hold (${what})`).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      const armed = await followSettleRecord(page);
+      const pending = armed.settle.filter((t) => t.cleared === null && t.fired === null);
+      expect(pending, "the refused end arms one quiet deadline").toHaveLength(1);
+      expect(pending[0].delay, "layout does not restart reader quiet time").toBe(QUIET_MS - READER_QUIET_MS);
+      await expectShortArrivalHeld(page, at);
+      await page.clock.runFor(QUIET_MS - READER_QUIET_MS - 1);
+      expect(await rowDrift(page, at), "the hold lasts until the reader's deadline").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      await page.clock.runFor(1);
+      await followDeliver(page, "arrival after the growth clamp deadline");
+      await expectSettledAtBottom(page, "legitimate quiet settlement resumes in-band following");
+    } finally {
+      await teardown(page);
+      await page.evaluate(() => document.getElementById("chat-scroll-container")?.style.removeProperty("max-height"));
     }
   });
 

@@ -365,7 +365,8 @@ export type FollowResize = {
 };
 
 /// Arm a one-shot, capture-phase `scrollend` listener on `window`, ahead of the
-/// app's: at the container's next end it shrinks the container by `px`
+/// app's: at the container's next end it resizes the container by `px`
+/// (positive shrinks, negative grows from an initially constrained height)
 /// (`max-height`, removed by `followRecorderStop`), forces layout with a geometry
 /// read and logs `resize`, so the app reads that end with the container already
 /// resized and before any ResizeObserver can report it (the mutation and the
