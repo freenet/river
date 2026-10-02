@@ -2,13 +2,16 @@ import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { newestVisibleRow, registerHistoryGeometry, savedVisibleRowDrift, type RowPosition } from "./history-scroll-geometry";
 import {
+  ARRIVAL,
   AT_BOTTOM_EPSILON_PX,
   afterLayoutSettles,
   deliver,
   distanceFromBottom,
+  expectDriftWithin,
   expectSettledAtBottom,
   parkAboveTheEnd,
   scrollTop,
+  viewAtRest,
 } from "./history-scroll-helpers";
 
 // "Scroll to latest messages" where the browser sends no `scrollend` (Safari
@@ -29,15 +32,11 @@ const PARK_PX = 3_000;
 /// backstop with it (NAVIGATION_QUIET_WITH_SCROLLEND_MS), which must not be used.
 const QUIET_MS = 250;
 const BACKSTOP_MS = 1_000;
-/// A row's gap may move this much and still be "in place".
-const IN_PLACE_TOLERANCE_PX = 4;
 
 /// One quiet-interval registration the app made, on `performance.now()`.
 type QuietTimer = { delay: number; at: number; fired: number | null; cleared: number | null };
 
 type Fallback = {
-  /// Whether the engine had `onscrollend` before the script removed it.
-  hadScrollend: boolean;
   /// Event types added to `#chat-scroll-container`, in order.
   listeners: string[];
   /// `setTimeout`s of QUIET_MS or BACKSTOP_MS made while a click, or a `scroll`
@@ -58,7 +57,6 @@ declare global {
 function withoutScrollend({ quietMs, backstopMs }: { quietMs: number; backstopMs: number }) {
   const CONTAINER_ID = "chat-scroll-container";
   const record: Fallback = {
-    hadScrollend: "onscrollend" in HTMLElement.prototype || "onscrollend" in Element.prototype,
     listeners: [],
     quiet: [],
     requests: { smooth: 0, other: 0 },
@@ -129,7 +127,6 @@ function fallback(page: Page): Promise<Fallback> {
 /// The app found no `onscrollend` and listens for everything else.
 async function expectFallbackSelected(page: Page) {
   const state = await fallback(page);
-  test.info().annotations.push({ type: "engine scrollend", description: String(state.hadScrollend) });
   expect(
     await page.evaluate(() => Reflect.has(document.getElementById("chat-scroll-container")!, "onscrollend")),
     "premise: the container has no onscrollend",
@@ -162,23 +159,6 @@ async function parkAndCount(page: Page) {
   };
 }
 
-/// The view has stopped moving: two reads 300ms apart agree.
-async function viewAtRest(page: Page, why: string): Promise<number> {
-  let last = Number.NaN;
-  await expect
-    .poll(
-      async () => {
-        const before = await scrollTop(page);
-        await page.waitForTimeout(300);
-        last = await scrollTop(page);
-        return Math.abs(last - before);
-      },
-      { timeout: 10_000, message: why },
-    )
-    .toBeLessThanOrEqual(1);
-  return last;
-}
-
 /// The navigation ended at its quiet interval: the last one armed has fired,
 /// none is left pending, and no backstop-length interval was ever armed.
 async function expectEndedByQuietInterval(page: Page) {
@@ -199,19 +179,10 @@ async function expectEndedByQuietInterval(page: Page) {
 }
 
 /// The row recorded in `before` is still at its gap, over five samples (500ms).
-async function expectRowHolds(page: Page, before: RowPosition, why: string) {
-  await expect.poll(() => savedVisibleRowDrift(page, before), { timeout: 5_000, message: why }).toBeLessThanOrEqual(
-    IN_PLACE_TOLERANCE_PX,
-  );
-  const drifts: number[] = [];
-  for (let i = 0; i < 5; i++) {
-    await page.waitForTimeout(100);
-    drifts.push(await savedVisibleRowDrift(page, before));
-  }
-  expect(Math.max(...drifts), `${why} (samples: ${drifts.join(", ")})`).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+function expectRowHolds(page: Page, before: RowPosition, why: string) {
+  return expectDriftWithin(page, () => savedVisibleRowDrift(page, before), why, { hold: true });
 }
 
-const ARRIVAL = (what: string) => `${what}: ${"v".repeat(200)}`;
 const button = (page: Page) => page.getByTestId("scroll-to-bottom");
 
 test.beforeEach(async ({ page }) => {

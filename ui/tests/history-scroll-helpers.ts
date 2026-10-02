@@ -9,13 +9,35 @@ import { waitForApp, selectRoom } from "./example-room";
 // when `#chat-scroll-container` is missing, so a caller comparing two reads for
 // equality must first rule NaN out.
 
-/// Matches BOTTOM_THRESHOLD_PX in ui/src/components/conversation.rs: how close
-/// to the end hides the scroll-to-latest button. Button presentation only; no
-/// distance from the end makes the view follow arrivals.
-export const BOTTOM_THRESHOLD_PX = 100;
+/// A test premise: far enough above the end to be clearly away from it. No
+/// production counterpart.
+export const PARKED_ABOVE_END_PX = 100;
+
+/// Mirror of `SCROLL_TO_LATEST_MARGIN_PX` in conversation.rs: the content's
+/// bottom padding plus rounding. Button tests only.
+export const SCROLL_TO_LATEST_MARGIN_PX = 20;
 
 /// Slack for fractional layout after a scroll that did land at the bottom.
 export const AT_BOTTOM_EPSILON_PX = 4;
+
+/// The geometry budget for "the reader's message did not move", in CSS px.
+///
+/// A test contract, deliberately not derived from the implementation's own
+/// slack: it allows the residual understood so far (the scroll model reads
+/// `scrollTop` and row gaps as whole pixels, and at a fractional device scale
+/// rows sit at fractional offsets) and stays far below a visible row movement.
+export const IN_PLACE_TOLERANCE_PX = 4;
+
+/// The fixture variant with rooms deeper than the render window.
+export const DEEP_ROOM_PATH = "/?deep-history-room=1";
+
+/// A tall inbound message whose marker is `what`.
+export const ARRIVAL = (what: string) => `${what}: ${"v".repeat(200)}`;
+
+/// A tall inbound message: `marker`, then `lines` more lines. At the default 12,
+/// taller than PARKED_ABOVE_END_PX on its own.
+export const TALL = (marker: string, lines = 12) =>
+  `${marker}\n${Array.from({ length: lines }, (_, i) => `line ${i}`).join("\n")}`;
 
 /// scrollHeight - scrollTop - clientHeight: how far the end of the history is
 /// below the visible area. 0 means the newest message is fully in view.
@@ -127,7 +149,7 @@ export async function parkAboveTheEnd(page: Page, px: number) {
   await readerScrollsWithoutGesture(page, await endMinus(page, px));
   await afterLayoutSettles(page);
   expect(await distanceFromBottom(page), "premise: the reader should be parked far up").toBeGreaterThan(
-    px - BOTTOM_THRESHOLD_PX,
+    px - PARKED_ABOVE_END_PX,
   );
   await expect(page.getByTestId("scroll-to-bottom")).toBeVisible({ timeout: 5_000 });
 }
@@ -173,4 +195,68 @@ export async function afterLayoutSettles(page: Page) {
         requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 300))),
       ),
   );
+}
+
+/// `drift()` comes within `tolerance`, polled; with `hold`, then stays there for
+/// five samples over 500ms.
+export async function expectDriftWithin(
+  page: Page,
+  drift: () => Promise<number>,
+  why: string,
+  { hold = false, tolerance = IN_PLACE_TOLERANCE_PX } = {},
+) {
+  await expect.poll(drift, { timeout: 5_000, message: why }).toBeLessThanOrEqual(tolerance);
+  if (!hold) return;
+  const drifts: number[] = [];
+  for (let i = 0; i < 5; i++) {
+    await page.waitForTimeout(100);
+    drifts.push(await drift());
+  }
+  expect(
+    Math.max(...drifts),
+    `${why} (it converged, then drifted; samples every 100ms: ${drifts.map((d) => d.toFixed(2)).join(", ")})`,
+  ).toBeLessThanOrEqual(tolerance);
+}
+
+/// The view has stopped moving: two reads 300ms apart agree.
+export async function viewAtRest(page: Page, why: string): Promise<number> {
+  let last = Number.NaN;
+  await expect
+    .poll(
+      async () => {
+        const before = await scrollTop(page);
+        await page.waitForTimeout(300);
+        last = await scrollTop(page);
+        return Math.abs(last - before);
+      },
+      { timeout: 10_000, message: why },
+    )
+    .toBeLessThanOrEqual(1);
+  return last;
+}
+
+const chatColumn = (page: Page) => page.locator("#chat-scroll-container");
+
+/// The chat column is hidden, with no height, and the hide's own observer
+/// pass is over.
+export async function chatHidden(page: Page) {
+  await expect(chatColumn(page)).toBeHidden({ timeout: 5_000 });
+  await expect
+    .poll(() => viewportHeight(page), { message: "premise: the hidden chat has no height" })
+    .toBe(0);
+  await afterLayoutSettles(page);
+}
+
+/// Open another mobile panel, hiding the chat.
+export async function hideChat(page: Page, opener: "hamburger-rooms-button" | "header-members-button") {
+  await page.getByTestId(opener).filter({ visible: true }).click();
+  await chatHidden(page);
+}
+
+/// Go back to the chat from the room list or the member list, and wait out the
+/// reveal's own observer pass.
+export async function revealChat(page: Page, back: "rooms-back-button" | "members-back-button") {
+  await page.getByTestId(back).click();
+  await expect(chatColumn(page)).toBeVisible();
+  await afterLayoutSettles(page);
 }

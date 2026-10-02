@@ -10,25 +10,21 @@ import {
 import {
   orderGrowAboveThenEnd,
   orderLog,
-  orderMark,
   orderRealFrames,
   orderReaderMove,
   orderRecorderStart,
   orderRecorderStop,
 } from "./history-event-order-fixture";
 import {
-  missingAnchorDrift,
-  missingAnchorHideScrollbar,
-  missingAnchorRemove,
-  missingAnchorSelect,
-} from "./history-missing-anchor-fixture";
-import {
   AT_BOTTOM_EPSILON_PX,
-  BOTTOM_THRESHOLD_PX,
+  IN_PLACE_TOLERANCE_PX,
+  PARKED_ABOVE_END_PX,
+  TALL,
   afterLayoutSettles,
   deliver,
   distanceFromBottom,
-  endMinus,
+  expectDriftWithin,
+  expectSettledAtBottom,
   fillHistory,
   openRoomAtBottom,
   readerScrollsToEnd,
@@ -40,25 +36,17 @@ import {
 // The reader's saved row across layout and native-event orderings that a
 // geometry heuristic could get wrong (history_scroll.rs, "Classifying a
 // `scroll` event" and "Timing and visibility"): a clamp to a shorter range, a
-// clamp while hidden, every saved row removed, and a reflow above the reader
+// clamp while hidden, the one reading anchor deleted, and a reflow above the reader
 // that the ResizeObserver reports after some other event.
 //
 // Arrivals never move the view, so every case asks the same thing: is the
-// reader's row where they left it, or, with no saved row left, is the view
-// where layout left it rather than at the newest message. `scrollend` finishes
-// only a scroll-to-latest navigation now; the synthetic ones below stand in for
-// an engine's end arriving early or late, and must change nothing.
+// reader's row where they left it. Deleting that one row places at the latest
+// message once, and a stray `scrollend` or a reveal cannot revive the old
+// offset or start following. `scrollend` finishes only a scroll-to-latest
+// navigation now; the synthetic ones below stand in for an engine's end
+// arriving early or late, and must change nothing.
 //
 // Assumes the example-data build (`window.__riverTest`). Arrivals are INBOUND.
-
-/// The geometry budget for "the reader's message did not move" (as in the
-/// other conversation-* specs).
-const IN_PLACE_TOLERANCE_PX = 4;
-/// Matches SCROLL_TOP_SLACK_PX in ui/src/components/conversation.rs: within
-/// this of the end is the end.
-const SCROLL_TOP_SLACK_PX = 2;
-/// A tall inbound message: its first line is the marker it is found by.
-const TALLER = (marker: string) => `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`;
 
 test.beforeEach(async ({ page }) => {
   await registerHistoryGeometry(page);
@@ -77,18 +65,8 @@ async function arrive(page: Page, text: string) {
 
 /// The saved row is back at its gap, in view, and stays there for five samples
 /// over 500ms.
-async function expectRowHeld(page: Page, before: RowPosition, why: string) {
-  await expect.poll(() => savedVisibleRowDrift(page, before), { timeout: 5_000, message: why }).toBeLessThanOrEqual(
-    IN_PLACE_TOLERANCE_PX,
-  );
-  const drifts: number[] = [];
-  for (let i = 0; i < 5; i++) {
-    await page.waitForTimeout(100);
-    drifts.push(await savedVisibleRowDrift(page, before));
-  }
-  expect(Math.max(...drifts), `${why} (then drifted: ${drifts.join(", ")})`).toBeLessThanOrEqual(
-    IN_PLACE_TOLERANCE_PX,
-  );
+function expectRowHeld(page: Page, before: RowPosition, why: string) {
+  return expectDriftWithin(page, () => savedVisibleRowDrift(page, before), why, { hold: true });
 }
 
 // Removing a positioned overhang shortens the scroll range without resizing
@@ -118,7 +96,7 @@ test.describe("A clamp to a shorter range", () => {
         // Let the move's own native end, where the engine sends one, go by.
         await orderRealFrames(page, 3);
         expect(await distanceFromBottom(page), "premise: the reader is parked well above the end").toBeGreaterThan(
-          BOTTOM_THRESHOLD_PX,
+          PARKED_ABOVE_END_PX,
         );
         const at = await newestVisibleRow(page);
         expect(at, "premise: a message is visible").not.toBeNull();
@@ -155,7 +133,7 @@ test.describe("A clamp to a shorter range", () => {
         );
 
         const marker = "arrival after the clamp";
-        await arrive(page, TALLER(marker));
+        await arrive(page, TALL(marker, 30));
         const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
         expect(height, "premise: the arrival gives back more than the clamp took").toBeGreaterThan(500);
         await expectRowHeld(
@@ -163,7 +141,7 @@ test.describe("A clamp to a shorter range", () => {
           at!,
           `the clamp was taken for the reader's position, so the arrival did not bring their row back (${await orderLog(page)})`,
         );
-        expect(await distanceFromBottom(page), "the arrival should be below the view").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+        expect(await distanceFromBottom(page), "the arrival should be below the view").toBeGreaterThan(PARKED_ABOVE_END_PX);
       } finally {
         await orderRecorderStop(page);
         await clampCleanup(page);
@@ -192,7 +170,7 @@ test.describe("An unreachable saved gap across a hide and reveal", () => {
       await readerScrollsWithoutGesture(page, (await scrollTop(page)) - 400);
       await afterLayoutSettles(page);
       expect(await distanceFromBottom(page), "premise: the reader is parked well above the end").toBeGreaterThan(
-        BOTTOM_THRESHOLD_PX,
+        PARKED_ABOVE_END_PX,
       );
       const at = await newestVisibleRow(page);
       expect(at, "premise: the saved row is visible before hiding").not.toBeNull();
@@ -208,155 +186,130 @@ test.describe("An unreachable saved gap across a hide and reveal", () => {
       await expect.poll(() => viewportHeight(page), { message: "premise: the back button reveals the history" }).toBeGreaterThan(0);
       await afterLayoutSettles(page);
       const after = await page.evaluate(() => window.__historyClamp.snapshot());
-      test.info().annotations.push({ type: "hidden clamp geometry", description: JSON.stringify({ before, after }) });
       expectFinalEndClamp({ before, after, scrolls: 0 });
 
       const marker = "tall arrival after the hidden clamp";
-      await arrive(page, TALLER(marker));
+      await arrive(page, TALL(marker, 30));
       expect(
         await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height),
         "premise: the arrival gives back more than the clamp took",
       ).toBeGreaterThan(500);
       await expectRowHeld(page, at!, "the reveal took the clamped end for the reader's position, so the arrival did not bring their row back");
-      expect(await distanceFromBottom(page), "the arrival should be below the view").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      expect(await distanceFromBottom(page), "the arrival should be below the view").toBeGreaterThan(PARKED_ABOVE_END_PX);
     } finally {
       await clampCleanup(page);
     }
   });
 });
 
-// Every row the reader's anchor remembers is removed (a moderator deleting a
-// run of messages), taking away more than they were parked above the end, so
-// the browser clamps them close to it. A restore then finds no saved row and
-// leaves the view where layout put it: nothing infers a request for the newest
-// message, now or on a later arrival, a stray `scrollend` or a reveal. The
-// reader's next scroll is what saves a new position.
-//
-// Arrivals are inbound and tall: one that moved the view would move
-// `scrollTop` by its height. The removal is the app's `removeMessages` hook
-// (history-missing-anchor-fixture.ts), in one state change.
+// The one saved anchor is deleted. While the history is measurable that places
+// at the latest message once; a stray `scrollend` must not revive the old
+// offset or start following. While the history is hidden, zero measurements
+// are not that deletion: the latest placement waits until the chat has a box
+// again. The landing is then preserved through later arrivals.
 
-/// Up from the end: parked well above it.
-const MISSING_UP_PX = 300;
-/// Enough filler messages that the removed neighbourhood is fillers only and
-/// history is left on both sides of it.
-const MISSING_FILLERS = 30;
+/// Enough filler that the deleted row is a plain message with a neighbor above it.
+const MISSING_FILLERS = 24;
 
-/// Open a room with `MISSING_FILLERS` fillers, park `MISSING_UP_PX` above the
-/// end, and remove every saved row. Leaves the recorder running: the caller
-/// stops it in a `finally`.
-async function parkAndRemoveSavedRows(page: Page) {
+/// Park on a filler, record the row above it, and delete only the parked row.
+async function deleteParkedAnchor(page: Page) {
   await openRoomAtBottom(page, "Team Chat Room");
   await fillHistory(page, MISSING_FILLERS);
-  await readerScrollsWithoutGesture(page, (await scrollTop(page)) - MISSING_UP_PX);
+  await readerScrollsWithoutGesture(page, (await scrollTop(page)) - 300);
   await afterLayoutSettles(page);
+  const anchor = await newestVisibleRow(page);
+  expect(anchor, "premise: a message is visible").not.toBeNull();
+  const neighborAlive = await page.evaluate((id) => {
+    const rows = Array.from(document.querySelectorAll<HTMLElement>("#chat-content [data-anchor-row]"));
+    const at = rows.findIndex((row) => row.id === id);
+    const neighbor = at > 0 ? rows[at - 1] : null;
+    return neighbor?.id.startsWith("msg-") ?? false;
+  }, anchor!.id);
+  expect(neighborAlive, "premise: a message survives above the anchor").toBe(true);
   await orderRecorderStart(page);
-  const selection = await missingAnchorSelect(page);
-  await orderMark(page, "remove");
-  const removal = await missingAnchorRemove(page, selection, () => orderRealFrames(page, 3));
-  return { selection, removal };
+  const unmatched = await callRiverTest(page, "removeMessages", [anchor!.id]);
+  expect(unmatched, "premise: the anchor id named a message").toEqual([]);
+  await expect
+    .poll(() => page.evaluate((id) => document.getElementById(id) === null, anchor!.id), { timeout: 5_000 })
+    .toBe(true);
+  return anchor!.id;
 }
 
-/// Two tall arrivals, the second to catch a jump that comes late: each must
-/// leave `scrollTop` at the post-removal offset, with the arrival below the view.
-async function expectStillThroughArrivals(page: Page, top: number, why: string) {
+/// Two tall arrivals must leave the landing row in place, below them.
+async function expectLandingPreserved(page: Page, landed: RowPosition, why: string) {
   for (const n of [1, 2]) {
-    const marker = `tall arrival ${n} after the anchor rows were removed`;
-    await arrive(page, TALLER(marker));
-    const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
+    const marker = `tall arrival ${n} after the anchor was deleted`;
+    await arrive(page, TALL(marker, 30));
+    const height = await page
+      .getByText(marker, { exact: false })
+      .last()
+      .evaluate((el) => el.getBoundingClientRect().height);
     expect(height, "premise: the arrival is far taller than the tolerance").toBeGreaterThan(
-      BOTTOM_THRESHOLD_PX + IN_PLACE_TOLERANCE_PX,
+      PARKED_ABOVE_END_PX + IN_PLACE_TOLERANCE_PX,
     );
-    const drift = await missingAnchorDrift(page, top);
-    expect(drift, `${why}: arrival ${n} moved the view by ${drift}px (${await orderLog(page)})`).toBeLessThanOrEqual(
-      IN_PLACE_TOLERANCE_PX,
-    );
+    await expectRowHeld(page, landed, `${why}: arrival ${n} moved the landing (${await orderLog(page)})`);
     expect(await distanceFromBottom(page), `${why}: arrival ${n} should be below the view`).toBeGreaterThan(
-      BOTTOM_THRESHOLD_PX,
+      PARKED_ABOVE_END_PX,
     );
   }
 }
 
-test.describe("Every saved anchor row removed", () => {
+test.describe("The reading anchor is deleted", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  test("the clamped reader stays where the removal left them through a stray scrollend and tall arrivals, and their next scroll is kept", async ({
-    page,
-  }) => {
+  test("a stray scrollend cannot revive the old offset, and later arrivals do not follow", async ({ page }) => {
     try {
-      const { selection, removal } = await parkAndRemoveSavedRows(page);
+      await deleteParkedAnchor(page);
+      await expectSettledAtBottom(page, "deleting the reading anchor should place at the latest message");
+      const landed = await newestVisibleRow(page);
+      expect(landed, "premise: the landing has a visible message").not.toBeNull();
       const ended = await page.evaluate(() => {
         const c = document.getElementById("chat-scroll-container")!;
         const top = c.scrollTop;
         c.dispatchEvent(new Event("scrollend"));
         return { top, after: c.scrollTop };
       });
-      const what = JSON.stringify({ selection, removal, ended });
-      test.info().annotations.push({ type: "missing anchor", description: what });
-      expect(
-        Math.abs(ended.top - removal.after.top),
-        `premise: the view is where the removal left it (${what})`,
-      ).toBeLessThanOrEqual(1);
-      expect(ended.after, `the stray end moved the view (${what})`).toBe(ended.top);
+      expect(ended.after, `the stray end moved the view (${await orderLog(page)})`).toBe(ended.top);
       await orderRealFrames(page, 2);
-      await expectStillThroughArrivals(page, removal.after.top, "a restore with no saved row went to the newest message");
-
-      // The reader's own move to the new end is theirs: it is saved, and the
-      // next arrival keeps that row where it is rather than following.
-      await orderMark(page, "back to the end");
-      const back = await orderReaderMove(page, (await endMinus(page, 0)) - (await scrollTop(page)));
-      expect(back.delivered, "premise: the reader's move back to the end reached the app").toBe(true);
-      expect(back.max - back.after, "premise: the reader reached the end").toBeLessThanOrEqual(SCROLL_TOP_SLACK_PX);
-      await orderRealFrames(page, 2);
-      const at = await newestVisibleRow(page);
-      expect(at, "premise: a message is visible").not.toBeNull();
-      await arrive(page, TALLER("arrival after the reader came back to the end"));
-      await expectRowHeld(page, at!, `the reader's own move was not saved, or the arrival was followed (${await orderLog(page)})`);
-      expect(await distanceFromBottom(page), "the arrival should be below the view").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      await expectRowHeld(page, landed!, "a stray scrollend moved the landing");
+      await expectLandingPreserved(page, landed!, "a stale event re-enabled following");
     } finally {
       await orderRecorderStop(page);
     }
   });
 });
 
-test.describe("Every saved anchor row removed, on the mobile layout", () => {
+test.describe("The reading anchor is deleted while the chat is hidden", () => {
   test.use({ viewport: { width: 390, height: 844 } });
 
-  test("the reveal leaves the clamped reader where the removal put them, after arrivals while hidden", async ({ page }) => {
+  test("the reveal places at the latest message once the chat is measurable, and the next arrival is preserved", async ({
+    page,
+  }) => {
     const chat = page.locator("#chat-scroll-container");
-    await missingAnchorHideScrollbar(page);
     try {
-      const { selection, removal } = await parkAndRemoveSavedRows(page);
+      await openRoomAtBottom(page, "Team Chat Room");
+      await fillHistory(page, MISSING_FILLERS);
+      await readerScrollsWithoutGesture(page, (await scrollTop(page)) - 300);
+      await afterLayoutSettles(page);
+      const anchor = await newestVisibleRow(page);
+      expect(anchor, "premise: a message is visible").not.toBeNull();
+      await orderRecorderStart(page);
+
       await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).click();
       await expect(chat).toBeHidden({ timeout: 5_000 });
       await expect.poll(() => viewportHeight(page), { message: "premise: hidden geometry is not measured" }).toBe(0);
+      const unmatched = await callRiverTest(page, "removeMessages", [anchor!.id]);
+      expect(unmatched, "premise: the anchor id named a message").toEqual([]);
       await orderRealFrames(page, 2);
-      for (const n of [1, 2]) {
-        const marker = `tall arrival ${n} while hidden`;
-        await callRiverTest(page, "appendMessage", TALLER(marker));
-        await expect(page.getByText(marker, { exact: false }).last(), "premise: delivered while hidden").toBeAttached({
-          timeout: 5_000,
-        });
-      }
-      await orderRealFrames(page, 2);
+
       await page.getByTestId("rooms-back-button").click();
       await expect(chat).toBeVisible();
       await expect.poll(() => viewportHeight(page), { message: "premise: the back button reveals the history" }).toBeGreaterThan(0);
-      await afterLayoutSettles(page);
-      const revealed = await page.evaluate(() => {
-        const c = document.getElementById("chat-scroll-container")!;
-        return { top: c.scrollTop, height: c.clientHeight, max: c.scrollHeight - c.clientHeight };
-      });
-      const what = JSON.stringify({ selection, removal, revealed, log: await orderLog(page) });
-      test.info().annotations.push({ type: "missing anchor reveal", description: what });
-      expect(
-        Math.abs(revealed.top - removal.after.top),
-        `the reveal found no saved row and moved the view anyway (${what})`,
-      ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
-      expect(revealed.max - revealed.top, `the arrivals while hidden should be below the view (${what})`).toBeGreaterThan(
-        BOTTOM_THRESHOLD_PX,
-      );
-      await expectStillThroughArrivals(page, removal.after.top, "a restore with no saved row went to the newest message after the reveal");
+      await expectSettledAtBottom(page, "the reveal should place at the latest message once the chat is measurable");
+      const landed = await newestVisibleRow(page);
+      expect(landed, "premise: the reveal has a visible message").not.toBeNull();
+      expect(landed!.id, "the deleted anchor must not be the landing").not.toBe(anchor!.id);
+      await expectLandingPreserved(page, landed!, "the reveal landing was not preserved");
     } finally {
       await orderRecorderStop(page);
     }
@@ -397,7 +350,6 @@ test.describe("A reflow above the reader, reported after another event", () => {
     const what =
       `${at!.id} at ${at!.gap.toFixed(1)}px, moved ${run.shift.toFixed(1)}px by the growth; ` +
       `scrollTop ${run.before} → ${run.grown} grown → ${run.ended} after the end; ${log}`;
-    test.info().annotations.push({ type: "ordered reflow", description: what });
     expect(log.slice(log.lastIndexOf("grow")), `premise: the end reached the app before the observer (${what})`).toMatch(
       /^grow end\b.*\bobserved\b/,
     );
@@ -419,7 +371,7 @@ test.describe("A reflow above the reader, reported after another event", () => {
         IN_PLACE_TOLERANCE_PX,
       );
       expect(await distanceFromBottom(page), `premise: the reader is parked well above the end (${what})`).toBeGreaterThan(
-        BOTTOM_THRESHOLD_PX,
+        PARKED_ABOVE_END_PX,
       );
       await deliver(page, `arrival after the reflow: ${"r".repeat(200)}`);
       await expectRowHeld(page, at, `an arrival after the reflow moved the reader's message (${await orderLog(page)})`);

@@ -8,15 +8,20 @@ import {
   type RowPosition,
 } from "./history-scroll-geometry";
 import {
+  ARRIVAL,
   AT_BOTTOM_EPSILON_PX,
+  DEEP_ROOM_PATH,
   afterLayoutSettles,
   deliver,
   distanceFromBottom,
+  expectDriftWithin,
   expectSettledAtBottom,
   fillHistory,
+  hideChat,
   historyHeight,
   openRoomAtBottom,
   readerScrollsWithoutGesture,
+  revealChat,
   viewportHeight,
 } from "./history-scroll-helpers";
 
@@ -37,9 +42,6 @@ import {
 // Arrivals are INBOUND (`window.__riverTest`, example-data build) unless a test
 // sends through the composer on purpose.
 
-/// The fixture variant with rooms deeper than the render window: Deep History
-/// Room has ~200 alternating-author messages (so three backfill steps of 60).
-const DEEP_ROOM_PATH = "/?deep-history-room=1";
 const DEEP_ROOM = "Deep History Room";
 /// A second windowed room, for the room the reader goes to and comes back from.
 const OTHER_ROOM = "Capped History Room";
@@ -47,14 +49,8 @@ const OTHER_ROOM = "Capped History Room";
 /// Rendered history rows: display items plus date separators.
 const HISTORY_ROWS = '[data-testid="conversation-history"] > *';
 
-/// A row's gap may move this much and still be "in place" (whole-pixel reads,
-/// fractional rows), far below a row's height.
-const IN_PLACE_TOLERANCE_PX = 4;
-
 /// How far above the end a parked reader sits: well past one arrival.
 const PARK_PX = 1_500;
-
-const ARRIVAL = (what: string) => `${what}: ${"v".repeat(200)}`;
 
 const chat = (page: Page) => page.locator("#chat-scroll-container");
 
@@ -81,15 +77,8 @@ async function newestRenderedId(page: Page): Promise<string> {
 /// row appended below can show its top 1-2px inside the view (the content's
 /// bottom padding and the list's row gap nearly cancel), which is not the view
 /// moving. Following is caught by the gap itself and by `expectNotFollowed`.
-async function expectRowHolds(page: Page, before: RowPosition, why: string) {
-  const drift = () => savedVisibleRowDrift(page, before);
-  await expect.poll(drift, { timeout: 5_000, message: why }).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
-  const drifts: number[] = [];
-  for (let i = 0; i < 5; i++) {
-    await page.waitForTimeout(100);
-    drifts.push(await drift());
-  }
-  expect(Math.max(...drifts), `${why} (samples: ${drifts.join(", ")})`).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+function expectRowHolds(page: Page, before: RowPosition, why: string) {
+  return expectDriftWithin(page, () => savedVisibleRowDrift(page, before), why, { hold: true });
 }
 
 /// The view is not at the end: something arrived below it and was not followed.
@@ -271,20 +260,48 @@ test.describe("Revisiting a room restores where the reader left it", () => {
   });
 });
 
+test.describe("A room whose saved anchor was deleted opens at its latest message", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("the anchor is deleted while another room is current, and the row above it survives", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page, 16);
+    const parked = await readerParksAboveTheEnd(page, 800);
+    const neighbor = await page.evaluate((id) => {
+      const rows = Array.from(document.querySelectorAll<HTMLElement>('#chat-content [id^="msg-"]'));
+      const at = rows.findIndex((row) => row.id === id);
+      return at > 0 ? rows[at - 1].id : null;
+    }, parked.id);
+    expect(neighbor, "premise: a message survives above the saved anchor").not.toBeNull();
+
+    await selectListedRoom(page, "Your Private Room");
+    await expect(page.getByRole("heading", { name: "Your Private Room" })).toBeVisible({ timeout: 5_000 });
+    const unmatched = await callRiverTest(page, "removeMessages", [parked.id]);
+    expect(unmatched, "premise: the saved anchor named a message in the room left behind").toEqual([]);
+
+    await selectListedRoom(page, "Team Chat Room");
+    await expect(page.getByRole("heading", { name: "Team Chat Room" })).toBeVisible({ timeout: 5_000 });
+    await expectSettledAtBottom(
+      page,
+      "returning to a room whose saved anchor was deleted should open at its latest message",
+    );
+    expect(
+      await page.evaluate((id) => document.getElementById(id) !== null, neighbor!),
+      "premise: the row above the deleted anchor is still in the room",
+    ).toBe(true);
+    const opened = await newestVisibleRow(page);
+    expect(opened, "premise: a message is visible").not.toBeNull();
+    expect(opened!.id, "the landing is not the surviving neighbor").not.toBe(neighbor);
+
+    await deliver(page, ARRIVAL("arrival after returning to a room whose anchor was deleted"));
+    await expectRowHolds(page, opened!, "the landing after returning was not preserved");
+    await expectNotFollowed(page, "the arrival should be below the view");
+  });
+});
+
 test.describe("A room opened for the first time starts at its newest message, once", () => {
   test.describe("while the chat is visible", () => {
     test.use({ viewport: { width: 1280, height: 900 } });
-
-    test("it opens on its newest message, and the next arrival is preserved, not followed", async ({ page }) => {
-      await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
-      await afterLayoutSettles(page);
-      const opened = await newestVisibleRow(page);
-      expect(opened?.id, "the room should open on its newest message").toBe(await newestRenderedId(page));
-
-      await deliver(page, ARRIVAL("first arrival after opening"));
-      await expectRowHolds(page, opened!, "the first arrival after opening moved the view");
-      await expectNotFollowed(page, "the arrival should be below the view");
-    });
 
     test("an empty room is placed at its newest message when its first content lands, then preserved", async ({
       page,
@@ -314,6 +331,23 @@ test.describe("A room opened for the first time starts at its newest message, on
 
       await deliver(page, ARRIVAL("arrival after the first content"));
       await expectRowHolds(page, placed!, "an arrival after the first content moved the view");
+      await expectNotFollowed(page, "the arrival should be below the view");
+
+      const emptied = await renderedMessageIds(page);
+      expect(emptied.length, "premise: the room has messages to remove").toBeGreaterThan(0);
+      const unmatched = await callRiverTest(page, "removeMessages", emptied);
+      expect(unmatched, "premise: every removed id named a message").toEqual([]);
+      await expect.poll(() => renderedMessageIds(page), { timeout: 5_000 }).toEqual([]);
+
+      await callRiverTest(page, "appendMessages", 40);
+      await expect(page.getByText("batched arrival 39")).toBeAttached({ timeout: 5_000 });
+      await expectSettledAtBottom(page, "the first content after the room was emptied should be placed at its newest message");
+      await afterLayoutSettles(page);
+      const replaced = await newestVisibleRow(page);
+      expect(replaced?.id, "placed on the newest message after the room was emptied").toBe(await newestRenderedId(page));
+
+      await deliver(page, ARRIVAL("arrival after the room was emptied"));
+      await expectRowHolds(page, replaced!, "an arrival after the emptied room was filled moved the view");
       await expectNotFollowed(page, "the arrival should be below the view");
     });
   });
@@ -367,10 +401,7 @@ test.describe("Mobile panels hide the chat at the end; arrivals while hidden", (
       const atEnd = await newestVisibleRow(page);
       expect(atEnd?.id, "premise: the newest message is the one in view").toBe(await newestRenderedId(page));
 
-      await page.getByTestId(panel.opener).filter({ visible: true }).click();
-      await expect(chat(page)).toBeHidden({ timeout: 5_000 });
-      await expect.poll(() => viewportHeight(page), { message: "premise: the hidden chat has no height" }).toBe(0);
-      await afterLayoutSettles(page);
+      await hideChat(page, panel.opener);
       for (let i = 0; i < 3; i++) {
         const text = ARRIVAL(`hidden arrival ${i}`);
         await callRiverTest(page, "appendMessage", text);
@@ -378,9 +409,7 @@ test.describe("Mobile panels hide the chat at the end; arrivals while hidden", (
       }
       await afterLayoutSettles(page);
 
-      await page.getByTestId(panel.back).click();
-      await expect(chat(page)).toBeVisible();
-      await afterLayoutSettles(page);
+      await revealChat(page, panel.back);
       await expectRowHolds(page, atEnd!, "the reveal did not show the row the reader left");
       await expectNotFollowed(page, "the arrivals while hidden should be below the view");
     });

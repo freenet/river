@@ -31,7 +31,7 @@ use self::emoji_picker::FREQUENT_EMOJIS;
 #[cfg(target_arch = "wasm32")]
 use self::history_scroll::HistoryHooks;
 use self::history_scroll::HistoryScroll;
-use self::history_scroll::SavedRow;
+use self::history_scroll::SavedAnchor;
 use self::not_member_notification::NotMemberNotification;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
@@ -2491,11 +2491,11 @@ fn beautify_freenet_label(url: &str) -> Option<String> {
 /// How close to the end of the history (in px) hides the scroll-to-latest
 /// button, as its IntersectionObserver's `rootMargin`.
 ///
-/// Button presentation only: no distance from the end changes where the view
-/// goes. Arrivals preserve the reader's saved row at the end too
-/// (history_scroll.rs).
+/// The content's bottom padding (`py-4`, 16px) plus rounding. Presentation
+/// only: arrivals never move the view. The button specs pin this against the
+/// padding, so a wider gap cannot hide a real row.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-const BOTTOM_THRESHOLD_PX: f64 = 100.0;
+const SCROLL_TO_LATEST_MARGIN_PX: f64 = 20.0;
 
 /// How many display items (message groups and event summaries) the conversation
 /// renders when a room is opened.
@@ -2543,8 +2543,8 @@ const WINDOW_ITEMS_CEILING: usize = INITIAL_WINDOW_ITEMS * 4;
 /// * Not a 1px marker at the very top: it would only intersect at
 ///   `scrollTop == 0`, so the reader hits the end of the rendered history and
 ///   *then* watches it grow. Reaching a screenful in means the next page is
-///   already there by the time they get to it — what `BOTTOM_THRESHOLD_PX`
-///   does for the other end via an IntersectionObserver `rootMargin`.
+///   already there by the time they get to it — the same idea as the
+///   scroll-to-latest observer's `rootMargin`, at the top.
 /// * Not a 1px marker at `top: BACKFILL_LEAD_PX` either. That was the first
 ///   attempt and it is worse than doing nothing: on any viewport SHORTER than
 ///   the lead, scrolling to the very top puts the marker BELOW the viewport, so
@@ -2580,39 +2580,35 @@ struct HistoryWindow {
 /// space, and with scroll anchoring disabled it crawls a parked reader upward
 /// one row per arrival. Anchoring on the head item's key holds the rendered
 /// set fixed in identity no matter how the indices shift underneath it.
+///
+/// This is the rendering boundary, not the reader's position. One key: when
+/// it is gone, the window keeps the items that were already rendered by
+/// shifting that start with the previous reading anchor's index. It does not
+/// adopt a neighboring head, and it does not slide forward onto the newest row.
 #[derive(Clone, PartialEq, Debug)]
 struct WindowAnchor {
-    /// `display_item_key` of the first [`WINDOW_ANCHOR_KEYS`] rendered items,
-    /// head first. The spares exist because the head key alone can vanish
-    /// while its NEIGHBORS survive: an at-cap drain that consumes the head
-    /// (or only its first message — a multi-message head group RE-KEYS, since
-    /// a group's key is its first message's id), or a batched delta draining
-    /// many items at once. The first spare still present tells us exactly
-    /// where the surviving remainder of the old window now sits.
-    keys: Vec<String>,
-    /// The index the head held last render — a hint so relocation is
+    /// `display_item_key` of the first rendered display item.
+    key: String,
+    /// The index that item held last render — a hint so relocation is
     /// O(shift), not O(total), in the common case.
     index: usize,
+    /// The reading anchor last render, and the index it held then. Front
+    /// prunes move every surviving index by the same amount; the difference
+    /// is how far `index` moves when `key` itself is gone. Not a second
+    /// reading position.
+    reading_key: Option<String>,
+    reading_at: Option<usize>,
 }
 
-/// Where a room visited this session was left: the history's saved rows
-/// (`HistoryScroll::leave_room`) and the rendered window they sit in, so a
-/// revisit renders them again before putting them back.
+/// Where a room visited this session was left: the history's one saved anchor
+/// (`HistoryScroll::leave_room`) and the rendered window it sits in, so a
+/// revisit renders it again before putting it back.
 #[derive(Clone, Debug)]
 struct RoomPosition {
-    rows: Vec<SavedRow>,
+    anchor: Option<SavedAnchor>,
     window_anchor: Option<WindowAnchor>,
     window_items: usize,
 }
-
-/// How many leading item keys the anchor remembers (head + spares).
-///
-/// Bounds how large a head-consuming removal can be precisely relocated: a
-/// front drain that consumes the head and ALL spares falls back to index 0,
-/// which for a front-contiguous drain — the only mechanism that can remove
-/// this many contiguous leading items — is exactly the nearest surviving
-/// item anyway.
-const WINDOW_ANCHOR_KEYS: usize = 8;
 
 /// Search for one anchored key after the item list changed.
 ///
@@ -2630,18 +2626,11 @@ fn relocate_anchor(total: usize, hint: usize, is_anchor: impl Fn(usize) -> bool)
     (hint.saturating_add(1)..total).find(|&i| is_anchor(i))
 }
 
-/// Re-locate the anchored window's start: the head by its own key, else by the
-/// first surviving spare (its position minus its offset in the anchor), else
-/// index 0.
+/// Re-locate the anchored window's start by its one head key.
 ///
-/// The index-0 fallback is exact for a front-contiguous drain that consumed
-/// the head and every spare — the oldest remaining item IS then the nearest
-/// survivor. It is a DEGRADED answer for the other way to lose that many
-/// contiguous leading items (a ban purge or bulk delete of >=
-/// [`WINDOW_ANCHOR_KEYS`] display items above the reader): the window jumps
-/// to the front of the room, bounded only by the ceiling. Rare, and it fails
-/// toward rendering MORE history rather than losing the reader's place
-/// entirely.
+/// `None` means that item is gone. The caller then includes the reading
+/// anchor or chooses the latest tail. It does not treat a neighbor, or index
+/// 0, as the same head.
 ///
 /// The view is held still by `HistoryScroll::restore`; this only picks which
 /// items render.
@@ -2649,14 +2638,76 @@ fn relocate_window(
     total: usize,
     anchor: &WindowAnchor,
     key_at: impl Fn(usize, &str) -> bool,
-) -> usize {
-    for (spare, key) in anchor.keys.iter().enumerate() {
-        let located = relocate_anchor(total, anchor.index + spare, |i| key_at(i, key));
-        if let Some(i) = located {
-            return i.saturating_sub(spare);
-        }
+) -> Option<usize> {
+    relocate_anchor(total, anchor.index, |i| key_at(i, &anchor.key))
+}
+
+/// Index of the display item that contains the reading anchor `key`.
+///
+/// A message anchor is the message's own id, which may sit behind a group's
+/// head key (a group's key is its first message). A date-separator anchor is
+/// `date-sep-` plus the item key of the item it precedes. An event anchor is
+/// the summary id, which is also that item's key.
+fn reading_anchor_index(items: &[DisplayItem], key: &str) -> Option<usize> {
+    if let Some(item_key) = key.strip_prefix("date-sep-") {
+        return items
+            .iter()
+            .position(|item| display_item_key(item) == item_key);
     }
-    0
+    items.iter().position(|item| match item {
+        DisplayItem::Messages(group) => group.messages.iter().any(|message| message.id == key),
+        DisplayItem::Event(summary) => summary.id == key,
+    })
+}
+
+/// Where the window starts once its head key is gone.
+///
+/// `previous.reading_key` is the same single anchor, remembered only so its
+/// index can be compared. Every surviving item moved by that difference, so
+/// the old start moves with it and rows above the anchor stay rendered.
+///
+/// When that ruler row was pruned too, the current anchor is not a safe
+/// start: the rows above it are what make its gap reachable. Begin at the
+/// front and let the ceiling clamp. `None` (no current anchor either) is the
+/// latest tail. A neighbor is never the head.
+fn boundary_after_lost_head(
+    previous: &WindowAnchor,
+    reading_now: Option<usize>,
+    index_of: impl Fn(&str) -> Option<usize>,
+) -> Option<usize> {
+    let shifted = previous
+        .reading_key
+        .as_deref()
+        .zip(previous.reading_at)
+        .and_then(|(key, was)| {
+            let now = index_of(key)?;
+            Some((previous.index + now).saturating_sub(was))
+        });
+    match shifted {
+        Some(start) => Some(reading_now.map_or(start, |reading| start.min(reading))),
+        None => reading_now.map(|_| 0),
+    }
+}
+
+/// The rendered range after a content change.
+///
+/// `boundary` is the head item's index: relocated when that item is still in
+/// the list, otherwise the index from [`boundary_after_lost_head`]. `reading`
+/// is the display item that contains the one saved reading anchor. A ceiling
+/// that would leave that anchor unrendered, or no anchor and no boundary,
+/// resolves to the latest tail.
+fn prepare_history_window(
+    total: usize,
+    requested: usize,
+    boundary: Option<usize>,
+    reading: Option<usize>,
+) -> HistoryWindow {
+    let candidate = HistoryWindow::resolve(total, requested, boundary.or(reading));
+    if reading.is_some_and(|reading| candidate.start > reading) {
+        HistoryWindow::resolve(total, requested, None)
+    } else {
+        candidate
+    }
 }
 
 /// Does `key` identify `item`, without allocating a key `String`?
@@ -2911,14 +2962,14 @@ pub fn Conversation() -> Element {
         let previous = prev_render_room.get();
         if previous != Some(room) {
             if let Some(Some(left)) = previous {
-                let rows = history.leave_room();
+                let anchor = history.leave_room();
                 let mut positions = room_positions.borrow_mut();
                 // `peek`: the signal's value is the old room's until the
                 // effect switches it, and this read must not subscribe.
                 positions.insert(
                     left,
                     RoomPosition {
-                        rows,
+                        anchor,
                         window_anchor: window_anchor.borrow().clone(),
                         window_items: *window_items.peek(),
                     },
@@ -2928,21 +2979,18 @@ pub fn Conversation() -> Element {
                 }
             }
             prev_render_room.set(Some(room));
-            let saved = room.and_then(|key| room_positions.borrow().get(&key).cloned());
+            let saved = room
+                .and_then(|key| room_positions.borrow().get(&key).cloned())
+                .unwrap_or(RoomPosition {
+                    anchor: None,
+                    window_anchor: None,
+                    window_items: INITIAL_WINDOW_ITEMS,
+                });
             window_rendered.set(0);
             window_overgrown.set(false);
-            match saved {
-                Some(saved) => {
-                    *window_anchor.borrow_mut() = saved.window_anchor;
-                    history.enter_room(Some(saved.rows));
-                    Some(saved.window_items)
-                }
-                None => {
-                    *window_anchor.borrow_mut() = None;
-                    history.enter_room(None);
-                    Some(INITIAL_WINDOW_ITEMS)
-                }
-            }
+            *window_anchor.borrow_mut() = saved.window_anchor;
+            history.enter_room(saved.anchor);
+            Some(saved.window_items)
         } else {
             None
         }
@@ -3192,22 +3240,17 @@ pub fn Conversation() -> Element {
 
     // IntersectionObserver drives only the scroll-to-latest button's visibility.
     // HistoryScroll separately listens for scroll events to track reader intent.
-    // A 1px sentinel at the content's bottom and a 100px root margin make the
-    // button disappear near the end; this observer runs on intersection changes.
+    // A 1px sentinel at the content's bottom, with a root margin of the
+    // content's bottom padding, hides the button only when what is below the
+    // view is that padding. This observer runs on intersection changes.
     #[cfg(target_arch = "wasm32")]
     use_effect(move || {
         use wasm_bindgen::prelude::*;
 
-        let Some(window) = web_sys::window() else {
+        let Some(sentinel) = history_scroll::element_by_id("bottom-sentinel") else {
             return;
         };
-        let Some(document) = window.document() else {
-            return;
-        };
-        let Some(sentinel) = document.get_element_by_id("bottom-sentinel") else {
-            return;
-        };
-        let Some(root) = document.get_element_by_id("chat-scroll-container") else {
+        let Some(root) = history_scroll::element_by_id("chat-scroll-container") else {
             return;
         };
 
@@ -3230,10 +3273,10 @@ pub fn Conversation() -> Element {
         let options = web_sys::IntersectionObserverInit::new();
         options.set_root(Some(&root));
         // Expand the detection zone below the viewport edge so the button
-        // hides when the reader is within `BOTTOM_THRESHOLD_PX` of the
-        // sentinel. Presentation only: nothing about where the view goes
+        // is hidden only when what is below the view is the content's bottom
+        // padding. Presentation only: nothing about where the view goes
         // reads this.
-        options.set_root_margin(&format!("0px 0px {BOTTOM_THRESHOLD_PX}px 0px"));
+        options.set_root_margin(&format!("0px 0px {SCROLL_TO_LATEST_MARGIN_PX}px 0px"));
         options.set_threshold(&JsValue::from_f64(0.0));
 
         if let Ok(observer) =
@@ -4227,23 +4270,38 @@ pub fn Conversation() -> Element {
                                     let subscribed_window = window_items();
                                     let requested_window =
                                         room_switch_window.unwrap_or(subscribed_window);
-                                    // Re-locate the anchored window by
-                                    // IDENTITY: at-cap pruning shifts every
-                                    // index, so the stored index is only a
-                                    // hint, and the head key alone can vanish
-                                    // while its neighbors survive (#505
-                                    // blockers; see `WindowAnchor` and
-                                    // `relocate_window`).
+                                    // Re-locate the window by the one head item's identity.
+                                    // At-cap pruning shifts every index, so the
+                                    // stored index is only a hint. A missing
+                                    // head is not replaced by a neighbor: the
+                                    // sole reading anchor is included, or the
+                                    // window is the latest tail.
                                     let prev_anchor = window_anchor.borrow().clone();
-                                    let relocated = prev_anchor.as_ref().map(|a| {
+                                    let relocated = prev_anchor.as_ref().and_then(|a| {
                                         relocate_window(groups.len(), a, |i, key| {
                                             display_item_key_matches(&groups[i], key)
                                         })
                                     });
-                                    let history_window = HistoryWindow::resolve(
+                                    let reading_key = history.reading_anchor_key();
+                                    let reading = reading_key
+                                        .as_deref()
+                                        .and_then(|key| reading_anchor_index(groups, key));
+                                    // A missing head is not the next item's key.
+                                    // Shift the old start by how far the previous
+                                    // reading anchor's index moved, so a front
+                                    // drain keeps the rows already on screen.
+                                    let boundary = relocated.or_else(|| {
+                                        prev_anchor.as_ref().and_then(|prev| {
+                                            boundary_after_lost_head(prev, reading, |key| {
+                                                reading_anchor_index(groups, key)
+                                            })
+                                        })
+                                    });
+                                    let history_window = prepare_history_window(
                                         groups.len(),
                                         requested_window,
-                                        relocated,
+                                        boundary,
+                                        reading,
                                     );
                                     // Remember where this render started so the
                                     // NEXT one grows instead of sliding (#501).
@@ -4251,14 +4309,14 @@ pub fn Conversation() -> Element {
                                     // fine: inter-render memory, nothing
                                     // renders from them, and re-resolving with
                                     // the values just written is a fixed point.
-                                    *window_anchor.borrow_mut() = Some(WindowAnchor {
-                                        keys: groups[history_window.start..]
-                                            .iter()
-                                            .take(WINDOW_ANCHOR_KEYS)
-                                            .map(display_item_key)
-                                            .collect(),
-                                        index: history_window.start,
-                                    });
+                                    *window_anchor.borrow_mut() = groups
+                                        .get(history_window.start)
+                                        .map(|item| WindowAnchor {
+                                            key: display_item_key(item),
+                                            index: history_window.start,
+                                            reading_key,
+                                            reading_at: reading,
+                                        });
                                     // What the backfill growth step grows FROM
                                     // (#505 blocker 2; see `grown_window`).
                                     window_rendered
@@ -6294,171 +6352,231 @@ mod tests {
         );
     }
 
-    /// Anchor carrying the head + spare keys the way the render does.
-    fn anchor_of(keys: &[String], start: usize) -> WindowAnchor {
+    fn head_anchor(key: &str, index: usize) -> WindowAnchor {
         WindowAnchor {
-            keys: keys[start..]
-                .iter()
-                .take(WINDOW_ANCHOR_KEYS)
-                .cloned()
-                .collect(),
-            index: start,
+            key: key.to_string(),
+            index,
+            reading_key: None,
+            reading_at: None,
         }
     }
 
     /// #505 blocker 1: the anchor is re-located by IDENTITY. An at-cap room
     /// prunes its oldest message per arrival, shifting every index down — the
     /// walk below is that steady state, and the head must stay the same ITEM
-    /// (its index marching toward 0), not the same index.
+    /// (its index marching toward 0), not the same index. Once that item
+    /// itself is gone, relocation says so; a later surviving reading anchor
+    /// stays in the window, and the next item is not adopted as the head.
     #[test]
     fn the_anchor_follows_the_item_through_at_cap_pruning() {
-        // A 100-item room at cap: items are identified by these keys.
         let mut keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
         let opened = HistoryWindow::resolve(keys.len(), INITIAL_WINDOW_ITEMS, None);
         assert_eq!(opened.start, 40);
         let head_key = keys[opened.start].clone();
-        let mut anchor = anchor_of(&keys, opened.start);
+        let mut anchor = head_anchor(&head_key, opened.start);
 
         for arrival in 0..40usize {
-            // apply_delta at cap: drain the oldest, append the new.
             keys.remove(0);
             keys.push(format!("new{arrival}"));
-            let relocated = relocate_window(keys.len(), &anchor, |i, key| keys[i] == key);
+            let relocated = relocate_window(keys.len(), &anchor, |i, key| keys[i] == key)
+                .expect("the head item is still in the list");
             let start =
-                HistoryWindow::resolve(keys.len(), INITIAL_WINDOW_ITEMS, Some(relocated)).start;
+                prepare_history_window(keys.len(), INITIAL_WINDOW_ITEMS, Some(relocated), None)
+                    .start;
             assert_eq!(
                 keys[start], head_key,
                 "arrival {arrival}: the window head changed identity — the \
                  #501 slide reproduced in content space"
             );
             assert_eq!(start, opened.start - (arrival + 1), "start marches down");
-            anchor = anchor_of(&keys, start);
+            anchor = head_anchor(&keys[start], start);
         }
 
-        // One more prune consumes the head itself: the head key is gone, but
-        // the FIRST SPARE (the item right after the old head) survives at
-        // index 0, so the relocation lands on the nearest surviving item and
-        // reports the head as removed.
+        // m80's index before this last prune. The head sits at 0; removing it
+        // shifts every survivor, including m80, down by one.
+        let reading_was = keys.iter().position(|key| key == "m80").unwrap();
         keys.remove(0);
         keys.push("new40".into());
-        let relocated = relocate_window(keys.len(), &anchor, |i, key| keys[i] == key);
         assert_eq!(
-            relocated, 0,
-            "the first surviving spare pins the window to the nearest \
-             surviving item"
+            relocate_window(keys.len(), &anchor, |i, key| keys[i] == key),
+            None,
+            "the head item is gone; a neighbor is not a replacement head"
         );
-    }
-
-    /// #505 re-review blocker: a MULTI-message head group RE-KEYS when an
-    /// at-cap drain consumes its first message (a group's key is its first
-    /// message's id). The old key is gone while the group itself survives —
-    /// the spares must still pin the window to the survivors.
-    #[test]
-    fn a_rekeyed_multi_message_head_group_is_still_anchored() {
-        // Window head at index 0: a group keyed by its first message "m0",
-        // followed by neighbors. The at-cap drain consumes "m0"; the group
-        // survives RE-KEYED as "m1". (Modelled at the key level — exactly
-        // what `display_item_key` exposes to this machinery.)
-        let anchor = WindowAnchor {
-            keys: vec!["m0".into(), "b".into(), "c".into(), "d".into()],
-            index: 0,
+        let reading = keys.iter().position(|key| key == "m80").unwrap();
+        let previous = WindowAnchor {
+            key: anchor.key.clone(),
+            index: anchor.index,
+            reading_key: Some("m80".into()),
+            reading_at: Some(reading_was),
         };
-        let post_keys = ["m1", "b", "c", "d", "e"];
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
+        let shifted = boundary_after_lost_head(&previous, Some(reading), |key| {
+            keys.iter().position(|item| item == key)
+        });
+        let window =
+            prepare_history_window(keys.len(), INITIAL_WINDOW_ITEMS, shifted, Some(reading));
         assert_eq!(
-            relocated, 0,
-            "the first spare (\"b\", found at index 1, offset 1 in the \
-             anchor) pins the window back to the re-keyed group"
+            window.start, 0,
+            "the old head was the first item; what remains of that window starts at the front"
+        );
+        assert!(
+            window.start <= reading,
+            "the surviving reading anchor stays inside the window"
+        );
+        let snapped = prepare_history_window(keys.len(), INITIAL_WINDOW_ITEMS, None, Some(reading));
+        assert_eq!(
+            snapped.start,
+            reading.min(keys.len() - INITIAL_WINDOW_ITEMS),
+            "without a measured shift the window includes the anchor and does not invent a head"
+        );
+        let latest = prepare_history_window(keys.len(), INITIAL_WINDOW_ITEMS, None, None);
+        assert_eq!(latest.start, keys.len() - INITIAL_WINDOW_ITEMS);
+    }
+
+    /// A batch that drains the head and appends more items than the window
+    /// must keep a row that sat above the reading anchor. Snapping to the
+    /// newest `requested` items would drop it.
+    #[test]
+    fn a_front_drain_keeps_rows_above_the_reading_anchor() {
+        let mut keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
+        let start = 20usize;
+        let reading_was = 70usize;
+        let probe = 55usize;
+        let probe_key = keys[probe].clone();
+        let reading_key = keys[reading_was].clone();
+        let previous = WindowAnchor {
+            key: keys[start].clone(),
+            index: start,
+            reading_key: Some(reading_key.clone()),
+            reading_at: Some(reading_was),
+        };
+        keys.drain(0..30);
+        for n in 0..61 {
+            keys.push(format!("new{n}"));
+        }
+        assert!(
+            relocate_window(keys.len(), &previous, |i, key| keys[i] == key).is_none(),
+            "premise: the head key was drained"
+        );
+        let reading = keys.iter().position(|key| key == &reading_key).unwrap();
+        let probe_at = keys.iter().position(|key| key == &probe_key).unwrap();
+        let shifted = boundary_after_lost_head(&previous, Some(reading), |key| {
+            keys.iter().position(|item| item == key)
+        });
+        let window =
+            prepare_history_window(keys.len(), INITIAL_WINDOW_ITEMS, shifted, Some(reading));
+        assert!(
+            window.start <= probe_at,
+            "the row above the anchor left the window"
+        );
+        assert!(window.start <= reading);
+        let tail = keys.len() - INITIAL_WINDOW_ITEMS;
+        assert!(
+            probe_at < tail,
+            "premise: a snapped tail would have dropped the probe"
         );
     }
 
-    /// Relocation must reach the DEEPEST spare the anchor holds. Landing via
-    /// spare `k` sets `start = i - k`, widening the window backward by `k`
-    /// items, so a bulk delete of several contiguous leading items above a
-    /// parked reader still keeps the survivors rendered (#505 delta review).
+    /// The row used to measure index shift can itself be pruned, while the
+    /// reader has since moved to a newer anchor that survives. Starting the
+    /// window at that newer anchor drops the rows above it.
     #[test]
-    fn relocation_reaches_the_deepest_spare() {
-        // Anchor: head + 7 spares. A bulk delete removes the head and the
-        // first 6 spares; relocation lands on spare 7 ("s7"), so the window
-        // widens back by 7 items.
-        let anchor = WindowAnchor {
-            keys: (0..WINDOW_ANCHOR_KEYS)
-                .map(|i| {
-                    if i == 0 {
-                        "head".to_string()
-                    } else {
-                        format!("s{i}")
-                    }
+    fn a_pruned_index_probe_does_not_collapse_onto_the_reading_anchor() {
+        let previous = WindowAnchor {
+            key: "gone-head".into(),
+            index: 20,
+            reading_key: Some("gone-ruler".into()),
+            reading_at: Some(40),
+        };
+        let total = 80;
+        let reading = 60;
+        let shifted = boundary_after_lost_head(&previous, Some(reading), |_| None);
+        assert_eq!(shifted, Some(0));
+        let window = prepare_history_window(total, INITIAL_WINDOW_ITEMS, shifted, Some(reading));
+        assert_eq!(window.start, 0);
+        assert!(
+            window.start < reading,
+            "rows above the surviving anchor stay in the window"
+        );
+    }
+
+    fn grouped(ids: &[&str]) -> DisplayItem {
+        DisplayItem::Messages(MessageGroup {
+            author_id: MemberId(freenet_scaffold::util::FastHash(1)),
+            author_name: String::new(),
+            author_badge: None,
+            author_impersonation: None,
+            is_self: false,
+            first_time: Utc::now(),
+            time_clamped: false,
+            first_delay_secs: None,
+            messages: ids
+                .iter()
+                .map(|id| GroupedMessage {
+                    content_text: String::new(),
+                    content_html: String::new(),
+                    time: Utc::now(),
+                    time_clamped: false,
+                    id: (*id).to_string(),
+                    message_id: MessageId(freenet_scaffold::util::FastHash(1)),
+                    edited: false,
+                    reactions: HashMap::new(),
+                    reply_strip: ReplyStrip::default(),
+                    receive_delay_secs: None,
                 })
                 .collect(),
-            index: 20,
+        })
+    }
+
+    /// A group's key is its first message. Deleting that message re-keys the
+    /// group, so the window head no longer matches, but a later message in the
+    /// same group is still the reading anchor and stays rendered.
+    #[test]
+    fn a_rekeyed_group_keeps_the_surviving_message_anchor() {
+        let anchor = WindowAnchor {
+            key: "m0".into(),
+            index: 0,
+            reading_key: Some("m2".into()),
+            reading_at: Some(0),
         };
-        let post_keys: Vec<String> = (0..7)
-            .map(|i| format!("older{i}"))
-            .chain(std::iter::once("s7".to_string()))
-            .chain((0..10).map(|i| format!("rest{i}")))
-            .collect();
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
+        let items = vec![grouped(&["m1", "m2"]), grouped(&["b"]), grouped(&["c"])];
         assert_eq!(
-            relocated, 0,
-            "spare 7 found at index 7, offset 7 in the anchor → start 0"
+            relocate_window(items.len(), &anchor, |i, key| {
+                display_item_key_matches(&items[i], key)
+            }),
+            None,
+            "the old head key is gone"
         );
+        let reading = reading_anchor_index(&items, "m2").expect("m2 is still in its group");
+        assert_eq!(reading, 0);
+        assert_eq!(
+            reading_anchor_index(&items, "date-sep-m1"),
+            Some(0),
+            "a date separator is the item it precedes"
+        );
+        let shifted = boundary_after_lost_head(&anchor, Some(reading), |key| {
+            reading_anchor_index(&items, key)
+        });
+        assert_eq!(
+            shifted,
+            Some(0),
+            "re-keying the head group does not move the window"
+        );
+        let window =
+            prepare_history_window(items.len(), INITIAL_WINDOW_ITEMS, shifted, Some(reading));
+        assert!(window.start <= reading);
     }
 
-    /// A batched drain that consumes the head AND several spares (the
-    /// `appendMessages` burst crossing the anchor) still lands on the first
-    /// surviving spare, offset back to where the head would have been.
+    /// The ceiling may slide a surviving boundary past the reading anchor.
+    /// That anchor is then unavailable under the window policy, so the window
+    /// is the latest tail rather than a span that no longer contains it.
     #[test]
-    fn a_batched_drain_past_the_head_lands_on_the_first_surviving_spare() {
-        // 100 items, window head at 25 with spares 25..33.
-        let keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
-        let anchor = anchor_of(&keys, 25);
-        // A 30-item drain + 30 arrivals: items 0..30 gone, head (25) and
-        // spares 25..29 with it; spare "m30" (offset 5) survives at index 0.
-        let post_keys: Vec<String> = (30..100)
-            .map(|i| format!("m{i}"))
-            .chain((0..30).map(|i| format!("new{i}")))
-            .collect();
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert_eq!(
-            relocated, 0,
-            "spare m30 found at index 0, offset 5 in the anchor → start 0: \
-             the whole surviving remainder of the old window stays rendered"
-        );
-
-        // And when the drain consumes every spare too, the only safe answer
-        // for a front-contiguous drain is index 0 — the oldest survivor.
-        let post_keys: Vec<String> = (40..100)
-            .map(|i| format!("m{i}"))
-            .chain((0..40).map(|i| format!("new{i}")))
-            .collect();
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert_eq!(relocated, 0);
-    }
-
-    /// The case where the spares are load-bearing and no fallback can stand
-    /// in for them: the head alone vanishes MID-window (its whole group
-    /// deleted), the neighbors survive in place. The first spare pins the
-    /// window one slot back from where it sits — a head-only relocation
-    /// would fall back to index 0 and blow the window open across the whole
-    /// room (ceiling-bounded, but a ~180-item over-render and a torn view).
-    #[test]
-    fn a_mid_window_head_deletion_reanchors_on_the_next_survivor() {
-        let keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
-        let anchor = anchor_of(&keys, 40);
-        // The head item "m40" is deleted outright; everything else survives,
-        // shifted down by one from index 41 on.
-        let post_keys: Vec<String> = keys
-            .iter()
-            .filter(|k| k.as_str() != "m40")
-            .cloned()
-            .collect();
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert_eq!(
-            relocated, 39,
-            "spare m41 (offset 1) found at index 40 → start 39: the window \
-             re-anchors one slot back, not at the front of the room"
-        );
+    fn a_cap_that_evicts_the_reading_anchor_opens_the_latest_tail() {
+        let total = 1_000;
+        let reading = 10;
+        let window = prepare_history_window(total, INITIAL_WINDOW_ITEMS, Some(100), Some(reading));
+        let tail = HistoryWindow::resolve(total, INITIAL_WINDOW_ITEMS, None);
+        assert_eq!(window.start, tail.start);
+        assert!(window.start > reading);
     }
 
     /// The trim guard: skip the bottom trim when the retained tail
@@ -6496,7 +6614,7 @@ mod tests {
         assert_eq!(find("c", 0), Some(2));
         // Hint out of range entirely: still found.
         assert_eq!(find("e", 400), Some(4));
-        // Gone: None, and `relocate_window` moves on to the next spare.
+        // Gone.
         assert_eq!(find("zz", 2), None);
         assert_eq!(relocate_anchor(0, 0, |_| true), None, "empty list");
     }
@@ -6557,18 +6675,18 @@ mod tests {
         let squashed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
 
         assert!(
-            squashed.contains("HistoryWindow::resolve(groups.len(),requested_window,"),
-            "the history must slice its display items through `HistoryWindow`"
+            squashed.contains("prepare_history_window(groups.len(),requested_window,"),
+            "the history must slice its display items through the one boundary \
+             key or the sole reading anchor"
         );
         assert!(
             squashed.contains("relocate_window(groups.len(),a,"),
-            "the anchor must be re-located by IDENTITY (head key, then spare \
-             keys) before resolving — a positional anchor slides the head in \
-             content space whenever an at-cap room prunes a message (#505 \
-             blocker 1)"
+            "the boundary must be re-located by IDENTITY before resolving — a \
+             positional anchor slides the head in content space whenever an \
+             at-cap room prunes a message (#505 blocker 1)"
         );
         assert!(
-            squashed.contains("*window_anchor.borrow_mut()=Some(WindowAnchor{"),
+            squashed.contains(".map(|item|WindowAnchor{"),
             "the render must write the resolved head's identity back so the \
              NEXT render grows instead of sliding (#501)"
         );
@@ -6598,20 +6716,21 @@ mod tests {
         // the bottom trim, so deleting the room reset would have
         // false-passed against it (#505 review).
         assert!(
-            squashed.contains("letrows=history.leave_room();")
+            squashed.contains("letanchor=history.leave_room();")
                 && squashed.contains("window_anchor:window_anchor.borrow().clone(),"),
-            "the render must save the room being left (its rows and window) \
+            "the render must save the room being left (its anchor and window) \
              while the DOM is still that room's"
         );
         assert!(
             squashed.contains(
-                "*window_anchor.borrow_mut()=saved.window_anchor;history.enter_room(Some(saved.rows));"
-            ) && squashed
-                .contains("*window_anchor.borrow_mut()=None;history.enter_room(None);"),
+                "*window_anchor.borrow_mut()=saved.window_anchor;history.enter_room(saved.anchor);"
+            ) && squashed.contains(
+                "unwrap_or(RoomPosition{anchor:None,window_anchor:None,window_items:INITIAL_WINDOW_ITEMS,})"
+            ),
             "the windowing Cells and the history must switch inline in the \
-             render on a room switch — the effect-based switch runs one render \
-             too late, so the new room's first frame would render at the old \
-             room's depth"
+             render on a room switch, including a room with no saved position \
+             — the effect-based switch runs one render too late, so the new \
+             room's first frame would render at the old room's depth"
         );
         assert!(
             squashed.contains("room_switch_window.unwrap_or(subscribed_window)"),
@@ -10437,27 +10556,17 @@ mod history_position_wiring_pins {
         );
     }
 
-    /// Nothing moves the view except the reader and their button click: no
-    /// send-triggered jump, no follow mode, no app animation loop.
+    /// Nothing moves the view except the reader and their button click: the
+    /// button starts one native navigation, and the controller does not run
+    /// its own animation loop.
     #[test]
     fn only_the_reader_and_the_button_move_the_view() {
         let prod = dense(production_source());
         let history = dense(history_source());
-        for retired in ["force_next", "seek_to_latest", "self.pinned", "is_pinned("] {
-            assert!(
-                !prod.contains(retired) && !history.contains(retired),
-                "`{retired}` belongs to the retired following model"
-            );
-        }
         assert!(
             !history.contains("request_animation_frame"),
             "the scroll-to-latest button uses the browser's own smooth scroll, \
              not an app frame loop"
-        );
-        assert_eq!(
-            history.matches("ScrollBehavior::Smooth").count(),
-            1,
-            "one native smooth-scroll request, from the button"
         );
         assert!(
             prod.contains("history.navigate_to_latest();"),
@@ -10507,13 +10616,21 @@ mod history_position_wiring_pins {
         );
     }
 
-    /// The render before a patch takes in a pending reader scroll first (see
-    /// the `history_scroll.rs` module doc).
+    /// The button's root margin is the content's bottom padding plus rounding.
+    /// A 16px list gap plus about a 20px event row must clear it, or a join
+    /// that lands below the view leaves the button hidden.
     #[test]
-    fn a_pending_reader_scroll_is_taken_in_before_a_restore() {
+    fn the_scroll_to_latest_margin_hides_only_padding() {
+        use super::SCROLL_TO_LATEST_MARGIN_PX;
+        const _: () = assert!(
+            SCROLL_TO_LATEST_MARGIN_PX < 36.0,
+            "a 16px gap plus about a 20px event row must clear the margin"
+        );
         assert!(
-            dense(production_source()).contains("history.take_in_undelivered_scroll();"),
-            "the render must read a pending reader scroll before the patch"
+            dense(production_source()).contains(
+                "options.set_root_margin(&format!(\"0px0px{SCROLL_TO_LATEST_MARGIN_PX}px0px\"));"
+            ),
+            "the scroll-to-latest observer must use SCROLL_TO_LATEST_MARGIN_PX as its root margin"
         );
     }
 }

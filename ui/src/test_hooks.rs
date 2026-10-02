@@ -167,16 +167,35 @@ fn with_current_room<T>(f: impl FnOnce(&mut RoomData, &VerifyingKey) -> T) -> Op
     ROOMS.with_mut(|rooms| rooms.map.get_mut(&room_key).map(|room| f(room, &room_key)))
 }
 
-/// Remove every message of the current room whose row id is in `dom_ids`, in one
-/// `ROOMS` mutation. Returns the ids that matched nothing, sorted and distinct.
+/// Remove every message whose row id is in `dom_ids`, in one `ROOMS` mutation.
+/// The current room is searched first. Ids it does not hold are removed from
+/// another visited room, so a snapshot saved on leaving can be invalidated
+/// while that room is not on screen. Returns the ids that matched nothing.
 fn remove(dom_ids: Vec<String>) -> Vec<String> {
-    let mut unmatched: std::collections::BTreeSet<String> = dom_ids.into_iter().collect();
-    with_current_room(|room, _| {
-        // The row id convention of the conversation's message rows.
+    fn drop_matching(room: &mut RoomData, unmatched: &mut std::collections::BTreeSet<String>) {
         room.room_state
             .recent_messages
             .messages
             .retain(|message| !unmatched.remove(&format!("msg-{:?}", message.id().0)));
+    }
+
+    let mut unmatched: std::collections::BTreeSet<String> = dom_ids.into_iter().collect();
+    let current = CURRENT_ROOM.peek().owner_key;
+    ROOMS.with_mut(|rooms| {
+        if let Some(key) = current {
+            if let Some(room) = rooms.map.get_mut(&key) {
+                drop_matching(room, &mut unmatched);
+            }
+        }
+        if unmatched.is_empty() {
+            return;
+        }
+        for (key, room) in rooms.map.iter_mut() {
+            if Some(*key) == current || unmatched.is_empty() {
+                continue;
+            }
+            drop_matching(room, &mut unmatched);
+        }
     });
     unmatched.into_iter().collect()
 }

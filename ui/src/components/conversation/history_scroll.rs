@@ -1,27 +1,32 @@
-//! Where the history's view goes: the reader's position is a message, not an offset.
+//! Where the history's view goes: the reader's position is one message, not an offset.
 //!
 //! # The saved position
 //!
-//! We remember the newest row that is visible (`data-anchor-row`) plus up to
-//! `ANCHOR_FALLBACK_ROWS` above it. Each [`SavedRow`] keeps its `gap` (the
-//! container's bottom edge minus the row's top edge) and its `offset` (the row's
-//! top inside `#chat-content`, which scrolling does not change). The gap is
-//! measured from the BOTTOM edge on purpose: a growing composer takes height off
-//! that edge, so the reader's text moves up with it rather than being covered.
+//! We remember exactly one row: the newest row that is visible (`data-anchor-row`).
+//! A [`SavedAnchor`] keeps its `gap` (the container's bottom edge minus the row's
+//! top edge) and its `offset` (the row's top inside `#chat-content`, which
+//! scrolling does not change). The gap is measured from the BOTTOM edge on
+//! purpose: a growing composer takes height off that edge, so the reader's text
+//! moves up with it rather than being covered. Nothing else is saved. A neighbor
+//! that survives the anchor's deletion is not a substitute for it.
 //!
 //! One rule holds everywhere, at the very end of the history too: only the
 //! reader, or their click on "Scroll to latest messages", moves the view.
 //! Arrivals (including the reader's own sends), joins, reactions, edits, late
-//! images, resizes and a hide and reveal all put the saved row back at its gap.
+//! images, resizes and a hide and reveal all put that one row back at its gap.
 //! There is no following mode, and no distance from the end that turns one on.
 //!
-//! * **Capture** measures the saved rows where the view is now: for a `scroll`
+//! * **Capture** measures that one row where the view is now: for a `scroll`
 //!   the reader caused, after a room's initial placement, and where a
 //!   scroll-to-latest navigation comes to rest or is cut short.
-//! * **Restore** puts the first saved row that still exists back at its gap
-//!   after a content or layout change. It never captures, so a gap the browser
-//!   cannot reach yet (the range is too short) stays saved for when it can.
-//!   With no saved row left, the view stays where it is.
+//! * **Restore** puts that row back at its gap after a content or layout change,
+//!   when it is still rendered. It never captures, so a gap the browser cannot
+//!   reach yet (the range is too short) stays saved for when it can.
+//! * **Missing** is the same transition everywhere the row is gone: end any
+//!   native navigation, forget the anchor, place at the current end once, and
+//!   capture the one row that lands there. A later arrival preserves that new
+//!   row. A hidden container (every measurement is 0) is not this case: the
+//!   anchor waits until the history has a box again.
 //! * **Recording** notes the layout signature and `scrollTop` after anything
 //!   moves the view, ours or not, so the next `scroll` event can be classified.
 //!
@@ -34,12 +39,12 @@
 //! A room opened for the first time this session starts at its newest message,
 //! once, as soon as it has rows and a laid-out container, and captures there.
 //! That is a starting position, not a mode: the next arrival is preserved like
-//! any other. Revisiting a room restores the rows saved when the reader left it
-//! (`leave_room`; the component restores that room's rendered window too, so
-//! the rows exist). If none of them is rendered any more, the revisit is placed
-//! like a first open. An empty room places when its first rows arrive. Either
-//! way the component is told (`HistoryHooks::positioned`), which is what lets
-//! the backfill sentinel mount.
+//! any other. Revisiting a room restores the one anchor saved when the reader
+//! left it (`leave_room`; the component restores that room's rendered window
+//! too, so the row can exist). If that anchor is not rendered any more, the
+//! revisit is placed like a first open. An empty room places when its first
+//! rows arrive. Either way the component is told (`HistoryHooks::positioned`),
+//! which is what lets the backfill sentinel mount.
 //!
 //! # Scroll-to-latest
 //!
@@ -49,8 +54,10 @@
 //! * its `scroll` events capture the position reached (so a hide keeps it);
 //! * restores do not write `scrollTop`: content landing below the view moves
 //!   nothing on screen, so nothing fights the animation and nothing retargets
-//!   it. A reflow ABOVE the view moves the saved row's `offset`; that cancels
-//!   the navigation once, keeping the row where the reader last saw it.
+//!   it. A reflow ABOVE the view moves the saved anchor's `offset`; that cancels
+//!   the navigation once, keeping the row where the reader last saw it. The
+//!   anchor disappearing is not a zero-pixel reflow: the navigation is cancelled
+//!   and the missing-anchor transition places at the latest message once.
 //!
 //! It finishes at a `scrollend` that finds the view at its destination (or the
 //! clamped end), or after `navigation_quiet_ms` with no `scroll` event; the
@@ -102,7 +109,7 @@
 //!   back where their previous event left them.
 //! * **Hidden**: the mobile layout hides the history (`display:none`), and every
 //!   read is then 0. It stays observed, but nothing measures, records or
-//!   restores it until it has height again; the saved rows wait. The first
+//!   restores it until it has height again; the saved anchor waits. The first
 //!   callback that finds it laid out again (the ResizeObserver, or the reveal's
 //!   own `scroll` in desktop WebKit) restores rather than capturing, so a
 //!   reveal never turns where the browser put the view into the reader's
@@ -128,10 +135,6 @@ use super::{trim_would_rearm_backfill, INITIAL_WINDOW_ITEMS};
 use dioxus::prelude::WritableExt;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{prelude::*, JsCast};
-
-/// How many rows above the newest visible one are remembered as fallbacks, for
-/// when the anchor row itself is deleted or windowed out before the restore.
-const ANCHOR_FALLBACK_ROWS: usize = 4;
 
 /// The most a `scroll` event may move `scrollTop`, after the layout signature
 /// changed, and still be read as the browser's clamp rather than the reader.
@@ -189,52 +192,66 @@ enum ScrollCause {
     Layout,
 }
 
-/// One remembered row: its `data-anchor-row` key, its `gap` (the container's
+/// The one remembered row: its `data-anchor-row` key, its `gap` (the container's
 /// bottom edge minus the row's top edge) and its `offset` (the row's top inside
 /// `#chat-content`, which only a reflow above it changes).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct SavedRow {
+pub(super) struct SavedAnchor {
     key: String,
     gap: i32,
     offset: i32,
 }
 
-/// How far the view must move to put the first saved row that still exists
-/// (newest first) back at its saved gap; `current_gap` finds a row's gap now,
-/// `None` if it is gone. `None` if no saved row survives, including when none
-/// was saved.
+/// How far the view must move to put the saved anchor back at its gap.
+///
+/// `current_gap` finds that row's gap now, `None` if it is not rendered.
+/// The result is `None` when nothing was saved or the saved row is gone — that
+/// is the missing-anchor transition, not a zero move. A row that is rendered
+/// but whose gap is out of the browser's reach is still this anchor: the delta
+/// is how far the view would have to move, and the caller keeps the saved gap.
 fn anchor_delta(
-    saved: &[SavedRow],
+    saved: Option<&SavedAnchor>,
     mut current_gap: impl FnMut(&str) -> Option<i32>,
 ) -> Option<i32> {
-    saved
-        .iter()
-        .find_map(|row| current_gap(&row.key).map(|now| row.gap - now))
+    let row = saved?;
+    current_gap(&row.key).map(|now| row.gap - now)
 }
 
-/// Whether the content above the saved position reflowed since it was captured,
-/// and by how much: `current_offset` finds a row's offset in the content now.
+/// What the saved anchor did in the content since it was captured.
 ///
-/// `Some(shift)` when the first surviving saved row moved in the content by more
-/// than rounding (`shift` is how far down), and `Some(0)` when rows were saved
-/// and none survives (deleted or windowed out). `None` when nothing moved, or
-/// nothing was saved to tell by. Scrolling changes no offset, so this is blind
-/// to the navigation's own movement, and content appended below the rows does
-/// not move them either.
+/// Scrolling changes no offset, so this is blind to a navigation's own
+/// movement, and content appended below the anchor does not move it either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorReflow {
+    /// Nothing was saved, or the saved anchor is still there and has not moved
+    /// past rounding.
+    Stable,
+    /// The saved anchor moved in the content. Positive is downward.
+    Shifted(i32),
+    /// A saved anchor is no longer rendered. Distinct from [`Shifted`]`(0)`:
+    /// a real zero move is [`Stable`].
+    Missing,
+}
+
+/// Whether the content above the saved anchor reflowed since it was captured.
+/// `current_offset` finds the anchor's offset in the content now.
 fn reflow_above(
-    saved: &[SavedRow],
+    saved: Option<&SavedAnchor>,
     mut current_offset: impl FnMut(&str) -> Option<i32>,
-) -> Option<i32> {
-    if saved.is_empty() {
-        return None;
-    }
-    let shift = saved
-        .iter()
-        .find_map(|row| current_offset(&row.key).map(|now| now - row.offset));
-    match shift {
-        None => Some(0),
-        Some(shift) if shift.abs() > SCROLL_TOP_SLACK_PX => Some(shift),
-        Some(_) => None,
+) -> AnchorReflow {
+    let Some(row) = saved else {
+        return AnchorReflow::Stable;
+    };
+    match current_offset(&row.key) {
+        None => AnchorReflow::Missing,
+        Some(now) => {
+            let shift = now - row.offset;
+            if shift.abs() > SCROLL_TOP_SLACK_PX {
+                AnchorReflow::Shifted(shift)
+            } else {
+                AnchorReflow::Stable
+            }
+        }
     }
 }
 
@@ -259,9 +276,8 @@ fn anchor_restore_for(delta: Option<i32>) -> AnchorRestore {
     }
 }
 
-/// Indices of up to `n` rows, newest first, starting at the newest row that
-/// intersects the viewport `[view_top, view_bottom]`. The rows above it are
-/// fallbacks and need not be visible. Empty if no row is visible.
+/// Index of the newest row that intersects the viewport `[view_top, view_bottom]`.
+/// `None` if no row is visible.
 ///
 /// There are `len` rows in document order and `rect(i)` gives row `i`'s
 /// `(top, bottom)`, so their tops are monotonic and the newest row starting above
@@ -269,13 +285,12 @@ fn anchor_restore_for(delta: Option<i32>) -> AnchorRestore {
 /// slice, because each call is a layout read in production: this makes O(log n)
 /// of them plus one for the newest row's bottom edge. Touching an edge is not
 /// intersecting it.
-fn newest_visible_rows(
+fn newest_visible_row(
     len: usize,
     rect: impl Fn(usize) -> (i32, i32),
     view_top: i32,
     view_bottom: i32,
-    n: usize,
-) -> Vec<usize> {
+) -> Option<usize> {
     // The first row whose top is not above the viewport's bottom edge.
     let (mut lo, mut hi) = (0, len);
     while lo < hi {
@@ -286,13 +301,11 @@ fn newest_visible_rows(
             hi = mid;
         }
     }
-    let Some(newest) = lo.checked_sub(1) else {
-        return Vec::new();
-    };
+    let newest = lo.checked_sub(1)?;
     if rect(newest).1 <= view_top {
-        return Vec::new();
+        return None;
     }
-    (0..=newest).rev().take(n).collect()
+    Some(newest)
 }
 
 /// Read a `scroll` event as an echo, a layout change's doing or the reader's
@@ -363,18 +376,19 @@ pub(super) struct HistoryHooks {
 /// What the current room's view still needs before ordinary preservation runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Placement {
-    /// In place: restores preserve the saved rows.
+    /// In place: restores preserve the saved anchor.
     Placed,
     /// No saved position: start at the newest message once it can be measured.
     Latest,
-    /// Saved when the reader left this room: put those rows back first.
+    /// Saved when the reader left this room: put that anchor back first.
     Saved,
 }
 
 /// The history's scroll state. See the module doc.
 pub(super) struct HistoryScroll {
-    /// Newest visible row first. Empty until something has been captured.
-    anchor: RefCell<Vec<SavedRow>>,
+    /// The one newest visible row. `None` until something has been captured,
+    /// and again once that row is gone and the latest landing has not yet.
+    anchor: RefCell<Option<SavedAnchor>>,
     placement: Cell<Placement>,
     /// Which room visit this is: `enter_room` counts up. Shared with deferred
     /// work, so a trim scheduled for one room is dropped if it runs after the
@@ -410,7 +424,7 @@ pub(super) struct HistoryScroll {
 impl Default for HistoryScroll {
     fn default() -> Self {
         Self {
-            anchor: RefCell::new(Vec::new()),
+            anchor: RefCell::new(None),
             placement: Cell::new(Placement::Latest),
             visit: Rc::new(Cell::new(0)),
             sig: Cell::new(LayoutSig::default()),
@@ -429,26 +443,34 @@ impl Default for HistoryScroll {
 }
 
 impl HistoryScroll {
-    /// The reader is leaving the current room: what to put back when they
-    /// return. Takes in their latest movement first and cancels a navigation
-    /// where it is, while the DOM is still this room's.
-    pub(super) fn leave_room(&self) -> Vec<SavedRow> {
+    /// The reader is leaving the current room: the one anchor to put back when
+    /// they return. Takes in their latest movement first and cancels a
+    /// navigation where it is, while the DOM is still this room's.
+    pub(super) fn leave_room(&self) -> Option<SavedAnchor> {
         #[cfg(target_arch = "wasm32")]
         self.settle_before_leaving();
         self.end_navigation();
         self.anchor.borrow().clone()
     }
 
+    /// The saved anchor's key, for the render to keep that row inside the
+    /// window when the window's own head key is gone.
+    pub(super) fn reading_anchor_key(&self) -> Option<String> {
+        self.anchor
+            .borrow()
+            .as_ref()
+            .map(|anchor| anchor.key.clone())
+    }
+
     /// A room becomes current: start from what `leave_room` saved for it, or
     /// at its newest message when nothing was.
-    pub(super) fn enter_room(&self, saved: Option<Vec<SavedRow>>) {
+    pub(super) fn enter_room(&self, saved: Option<SavedAnchor>) {
         self.end_navigation();
         self.visit.set(self.visit.get().wrapping_add(1));
-        let saved = saved.unwrap_or_default();
-        self.placement.set(if saved.is_empty() {
-            Placement::Latest
-        } else {
+        self.placement.set(if saved.is_some() {
             Placement::Saved
+        } else {
+            Placement::Latest
         });
         *self.anchor.borrow_mut() = saved;
         self.sig.set(LayoutSig::default());
@@ -459,6 +481,10 @@ impl HistoryScroll {
     /// the view: the callers that need the animation stopped do that first.
     fn end_navigation(&self) {
         self.navigation.set(None);
+        self.clear_navigation_timer();
+    }
+
+    fn clear_navigation_timer(&self) {
         #[cfg(target_arch = "wasm32")]
         if let (Some(handle), Some(window)) = (self.navigation_timer.take(), web_sys::window()) {
             window.clear_timeout_with_handle(handle);
@@ -475,7 +501,7 @@ impl HistoryScroll {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn element_by_id(id: &str) -> Option<web_sys::Element> {
+pub(super) fn element_by_id(id: &str) -> Option<web_sys::Element> {
     web_sys::window()
         .and_then(|w| w.document())
         .and_then(|d| d.get_element_by_id(id))
@@ -621,7 +647,7 @@ impl HistoryScroll {
         if let (Some(list), Some(content)) =
             (self.rows.borrow().as_ref(), self.content.borrow().as_ref())
         {
-            // Relative to the container, the frame `newest_visible_rows` works in.
+            // Relative to the container, the frame `newest_visible_row` works in.
             // Each call is a layout read, and the search makes few of them.
             let view = container.get_bounding_client_rect();
             let content_top = content.get_bounding_client_rect().top();
@@ -634,25 +660,16 @@ impl HistoryScroll {
                     (r.bottom() - view.top()).round() as i32,
                 )
             };
-            let picked = newest_visible_rows(
-                list.length() as usize,
-                rect,
-                0,
-                view_bottom,
-                ANCHOR_FALLBACK_ROWS + 1,
-            );
-            *self.anchor.borrow_mut() = picked
-                .into_iter()
-                .filter_map(|i| {
-                    let row = item(i);
-                    let top = row.get_bounding_client_rect().top();
-                    Some(SavedRow {
-                        key: row.get_attribute(ANCHOR_ATTR)?,
-                        gap: (view.bottom() - top).round() as i32,
-                        offset: (top - content_top).round() as i32,
-                    })
+            let picked = newest_visible_row(list.length() as usize, rect, 0, view_bottom);
+            *self.anchor.borrow_mut() = picked.and_then(|i| {
+                let row = item(i);
+                let top = row.get_bounding_client_rect().top();
+                Some(SavedAnchor {
+                    key: row.get_attribute(ANCHOR_ATTR)?,
+                    gap: (view.bottom() - top).round() as i32,
+                    offset: (top - content_top).round() as i32,
                 })
-                .collect();
+            });
         }
         self.record(container);
     }
@@ -666,7 +683,7 @@ impl HistoryScroll {
 
     /// A view resting AT the bottom is the one moment a window trim is
     /// invisible: the rows it removes are above the view, and the restore that
-    /// follows puts the saved row (at the bottom) back at its gap. Gated at
+    /// follows puts the saved anchor (at the bottom) back at its gap. Gated at
     /// SCROLL_TOP_SLACK_PX of the end, so a reader resting higher keeps the rows
     /// above them. Skipped when the trimmed tail would leave the backfill
     /// sentinel in range of the bottom, or the two oscillate at render speed
@@ -748,14 +765,21 @@ impl HistoryScroll {
         }
         if self.navigation.get().is_some() {
             // Content below the view moves nothing on screen; leave the
-            // animation alone unless something above it reflowed.
+            // animation alone unless something above it reflowed, or the
+            // anchor itself is gone.
             match self.navigation_reflow(&container) {
-                Some(shift) => self.cancel_navigation_for_reflow(&container, shift),
-                None => self.record(&container),
+                AnchorReflow::Shifted(shift) => {
+                    self.cancel_navigation_for_reflow(&container, shift)
+                }
+                AnchorReflow::Missing => self.land_on_latest(&container),
+                AnchorReflow::Stable => self.record(&container),
             }
             return;
         }
-        self.restore_anchor(&container);
+        if self.restore_anchor(&container) == AnchorRestore::Missing {
+            self.land_on_latest(&container);
+            return;
+        }
         self.record(&container);
     }
 
@@ -772,21 +796,37 @@ impl HistoryScroll {
         self.tell_positioned();
     }
 
-    /// A revisited room puts its saved rows back, once it has rows. If none of
-    /// them is rendered, it starts at its newest message instead. Nothing is
-    /// captured: a gap out of reach for now stays saved.
+    /// A revisited room puts its saved anchor back, once it has rows. If that
+    /// anchor is not rendered, the room starts at its newest message instead.
+    /// Nothing is captured on a successful restore: a gap out of reach for now
+    /// stays saved.
     fn place_saved(&self, container: &web_sys::Element) {
         if !self.has_rows() {
             self.record(container);
             return;
         }
         if self.restore_anchor(container) == AnchorRestore::Missing {
-            self.place_at_latest(container);
+            self.land_on_latest(container);
             return;
         }
         self.record(container);
         self.placement.set(Placement::Placed);
         self.tell_positioned();
+    }
+
+    /// The saved anchor is gone. End any navigation, forget it, and place at
+    /// the current end once rows and geometry exist. The landing capture is
+    /// the new single anchor; a later arrival preserves it.
+    fn land_on_latest(&self, container: &web_sys::Element) {
+        let navigating = self.navigation.get().is_some();
+        self.end_navigation();
+        *self.anchor.borrow_mut() = None;
+        if navigating {
+            // A write to the position a smooth scroll is already at does not
+            // abort it in Firefox. Stop it before the jump to the end.
+            stop_native_scroll(container);
+        }
+        self.place_at_latest(container);
     }
 
     fn tell_positioned(&self) {
@@ -796,12 +836,11 @@ impl HistoryScroll {
         }
     }
 
-    /// Scroll the first saved row that still exists back to its gap. If none
-    /// survives (or none was saved), leave the view alone: the next reader
-    /// scroll captures a new position.
+    /// Scroll the saved anchor back to its gap. If it is gone (or none was
+    /// saved), write nothing: the caller places at the latest message.
     fn restore_anchor(&self, container: &web_sys::Element) -> AnchorRestore {
         let view = container.get_bounding_client_rect();
-        let delta = anchor_delta(&self.anchor.borrow(), |key| {
+        let delta = anchor_delta(self.anchor.borrow().as_ref(), |key| {
             Some(gap(&view, &self.find_row(container, key)?))
         });
         let restored = anchor_restore_for(delta);
@@ -811,31 +850,29 @@ impl HistoryScroll {
         restored
     }
 
-    /// `reflow_above` for the saved rows as rendered now.
-    fn navigation_reflow(&self, container: &web_sys::Element) -> Option<i32> {
-        let content_top = self
+    /// [`reflow_above`] for the saved anchor as rendered now.
+    fn navigation_reflow(&self, container: &web_sys::Element) -> AnchorReflow {
+        let Some(content_top) = self
             .content
             .borrow()
-            .as_ref()?
-            .get_bounding_client_rect()
-            .top();
-        reflow_above(&self.anchor.borrow(), |key| {
+            .as_ref()
+            .map(|content| content.get_bounding_client_rect().top())
+        else {
+            return AnchorReflow::Stable;
+        };
+        reflow_above(self.anchor.borrow().as_ref(), |key| {
             let row = self.find_row(container, key)?;
             Some((row.get_bounding_client_rect().top() - content_top).round() as i32)
         })
     }
 
     /// Something above the view reflowed during a navigation: stop it, keeping
-    /// the saved row where the reader last saw it (`shift` is how far the
+    /// the saved anchor where the reader last saw it (`shift` is how far the
     /// reflow moved it down), and capture there.
     fn cancel_navigation_for_reflow(&self, container: &web_sys::Element, shift: i32) {
         self.end_navigation();
-        if shift == 0 {
-            stop_native_scroll(container);
-        } else {
-            // A real move, so it aborts the animation as it compensates.
-            container.set_scroll_top(container.scroll_top() + shift);
-        }
+        // A real move, so it aborts the animation as it compensates.
+        container.set_scroll_top(container.scroll_top() + shift);
         self.capture(container);
     }
 
@@ -847,14 +884,16 @@ impl HistoryScroll {
     }
 
     /// A `scroll` during a navigation is its progress: capture it, unless the
-    /// saved row moved in the content, which only a reflow above it does.
+    /// saved anchor moved in the content (a reflow above it) or disappeared.
     fn on_navigation_scroll(&self, container: &web_sys::Element) {
-        if let Some(shift) = self.navigation_reflow(container) {
-            self.cancel_navigation_for_reflow(container, shift);
-            return;
+        match self.navigation_reflow(container) {
+            AnchorReflow::Missing => self.land_on_latest(container),
+            AnchorReflow::Shifted(shift) => self.cancel_navigation_for_reflow(container, shift),
+            AnchorReflow::Stable => {
+                self.capture(container);
+                self.arm_navigation_timer();
+            }
         }
-        self.capture(container);
-        self.arm_navigation_timer();
     }
 
     /// Read a `scroll` event as layout's doing (restore) or the reader's
@@ -946,9 +985,7 @@ impl HistoryScroll {
 
     /// (Re)start the navigation's quiet interval.
     fn arm_navigation_timer(&self) {
-        if let (Some(handle), Some(window)) = (self.navigation_timer.take(), web_sys::window()) {
-            window.clear_timeout_with_handle(handle);
-        }
+        self.clear_navigation_timer();
         let callback = self.navigation_quiet.borrow().clone();
         let (Some(window), Some(callback)) = (web_sys::window(), callback) else {
             return;
@@ -1086,9 +1123,9 @@ mod tests {
 
     const VIEW: (i32, i32) = (0, 500);
 
-    /// `newest_visible_rows` over an array: the closure is all it gets to see.
-    fn newest(rows: &[(i32, i32)], view_top: i32, view_bottom: i32, n: usize) -> Vec<usize> {
-        newest_visible_rows(rows.len(), |i| rows[i], view_top, view_bottom, n)
+    /// `newest_visible_row` over an array: the closure is all it gets to see.
+    fn newest(rows: &[(i32, i32)], view_top: i32, view_bottom: i32) -> Option<usize> {
+        newest_visible_row(rows.len(), |i| rows[i], view_top, view_bottom)
     }
 
     fn sig(content_height: i32, client_height: i32, client_width: i32) -> LayoutSig {
@@ -1100,8 +1137,8 @@ mod tests {
         }
     }
 
-    fn row(key: &str, gap: i32, offset: i32) -> SavedRow {
-        SavedRow {
+    fn row(key: &str, gap: i32, offset: i32) -> SavedAnchor {
+        SavedAnchor {
             key: key.into(),
             gap,
             offset,
@@ -1109,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn newest_visible_rows_picks_the_last_row_intersecting_the_viewport() {
+    fn newest_visible_row_picks_the_last_row_intersecting_the_viewport() {
         // Rows straddling the top edge, inside, and straddling the bottom edge.
         let rows = [
             (-150, -50),
@@ -1119,53 +1156,34 @@ mod tests {
             (450, 650),
             (650, 800),
         ];
-        assert_eq!(newest(&rows, VIEW.0, VIEW.1, 1), vec![4]);
+        assert_eq!(newest(&rows, VIEW.0, VIEW.1), Some(4));
 
         // The newest row ends inside the view, so the ones below it are off screen.
-        assert_eq!(newest(&rows[..4], VIEW.0, VIEW.1, 1), vec![3]);
+        assert_eq!(newest(&rows[..4], VIEW.0, VIEW.1), Some(3));
 
         // Only a row straddling the top edge is visible.
         let above = [(-300, -200), (-200, 20), (600, 700)];
-        assert_eq!(newest(&above, VIEW.0, VIEW.1, 1), vec![1]);
+        assert_eq!(newest(&above, VIEW.0, VIEW.1), Some(1));
 
         // A row taller than the viewport, covering both edges.
         let tall = [(-100, 900)];
-        assert_eq!(newest(&tall, VIEW.0, VIEW.1, 1), vec![0]);
+        assert_eq!(newest(&tall, VIEW.0, VIEW.1), Some(0));
 
-        assert_eq!(newest(&[], VIEW.0, VIEW.1, 1), Vec::<usize>::new());
+        assert_eq!(newest(&[], VIEW.0, VIEW.1), None);
 
         // Touching an edge is not intersecting it; one pixel of overlap is.
-        assert!(newest(&[(-100, 0)], 0, 500, 1).is_empty());
-        assert_eq!(newest(&[(0, 100), (500, 600)], 0, 500, 1), vec![0]);
-        assert_eq!(newest(&[(-100, 1)], 0, 500, 1), vec![0]);
-        assert_eq!(newest(&[(499, 600)], 0, 500, 1), vec![0]);
+        assert_eq!(newest(&[(-100, 0)], 0, 500), None);
+        assert_eq!(newest(&[(0, 100), (500, 600)], 0, 500), Some(0));
+        assert_eq!(newest(&[(-100, 1)], 0, 500), Some(0));
+        assert_eq!(newest(&[(499, 600)], 0, 500), Some(0));
     }
 
     #[test]
-    fn newest_visible_rows_returns_up_to_n_fallbacks_above_it() {
-        let rows = [
-            (0, 100),
-            (100, 200),
-            (200, 300),
-            (300, 400),
-            (400, 500),
-            (500, 600),
-        ];
-        // Row 4 is the newest visible one; the n rows are it and those above it.
-        assert_eq!(newest(&rows, 0, 450, 3), vec![4, 3, 2]);
-        // Fewer rows exist than were asked for.
-        assert_eq!(newest(&rows[..2], 0, 450, 5), vec![1, 0]);
-        // The fallbacks need not be visible themselves.
-        assert_eq!(newest(&rows, 250, 450, 4), vec![4, 3, 2, 1]);
-        assert_eq!(newest(&rows, 0, 450, 0), Vec::<usize>::new());
-    }
-
-    #[test]
-    fn newest_visible_rows_reads_only_a_handful_of_rects() {
+    fn newest_visible_row_reads_only_a_handful_of_rects() {
         // Capture runs on every reader scroll event, and each rect is a layout read.
         let rows: Vec<(i32, i32)> = (0..10_000).map(|i| (i * 100, i * 100 + 90)).collect();
         let reads = Cell::new(0usize);
-        let picked = newest_visible_rows(
+        let picked = newest_visible_row(
             rows.len(),
             |i| {
                 reads.set(reads.get() + 1);
@@ -1173,9 +1191,8 @@ mod tests {
             },
             300_000,
             300_500,
-            ANCHOR_FALLBACK_ROWS + 1,
         );
-        assert_eq!(picked, vec![3_004, 3_003, 3_002, 3_001, 3_000]);
+        assert_eq!(picked, Some(3_004));
         // log2(10_000) is about 14: the search, plus the one bottom-edge read.
         assert!(reads.get() <= 16, "read {} rects", reads.get());
     }
@@ -1405,17 +1422,16 @@ mod tests {
 
     #[test]
     fn a_restore_distinguishes_a_missing_anchor_from_one_at_its_gap() {
-        let saved = vec![row("m3", 300, 0), row("m2", 500, 0), row("m1", 700, 0)];
-        // Every saved row gone, or none saved: nothing to put back.
-        assert_eq!(anchor_delta(&saved, |_| None), None);
-        assert_eq!(anchor_delta(&[], |_| Some(0)), None);
-        // The newest survivor decides, wherever it is in the list.
-        let only_m2 = |key: &str| (key == "m2").then_some(460);
-        assert_eq!(anchor_delta(&saved, only_m2), Some(40));
-        let all = |key: &str| Some(if key == "m3" { 280 } else { 0 });
-        assert_eq!(anchor_delta(&saved, all), Some(20));
-        // A survivor already at its gap needs no write, which is not missing.
-        assert_eq!(anchor_delta(&saved, |_| Some(300)), Some(0));
+        let saved = row("m3", 300, 0);
+        // The saved row is gone, or none was saved: nothing to put back.
+        assert_eq!(anchor_delta(Some(&saved), |_| None), None);
+        assert_eq!(anchor_delta(None, |_| Some(0)), None);
+        // The same row, moved off its gap. A gap the browser cannot reach is
+        // still this anchor, not a different row.
+        assert_eq!(anchor_delta(Some(&saved), |_| Some(260)), Some(40));
+        assert_eq!(anchor_delta(Some(&saved), |_| Some(3_000)), Some(-2_700));
+        // Already at its gap: no write, which is not missing.
+        assert_eq!(anchor_delta(Some(&saved), |_| Some(300)), Some(0));
 
         assert_eq!(anchor_restore_for(None), AnchorRestore::Missing);
         assert_eq!(anchor_restore_for(Some(0)), AnchorRestore::AtGap);
@@ -1434,27 +1450,30 @@ mod tests {
     }
 
     #[test]
-    fn only_a_reflow_above_the_saved_rows_counts_during_a_navigation() {
-        let saved = vec![row("m3", 300, 2000), row("m2", 500, 1800)];
+    fn only_a_reflow_above_the_saved_anchor_counts_during_a_navigation() {
+        let saved = row("m3", 300, 2000);
         // Scrolling and content appended below move no offset.
         assert_eq!(
-            reflow_above(&saved, |k| Some(if k == "m3" { 2000 } else { 1800 })),
-            None
+            reflow_above(Some(&saved), |_| Some(2000)),
+            AnchorReflow::Stable
         );
         assert_eq!(
-            reflow_above(&saved, |_| Some(2000 + SCROLL_TOP_SLACK_PX)),
-            None
+            reflow_above(Some(&saved), |_| Some(2000 + SCROLL_TOP_SLACK_PX)),
+            AnchorReflow::Stable
         );
-        // Something above grew or shrank: the newest survivor says by how much.
-        assert_eq!(reflow_above(&saved, |_| Some(2120)), Some(120));
+        // Something above grew or shrank.
         assert_eq!(
-            reflow_above(&saved, |k| (k == "m2").then_some(1700)),
-            Some(-100)
+            reflow_above(Some(&saved), |_| Some(2120)),
+            AnchorReflow::Shifted(120)
         );
-        // Every saved row gone is a reflow too, with nothing to compensate by.
-        assert_eq!(reflow_above(&saved, |_| None), Some(0));
+        assert_eq!(
+            reflow_above(Some(&saved), |_| Some(1900)),
+            AnchorReflow::Shifted(-100)
+        );
+        // The saved anchor is gone. That is not a zero-pixel reflow.
+        assert_eq!(reflow_above(Some(&saved), |_| None), AnchorReflow::Missing);
         // Nothing saved: nothing to tell by, so nothing to cancel for.
-        assert_eq!(reflow_above(&[], |_| None), None);
+        assert_eq!(reflow_above(None, |_| None), AnchorReflow::Stable);
     }
 
     #[test]
@@ -1487,12 +1506,12 @@ mod tests {
 
         // Leaving keeps what was captured; entering another room forgets the
         // geometry and starts that room at its newest message.
-        *history.anchor.borrow_mut() = vec![row("a1", 120, 900)];
+        *history.anchor.borrow_mut() = Some(row("a1", 120, 900));
         history.sig.set(sig(3000, 600, 1000));
         history.top.set(2000);
         history.navigation.set(Some(2400));
         let left = history.leave_room();
-        assert_eq!(left, vec![row("a1", 120, 900)]);
+        assert_eq!(left, Some(row("a1", 120, 900)));
         assert_eq!(history.navigation.get(), None);
 
         let visit = history.visit.get();
@@ -1503,30 +1522,31 @@ mod tests {
             "a switch drops trims scheduled before it"
         );
         assert_eq!(history.placement.get(), Placement::Latest);
-        assert!(history.anchor.borrow().is_empty());
+        assert!(history.anchor.borrow().is_none());
         assert_eq!(history.sig.get(), LayoutSig::default());
         assert_eq!(history.top.get(), 0);
 
-        // Coming back restores the saved rows first.
-        history.enter_room(Some(left));
+        // Coming back restores the saved anchor first.
+        history.enter_room(left);
         assert_eq!(history.placement.get(), Placement::Saved);
-        assert_eq!(&*history.anchor.borrow(), &[row("a1", 120, 900)]);
+        assert_eq!(history.anchor.borrow().as_ref(), Some(&row("a1", 120, 900)));
 
-        // An empty saved position is no position.
-        history.enter_room(Some(Vec::new()));
+        // No saved anchor is no position.
+        history.enter_room(None);
         assert_eq!(history.placement.get(), Placement::Latest);
+        assert!(history.anchor.borrow().is_none());
     }
 
     #[test]
-    fn a_hide_forgets_the_navigation_and_keeps_the_saved_rows() {
+    fn a_hide_forgets_the_navigation_and_keeps_the_saved_anchor() {
         let history = HistoryScroll::default();
         history.placement.set(Placement::Placed);
-        *history.anchor.borrow_mut() = vec![row("m9", 40, 5000)];
+        *history.anchor.borrow_mut() = Some(row("m9", 40, 5000));
         history.navigation.set(Some(8000));
         history.note_hidden();
         assert!(history.hidden.get());
         assert_eq!(history.navigation.get(), None);
-        assert_eq!(&*history.anchor.borrow(), &[row("m9", 40, 5000)]);
+        assert_eq!(history.anchor.borrow().as_ref(), Some(&row("m9", 40, 5000)));
         assert_eq!(history.placement.get(), Placement::Placed);
     }
 }

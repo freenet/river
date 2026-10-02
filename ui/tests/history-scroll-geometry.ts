@@ -4,7 +4,7 @@ import { Page } from "@playwright/test";
 export type RowPosition = { id: string; gap: number };
 
 /// A saved row's gap, plus whether any part of it intersects the viewport.
-export type SavedRow = RowPosition & { visible: boolean };
+type SavedRow = RowPosition & { visible: boolean };
 
 type HistoryGeometry = {
   newestVisible(container: HTMLElement): RowPosition | null;
@@ -20,7 +20,7 @@ declare global {
 /// Install `window.__riverHistoryGeometry`. Self-contained, so it can be an
 /// init script or run in the current document. A second install leaves the
 /// first in place.
-export function installHistoryGeometry() {
+function installHistoryGeometry() {
   const current = window.__riverHistoryGeometry;
   if (typeof current?.newestVisible === "function" && typeof current?.positionOf === "function") return;
   const missingContainer = "history geometry: chat scroll container is missing";
@@ -53,12 +53,6 @@ export function registerHistoryGeometry(page: Page): Promise<void> {
   return page.addInitScript(installHistoryGeometry);
 }
 
-/// Install into the document that is already open. Fixture entry points that
-/// run after navigation use this; an init script that already ran is left as it is.
-export function ensureHistoryGeometry(page: Page): Promise<void> {
-  return page.evaluate(installHistoryGeometry);
-}
-
 function readNewest(page: Page): Promise<RowPosition | null> {
   return page.evaluate(() => {
     const geo = window.__riverHistoryGeometry;
@@ -82,11 +76,6 @@ function readSaved(page: Page, id: string): Promise<SavedRow | null> {
 /// The newest message intersecting the viewport, or null when none does.
 export function newestVisibleRow(page: Page): Promise<RowPosition | null> {
   return readNewest(page);
-}
-
-/// Gap of the saved row, or null when that row is missing or outside the container.
-export function savedRowPosition(page: Page, id: string): Promise<SavedRow | null> {
-  return readSaved(page, id);
 }
 
 /// Drift of the saved row while it is still the newest visible message.

@@ -8,8 +8,8 @@ import { Page } from "@playwright/test";
 //
 // The recorder's log (`orderLog`) holds every `scroll` and every `scrollend`
 // (`end`) the container delivered, each recorded by a listener added after the
-// app's, so an entry means the app has had the event, plus the test's own
-// marks (`orderMark`) and what the helpers below did.
+// app's, so an entry means the app has had the event, plus what the helpers
+// below did.
 //
 // Every wait is on real rendering passes: `afterRealFrame` resolves after the
 // next `requestAnimationFrame` and the task after it, so a step's `scroll`
@@ -17,7 +17,7 @@ import { Page } from "@playwright/test";
 
 /// One reader move: `scrollTop` before the write and as read back right after
 /// it, and the live end then.
-export type ReaderMove = {
+type ReaderMove = {
   before: number;
   after: number;
   max: number;
@@ -86,11 +86,6 @@ export async function orderRecorderStop(page: Page) {
 /// The event log so far, as one line.
 export function orderLog(page: Page): Promise<string> {
   return page.evaluate(() => window.__historyOrder!.log.join(" "));
-}
-
-/// Add `label` to the event log.
-export function orderMark(page: Page, label: string) {
-  return page.evaluate((label) => void window.__historyOrder!.log.push(label), label);
 }
 
 /// Let `n` real rendering passes go by (and the task after each).

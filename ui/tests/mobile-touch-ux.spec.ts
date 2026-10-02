@@ -1,6 +1,7 @@
 import { test, expect, Page } from "@playwright/test";
 import { waitForApp, selectRoom } from "./example-room";
 import { newestVisibleRow, registerHistoryGeometry, savedRowDrift } from "./history-scroll-geometry";
+import { distanceFromBottom } from "./history-scroll-helpers";
 
 // Coverage for freenet/river#402 — mobile / touch UX improvements:
 //   1. Touch-accessible message action menu (kebab), since the hover action
@@ -20,25 +21,7 @@ async function isTouchOnly(page: Page): Promise<boolean> {
 // its rows are laid out. Wait for that before a test scrolls up, so the test
 // does not race the placement.
 async function waitSettledAtBottom(page: Page) {
-  await expect
-    .poll(
-      () =>
-        page.evaluate(() => {
-          const el = document.getElementById("chat-scroll-container");
-          if (!el) return Number.MAX_SAFE_INTEGER;
-          return el.scrollHeight - el.scrollTop - el.clientHeight;
-        }),
-      { timeout: 5_000 }
-    )
-    .toBeLessThan(120);
-}
-
-async function distanceFromBottom(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.getElementById("chat-scroll-container");
-    if (!el) return Number.MAX_SAFE_INTEGER;
-    return el.scrollHeight - el.scrollTop - el.clientHeight;
-  });
+  await expect.poll(() => distanceFromBottom(page), { timeout: 5_000 }).toBeLessThan(120);
 }
 
 // Scroll the history to the top and wait for the scroll-to-latest button to

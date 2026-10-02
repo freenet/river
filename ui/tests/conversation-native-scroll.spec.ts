@@ -7,14 +7,17 @@ import {
   type RowPosition,
 } from "./history-scroll-geometry";
 import {
+  ARRIVAL,
   AT_BOTTOM_EPSILON_PX,
-  afterLayoutSettles,
   deliver,
   distanceFromBottom,
+  expectDriftWithin,
   expectSettledAtBottom,
+  hideChat,
   parkAboveTheEnd,
+  revealChat,
   scrollTop,
-  viewportHeight,
+  viewAtRest,
 } from "./history-scroll-helpers";
 
 // "Scroll to latest messages" is ONE native smooth scroll to the end measured at
@@ -32,9 +35,6 @@ import {
 
 /// How far above the end the reader parks before the click.
 const PARK_PX = 3_000;
-/// A row's gap may move this much and still be "in place" (whole-pixel reads,
-/// fractional rows), far below a row's height.
-const IN_PLACE_TOLERANCE_PX = 4;
 
 const button = (page: Page) => page.getByTestId("scroll-to-bottom");
 
@@ -94,37 +94,10 @@ async function animationUnderway(page: Page, from: number) {
     .toBeGreaterThan(from + 40);
 }
 
-/// The view has stopped moving: two reads 300ms apart agree.
-async function viewAtRest(page: Page, why: string): Promise<number> {
-  let last = Number.NaN;
-  await expect
-    .poll(
-      async () => {
-        const before = await scrollTop(page);
-        await page.waitForTimeout(300);
-        last = await scrollTop(page);
-        return Math.abs(last - before);
-      },
-      { timeout: 10_000, message: why },
-    )
-    .toBeLessThanOrEqual(1);
-  return last;
-}
-
 /// The row recorded in `before` is still at its gap, over five samples (500ms).
-async function expectRowHolds(page: Page, before: RowPosition, why: string) {
-  await expect.poll(() => savedRowDrift(page, before), { timeout: 5_000, message: why }).toBeLessThanOrEqual(
-    IN_PLACE_TOLERANCE_PX,
-  );
-  const drifts: number[] = [];
-  for (let i = 0; i < 5; i++) {
-    await page.waitForTimeout(100);
-    drifts.push(await savedRowDrift(page, before));
-  }
-  expect(Math.max(...drifts), `${why} (samples: ${drifts.join(", ")})`).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+function expectRowHolds(page: Page, before: RowPosition, why: string) {
+  return expectDriftWithin(page, () => savedRowDrift(page, before), why, { hold: true });
 }
-
-const ARRIVAL = (what: string) => `${what}: ${"v".repeat(200)}`;
 
 test.beforeEach(async ({ page }) => {
   await registerHistoryGeometry(page);
@@ -229,6 +202,43 @@ test.describe("Scroll to latest is one native smooth scroll", () => {
     await expectRowHolds(page, stopped!, "the interrupted position was not preserved");
   });
 
+  test("deleting the reading anchor during the animation places at the latest message once", async ({ page }) => {
+    const { parkedAt } = await parkAndRecord(page);
+    await button(page).click();
+    await animationUnderway(page, parkedAt);
+    // Scroll events during the animation replace the anchor. A one-pixel move
+    // aborts the smooth scroll and is delivered synchronously, so the app
+    // captures this view before the read; nothing else can capture a newer
+    // row before the removal.
+    await page.evaluate(() => {
+      const container = document.getElementById("chat-scroll-container")!;
+      const top = container.scrollTop;
+      container.scrollTop = top + 1;
+      container.scrollTop = top;
+    });
+    const anchor = await newestVisibleRow(page);
+    expect(anchor, "premise: a message is visible during the animation").not.toBeNull();
+    const unmatched = await callRiverTest(page, "removeMessages", [anchor!.id]);
+    expect(unmatched, "premise: the anchor id named a message").toEqual([]);
+    await expectSettledAtBottom(page, "losing the anchor mid-flight should place at the latest message");
+    await viewAtRest(page, "the view should come to rest at the latest message");
+    expect(await scrollRequests(page), "the old request is not replaced by another smooth scroll").toEqual({
+      smooth: 1,
+      other: 0,
+    });
+
+    const landed = await newestVisibleRow(page);
+    expect(landed, "premise: the landing has a visible message").not.toBeNull();
+    expect(landed!.id, "the deleted anchor is not the landing").not.toBe(anchor!.id);
+    await page.waitForTimeout(1_500);
+    await expectRowHolds(page, landed!, "a stale navigation end moved the landing");
+    await deliver(page, ARRIVAL("arrival after the anchor was deleted mid-flight"));
+    await expectRowHolds(page, landed!, "an arrival after the landing moved the view");
+    expect(await distanceFromBottom(page), "the arrival should stay below the view").toBeGreaterThan(
+      AT_BOTTOM_EPSILON_PX,
+    );
+  });
+
   test("with reduced motion it goes straight to the end", async ({ page }) => {
     await page.emulateMedia({ reducedMotion: "reduce" });
     await parkAndRecord(page);
@@ -243,14 +253,6 @@ test.describe("Scroll to latest is one native smooth scroll", () => {
 test.describe("Hiding the chat cancels the animation", () => {
   test.use({ viewport: { width: 390, height: 844 } });
 
-  const chat = (page: Page) => page.locator("#chat-scroll-container");
-
-  async function chatHidden(page: Page) {
-    await expect(chat(page)).toBeHidden({ timeout: 5_000 });
-    await expect.poll(() => viewportHeight(page), { message: "premise: the hidden chat has no height" }).toBe(0);
-    await afterLayoutSettles(page);
-  }
-
   for (const hide of [
     { by: "the rooms button", opener: "hamburger-rooms-button", back: "rooms-back-button" },
     { by: "the members button", opener: "header-members-button", back: "members-back-button" },
@@ -261,8 +263,7 @@ test.describe("Hiding the chat cancels the animation", () => {
       const { parkedAt } = await parkAndRecord(page);
       await button(page).click();
       await animationUnderway(page, parkedAt);
-      await page.getByTestId(hide.opener).filter({ visible: true }).click();
-      await chatHidden(page);
+      await hideChat(page, hide.opener);
       for (let i = 0; i < 3; i++) {
         const text = ARRIVAL(`hidden arrival ${i}`);
         await callRiverTest(page, "appendMessage", text);
@@ -271,9 +272,7 @@ test.describe("Hiding the chat cancels the animation", () => {
       // Longer than any quiet interval the navigation could have left behind.
       await page.waitForTimeout(1_500);
 
-      await page.getByTestId(hide.back).click();
-      await expect(chat(page)).toBeVisible();
-      await afterLayoutSettles(page);
+      await revealChat(page, hide.back);
       const revealed = await newestVisibleRow(page);
       expect(revealed, "premise: a message should be visible").not.toBeNull();
       expect(await distanceFromBottom(page), "the reveal should not have finished the animation").toBeGreaterThan(
