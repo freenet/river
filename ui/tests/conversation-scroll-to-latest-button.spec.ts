@@ -95,16 +95,26 @@ test("the margin covers only padding", async ({ page }) => {
   ).toBeLessThanOrEqual(SCROLL_TO_LATEST_MARGIN_PX);
 });
 
-test("clicking it hides it once at the end", async ({ page }) => {
-  await openRoomAtBottom(page, "Team Chat Room");
-  await deliver(page, SHORT);
-  await buttonShown(page);
-  await page.getByTestId("scroll-to-bottom").click();
-  await expectSettledAtBottom(page, "the button should reach the end");
-  await expect
-    .poll(async () => page.getByTestId("scroll-to-bottom").count(), {
-      timeout: 5_000,
-      message: "the button should hide once the end is in view",
-    })
-    .toBe(0);
-});
+// Also at 500x400, the short viewport the old #402.3 mobile-touch-ux case used.
+for (const viewport of [
+  { width: 900, height: 700 },
+  { width: 500, height: 400 },
+]) {
+  test.describe(`at ${viewport.width}x${viewport.height}`, () => {
+    test.use({ viewport });
+
+    test("clicking it hides it once at the end", async ({ page }) => {
+      await openRoomAtBottom(page, "Team Chat Room");
+      await deliver(page, SHORT);
+      await buttonShown(page);
+      await page.getByTestId("scroll-to-bottom").click();
+      await expectSettledAtBottom(page, "the button should reach the end");
+      await expect
+        .poll(async () => page.getByTestId("scroll-to-bottom").count(), {
+          timeout: 5_000,
+          message: "the button should hide once the end is in view",
+        })
+        .toBe(0);
+    });
+  });
+}

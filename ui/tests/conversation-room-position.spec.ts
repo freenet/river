@@ -136,6 +136,29 @@ const SWITCHERS: Switcher[] = [
   },
 ];
 
+/// A and B each come back at their own parked row, with the button showing;
+/// then a revisited room that was never backfilled still pages back.
+async function eachRoomKeepsItsOwnRow(page: Page, sw: Switcher) {
+  await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+  const inA = await readerParksAboveTheEnd(page, PARK_PX);
+
+  await sw.to(page, OTHER_ROOM);
+  await expectSettledAtBottom(page, "B should open at its newest message, not at A's offset");
+  const inB = await readerParksAboveTheEnd(page, PARK_PX * 2);
+  expect(inB.id, "premise: the rooms show different rows").not.toBe(inA.id);
+
+  await sw.to(page, DEEP_ROOM);
+  await expectVisibleRowHolds(page, inA, "A did not come back at its own row");
+  await expect(page.getByTestId("scroll-to-bottom"), "A came back above its end, so the button shows").toBeVisible();
+  await sw.to(page, OTHER_ROOM);
+  await expectVisibleRowHolds(page, inB, "B did not come back at its own row");
+  await sw.to(page, DEEP_ROOM);
+  await expectVisibleRowHolds(page, inA, "A did not come back at its own row a second time");
+
+  // Paging in a revisited room that was never backfilled.
+  await backfillOnce(page, "backfill after coming back revealed no older rows");
+}
+
 test.beforeEach(async ({ page }) => {
   await registerHistoryGeometry(page);
 });
@@ -211,23 +234,7 @@ test.describe("Revisiting a room restores where the reader left it", () => {
     });
 
     test(`each room keeps its own row, switching by ${sw.by}`, async ({ page }) => {
-      await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
-      const inA = await readerParksAboveTheEnd(page, PARK_PX);
-
-      await sw.to(page, OTHER_ROOM);
-      await expectSettledAtBottom(page, "B should open at its newest message, not at A's offset");
-      const inB = await readerParksAboveTheEnd(page, PARK_PX * 2);
-      expect(inB.id, "premise: the rooms show different rows").not.toBe(inA.id);
-
-      await sw.to(page, DEEP_ROOM);
-      await expectVisibleRowHolds(page, inA, "A did not come back at its own row");
-      await sw.to(page, OTHER_ROOM);
-      await expectVisibleRowHolds(page, inB, "B did not come back at its own row");
-      await sw.to(page, DEEP_ROOM);
-      await expectVisibleRowHolds(page, inA, "A did not come back at its own row a second time");
-
-      // Paging in a revisited room that was never backfilled.
-      await backfillOnce(page, "backfill after coming back revealed no older rows");
+      await eachRoomKeepsItsOwnRow(page, sw);
     });
   }
 
@@ -241,6 +248,15 @@ test.describe("Revisiting a room restores where the reader left it", () => {
     await afterLayoutSettles(page);
     await expectVisibleRowHolds(page, saved, "re-selecting the open room moved the view");
     expect(await renderedRowCount(page), "re-selecting the open room changed its window").toBe(rows);
+  });
+});
+
+// The short viewport the old #402.3 mobile-touch-ux case used.
+test.describe("Revisiting a room at a short viewport", () => {
+  test.use({ viewport: { width: 1280, height: 420 } });
+
+  test("each room keeps its own row, switching by the room list", async ({ page }) => {
+    await eachRoomKeepsItsOwnRow(page, SWITCHERS[0]);
   });
 });
 
