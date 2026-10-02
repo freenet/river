@@ -409,7 +409,17 @@ test.describe("A reflow above the reader, reported after another event", () => {
   // same rendering pass as the observer and before it, so an image loading
   // 75-85ms after the ticks produced the order natively. The delays straddle
   // that window; elsewhere they only check the outcome.
+  //
+  // Fifteen native timing runs across the desktop projects, so it is opt-in
+  // and CI runs it as its own step:
+  //   RIVER_NATIVE_WHEEL_IMAGE_PROBE=1 npx playwright test \
+  //     conversation-anchor-events.spec.ts --grep "native input probe" \
+  //     --project=chromium --project=firefox --project=webkit
   test("native input probe: wheel ticks, then an image loading above the reader", async ({ page, isMobile }) => {
+    test.skip(
+      process.env.RIVER_NATIVE_WHEEL_IMAGE_PROBE !== "1",
+      "opt-in native timing probe: set RIVER_NATIVE_WHEEL_IMAGE_PROBE=1 to run it (CI runs it in its own step)",
+    );
     test.skip(
       isMobile,
       "no wheel input on the mobile projects: page.mouse.wheel is unsupported on mobile WebKit, and mobile Chromium is a touch device",

@@ -389,10 +389,10 @@ jobs:
     # can serve a stale binary (AGENTS.md, "Verify what you are actually
     # testing"). A static server has no build of its own.
     #
-    # The readiness check matches the hashed `river-ui-dxh…` script that
-    # `dx build` writes into index.html, so it only passes against a dx
-    # release build. The page's startup log ("River UI loaded - Built: … |
-    # Commit: …") identifies the exact build if a run needs checking.
+    # The readiness check only looks for "river-ui" in the served index.html;
+    # it confirms the server is up, not which build it serves. The page's
+    # startup log ("River UI loaded - Built: … | Commit: …") identifies the
+    # exact build if a run needs checking.
     - name: Serve built UI and wait for readiness
       run: |
         python3 -m http.server 8082 --bind 127.0.0.1 \
@@ -419,6 +419,20 @@ jobs:
       working-directory: ./ui/tests
       env:
         PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082
+
+    # The native wheel/image timing probe is opt-in in the default suite (five
+    # image delays per desktop browser), so it runs here as its own step. It is
+    # the only native-input coverage of that ordering; do not drop this step.
+    - name: Run native wheel/image probe
+      if: ${{ !cancelled() }}
+      run: >-
+        npx playwright test conversation-anchor-events.spec.ts
+        --grep "native input probe"
+        --project=chromium --project=firefox --project=webkit
+      working-directory: ./ui/tests
+      env:
+        PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082
+        RIVER_NATIVE_WHEEL_IMAGE_PROBE: "1"
 
     # `always()`, not `failure()`: with `retries: 2` an intermittent test is
     # reported as "flaky" and the job still succeeds, so a `failure()` guard

@@ -290,7 +290,7 @@ const ARRIVALS = [
 
 // The rule at its sharpest: a reader exactly at the end of the history is not
 // followed either. What they could see stays where it was, and the arrival
-// waits below the view (decisions 1 and 2 of HISTORY-SCROLL-SIMPLIFICATION-PLAN.md).
+// waits below the view: arrivals never scroll, and the end is not a mode.
 test.describe("Arrivals at the end of the history do not move the view", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
