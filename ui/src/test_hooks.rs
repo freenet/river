@@ -189,14 +189,6 @@ pub fn install_test_hooks() {
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 
-/// Run `f` on the current room inside ONE `ROOMS` mutation; `None` if there is
-/// no current room or it is not loaded. Needs the Dioxus runtime: call it from
-/// inside `defer`.
-fn with_current_room<T>(f: impl FnOnce(&mut RoomData, &VerifyingKey) -> T) -> Option<T> {
-    let room_key = CURRENT_ROOM.peek().owner_key?;
-    ROOMS.with_mut(|rooms| rooms.map.get_mut(&room_key).map(|room| f(room, &room_key)))
-}
-
 /// Remove every message whose row id is in `dom_ids`, in one `ROOMS` mutation.
 /// The current room is searched first. Ids it does not hold are removed from
 /// another visited room, so a snapshot saved on leaving can be invalidated
@@ -338,11 +330,18 @@ fn prune_to_cap(room: &mut RoomData) {
 }
 
 /// Deliver every message to the current room in ONE `ROOMS` mutation, so one
-/// re-render, as a network delta does.
+/// re-render, as a network delta does. A no-op without a loaded current room.
+/// Needs the Dioxus runtime: call it from inside `defer`.
 fn deliver(messages: impl IntoIterator<Item = (RoomMessageBody, Delivery)>) {
-    with_current_room(|room, room_key| {
+    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+        return;
+    };
+    ROOMS.with_mut(|rooms| {
+        let Some(room) = rooms.map.get_mut(&room_key) else {
+            return;
+        };
         for (content, delivery) in messages {
-            push_test_message(room, room_key, content, delivery);
+            push_test_message(room, &room_key, content, delivery);
         }
         prune_to_cap(room);
     });

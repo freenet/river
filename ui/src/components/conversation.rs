@@ -2652,7 +2652,7 @@ fn reading_anchor_index(items: &[DisplayItem], key: &str) -> Option<usize> {
     if let Some(item_key) = key.strip_prefix("date-sep-") {
         return items
             .iter()
-            .position(|item| display_item_key(item) == item_key);
+            .position(|item| display_item_key_matches(item, item_key));
     }
     items.iter().position(|item| match item {
         DisplayItem::Messages(group) => group.messages.iter().any(|message| message.id == key),

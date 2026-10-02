@@ -466,8 +466,9 @@ impl HistoryScroll {
     /// they return. Takes in their latest movement first and cancels a
     /// navigation where it is, while the DOM is still this room's.
     pub(super) fn leave_room(&self) -> Option<SavedAnchor> {
+        // `before_hide`, for a room switch: the DOM is still the old room's.
         #[cfg(target_arch = "wasm32")]
-        self.settle_before_leaving();
+        self.before_hide();
         self.end_navigation();
         self.anchor.borrow().clone()
     }
@@ -1128,11 +1129,6 @@ impl HistoryScroll {
         if self.navigation.get().is_some() {
             self.stop_navigation_here(&container);
         }
-    }
-
-    /// `before_hide`, for a room switch: the DOM is still the old room's.
-    fn settle_before_leaving(&self) {
-        self.before_hide();
     }
 
     /// Listen for the reader's scrolls and input and for layout changes.
