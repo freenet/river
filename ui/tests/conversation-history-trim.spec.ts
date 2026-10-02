@@ -180,6 +180,48 @@ async function expectALaterReturnTrims(page: Page, grown: number) {
 test.describe("A bottom trim is decided again when it runs", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
+  test("multiple queued callbacks apply at most one bottom trim", async ({ page }) => {
+    const grown = await openBackfilled(page);
+    await tagHead(page);
+    const queued = await page.evaluate(() => {
+      const container = document.getElementById("chat-scroll-container")!;
+      const first = window.__riverDeferred!.captureEnd(true);
+      // Make a real reader-position transition before returning to the end;
+      // otherwise the second scroll observation is an echo and queues nothing.
+      container.scrollTop = Math.round((container.scrollHeight - container.clientHeight) / 2);
+      container.dispatchEvent(new Event("scroll"));
+      const second = window.__riverDeferred!.captureEnd(true);
+      return [first, second];
+    });
+    expect(queued, "premise: both end observations queued deferred work").toHaveLength(2);
+    for (const race of queued) expectCapturedEnd(race);
+
+    await page.evaluate(() => window.__riverDeferred!.release());
+    await expect
+      .poll(() => renderedItemCount(page), {
+        timeout: 5_000,
+        message: "the first eligible callback did not trim the overgrown window",
+      })
+      .toBeLessThan(grown);
+    await afterQueuedCallbacks(page);
+
+    const remaining = await renderedItemCount(page);
+    expect(remaining, "the queued callbacks trimmed past the normal retained window").toBeGreaterThanOrEqual(40);
+    expect(remaining, "the overgrown window should be trimmed once to its normal size").toBeLessThan(67);
+    expect(await headStillRendered(page), "the first eligible callback left the old head in place").toBe(false);
+
+    // The normal cap remains pageable after the queued callbacks have drained.
+    await page.evaluate(() => {
+      document.getElementById("chat-scroll-container")!.scrollTop = 0;
+    });
+    await expect
+      .poll(() => renderedItemCount(page), {
+        timeout: 5_000,
+        message: "backfill after the queued trim revealed no older history",
+      })
+      .toBeGreaterThan(remaining + 40);
+  });
+
   test("a reader who leaves the end before the trim runs keeps the backfilled rows", async ({ page }) => {
     const grown = await openBackfilled(page);
     await tagHead(page);

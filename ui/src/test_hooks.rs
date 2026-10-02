@@ -32,6 +32,36 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::convert::{FromWasmAbi, ReturnWasmAbi};
 use wasm_bindgen::JsValue;
 
+/// Exercise the real history controller at a chosen DOM boundary. These
+/// callbacks mutate no application state directly: controller signal work
+/// still goes through `defer`. Registration happens once, after its install.
+pub fn install_history_scroll_probe(take_in: impl Fn() + 'static, restore: impl Fn() + 'static) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(hooks) = js_sys::Reflect::get(&window, &JsValue::from_str("__riverTest")) else {
+        return;
+    };
+    if !hooks.is_object()
+        || js_sys::Reflect::has(&hooks, &JsValue::from_str("takeInPendingHistoryScroll"))
+            .unwrap_or(false)
+    {
+        return;
+    }
+    let take_in = Closure::<dyn FnMut()>::new(take_in).into_js_value();
+    let restore = Closure::<dyn FnMut()>::new(restore).into_js_value();
+    let _ = js_sys::Reflect::set(
+        &hooks,
+        &JsValue::from_str("takeInPendingHistoryScroll"),
+        &take_in,
+    );
+    let _ = js_sys::Reflect::set(
+        &hooks,
+        &JsValue::from_str("restoreHistoryPosition"),
+        &restore,
+    );
+}
+
 pub fn install_test_hooks() {
     let Some(window) = web_sys::window() else {
         return;

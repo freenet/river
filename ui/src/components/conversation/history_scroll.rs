@@ -119,6 +119,8 @@
 //!   patch, a room switch and a hide first take in a pending reader scroll
 //!   (`take_in_undelivered_scroll`), or the next restore would put the reader
 //!   back where their previous event left them.
+//!   A pending Layout move is recorded there too: a clamp read against an
+//!   empty DOM must not be classified again as Reader against a later refill.
 //! * **The bottom trim** is decided where the view comes to rest at the end and
 //!   applied on a later task (`defer`), so that task decides it again: the same
 //!   room visit, the window still overgrown, rows rendered in a laid-out
@@ -788,7 +790,9 @@ impl HistoryScroll {
 
     /// Take in a scroll whose event has not arrived yet, before rendering or
     /// restoring: the reader's is captured, a navigation's recorded as its
-    /// progress. Layout movement is left for the restore.
+    /// progress. Layout movement is recorded without changing the anchor;
+    /// the restore still puts that anchor back. Otherwise a clamp observed
+    /// before a refill could be captured as Reader against the refilled DOM.
     pub(super) fn take_in_undelivered_scroll(&self) {
         let Some(container) = self.laid_out_container() else {
             return;
@@ -801,8 +805,12 @@ impl HistoryScroll {
         }
         if self.navigation.get().is_some() {
             self.on_navigation_scroll(&container);
-        } else if self.cause_now(&container) == ScrollCause::Reader {
-            self.capture_at_rest(&container);
+        } else {
+            match self.cause_now(&container) {
+                ScrollCause::Echo => {}
+                ScrollCause::Layout => self.record(&container),
+                ScrollCause::Reader => self.capture_at_rest(&container),
+            }
         }
     }
 
@@ -1209,6 +1217,16 @@ impl HistoryScroll {
             listen(
                 event,
                 &Closure::<dyn FnMut()>::new(move || this.on_reader_input()).into_js_value(),
+            );
+        }
+
+        #[cfg(all(feature = "example-data", feature = "no-sync"))]
+        {
+            let take_in = self.clone();
+            let restore = self.clone();
+            crate::test_hooks::install_history_scroll_probe(
+                move || take_in.take_in_undelivered_scroll(),
+                move || restore.restore(),
             );
         }
     }

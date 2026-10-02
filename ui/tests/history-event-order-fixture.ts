@@ -83,6 +83,115 @@ export async function orderRecorderStop(page: Page) {
   });
 }
 
+export type MidflightArrival = {
+  start: number;
+  destination: number;
+  atRequest: number;
+  atAttachment: number;
+  afterAttachment: number;
+  attached: string[];
+  events: string[];
+  midflightAtAttachment: boolean;
+  progressedAfterAttachment: boolean;
+};
+
+/// Request arrivals from the page's real animation clock and record when their
+/// rows actually attach. The probe is installed before it clicks the button,
+/// so both the start and destination are the click-time values. `after-end` is
+/// the negative control: it requests only after that destination is reached.
+export function recordMidflightArrival(page: Page, messages: string[], mode: "midflight" | "after-end" = "midflight") {
+  return page.evaluate(
+    ({ messages, mode }) =>
+      new Promise<MidflightArrival>((resolve, reject) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const start = c.scrollTop;
+        const destination = c.scrollHeight - c.clientHeight;
+        const events: string[] = [];
+        events.push(`click-target@${start.toFixed(1)}→${destination.toFixed(1)}`);
+        const attached: string[] = [];
+        let raf = 0;
+        const cleanup = () => {
+          window.clearTimeout(timeout);
+          cancelAnimationFrame(raf);
+          observer.disconnect();
+          c.removeEventListener("scroll", onScroll);
+          c.removeEventListener("scrollend", onEnd);
+        };
+        const timeout = window.setTimeout(() => {
+          cleanup();
+          reject(new Error(`arrival probe timed out: ${JSON.stringify({ start, destination, events, attached })}`));
+        }, 10_000);
+        let requested = false;
+        let atRequest = Number.NaN;
+        let atAttachment = Number.NaN;
+        const finish = () => {
+          if (attached.length !== messages.length || !Number.isNaN(atAttachment)) return;
+          atAttachment = c.scrollTop;
+          events.push(`attached@${atAttachment.toFixed(1)}`);
+          requestAnimationFrame(() => {
+            const afterAttachment = c.scrollTop;
+            events.push(`frame@${afterAttachment.toFixed(1)}`);
+            cleanup();
+            resolve({
+              start,
+              destination,
+              atRequest,
+              atAttachment,
+              afterAttachment,
+              attached,
+              events,
+              midflightAtAttachment: atAttachment > start + 40 && destination - atAttachment > 250,
+              progressedAfterAttachment: afterAttachment > atAttachment + 1 && afterAttachment < destination + 4,
+            });
+          });
+        };
+        const observer = new MutationObserver(() => {
+          for (const text of messages) {
+            if (!attached.includes(text) && c.textContent?.includes(text)) attached.push(text);
+          }
+          finish();
+        });
+        observer.observe(document.getElementById("chat-content")!, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+        });
+        const request = () => {
+          if (requested) return;
+          requested = true;
+          atRequest = c.scrollTop;
+          events.push(`request@${atRequest.toFixed(1)}`);
+          const hooks = (window as Window & { __riverTest?: { appendMessage(text: string): void } }).__riverTest;
+          if (!hooks) throw new Error("arrival probe: window.__riverTest is unavailable");
+          for (const text of messages) hooks.appendMessage(text);
+          // Catch hooks that synchronously alter text as well as deferred DOM attachment.
+          for (const text of messages) if (c.textContent?.includes(text)) attached.push(text);
+          finish();
+        };
+        const onScroll = () => events.push(`scroll@${c.scrollTop.toFixed(1)}`);
+        const onEnd = () => events.push(`end@${c.scrollTop.toFixed(1)}`);
+        c.addEventListener("scroll", onScroll);
+        c.addEventListener("scrollend", onEnd);
+        const button = document.querySelector<HTMLElement>('[data-testid="scroll-to-bottom"]');
+        if (!button) {
+          cleanup();
+          reject(new Error("arrival probe: scroll-to-bottom button is unavailable"));
+          return;
+        }
+        button.click();
+        const sample = () => {
+          if (requested) return;
+          const top = c.scrollTop;
+          if (mode === "midflight" && top > start + 40 && destination - top > 250) request();
+          else if (mode === "after-end" && top >= destination - 4) request();
+          else raf = requestAnimationFrame(sample);
+        };
+        raf = requestAnimationFrame(sample);
+      }),
+    { messages, mode },
+  );
+}
+
 /// The event log so far, as one line.
 export function orderLog(page: Page): Promise<string> {
   return page.evaluate(() => window.__historyOrder!.log.join(" "));

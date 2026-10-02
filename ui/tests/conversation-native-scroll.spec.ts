@@ -13,6 +13,7 @@ import {
   orderLog,
   orderRecorderStart,
   orderRecorderStop,
+  recordMidflightArrival,
   registerEndReflow,
   type EndReflow,
   type EndReflowKind,
@@ -101,13 +102,13 @@ test.describe("Scroll to latest is one native smooth scroll", () => {
   });
 
   test("arrivals during the animation do not retarget it or snap it to the new end", async ({ page }) => {
-    const { parkedAt, destination } = await parkAndRecord(page);
-    await button(page).click();
-    await animationUnderway(page, parkedAt);
-    for (let i = 0; i < 3; i++) {
-      await callRiverTest(page, "appendMessage", ARRIVAL(`arrival ${i} mid-flight`));
-    }
-    await expect(page.getByText("arrival 2 mid-flight")).toBeAttached({ timeout: 5_000 });
+    const { destination } = await parkAndRecord(page);
+    const arrivals = [0, 1, 2].map((i) => ARRIVAL(`arrival ${i} mid-flight`));
+    const proof = await recordMidflightArrival(page, arrivals);
+    expect(proof.attached).toEqual(arrivals);
+    expect(proof.midflightAtAttachment, `arrivals must attach before the click destination; ${JSON.stringify(proof)}`).toBe(true);
+    expect(proof.progressedAfterAttachment, `navigation must advance after attachment; ${JSON.stringify(proof)}`).toBe(true);
+    expect(proof.destination).toBeCloseTo(destination, 0);
 
     const rest = await viewAtRest(page, "the view should come to rest");
     expect(await scrollRequests(page), "the click's request is the only one").toEqual({ smooth: 1, other: 0 });
@@ -123,6 +124,12 @@ test.describe("Scroll to latest is one native smooth scroll", () => {
     await expectRowHolds(page, landed!, "the landing moved after the animation ended");
     await deliver(page, ARRIVAL("arrival after the landing"));
     await expectRowHolds(page, landed!, "an arrival after the landing moved the view");
+  });
+
+  test("the attachment-time probe rejects arrivals requested after the landing", async ({ page }) => {
+    await parkAndRecord(page);
+    const proof = await recordMidflightArrival(page, [ARRIVAL("arrival after native landing")], "after-end");
+    expect(proof.midflightAtAttachment, `negative control unexpectedly looked mid-flight: ${JSON.stringify(proof)}`).toBe(false);
   });
 
   test("a second click asks for the end as it is then", async ({ page }) => {

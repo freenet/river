@@ -5,6 +5,7 @@ import {
   endReflowResult,
   endReflowUnhide,
   registerEndReflow,
+  recordMidflightArrival,
   type EndReflow,
   type EndReflowKind,
 } from "./history-event-order-fixture";
@@ -241,13 +242,13 @@ test.describe("Without scrollend, scroll to latest ends after a quiet interval",
   test("arrivals during the animation do not retarget it, and it lands at the end measured at the click", async ({
     page,
   }) => {
-    const { parkedAt, destination } = await parkAndCount(page);
-    await button(page).click();
-    await animationUnderway(page, parkedAt);
-    for (let i = 0; i < 3; i++) {
-      await callRiverTest(page, "appendMessage", ARRIVAL(`arrival ${i} mid-flight`));
-    }
-    await expect(page.getByText("arrival 2 mid-flight")).toBeAttached({ timeout: 5_000 });
+    const { destination } = await parkAndCount(page);
+    const arrivals = [0, 1, 2].map((i) => ARRIVAL(`arrival ${i} mid-flight`));
+    const proof = await recordMidflightArrival(page, arrivals);
+    expect(proof.attached).toEqual(arrivals);
+    expect(proof.midflightAtAttachment, `arrivals must attach before the click destination; ${JSON.stringify(proof)}`).toBe(true);
+    expect(proof.progressedAfterAttachment, `navigation must advance after attachment; ${JSON.stringify(proof)}`).toBe(true);
+    expect(proof.destination).toBeCloseTo(destination, 0);
 
     const rest = await viewAtRest(page, "the view should come to rest");
     expect((await fallback(page)).requests, "the click's request is the only one").toEqual({ smooth: 1, other: 0 });

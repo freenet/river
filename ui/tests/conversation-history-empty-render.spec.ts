@@ -11,6 +11,7 @@ import {
   expectVisibleRowHolds,
   maxScrollTop,
   parkAboveTheEnd,
+  readerScrollsToEnd,
   recordScrollRequests,
   scrollRequests,
   scrollTop,
@@ -56,6 +57,78 @@ test.describe("A render with no rows is not a deleted anchor", () => {
       PARKED_ABOVE_END_PX,
     );
   });
+
+  for (const reader of ["parked", "at the end"] as const) {
+    test(`the synchronous empty-layout clamp is consumed for a reader ${reader}`, async ({ page }) => {
+      await parkAboveTheEnd(page, PARK_PX);
+      if (reader === "at the end") {
+        await readerScrollsToEnd(page);
+        await afterLayoutSettles(page);
+      }
+      const saved = await visibleRow(page);
+      let result: {
+        before: number;
+        after: number;
+        emptyRows: number;
+        clientHeight: number;
+        range: number;
+        collapsedTop: number;
+        clamp: number;
+        events: string[];
+        detachedMutations: number | null;
+      };
+      try {
+        result = await page.evaluate(() => {
+          const c = document.getElementById("chat-scroll-container")!;
+          const content = document.getElementById("chat-content")!;
+          const events: string[] = [];
+          const onScroll = () => events.push("scroll");
+          const onScrollEnd = () => events.push("scrollend");
+          const observers = [content, c].map((target, index) => {
+            const observer = new ResizeObserver(() => events.push(index === 0 ? "content-resize" : "container-resize"));
+            observer.observe(target);
+            return observer;
+          });
+          const beforeTop = c.scrollTop;
+          c.addEventListener("scroll", onScroll);
+          c.addEventListener("scrollend", onScrollEnd);
+          let detachedMutations: number | null = null;
+          try {
+            const { before, after } = window.__riverEmptyRender!.empty(false);
+            const emptyRows = document.querySelectorAll("#chat-content .anchor-row").length;
+            // Force both the content range and native scroll clamp before the
+            // real controller consumes the undelivered layout movement.
+            const clientHeight = c.clientHeight;
+            const range = c.scrollHeight - c.clientHeight;
+            const collapsedTop = c.scrollTop;
+            const clamp = beforeTop - collapsedTop;
+            window.__riverTest!.takeInPendingHistoryScroll();
+            detachedMutations = window.__riverEmptyRender!.restore();
+            void document.getElementById("chat-content")!.getBoundingClientRect().height;
+            window.__riverTest!.restoreHistoryPosition();
+            return { before, after, emptyRows, clientHeight, range, collapsedTop, clamp, events, detachedMutations };
+          } finally {
+            // The retained Dioxus nodes must be back before this evaluation
+            // yields, including when an assertion inside the fixture fails.
+            detachedMutations ??= window.__riverEmptyRender!.restore();
+            c.removeEventListener("scroll", onScroll);
+            c.removeEventListener("scrollend", onScrollEnd);
+            for (const observer of observers) observer.disconnect();
+          }
+        });
+      } finally {
+        await restoreHistory(page);
+      }
+      expect(result.emptyRows, "premise: the history collapsed to no message rows").toBe(0);
+      expect(result.clientHeight, "premise: the scroll container remains visible and laid out").toBeGreaterThan(0);
+      expect(result.range, "premise: the empty range is shorter than the viewport").toBeLessThanOrEqual(1);
+      expect(result.collapsedTop, "premise: collapse clamped scrollTop to the top").toBeLessThanOrEqual(1);
+      expect(result.clamp, "premise: the layout clamp is well beyond the 200px allowance").toBeGreaterThan(200);
+      expect(result.events, "no browser scroll or resize event was delivered before refill").toEqual([]);
+      expect(result.detachedMutations, "the app did not mutate retained nodes while detached").toBe(0);
+      await expectVisibleRowHolds(page, saved, "the synchronous refill lost the saved row");
+    });
+  }
 
   test("capture: a reader scroll while no rows render keeps the saved message for when they return", async ({ page }) => {
     await parkAboveTheEnd(page, PARK_PX);
