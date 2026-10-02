@@ -11,6 +11,7 @@ import {
   AT_BOTTOM_EPSILON_PX,
   DEEP_ROOM_PATH,
   afterLayoutSettles,
+  backfillOnce,
   deliver,
   distanceFromBottom,
   expectVisibleRowHolds,
@@ -88,18 +89,6 @@ async function readerParksAboveTheEnd(page: Page, px: number): Promise<RowPositi
     px / 2,
   );
   return at;
-}
-
-/// The reader reaches the top of what is rendered; one backfill step lands
-/// above them. Returns the rendered row count after it.
-async function backfillOnce(page: Page, why: string): Promise<number> {
-  const before = await renderedRowCount(page);
-  await page.evaluate(() => {
-    document.getElementById("chat-scroll-container")!.scrollTop = 0;
-  });
-  await expect.poll(() => renderedRowCount(page), { timeout: 5_000, message: why }).toBeGreaterThan(before + 40);
-  await afterLayoutSettles(page);
-  return renderedRowCount(page);
 }
 
 /// Backfill the deep room once, then park with the view's bottom edge above

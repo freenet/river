@@ -319,6 +319,20 @@ export function renderedRowCount(page: Page): Promise<number> {
   return page.locator(HISTORY_ROWS).count();
 }
 
+/// The reader reaches the top of what is rendered; one backfill step lands
+/// above them. Waits for the window to grow and settle, so it is not for tests
+/// that read geometry in the same task as the backfill. Returns the rendered
+/// row count after it.
+export async function backfillOnce(page: Page, why: string): Promise<number> {
+  const before = await renderedRowCount(page);
+  await page.evaluate(() => {
+    document.getElementById("chat-scroll-container")!.scrollTop = 0;
+  });
+  await expect.poll(() => renderedRowCount(page), { timeout: 5_000, message: why }).toBeGreaterThan(before + 40);
+  await afterLayoutSettles(page);
+  return renderedRowCount(page);
+}
+
 /// The saved row remains visible at its gap over five samples, even if a
 /// newer row enters the view without moving it.
 export function expectVisibleRowHolds(page: Page, row: RowPosition, why: string) {

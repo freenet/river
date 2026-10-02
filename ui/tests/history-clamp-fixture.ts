@@ -1,6 +1,8 @@
 import { expect, Page } from "@playwright/test";
 
-type Shape = {
+/// The numbers HistoryScroll's layout signature describes (content and
+/// container sizes), plus the scroll position and range, which it does not.
+export type Shape = {
   top: number;
   max: number;
   contentHeight: number;
@@ -19,6 +21,7 @@ declare global {
   interface Window {
     __historyClamp: {
       snapshot(): Shape;
+      setHeight(height: number): { before: Shape; after: Shape };
       remove(): ClampRecord;
       removed: ClampRecord | null;
       scrolls: number;
@@ -27,14 +30,14 @@ declare global {
   }
 }
 
-// A clamp to a shorter range that no layout signature records, for the
-// "A clamp to a shorter range" and hidden-clamp cases in
-// conversation-anchor-events.spec.ts. Geometry only: an absolute overhang
-// changes the live scroll range without changing any dimension in
-// HistoryScroll's LayoutSig, and removing it makes the browser clamp
+// A clamp to a shorter range that no layout signature records. Geometry only:
+// an absolute overhang below the history's content changes the live scroll
+// range without changing any dimension in HistoryScroll's LayoutSig, the way
+// an open popover near the end does, and removing it makes the browser clamp
 // `scrollTop` by more than LAYOUT_SHIFT_ALLOWANCE_PX (history_scroll.rs).
 // Installed after startup, so its scroll counter observes events after the
-// app's own listener.
+// app's own listener. Every read is synchronous, so a clamp has already
+// happened by the `after` shape.
 export function clampOverhang(page: Page, height = 700) {
   return page.evaluate((height) => {
     const c = document.getElementById("chat-scroll-container")!;
@@ -59,6 +62,11 @@ export function clampOverhang(page: Page, height = 700) {
       removed: null,
       scrolls: 0,
       snapshot: shape,
+      setHeight(height) {
+        const before = shape();
+        box.style.height = `${height}px`;
+        return { before, after: shape() };
+      },
       remove() {
         const before = shape();
         box.remove();
@@ -72,6 +80,16 @@ export function clampOverhang(page: Page, height = 700) {
     };
     return { before, after: shape() };
   }, height);
+}
+
+/// Resize the installed overhang.
+export function resizeOverhang(page: Page, height: number) {
+  return page.evaluate((height) => window.__historyClamp.setHeight(height), height);
+}
+
+/// Remove the installed overhang; the browser clamps at once.
+export function removeOverhang(page: Page): Promise<ClampRecord> {
+  return page.evaluate(() => window.__historyClamp.remove());
 }
 
 export function expectFinalEndClamp(record: ClampRecord) {

@@ -1,6 +1,7 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { selectListedRoom } from "./example-room";
+import { clampOverhang, removeOverhang, resizeOverhang, type Shape } from "./history-clamp-fixture";
+import { openEditOnRow, selectListedRoom } from "./example-room";
 import {
   newestMessageDrift,
   newestVisibleRow,
@@ -1039,7 +1040,7 @@ test.describe("The newest visible message stays in place", () => {
     const before = await requireNewestVisibleRow(page);
     expect(before.id, `premise: the reader's newest visible row is not the one being edited (${ownId})`).not.toBe(ownId);
 
-    const editArea = await openEditOn(page, ownId);
+    const editArea = await openEditOnRow(page, page.locator(`[id="${ownId}"]`));
     // `newest: false`: the reader's row may show only a sliver at the bottom
     // edge, where a pixel of rounding decides whether it still counts as visible.
     await expectInPlace(page, before, "the edit form opening above the reader moved their row", {
@@ -1060,23 +1061,6 @@ test.describe("The newest visible message stays in place", () => {
     await expectInPlace(page, before, "an edit above the reader moved their row", { newest: false, hold: true });
   });
 });
-
-/// Open the edit form on the own message whose row is `id`: its kebab on touch,
-/// its hover actions otherwise, as `openOwnMessageEdit` (example-room.ts) does
-/// for the first own message. Returns the edit textarea.
-async function openEditOn(page: Page, id: string) {
-  const row = page.locator(`[id="${id}"]`);
-  if (await page.evaluate(() => window.matchMedia("(hover: none)").matches)) {
-    await row.getByTestId("message-kebab").click();
-    await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();
-  } else {
-    await row.getByTestId("message-bubble").hover();
-    await row.getByRole("button", { name: /edit/i }).click();
-  }
-  const editArea = row.locator('textarea[id^="edit-msg-"]');
-  await expect(editArea).toBeVisible({ timeout: 5_000 });
-  return editArea;
-}
 
 /// An anchor-bearing history row: a message, a date separator or an event
 /// summary. `top`/`bottom` are relative to the container's top edge, so a row
@@ -1344,56 +1328,9 @@ test.describe("The reader's place survives removed and late content (#507)", () 
   });
 });
 
-/// The numbers the scroll model's layout signature describes (content and
-/// container sizes), plus the scroll range, which it does not.
-type Shape = {
-  top: number;
-  max: number;
-  contentHeight: number;
-  contentWidth: number;
-  viewport: number;
-  viewportWidth: number;
-};
-
-/// Set the height of a test-only box hanging absolutely positioned below the
-/// history's content, or remove it with `null`. It adds scrollable overflow
-/// without resizing the content wrapper or the container, the way an open
-/// popover near the end of the history does. Returns the shape before and
-/// after, the after read synchronously so any clamp has already happened.
-function setOverhang(page: Page, height: number | null): Promise<{ before: Shape; after: Shape }> {
-  return page.evaluate((height) => {
-    const c = document.getElementById("chat-scroll-container")!;
-    const content = document.getElementById("chat-content")!;
-    const shape = () => ({
-      top: c.scrollTop,
-      max: c.scrollHeight - c.clientHeight,
-      contentHeight: content.getBoundingClientRect().height,
-      contentWidth: content.clientWidth,
-      viewport: c.clientHeight,
-      viewportWidth: c.clientWidth,
-    });
-    const before = shape();
-    let box = document.getElementById("test-overhang");
-    if (height === null) {
-      box?.remove();
-    } else {
-      if (!box) {
-        // Positioned so the box's overflow belongs to the scroll container.
-        content.style.position = "relative";
-        box = document.createElement("div");
-        box.id = "test-overhang";
-        box.style.cssText = "position:absolute;top:100%;left:0;width:1px;pointer-events:none;";
-        content.appendChild(box);
-      }
-      box.style.height = `${height}px`;
-    }
-    return { before, after: shape() };
-  }, height);
-}
-
 /// The signature's dimensions did not change between `a` and `b`.
 function expectSameShape(a: Shape, b: Shape, why: string) {
-  for (const key of ["contentHeight", "contentWidth", "viewport", "viewportWidth"] as const) {
+  for (const key of ["contentHeight", "contentWidth", "clientHeight", "clientWidth"] as const) {
     expect(Math.abs(a[key] - b[key]), `${why}: ${key} ${a[key]} -> ${b[key]}`).toBeLessThanOrEqual(0.5);
   }
 }
@@ -1466,9 +1403,9 @@ test.describe("A clamp to the end is not the reader", () => {
   test("a small reader scroll after an overhang grew is kept", async ({ page }) => {
     const SMALL_MOVE_PX = 150;
     await parkAt(page, "half");
-    await setOverhang(page, 0);
+    await clampOverhang(page, 0);
     await afterLayoutSettles(page);
-    const grown = await setOverhang(page, 800);
+    const grown = await resizeOverhang(page, 800);
     expect(
       grown.after.max - grown.before.max,
       "premise: the overhang adds scroll range",
@@ -1509,9 +1446,9 @@ test.describe("A clamp to the end is not the reader", () => {
       const INTO_OVERHANG_PX = 300;
       await openRoomAtBottom(page, "Team Chat Room");
       await fillHistory(page, 12);
-      const created = await setOverhang(page, 0);
+      const created = await clampOverhang(page, 0);
       await afterLayoutSettles(page);
-      await setOverhang(page, OVERHANG_PX);
+      await resizeOverhang(page, OVERHANG_PX);
       await afterLayoutSettles(page);
 
       const contentEnd = created.before.max;
@@ -1524,7 +1461,7 @@ test.describe("A clamp to the end is not the reader", () => {
       );
       const before = await requireNewestVisibleRow(page);
 
-      const removed = await setOverhang(page, null);
+      const removed = await removeOverhang(page);
       expectSameShape(removed.before, removed.after, "premise: removing the overhang resizes nothing the signature describes");
       expect(
         removed.before.top - removed.after.top,

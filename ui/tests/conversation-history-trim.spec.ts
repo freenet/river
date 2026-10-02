@@ -12,6 +12,7 @@ import {
   AT_BOTTOM_EPSILON_PX,
   DEEP_ROOM_PATH,
   afterLayoutSettles,
+  backfillOnce,
   deliver,
   distanceFromBottom,
   expectSettledAtBottom,
@@ -111,15 +112,7 @@ function renderedItemCount(page: Page): Promise<number> {
 async function openBackfilled(page: Page) {
   await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
   await expect(page.locator("#top-backfill-sentinel"), "premise: the room is windowed").toHaveCount(1);
-  const initial = await renderedRowCount(page);
-  await page.evaluate(() => {
-    document.getElementById("chat-scroll-container")!.scrollTop = 0;
-  });
-  await expect
-    .poll(() => renderedRowCount(page), { timeout: 5_000, message: "premise: reaching the top backfills" })
-    .toBeGreaterThan(initial + 40);
-  await afterLayoutSettles(page);
-  return renderedRowCount(page);
+  return backfillOnce(page, "premise: reaching the top backfills");
 }
 
 /// Mark the first rendered item so a trim that removes the head is observable.
