@@ -23,7 +23,7 @@ import {
   afterLayoutSettles,
   deliver,
   distanceFromBottom,
-  expectDriftWithin,
+  expectVisibleRowHolds,
   expectSettledAtBottom,
   fillHistory,
   openRoomAtBottom,
@@ -61,12 +61,6 @@ async function arrive(page: Page, text: string) {
     "premise: the arrival was delivered",
   ).toBeAttached({ timeout: 5_000 });
   await afterLayoutSettles(page);
-}
-
-/// The saved row is back at its gap, in view, and stays there for five samples
-/// over 500ms.
-function expectRowHeld(page: Page, before: RowPosition, why: string) {
-  return expectDriftWithin(page, () => savedVisibleRowDrift(page, before), why, { hold: true });
 }
 
 // Removing a positioned overhang shortens the scroll range without resizing
@@ -136,7 +130,7 @@ test.describe("A clamp to a shorter range", () => {
         await arrive(page, TALL(marker, 30));
         const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
         expect(height, "premise: the arrival gives back more than the clamp took").toBeGreaterThan(500);
-        await expectRowHeld(
+        await expectVisibleRowHolds(
           page,
           at!,
           `the clamp was taken for the reader's position, so the arrival did not bring their row back (${await orderLog(page)})`,
@@ -194,7 +188,7 @@ test.describe("An unreachable saved gap across a hide and reveal", () => {
         await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height),
         "premise: the arrival gives back more than the clamp took",
       ).toBeGreaterThan(500);
-      await expectRowHeld(page, at!, "the reveal took the clamped end for the reader's position, so the arrival did not bring their row back");
+      await expectVisibleRowHolds(page, at!, "the reveal took the clamped end for the reader's position, so the arrival did not bring their row back");
       expect(await distanceFromBottom(page), "the arrival should be below the view").toBeGreaterThan(PARKED_ABOVE_END_PX);
     } finally {
       await clampCleanup(page);
@@ -247,7 +241,7 @@ async function expectLandingPreserved(page: Page, landed: RowPosition, why: stri
     expect(height, "premise: the arrival is far taller than the tolerance").toBeGreaterThan(
       PARKED_ABOVE_END_PX + IN_PLACE_TOLERANCE_PX,
     );
-    await expectRowHeld(page, landed, `${why}: arrival ${n} moved the landing (${await orderLog(page)})`);
+    await expectVisibleRowHolds(page, landed, `${why}: arrival ${n} moved the landing (${await orderLog(page)})`);
     expect(await distanceFromBottom(page), `${why}: arrival ${n} should be below the view`).toBeGreaterThan(
       PARKED_ABOVE_END_PX,
     );
@@ -271,7 +265,7 @@ test.describe("The reading anchor is deleted", () => {
       });
       expect(ended.after, `the stray end moved the view (${await orderLog(page)})`).toBe(ended.top);
       await orderRealFrames(page, 2);
-      await expectRowHeld(page, landed!, "a stray scrollend moved the landing");
+      await expectVisibleRowHolds(page, landed!, "a stray scrollend moved the landing");
       await expectLandingPreserved(page, landed!, "a stale event re-enabled following");
     } finally {
       await orderRecorderStop(page);
@@ -374,7 +368,7 @@ test.describe("A reflow above the reader, reported after another event", () => {
         PARKED_ABOVE_END_PX,
       );
       await deliver(page, `arrival after the reflow: ${"r".repeat(200)}`);
-      await expectRowHeld(page, at, `an arrival after the reflow moved the reader's message (${await orderLog(page)})`);
+      await expectVisibleRowHolds(page, at, `an arrival after the reflow moved the reader's message (${await orderLog(page)})`);
     } finally {
       await orderRecorderStop(page);
     }
@@ -390,7 +384,7 @@ test.describe("A reflow above the reader, reported after another event", () => {
         IN_PLACE_TOLERANCE_PX,
       );
       await deliver(page, `arrival after the reflow: ${"r".repeat(200)}`);
-      await expectRowHeld(page, at, `an arrival after the reflow moved the reader's message (${await orderLog(page)})`);
+      await expectVisibleRowHolds(page, at, `an arrival after the reflow moved the reader's message (${await orderLog(page)})`);
       expect(await distanceFromBottom(page), "the arrival should be below the view, not followed").toBeGreaterThan(
         AT_BOTTOM_EPSILON_PX,
       );

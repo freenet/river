@@ -22,11 +22,19 @@
 //! * **Restore** puts that row back at its gap after a content or layout change,
 //!   when it is still rendered. It never captures, so a gap the browser cannot
 //!   reach yet (the range is too short) stays saved for when it can.
-//! * **Missing** is the same transition everywhere the row is gone: end any
-//!   native navigation, forget the anchor, place at the current end once, and
-//!   capture the one row that lands there. A later arrival preserves that new
-//!   row. A hidden container (every measurement is 0) is not this case: the
-//!   anchor waits until the history has a box again.
+//! * **Missing** is the same transition everywhere the row is gone while other
+//!   rows render: end any native navigation, forget the anchor, place at the
+//!   current end once, and capture the one row that lands there. A later
+//!   arrival preserves that new row. A hidden container (every measurement is
+//!   0) is not this case: the anchor waits until the history has a box again.
+//! * **Empty** is not Missing either. A render with no rows at all (the "No
+//!   messages yet" branch while a contended read leaves `message_groups` empty,
+//!   #555) is no evidence the saved row was deleted. Restore, capture and the
+//!   missing-anchor transition only record while no row renders, a click on
+//!   "Scroll to latest messages" asks for nothing, and a navigation in flight
+//!   is stopped where it is. The saved anchor, its gap and any pending
+//!   placement wait for the rows; the first restore that finds them puts the
+//!   anchor back.
 //! * **Recording** notes the layout signature and `scrollTop` after anything
 //!   moves the view, ours or not, so the next `scroll` event can be classified.
 //!
@@ -56,13 +64,17 @@
 //!   nothing on screen, so nothing fights the animation and nothing retargets
 //!   it. A reflow ABOVE the view moves the saved anchor's `offset`; that cancels
 //!   the navigation once, keeping the row where the reader last saw it. The
-//!   anchor disappearing is not a zero-pixel reflow: the navigation is cancelled
-//!   and the missing-anchor transition places at the latest message once.
+//!   cancel stops the animation explicitly before it corrects, since the
+//!   correction can clamp to the offset the view is already at. The anchor
+//!   disappearing is not a zero-pixel reflow: the navigation is cancelled and
+//!   the missing-anchor transition places at the latest message once. No rows
+//!   rendering at all stops it where it is (see Empty above).
 //!
 //! It finishes at a `scrollend` that finds the view at its destination (or the
-//! clamped end), or after `navigation_quiet_ms` with no `scroll` event; the
-//! landing is captured, and may be above an end that has moved on since the
-//! click. Another click is how the reader asks for that. The reader's own input
+//! clamped end), or after `navigation_quiet_ms` with no `scroll` event. Either
+//! end first handles a reflow, a missing anchor or an empty render since the
+//! last `scroll`, exactly as a `scroll` would, and only then captures the
+//! landing, which may be above an end that has moved on since the click. Another click is how the reader asks for that. The reader's own input
 //! (`wheel`, `touchstart`, `pointerdown`, `keydown` on the history), a hide, a
 //! room switch and a second click each cancel it. Cancelling writes `scrollTop`
 //! one pixel off and back: Firefox does not abort a smooth scroll for a write to
@@ -107,6 +119,11 @@
 //!   patch, a room switch and a hide first take in a pending reader scroll
 //!   (`take_in_undelivered_scroll`), or the next restore would put the reader
 //!   back where their previous event left them.
+//! * **The bottom trim** is decided where the view comes to rest at the end and
+//!   applied on a later task (`defer`), so that task decides it again: the same
+//!   room visit, the window still overgrown, rows rendered in a laid-out
+//!   container, the view still at the end and the tail still clear of the
+//!   backfill. A rejected trim changes nothing and stays eligible.
 //! * **Hidden**: the mobile layout hides the history (`display:none`), and every
 //!   read is then 0. It stays observed, but nothing measures, records or
 //!   restores it until it has height again; the saved anchor waits. The first
@@ -522,6 +539,21 @@ fn view_at_end(container: &web_sys::Element) -> bool {
     at_end(container.scroll_top(), max_scroll_top(container))
 }
 
+/// Whether trimming a window of `rendered` items back to its initial size would
+/// go unseen now: the view rests at the live end, and the retained tail would
+/// not leave the backfill sentinel in range of it (#505; see
+/// `trim_would_rearm_backfill`).
+#[cfg(target_arch = "wasm32")]
+fn trim_is_invisible(container: &web_sys::Element, rendered: usize) -> bool {
+    view_at_end(container)
+        && !trim_would_rearm_backfill(
+            container.scroll_height(),
+            container.client_height(),
+            rendered,
+            INITIAL_WINDOW_ITEMS,
+        )
+}
+
 /// How far above the container's bottom edge `row`'s top edge sits.
 #[cfg(target_arch = "wasm32")]
 fn gap(view: &web_sys::DomRect, row: &web_sys::Element) -> i32 {
@@ -642,8 +674,13 @@ impl HistoryScroll {
     }
 
     /// Measure the saved rows where the view is now (see "The saved position"),
-    /// and record.
+    /// and record. With no rows rendered it only records: an empty render is
+    /// not a position, and the saved anchor waits for the rows.
     fn capture(&self, container: &web_sys::Element) {
+        if !self.has_rows() {
+            self.record(container);
+            return;
+        }
         if let (Some(list), Some(content)) =
             (self.rows.borrow().as_ref(), self.content.borrow().as_ref())
         {
@@ -675,8 +712,13 @@ impl HistoryScroll {
     }
 
     /// Capture where the view has come to rest, and trim the window if that is
-    /// the bottom.
+    /// the bottom. With no rows rendered it only records, and schedules no trim
+    /// from a history clamped to its empty height.
     fn capture_at_rest(&self, container: &web_sys::Element) {
+        if !self.has_rows() {
+            self.record(container);
+            return;
+        }
         self.capture(container);
         self.trim_at_bottom(container);
     }
@@ -689,40 +731,53 @@ impl HistoryScroll {
     /// sentinel in range of the bottom, or the two oscillate at render speed
     /// (#505; see `trim_would_rearm_backfill`).
     ///
-    /// Runs where the reader's own scroll comes to rest at the end, and where a
-    /// scroll-to-latest navigation lands there, never for an arrival. Nothing to
-    /// trim (not installed, or the window has not grown past its initial size)
-    /// reads no geometry.
+    /// Runs where the reader's own scroll comes to rest at the end, where a
+    /// scroll-to-latest navigation lands there, and where a placement at the
+    /// latest message lands, never for an arrival. Nothing to trim (not
+    /// installed, or the window has not grown past its initial size) reads no
+    /// geometry.
+    ///
+    /// The trim is decided here and applied on a later task, so the deferred
+    /// callback decides it again against the history as it is then: the same
+    /// room visit, the window still overgrown, rows rendered in a laid-out
+    /// container, and `trim_is_invisible`. A callback that finds any of those
+    /// gone changes nothing, so the window stays eligible for the next rest at
+    /// the end; several queued callbacks trim once, since the first to trim
+    /// clears `window_overgrown`.
     fn trim_at_bottom(&self, container: &web_sys::Element) {
         let hooks = self.hooks.borrow();
         let Some(trim) = hooks.as_ref().filter(|h| h.window_overgrown.get()) else {
             return;
         };
-        if view_at_end(container)
-            && !trim_would_rearm_backfill(
-                container.scroll_height(),
-                container.client_height(),
-                trim.window_rendered.get(),
-                INITIAL_WINDOW_ITEMS,
-            )
-        {
-            trim.window_overgrown.set(false);
-            let window_anchor = trim.window_anchor.clone();
-            let mut window_items = trim.window_items;
-            let (visit, trimmed_visit) = (self.visit.clone(), self.visit.get());
-            // Deferred: this runs from a raw JS callback with no Dioxus scope,
-            // and `window_items` is a signal the render subscribes to. See
-            // .claude/rules/dioxus-signal-safety.md. A room switch in between
-            // (`leave_room`'s own take-in can schedule this) owns the window
-            // by then: the room switched to may have had its depth restored.
-            crate::util::defer(move || {
-                if visit.get() != trimmed_visit {
-                    return;
-                }
-                *window_anchor.borrow_mut() = None;
-                window_items.set(INITIAL_WINDOW_ITEMS);
-            });
+        if !trim_is_invisible(container, trim.window_rendered.get()) {
+            return;
         }
+        let window_overgrown = trim.window_overgrown.clone();
+        let window_rendered = trim.window_rendered.clone();
+        let window_anchor = trim.window_anchor.clone();
+        let mut window_items = trim.window_items;
+        let container = container.clone();
+        let rows = self.rows.borrow().clone();
+        let (visit, trimmed_visit) = (self.visit.clone(), self.visit.get());
+        // Deferred: this runs from a raw JS callback with no Dioxus scope, and
+        // `window_items` is a signal the render subscribes to. See
+        // .claude/rules/dioxus-signal-safety.md. A room switch in between
+        // (`leave_room`'s own take-in can schedule this) owns the window by
+        // then: the room switched to may have had its depth restored, so the
+        // visit is checked before any shared handle is read.
+        crate::util::defer(move || {
+            if visit.get() != trimmed_visit || !window_overgrown.get() {
+                return;
+            }
+            let has_rows = rows.as_ref().is_some_and(|rows| rows.length() > 0);
+            let laid_out = container.client_width() > 0 && container.client_height() > 0;
+            if !has_rows || !laid_out || !trim_is_invisible(&container, window_rendered.get()) {
+                return;
+            }
+            window_overgrown.set(false);
+            *window_anchor.borrow_mut() = None;
+            window_items.set(INITIAL_WINDOW_ITEMS);
+        });
     }
 
     /// Put the view where it belongs after a layout or content change.
@@ -765,14 +820,10 @@ impl HistoryScroll {
         }
         if self.navigation.get().is_some() {
             // Content below the view moves nothing on screen; leave the
-            // animation alone unless something above it reflowed, or the
-            // anchor itself is gone.
-            match self.navigation_reflow(&container) {
-                AnchorReflow::Shifted(shift) => {
-                    self.cancel_navigation_for_reflow(&container, shift)
-                }
-                AnchorReflow::Missing => self.land_on_latest(&container),
-                AnchorReflow::Stable => self.record(&container),
+            // animation alone unless something above it reflowed, the anchor
+            // itself is gone, or no rows render at all.
+            if !self.handle_navigation_reflow(&container) {
+                self.record(&container);
             }
             return;
         }
@@ -784,14 +835,16 @@ impl HistoryScroll {
     }
 
     /// A room with no saved position starts at its newest message, once it has
-    /// any, and that is captured at once.
+    /// any, and that is captured at once. That is a rest at the end, so an
+    /// overgrown window trims there, whether or not the write produced a
+    /// `scroll` the reader is credited with.
     fn place_at_latest(&self, container: &web_sys::Element) {
         if !self.has_rows() {
             self.record(container);
             return;
         }
         container.set_scroll_top(container.scroll_height());
-        self.capture(container);
+        self.capture_at_rest(container);
         self.placement.set(Placement::Placed);
         self.tell_positioned();
     }
@@ -815,9 +868,14 @@ impl HistoryScroll {
     }
 
     /// The saved anchor is gone. End any navigation, forget it, and place at
-    /// the current end once rows and geometry exist. The landing capture is
-    /// the new single anchor; a later arrival preserves it.
+    /// the current end. The landing capture is the new single anchor; a later
+    /// arrival preserves it. With no rows rendered nothing is gone yet: it only
+    /// records, and the anchor waits for the rows.
     fn land_on_latest(&self, container: &web_sys::Element) {
+        if !self.has_rows() {
+            self.record(container);
+            return;
+        }
         let navigating = self.navigation.get().is_some();
         self.end_navigation();
         *self.anchor.borrow_mut() = None;
@@ -870,9 +928,13 @@ impl HistoryScroll {
     /// the saved anchor where the reader last saw it (`shift` is how far the
     /// reflow moved it down), and capture there.
     fn cancel_navigation_for_reflow(&self, container: &web_sys::Element, shift: i32) {
+        let corrected = container.scroll_top() + shift;
         self.end_navigation();
-        // A real move, so it aborts the animation as it compensates.
-        container.set_scroll_top(container.scroll_top() + shift);
+        // The correction is not relied on to abort the animation: it can clamp
+        // to the offset the view is already at (a negative shift at the top),
+        // and Firefox does not abort a smooth scroll for that.
+        stop_native_scroll(container);
+        container.set_scroll_top(corrected);
         self.capture(container);
     }
 
@@ -883,16 +945,39 @@ impl HistoryScroll {
         self.capture_at_rest(container);
     }
 
-    /// A `scroll` during a navigation is its progress: capture it, unless the
-    /// saved anchor moved in the content (a reflow above it) or disappeared.
-    fn on_navigation_scroll(&self, container: &web_sys::Element) {
+    /// What a navigation does about the history as it is now, before any
+    /// caller captures. `true` means it was handled and the caller stops:
+    ///
+    /// * no rows render: end the navigation and stop the animation where it is,
+    ///   recording only. There is no row to measure a reflow by or to land on,
+    ///   and the saved anchor waits for the rows; their return restores, it
+    ///   never resumes or retargets the animation;
+    /// * the saved anchor moved in the content (a reflow above it): cancel,
+    ///   keeping it where the reader last saw it;
+    /// * the saved anchor is gone: the missing-anchor transition.
+    ///
+    /// `false`: rows render and the anchor is where it was.
+    fn handle_navigation_reflow(&self, container: &web_sys::Element) -> bool {
+        if !self.has_rows() {
+            self.end_navigation();
+            stop_native_scroll(container);
+            self.record(container);
+            return true;
+        }
         match self.navigation_reflow(container) {
-            AnchorReflow::Missing => self.land_on_latest(container),
             AnchorReflow::Shifted(shift) => self.cancel_navigation_for_reflow(container, shift),
-            AnchorReflow::Stable => {
-                self.capture(container);
-                self.arm_navigation_timer();
-            }
+            AnchorReflow::Missing => self.land_on_latest(container),
+            AnchorReflow::Stable => return false,
+        }
+        true
+    }
+
+    /// A `scroll` during a navigation is its progress: capture it, unless
+    /// `handle_navigation_reflow` dealt with it.
+    fn on_navigation_scroll(&self, container: &web_sys::Element) {
+        if !self.handle_navigation_reflow(container) {
+            self.capture(container);
+            self.arm_navigation_timer();
         }
     }
 
@@ -926,6 +1011,12 @@ impl HistoryScroll {
         let Some(container) = self.laid_out_container() else {
             return;
         };
+        // No rows render: there is nothing to land on or to capture, and the
+        // saved anchor waits for the rows. The click asks for nothing.
+        if !self.has_rows() {
+            self.record(&container);
+            return;
+        }
         if self.hidden.get() || self.placement.get() != Placement::Placed {
             self.restore_now();
         } else {
@@ -953,8 +1044,11 @@ impl HistoryScroll {
         self.arm_navigation_timer();
     }
 
-    /// The navigation has come to rest: capture where it landed. A `scrollend`
-    /// counts only at the destination (`navigation_arrived`); the quiet
+    /// The navigation has come to rest: capture where it landed. A reflow,
+    /// a missing anchor or an empty render since its last `scroll` is handled
+    /// first (`handle_navigation_reflow`), at either kind of end, so the
+    /// capture never takes a displaced view for the landing. A `scrollend`
+    /// then counts only at the destination (`navigation_arrived`); the quiet
     /// interval ends it wherever it is. Hidden, the hide has ended it already.
     fn finish_navigation(&self, native_end: bool) {
         let Some(destination) = self.navigation.get() else {
@@ -963,6 +1057,9 @@ impl HistoryScroll {
         let Some(container) = self.laid_out_container() else {
             return;
         };
+        if self.handle_navigation_reflow(&container) {
+            return;
+        }
         if native_end
             && !navigation_arrived(
                 container.scroll_top(),

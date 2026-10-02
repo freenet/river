@@ -10603,16 +10603,26 @@ mod history_position_wiring_pins {
     /// rows from under a reader resting just above the end, or oscillates
     /// trim against backfill.
     /// `view_at_end` is `at_end`, whose slack is pinned by its own unit test.
+    /// That the deferred trim re-applies this gate when it runs is covered in
+    /// the browser (`conversation-history-trim.spec.ts`), where the defer is
+    /// a real later task.
     #[test]
     fn the_trim_stays_gated_at_the_bottom() {
+        let history = dense(history_source());
         assert!(
-            dense(history_source()).contains(
+            history.contains(
                 "letSome(trim)=hooks.as_ref().filter(|h|h.window_overgrown.get())else{return;};\
-                 ifview_at_end(container)&&!trim_would_rearm_backfill("
+                 if!trim_is_invisible(container,trim.window_rendered.get()){return;}"
             ),
-            "the trim must need an overgrown window, the view within \
-             SCROLL_TOP_SLACK_PX of the end, and a tail that does not re-arm \
-             the backfill"
+            "the trim must need an overgrown window and pass the gate"
+        );
+        assert!(
+            history.contains(
+                "fntrim_is_invisible(container:&web_sys::Element,rendered:usize)->bool{\
+                 view_at_end(container)&&!trim_would_rearm_backfill("
+            ),
+            "the gate must need the view within SCROLL_TOP_SLACK_PX of the end, \
+             and a tail that does not re-arm the backfill"
         );
     }
 

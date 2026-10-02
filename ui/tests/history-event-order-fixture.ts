@@ -1,8 +1,8 @@
 import { Page } from "@playwright/test";
 
-// Browser-test utilities for conversation-anchor-events.spec.ts: put native
-// events and layout changes in a chosen order relative to the app's own
-// listeners, and keep one log of what reached the app. Everything runs on the
+// Browser-test utilities for the conversation-* specs that need an exact event
+// order: put native events and layout changes in a chosen order relative to the
+// app's own listeners, and keep one log of what reached the app. Everything runs on the
 // browser's own clock. Nothing here writes application state or implements a
 // scroll policy; the in-page parts must be self-contained.
 //
@@ -171,4 +171,123 @@ export function orderGrowAboveThenEnd(page: Page, px: number, id: string) {
       }),
     { px, id },
   );
+}
+
+/// What a scroll-to-latest navigation's end met, applied in the same task just
+/// before the app handles that end: `grow` pads the newest message row wholly
+/// above the view by `px`, `hide` takes the reading anchor out of the rendered
+/// rows.
+export type EndReflowKind = "grow" | "hide";
+
+/// What the fixture's `run` observed: the newest visible message before the
+/// change, the view and live end, and how far `grow` moved that message down.
+export type EndReflow = {
+  kind: EndReflowKind;
+  top: number;
+  max: number;
+  anchor: { id: string; gap: number } | null;
+  shift: number;
+};
+
+type EndReflowFixture = {
+  result: EndReflow | null;
+  /// Apply `kind` now. Logs it to the order recorder, when one runs, and logs
+  /// `observed` at the first ResizeObserver delivery after it.
+  run(kind: EndReflowKind, px: number): EndReflow;
+  /// Put back what `hide` took away.
+  unhide(): void;
+};
+
+declare global {
+  interface Window {
+    __historyEndReflow?: EndReflowFixture;
+  }
+}
+
+/// Install `window.__historyEndReflow`. Runs in the page (`addInitScript`), so
+/// it is self-contained.
+///
+/// `hide` renames the newest visible anchor row's `data-anchor-row` rather than
+/// removing it: the row and its layout stay, so the rest of the history is
+/// untouched, but the saved key is no longer rendered, which is all "missing"
+/// means to the scroll model. A real deletion cannot be timed into one task:
+/// the `removeMessages` hook defers its state change and the render follows it.
+function installEndReflow() {
+  const intersecting = (box: DOMRect, row: DOMRect) => row.bottom > box.top && row.top < box.bottom;
+  let hidden: { row: HTMLElement; key: string } | null = null;
+  const fixture: EndReflowFixture = {
+    result: null,
+    run(kind, px) {
+      const c = document.getElementById("chat-scroll-container")!;
+      const box = c.getBoundingClientRect();
+      const messages = Array.from(c.querySelectorAll<HTMLElement>('[id^="msg-"]'));
+      const visible = messages.filter((r) => intersecting(box, r.getBoundingClientRect())).at(-1);
+      const result: EndReflow = {
+        kind,
+        top: c.scrollTop,
+        max: c.scrollHeight - c.clientHeight,
+        anchor: visible ? { id: visible.id, gap: box.bottom - visible.getBoundingClientRect().top } : null,
+        shift: 0,
+      };
+      if (kind === "grow") {
+        const above = messages.filter((r) => r.getBoundingClientRect().bottom < box.top).at(-1);
+        if (!above || !visible) throw new Error("end reflow: no message row wholly above a visible one");
+        const before = visible.getBoundingClientRect().top;
+        above.style.paddingTop = `${(parseFloat(above.style.paddingTop) || 0) + px}px`;
+        result.shift = visible.getBoundingClientRect().top - before;
+      } else {
+        const rows = Array.from(c.querySelectorAll<HTMLElement>("#chat-content [data-anchor-row]"));
+        const row = rows.filter((r) => intersecting(box, r.getBoundingClientRect())).at(-1);
+        if (!row) throw new Error("end reflow: no anchor row is visible");
+        const key = row.getAttribute("data-anchor-row")!;
+        row.setAttribute("data-anchor-row", `${key}::hidden-by-test`);
+        hidden = { row, key };
+      }
+      window.__historyOrder?.log.push(kind);
+      const observer = new ResizeObserver(() => {
+        observer.disconnect();
+        window.__historyOrder?.log.push("observed");
+      });
+      observer.observe(document.getElementById("chat-content")!);
+      fixture.result = result;
+      return result;
+    },
+    unhide() {
+      hidden?.row.setAttribute("data-anchor-row", hidden.key);
+      hidden = null;
+    },
+  };
+  window.__historyEndReflow = fixture;
+}
+
+/// Register `window.__historyEndReflow` for every later navigation.
+export function registerEndReflow(page: Page): Promise<void> {
+  return page.addInitScript(installEndReflow);
+}
+
+/// Apply `kind` in the capture phase of the history's next native `scrollend`,
+/// before the app's own listener on the container runs.
+export function endReflowAtNextScrollend(page: Page, kind: EndReflowKind, px = 0) {
+  return page.evaluate(
+    ({ kind, px }) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const onEnd = (e: Event) => {
+        if (e.target !== c) return;
+        window.removeEventListener("scrollend", onEnd, true);
+        window.__historyEndReflow!.run(kind, px);
+      };
+      window.addEventListener("scrollend", onEnd, true);
+    },
+    { kind, px },
+  );
+}
+
+/// What the end reflow did, once it has run.
+export function endReflowResult(page: Page): Promise<EndReflow | null> {
+  return page.evaluate(() => window.__historyEndReflow?.result ?? null);
+}
+
+/// Put back the anchor key `hide` renamed.
+export function endReflowUnhide(page: Page) {
+  return page.evaluate(() => window.__historyEndReflow?.unhide());
 }

@@ -1,4 +1,5 @@
 import { expect, Page } from "@playwright/test";
+import { savedVisibleRowDrift, type RowPosition } from "./history-scroll-geometry";
 import { callRiverTest } from "./river-test";
 import { waitForApp, selectRoom } from "./example-room";
 
@@ -259,4 +260,67 @@ export async function revealChat(page: Page, back: "rooms-back-button" | "member
   await page.getByTestId(back).click();
   await expect(chatColumn(page)).toBeVisible();
   await afterLayoutSettles(page);
+}
+
+export type ScrollRequests = { smooth: number; other: number };
+
+declare global {
+  interface Window {
+    __riverScrollRequests?: ScrollRequests;
+  }
+}
+
+/// Count `scrollTo`/`scroll` calls on the history from here on, by behavior,
+/// in `window.__riverScrollRequests`.
+/// `scrollTop` writes (anchor corrections, cancelling) are not counted: only a
+/// smooth request animates.
+export async function recordScrollRequests(page: Page) {
+  await page.evaluate(() => {
+    const record: ScrollRequests = { smooth: 0, other: 0 };
+    window.__riverScrollRequests = record;
+    const container = document.getElementById("chat-scroll-container")!;
+    for (const name of ["scrollTo", "scroll"] as const) {
+      const original = container[name].bind(container) as (...args: unknown[]) => void;
+      (container as unknown as Record<string, unknown>)[name] = (...args: unknown[]) => {
+        const options = args[0];
+        const smooth =
+          typeof options === "object" && options !== null && (options as ScrollToOptions).behavior === "smooth";
+        if (smooth) record.smooth++;
+        else record.other++;
+        original(...args);
+      };
+    }
+  });
+}
+
+export function scrollRequests(page: Page): Promise<ScrollRequests> {
+  return page.evaluate(() => window.__riverScrollRequests!);
+}
+
+/// The live end, `scrollHeight - clientHeight`.
+export function maxScrollTop(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const el = document.getElementById("chat-scroll-container")!;
+    return el.scrollHeight - el.clientHeight;
+  });
+}
+
+/// Wait until the native animation has visibly moved the view.
+export async function animationUnderway(page: Page, from: number) {
+  await expect
+    .poll(() => scrollTop(page), { timeout: 5_000, message: "premise: the native animation should start" })
+    .toBeGreaterThan(from + 40);
+}
+
+/// Display items and date separators in the rendered history window.
+export const HISTORY_ROWS = '[data-testid="conversation-history"] > *';
+
+export function renderedRowCount(page: Page): Promise<number> {
+  return page.locator(HISTORY_ROWS).count();
+}
+
+/// The saved row remains visible at its gap over five samples, even if a
+/// newer row enters the view without moving it.
+export function expectVisibleRowHolds(page: Page, row: RowPosition, why: string) {
+  return expectDriftWithin(page, () => savedVisibleRowDrift(page, row), why, { hold: true });
 }

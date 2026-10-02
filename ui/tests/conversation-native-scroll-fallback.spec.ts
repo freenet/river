@@ -1,14 +1,24 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { newestVisibleRow, registerHistoryGeometry, savedVisibleRowDrift, type RowPosition } from "./history-scroll-geometry";
+import { newestVisibleRow, registerHistoryGeometry } from "./history-scroll-geometry";
+import {
+  endReflowResult,
+  endReflowUnhide,
+  registerEndReflow,
+  type EndReflow,
+  type EndReflowKind,
+} from "./history-event-order-fixture";
 import {
   ARRIVAL,
   AT_BOTTOM_EPSILON_PX,
+  IN_PLACE_TOLERANCE_PX,
   afterLayoutSettles,
+  animationUnderway,
   deliver,
   distanceFromBottom,
-  expectDriftWithin,
+  expectVisibleRowHolds,
   expectSettledAtBottom,
+  maxScrollTop,
   parkAboveTheEnd,
   scrollTop,
   viewAtRest,
@@ -45,6 +55,10 @@ type Fallback = {
   quiet: QuietTimer[];
   /// `scrollTo`/`scroll` calls on the container, by behavior.
   requests: { smooth: number; other: number };
+  /// Run once, in the task of the next quiet interval to fire, just before the
+  /// app's own callback: a test's layout change at the moment the navigation
+  /// ends.
+  beforeQuiet?: () => void;
 };
 
 declare global {
@@ -102,6 +116,9 @@ function withoutScrollend({ quietMs, backstopMs }: { quietMs: number; backstopMs
       function (this: unknown, ...a: unknown[]) {
         timer.fired = performance.now();
         timers.delete(handle);
+        const before = record.beforeQuiet;
+        record.beforeQuiet = undefined;
+        before?.();
         return (cb as (...a: unknown[]) => unknown).apply(this, a);
       },
       delay,
@@ -152,10 +169,7 @@ async function parkAndCount(page: Page) {
   });
   return {
     parkedAt: await scrollTop(page),
-    destination: await page.evaluate(() => {
-      const el = document.getElementById("chat-scroll-container")!;
-      return el.scrollHeight - el.clientHeight;
-    }),
+    destination: await maxScrollTop(page),
   };
 }
 
@@ -178,15 +192,11 @@ async function expectEndedByQuietInterval(page: Page) {
   expect(quiet.at(-1)!.fired, `the last quiet interval did not fire (${what})`).not.toBeNull();
 }
 
-/// The row recorded in `before` is still at its gap, over five samples (500ms).
-function expectRowHolds(page: Page, before: RowPosition, why: string) {
-  return expectDriftWithin(page, () => savedVisibleRowDrift(page, before), why, { hold: true });
-}
-
 const button = (page: Page) => page.getByTestId("scroll-to-bottom");
 
 test.beforeEach(async ({ page }) => {
   await registerHistoryGeometry(page);
+  await registerEndReflow(page);
   await page.addInitScript(withoutScrollend, { quietMs: QUIET_MS, backstopMs: BACKSTOP_MS });
 });
 
@@ -214,15 +224,15 @@ test.describe("Without scrollend, scroll to latest ends after a quiet interval",
         c.style.maxHeight = `${c.clientHeight - 120}px`;
       });
       await afterLayoutSettles(page);
-      await expectRowHolds(page, landed!, "a resize after the landing moved the row: the navigation never ended");
+      await expectVisibleRowHolds(page, landed!, "a resize after the landing moved the row: the navigation never ended");
     } finally {
       await page.evaluate(() => document.getElementById("chat-scroll-container")?.style.removeProperty("max-height"));
     }
     await afterLayoutSettles(page);
-    await expectRowHolds(page, landed!, "removing the resize moved the landing row");
+    await expectVisibleRowHolds(page, landed!, "removing the resize moved the landing row");
 
     await deliver(page, ARRIVAL("arrival after the landing"));
-    await expectRowHolds(page, landed!, "an arrival after the landing moved the view");
+    await expectVisibleRowHolds(page, landed!, "an arrival after the landing moved the view");
     expect(await distanceFromBottom(page), "the arrival should be below the view, not followed").toBeGreaterThan(
       AT_BOTTOM_EPSILON_PX,
     );
@@ -233,9 +243,7 @@ test.describe("Without scrollend, scroll to latest ends after a quiet interval",
   }) => {
     const { parkedAt, destination } = await parkAndCount(page);
     await button(page).click();
-    await expect
-      .poll(() => scrollTop(page), { timeout: 5_000, message: "premise: the native animation should start" })
-      .toBeGreaterThan(parkedAt + 40);
+    await animationUnderway(page, parkedAt);
     for (let i = 0; i < 3; i++) {
       await callRiverTest(page, "appendMessage", ARRIVAL(`arrival ${i} mid-flight`));
     }
@@ -253,8 +261,79 @@ test.describe("Without scrollend, scroll to latest ends after a quiet interval",
     const landed = await newestVisibleRow(page);
     expect(landed, "premise: a message should be visible").not.toBeNull();
     await page.waitForTimeout(1_000);
-    await expectRowHolds(page, landed!, "the landing moved after the quiet interval");
+    await expectVisibleRowHolds(page, landed!, "the landing moved after the quiet interval");
     await deliver(page, ARRIVAL("arrival after the landing"));
-    await expectRowHolds(page, landed!, "an arrival after the landing moved the view");
+    await expectVisibleRowHolds(page, landed!, "an arrival after the landing moved the view");
+  });
+});
+
+test.describe("Without scrollend, the quiet interval handles a reflow before it captures", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  /// The growth above the view when the quiet interval fires.
+  const GROW_PX = 200;
+
+  /// Park, click, and apply `kind` in the task of the quiet interval that ends
+  /// the navigation, before the app's callback and before any observer can
+  /// report it. With `arrival`, a message lands below the view mid-flight, so
+  /// the end at the click is no longer the latest.
+  async function reflowAtQuietEnd(page: Page, kind: EndReflowKind, { arrival = false } = {}) {
+    const { parkedAt, destination } = await parkAndCount(page);
+    await page.evaluate(
+      ({ kind, px }) => {
+        window.__riverFallback!.beforeQuiet = () => window.__historyEndReflow!.run(kind, px);
+      },
+      { kind, px: GROW_PX },
+    );
+    await button(page).click();
+    if (arrival) await callRiverTest(page, "appendMessage", ARRIVAL("arrival mid-flight"));
+    await animationUnderway(page, parkedAt);
+    await expect
+      .poll(() => endReflowResult(page), { timeout: 10_000, message: "premise: the quiet interval fired" })
+      .not.toBeNull();
+    const run = (await endReflowResult(page)) as EndReflow;
+    const what = `${JSON.stringify(run)}; destination ${destination}; ${JSON.stringify((await fallback(page)).quiet)}`;
+    expect(
+      Math.abs(run.top - destination),
+      `premise: the animation had reached its destination when the interval fired (${what})`,
+    ).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
+    expect(run.anchor, `premise: a message was visible at the end (${what})`).not.toBeNull();
+    await expectEndedByQuietInterval(page);
+    return { run, what };
+  }
+
+  test("growth above the anchor as the interval fires keeps the anchor's gap", async ({ page }) => {
+    const { run, what } = await reflowAtQuietEnd(page, "grow");
+    expect(
+      Math.abs(run.shift - GROW_PX),
+      `premise: the growth pushed the anchor down before the app saw it (${what})`,
+    ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+    await afterLayoutSettles(page);
+    await expectVisibleRowHolds(page, run.anchor!, `the quiet end captured the displaced view (${what})`);
+    await deliver(page, ARRIVAL("arrival after the corrected end"));
+    await expectVisibleRowHolds(page, run.anchor!, "an arrival after the corrected end moved the view");
+    expect((await fallback(page)).requests, "nothing re-issued the animation").toEqual({ smooth: 1, other: 0 });
+  });
+
+  test("an anchor missing as the interval fires, with rows still rendered, lands at the latest message", async ({
+    page,
+  }) => {
+    try {
+      const { run, what } = await reflowAtQuietEnd(page, "hide", { arrival: true });
+      expect(run.max - run.top, `premise: the arrival put the latest message below the end (${what})`).toBeGreaterThan(
+        AT_BOTTOM_EPSILON_PX,
+      );
+      await expectSettledAtBottom(page, `a missing anchor at the quiet end should land at the latest message (${what})`);
+      await viewAtRest(page, "the view should come to rest at the latest message");
+      const landed = await newestVisibleRow(page);
+      expect(landed, "premise: a message is visible at the landing").not.toBeNull();
+      await endReflowUnhide(page);
+      await deliver(page, ARRIVAL("arrival after the landing"));
+      await expectVisibleRowHolds(page, landed!, "an arrival after the landing moved the view");
+      expect(await distanceFromBottom(page), "the arrival was followed").toBeGreaterThan(AT_BOTTOM_EPSILON_PX);
+      expect((await fallback(page)).requests, "the landing is not another animation").toEqual({ smooth: 1, other: 0 });
+    } finally {
+      await endReflowUnhide(page);
+    }
   });
 });

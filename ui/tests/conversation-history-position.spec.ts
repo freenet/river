@@ -11,6 +11,7 @@ import {
 import {
   AT_BOTTOM_EPSILON_PX,
   DEEP_ROOM_PATH,
+  HISTORY_ROWS,
   IN_PLACE_TOLERANCE_PX,
   PARKED_ABOVE_END_PX,
   TALL,
@@ -27,6 +28,7 @@ import {
   openRoomAtBottom,
   readerScrollsToEnd,
   readerScrollsWithoutGesture,
+  renderedRowCount,
   revealChat,
   scrollTop,
   viewportHeight,
@@ -66,9 +68,6 @@ import {
 //
 // Assumes the example-data build, which exposes `window.__riverTest` for
 // delivering INBOUND messages.
-
-// Rendered history rows: display items plus date separators.
-const HISTORY_ROWS = '[data-testid="conversation-history"] > *';
 
 /// The scroll model's allowance for a layout move (LAYOUT_SHIFT_ALLOWANCE_PX in
 /// ui/src/components/conversation/history_scroll.rs). Only a fixture premise:
@@ -231,11 +230,6 @@ async function expectNotFollowed(page: Page, before: RowPosition, why: string) {
     await distanceFromBottom(page),
     `${why}: the view was pulled down to the new end`,
   ).toBeGreaterThan(AT_BOTTOM_EPSILON_PX);
-}
-
-/// Rendered history rows. A windowed tail is ~60 items plus a separator or two.
-function renderedRowCount(page: Page): Promise<number> {
-  return page.locator(HISTORY_ROWS).count();
 }
 
 /// Fill Team Chat Room, have the reader scroll to its very end themselves, and
