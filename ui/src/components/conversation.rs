@@ -583,10 +583,10 @@ fn group_messages(
             .is_some_and(|limit| raw_time > limit);
         let message_time = if time_clamped { clamp_to } else { raw_time };
 
-        let author_name = resolve_member_nickname(member_info, author_id, secrets);
-
         // Handle event messages (join, etc.) — summarize consecutive events within 1 hour
         if message.message.content.is_event() {
+            // Every event keeps its own name, merged into a summary or not.
+            let author_name = resolve_member_nickname(member_info, author_id, secrets);
             let msg_id_str = format!("{:?}", message_id.0);
             let event_group_threshold = Duration::from_secs(60 * 60);
             let should_merge = matches!(items.last(), Some(DisplayItem::Event(ref s))
@@ -678,6 +678,10 @@ fn group_messages(
                 group.messages.push(grouped_message);
             }
         } else {
+            // Resolved here rather than once per message: a message that joins
+            // its author's group above shares that group's header, so a name
+            // resolved for it was only ever allocated and dropped.
+            let author_name = resolve_member_nickname(member_info, author_id, secrets);
             // Once per GROUP, not once per message: consecutive messages from
             // one author share a header, so the warning is a property of the
             // group.
@@ -9793,7 +9797,8 @@ mod resolve_reply_strip_tests {
     }
 }
 
-/// Tests for [`group_messages`]' clock handling.
+/// Tests for [`group_messages`]: chiefly its clock handling, plus the names it
+/// resolves for group headers and event summaries.
 ///
 /// These are possible at all because the receive-time snapshot is now a
 /// parameter: the function used to read the `RECEIVE_TIMES` `GlobalSignal`
@@ -9947,6 +9952,94 @@ mod group_messages_clock_tests {
             "with an unknown identity nothing is 'mine' — but nothing is \
              mis-attributed either"
         );
+    }
+
+    /// Names are resolved only where they are kept (an event row, or the
+    /// header of a NEW group), so pin what each of those shows across a run
+    /// that also exercises the skipped path: a message joining its author's
+    /// existing group, then two events merging into one summary, then the
+    /// same author again after the event, which must open a fresh group with
+    /// its own header.
+    ///
+    /// Alice carries a duplicate `member_info` record whose LOSING copy comes
+    /// last, so a name read from a last-write-wins `member_id -> name` map
+    /// would say "Stale". The header must still come from the canonical
+    /// record.
+    #[test]
+    fn group_headers_and_event_names_survive_a_joined_group() {
+        let owner = signing_key(70);
+        let owner_id = member_id_of(&owner);
+        let alice = signing_key(71);
+        let bob = signing_key(72);
+        let carol = signing_key(73);
+
+        let base = at(1_700_000_000_000);
+        let minutes = |n: i64| base + chrono::Duration::minutes(n);
+        let event_at = |sk: &SigningKey, sent: DateTime<Utc>| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: member_id_of(sk),
+                    time: UNIX_EPOCH + StdDuration::from_millis(sent.timestamp_millis() as u64),
+                    content: RoomMessageBody::join_event(),
+                },
+                sk,
+            )
+        };
+        let messages = state(vec![
+            message_at(owner_id, &alice, minutes(0)),
+            message_at(owner_id, &alice, minutes(1)),
+            event_at(&bob, minutes(2)),
+            event_at(&carol, minutes(3)),
+            message_at(owner_id, &alice, minutes(4)),
+        ]);
+
+        let mut member_info = MemberInfoV1 {
+            member_info: vec![AuthorizedMemberInfo::new(
+                MemberInfo::new_public(member_id_of(&alice), 2, "Alice".to_string()),
+                &alice,
+            )],
+        };
+        member_info
+            .member_info
+            .extend(info(&bob, "Bob").member_info);
+        member_info
+            .member_info
+            .extend(info(&carol, "Carol").member_info);
+        member_info.member_info.push(AuthorizedMemberInfo::new(
+            MemberInfo::new_public(member_id_of(&alice), 1, "Stale".to_string()),
+            &alice,
+        ));
+
+        let items = group(
+            &messages,
+            &member_info,
+            owner_id,
+            &ReceiveTimes::new(),
+            minutes(60),
+        );
+
+        match items.as_slice() {
+            [DisplayItem::Messages(first), DisplayItem::Event(events), DisplayItem::Messages(second)] =>
+            {
+                assert_eq!(
+                    first.author_name, "Alice",
+                    "canonical record, not the last one"
+                );
+                assert_eq!(
+                    first.messages.len(),
+                    2,
+                    "the second message joins the first group"
+                );
+                assert_eq!(events.names, vec!["Bob".to_string(), "Carol".to_string()]);
+                assert_eq!(second.author_name, "Alice");
+                assert_eq!(second.messages.len(), 1);
+            }
+            other => panic!(
+                "expected [group, event summary, group], got {} items",
+                other.len()
+            ),
+        }
     }
 
     fn only_group(items: &[DisplayItem]) -> &MessageGroup {
