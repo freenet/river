@@ -9,6 +9,7 @@ import {
   distanceFromBottom,
   endMinus,
   expectSettledAtBottom,
+  fillHistory,
   historyHeight,
   openRoomAtBottom,
   readerScrollsWithoutGesture,
@@ -273,15 +274,6 @@ const DEEP_ROOM_PATH = "/?deep-history-room=1";
 /// Rendered history rows. A windowed tail is ~60 items plus a separator or two.
 function renderedRowCount(page: Page): Promise<number> {
   return page.locator(HISTORY_ROWS).count();
-}
-
-/// Add enough history to have somewhere to scroll back through: `count` plain
-/// messages (alternating authors, so one row each; no reactions or replies).
-async function fillHistory(page: Page, count = 8) {
-  for (let i = 0; i < count; i++) {
-    await deliver(page, `filler ${i}: ${"y".repeat(200)}`);
-  }
-  await expectSettledAtBottom(page, "filler messages should have been followed");
 }
 
 /// Park a reader mid-history and remember the newest message they can see.

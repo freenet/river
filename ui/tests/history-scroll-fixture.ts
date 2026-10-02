@@ -1,7 +1,6 @@
 import { expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { waitForApp, selectRoom } from "./example-room";
-import { distanceFromBottom } from "./history-scroll-helpers";
+import { fillHistory, openRoomAtBottom } from "./history-scroll-helpers";
 
 // Browser-test utilities for the history-scroll specs, in three sections:
 //
@@ -1011,21 +1010,10 @@ export async function debounceDeliverJoin(page: Page) {
 }
 
 /// Open `roomName` at its newest message and add `fillers` messages to scroll
-/// back through, on the running clock.
+/// back through, on the running clock (before `debouncePauseWhenQuiet`).
+/// `openRoomAtBottom` asserts the chat container is visible before any
+/// geometry read, so missing markup fails here rather than reading NaN.
 export async function debounceOpenFilledRoom(page: Page, roomName: string, path = "/", fillers = 8) {
-  await page.goto(path);
-  await waitForApp(page);
-  await selectRoom(page, roomName);
-  await expect(page.locator("#chat-scroll-container")).toBeVisible({ timeout: 5_000 });
-  for (let i = 0; i < fillers; i++) {
-    const text = `filler ${i}: ${"y".repeat(200)}`;
-    await callRiverTest(page, "appendMessage", text);
-    await expect(page.getByText(text.slice(0, 40), { exact: false }).last()).toBeVisible({ timeout: 5_000 });
-  }
-  await expect
-    .poll(() => distanceFromBottom(page), {
-      timeout: 5_000,
-      message: "premise: the fillers should have been followed",
-    })
-    .toBeLessThanOrEqual(4);
+  await openRoomAtBottom(page, roomName, path);
+  await fillHistory(page, fillers);
 }

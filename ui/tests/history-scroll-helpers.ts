@@ -78,6 +78,17 @@ export async function deliver(page: Page, text: string) {
   });
 }
 
+/// Add enough history to have somewhere to scroll back through: `count` plain
+/// messages (alternating authors, so one row each; no reactions or replies),
+/// each on the page before the next is sent, then followed to the end. On the
+/// running clock; the paused-clock deliveries are the debounce fixture's own.
+export async function fillHistory(page: Page, count = 8) {
+  for (let i = 0; i < count; i++) {
+    await deliver(page, `filler ${i}: ${"y".repeat(200)}`);
+  }
+  await expectSettledAtBottom(page, "filler messages should have been followed");
+}
+
 /// Open a room and wait until the history has settled at its newest message.
 ///
 /// `path` lets a test opt into fixture variants the default build hides —
