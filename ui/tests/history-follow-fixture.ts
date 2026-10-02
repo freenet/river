@@ -48,7 +48,7 @@ export type FollowEntry =
 
 /// One registration of the app's quiet-deadline callback (`observeSettle`), on
 /// the page's clock.
-export type FollowSettleTimer = {
+type FollowSettleTimer = {
   handle: number;
   at: number;
   delay: number;
@@ -57,7 +57,7 @@ export type FollowSettleTimer = {
 };
 
 /// What a `followBeforeSettleFire` action saw, in the task the callback then ran in.
-export type FollowBeforeFire = {
+type FollowBeforeFire = {
   handle: number;
   at: number;
   before: number;
@@ -359,7 +359,7 @@ export function followGrowAboveThenEnd(page: Page, px: number, id: string) {
 
 /// What `followResizeBeforeEnd` saw: the container's `scrollTop` and height
 /// just before and just after its resize, in the listener, and when it ran.
-export type FollowResize = {
+type FollowResize = {
   ran: boolean;
   before: { top: number; height: number };
   after: { top: number; height: number };
@@ -417,7 +417,7 @@ export function followResizeRecord(page: Page): Promise<FollowResize> {
 /// growth, after it (read in the same task, so any clamp is in it), and once the
 /// app had handled the end; `scrollsAtEnd` counts the container's `scroll`
 /// events from the growth until the app had handled that end.
-export type FollowGrowEnd = {
+type FollowGrowEnd = {
   before: { top: number; height: number; max: number };
   after: { top: number; height: number; max: number };
   ended: { top: number };

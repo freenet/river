@@ -41,7 +41,7 @@ export const SEEK_CLOCK_FRAME_MS = 16;
 
 /// One sample, taken once a frame's work is over: the clock's time, `scrollTop`,
 /// and the live end (`scrollHeight - clientHeight`).
-export type SeekClockFrame = { t: number; top: number; max: number };
+type SeekClockFrame = { t: number; top: number; max: number };
 
 export type SeekClockRecord = {
   frames: SeekClockFrame[];
@@ -331,7 +331,7 @@ export function seekClockLog(record: SeekClockRecord): string {
 // touch without requiring an order.
 
 /// One controlled gesture: where to step, what to do, and when.
-export type GateScrollendPlan = {
+type GateScrollendPlan = {
   /// `scrollTop` for each frame, as offsets from where the gesture starts.
   path: number[];
   /// Act at the first scroll event that has moved up `upPx` from the start
@@ -350,7 +350,7 @@ export type GateScrollendPlan = {
 );
 
 /// What the controlled gesture saw.
-export type GateScrollendRun = {
+type GateScrollendRun = {
   /// In order: `input` (a step written), `scroll` (an event on the container),
   /// `deliver` (the hook was asked for the arrival), `patch` (its row is in the
   /// DOM), or for `hide`: `hide` (the opener clicked) and `hidden` (the chat has
@@ -618,7 +618,7 @@ export const DEBOUNCE_SETTLE_MS = 120;
 /// One fallback registration the app made: when (on the page's clock), and what
 /// became of it. `seq` orders registrations, clears and firings against each
 /// other.
-export type DebounceRegistration = {
+type DebounceRegistration = {
   handle: number;
   at: number;
   seq: number;
@@ -631,7 +631,7 @@ export type DebounceRegistration = {
   fired: { at: number; seq: number } | null;
 };
 
-export type DebounceState = {
+type DebounceState = {
   /// The page's clock now.
   now: number;
   /// How often the app asked whether the container has `onscrollend` (each
@@ -655,7 +655,7 @@ export type DebounceState = {
   beforeFire: DebounceBeforeFire[];
 };
 
-export type DebounceBeforeFire = {
+type DebounceBeforeFire = {
   /// The registration whose firing it ran ahead of.
   handle: number;
   at: number;

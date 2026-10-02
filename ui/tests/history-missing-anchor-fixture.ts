@@ -31,7 +31,7 @@ const IN_PLACE_TOLERANCE_PX = 4;
 
 /// The container's geometry: `scrollTop`, its height, the live end, and how far
 /// that end is below the view.
-export type MissingAnchorGeometry = {
+type MissingAnchorGeometry = {
   top: number;
   height: number;
   scrollHeight: number;
@@ -40,7 +40,7 @@ export type MissingAnchorGeometry = {
 };
 
 /// The neighbourhood chosen right after the reader's last delivered move.
-export type MissingAnchorSelection = {
+type MissingAnchorSelection = {
   /// Row ids to remove (`msg-…`), oldest first.
   ids: string[];
   /// The newest visible row, the one the reader's capture saved first.
@@ -52,7 +52,7 @@ export type MissingAnchorSelection = {
 
 /// What the removal did, read once the caller's frame wait has let the clamp's
 /// `scroll` and the ResizeObserver reach the app.
-export type MissingAnchorRemoval = {
+type MissingAnchorRemoval = {
   before: MissingAnchorGeometry;
   after: MissingAnchorGeometry;
   /// The container's `scroll` events since the removal was requested (counted
