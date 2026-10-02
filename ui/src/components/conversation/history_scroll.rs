@@ -64,9 +64,14 @@
 //!   gesture first puts back a reflow the ResizeObserver has not reported yet
 //!   (the signature differs from the record: an image loading above the view
 //!   moves the rows, not `scrollTop`), against the existing anchor, and only
-//!   then measures. However a gesture ends (a settle, or the reveal's restore
-//!   below), its deadline is cancelled with it, so no handle is left for the
-//!   next gesture to take for its own.
+//!   then measures. A pending layout clamp is restored first too, even when
+//!   the signature has not changed. That settle preserves the anchor and pin
+//!   instead of capturing: the old gap may be past the new end, so a restore
+//!   cannot necessarily put it back until content grows again. It records the
+//!   resulting geometry, making the clamp's later `scroll` an echo. However a
+//!   gesture ends (a settle, or the reveal's restore below), its deadline is
+//!   cancelled with it, so no handle is left for the next gesture to take for
+//!   its own.
 //! * **Stale ends**: with no gesture in progress a settle does nothing, which
 //!   makes a stale `scrollend` (another room's, an old gesture's, a seek
 //!   frame's) harmless then: room switches, forced snaps and new seeks end the
@@ -81,9 +86,9 @@
 //! # Where capture runs
 //!
 //! A `scroll` classified as the reader's (from the listener or taken in early,
-//! below), a gesture's settle, and a touch that stops a seek. The last two
-//! capture directly, never through `on_scroll`: the position has usually been
-//! recorded already and would classify as an echo.
+//! below), a gesture's settle unless it takes in a layout clamp, and a touch
+//! that stops a seek. The last two capture directly, never through `on_scroll`:
+//! the position has usually been recorded already and would classify as an echo.
 //!
 //! # Classifying a `scroll` event (`classify_scroll`)
 //!
@@ -145,7 +150,8 @@
 //! **Why this can't latch as #486 did**: the pin comes only from the reader's
 //! own positions. Growing content, a growing composer or a rewrap restore
 //! instead of measuring, so none of them can clear it, and every gesture ends in
-//! a settle that measures again.
+//! a settle that measures again unless a pending layout clamp preserves that
+//! reader position instead.
 //!
 //! State is `Cell`/`RefCell`, never signals: raw JS callbacks write it.
 
@@ -265,6 +271,14 @@ enum SettleCause {
     Quiet,
 }
 
+/// Whether completing a gesture measures reader intent or keeps the position
+/// from before a layout clamp, which may not currently be reachable.
+#[derive(Clone, Copy)]
+enum GesturePosition {
+    Capture,
+    Preserve,
+}
+
 /// Whether a settle from `cause` ends the gesture, with the view at `now` and
 /// `reader_rev` the current reader revision. A quiet deadline always does, even
 /// at the corrected view: the reader has stopped. A native end with the view's
@@ -290,7 +304,8 @@ fn settle_ends_gesture(
 /// the ResizeObserver has not reported yet, such as an image loading above the
 /// view, which moves the reader's rows without moving `scrollTop`; measured as
 /// it is, the settle would save where the reflow pushed them. An unchanged
-/// layout has nothing to put back.
+/// signature has no reflow to put back; a pending layout clamp is handled
+/// separately by `settle_eligible`.
 fn settle_restores_first(follow: Follow, force: bool, recorded: LayoutSig, now: LayoutSig) -> bool {
     matches!(follow, Follow::Gesture { .. }) && !force && recorded != now
 }
@@ -768,19 +783,25 @@ impl HistoryScroll {
         self.restore_now()
     }
 
-    /// Read a reader scroll whose `scroll` event has not arrived yet (see "Late
-    /// scroll events"): the view has moved by more than a layout clamp could
-    /// since it was recorded.
+    /// Take in a pending reader scroll before rendering or restoring. Layout
+    /// movement is left for the restore; it must never capture reader intent.
     pub(super) fn take_in_undelivered_scroll(&self) {
-        let Some(container) = self.laid_out_container() else {
-            return;
-        };
+        let _ = self.take_in_pending_scroll();
+    }
+
+    /// Classify movement before taking it in, so a settle can preserve intent
+    /// when it finds a layout clamp whose `scroll` has not arrived yet. No top
+    /// movement is not a pending scroll: a reflow still uses restore-first.
+    fn take_in_pending_scroll(&self) -> Option<ScrollCause> {
+        let container = self.laid_out_container()?;
         if container.scroll_top() == self.top.get() {
-            return;
+            return None;
         }
-        if self.cause_now(&container) == ScrollCause::Reader {
-            self.on_scroll();
+        let cause = self.cause_now(&container);
+        if cause == ScrollCause::Reader {
+            self.on_reader_scroll(&container);
         }
+        Some(cause)
     }
 
     /// Who the `scroll` event now pending (or being handled) belongs to.
@@ -808,7 +829,7 @@ impl HistoryScroll {
         }
         self.restore_position(&container);
         if self.settle_pending.take() {
-            self.end_gesture();
+            self.end_gesture(GesturePosition::Capture);
         }
     }
 
@@ -1018,7 +1039,7 @@ impl HistoryScroll {
     /// reader's quiet deadline, which is armed if it is not already (and is not
     /// moved: it runs from the reader's last move).
     fn settle_native(&self) {
-        self.take_in_undelivered_scroll();
+        let pending = self.take_in_pending_scroll();
         if let Some(container) = self.laid_out_container() {
             if !self.settle_allowed(SettleCause::Native, self.live_edges(&container)) {
                 if self.settle_timer.get().is_none() {
@@ -1027,7 +1048,7 @@ impl HistoryScroll {
                 return;
             }
         }
-        self.settle_eligible();
+        self.settle_eligible(pending);
     }
 
     /// The reader's quiet deadline has passed: the gesture settles wherever the
@@ -1042,35 +1063,46 @@ impl HistoryScroll {
         // The callback running now has fired.
         self.settle_timer.set(None);
         let reader_rev = self.reader_rev.get();
-        self.take_in_undelivered_scroll();
+        let pending = self.take_in_pending_scroll();
         if self.reader_rev.get() != reader_rev
             && matches!(self.follow.get(), Follow::Gesture { .. })
         {
             self.arm_quiet_deadline();
             return;
         }
-        self.settle_eligible();
+        self.settle_eligible(pending);
     }
 
     /// A settle that ends the gesture, the reader's pending scroll taken in. A
     /// reflow no observer has reported yet is put back first, against the
     /// reader's existing anchor (`settle_restores_first`), so the capture
     /// measures the reader's place and not where the reflow pushed their rows.
-    /// That restore may correct the view; the gesture ends right after, which
-    /// drops the record, so the correction's own end meets no gesture.
-    fn settle_eligible(&self) {
+    /// A pending layout clamp also restores first, even without a signature
+    /// change, and preserves intent: a gap beyond the new end is unreachable
+    /// until the range grows again. Recording alone makes its later scroll an
+    /// echo. That restore may correct the view; the gesture ends right after,
+    /// which drops the correction, so its own end meets no gesture.
+    fn settle_eligible(&self, pending: Option<ScrollCause>) {
         self.cancel_settle_timer();
+        let pending_layout = pending == Some(ScrollCause::Layout);
         if let Some(container) = self.laid_out_container() {
             if settle_restores_first(
                 self.follow.get(),
                 self.force.get(),
                 self.sig.get(),
                 self.read_sig(&container),
-            ) {
+            ) || (pending_layout
+                && matches!(self.follow.get(), Follow::Gesture { .. })
+                && !self.force.get())
+            {
                 self.restore_position(&container);
             }
         }
-        self.end_gesture();
+        self.end_gesture(if pending_layout {
+            GesturePosition::Preserve
+        } else {
+            GesturePosition::Capture
+        });
     }
 
     /// Arm the quiet deadline, `SCROLL_SETTLE_DEBOUNCE_MS` after the reader's
@@ -1089,11 +1121,12 @@ impl HistoryScroll {
         }
     }
 
-    /// The gesture is over: where it came to rest decides the pin. Does not
+    /// The gesture is over: capture where the reader came to rest, or preserve
+    /// their intent through a pending layout clamp and record only. Does not
     /// snap. Hidden, it waits for the reveal's restore. Completing it cancels
     /// its quiet deadline: a reveal ends a gesture with no settle of its own,
     /// and a handle left behind would be taken for the next gesture's.
-    fn end_gesture(&self) {
+    fn end_gesture(&self, position: GesturePosition) {
         if !matches!(self.follow.get(), Follow::Gesture { .. }) {
             return;
         }
@@ -1104,7 +1137,10 @@ impl HistoryScroll {
         self.cancel_settle_timer();
         self.follow.set(Follow::Free);
         self.correction.set(None);
-        self.capture(&container);
+        match position {
+            GesturePosition::Capture => self.capture(&container),
+            GesturePosition::Preserve => self.record(&container),
+        }
     }
 
     /// A finger on the history stops the scroll-to-latest animation where it is:

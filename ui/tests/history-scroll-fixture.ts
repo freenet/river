@@ -671,9 +671,9 @@ type DebounceRow = { id: string; gap: number };
 type DebounceDom = {
   probe: Omit<DebounceState, "now" | "otherLookupDelegated">;
   restore(): void;
-  /// Arm the one-shot action: move `scrollTop` by `px` just before the settle
-  /// callback next fires.
-  beforeSettleFire(px: number): void;
+  /// Arm one geometry change just before the settle callback next fires: move
+  /// `scrollTop` by a distance, or remove the positioned-overhang fixture.
+  beforeSettleFire(action: number | "remove-overhang"): void;
   /// Resolve after `n` native rendering updates.
   frames(n: number): Promise<void>;
   newestVisible(): DebounceRow | null;
@@ -704,8 +704,8 @@ function debounceInitScript() {
   };
   let seq = 0;
   let armed = false;
-  /// The one-shot action's distance, while one is armed.
-  let lateMovePx: number | null = null;
+  /// Geometry to change in the same task immediately before settlement.
+  let lateMovePx: number | "remove-overhang" | null = null;
   const container = () => document.getElementById(CONTAINER_ID) as HTMLElement;
   const duringContainerScroll = (c: Element) => {
     const ev = (window as { event?: Event }).event;
@@ -759,7 +759,8 @@ function debounceInitScript() {
       const px = lateMovePx;
       lateMovePx = null;
       const topBefore = c.scrollTop;
-      c.scrollTop = topBefore + px;
+      if (px === "remove-overhang") window.__historyClamp.remove();
+      else c.scrollTop = topBefore + px;
       probe.beforeFire.push({
         handle: rec.handle,
         at: Date.now(),
@@ -917,9 +918,9 @@ export function debounceFired(state: DebounceState, from: number): DebounceRegis
 }
 
 /// Arm the one-shot action (see the section comment): just before the settle
-/// callback next fires, move the view by `px` (negative is up), with no event of
-/// its own. Its record is in `debounceState(page).beforeFire`.
-export function debounceBeforeSettleFire(page: Page, px: number) {
+/// callback next fires, move the view (negative is up) or remove the overhang,
+/// without dispatching an event. Its record is in `debounceState(page).beforeFire`.
+export function debounceBeforeSettleFire(page: Page, px: number | "remove-overhang") {
   return page.evaluate((px) => window.__riverDebounce.beforeSettleFire(px), px);
 }
 

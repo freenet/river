@@ -1,5 +1,6 @@
 import { test, expect, Page, Route } from "@playwright/test";
 import { callRiverTest } from "./river-test";
+import { clampCleanup, clampOverhang, clampRowDrift, expectFinalEndClamp } from "./history-clamp-fixture";
 import { seekClockInstall, seekClockPause } from "./history-scroll-fixture";
 import {
   FollowEntry,
@@ -52,6 +53,63 @@ const SCROLL_TOP_SLACK_PX = 2;
 /// The geometry budget for "the reader's message did not move" (as in
 /// conversation-autoscroll.spec.ts), not derived from the slack above.
 const IN_PLACE_TOLERANCE_PX = 4;
+
+test.describe("A pending layout clamp at settlement", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("a signature-unchanged clamp before scrollend preserves the parked reader (controlled order: clamp → end → scroll)", async ({ page }) => {
+    await seekClockInstall(page);
+    await openRoomAtBottom(page, "Team Chat Room");
+    for (let i = 0; i < 8; i++) await deliver(page, `clamp filler ${i}: ${"y".repeat(200)}`);
+    await afterLayoutSettles(page);
+    const overhang = await clampOverhang(page);
+    try {
+      await readerScrollsWithoutGesture(page, overhang.after.max);
+      await afterLayoutSettles(page);
+      await seekClockPause(page);
+      await followRecorderStart(page, { gateEnds: true });
+      await followMark(page, "park");
+      const move = await followReaderMove(page, -400);
+      expect(move.delivered, "premise: the reader's move reached the app").toBe(true);
+      expect(move.after - move.before, "premise: the upward move starts a held gesture").toBeCloseTo(-400, 0);
+      expect(await followAwaitAfter(page, "park", "held"), "premise: the move's end was gated").toBe(true);
+      expect(await distanceFromBottom(page), "premise: the reader is outside the follow band").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      const at = await newestVisibleRow(page);
+      expect(at, "premise: the original anchor row is visible").not.toBeNull();
+
+      const settled = await page.evaluate(() => {
+        const rec = window.__followRecorder!;
+        rec.setGate(false);
+        rec.log.push("clamp");
+        const removed = window.__historyClamp.remove();
+        const scrollsBeforeEnd = window.__historyClamp.scrolls;
+        document.getElementById("chat-scroll-container")!.dispatchEvent(new Event("scrollend"));
+        return { removed, scrollsBeforeEnd, scrollsAfterEnd: window.__historyClamp.scrolls, log: rec.log.slice() };
+      });
+      expectFinalEndClamp(settled.removed);
+      expect(settled.scrollsAfterEnd, "premise: the end ran before the clamp's scroll event").toBe(settled.scrollsBeforeEnd);
+      expect(settled.log.slice(settled.log.lastIndexOf("clamp")), "premise: the end reached the app immediately after the clamp").toEqual(["clamp", "end"]);
+      await followRealFrames(page, 3);
+      expect(await page.evaluate(() => window.__historyClamp.scrolls), "premise: the later scroll was delivered").toBeGreaterThan(settled.scrollsAfterEnd);
+      expect(await scrollTop(page), "the unreachable anchor leaves the view at the clamped end").toBeCloseTo(settled.removed.after.top, 0);
+
+      const marker = "arrival after native clamp settle";
+      await followDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
+      const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
+      expect(height, "premise: the arrival restores the lost range plus the follow band").toBeGreaterThan(500);
+      await expect.poll(() => clampRowDrift(page, at!), {
+        message: "settlement captured the clamp and followed the tall arrival",
+      }).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      await followRealFrames(page, 3);
+      expect(await clampRowDrift(page, at!), "the saved row stays at its gap after later events").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      expect(await distanceFromBottom(page), "the arrival must leave the reader parked").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    } finally {
+      await followRecorderStop(page);
+      await clampCleanup(page);
+      await page.clock.resume();
+    }
+  });
+});
 
 /// Fill Team Chat Room with tall rows and park the reader `px` above the end.
 async function parkAboveTheEnd(page: Page, px: number) {
