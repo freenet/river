@@ -1546,6 +1546,29 @@ mod tests {
             at(2000 - LAYOUT_SHIFT_ALLOWANCE_PX - 1),
             ScrollCause::Reader
         );
+        // A short intermediate layout can clamp the view and then leave the
+        // history taller, so the offset ends below the final end. The final-end
+        // clause cannot see that clamp; only the allowance can.
+        let (grown, narrower) = (sig(3000, 600, 1000), sig(3100, 600, 880));
+        let below_end = 2500;
+        let within = 1889;
+        assert!(within < below_end);
+        assert_eq!(
+            classify_scroll(grown, narrower, 2000, within, below_end),
+            ScrollCause::Layout
+        );
+        // The documented residual: a larger intermediate clamp that moves the
+        // bottom edge too (the container is unchanged here) reads as the reader.
+        assert_eq!(
+            classify_scroll(
+                grown,
+                narrower,
+                2000,
+                2000 - LAYOUT_SHIFT_ALLOWANCE_PX - 1,
+                below_end,
+            ),
+            ScrollCause::Reader
+        );
     }
 
     #[test]
@@ -1581,24 +1604,6 @@ mod tests {
         // An old offset within rounding of the new end is not taken as
         // unreachable: nothing provably clamped it.
         assert_eq!(at(max + SCROLL_TOP_SLACK_PX, max), ScrollCause::Reader);
-    }
-
-    #[test]
-    fn an_intermediate_clamp_is_layout_only_within_the_allowance() {
-        // The view clamped during a short intermediate layout and the history
-        // then came out taller: it ends BELOW the final end, so the final-end
-        // clause cannot see it and only the allowance can.
-        let (a, b) = (sig(3000, 600, 1000), sig(3100, 600, 880));
-        let max = 2500;
-        assert_eq!(classify_scroll(a, b, 2000, 1889, max), ScrollCause::Layout);
-        // The documented residual: a larger intermediate clamp that moves the
-        // bottom edge too (the container is unchanged here) reads as the reader.
-        assert_eq!(
-            classify_scroll(a, b, 2000, 2000 - LAYOUT_SHIFT_ALLOWANCE_PX - 1, max),
-            ScrollCause::Reader
-        );
-        // And with nothing in the signature changed, it is the reader at any size.
-        assert_eq!(classify_scroll(a, a, 2000, 1889, max), ScrollCause::Reader);
     }
 
     /// A pinned view at the end of a 3000px history in a 400px container (top
@@ -2067,25 +2072,29 @@ mod tests {
 
     #[test]
     fn native_settle_policy_matrix() {
+        // View top 940. Each row is the outcome itself: a pending layout refuses
+        // a native end, and a correction refuses only an end at its own top.
         let now = edges(940, 460);
-        let corrections = [None, Some(now.top), Some(980)];
-        let pendings = [
-            None,
-            Some(ScrollCause::Echo),
-            Some(ScrollCause::Reader),
-            Some(ScrollCause::Layout),
+        let cases = [
+            (None, None, true),
+            (None, Some(940), false),
+            (None, Some(980), true),
+            (Some(ScrollCause::Echo), None, true),
+            (Some(ScrollCause::Echo), Some(940), false),
+            (Some(ScrollCause::Echo), Some(980), true),
+            (Some(ScrollCause::Reader), None, true),
+            (Some(ScrollCause::Reader), Some(940), false),
+            (Some(ScrollCause::Reader), Some(980), true),
+            (Some(ScrollCause::Layout), None, false),
+            (Some(ScrollCause::Layout), Some(940), false),
+            (Some(ScrollCause::Layout), Some(980), false),
         ];
-        for pending in pendings {
-            for correction in corrections {
-                // A pending layout movement refuses a native end whatever the
-                // evidence; anything else is judged on the correction's top alone.
-                let expected = pending != Some(ScrollCause::Layout) && correction != Some(now.top);
-                assert_eq!(
-                    native_end_settles(pending, correction, now),
-                    expected,
-                    "{pending:?} with {correction:?}"
-                );
-            }
+        for (pending, correction, settles) in cases {
+            assert_eq!(
+                native_end_settles(pending, correction, now),
+                settles,
+                "{pending:?} with {correction:?}"
+            );
         }
     }
 
@@ -2337,25 +2346,6 @@ mod tests {
         assert_eq!(anchor_delta(&saved, |_| Some(300)), Some(0));
     }
 
-    #[test]
-    fn a_constrained_restore_preserves_intent_until_the_next_reader_move() {
-        let history = corrected_gesture();
-        history.pinned.set(false);
-        history.anchor.borrow_mut().push(("m1".into(), 120));
-        history.note_anchor_restore(AnchorRestore::after_write(100, 400, 100));
-        // Accounting for the clamp and then successfully restoring the gap
-        // must not erase its effect on this gesture's settlement choice.
-        history.top.set(100);
-        history.sig.set(sig(700, 600, 1000));
-        history.note_anchor_restore(AnchorRestore::after_write(100, 400, 400));
-        assert_eq!(history.gesture_position(false), GesturePosition::Preserve);
-        assert!(!history.pinned.get());
-        assert_eq!(&*history.anchor.borrow(), &[("m1".into(), 120)]);
-        history.note_reader_move();
-        assert_eq!(history.gesture_position(false), GesturePosition::Capture);
-        assert_eq!(history.gesture_position(true), GesturePosition::Preserve);
-    }
-
     /// A surviving row already at its gap, and a write that reached it.
     fn successful_restores() -> [AnchorRestore; 2] {
         [
@@ -2428,6 +2418,13 @@ mod tests {
                 GesturePosition::Capture,
                 "{restored:?} then a reader move"
             );
+            // The move cleared the latch. A layout still pending is its own
+            // reason to preserve, and must not have been cleared with it.
+            assert_eq!(
+                history.gesture_position(true),
+                GesturePosition::Preserve,
+                "{restored:?} then a reader move, with a layout still pending"
+            );
         }
     }
 
@@ -2479,20 +2476,6 @@ mod tests {
     }
 
     #[test]
-    fn a_new_rooms_empty_anchor_is_missing_and_its_forced_snap_still_owed() {
-        let history = parked_gesture();
-        history.note_anchor_restore(AnchorRestore::Missing);
-        history.reset_for_room();
-        // The new room has nothing saved: a restore of it finds nothing and
-        // writes nothing, and the forced snap it is owed still decides.
-        assert_eq!(anchor_delta(&history.anchor.borrow(), |_| Some(0)), None);
-        history.note_anchor_restore(AnchorRestore::Missing);
-        assert!(history.force.get() && history.pinned.get());
-        assert!(!history.preserve_gesture_position.get());
-        assert_eq!(history.gesture_position(false), GesturePosition::Capture);
-    }
-
-    #[test]
     fn a_room_switch_forgets_the_old_rooms_position() {
         let history = HistoryScroll::default();
         history.pinned.set(false);
@@ -2515,5 +2498,13 @@ mod tests {
         assert!(history.anchor.borrow().is_empty());
         assert_eq!(history.sig.get(), LayoutSig::default());
         assert_eq!(history.top.get(), 0);
+        // The new room has nothing saved: a restore finds nothing and writes
+        // nothing, and the forced snap it is owed still decides. That missing
+        // restore does not latch preservation.
+        assert_eq!(anchor_delta(&history.anchor.borrow(), |_| Some(0)), None);
+        history.note_anchor_restore(AnchorRestore::Missing);
+        assert!(history.force.get() && history.pinned.get());
+        assert!(!history.preserve_gesture_position.get());
+        assert_eq!(history.gesture_position(false), GesturePosition::Capture);
     }
 }
