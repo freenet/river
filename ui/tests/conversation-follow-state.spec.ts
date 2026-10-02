@@ -638,9 +638,9 @@ test.describe("An anchor correction's own scrollend", () => {
   // growing) moves the view's bottom edge and not its top, and nobody moved the
   // view; before, the end no longer matched both edges, so it settled the held
   // gesture and the observer's restore then snapped the reader. Matching now
-  // compares the top and the reader revision. The resize is made in a
-  // capture-phase listener ahead of the app's, at the correction's real end, so
-  // no observer can report it first.
+  // compares the top alone, and a reader move forgets the correction. The
+  // resize is made in a capture-phase listener ahead of the app's, at the
+  // correction's real end, so no observer can report it first.
   test("a container resize just before the correction's end keeps the gesture held (controlled order: correction → resize → its end → observer)", async ({
     page,
   }) => {
