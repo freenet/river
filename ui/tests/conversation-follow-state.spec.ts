@@ -1,10 +1,16 @@
 import { test, expect, Page, Route } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { clampCleanup, clampOverhang, clampRowDrift, expectFinalEndClamp } from "./history-clamp-fixture";
+import { clampCleanup, clampOverhang, expectFinalEndClamp } from "./history-clamp-fixture";
+import {
+  newestMessageDrift,
+  newestVisibleRow,
+  registerHistoryGeometry,
+  savedVisibleRowDrift,
+  type RowPosition,
+} from "./history-scroll-geometry";
 import { seekClockInstall, seekClockPause } from "./history-scroll-fixture";
 import {
   FollowEntry,
-  RowPosition,
   followAwaitAfter,
   followBeforeSettleFire,
   followDeliver,
@@ -24,8 +30,6 @@ import {
   followSettleRecord,
   followTimeline,
   followUngate,
-  newestVisibleRow,
-  rowDrift,
 } from "./history-follow-fixture";
 import {
   missingAnchorDrift,
@@ -60,6 +64,10 @@ const SCROLL_TOP_SLACK_PX = 2;
 /// The geometry budget for "the reader's message did not move" (as in
 /// conversation-autoscroll.spec.ts), not derived from the slack above.
 const IN_PLACE_TOLERANCE_PX = 4;
+
+test.beforeEach(async ({ page }) => {
+  await registerHistoryGeometry(page);
+});
 
 test.describe("A pending layout clamp at settlement", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
@@ -121,11 +129,11 @@ test.describe("A pending layout clamp at settlement", () => {
         await followDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
         const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
         expect(height, "premise: the arrival restores the lost range plus the follow band").toBeGreaterThan(500);
-        await expect.poll(() => clampRowDrift(page, at!), {
+        await expect.poll(() => savedVisibleRowDrift(page, at!), {
           message: "settlement captured the clamp and followed the tall arrival",
         }).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
         await followRealFrames(page, 3);
-        expect(await clampRowDrift(page, at!), "the saved row stays at its gap after later events").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+        expect(await savedVisibleRowDrift(page, at!), "the saved row stays at its gap after later events").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
         expect(await distanceFromBottom(page), "the arrival must leave the reader parked").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
       } finally {
         await followRecorderStop(page);
@@ -199,7 +207,7 @@ test.describe("An unreachable anchor on mobile reveal", () => {
         const marker = "tall arrival after hidden clamp";
         await followDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
         expect(await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(500);
-        expect(await clampRowDrift(page, at!), "reveal captured the clamp and followed the tall arrival").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+        expect(await savedVisibleRowDrift(page, at!), "reveal captured the clamp and followed the tall arrival").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
         expect(await distanceFromBottom(page)).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
       } finally {
         await followRecorderStop(page);
@@ -212,13 +220,13 @@ test.describe("An unreachable anchor on mobile reveal", () => {
 
 /// The row is back at its gap, and stays there for five samples over 500ms.
 async function expectRowHeld(page: Page, before: { id: string; gap: number }, why: string) {
-  await expect.poll(() => rowDrift(page, before), { timeout: 5_000, message: why }).toBeLessThanOrEqual(
+  await expect.poll(() => newestMessageDrift(page, before), { timeout: 5_000, message: why }).toBeLessThanOrEqual(
     IN_PLACE_TOLERANCE_PX,
   );
   const drifts: number[] = [];
   for (let i = 0; i < 5; i++) {
     await page.waitForTimeout(100);
-    drifts.push(await rowDrift(page, before));
+    drifts.push(await newestMessageDrift(page, before));
   }
   expect(Math.max(...drifts), `${why} (then drifted: ${drifts.join(", ")})`).toBeLessThanOrEqual(
     IN_PLACE_TOLERANCE_PX,
@@ -481,7 +489,7 @@ async function correctedHeldGesture(
     Math.abs(correction - GROW_PX),
     `premise: the restore corrected the view by the growth (${correction}px; ${log})`,
   ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
-  expect(await rowDrift(page, at), `premise: the correction put the reader's message back (${log})`).toBeLessThanOrEqual(
+  expect(await newestMessageDrift(page, at), `premise: the correction put the reader's message back (${log})`).toBeLessThanOrEqual(
     IN_PLACE_TOLERANCE_PX,
   );
   test.info().annotations.push({
@@ -617,7 +625,7 @@ test.describe("An anchor correction's own scrollend", () => {
       await page.clock.runFor(late.at + QUIET_MS - 1 - after.now);
       await followRealFrames(page, 2);
       expect((await followSettleRecord(page)).settle.filter((t) => t.fired !== null).length, "the gesture settled early").toBe(1);
-      expect(await rowDrift(page, at!), "the hold let go before the fresh deadline").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      expect(await newestMessageDrift(page, at!), "the hold let go before the fresh deadline").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
       const beforeSettle = await scrollTop(page);
       await page.clock.runFor(1);
       await followRealFrames(page, 2);
@@ -676,7 +684,7 @@ test.describe("An anchor correction's own scrollend", () => {
       );
 
       expect(
-        await rowDrift(page, at),
+        await newestMessageDrift(page, at),
         `the resized correction's end settled the held gesture, and the observer's restore then snapped the reader (${what})`,
       ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
       await expectShortArrivalHeld(page, at);
@@ -715,14 +723,14 @@ test.describe("An anchor correction's own scrollend", () => {
       expect(resize.before.top - resize.after.top, "premise: container growth clamped scrollTop").toBeGreaterThan(SCROLL_TOP_SLACK_PX);
       expect(resize.after.top + resize.after.height - resize.before.top - resize.before.height, "premise: the bottom edge changed too").toBeGreaterThan(SCROLL_TOP_SLACK_PX);
       expect(await distanceFromBottom(page), "premise: the reader remains inside the follow band").toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
-      expect(await rowDrift(page, at), `the growth clamp accepted the correction's own end and released the hold (${what})`).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      expect(await newestMessageDrift(page, at), `the growth clamp accepted the correction's own end and released the hold (${what})`).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
       const armed = await followSettleRecord(page);
       const pending = armed.settle.filter((t) => t.cleared === null && t.fired === null);
       expect(pending, "the refused end arms one quiet deadline").toHaveLength(1);
       expect(pending[0].delay, "layout does not restart reader quiet time").toBe(QUIET_MS - READER_QUIET_MS);
       await expectShortArrivalHeld(page, at);
       await page.clock.runFor(QUIET_MS - READER_QUIET_MS - 1);
-      expect(await rowDrift(page, at), "the hold lasts until the reader's deadline").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      expect(await newestMessageDrift(page, at), "the hold lasts until the reader's deadline").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
       await page.clock.runFor(1);
       await followDeliver(page, "arrival after the growth clamp deadline");
       await expectSettledAtBottom(page, "legitimate quiet settlement resumes in-band following");
@@ -777,7 +785,7 @@ test.describe("An anchor correction's own scrollend", () => {
       ).toMatch(/^container grow end (held )*scroll\b.*\bobserved\b/);
 
       expect(
-        await rowDrift(page, at),
+        await newestMessageDrift(page, at),
         `the growth clamp's own end settled the held gesture with no correction to refuse it, and the observer's restore then snapped the reader (${what})`,
       ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
       const armed = await followSettleRecord(page);
@@ -792,7 +800,7 @@ test.describe("An anchor correction's own scrollend", () => {
       await page.clock.runFor(QUIET_MS - READER_QUIET_MS - 1);
       await followRealFrames(page, 2);
       expect((await followSettleRecord(page)).settle.filter((t) => t.fired !== null), "the gesture settled early").toEqual([]);
-      expect(await rowDrift(page, at), "the hold lasts until the reader's deadline").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      expect(await newestMessageDrift(page, at), "the hold lasts until the reader's deadline").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
       await page.clock.runFor(1);
       await followRealFrames(page, 2);
       expect(
@@ -955,12 +963,10 @@ test.describe("An anchor correction's own scrollend", () => {
         const c = document.getElementById("chat-scroll-container")!;
         const rec = window.__followRecorder!;
         const probe = (window as unknown as { __followProbe: { lastScroll: number; live: boolean } }).__followProbe;
+        const geo = window.__riverHistoryGeometry;
+        if (!geo) throw new Error("history geometry is not installed");
+        const at = geo.newestVisible(c);
         const box = c.getBoundingClientRect();
-        let at: { id: string; gap: number } | null = null;
-        for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
-          const r = row.getBoundingClientRect();
-          if (r.bottom > box.top && r.top < box.bottom) at = { id: row.id, gap: box.bottom - r.top };
-        }
         const above = Array.from(c.querySelectorAll<HTMLElement>('[id^="msg-"]'))
           .filter((r) => r.getBoundingClientRect().bottom < box.top)
           .at(-1)!;
@@ -1008,7 +1014,7 @@ test.describe("An anchor correction's own scrollend", () => {
       }, GROW_PX);
       await afterLayoutSettles(page);
       const log = await followLog(page);
-      const drift = await rowDrift(page, run.at!);
+      const drift = await newestMessageDrift(page, run.at!);
       const distance = await distanceFromBottom(page);
       const t = (v: number | null) => (v === null ? "none" : `${v - run.lastReader}ms`);
       const timeline =
@@ -1398,7 +1404,7 @@ test.describe("A settle before the observer reports a reflow above the reader", 
       const { at, what } = await settleBeforeObserver(page, PARKED_UP_PX);
       await followRealFrames(page, 3);
       expect(
-        await rowDrift(page, at),
+        await newestMessageDrift(page, at),
         `the settle measured the reflowed rows before putting the anchor back, so the reader's message moved (${what})`,
       ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
       expect(await distanceFromBottom(page), `premise: the reader is outside the band (${what})`).toBeGreaterThan(
@@ -1471,13 +1477,9 @@ test.describe("A settle before the observer reports a reflow above the reader", 
           const row = img.closest<HTMLElement>('[id^="msg-"]')!;
           const events: ProbeEvent[] = [];
           const newest = () => {
-            const view = c.getBoundingClientRect();
-            let at: { id: string; gap: number } | null = null;
-            for (const r of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
-              const b = r.getBoundingClientRect();
-              if (b.bottom > view.top && b.top < view.bottom) at = { id: r.id, gap: view.bottom - b.top };
-            }
-            return at;
+            const geo = window.__riverHistoryGeometry;
+            if (!geo) throw new Error("history geometry is not installed");
+            return geo.newestVisible(c);
           };
           const push = (kind: string) =>
             events.push({

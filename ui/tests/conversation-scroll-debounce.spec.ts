@@ -1,6 +1,7 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { clampCleanup, clampOverhang, clampRowDrift, expectFinalEndClamp } from "./history-clamp-fixture";
+import { clampCleanup, clampOverhang, expectFinalEndClamp } from "./history-clamp-fixture";
+import { savedVisibleRowDrift } from "./history-scroll-geometry";
 import {
   DEBOUNCE_SETTLE_MS,
   debounceAdvance,
@@ -152,7 +153,7 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
         await debounceDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
         const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
         expect(height, "premise: the arrival restores the lost range plus the follow band").toBeGreaterThan(500);
-        expect(await clampRowDrift(page, at), "the quiet deadline captured the clamp and followed the tall arrival").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+        expect(await savedVisibleRowDrift(page, at), "the quiet deadline captured the clamp and followed the tall arrival").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
         expect(await distanceFromBottom(page), "the arrival must leave the reader parked").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
       } finally {
         await clampCleanup(page);

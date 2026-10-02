@@ -1,6 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { newestVisibleRow, rowDrift } from "./history-follow-fixture";
+import { newestMessageDrift, newestVisibleRow, registerHistoryGeometry } from "./history-scroll-geometry";
 import {
   BOTTOM_THRESHOLD_PX,
   afterLayoutSettles,
@@ -30,6 +30,10 @@ const SCROLL_TOP_SLACK_PX = 2;
 /// The geometry budget for "the reader's message did not move", as in
 /// conversation-follow-state.spec.ts.
 const IN_PLACE_TOLERANCE_PX = 4;
+
+test.beforeEach(async ({ page }) => {
+  await registerHistoryGeometry(page);
+});
 
 /// One line of the seek takeover diagnostic's log.
 type SeekEndEvent = { kind: "scroll" | "end" | "wheel" | "touch" | "deliver"; t: number; top: number; left: number };
@@ -132,7 +136,7 @@ test.describe("A seek frame's end after the reader takes over", () => {
         });
         await followDeliverOwnClock(page);
         await afterLayoutSettles(page);
-        const drift = at ? await rowDrift(page, at) : Infinity;
+        const drift = at ? await newestMessageDrift(page, at) : Infinity;
         const full = await page.evaluate(() => (window as unknown as { __seekEnd: SeekEndEvent[] }).__seekEnd);
         // Up to the arrival: its own snap is no part of the question.
         const log = full.slice(0, full.findIndex((e) => e.kind === "deliver"));

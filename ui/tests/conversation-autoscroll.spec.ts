@@ -1,6 +1,14 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { selectListedRoom } from "./example-room";
+import {
+  newestMessageDrift,
+  newestVisibleRow,
+  registerHistoryGeometry,
+  savedRowDrift,
+  savedRowPosition,
+  type RowPosition,
+} from "./history-scroll-geometry";
 import { gateScrollendExpectOrder, gateScrollendGesture, gateScrollendTimeline } from "./history-scroll-fixture";
 import {
   AT_BOTTOM_EPSILON_PX,
@@ -106,13 +114,9 @@ function installScrollHelpers() {
   const HISTORY = '[data-testid="conversation-history"]';
   const helpers: ScrollHelpers = {
     newestVisible(c) {
-      const box = c.getBoundingClientRect();
-      let found: RowPosition | null = null;
-      for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
-        const r = row.getBoundingClientRect();
-        if (r.bottom > box.top && r.top < box.bottom) found = { id: row.id, gap: box.bottom - r.top };
-      }
-      return found;
+      const geo = window.__riverHistoryGeometry;
+      if (!geo) throw new Error("history geometry is not installed");
+      return geo.newestVisible(c);
     },
     rowWithText(text) {
       const rows = document.querySelectorAll<HTMLElement>(`${HISTORY} [id^="msg-"]`);
@@ -134,6 +138,7 @@ function installScrollHelpers() {
 
 // Before every navigation of every test, so each evaluation can rely on it.
 test.beforeEach(async ({ page }) => {
+  await registerHistoryGeometry(page);
   await page.addInitScript(installScrollHelpers);
 });
 
@@ -184,10 +189,7 @@ async function expectStaysPut(page: Page, why: string) {
 /// The newest history message with any part inside the scroll container, and
 /// how far its top sits above the container's bottom edge.
 function newestVisibleMessage(page: Page): Promise<RowPosition | null> {
-  return page.evaluate(() => {
-    const c = document.getElementById("chat-scroll-container");
-    return c ? window.__riverScroll.newestVisible(c) : null;
-  });
+  return newestVisibleRow(page);
 }
 
 /// The geometry budget for "the reader's message did not move", in CSS px.
@@ -200,28 +202,17 @@ function newestVisibleMessage(page: Page): Promise<RowPosition | null> {
 /// measured drift rather than widening this.
 const IN_PLACE_TOLERANCE_PX = 4;
 
-type RowPosition = { id: string; gap: number };
-
 /// The gap from the container's bottom edge to the top of the row whose DOM id
-/// is `id`, or null when that row is not on the page.
-function rowGap(page: Page, id: string): Promise<number | null> {
-  return page.evaluate((rowId) => {
-    const c = document.getElementById("chat-scroll-container");
-    const row = document.getElementById(rowId);
-    if (!c || !row || !c.contains(row)) return null;
-    return c.getBoundingClientRect().bottom - row.getBoundingClientRect().top;
-  }, id);
+/// is `id`, or null when that row is missing or outside the container.
+async function rowGap(page: Page, id: string): Promise<number | null> {
+  return (await savedRowPosition(page, id))?.gap ?? null;
 }
 
-/// How far a remembered position has drifted, identity and gap read in ONE
-/// evaluation. Infinity when the row is gone, or (with `newest`) when another
-/// message is now the newest visible one: a missing row is a failure, never a
-/// zero drift.
-async function positionDrift(page: Page, before: RowPosition, newest: boolean): Promise<number> {
-  const now = newest
-    ? await newestVisibleMessage(page)
-    : { id: before.id, gap: await rowGap(page, before.id) };
-  return now?.id === before.id && now.gap !== null ? Math.abs(now.gap - before.gap) : Infinity;
+/// How far a remembered position has drifted. Infinity when the row is gone, or
+/// (with `newest`) when another message is now the newest visible one: a
+/// missing row is a failure, never a zero drift.
+function positionDrift(page: Page, before: RowPosition, newest: boolean): Promise<number> {
+  return newest ? newestMessageDrift(page, before) : savedRowDrift(page, before);
 }
 
 /// `before`'s row is back at its gap. `newest` (the default) also requires it to

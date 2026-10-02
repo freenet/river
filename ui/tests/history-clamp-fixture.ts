@@ -82,18 +82,3 @@ export function expectFinalEndClamp(record: ClampRecord) {
 export async function clampCleanup(page: Page) {
   await page.evaluate(() => window.__historyClamp?.cleanup());
 }
-
-// An arrival can fill the blank overhang area with a newer visible row while
-// the saved row stays exactly in place. Compare the saved identity and gap,
-// rather than requiring it to remain the newest visible message.
-export function clampRowDrift(page: Page, at: { id: string; gap: number }) {
-  return page.evaluate(({ id, gap }) => {
-    const c = document.getElementById("chat-scroll-container")!;
-    const row = document.getElementById(id);
-    if (!row || !c.contains(row)) return Infinity;
-    const view = c.getBoundingClientRect();
-    const rect = row.getBoundingClientRect();
-    if (rect.bottom <= view.top || rect.top >= view.bottom) return Infinity;
-    return Math.abs(view.bottom - rect.top - gap);
-  }, at);
-}

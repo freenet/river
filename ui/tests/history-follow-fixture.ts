@@ -580,27 +580,3 @@ export function followTimeline(entries: FollowEntry[]): string {
     })
     .join(" ");
 }
-
-/// The newest message row with any part in view, and its top's gap above the
-/// container's bottom edge.
-export type RowPosition = { id: string; gap: number };
-
-export function newestVisibleRow(page: Page): Promise<RowPosition | null> {
-  return page.evaluate(() => {
-    const c = document.getElementById("chat-scroll-container")!;
-    const box = c.getBoundingClientRect();
-    let found: { id: string; gap: number } | null = null;
-    for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
-      const r = row.getBoundingClientRect();
-      if (r.bottom > box.top && r.top < box.bottom) found = { id: row.id, gap: box.bottom - r.top };
-    }
-    return found;
-  });
-}
-
-/// How far `before`'s row has moved from its gap; Infinity once another row is
-/// the newest visible one, or it is gone.
-export async function rowDrift(page: Page, before: RowPosition): Promise<number> {
-  const now = await newestVisibleRow(page);
-  return now?.id === before.id ? Math.abs(now.gap - before.gap) : Infinity;
-}

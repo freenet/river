@@ -1,6 +1,7 @@
 import { expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { fillHistory, openRoomAtBottom } from "./history-scroll-helpers";
+import { ensureHistoryGeometry, newestMessageDrift, registerHistoryGeometry } from "./history-scroll-geometry";
 
 // Browser-test utilities for the history-scroll specs, in three sections:
 //
@@ -13,7 +14,8 @@ import { fillHistory, openRoomAtBottom } from "./history-scroll-helpers";
 //
 // Nothing here writes application state or implements a follow policy. The
 // in-page parts (anything passed to `page.evaluate` or `addInitScript`) must be
-// self-contained, so each section keeps its own small DOM helpers. Their
+// self-contained. Message geometry is the shared namespace, resolved when a
+// read runs; each section keeps its own clock, gate, and timer helpers. Their
 // frame waits differ on purpose: the seek clock captures the native
 // `requestAnimationFrame` before installing the clock, settle ordering runs on
 // the real clock, and the debounce section, whose clock fakes
@@ -408,20 +410,16 @@ function gateScrollendInPage(plan: GateScrollendPlan): Promise<GateScrollendRun>
     let done = false;
     const timers: number[] = [];
 
+    const geometry = () => {
+      const geo = window.__riverHistoryGeometry;
+      if (!geo) throw new Error("history geometry is not installed");
+      return geo;
+    };
     const gapOf = (id: string) => {
-      const row = document.getElementById(id);
-      if (!row || !c.contains(row)) return null;
-      return { id, gap: c.getBoundingClientRect().bottom - row.getBoundingClientRect().top };
+      const row = geometry().positionOf(c, id);
+      return row ? { id: row.id, gap: row.gap } : null;
     };
-    const newestVisible = () => {
-      const box = c.getBoundingClientRect();
-      let found: { id: string; gap: number } | null = null;
-      for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
-        const r = row.getBoundingClientRect();
-        if (r.bottom > box.top && r.top < box.bottom) found = { id: row.id, gap: box.bottom - r.top };
-      }
-      return found;
-    };
+    const newestVisible = () => geometry().newestVisible(c);
     const marker = "text" in plan ? plan.text.slice(0, 40) : null;
     const landed = () =>
       marker !== null &&
@@ -531,6 +529,7 @@ function gateScrollendInPage(plan: GateScrollendPlan): Promise<GateScrollendRun>
 /// Run one controlled gesture (see the section comment). Every listener,
 /// observer and timer it installs is removed before it returns, whatever happens.
 export async function gateScrollendGesture(page: Page, plan: GateScrollendPlan): Promise<GateScrollendRun> {
+  await ensureHistoryGeometry(page);
   try {
     return await page.evaluate(gateScrollendInPage, plan);
   } finally {
@@ -849,14 +848,11 @@ function debounceInitScript() {
       for (let i = 0; i < n; i++) await frame();
     },
     newestVisible() {
+      const geo = window.__riverHistoryGeometry;
+      if (!geo) throw new Error("history geometry is not installed");
       const c = container();
-      const box = c.getBoundingClientRect();
-      let found: DebounceRow | null = null;
-      for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
-        const r = row.getBoundingClientRect();
-        if (r.bottom > box.top && r.top < box.bottom) found = { id: row.id, gap: box.bottom - r.top };
-      }
-      return found;
+      if (!c) throw new Error("history geometry: chat scroll container is missing");
+      return geo.newestVisible(c);
     },
     async scrollTo(top) {
       const c = container();
@@ -877,6 +873,7 @@ function debounceInitScript() {
 
 /// Select the fallback and take over the clock. Call before the first navigation.
 export async function debounceUseFallback(page: Page) {
+  await registerHistoryGeometry(page);
   await page.addInitScript(debounceInitScript);
   await page.clock.install();
 }
@@ -978,9 +975,8 @@ export function debounceScrollTo(page: Page, top: number) {
 
 /// How far `before`'s row has moved from its gap; Infinity when it is gone or is
 /// no longer the newest visible message.
-export async function debounceDrift(page: Page, before: DebounceRow): Promise<number> {
-  const now = await page.evaluate(() => window.__riverDebounce.newestVisible());
-  return now?.id === before.id ? Math.abs(now.gap - before.gap) : Infinity;
+export function debounceDrift(page: Page, before: DebounceRow): Promise<number> {
+  return newestMessageDrift(page, before);
 }
 
 /// Deliver an inbound message on a paused clock: request it, run the deferred
