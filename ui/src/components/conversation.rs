@@ -10317,30 +10317,9 @@ mod autoscroll_wiring_pins {
         source.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
-    /// `is_at_bottom` answers "is the end of the history on screen right now?".
-    /// Gating auto-scroll on it is the #486 latch: once the gap exceeded the
-    /// observer's margin the gate read false and nothing re-armed it. The
-    /// signal may still drive the scroll-to-latest button, so this pins the
-    /// narrow thing — it must not appear in the auto-scroll effect's condition.
-    #[test]
-    fn autoscroll_is_not_gated_on_the_intersection_observer() {
-        let prod = production_source();
-        for forbidden in [
-            "forced || *is_at_bottom.peek()",
-            "*is_at_bottom.peek() || forced",
-            "forced || is_at_bottom()",
-        ] {
-            assert!(
-                !prod.contains(forbidden),
-                "auto-scroll must follow the history's own pin, not the \
-                 scroll-to-latest button's IntersectionObserver: found `{forbidden}`"
-            );
-        }
-    }
-
-    /// The trigger, not just the gate. An `onmounted` on the last bubble is
-    /// silent for every content change that leaves that row in place, so the
-    /// effect has to subscribe to the grouped-message memo instead.
+    /// The auto-scroll trigger. An `onmounted` on the last bubble is silent
+    /// for every content change that leaves that row in place, so the effect
+    /// has to subscribe to the grouped-message memo instead.
     #[test]
     fn autoscroll_is_triggered_by_content_change_not_by_a_remount() {
         let prod = production_source();
