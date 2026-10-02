@@ -103,12 +103,22 @@
 //!
 //! # Where capture runs
 //!
-//! A `scroll` classified as the reader's (from the listener or taken in early,
-//! below), a gesture's settle unless a pending layout clamp, or a restore in
-//! the gesture that was constrained or found no saved row, requires
-//! preservation, and a touch that stops a seek. The last two capture
-//! directly, never through `on_scroll`:
-//! the position has usually been recorded already and would classify as an echo.
+//! Capture runs for a `scroll` classified as the reader's, whether the listener
+//! delivers it or it is taken in early (below), unless it leaves a seek running:
+//! that one is only recorded. It also runs directly, never through `on_scroll`,
+//! for a touch that stops a seek and for a gesture's settle (including the one
+//! a reveal's restore finishes) that preserves nothing. Their position has
+//! usually been recorded already and would classify as an echo.
+//!
+//! A settle preserves instead, keeping the saved anchor and pin, in two cases.
+//! One is a layout clamp it finds pending (only the quiet deadline settles over
+//! one: a native end that finds it is refused). The other is latched: an anchor
+//! restore during the gesture that was constrained or found no saved row. The
+//! latch holds even when the layout's `scroll` was delivered and recorded before
+//! the settle, so nothing is pending then, and a later successful restore does
+//! not clear it. A reader move does, as does the gesture ending or being
+//! replaced (a room switch, a forced snap, a new seek). A preserving settle may
+//! restore first, as any settle may, but then only records geometry.
 //!
 //! # Classifying a `scroll` event (`classify_scroll`)
 //!
