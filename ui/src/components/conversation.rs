@@ -10376,14 +10376,17 @@ mod autoscroll_wiring_pins {
     /// A trim is only invisible at the exact bottom, and only when the trimmed
     /// tail would not re-fire the backfill (#505). Loosening either gate yanks
     /// a reader parked in the pin band, or oscillates trim against backfill.
+    /// `view_at_end` is `at_end`, whose slack is pinned by its own unit test.
     #[test]
     fn the_trim_stays_gated_at_the_bottom() {
         assert!(
             dense(history_source()).contains(
-                "distance<=SCROLL_TOP_SLACK_PXasf64&&trim.window_overgrown.get()&&!trim_would_rearm_backfill("
+                "letSome(trim)=hooks.as_ref().filter(|h|h.window_overgrown.get())else{return;};\
+                 ifview_at_end(container)&&!trim_would_rearm_backfill("
             ),
-            "the trim must need distance <= SCROLL_TOP_SLACK_PX, an overgrown \
-             window, and a tail that does not re-arm the backfill"
+            "the trim must need an overgrown window, the view within \
+             SCROLL_TOP_SLACK_PX of the end, and a tail that does not re-arm \
+             the backfill"
         );
     }
 

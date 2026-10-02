@@ -814,10 +814,19 @@ impl HistoryScroll {
     }
 
     /// Take the reader's position as the new truth (see "Where capture runs").
+    ///
+    /// At the live end (within rounding, not the pin band) it saves no rows:
+    /// every caller leaves the follow `Free` there, and a pinned `Free` restore
+    /// snaps without reading them. Rows are needed only once the reader is
+    /// unpinned or holding a gesture, and either takes a capture away from the
+    /// end, which saves fresh ones. Inside the band a held gesture still needs
+    /// them, so only the exact end skips.
     fn capture(&self, container: &web_sys::Element) {
-        let distance = (max_scroll_top(container) - container.scroll_top()) as f64;
-        self.pinned.set(is_pinned(distance));
-        if let Some(list) = self.rows.borrow().as_ref() {
+        let (top, max) = (container.scroll_top(), max_scroll_top(container));
+        self.pinned.set(is_pinned((max - top) as f64));
+        if at_end(top, max) {
+            self.anchor.borrow_mut().clear();
+        } else if let Some(list) = self.rows.borrow().as_ref() {
             // Relative to the container, the frame `newest_visible_rows` works in.
             // Each call is a layout read, and the search makes few of them.
             let view = container.get_bounding_client_rect();
@@ -859,30 +868,31 @@ impl HistoryScroll {
     /// the two oscillate at render speed (#505; see `trim_would_rearm_backfill`).
     ///
     /// Runs from a reader's capture, from an echo (a follower's snap), and from
-    /// the scroll-to-latest animation arriving.
+    /// the scroll-to-latest animation arriving. Nothing to trim (not installed,
+    /// or the window has not grown past its initial size) reads no geometry.
     fn trim_at_bottom(&self, container: &web_sys::Element) {
-        let distance = (max_scroll_top(container) - container.scroll_top()) as f64;
-        if let Some(trim) = self.hooks.borrow().as_ref() {
-            if distance <= SCROLL_TOP_SLACK_PX as f64
-                && trim.window_overgrown.get()
-                && !trim_would_rearm_backfill(
-                    container.scroll_height(),
-                    container.client_height(),
-                    trim.window_rendered.get(),
-                    INITIAL_WINDOW_ITEMS,
-                )
-            {
-                trim.window_overgrown.set(false);
-                let window_anchor = trim.window_anchor.clone();
-                let mut window_items = trim.window_items;
-                // Deferred: this runs from a raw JS callback with no Dioxus scope,
-                // and `window_items` is a signal the render subscribes to. See
-                // .claude/rules/dioxus-signal-safety.md.
-                crate::util::defer(move || {
-                    *window_anchor.borrow_mut() = None;
-                    window_items.set(INITIAL_WINDOW_ITEMS);
-                });
-            }
+        let hooks = self.hooks.borrow();
+        let Some(trim) = hooks.as_ref().filter(|h| h.window_overgrown.get()) else {
+            return;
+        };
+        if view_at_end(container)
+            && !trim_would_rearm_backfill(
+                container.scroll_height(),
+                container.client_height(),
+                trim.window_rendered.get(),
+                INITIAL_WINDOW_ITEMS,
+            )
+        {
+            trim.window_overgrown.set(false);
+            let window_anchor = trim.window_anchor.clone();
+            let mut window_items = trim.window_items;
+            // Deferred: this runs from a raw JS callback with no Dioxus scope,
+            // and `window_items` is a signal the render subscribes to. See
+            // .claude/rules/dioxus-signal-safety.md.
+            crate::util::defer(move || {
+                *window_anchor.borrow_mut() = None;
+                window_items.set(INITIAL_WINDOW_ITEMS);
+            });
         }
     }
 
@@ -1220,6 +1230,11 @@ impl HistoryScroll {
     /// gesture.
     fn settle_eligible(&self, pending: Option<ScrollCause>) {
         self.cancel_settle_timer();
+        // No gesture, nothing to settle (a stale end): no layout to read. After
+        // the caller's take-in, which can be what started the gesture.
+        if !matches!(self.follow.get(), Follow::Gesture { .. }) {
+            return;
+        }
         let pending_layout = pending == Some(ScrollCause::Layout);
         if let Some(container) = self.laid_out_container() {
             if settle_restores_first(
