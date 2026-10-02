@@ -3006,7 +3006,11 @@ pub fn Conversation() -> Element {
 
     // Memoize expensive message grouping (decryption + markdown parsing)
     // This prevents re-computing on every render/keystroke
-    // Returns (groups, self_member_id, member_names) so we can highlight user's reactions and show names in tooltips
+    // Returns (groups, self_member_id, member_names) so we can highlight user's reactions and show names in tooltips.
+    // `member_names` is behind an `Rc` so every message group shares this
+    // pass's map instead of deep-copying it per row and per group render. It is
+    // never mutated after this point; a later pass builds a fresh map, and the
+    // memo's (and the group props') `PartialEq` still compares contents.
     let message_groups = use_memo(move || {
         // Anchor FIRST: a contended `ROOMS.try_read()` below registers no
         // subscription (dioxus-signals `signal.rs:409` returns before
@@ -3109,7 +3113,7 @@ pub fn Conversation() -> Element {
                             fallback_now: Utc::now(),
                         },
                     );
-                    return Some((groups, self_member_id, member_names));
+                    return Some((groups, self_member_id, Rc::new(member_names)));
                 }
             }
         }
@@ -4218,7 +4222,8 @@ pub fn Conversation() -> Element {
                                     );
                                     let groups = groups[history_window.start..].to_vec();
                                     let self_member_id = *self_member_id;
-                                    let member_names = member_names.clone();
+                                    // A handle, not the map: see the memo.
+                                    let member_names = Rc::clone(member_names);
                                     // Room limits for the in-place edit form's
                                     // encoded-size gate (same measure the
                                     // contract enforces on the edit action).
@@ -4351,7 +4356,6 @@ pub fn Conversation() -> Element {
                                                 move |row| {
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let handle_edit_message = handle_edit_message.clone();
-                                                let member_names = member_names.clone();
                                                 match row {
                                                     DisplayRow::DateSeparator { key, label } => rsx! {
                                                         div {
@@ -4391,7 +4395,9 @@ pub fn Conversation() -> Element {
                                                                 MessageGroupComponent {
                                                                 group: group,
                                                                 self_member_id: self_member_id,
-                                                                member_names: member_names,
+                                                                // Only message groups take the names;
+                                                                // separator and event rows never did.
+                                                                member_names: Rc::clone(&member_names),
                                                                 max_message_size: edit_max_size,
                                                                 is_private: edit_is_private,
                                                                 edit_trigger: edit_trigger,
@@ -4814,7 +4820,9 @@ fn MessageGroupComponent(
     /// yourself from the @mention list), and each degrades to the "not me"
     /// answer.
     self_member_id: Option<MemberId>,
-    member_names: HashMap<MemberId, String>,
+    /// Shared with every other group from the same grouping pass (see the
+    /// `message_groups` memo). Read-only here.
+    member_names: Rc<HashMap<MemberId, String>>,
     /// Room max message size in ENCODED content bytes — bounds the edit
     /// action body (`RoomMessageBody::measure_edit`), not the raw text.
     max_message_size: usize,
@@ -4885,25 +4893,6 @@ fn MessageGroupComponent(
     // composer in message_input.rs). One signal suffices: at most one message
     // in this group is edited at a time.
     let mut edit_mention = use_signal(|| None as Option<mention::MentionAutocomplete>);
-
-    // Mentionable members for the edit form's @ autocomplete: every member with
-    // a (decrypted) nickname except self, sorted by name — the same shape the
-    // composer receives, derived from `member_names` so no extra prop plumbing.
-    let edit_mention_members: Vec<(MemberId, String)> = {
-        let mut v: Vec<(MemberId, String)> = member_names
-            .iter()
-            // With no known identity there is no "yourself" to exclude, so the
-            // list keeps every member. Over-inclusive, never wrong: excluding
-            // an arbitrary member would silently make them unmentionable.
-            .filter(|(id, _)| Some(**id) != self_member_id)
-            // `display_nickname` never returns an empty string, so the old
-            // is-empty filter became dead: the placeholder is what to exclude.
-            .filter(|(_, name)| *name != crate::util::display_name::UNNAMED)
-            .map(|(id, name)| (*id, name.clone()))
-            .collect();
-        v.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-        v
-    };
 
     // Watch for external edit requests (e.g. up-arrow in empty input)
     let message_ids: Vec<String> = group.messages.iter().map(|m| m.id.clone()).collect();
@@ -5053,7 +5042,33 @@ fn MessageGroupComponent(
                                             let pick_id = edit_id.clone();
                                             let kd_id = edit_id.clone();
                                             let input_id = edit_id.clone();
-                                            let input_members = edit_mention_members.clone();
+                                            // Mentionable members for the edit form's @
+                                            // autocomplete: every member with a (decrypted)
+                                            // nickname except self, sorted by name — the same
+                                            // shape the composer receives, derived from
+                                            // `member_names` so no extra prop plumbing. Built
+                                            // here, only for the message being edited, rather
+                                            // than for every group on every render. Inline,
+                                            // not a memo: its inputs are props, which a memo
+                                            // would not track.
+                                            let input_members: Vec<(MemberId, String)> = {
+                                                let mut v: Vec<(MemberId, String)> = member_names
+                                                    .iter()
+                                                    // With no known identity there is no "yourself" to
+                                                    // exclude, so the list keeps every member.
+                                                    // Over-inclusive, never wrong: excluding an
+                                                    // arbitrary member would silently make them
+                                                    // unmentionable.
+                                                    .filter(|(id, _)| Some(**id) != self_member_id)
+                                                    // `display_nickname` never returns an empty string,
+                                                    // so the old is-empty filter became dead: the
+                                                    // placeholder is what to exclude.
+                                                    .filter(|(_, name)| *name != crate::util::display_name::UNNAMED)
+                                                    .map(|(id, name)| (*id, name.clone()))
+                                                    .collect();
+                                                v.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                                                v
+                                            };
                                             rsx! {
                                                 div {
                                                     class: format!(
