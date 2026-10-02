@@ -11,6 +11,9 @@ import { waitForApp, selectRoom } from "./example-room";
 // timer. Those return NaN when `#chat-scroll-container` is missing, so a caller
 // comparing two reads for equality must first rule NaN out.
 
+/// Matches BOTTOM_THRESHOLD_PX in ui/src/components/conversation.rs.
+export const BOTTOM_THRESHOLD_PX = 100;
+
 /// Slack for fractional layout after a scroll that did land at the bottom.
 export const AT_BOTTOM_EPSILON_PX = 4;
 
@@ -88,6 +91,25 @@ export async function openRoomAtBottom(page: Page, roomName: string, path = "/")
   // asserted since a hidden panel would make every geometry read below return 0.
   await expect(page.locator("#chat-scroll-container")).toBeVisible({ timeout: 5_000 });
   await expectSettledAtBottom(page, "opening a room should land on its newest message");
+}
+
+/// Fill Team Chat Room with tall rows and park the reader `px` above the end.
+export async function parkAboveTheEnd(page: Page, px: number) {
+  await openRoomAtBottom(page, "Team Chat Room");
+  await page.evaluate(async () => {
+    for (let i = 0; i < 30; i++) {
+      window.__riverTest!.appendMessage(`follow filler ${i}: ${"w ".repeat(450)}`);
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    }
+  });
+  await expect(page.getByText("follow filler 29:")).toBeAttached({ timeout: 5_000 });
+  await expectSettledAtBottom(page, "premise: the fillers should have been followed");
+  await readerScrollsWithoutGesture(page, await endMinus(page, px));
+  await afterLayoutSettles(page);
+  expect(await distanceFromBottom(page), "premise: the reader should be parked far up").toBeGreaterThan(
+    px - BOTTOM_THRESHOLD_PX,
+  );
+  await expect(page.getByTestId("scroll-to-bottom")).toBeVisible({ timeout: 5_000 });
 }
 
 /// A reader scroll with NO gesture event at all (conversation-autoscroll.spec.ts's
