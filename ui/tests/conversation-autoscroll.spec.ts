@@ -52,9 +52,10 @@ import {
 //     newest message in view when a resize reflows...` are the #486 tests. Each
 //     fails against the pre-fix code at its own assertion.
 //   * `respects the reader...`, `respects a reader scroll that produces no
-//     gesture event` and `does not drag a parked reader down...` are the
-//     opposite guard. They constrain the FIX, not the bug: the pre-fix code
-//     also refuses to scroll a parked reader (for the wrong reason — its gate
+//     gesture event` and `the same message is still in place after resizing
+//     there and back...` are the opposite guard. They constrain the FIX, not
+//     the bug: the pre-fix code also refuses to scroll a parked reader (for the
+//     wrong reason — its gate
 //     has latched), so a revert makes them fail at their setup rather than at
 //     the assertion that matters. Their teeth are against a wrong fix, and that
 //     is established by mutating the fix, not by reverting it.
@@ -279,6 +280,24 @@ async function parkMidHistory(page: Page): Promise<RowPosition> {
     })
     .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
   // The scroll has to have landed before we look at what is on screen.
+  await afterLayoutSettles(page);
+  const before = await newestVisibleMessage(page);
+  expect(before, "premise: a message should be visible").not.toBeNull();
+  return before!;
+}
+
+/// Park at the oldest rendered history. The newest visible message is the one
+/// at the bottom of that view, and a later resize has to keep it there.
+async function parkAtHistoryTop(page: Page): Promise<RowPosition> {
+  await openRoomAtBottom(page, "Team Chat Room");
+  await fillHistory(page);
+  await readerScrollsTo(page, 0);
+  await expect
+    .poll(() => distanceFromBottom(page), {
+      timeout: 5_000,
+      message: "premise: the reader should be parked above the bottom",
+    })
+    .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
   await afterLayoutSettles(page);
   const before = await newestVisibleMessage(page);
   expect(before, "premise: a message should be visible").not.toBeNull();
@@ -834,27 +853,6 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     expectCollapseUnderArrival(collapse, first);
     await expectStillFollowingAfterCollapse(page);
   });
-
-  test("does not drag a parked reader down when a resize reflows the history", async ({
-    page,
-  }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-
-    await readerScrollsTo(page, 0);
-    await expect
-      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
-      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
-
-    // Same reflow as above, with the reader parked. The follow and the refusal
-    // to follow run through the same ResizeObserver, so this is the half that
-    // stops "keep the newest message in view" from becoming "never let the
-    // reader look away".
-    await page.setViewportSize({ width: 380, height: 900 });
-    await expect
-      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
-      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
-  });
 });
 
 // The reader's position is a message, not an offset: whichever message is the
@@ -862,21 +860,33 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
 test.describe("The newest visible message stays in view", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  test("the same message is still in place after resizing there and back @fractional-geometry", async ({ page }) => {
-    const before = await parkMidHistory(page);
-    await page.setViewportSize({ width: 380, height: 900 });
-    await expectSameMessageInPlace(
+  for (const start of ["top-of-history", "mid-history"] as const) {
+    test(`the same message is still in place after resizing there and back from the ${start} @fractional-geometry`, async ({
       page,
-      before,
-      "the resize moved the message the reader was looking at",
-    );
-    await page.setViewportSize({ width: 1280, height: 900 });
-    await expectSameMessageInPlace(
-      page,
-      before,
-      "resizing back did not return the reader's message to where it was",
-    );
-  });
+    }) => {
+      const before = start === "mid-history" ? await parkMidHistory(page) : await parkAtHistoryTop(page);
+      expect(
+        await distanceFromBottom(page),
+        "premise: the reader is outside the follow band",
+      ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      await page.setViewportSize({ width: 380, height: 900 });
+      await expectSameMessageInPlace(page, before, "the resize moved the message the reader was looking at");
+      expect(
+        await distanceFromBottom(page),
+        "narrowing dragged the parked reader into the follow band",
+      ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      await page.setViewportSize({ width: 1280, height: 900 });
+      await expectSameMessageInPlace(
+        page,
+        before,
+        "resizing back did not return the reader's message to where it was",
+      );
+      expect(
+        await distanceFromBottom(page),
+        "widening dragged the parked reader into the follow band",
+      ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    });
+  }
 
   // The reader's position is measured from the container's BOTTOM edge, and the
   // composer takes height off that edge. So a growing draft moves a parked
