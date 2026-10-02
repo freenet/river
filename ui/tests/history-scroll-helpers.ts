@@ -5,13 +5,13 @@ import { waitForApp, selectRoom } from "./example-room";
 // Node-side helpers shared by the conversation-* specs. A spec cannot import
 // another without registering its tests twice, so they live here.
 //
-// The waits here run on the browser's own clock. The debounce spec, whose
-// clock is paused, has its own delivery and frame waits in
-// history-scroll-fixture.ts; it shares only the geometry reads, which use no
-// timer. Those return NaN when `#chat-scroll-container` is missing, so a caller
-// comparing two reads for equality must first rule NaN out.
+// The waits here run on the browser's own clock. The geometry reads return NaN
+// when `#chat-scroll-container` is missing, so a caller comparing two reads for
+// equality must first rule NaN out.
 
-/// Matches BOTTOM_THRESHOLD_PX in ui/src/components/conversation.rs.
+/// Matches BOTTOM_THRESHOLD_PX in ui/src/components/conversation.rs: how close
+/// to the end hides the scroll-to-latest button. Button presentation only; no
+/// distance from the end makes the view follow arrivals.
 export const BOTTOM_THRESHOLD_PX = 100;
 
 /// Slack for fractional layout after a scroll that did land at the bottom.
@@ -80,13 +80,23 @@ export async function deliver(page: Page, text: string) {
 
 /// Add enough history to have somewhere to scroll back through: `count` plain
 /// messages (alternating authors, so one row each; no reactions or replies),
-/// each on the page before the next is sent, then followed to the end. On the
-/// running clock; the paused-clock deliveries are the debounce fixture's own.
+/// each on the page before the next is sent. Arrivals do not move the view, so
+/// the reader then scrolls to the end themselves (`readerScrollsToEnd`). On the
+/// running clock.
 export async function fillHistory(page: Page, count = 8) {
   for (let i = 0; i < count; i++) {
     await deliver(page, `filler ${i}: ${"y".repeat(200)}`);
   }
-  await expectSettledAtBottom(page, "filler messages should have been followed");
+  await readerScrollsToEnd(page);
+}
+
+/// The reader scrolls to the very end themselves (no button), and the scroll
+/// has landed there. A no-op if the view is already at the end.
+export async function readerScrollsToEnd(page: Page) {
+  if ((await distanceFromBottom(page)) > AT_BOTTOM_EPSILON_PX) {
+    await readerScrollsWithoutGesture(page, await historyHeight(page));
+  }
+  await expectSettledAtBottom(page, "premise: the reader's scroll should land at the end");
 }
 
 /// Open a room and wait until the history has settled at its newest message.
@@ -109,12 +119,11 @@ export async function parkAboveTheEnd(page: Page, px: number) {
   await openRoomAtBottom(page, "Team Chat Room");
   await page.evaluate(async () => {
     for (let i = 0; i < 30; i++) {
-      window.__riverTest!.appendMessage(`follow filler ${i}: ${"w ".repeat(450)}`);
+      window.__riverTest!.appendMessage(`park filler ${i}: ${"w ".repeat(450)}`);
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     }
   });
-  await expect(page.getByText("follow filler 29:")).toBeAttached({ timeout: 5_000 });
-  await expectSettledAtBottom(page, "premise: the fillers should have been followed");
+  await expect(page.getByText("park filler 29:")).toBeAttached({ timeout: 5_000 });
   await readerScrollsWithoutGesture(page, await endMinus(page, px));
   await afterLayoutSettles(page);
   expect(await distanceFromBottom(page), "premise: the reader should be parked far up").toBeGreaterThan(
@@ -123,7 +132,7 @@ export async function parkAboveTheEnd(page: Page, px: number) {
   await expect(page.getByTestId("scroll-to-bottom")).toBeVisible({ timeout: 5_000 });
 }
 
-/// A reader scroll with NO gesture event at all (conversation-autoscroll.spec.ts's
+/// A reader scroll with NO gesture event at all (conversation-history-position.spec.ts's
 /// `readerScrollsTo` dispatches a synthetic `wheel` first).
 ///
 /// Not a contrivance: a native scrollbar drag dispatches no pointer event to
@@ -134,8 +143,7 @@ export async function parkAboveTheEnd(page: Page, px: number) {
 /// wait.
 ///
 /// Resolves with `scrollTop` as it is right after the app has handled the
-/// `scrollend` (its listener was installed first): whatever the settle did, it
-/// did synchronously.
+/// `scrollend` (its listener was installed first).
 export function readerScrollsWithoutGesture(page: Page, top: number): Promise<number> {
   return page.evaluate(
     (t) =>

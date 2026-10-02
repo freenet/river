@@ -3,15 +3,9 @@ import { defineConfig, devices } from "@playwright/test";
 // Engine-agnostic tests (usually hook-driven) tag themselves @chromium-only and run once.
 const CHROMIUM_ONLY = /@chromium-only/;
 
-// Exploratory scroll diagnostics: long, native-input probes that publish
-// timelines rather than gate a change. Excluded from discovery unless
-// RIVER_SCROLL_DIAGNOSTICS=1.
-const SCROLL_DIAGNOSTICS = ["conversation-seek-takeover-diagnostic.spec.ts"];
-
 export default defineConfig({
   testDir: ".",
   testMatch: "*.spec.ts",
-  testIgnore: process.env.RIVER_SCROLL_DIAGNOSTICS === "1" ? [] : SCROLL_DIAGNOSTICS,
   timeout: 60_000,
   retries: 2,
   use: {
@@ -54,7 +48,7 @@ export default defineConfig({
     // they run on every other project too.
     {
       name: "chromium-dpr-1.5",
-      testMatch: "conversation-autoscroll.spec.ts",
+      testMatch: "conversation-history-position.spec.ts",
       grep: /@fractional-geometry/,
       grepInvert: CHROMIUM_ONLY,
       use: { ...devices["Desktop Chrome"], deviceScaleFactor: 1.5 },

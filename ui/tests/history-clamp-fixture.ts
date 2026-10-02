@@ -27,9 +27,14 @@ declare global {
   }
 }
 
-// Geometry only: an absolute overhang changes the live scroll range without
-// changing any dimension in HistoryScroll's LayoutSig. Installed after startup,
-// so its scroll counter observes events after the app's own listener.
+// A clamp to a shorter range that no layout signature records, for the
+// "A clamp to a shorter range" and hidden-clamp cases in
+// conversation-anchor-events.spec.ts. Geometry only: an absolute overhang
+// changes the live scroll range without changing any dimension in
+// HistoryScroll's LayoutSig, and removing it makes the browser clamp
+// `scrollTop` by more than LAYOUT_SHIFT_ALLOWANCE_PX (history_scroll.rs).
+// Installed after startup, so its scroll counter observes events after the
+// app's own listener.
 export function clampOverhang(page: Page, height = 700) {
   return page.evaluate((height) => {
     const c = document.getElementById("chat-scroll-container")!;

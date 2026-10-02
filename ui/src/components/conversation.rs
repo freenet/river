@@ -31,6 +31,7 @@ use self::emoji_picker::FREQUENT_EMOJIS;
 #[cfg(target_arch = "wasm32")]
 use self::history_scroll::HistoryHooks;
 use self::history_scroll::HistoryScroll;
+use self::history_scroll::SavedRow;
 use self::not_member_notification::NotMemberNotification;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
@@ -2487,10 +2488,13 @@ fn beautify_freenet_label(url: &str) -> Option<String> {
     Some(format!("freenet:{id_prefix}{suffix}"))
 }
 
-/// How close to the end of the history (in px) still counts as "at the bottom".
+/// How close to the end of the history (in px) hides the scroll-to-latest
+/// button, as its IntersectionObserver's `rootMargin`.
 ///
-/// Shared by the scroll-to-latest button's IntersectionObserver `rootMargin`
-/// and by the pin flag, so the two agree about where the bottom is.
+/// Button presentation only: no distance from the end changes where the view
+/// goes. Arrivals preserve the reader's saved row at the end too
+/// (history_scroll.rs).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const BOTTOM_THRESHOLD_PX: f64 = 100.0;
 
 /// How many display items (message groups and event summaries) the conversation
@@ -2516,7 +2520,7 @@ const WINDOW_GROWTH_ITEMS: usize = 60;
 
 /// Hard ceiling on how many display items arrival-growth can accumulate.
 ///
-/// While the reader is pinned to the bottom (or parked mid-history), arrivals
+/// Wherever the reader is (at the bottom or parked mid-history), arrivals
 /// GROW the rendered window instead of sliding it — see
 /// [`HistoryWindow::resolve`] — so a long session in a busy room would
 /// otherwise re-accumulate exactly the unbounded render the window exists to
@@ -2589,6 +2593,16 @@ struct WindowAnchor {
     /// The index the head held last render — a hint so relocation is
     /// O(shift), not O(total), in the common case.
     index: usize,
+}
+
+/// Where a room visited this session was left: the history's saved rows
+/// (`HistoryScroll::leave_room`) and the rendered window they sit in, so a
+/// revisit renders them again before putting them back.
+#[derive(Clone, Debug)]
+struct RoomPosition {
+    rows: Vec<SavedRow>,
+    window_anchor: Option<WindowAnchor>,
+    window_items: usize,
 }
 
 /// How many leading item keys the anchor remembers (head + spares).
@@ -2670,7 +2684,7 @@ const TRIM_HEADROOM_PX: f64 = 200.0;
 /// viewport iff `content_height < client_height + BACKFILL_LEAD_PX`. A tail
 /// short enough for that (browser zoom-out, a tall portrait monitor over a
 /// modest window) would re-fire the backfill the moment the trim lands:
-/// grow → snap → trim → grow, a silent render loop at full speed
+/// grow → trim → grow, a silent render loop at full speed
 /// (#505 re-review). `HistoryScroll::trim_at_bottom` skips the trim when the retained
 /// tail's ESTIMATED height (current height scaled by the retained fraction)
 /// would sit within the strip's reach; the window then simply stays grown,
@@ -2715,7 +2729,7 @@ impl HistoryWindow {
     /// appended the new one at the bottom. Removing content above the viewport
     /// while adding below it is what broke arrival auto-scroll in
     /// freenet/river#501 — browser scroll anchoring rewrote `scrollTop` behind
-    /// the pin — and it visibly shifts a reader parked mid-history now that
+    /// the scroll model — and it visibly shifts a reader parked mid-history now that
     /// scroll anchoring is disabled on the container. So:
     ///
     /// * `start` NEVER moves forward from the anchor on an ordinary render:
@@ -2729,10 +2743,10 @@ impl HistoryWindow {
     ///   ceiling from ever capping a reader-requested backfill.
     ///
     /// Trimming back toward [`INITIAL_WINDOW_ITEMS`] is NOT done here — it is
-    /// an explicit event (the reader's own scroll landing at the bottom, or a
-    /// room switch) that clears the anchor and resets `window`, because a trim
-    /// is only invisible when the view is at the bottom, where the browser's
-    /// scrollTop clamp keeps the tail glued in place.
+    /// an explicit event (the reader's own scroll, or a scroll-to-latest
+    /// navigation, coming to rest at the bottom) that clears the anchor and
+    /// resets `window`, because a trim is only invisible when the view is at
+    /// the bottom, where the rows it removes are all above the view.
     fn resolve(total_items: usize, window: usize, anchor: Option<usize>) -> Self {
         // `max(1)` so the newest item is always on screen: a zero window would
         // render an empty history that the reader has no way to scroll into.
@@ -2766,8 +2780,8 @@ impl HistoryWindow {
 ///
 /// `scrollTop` is fractional in every engine while `Element::scroll_top`
 /// rounds, so an exact comparison would report a 1px difference on a view that
-/// never moved. `conversation-autoscroll.spec.ts` is what catches this being
-/// too tight.
+/// never moved. `conversation-history-position.spec.ts` (its
+/// `@fractional-geometry` cases) is what catches this being too tight.
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
 /// The two affordances the no-room screen must offer in EVERY load state
@@ -2822,8 +2836,10 @@ pub fn Conversation() -> Element {
         }
     };
     // Drives the scroll-to-latest button only: "is the end of the history on
-    // screen right now?". Auto-scroll follows `history`'s pin below, which
-    // answers the different question this one cannot (#486).
+    // screen right now?". Nothing about where the view goes reads it: arrivals
+    // preserve the reader's saved row wherever it is (history_scroll.rs).
+    // Written only by the wasm-only IntersectionObserver.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))]
     let mut is_at_bottom = use_signal(|| true);
     // How many trailing display items the history renders. Grows only when the
     // reader reaches the top of what is rendered — see `INITIAL_WINDOW_ITEMS`.
@@ -2845,52 +2861,98 @@ pub fn Conversation() -> Element {
     // `HistoryScroll::trim_at_bottom` has anything to do. Maintained by render, read from the raw scroll
     // callback (which cannot touch signals).
     let window_overgrown = use_hook(|| Rc::new(std::cell::Cell::new(false)));
-    // Whether the opening snap for the CURRENT room has landed. The backfill
-    // sentinel only mounts once this is true: a freshly-opened >window room
-    // renders at `scrollTop = 0` for a beat before the snap runs, and a
-    // sentinel mounted during that beat is intersecting, fires, and cascades
-    // the backfill until the whole room is rendered (#501 H2). A signal, not a
-    // `Cell`, because the sentinel's `if` in rsx renders from it.
-    let mut opening_snap_done = use_signal(|| false);
-    // Where the history's view goes: the reader's pin, the newest-visible-message
-    // anchor, and the forced snap a room switch or your own send raises (#402).
-    // Plain `Cell`s inside, not signals: they are written from raw JS callbacks
-    // that run with no Dioxus scope on the stack, and nothing renders from them.
-    // See history_scroll.rs.
+    // Whether the CURRENT room's view is in place: its first-open placement at
+    // the newest message, or the position saved when the reader last left it.
+    // The backfill sentinel only mounts once this is true: a freshly-opened
+    // >window room renders at `scrollTop = 0` for a beat before it is placed,
+    // and a sentinel mounted during that beat is intersecting, fires, and
+    // cascades the backfill until the whole room is rendered (#501 H2). A
+    // signal, not a `Cell`, because the sentinel's `if` in rsx renders from it.
+    let mut position_ready = use_signal(|| false);
+    // Where the history's view goes: the newest-visible-message anchor, kept
+    // through arrivals, layout changes and hide/reveal, and the scroll-to-latest
+    // button's native navigation. Plain `Cell`s inside, not signals: they are
+    // written from raw JS callbacks that run with no Dioxus scope on the stack,
+    // and nothing renders from them. See history_scroll.rs.
     let history = use_hook(|| Rc::new(HistoryScroll::default()));
+    // Each room visited this session: where its view was and how far back its
+    // rendered window reached when the reader left it, so coming back restores
+    // both. Session-local and keyed by room; plain row ids and window keys, no
+    // DOM nodes. Rooms no longer in `ROOMS` are dropped whenever one is saved.
+    let room_positions = use_hook(|| {
+        Rc::new(std::cell::RefCell::new(HashMap::<
+            ed25519_dalek::VerifyingKey,
+            RoomPosition,
+        >::new()))
+    });
 
-    // Reset the windowing Cells the moment THIS render is for a different
-    // room — not only in the effect below, which runs AFTER the first render
-    // of the new room has already resolved against the OLD room's anchor and
-    // requested size (cloning and patching up to a fully-backfilled room's
-    // depth for one wasted frame; #505 review). Cells are safe to write
-    // during render; the signals (`window_items`, `opening_snap_done`) still
-    // reset in the effect, so this render substitutes `INITIAL_WINDOW_ITEMS`
-    // below and keeps the sentinel unmounted until they catch up.
+    // Switch the windowing Cells and the history's position the moment THIS
+    // render is for a different room — not only in the effect below, which
+    // runs AFTER the first render of the new room has already resolved against
+    // the OLD room's anchor and requested size (cloning and patching up to a
+    // fully-backfilled room's depth for one wasted frame; #505 review). The
+    // DOM is still the old room's here, so this is also where the old room's
+    // position is saved. Cells are safe to write during render; the signals
+    // (`window_items`, `position_ready`) still switch in the effect, so this
+    // render substitutes the new room's window size below and keeps the
+    // sentinel unmounted until they catch up.
     //
     // `Option<Option<..>>` so the very first render (no room recorded yet) also
     // counts as a change and starts from a clean window. Also read by the
-    // opening-snap callback below, as the room whose history is in the DOM.
+    // `positioned` callback below, as the room whose history is in the DOM.
     let prev_render_room = use_hook(|| {
         Rc::new(std::cell::Cell::new(
             None::<Option<ed25519_dalek::VerifyingKey>>,
         ))
     });
-    let room_changed_this_render = {
+    // `Some(window size)` on the render that switched rooms.
+    let room_switch_window = {
         let room = CURRENT_ROOM.read().owner_key;
-        let changed = prev_render_room.get() != Some(room);
-        if changed {
+        let previous = prev_render_room.get();
+        if previous != Some(room) {
+            if let Some(Some(left)) = previous {
+                let rows = history.leave_room();
+                let mut positions = room_positions.borrow_mut();
+                // `peek`: the signal's value is the old room's until the
+                // effect switches it, and this read must not subscribe.
+                positions.insert(
+                    left,
+                    RoomPosition {
+                        rows,
+                        window_anchor: window_anchor.borrow().clone(),
+                        window_items: *window_items.peek(),
+                    },
+                );
+                if let Ok(rooms) = ROOMS.try_read() {
+                    positions.retain(|key, _| rooms.map.contains_key(key));
+                }
+            }
             prev_render_room.set(Some(room));
-            *window_anchor.borrow_mut() = None;
+            let saved = room.and_then(|key| room_positions.borrow().get(&key).cloned());
             window_rendered.set(0);
             window_overgrown.set(false);
+            match saved {
+                Some(saved) => {
+                    *window_anchor.borrow_mut() = saved.window_anchor;
+                    history.enter_room(Some(saved.rows));
+                    Some(saved.window_items)
+                }
+                None => {
+                    *window_anchor.borrow_mut() = None;
+                    history.enter_room(None);
+                    Some(INITIAL_WINDOW_ITEMS)
+                }
+            }
+        } else {
+            None
         }
-        changed
     };
+    let room_changed_this_render = room_switch_window.is_some();
 
     // Re-window when the reader opens a DIFFERENT room. The window means "how
     // far back have I looked in THIS room", so carrying it across rooms would
-    // render a freshly-opened room to the depth of the last one.
+    // render a freshly-opened room to the depth of the last one. A room
+    // visited earlier this session gets back the depth it had.
     //
     // Guarded on an ACTUAL key change for the same reason the room-switch
     // effect below is: Dioxus re-runs the effect on any write to
@@ -2901,17 +2963,21 @@ pub fn Conversation() -> Element {
     {
         let prev_windowed_room =
             use_hook(|| Rc::new(std::cell::Cell::new(None::<ed25519_dalek::VerifyingKey>)));
+        let room_positions = room_positions.clone();
         use_effect(move || {
             let room = CURRENT_ROOM.read().owner_key;
-            // The Cells (anchor, rendered, overgrown) were already reset by
-            // the render-side check above; only the SIGNALS reset here,
-            // because writing them from render would re-enter the render.
+            // The Cells (anchor, rendered, overgrown) and the history were
+            // already switched by the render-side check above; only the
+            // SIGNALS switch here, because writing them from render would
+            // re-enter the render.
             if prev_windowed_room.get() != room {
                 prev_windowed_room.set(room);
-                window_items.set(INITIAL_WINDOW_ITEMS);
-                // Re-gate the backfill sentinel until the new room's opening
-                // snap has landed (#501 H2).
-                opening_snap_done.set(false);
+                let saved_window =
+                    room.and_then(|key| room_positions.borrow().get(&key).map(|p| p.window_items));
+                window_items.set(saved_window.unwrap_or(INITIAL_WINDOW_ITEMS));
+                // Re-gate the backfill sentinel until the new room's position
+                // is in place (#501 H2).
+                position_ready.set(false);
             }
         });
     }
@@ -3163,11 +3229,10 @@ pub fn Conversation() -> Element {
 
         let options = web_sys::IntersectionObserverInit::new();
         options.set_root(Some(&root));
-        // Expand the detection zone below the viewport edge so the user counts
-        // as "at bottom" when within `BOTTOM_THRESHOLD_PX` of the sentinel.
-        // Built from the constant rather than written out, so the button and
-        // the pin cannot drift apart: the doc on `BOTTOM_THRESHOLD_PX` claims
-        // they agree, and this is what makes that true.
+        // Expand the detection zone below the viewport edge so the button
+        // hides when the reader is within `BOTTOM_THRESHOLD_PX` of the
+        // sentinel. Presentation only: nothing about where the view goes
+        // reads this.
         options.set_root_margin(&format!("0px 0px {BOTTOM_THRESHOLD_PX}px 0px"));
         options.set_threshold(&JsValue::from_f64(0.0));
 
@@ -3206,22 +3271,22 @@ pub fn Conversation() -> Element {
             window_anchor: window_anchor.clone(),
             window_overgrown: window_overgrown.clone(),
             window_rendered: window_rendered.clone(),
-            // Whoever restored (this effect, the ResizeObserver on a reveal, a
-            // layout scroll), the opening snap for this room has landed, so the
-            // backfill sentinel may mount (#501 H2). Deferred, since the
-            // observers are raw JS callbacks, and the signal is only written on
-            // the transition, so steady-state arrivals do not re-notify the
-            // render for nothing. The room is re-checked because this task can
-            // outlive a rapid room switch, and a stale set here would un-gate
-            // the new room's sentinel before ITS snap (#505 review).
-            snapped_to_bottom: Rc::new(move || {
-                let Some(room_at_snap) = prev_render_room.get() else {
+            // Whoever placed it (this effect, the ResizeObserver on a reveal, a
+            // scroll), this room's position is in place, so the backfill
+            // sentinel may mount (#501 H2). Called once per room visit.
+            // Deferred, since the observers are raw JS callbacks, and the
+            // signal is only written on the transition. The room is re-checked
+            // because this task can outlive a rapid room switch, and a stale
+            // set here would un-gate the new room's sentinel before ITS
+            // placement (#505 review).
+            positioned: Rc::new(move || {
+                let Some(room_placed) = prev_render_room.get() else {
                     return;
                 };
-                let mut opening_snap_done = opening_snap_done;
+                let mut position_ready = position_ready;
                 crate::util::defer(move || {
-                    if CURRENT_ROOM.peek().owner_key == room_at_snap && !*opening_snap_done.peek() {
-                        opening_snap_done.set(true);
+                    if CURRENT_ROOM.peek().owner_key == room_placed && !*position_ready.peek() {
+                        position_ready.set(true);
                     }
                 });
             }),
@@ -3237,39 +3302,31 @@ pub fn Conversation() -> Element {
         }
     });
 
-    // Snap to the newest message whenever the selected room changes (#402). The
-    // Conversation component is mounted once and reused across rooms (hidden or
-    // shown via CSS), so `#chat-scroll-container` persists from the previous room.
-    // Reading `CURRENT_ROOM` (which holds only `owner_key`) re-runs this on every
-    // room change and nothing else.
-    //
-    // This only forces the snap. The force is spent by the first restore that has
-    // usable geometry, whoever runs it: usually the content effect above once the
-    // new room's groups render. A ResizeObserver restore before that render spends
-    // it against the old room's rows, harmlessly: `reset_for_room` has set the
-    // pin, so the content effect's restore of the new room still snaps, and
-    // `snapped_to_bottom`'s room check skips the early completion (the rendered
-    // room is still the old one), so only the new room's own snap releases its
-    // backfill gate. While the history is hidden nothing spends it.
-    //
-    // Guarded on an ACTUAL key change: re-selecting the already-open room rewrites
-    // `CURRENT_ROOM` with the same key, and forcing a snap with no new content to
-    // consume it would snap the reader to the bottom on a later message (#402).
-    {
+    // A room switch needs no effect of its own for the view: the render-side
+    // check above saved the old room's position and gave the history the new
+    // one's (a first visit starts at its newest message), and the first
+    // restore with the new room's rows and usable geometry puts it in place.
+    // The Conversation component is mounted once and reused across rooms
+    // (hidden or shown via CSS), so `#chat-scroll-container` persists from the
+    // previous room. Re-selecting the already-open room rewrites
+    // `CURRENT_ROOM` with the same key and switches nothing. The
+    // scroll-to-latest button's `is_at_bottom` is the IntersectionObserver's
+    // to report for the new layout, so it is not reset here.
+
+    // The mobile panel buttons that hide the chat: the history cancels a
+    // scroll-to-latest navigation and takes in the reader's latest scroll
+    // first, while it still has a box to do that in (a cancel issued after
+    // `display:none` may do nothing). The panel switch itself is deferred as
+    // ever (dioxus-signal-safety.md).
+    let hide_chat_for = {
+        #[cfg(target_arch = "wasm32")]
         let history = history.clone();
-        let prev_room =
-            use_hook(|| Rc::new(std::cell::Cell::new(None::<ed25519_dalek::VerifyingKey>)));
-        use_effect(move || {
-            let room = CURRENT_ROOM.read().owner_key;
-            if prev_room.get() != room {
-                prev_room.set(room);
-                // Reset here, not left to the snap: a room with no messages
-                // produces no scroll and would inherit the previous room's state.
-                history.reset_for_room();
-                is_at_bottom.set(true);
-            }
-        });
-    }
+        move |view: MobileView| {
+            #[cfg(target_arch = "wasm32")]
+            history.before_hide();
+            crate::util::defer(move || *MOBILE_VIEW.write() = view);
+        }
+    };
 
     // Handler for toggling a reaction on a message (add or remove)
     let handle_toggle_reaction = {
@@ -3719,7 +3776,6 @@ pub fn Conversation() -> Element {
 
     // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
-        let history = history.clone();
         move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
             if message_text.is_empty() {
                 warn!("Message is empty");
@@ -3760,14 +3816,6 @@ pub fn Conversation() -> Element {
                     .get_secret()
                     .map(|(secret, version)| (*secret, version));
 
-                // Cloned into the async send so the forced snap (consumed by the
-                // content effect when the sent message appears) is raised ONLY
-                // after the delta applies locally — a rejected send (empty,
-                // over-size, serialize/sign/delta failure) then leaves the
-                // scroll position and the scroll-to-latest button untouched
-                // rather than snapping a later unrelated message to the bottom
-                // (#402 review).
-                let history = history.clone();
                 // Retained even though this block no longer awaits anything:
                 // it keeps the body off the event handler's stack. The guard
                 // that actually protects the ROOMS write is the
@@ -3942,19 +3990,10 @@ pub fn Conversation() -> Element {
                             }
                         });
                         if delta_applied {
-                            // Local apply succeeded and a message will mount:
-                            // scroll it into view — but only if the user is still
-                            // viewing the room this send targeted. This runs two
-                            // task hops after the keypress (`spawn_local`, then
-                            // `defer`'s setTimeout), so they may have switched
-                            // rooms; arming the conversation-wide flag then would
-                            // snap the NEW room to the bottom on its next message
-                            // (#402 review). Still required now that signing is
-                            // synchronous — the hops, not the signature, are what
-                            // let a room switch interleave.
-                            if CURRENT_ROOM.peek().owner_key == Some(current_room) {
-                                history.force_next();
-                            }
+                            // The sent message mounts like any arrival: the
+                            // reader's saved row keeps its place, wherever they
+                            // are reading (history_scroll.rs). Sending is not a
+                            // request to move the view.
                             crate::util::debug_log("[send] marking NEEDS_SYNC");
                             crate::components::app::mark_needs_sync(current_room);
                             #[cfg(target_arch = "wasm32")]
@@ -4001,7 +4040,10 @@ pub fn Conversation() -> Element {
                                     } else {
                                         "Open room list".to_string()
                                     },
-                                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
+                                    onclick: {
+                                        let hide_chat_for = hide_chat_for.clone();
+                                        move |_| hide_chat_for(MobileView::Rooms)
+                                    },
                                     Icon { icon: FaBars, width: 18, height: 18 }
                                     // Unread-elsewhere badge: new messages in OTHER rooms
                                     // (and DMs) are invisible on mobile while a room fills
@@ -4122,7 +4164,10 @@ pub fn Conversation() -> Element {
                                 button {
                                     "data-testid": "header-members-button",
                                     class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors flex-shrink-0",
-                                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Members),
+                                    onclick: {
+                                        let hide_chat_for = hide_chat_for.clone();
+                                        move |_| hide_chat_for(MobileView::Members)
+                                    },
                                     Icon { icon: FaUsers, width: 18, height: 18 }
                                 }
                             }
@@ -4146,10 +4191,12 @@ pub fn Conversation() -> Element {
                     class: "h-full overflow-y-auto overflow-x-hidden",
                     // `overflow-anchor: none`: The history's scroll model owns
                     // scrollTop (history_scroll.rs); browser anchoring would
-                    // move it underneath.
+                    // move it underneath. `scroll-behavior: auto`: its anchor
+                    // corrections and its cancel of a scroll-to-latest
+                    // navigation are `scrollTop` writes that must stay instant.
                     // Inline style, not a Tailwind arbitrary class, so it cannot
                     // depend on the class scanner seeing it.
-                    style: "overflow-anchor:none;",
+                    style: "overflow-anchor:none;scroll-behavior:auto;",
                     id: "chat-scroll-container",
                     div { class: "max-w-4xl mx-auto px-4 py-4", id: "chat-content",
                     {
@@ -4172,15 +4219,14 @@ pub fn Conversation() -> Element {
                                     // every re-render — would pay most of the
                                     // cost the window exists to avoid.
                                     // Subscribe every render; the value is
-                                    // substituted on a room switch because the
-                                    // signal's own reset only lands in the
-                                    // NEXT render's effect pass.
+                                    // substituted on a room switch (the new
+                                    // room's saved depth, or the initial
+                                    // window) because the signal's own switch
+                                    // only lands in the NEXT render's effect
+                                    // pass.
                                     let subscribed_window = window_items();
-                                    let requested_window = if room_changed_this_render {
-                                        INITIAL_WINDOW_ITEMS
-                                    } else {
-                                        subscribed_window
-                                    };
+                                    let requested_window =
+                                        room_switch_window.unwrap_or(subscribed_window);
                                     // Re-locate the anchored window by
                                     // IDENTITY: at-cap pruning shifts every
                                     // index, so the stored index is only a
@@ -4287,23 +4333,23 @@ pub fn Conversation() -> Element {
                                         // history by that much every time the
                                         // sentinel appeared or (on the last
                                         // backfill) disappeared.
-                                        // Gated on the opening snap having
-                                        // landed as well: a >window room's
+                                        // Gated on the room's position being
+                                        // in place as well: a >window room's
                                         // first render sits at `scrollTop = 0`
-                                        // until the snap runs, and a sentinel
+                                        // until it is placed, and a sentinel
                                         // mounted during that beat fires from
                                         // the top of the history and cascades
                                         // the backfill (#501 H2). Mounting it
-                                        // after the snap means its first
-                                        // observation sees the view at the
-                                        // bottom, far below the strip. The
-                                        // room-change check covers the one
-                                        // render where `opening_snap_done` is
-                                        // still the PREVIOUS room's true —
-                                        // its reset only lands in the effect
-                                        // pass after this render.
+                                        // after the placement means its first
+                                        // observation sees the reader's actual
+                                        // view. The room-change check covers
+                                        // the one render where
+                                        // `position_ready` is still the
+                                        // PREVIOUS room's true — its reset only
+                                        // lands in the effect pass after this
+                                        // render.
                                         if history_window.has_older
-                                            && opening_snap_done()
+                                            && position_ready()
                                             && !room_changed_this_render
                                         {
                                             // Zero-height anchor; the sentinel
@@ -4378,7 +4424,7 @@ pub fn Conversation() -> Element {
                                                         rsx! {
                                                             div {
                                                                 key: "{key}",
-                                                                // Test hook: the autoscroll spec locates rows by it.
+                                                                // Test hook: the history-position specs locate rows by it.
                                                                 "data-item-key": "{key}",
                                                                 "data-anchor-row": "{key}",
                                                                 class: "anchor-row flex justify-center py-1",
@@ -4392,7 +4438,7 @@ pub fn Conversation() -> Element {
                                                     DisplayRow::Item(DisplayItem::Messages(group)) => {
                                                         let key = group.messages[0].id.clone();
                                                         rsx! {
-                                                            // Test hook: the autoscroll spec locates rows by it.
+                                                            // Test hook: the history-position specs locate rows by it.
                                                             div {
                                                                 key: "{key}",
                                                                 "data-item-key": "{key}",
@@ -4456,8 +4502,8 @@ pub fn Conversation() -> Element {
                         class: "h-px pointer-events-none",
                     }
             }
-                // Scroll-to-latest button (#402): shown whenever the user is not
-                // pinned to the bottom of the history. Reuses the `is_at_bottom`
+                // Scroll-to-latest button (#402): shown whenever the end of the
+                // history is not in view. Reuses the `is_at_bottom`
                 // IntersectionObserver state, so it appears after scrolling up
                 // (e.g. reading back through a long, multi-room history) and
                 // hides once the newest message is in view. Handy on every
@@ -4474,21 +4520,18 @@ pub fn Conversation() -> Element {
                         // would leave the button hidden if the user interrupts
                         // the smooth scroll before reaching the bottom (the
                         // observer emits no new change and stays quiet). #402.
-                        onclick: move |_| {
-                            // Asking for the newest message is the clearest
-                            // possible statement of intent, so this re-arms the
-                            // pin (inside `seek_to_latest`) even though the
-                            // button itself renders off the IntersectionObserver.
-                            // The smooth scroll is a seek: its frames are not
-                            // read as the reader, and each one steps towards the
-                            // live end, so it follows messages landing on the way
-                            // (history_scroll.rs).
+                        onclick: {
                             #[cfg(target_arch = "wasm32")]
-                            {
-                                let history = history.clone();
-                                crate::util::safe_spawn_local(async move {
-                                    history.seek_to_latest();
-                                });
+                            let history = history.clone();
+                            move |_| {
+                                // One native smooth scroll to the end as it is
+                                // at this click. Messages landing on the way do
+                                // not retarget it; another click asks for them
+                                // (history_scroll.rs). Synchronous: it touches
+                                // no signal, and the end is measured at the
+                                // click.
+                                #[cfg(target_arch = "wasm32")]
+                                history.navigate_to_latest();
                             }
                         },
                         Icon { icon: FaChevronDown, width: 18, height: 18 }
@@ -4654,7 +4697,10 @@ pub fn Conversation() -> Element {
                                 } else {
                                     "Open room list".to_string()
                                 },
-                                onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
+                                onclick: {
+                                        let hide_chat_for = hide_chat_for.clone();
+                                        move |_| hide_chat_for(MobileView::Rooms)
+                                    },
                                 Icon { icon: FaBars, width: 18, height: 18 }
                                 // Same unread-elsewhere badge as the room-header
                                 // hamburger; with no room selected every room's
@@ -6185,7 +6231,7 @@ mod tests {
     }
 
     /// Arrivals GROW an anchored window instead of sliding it (#501): with the
-    /// reader pinned to the bottom, the start index stays put as the total
+    /// reader at the bottom, the start index stays put as the total
     /// climbs, so nothing is removed above the viewport in the same patch that
     /// appends below it.
     #[test]
@@ -6219,8 +6265,8 @@ mod tests {
         assert!(trimmed.has_older);
     }
 
-    /// The ceiling bounds what arrival growth can accumulate — a reader pinned
-    /// through a very long burst must not re-accumulate the unbounded render
+    /// The ceiling bounds what arrival growth can accumulate — a reader at the
+    /// bottom through a very long burst must not re-accumulate the unbounded render
     /// the window exists to prevent — but it NEVER caps a reader-requested
     /// backfill, which would dead-end paging through history.
     #[test]
@@ -6552,16 +6598,31 @@ mod tests {
         // the bottom trim, so deleting the room reset would have
         // false-passed against it (#505 review).
         assert!(
-            squashed.contains("prev_render_room.set(Some(room));*window_anchor.borrow_mut()=None;"),
-            "the windowing Cells must reset inline in the render on a room \
-             switch — the effect-based reset runs one render too late, so \
-             the new room's first frame would render at the old room's depth"
+            squashed.contains("letrows=history.leave_room();")
+                && squashed.contains("window_anchor:window_anchor.borrow().clone(),"),
+            "the render must save the room being left (its rows and window) \
+             while the DOM is still that room's"
         );
         assert!(
-            squashed
-                .contains("prev_windowed_room.set(room);window_items.set(INITIAL_WINDOW_ITEMS);"),
-            "the requested window signal must reset when the reader opens \
-             another room"
+            squashed.contains(
+                "*window_anchor.borrow_mut()=saved.window_anchor;history.enter_room(Some(saved.rows));"
+            ) && squashed
+                .contains("*window_anchor.borrow_mut()=None;history.enter_room(None);"),
+            "the windowing Cells and the history must switch inline in the \
+             render on a room switch — the effect-based switch runs one render \
+             too late, so the new room's first frame would render at the old \
+             room's depth"
+        );
+        assert!(
+            squashed.contains("room_switch_window.unwrap_or(subscribed_window)"),
+            "the room-switch render must resolve at the new room's window size"
+        );
+        assert!(
+            squashed.contains(
+                "prev_windowed_room.set(room);letsaved_window=room.and_then(|key|room_positions.borrow().get(&key).map(|p|p.window_items));window_items.set(saved_window.unwrap_or(INITIAL_WINDOW_ITEMS));"
+            ),
+            "the requested window signal must switch to the room's saved depth \
+             (or the initial window) when the reader opens another room"
         );
     }
 
@@ -10279,16 +10340,15 @@ mod group_messages_clock_tests {
     }
 }
 
-/// Source-grep pins for the auto-scroll wiring in [`Conversation`] and
+/// Source-grep pins for the history-position wiring in [`Conversation`] and
 /// `history_scroll.rs`.
 ///
 /// The behaviour these guard is only observable in a browser (it is measured
-/// by `ui/tests/conversation-autoscroll.spec.ts`), so these exist to make a
+/// by the `ui/tests/conversation-*position*.spec.ts` and
+/// `conversation-native-scroll*.spec.ts` specs), so these exist to make a
 /// silent revert in a refactor fail at `cargo test` rather than in the field.
-/// freenet/river#486 is what a silent revert costs: the view stopped following
-/// the conversation for 54 consecutive arrivals.
 #[cfg(test)]
-mod autoscroll_wiring_pins {
+mod history_position_wiring_pins {
     /// The production half of this file, cut at the first test module.
     ///
     /// Cut by a needle that cannot match itself — it contains an escaped
@@ -10317,11 +10377,11 @@ mod autoscroll_wiring_pins {
         source.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
-    /// The auto-scroll trigger. An `onmounted` on the last bubble is silent
+    /// The restore trigger. An `onmounted` on the last bubble is silent
     /// for every content change that leaves that row in place, so the effect
     /// has to subscribe to the grouped-message memo instead.
     #[test]
-    fn autoscroll_is_triggered_by_content_change_not_by_a_remount() {
+    fn restore_is_triggered_by_content_change_not_by_a_remount() {
         let prod = production_source();
         assert!(
             !prod.contains("last_chat_element"),
@@ -10354,28 +10414,85 @@ mod autoscroll_wiring_pins {
     #[test]
     fn the_scroll_container_disables_scroll_anchoring() {
         assert!(
-            dense(production_source()).contains(concat!("style:\"overflow-", "anchor:none;\"")),
+            dense(production_source()).contains(concat!(
+                "style:\"overflow-",
+                "anchor:none;scroll-behavior:auto;\""
+            )),
             "#chat-scroll-container must set `overflow-anchor: none` — browser \
              scroll anchoring rewriting scrollTop is #501's H1"
         );
     }
 
-    /// The backfill sentinel waits for the room-open snap (#501 H2), including
-    /// the one render where the previous room's `opening_snap_done` is still true.
+    /// The backfill sentinel waits for the room's position to be in place
+    /// (#501 H2), including the one render where the previous room's
+    /// `position_ready` is still true.
     #[test]
-    fn the_backfill_sentinel_waits_for_the_opening_snap() {
+    fn the_backfill_sentinel_waits_for_the_rooms_position() {
         assert!(
             dense(production_source()).contains(
-                "ifhistory_window.has_older&&opening_snap_done()&&!room_changed_this_render"
+                "ifhistory_window.has_older&&position_ready()&&!room_changed_this_render"
             ),
-            "a sentinel mounted before the opening snap fires from the top and \
+            "a sentinel mounted before the room is placed fires from the top and \
              cascades the backfill (#501 H2)"
         );
     }
 
+    /// Nothing moves the view except the reader and their button click: no
+    /// send-triggered jump, no follow mode, no app animation loop.
+    #[test]
+    fn only_the_reader_and_the_button_move_the_view() {
+        let prod = dense(production_source());
+        let history = dense(history_source());
+        for retired in ["force_next", "seek_to_latest", "self.pinned", "is_pinned("] {
+            assert!(
+                !prod.contains(retired) && !history.contains(retired),
+                "`{retired}` belongs to the retired following model"
+            );
+        }
+        assert!(
+            !history.contains("request_animation_frame"),
+            "the scroll-to-latest button uses the browser's own smooth scroll, \
+             not an app frame loop"
+        );
+        assert_eq!(
+            history.matches("ScrollBehavior::Smooth").count(),
+            1,
+            "one native smooth-scroll request, from the button"
+        );
+        assert!(
+            prod.contains("history.navigate_to_latest();"),
+            "the button must start the native navigation"
+        );
+    }
+
+    /// The panel buttons that hide the chat cancel a navigation first, while
+    /// the history still has a box to cancel it in.
+    #[test]
+    fn hiding_the_chat_cancels_a_navigation_first() {
+        let prod = dense(production_source());
+        assert!(
+            prod.contains(
+                "history.before_hide();crate::util::defer(move||*MOBILE_VIEW.write()=view);"
+            ),
+            "`hide_chat_for` must call `before_hide` before deferring the panel switch"
+        );
+        assert_eq!(
+            prod.matches("MobileView::Rooms").count(),
+            prod.matches("hide_chat_for(MobileView::Rooms)").count(),
+            "every switch to the rooms panel from the conversation goes through \
+             `hide_chat_for`"
+        );
+        assert!(prod.contains("hide_chat_for(MobileView::Members)"));
+        assert!(
+            !prod.contains("*MOBILE_VIEW.write()=MobileView::"),
+            "no direct panel switch away from the chat"
+        );
+    }
+
     /// A trim is only invisible at the exact bottom, and only when the trimmed
-    /// tail would not re-fire the backfill (#505). Loosening either gate yanks
-    /// a reader parked in the pin band, or oscillates trim against backfill.
+    /// tail would not re-fire the backfill (#505). Loosening either gate trims
+    /// rows from under a reader resting just above the end, or oscillates
+    /// trim against backfill.
     /// `view_at_end` is `at_end`, whose slack is pinned by its own unit test.
     #[test]
     fn the_trim_stays_gated_at_the_bottom() {

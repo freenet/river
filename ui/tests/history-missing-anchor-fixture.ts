@@ -1,11 +1,11 @@
 import { expect, Page } from "@playwright/test";
 
-// Browser-test utilities for removing EVERY row the history remembers as the
-// reader's anchor while their gesture is still open, so a restore finds no
-// saved row (history_scroll.rs, `restore_anchor`), and for checking that the
-// removal is the one the regression claims. Shared by the native-end and mobile
-// reveal cases in conversation-follow-state.spec.ts and the no-`scrollend`
-// fallback case in conversation-scroll-debounce.spec.ts.
+// Browser-test utilities for removing EVERY row the history saved as the
+// reader's position, so a restore finds no saved row (history_scroll.rs,
+// `restore_anchor`), and for checking that the removal is the one the
+// regression claims. Used by the "Every saved anchor row removed" cases in
+// conversation-anchor-events.spec.ts (native end, tall arrivals, and the mobile
+// reveal).
 //
 // The neighbourhood is the reader's newest visible row and every anchor-bearing
 // row from two viewports above it, and never fewer than eight rows above it: far
@@ -13,17 +13,19 @@ import { expect, Page } from "@playwright/test";
 // that number. It must hold plain inbound filler messages only (`filler N:`),
 // so no date separator or event row survives as a fallback. Removing it takes
 // away more height than the reader was parked above the end, so the browser
-// clamps `scrollTop` to the new end: a reader who was outside the follow band is
-// put inside it by layout alone.
+// clamps `scrollTop` to the new end: a reader parked well above the end is put
+// close to it by layout alone, which must not read as a request for the newest
+// message.
 //
 // Removal goes through the app's `removeMessages` test hook, in one state
-// change. The hook defers its write (`setTimeout(0)`), and every caller here
-// runs on a paused Playwright clock, so the removal runs the clock for zero ms
-// to let it happen; nothing else on the clock moves. Nothing here writes
-// `scrollTop`, dispatches an event, or implements a follow policy. The in-page
-// parts must be self-contained.
+// change. The hook defers its write (`setTimeout(0)`) and resolves once it has
+// run, on the browser's own clock. Nothing here writes `scrollTop`, dispatches
+// an event, or implements a scroll policy. The in-page parts must be
+// self-contained.
 
-/// Matches BOTTOM_THRESHOLD_PX in ui/src/components/conversation.rs.
+/// Matches BOTTOM_THRESHOLD_PX in ui/src/components/conversation.rs: within
+/// this of the end hides the scroll-to-latest button. Here it only sizes "parked
+/// well above the end" and "clamped close to it".
 const BOTTOM_THRESHOLD_PX = 100;
 /// The geometry budget for "the view did not move", as IN_PLACE_TOLERANCE_PX in
 /// the specs.
@@ -90,7 +92,7 @@ function geometry(page: Page): Promise<MissingAnchorGeometry> {
 /// Choose the neighbourhood (see the module comment) from the anchor-bearing
 /// rows as they are now. Call right after the reader's last delivered move, so
 /// they are the rows that move's capture saved. Checks the premises that make
-/// it the right neighbourhood: the reader is parked outside the band, and every
+/// it the right neighbourhood: the reader is parked well above the end, and every
 /// chosen row is a plain filler message with rows left above it.
 export async function missingAnchorSelect(page: Page): Promise<MissingAnchorSelection> {
   const picked = await page.evaluate(() => {
@@ -112,7 +114,7 @@ export async function missingAnchorSelect(page: Page): Promise<MissingAnchorSele
   });
   const before = await geometry(page);
   expect(picked.newestAt, "premise: a row is visible").toBeGreaterThanOrEqual(0);
-  expect(before.distance, "premise: the reader is parked outside the follow band").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+  expect(before.distance, "premise: the reader is parked well above the end").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
   expect(picked.firstAt, "premise: anchor-bearing rows remain above the neighbourhood").toBeGreaterThan(0);
   const doomed = picked.rows.slice(picked.firstAt, picked.newestAt + 1);
   expect(
@@ -127,12 +129,11 @@ export async function missingAnchorSelect(page: Page): Promise<MissingAnchorSele
   };
 }
 
-/// Remove the selection in one state change on the paused clock, wait with
+/// Remove the selection in one state change, wait with
 /// `frames` (the caller's real-frame wait) for the layout to reach the app, and
 /// check that the removal did what the regressions need: every row gone and
 /// none of them left anchor-bearing, the layout changed, `scrollTop` clamped
-/// materially, scrollable content left, and the view now inside the follow
-/// band. The clamped geometry is returned for the outcome checks, since no
+/// materially, scrollable content left, and the view now close to the end. The clamped geometry is returned for the outcome checks, since no
 /// saved row is left to compare against.
 export async function missingAnchorRemove(
   page: Page,
@@ -174,7 +175,6 @@ export async function missingAnchorRemove(
     record.removal = hooks.removeMessages(ids);
   }, selection.ids);
   try {
-    await page.clock.runFor(0);
     const unmatched = await page.evaluate(() => window.__missingAnchor!.removal!);
     expect(unmatched, "premise: every id named a message").toEqual([]);
     await expect
@@ -202,7 +202,7 @@ export async function missingAnchorRemove(
     );
     expect(seen.remaining, `premise: anchor-bearing rows remain (${what})`).toBeGreaterThan(0);
     expect(after.max, `premise: the remaining history still scrolls (${what})`).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
-    expect(after.distance, `premise: the clamp put the view inside the follow band (${what})`).toBeLessThanOrEqual(
+    expect(after.distance, `premise: the clamp put the view close to the end (${what})`).toBeLessThanOrEqual(
       BOTTOM_THRESHOLD_PX - IN_PLACE_TOLERANCE_PX,
     );
     expect(seen.scrolls, `premise: the clamp's scroll reached the app (${what})`).toBeGreaterThan(0);
@@ -230,8 +230,8 @@ export async function missingAnchorDrift(page: Page, top: number): Promise<numbe
 /// shorter range, and the scrollbar then narrows the rows again and leaves the
 /// view a few wrapped lines above the end (40 to 120px across runs). With a
 /// saved row, the app's restore puts that right; with none left, nothing does,
-/// so the reader's offset after the reveal would be the engine's, sometimes
-/// outside the band the regression needs. Without a scrollbar, the width never
+/// so the reader's offset after the reveal would be the engine's, sometimes far
+/// from where the removal left it. Without a scrollbar, the width never
 /// changes. Chromium and Firefox here draw overlay scrollbars, so nothing
 /// changes for them.
 export async function missingAnchorHideScrollbar(page: Page) {

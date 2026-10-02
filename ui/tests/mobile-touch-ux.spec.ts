@@ -1,12 +1,14 @@
 import { test, expect, Page } from "@playwright/test";
 import { waitForApp, selectRoom } from "./example-room";
+import { newestVisibleRow, registerHistoryGeometry, savedRowDrift } from "./history-scroll-geometry";
 
 // Coverage for freenet/river#402 — mobile / touch UX improvements:
 //   1. Touch-accessible message action menu (kebab), since the hover action
 //      bar can never appear on a device without a hover pointer.
 //   2. Header hamburger spacing: see room-header-layout.spec.ts.
-//   3. A scroll-to-latest button shown whenever the history is not pinned to
-//      the bottom, plus a snap-to-bottom on room switch.
+//   3. A scroll-to-latest button shown whenever the end of the history is out
+//      of view. A room opened for the first time lands at its newest message;
+//      a room revisited in the same session comes back where the reader left it.
 
 // Whether this browser context has no hover pointer (i.e. a touch device).
 // The kebab is shown only in that case; the hover action bar only otherwise.
@@ -14,9 +16,9 @@ async function isTouchOnly(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none)").matches);
 }
 
-// The app scrolls to the bottom asynchronously on room entry. Wait for that to
-// settle before a test scrolls up, otherwise the pending async scroll races the
-// test and snaps the history back down under it.
+// The app places a room opened for the first time at its newest message once
+// its rows are laid out. Wait for that before a test scrolls up, so the test
+// does not race the placement.
 async function waitSettledAtBottom(page: Page) {
   await expect
     .poll(
@@ -377,27 +379,41 @@ test.describe("Scroll-to-latest button (#402.3)", () => {
   });
 });
 
-test.describe("Room-switch scroll reset (#402.3)", () => {
+test.describe("Room-switch scroll position (#402.3)", () => {
   // Short viewport so the example history overflows and is scrollable.
   test.use({ viewport: { width: 1280, height: 420 } });
 
-  test("switching rooms lands at the bottom even after scrolling up", async ({
+  test.beforeEach(async ({ page }) => {
+    await registerHistoryGeometry(page);
+  });
+
+  test("a room opened for the first time lands at its newest message, and a revisit comes back where the reader was", async ({
     page,
   }) => {
     await page.goto("/");
     await waitForApp(page);
 
-    // Enter a room and scroll up so it is no longer pinned to the bottom.
+    // Enter a room and scroll up, away from the newest message.
     await selectRoom(page, "Your Private Room");
     await waitSettledAtBottom(page);
     await scrollUpUntilButtonVisible(page);
+    const reading = await newestVisibleRow(page);
+    expect(reading, "premise: a message should be visible").not.toBeNull();
 
-    // Switch away and back. The Conversation component is reused across rooms,
-    // so without the room-change reset the scroll position would persist near
-    // the top. It must snap back to the newest message instead.
+    // The Conversation component is reused across rooms, so the old room's
+    // offset is still on the container: a room never opened before must not
+    // inherit it.
     await selectRoom(page, "Team Chat Room");
-    await selectRoom(page, "Your Private Room");
-
     await expect.poll(() => distanceFromBottom(page), { timeout: 5_000 }).toBeLessThan(120);
+
+    // Coming back restores the message the reader was reading, at its place.
+    await selectRoom(page, "Your Private Room");
+    await expect
+      .poll(() => savedRowDrift(page, reading!), {
+        timeout: 5_000,
+        message: "the revisited room did not come back where the reader was",
+      })
+      .toBeLessThanOrEqual(4);
+    await expect(page.locator('[data-testid="scroll-to-bottom"]')).toBeVisible();
   });
 });
