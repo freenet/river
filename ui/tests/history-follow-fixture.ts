@@ -23,8 +23,9 @@ import { SEEK_CLOCK_FRAME_MS } from "./history-scroll-fixture";
 // With `observeSettle` (on the seek clock only) the recorder also watches the
 // app's quiet-deadline callback. It is identified once, by its registration
 // while a container `scrollend` is being dispatched to the app with a delay
-// (a correction's end refused, the one native-mode path that arms it from an
-// end); every registration of that same callback after it is recorded with its
+// (a refused end: a correction's own, or one that found a layout clamp not yet
+// delivered, the native-mode paths that arm it from an end); every
+// registration of that same callback after it is recorded with its
 // delay, clear and firing (`followSettleRecord`), wherever it is made.
 // `followBeforeSettleFire` arms a one-shot action on it: just before its next
 // firing, in the same task, it moves `scrollTop` and records what it saw. It
@@ -410,6 +411,66 @@ export function followResizeBeforeEnd(page: Page, px: number) {
 
 export function followResizeRecord(page: Page): Promise<FollowResize> {
   return page.evaluate(() => (window as unknown as { __followResize: FollowResize }).__followResize);
+}
+
+/// What `followGrowContainerThenEnd` saw: the container's geometry before the
+/// growth, after it (read in the same task, so any clamp is in it), and once the
+/// app had handled the end; `scrollsAtEnd` counts the container's `scroll`
+/// events from the growth until the app had handled that end.
+export type FollowGrowEnd = {
+  before: { top: number; height: number; max: number };
+  after: { top: number; height: number; max: number };
+  ended: { top: number };
+  scrollsAtEnd: number;
+};
+
+/// In one task: grow the container by `px` from an initially constrained
+/// height (`max-height`, removed by `followRecorderStop`), force layout with a
+/// geometry read, and dispatch one synthetic `scrollend` on it, so the app reads
+/// that end with the growth (and any clamp of `scrollTop` it caused) already in
+/// place, before the clamp's `scroll` or any ResizeObserver can report it. The
+/// gate is lifted for that end alone and put back as it was, so the clamp's own
+/// native end (if the engine sends one) and later ones stay gated. Logs
+/// `container grow`, `end` (the recorder's, after the app's listener) and
+/// `observed` (this helper's own observer on the container, its first delivery,
+/// after the app's). Resolves once it has delivered. Nothing here corrects the
+/// view: any scroll it records is the browser's or the app's.
+export function followGrowContainerThenEnd(page: Page, px: number) {
+  return page.evaluate(
+    (px) =>
+      new Promise<FollowGrowEnd>((resolve) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const rec = window.__followRecorder!;
+        let scrolls = 0;
+        const count = () => scrolls++;
+        c.addEventListener("scroll", count);
+        const edges = () => ({ top: c.scrollTop, height: c.clientHeight, max: c.scrollHeight - c.clientHeight });
+        const before = edges();
+        c.style.maxHeight = `${c.clientHeight + px}px`;
+        const after = edges();
+        rec.log.push("container grow");
+        const gated = rec.setGate(false);
+        c.dispatchEvent(new Event("scrollend"));
+        rec.setGate(gated);
+        const ended = { top: c.scrollTop };
+        const scrollsAtEnd = scrolls;
+        const observer = new ResizeObserver(() => {
+          observer.disconnect();
+          rec.log.push("observed");
+          rec.afterRealFrame(() => {
+            c.removeEventListener("scroll", count);
+            resolve({ before, after, ended, scrollsAtEnd });
+          });
+        });
+        observer.observe(c);
+        rec.cleanups.push(() => {
+          observer.disconnect();
+          c.removeEventListener("scroll", count);
+          c.style.removeProperty("max-height");
+        });
+      }),
+    px,
+  );
 }
 
 /// The history's event-summary rows (join events and the like).

@@ -64,19 +64,30 @@
 //!   gesture ends. The top only: a
 //!   container resized before the observer reports it can move the bottom edge
 //!   alone, or also clamp the top. Existing correction evidence follows a
-//!   classified layout clamp, both before its scroll is delivered and when its
-//!   geometry is recorded. That is a geometry match, not provenance: the reader's
-//!   last end coalesced with the correction looks the same, which is what the
-//!   deadline is for. A settle that does end the gesture first puts back a
-//!   reflow the ResizeObserver has not reported yet
-//!   (the signature differs from the record: an image loading above the view
-//!   moves the rows, not `scrollTop`), against the existing anchor, and only
-//!   then measures. A pending layout clamp is restored first too, even when
-//!   the signature has not changed. That settle preserves the anchor and pin
+//!   classified layout clamp when the restore records its geometry, so a later
+//!   end at the clamped top still matches. That is a geometry match, not
+//!   provenance: the reader's last end coalesced with the correction looks the
+//!   same, which is what the deadline is for. A `scrollend` whose take-in finds
+//!   a layout clamp not yet delivered (its `scroll` and the observer still to
+//!   come) is refused the same way, with or without a correction to match: an
+//!   engine can send the clamp's own end first, and a clamp is not the reader
+//!   coming to rest. The clamp's `scroll` or the observer then restores it. A
+//!   settle that does end the gesture first puts back a reflow the
+//!   ResizeObserver has not reported yet (the signature differs from the
+//!   record: an image loading above the view moves the rows, not `scrollTop`),
+//!   against the existing anchor, and only then measures. A layout clamp the
+//!   quiet deadline finds pending is restored first too, even when the
+//!   signature has not changed. That settle preserves the anchor and pin
 //!   instead of capturing: the old gap may be past the new end, so a restore
 //!   cannot necessarily put it back until content grows again. A constrained
 //!   restore remembers that choice until the reader moves or the gesture ends,
-//!   even after recording makes the clamp's later `scroll` an echo. However a
+//!   even after recording makes the clamp's later `scroll` an echo. So does a
+//!   restore that finds no saved row at all (every one removed, say, by a
+//!   deletion that also clamps the view into the follow band): it leaves the
+//!   view where layout put it, and that is not where the reader chose to be
+//!   either, so the settle records it and keeps the old anchor and pin rather
+//!   than measuring a new pin there. The reader's next scroll captures again.
+//!   However a
 //!   gesture ends (a settle, or the reveal's restore below), its deadline is
 //!   cancelled with it, so no handle is left for the next gesture to take for
 //!   its own.
@@ -84,18 +95,19 @@
 //!   makes a stale `scrollend` (another room's, an old gesture's, a seek
 //!   frame's) harmless then: room switches, forced snaps and new seeks end the
 //!   gesture, and forget its correction and deadline. It is not harmless while
-//!   a gesture is in progress: an end that reaches the app then and does not
-//!   match the latest correction settles that gesture, whoever's it was. A seek
-//!   frame's end queued behind the reader's takeover would be one; the
-//!   engines in the suite were not seen to produce that order (see
-//!   `conversation-follow-state.spec.ts`, the seek takeover diagnostic), and
-//!   nothing here prevents it.
+//!   a gesture is in progress: an end that reaches the app then, takes in no
+//!   pending clamp and does not match the latest correction settles that
+//!   gesture, whoever's it was. A seek frame's end queued behind the reader's
+//!   takeover would be one; the engines in the suite were not seen to produce
+//!   that order (see `conversation-follow-state.spec.ts`, the seek takeover
+//!   diagnostic), and nothing here prevents it.
 //!
 //! # Where capture runs
 //!
 //! A `scroll` classified as the reader's (from the listener or taken in early,
-//! below), a gesture's settle unless a pending or remembered layout clamp
-//! requires preservation, and a touch that stops a seek. The last two capture
+//! below), a gesture's settle unless a pending layout clamp, or a restore in
+//! the gesture that was constrained or found no saved row, requires
+//! preservation, and a touch that stops a seek. The last two capture
 //! directly, never through `on_scroll`:
 //! the position has usually been recorded already and would classify as an echo.
 //!
@@ -150,10 +162,11 @@
 //!   force wait. The ResizeObserver's restore on reveal picks up where it was,
 //!   restarts a seek the hide cut short, and then finishes the settle of a
 //!   gesture the hide ended (engines send no `scrollend` for it), after putting
-//!   the anchor back, preserving its saved gap and pin if that restore is
-//!   constrained. A quiet deadline that passes while hidden waits the same
-//!   way. Desktop WebKit sends a `scroll` and `scrollend` of its own for the
-//!   reveal, which can settle first; it takes the same restore-first path.
+//!   the anchor back, preserving its saved gap and pin if that restore (or an
+//!   earlier one in the gesture) is constrained or finds no saved row. A quiet
+//!   deadline that passes while hidden waits the same way. Desktop WebKit
+//!   sends a `scroll` and `scrollend` of its own for the reveal, which can
+//!   settle first; it takes the same restore-first path.
 //!   A reveal scroll arriving before the observer also restores first instead
 //!   of capturing the hidden gesture's browser-restored geometry as reader intent.
 //! * **Touch momentum**: a restore that writes `scrollTop` (an anchor
@@ -163,8 +176,8 @@
 //! **Why this can't latch as #486 did**: the pin comes only from the reader's
 //! own positions. Growing content, a growing composer or a rewrap restore
 //! instead of measuring, so none of them can clear it, and every gesture ends in
-//! a settle that measures again unless a pending or remembered clamp preserves
-//! that reader position instead.
+//! a settle that measures again unless a pending clamp, or a restore that could
+//! not put the reader's row back, preserves that reader position instead.
 //!
 //! State is `Cell`/`RefCell`, never signals: raw JS callbacks write it.
 
@@ -310,40 +323,90 @@ enum GesturePosition {
     Preserve,
 }
 
-/// What restoring a surviving anchor actually achieved. A browser may clamp a
-/// write partially or entirely; neither outcome is the reader choosing that gap.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-struct AnchorRestore {
-    moved: bool,
-    constrained: bool,
+/// What restoring the saved anchor achieved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorRestore {
+    /// No saved row survives, or none was saved: nothing was written.
+    Missing,
+    /// A saved row survives. `moved` if the write moved the view; `constrained`
+    /// if the browser clamped it short of the saved gap, partially or entirely,
+    /// which is not the reader choosing that gap. A row already at its gap is
+    /// neither.
+    Restored { moved: bool, constrained: bool },
 }
 
 impl AnchorRestore {
     fn after_write(before: i32, requested: i32, actual: i32) -> Self {
-        Self {
+        Self::Restored {
             moved: actual != before,
             constrained: (requested - actual).abs() > SCROLL_TOP_SLACK_PX,
         }
     }
+
+    /// Whether the restore wrote a new position: a correction.
+    fn moved(self) -> bool {
+        matches!(self, Self::Restored { moved: true, .. })
+    }
+
+    fn constrained(self) -> bool {
+        matches!(
+            self,
+            Self::Restored {
+                constrained: true,
+                ..
+            }
+        )
+    }
+
+    /// Whether the view is not where the reader's saved anchor says, through no
+    /// move of theirs: no saved row was left to put back, or the browser would
+    /// not let it reach its gap. Either way where layout left the view is not
+    /// the reader's choice, so a gesture must not end by capturing it.
+    fn preserves_intent(self) -> bool {
+        self == Self::Missing || self.constrained()
+    }
 }
 
-/// Whether a settle from `cause` ends the gesture, with the view at `now` and
-/// `reader_rev` the current reader revision. A quiet deadline always does, even
-/// at the corrected view: the reader has stopped. A native end with the view's
-/// top exactly where our latest correction left it, with no reader move since,
-/// may be that correction's own, so it does not; it cannot be told from the
-/// reader's last end coalesced with it, which is why the quiet deadline backs it
-/// up. The top only, exactly: the bottom edge also moves when the container is
-/// resized (the composer growing) before the observer has reported it, and that
-/// is not anyone moving the view.
+/// How far the view must move to put the first saved row that still exists
+/// (newest first) back at its saved gap; `current_gap` finds a row's gap now,
+/// `None` if it is gone. `None` if no saved row survives, including when none
+/// was saved.
+fn anchor_delta(
+    saved: &[(String, i32)],
+    mut current_gap: impl FnMut(&str) -> Option<i32>,
+) -> Option<i32> {
+    saved
+        .iter()
+        .find_map(|(key, saved_gap)| current_gap(key).map(|now| saved_gap - now))
+}
+
+/// Whether a settle from `cause` ends the gesture, with `pending` the movement
+/// its take-in found, the view at `now` and `reader_rev` the current reader
+/// revision. A quiet deadline always does, even at the corrected view: the
+/// reader has stopped. A native end that took in a pending layout movement does
+/// not, whatever the correction evidence: that end may be the clamp's own (an
+/// engine can send it before the clamp's `scroll` and the observer), and a
+/// layout clamp is never the reader coming to rest. Otherwise, a native end with
+/// the view's top exactly where our latest correction left it, with no reader
+/// move since, may be that correction's own, so it does not either; it cannot
+/// be told from the reader's last end coalesced with it, which is why the quiet
+/// deadline backs both up. The top only, exactly: the bottom edge also moves
+/// when the container is resized (the composer growing) before the observer has
+/// reported it, and that is not anyone moving the view.
 fn settle_ends_gesture(
     cause: SettleCause,
+    pending: Option<ScrollCause>,
     correction: Option<Correction>,
     now: ViewEdges,
     reader_rev: u32,
 ) -> bool {
-    cause == SettleCause::Quiet
-        || correction.is_none_or(|c| c.edges.top != now.top || c.reader_rev != reader_rev)
+    match cause {
+        SettleCause::Quiet => true,
+        SettleCause::Native if pending == Some(ScrollCause::Layout) => false,
+        SettleCause::Native => {
+            correction.is_none_or(|c| c.edges.top != now.top || c.reader_rev != reader_rev)
+        }
+    }
 }
 
 /// Whether a settle that ends the gesture must put the view back first: a
@@ -537,8 +600,9 @@ pub(super) struct HistoryScroll {
     /// A gesture ended while the history was hidden; finish it on the first
     /// laid-out restore.
     settle_pending: Cell<bool>,
-    /// A gesture restore could not reach the saved gap. Recording the clamp
-    /// must not turn it into reader intent at a later settle or reveal.
+    /// A gesture restore could not reach the saved gap, or found no saved row.
+    /// Recording where layout left the view must not turn it into reader intent
+    /// at a later settle or reveal.
     preserve_gesture_position: Cell<bool>,
     /// The reader's quiet deadline (see "Settle"), while one is pending.
     settle_timer: Cell<Option<i32>>,
@@ -634,10 +698,11 @@ impl HistoryScroll {
         self.preserve_gesture_position.set(false);
     }
 
-    /// Keep unreachable reader intent until they move again, even if a later
-    /// restore can reach it before this gesture settles.
+    /// Keep reader intent a restore could not put back (no saved row left, or
+    /// its gap out of reach) until they move again, even if a later restore
+    /// reaches it before this gesture settles.
     fn note_anchor_restore(&self, restored: AnchorRestore) {
-        if restored.constrained && matches!(self.follow.get(), Follow::Gesture { .. }) {
+        if restored.preserves_intent() && matches!(self.follow.get(), Follow::Gesture { .. }) {
             self.preserve_gesture_position.set(true);
         }
     }
@@ -661,9 +726,21 @@ impl HistoryScroll {
         }
     }
 
-    /// Whether a settle from `cause`, with the view at `now`, ends the gesture.
-    fn settle_allowed(&self, cause: SettleCause, now: ViewEdges) -> bool {
-        settle_ends_gesture(cause, self.correction.get(), now, self.reader_rev.get())
+    /// Whether a settle from `cause`, after taking in `pending`, with the view
+    /// at `now`, ends the gesture.
+    fn settle_allowed(
+        &self,
+        cause: SettleCause,
+        pending: Option<ScrollCause>,
+        now: ViewEdges,
+    ) -> bool {
+        settle_ends_gesture(
+            cause,
+            pending,
+            self.correction.get(),
+            now,
+            self.reader_rev.get(),
+        )
     }
 
     fn cancel_settle_timer(&self) {
@@ -928,7 +1005,7 @@ impl HistoryScroll {
                     self.recorded_edges(),
                     self.reader_rev.get(),
                 ));
-                if restored.moved {
+                if restored.moved() {
                     self.note_correction(self.recorded_edges());
                 }
             }
@@ -1042,29 +1119,32 @@ impl HistoryScroll {
     }
 
     /// Scroll the first anchor row that still exists back to its gap. If none
-    /// survives, leave the view alone: the next reader scroll captures a new one.
-    /// Report both movement and a saved gap the browser could not reach.
+    /// survives (or none was saved), leave the view alone and report it
+    /// `Missing`: the next reader scroll captures a new anchor, and a gesture in
+    /// progress remembers it (`note_anchor_restore`) so that neither its settle
+    /// nor the reveal that finishes it captures in the meantime. Otherwise
+    /// report both movement and a saved gap the browser could not reach.
     fn restore_anchor(&self, container: &web_sys::Element) -> AnchorRestore {
         let view = container.get_bounding_client_rect();
-        // Newest first, so the first row found is the newest survivor.
-        for (key, saved_gap) in self.anchor.borrow().iter() {
-            let Some(key) = css_escape(key) else {
-                continue;
-            };
+        let delta = anchor_delta(&self.anchor.borrow(), |key| {
+            let key = css_escape(key)?;
             let selector = format!("#chat-content [{ANCHOR_ATTR}=\"{key}\"]");
-            let Ok(Some(row)) = container.query_selector(&selector) else {
-                continue;
+            let row = container.query_selector(&selector).ok()??;
+            Some(gap(&view, &row))
+        });
+        let Some(delta) = delta else {
+            return AnchorRestore::Missing;
+        };
+        if delta.abs() <= SCROLL_TOP_SLACK_PX {
+            return AnchorRestore::Restored {
+                moved: false,
+                constrained: false,
             };
-            let delta = saved_gap - gap(&view, &row);
-            if delta.abs() <= SCROLL_TOP_SLACK_PX {
-                return AnchorRestore::default();
-            }
-            let top = container.scroll_top();
-            let requested = top + delta;
-            container.set_scroll_top(requested);
-            return AnchorRestore::after_write(top, requested, container.scroll_top());
         }
-        AnchorRestore::default()
+        let top = container.scroll_top();
+        let requested = top + delta;
+        container.set_scroll_top(requested);
+        AnchorRestore::after_write(top, requested, container.scroll_top())
     }
 
     /// Read a `scroll` event as layout's doing (restore) or the reader's (capture).
@@ -1088,7 +1168,7 @@ impl HistoryScroll {
         self.note_reader_move();
         self.last_reader_move.set(js_sys::Date::now());
         // Without `scrollend` every move arms the quiet deadline; with it, only
-        // a deadline already pending (a correction's end was refused) restarts.
+        // a deadline already pending (an end was refused) restarts.
         if !self.native_settle.get() || self.settle_timer.get().is_some() {
             self.arm_quiet_deadline();
         }
@@ -1119,29 +1199,23 @@ impl HistoryScroll {
     }
 
     /// The browser says a scroll has come to rest: see "Settle". Not if the end
-    /// may be our latest correction's own; then the gesture stays held until the
-    /// reader's quiet deadline, which is armed if it is not already (and is not
-    /// moved: it runs from the reader's last move).
+    /// took in a pending layout clamp, or may be our latest correction's own;
+    /// then the gesture stays held until the reader's quiet deadline, which is
+    /// armed if it is not already (and is not moved: it runs from the reader's
+    /// last move).
     fn settle_native(&self) {
         let pending = self.take_in_pending_scroll();
         if let Some(container) = self.laid_out_container() {
             let now = self.live_edges(&container);
-            // A growth clamp can move the top before either its scroll or the
-            // observer arrives. Judge the existing correction in that layout,
-            // without inventing a correction from the settle's own restore.
-            let allowed = if pending == Some(ScrollCause::Layout) {
-                let correction = correction_after_layout(
-                    self.correction.get(),
-                    self.recorded_edges(),
-                    now,
-                    self.reader_rev.get(),
-                );
-                settle_ends_gesture(SettleCause::Native, correction, now, self.reader_rev.get())
-            } else {
-                self.settle_allowed(SettleCause::Native, now)
-            };
-            if !allowed {
-                if self.settle_timer.get().is_none() {
+            // A clamp can move the top before either its scroll or the observer
+            // arrives; its end is refused on that alone, with or without a
+            // correction to match. The clamp's scroll or the observer restores it.
+            if !self.settle_allowed(SettleCause::Native, pending, now) {
+                // Only a gesture has a hold to keep: a deadline armed with none
+                // would be taken for the next gesture's.
+                if matches!(self.follow.get(), Follow::Gesture { .. })
+                    && self.settle_timer.get().is_none()
+                {
                     self.arm_quiet_deadline();
                 }
                 return;
@@ -1176,12 +1250,15 @@ impl HistoryScroll {
     /// reflow no observer has reported yet is put back first, against the
     /// reader's existing anchor (`settle_restores_first`), so the capture
     /// measures the reader's place and not where the reflow pushed their rows.
-    /// A pending layout clamp also restores first, even without a signature
-    /// change, and preserves intent: a gap beyond the new end is unreachable
-    /// until the range grows again. A constrained restore retains that choice
-    /// even when the layout scroll was delivered and recorded before settling.
-    /// That restore may correct the view; the gesture ends right after,
-    /// which drops the correction, so its own end meets no gesture.
+    /// A layout clamp still pending (only the quiet deadline settles over one:
+    /// a native end that finds it is refused) also restores first, even without
+    /// a signature change, and preserves intent: a gap beyond the new end is
+    /// unreachable until the range grows again. A constrained restore, or one
+    /// that found no saved row, retains that choice even when the layout scroll
+    /// was delivered and recorded before settling, so a settle with nothing
+    /// pending preserves too. That restore may correct the view; the gesture ends
+    /// right after, which drops the correction, so its own end meets no
+    /// gesture.
     fn settle_eligible(&self, pending: Option<ScrollCause>) {
         self.cancel_settle_timer();
         let pending_layout = pending == Some(ScrollCause::Layout);
@@ -1218,7 +1295,8 @@ impl HistoryScroll {
     }
 
     /// The gesture is over: capture where the reader came to rest, or preserve
-    /// their intent through a pending or remembered layout clamp and record only.
+    /// their intent through a pending layout clamp, or a restore that could not
+    /// put their row back, and record only.
     /// Does not snap. Hidden, it waits for the reveal's restore. Completing it cancels
     /// its quiet deadline: a reveal ends a gesture with no settle of its own,
     /// and a handle left behind would be taken for the next gesture's.
@@ -1906,14 +1984,14 @@ mod tests {
     #[test]
     fn a_native_end_at_our_correction_does_not_settle_the_gesture() {
         let history = corrected_gesture();
-        assert!(!history.settle_allowed(SettleCause::Native, CORRECTED));
+        assert!(!history.settle_allowed(SettleCause::Native, None, CORRECTED));
         // Every end that matches is refused, not just the first: an engine can
         // send more than one for a write.
-        assert!(!history.settle_allowed(SettleCause::Native, CORRECTED));
+        assert!(!history.settle_allowed(SettleCause::Native, None, CORRECTED));
         // Any other top is an end the correction cannot have caused.
         for other in [edges(2299, 600), edges(2301, 600)] {
             assert!(
-                history.settle_allowed(SettleCause::Native, other),
+                history.settle_allowed(SettleCause::Native, None, other),
                 "{other:?}"
             );
         }
@@ -1927,7 +2005,7 @@ mod tests {
         let height = CORRECTED.bottom - CORRECTED.top;
         for resized in [height - 40, height - 1, height + 1, height + 40] {
             assert!(
-                !history.settle_allowed(SettleCause::Native, edges(CORRECTED.top, resized)),
+                !history.settle_allowed(SettleCause::Native, None, edges(CORRECTED.top, resized)),
                 "{resized}px tall"
             );
         }
@@ -1937,16 +2015,24 @@ mod tests {
             edges(CORRECTED.top + 1, height + 40),
         ] {
             assert!(
-                history.settle_allowed(SettleCause::Native, other),
+                history.settle_allowed(SettleCause::Native, None, other),
                 "{other:?}"
             );
         }
         // A reader move since lets it settle at the corrected top, resized or not.
         history.note_reader_move();
-        assert!(history.settle_allowed(SettleCause::Native, edges(CORRECTED.top, height - 40)));
+        assert!(history.settle_allowed(
+            SettleCause::Native,
+            None,
+            edges(CORRECTED.top, height - 40)
+        ));
         // And the quiet deadline settles there whatever the height.
         let history = corrected_gesture();
-        assert!(history.settle_allowed(SettleCause::Quiet, edges(CORRECTED.top, height + 40)));
+        assert!(history.settle_allowed(
+            SettleCause::Quiet,
+            None,
+            edges(CORRECTED.top, height + 40)
+        ));
     }
 
     #[test]
@@ -1964,8 +2050,12 @@ mod tests {
                 classify_scroll(before, grown, CORRECTED.top, now.top, now.top),
                 ScrollCause::Layout
             );
-            // The unadjusted geometry is precisely the old premature settle.
-            assert!(history.settle_allowed(SettleCause::Native, now));
+            // Pending, the clamp's end is refused on the movement alone.
+            assert!(!history.settle_allowed(SettleCause::Native, Some(ScrollCause::Layout), now));
+            // Once the clamp is delivered nothing is pending, and the unadjusted
+            // geometry is precisely the old premature settle; the restore that
+            // records it carries the correction to the clamped top.
+            assert!(history.settle_allowed(SettleCause::Native, None, now));
             let projected = correction_after_layout(
                 history.correction.get(),
                 CORRECTED,
@@ -1974,16 +2064,87 @@ mod tests {
             );
             assert!(!settle_ends_gesture(
                 SettleCause::Native,
+                None,
                 projected,
                 now,
                 history.reader_rev.get()
             ));
             assert!(settle_ends_gesture(
                 SettleCause::Quiet,
+                None,
                 projected,
                 now,
                 history.reader_rev.get()
             ));
+        }
+    }
+
+    #[test]
+    fn a_growth_clamps_own_end_is_refused_with_no_correction_evidence() {
+        // The review's geometry: a held reader 20px above the end of 1400px of
+        // content, no correction yet. The container grows from 400 to 460 and
+        // the browser clamps the top from 980 to the new end, 940; that clamp's
+        // end arrives before its scroll and before the observer.
+        let history = HistoryScroll::default();
+        history.note_reader_move();
+        history.follow.set(Follow::Gesture {
+            from: edges(1000, 400),
+            held: true,
+        });
+        let pending = classify_scroll(sig(1400, 400, 1000), sig(1400, 460, 1000), 980, 940, 940);
+        assert_eq!(pending, ScrollCause::Layout);
+        let now = edges(940, 460);
+        assert_eq!(history.correction.get(), None);
+        assert!(!history.settle_allowed(SettleCause::Native, Some(pending), now));
+        // Refusing it manufactures no evidence for a later end to match.
+        assert_eq!(history.correction.get(), None);
+        // The reader's quiet deadline still settles it, clamp pending or not.
+        assert!(history.settle_allowed(SettleCause::Quiet, Some(pending), now));
+        assert!(history.settle_allowed(SettleCause::Quiet, None, now));
+        // Once the clamp has been delivered and recorded there is nothing pending,
+        // and with no correction the reader's own end settles, as before.
+        assert!(history.settle_allowed(SettleCause::Native, None, now));
+    }
+
+    #[test]
+    fn native_settle_policy_matrix() {
+        let rev = 7;
+        let now = edges(940, 460);
+        let matching = Some(Correction {
+            edges: now,
+            reader_rev: rev,
+        });
+        let other_top = Some(Correction {
+            edges: edges(980, 400),
+            reader_rev: rev,
+        });
+        let older_rev = Some(Correction {
+            edges: now,
+            reader_rev: rev - 1,
+        });
+        let corrections = [None, matching, other_top, older_rev];
+        let pendings = [
+            None,
+            Some(ScrollCause::Echo),
+            Some(ScrollCause::Reader),
+            Some(ScrollCause::Layout),
+        ];
+        for pending in pendings {
+            for correction in corrections {
+                let case = format!("{pending:?} with {correction:?}");
+                assert!(
+                    settle_ends_gesture(SettleCause::Quiet, pending, correction, now, rev),
+                    "quiet: {case}"
+                );
+                // A pending layout movement refuses a native end whatever the
+                // evidence; anything else is judged on the correction alone.
+                let expected = pending != Some(ScrollCause::Layout) && correction != matching;
+                assert_eq!(
+                    settle_ends_gesture(SettleCause::Native, pending, correction, now, rev),
+                    expected,
+                    "native: {case}"
+                );
+            }
         }
     }
 
@@ -1999,10 +2160,10 @@ mod tests {
             now,
             history.reader_rev.get(),
         ));
-        assert!(!history.settle_allowed(SettleCause::Native, now));
-        assert!(history.settle_allowed(SettleCause::Native, edges(now.top - 1, 660)));
+        assert!(!history.settle_allowed(SettleCause::Native, None, now));
+        assert!(history.settle_allowed(SettleCause::Native, None, edges(now.top - 1, 660)));
         history.note_reader_move();
-        assert!(history.settle_allowed(SettleCause::Native, now));
+        assert!(history.settle_allowed(SettleCause::Native, None, now));
     }
 
     #[test]
@@ -2014,6 +2175,7 @@ mod tests {
         assert_eq!(none, None);
         assert!(settle_ends_gesture(
             SettleCause::Native,
+            None,
             none,
             now,
             revision
@@ -2027,6 +2189,7 @@ mod tests {
             assert_eq!(projected, previous);
             assert!(settle_ends_gesture(
                 SettleCause::Native,
+                None,
                 projected,
                 now,
                 rev
@@ -2041,13 +2204,13 @@ mod tests {
         // can be the reader's.
         history.note_reader_move();
         history.note_reader_move();
-        assert!(history.settle_allowed(SettleCause::Native, CORRECTED));
+        assert!(history.settle_allowed(SettleCause::Native, None, CORRECTED));
     }
 
     #[test]
     fn the_quiet_deadline_settles_even_at_the_corrected_view() {
         let history = corrected_gesture();
-        assert!(history.settle_allowed(SettleCause::Quiet, CORRECTED));
+        assert!(history.settle_allowed(SettleCause::Quiet, None, CORRECTED));
     }
 
     #[test]
@@ -2056,7 +2219,7 @@ mod tests {
         let history = corrected_gesture();
         history.end_interaction();
         assert_eq!(history.correction.get(), None);
-        assert!(history.settle_allowed(SettleCause::Native, CORRECTED));
+        assert!(history.settle_allowed(SettleCause::Native, None, CORRECTED));
         // So does the room reset, through it.
         let history = corrected_gesture();
         history.reset_for_room();
@@ -2070,7 +2233,7 @@ mod tests {
             from: edges(2000, 600),
             held: true,
         });
-        assert!(history.settle_allowed(SettleCause::Native, CORRECTED));
+        assert!(history.settle_allowed(SettleCause::Native, None, CORRECTED));
     }
 
     #[test]
@@ -2119,35 +2282,55 @@ mod tests {
     fn anchor_restoration_distinguishes_noop_partial_and_complete_writes() {
         assert_eq!(
             AnchorRestore::after_write(100, 400, 100),
-            AnchorRestore {
+            AnchorRestore::Restored {
                 moved: false,
                 constrained: true
             }
         );
         assert_eq!(
             AnchorRestore::after_write(100, 400, 200),
-            AnchorRestore {
+            AnchorRestore::Restored {
                 moved: true,
                 constrained: true
             }
         );
         assert_eq!(
             AnchorRestore::after_write(100, 400, 400),
-            AnchorRestore {
+            AnchorRestore::Restored {
                 moved: true,
                 constrained: false
             }
         );
-        assert!(!AnchorRestore::after_write(100, 400, 400 - SCROLL_TOP_SLACK_PX).constrained);
-        assert!(AnchorRestore::after_write(100, 400, 400 - SCROLL_TOP_SLACK_PX - 1).constrained);
-        assert!(AnchorRestore::after_write(100, -20, 0).constrained);
-        assert_eq!(
-            AnchorRestore::default(),
-            AnchorRestore {
-                moved: false,
-                constrained: false
-            }
-        );
+        assert!(!AnchorRestore::after_write(100, 400, 400 - SCROLL_TOP_SLACK_PX).constrained());
+        assert!(AnchorRestore::after_write(100, 400, 400 - SCROLL_TOP_SLACK_PX - 1).constrained());
+        assert!(AnchorRestore::after_write(100, -20, 0).constrained());
+        // Nothing to write is neither a correction nor constrained, whether a
+        // row is already at its gap or no row is left.
+        let at_gap = AnchorRestore::Restored {
+            moved: false,
+            constrained: false,
+        };
+        for nothing_written in [at_gap, AnchorRestore::Missing] {
+            assert!(!nothing_written.moved(), "{nothing_written:?}");
+            assert!(!nothing_written.constrained(), "{nothing_written:?}");
+        }
+        assert_ne!(at_gap, AnchorRestore::Missing);
+    }
+
+    #[test]
+    fn a_restore_distinguishes_a_missing_anchor_from_one_at_its_gap() {
+        let saved: Vec<(String, i32)> =
+            vec![("m3".into(), 300), ("m2".into(), 500), ("m1".into(), 700)];
+        // Every saved row gone, or none saved: nothing to put back.
+        assert_eq!(anchor_delta(&saved, |_| None), None);
+        assert_eq!(anchor_delta(&[], |_| Some(0)), None);
+        // The newest survivor decides, wherever it is in the list.
+        let only_m2 = |key: &str| (key == "m2").then_some(460);
+        assert_eq!(anchor_delta(&saved, only_m2), Some(40));
+        let all = |key: &str| Some(if key == "m3" { 280 } else { 0 });
+        assert_eq!(anchor_delta(&saved, all), Some(20));
+        // A survivor already at its gap needs no write, which is not missing.
+        assert_eq!(anchor_delta(&saved, |_| Some(300)), Some(0));
     }
 
     #[test]
@@ -2169,28 +2352,140 @@ mod tests {
         assert_eq!(history.gesture_position(true), GesturePosition::Preserve);
     }
 
-    #[test]
-    fn successful_or_missing_anchor_restores_do_not_preserve_a_gesture() {
-        let history = corrected_gesture();
-        for restored in [
-            AnchorRestore::default(),
+    /// A surviving row already at its gap, and a write that reached it.
+    fn successful_restores() -> [AnchorRestore; 2] {
+        [
+            AnchorRestore::Restored {
+                moved: false,
+                constrained: false,
+            },
             AnchorRestore::after_write(100, 400, 400),
-        ] {
+        ]
+    }
+
+    /// No saved row left, and writes the browser clamped entirely or partly.
+    fn intent_preserving_restores() -> [AnchorRestore; 3] {
+        [
+            AnchorRestore::Missing,
+            AnchorRestore::after_write(100, 400, 100),
+            AnchorRestore::after_write(100, 400, 200),
+        ]
+    }
+
+    /// A held gesture parked outside the band, with one saved row.
+    fn parked_gesture() -> HistoryScroll {
+        let history = corrected_gesture();
+        history.pinned.set(false);
+        history.anchor.borrow_mut().push(("m1".into(), 120));
+        history
+    }
+
+    #[test]
+    fn successful_anchor_restores_permit_capture() {
+        let history = parked_gesture();
+        for restored in successful_restores() {
             history.note_anchor_restore(restored);
-            assert_eq!(history.gesture_position(false), GesturePosition::Capture);
+            assert_eq!(
+                history.gesture_position(false),
+                GesturePosition::Capture,
+                "{restored:?}"
+            );
         }
+    }
+
+    #[test]
+    fn missing_or_constrained_restores_preserve_a_gesture() {
+        for restored in intent_preserving_restores() {
+            let history = parked_gesture();
+            history.note_anchor_restore(restored);
+            assert_eq!(
+                history.gesture_position(false),
+                GesturePosition::Preserve,
+                "{restored:?}"
+            );
+            // Noting it changes neither what the reader saved nor the pin.
+            assert_eq!(&*history.anchor.borrow(), &[("m1".into(), 120)]);
+            assert!(!history.pinned.get());
+            // Later restores that succeed, and later layout, keep the choice.
+            for later in successful_restores() {
+                history.note_anchor_restore(later);
+            }
+            history.top.set(100);
+            history.sig.set(sig(700, 600, 1000));
+            assert_eq!(
+                history.gesture_position(false),
+                GesturePosition::Preserve,
+                "{restored:?} then success"
+            );
+            // The reader moving again is new intent, and captures.
+            history.note_reader_move();
+            assert_eq!(
+                history.gesture_position(false),
+                GesturePosition::Capture,
+                "{restored:?} then a reader move"
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_an_interaction_forgets_a_missing_or_constrained_restore() {
+        for restored in intent_preserving_restores() {
+            let history = parked_gesture();
+            history.note_anchor_restore(restored);
+            history.end_interaction();
+            assert_eq!(
+                history.gesture_position(false),
+                GesturePosition::Capture,
+                "{restored:?}"
+            );
+            assert_eq!(history.follow.get(), Follow::Free);
+
+            let history = parked_gesture();
+            history.note_anchor_restore(restored);
+            history.reset_for_room();
+            assert!(!history.preserve_gesture_position.get(), "{restored:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_anchor_with_no_gesture_preserves_nothing() {
+        // A parked reader with no gesture keeps the view as it is (restore
+        // writes nothing) and captures at their next scroll; nothing is latched.
+        for follow in [
+            Follow::Free,
+            Follow::Seeking {
+                from: edges(2000, 600),
+            },
+        ] {
+            let history = HistoryScroll::default();
+            history.pinned.set(false);
+            history.anchor.borrow_mut().push(("m1".into(), 120));
+            history.follow.set(follow);
+            history.note_anchor_restore(AnchorRestore::Missing);
+            assert!(!history.preserve_gesture_position.get(), "{follow:?}");
+            assert_eq!(history.gesture_position(false), GesturePosition::Capture);
+            assert_eq!(&*history.anchor.borrow(), &[("m1".into(), 120)]);
+            assert!(!history.pinned.get());
+        }
+        // A constrained write outside a gesture latches nothing either.
+        let history = corrected_gesture();
         history.end_interaction();
         history.note_anchor_restore(AnchorRestore::after_write(100, 400, 100));
         assert_eq!(history.gesture_position(false), GesturePosition::Capture);
     }
 
     #[test]
-    fn replacing_an_interaction_forgets_its_constrained_restore() {
-        let history = corrected_gesture();
-        history.note_anchor_restore(AnchorRestore::after_write(100, 400, 100));
-        history.end_interaction();
+    fn a_new_rooms_empty_anchor_is_missing_and_its_forced_snap_still_owed() {
+        let history = parked_gesture();
+        history.note_anchor_restore(AnchorRestore::Missing);
+        history.reset_for_room();
+        // The new room has nothing saved: a restore of it finds nothing and
+        // writes nothing, and the forced snap it is owed still decides.
+        assert_eq!(anchor_delta(&history.anchor.borrow(), |_| Some(0)), None);
+        history.note_anchor_restore(AnchorRestore::Missing);
+        assert!(history.force.get() && history.pinned.get());
+        assert!(!history.preserve_gesture_position.get());
         assert_eq!(history.gesture_position(false), GesturePosition::Capture);
-        assert_eq!(history.follow.get(), Follow::Free);
     }
 
     #[test]

@@ -12,6 +12,7 @@ import {
   followGate,
   followGrowAbove,
   followGrowAboveThenEnd,
+  followGrowContainerThenEnd,
   followLog,
   followMark,
   followRealFrames,
@@ -26,6 +27,12 @@ import {
   newestVisibleRow,
   rowDrift,
 } from "./history-follow-fixture";
+import {
+  missingAnchorDrift,
+  missingAnchorHideScrollbar,
+  missingAnchorRemove,
+  missingAnchorSelect,
+} from "./history-missing-anchor-fixture";
 import {
   AT_BOTTOM_EPSILON_PX,
   afterLayoutSettles,
@@ -922,6 +929,81 @@ test.describe("An anchor correction's own scrollend", () => {
     }
   });
 
+  // The same growth clamp with no correction before it: the reader has only
+  // moved, so there is no evidence of ours for the clamp's end to match. The
+  // container grows under a reader 20px above the end and the browser clamps
+  // `scrollTop` to the new end; an engine can deliver that clamp's `scrollend`
+  // before its `scroll` and before the observer. Before, the end found no
+  // correction to refuse it by, settled the held gesture with the pin still set,
+  // and the observer's restore then snapped the reader. A native end that takes
+  // in a pending layout movement is now refused whatever the evidence, and the
+  // reader's own quiet deadline settles the gesture. Only the controlled end
+  // reaches the app: the reader's, the clamp's and the restore's native ends
+  // stay gated, so none of them can release the hold being measured.
+  test("a container-growth clamp's own end with no prior correction keeps the gesture held (controlled order: move → growth clamp → its end → scroll → observer)", async ({ page }) => {
+    const GROW_CONTAINER_PX = 60;
+    try {
+      const at = await heldGesture(page, { initialShrinkPx: 80, observeSettle: true });
+      const moved = await scrollTop(page);
+      await page.clock.runFor(READER_QUIET_MS);
+      await followRealFrames(page, 3);
+      const run = await followGrowContainerThenEnd(page, GROW_CONTAINER_PX);
+      await followRealFrames(page, 3);
+      const log = await followLog(page);
+      const what = `${JSON.stringify(run)}; ${log}`;
+      test.info().annotations.push({ type: "growth clamp end without a correction", description: what });
+      expect(
+        log.slice(log.lastIndexOf("move")),
+        `premise: one delivered reader move with its end gated, then the growth, with no scroll between (${what})`,
+      ).toMatch(/^move scroll (held )+container grow\b/);
+      expect(run.before.top, `premise: no layout correction moved the view after the reader (${what})`).toBe(moved);
+      expect(run.before.max - run.before.top, `premise: the reader was inside the follow band (${what})`).toBeLessThanOrEqual(
+        BOTTOM_THRESHOLD_PX - IN_PLACE_TOLERANCE_PX,
+      );
+      expect(run.after.height - run.before.height, `premise: the container grew (${what})`).toBe(GROW_CONTAINER_PX);
+      expect(run.before.top - run.after.top, `premise: the growth clamped scrollTop (${what})`).toBeGreaterThan(SCROLL_TOP_SLACK_PX);
+      expect(run.after.max - run.after.top, `premise: the clamp is to the new end (${what})`).toBeLessThanOrEqual(SCROLL_TOP_SLACK_PX);
+      expect(
+        run.after.top + run.after.height - run.before.top - run.before.height,
+        `premise: the bottom edge moved too (${what})`,
+      ).toBeGreaterThan(SCROLL_TOP_SLACK_PX);
+      expect(run.scrollsAtEnd, `premise: the end reached the app before the clamp's scroll (${what})`).toBe(0);
+      expect(
+        log.slice(log.lastIndexOf("container grow")),
+        `premise: the end, then the clamp's scroll, then the observer (${what})`,
+      ).toMatch(/^container grow end (held )*scroll\b.*\bobserved\b/);
+
+      expect(
+        await rowDrift(page, at),
+        `the growth clamp's own end settled the held gesture with no correction to refuse it, and the observer's restore then snapped the reader (${what})`,
+      ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      const armed = await followSettleRecord(page);
+      expect(armed.settle, `the refused end armed one quiet deadline (${JSON.stringify(armed)})`).toHaveLength(1);
+      const deadline = armed.settle[0];
+      expect(deadline.cleared ?? deadline.fired, "the deadline is pending").toBeNull();
+      expect(deadline.delay, "it runs from the reader's move, not the clamp or its end").toBe(QUIET_MS - READER_QUIET_MS);
+
+      await followDeliver(page, "join");
+      await expectRowHeld(page, at, `a short arrival moved the held reader after the clamp's end (${await followLog(page)})`);
+      await expectInBand(page, "premise: the short arrival leaves the reader inside the band");
+      await page.clock.runFor(QUIET_MS - READER_QUIET_MS - 1);
+      await followRealFrames(page, 2);
+      expect((await followSettleRecord(page)).settle.filter((t) => t.fired !== null), "the gesture settled early").toEqual([]);
+      expect(await rowDrift(page, at), "the hold lasts until the reader's deadline").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      await page.clock.runFor(1);
+      await followRealFrames(page, 2);
+      expect(
+        (await followSettleRecord(page)).settle.filter((t) => t.fired !== null).map((t) => t.handle),
+        "premise: the reader's deadline settled the gesture",
+      ).toEqual([deadline.handle]);
+      await followDeliver(page, "arrival after the growth clamp's deadline");
+      await expectSettledAtBottom(page, `quiet settlement did not resume in-band following (${await followLog(page)})`);
+    } finally {
+      await teardown(page);
+      await page.evaluate(() => document.getElementById("chat-scroll-container")?.style.removeProperty("max-height"));
+    }
+  });
+
   test("a reader move after the correction settles on its own end, even back where the correction left the view", async ({
     page,
   }) => {
@@ -1275,6 +1357,191 @@ test.describe("An anchor correction's own scrollend, on the mobile layout", () =
       await teardown(page);
     }
   });
+});
+
+// Every row the reader's anchor remembers is removed while their gesture is
+// still open (a moderator deleting a run of messages), and the removal takes
+// away more than they were parked above the end, so the browser clamps them into
+// the follow band. A restore then finds no saved row to put back, and leaves
+// the view where layout put it. Before, that restore did not count as one the
+// gesture could not reach: the settle, or the reveal that finishes a gesture the
+// hide cut short, measured the clamped position as the reader's own, re-pinned a
+// reader who was outside the band, and the next arrival snapped them to it. A
+// missing anchor now preserves the reader's intent as a constrained restore
+// does: the gesture ends without measuring, the pin stays unset, and the reader
+// stays parked until they scroll again.
+//
+// Arrivals are inbound and tall: from the clamped end, one that is followed
+// moves `scrollTop` by its height, and one that is not leaves the reader outside
+// the band. The removal is the app's `removeMessages` hook
+// (history-missing-anchor-fixture.ts).
+
+/// Up out of the band: the reader is parked, not following.
+const MISSING_UP_PX = 300;
+/// Enough filler messages that the removed neighbourhood is fillers only and
+/// history is left on both sides of it.
+const MISSING_FILLERS = 30;
+/// Far taller than the follow band on its own.
+const TALLER = (marker: string) => `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`;
+
+/// Two tall arrivals, the second to catch a snap that comes late: each must
+/// leave `scrollTop` at the post-removal offset and the reader outside the band.
+async function expectParkedThroughArrivals(page: Page, top: number, why: string) {
+  for (const n of [1, 2]) {
+    const marker = `tall arrival ${n} after the anchor rows were removed`;
+    await followDeliver(page, TALLER(marker));
+    const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
+    expect(height, "premise: the arrival is taller than the follow band").toBeGreaterThan(BOTTOM_THRESHOLD_PX + IN_PLACE_TOLERANCE_PX);
+    const drift = await missingAnchorDrift(page, top);
+    expect(drift, `${why}: arrival ${n} moved the parked view by ${drift}px (${await followLog(page)})`).toBeLessThanOrEqual(
+      IN_PLACE_TOLERANCE_PX,
+    );
+    expect(await distanceFromBottom(page), `${why}: arrival ${n} left the reader inside the band`).toBeGreaterThan(
+      BOTTOM_THRESHOLD_PX,
+    );
+  }
+}
+
+test.describe("Every saved anchor row removed during a held gesture", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  // The settle runs with nothing pending: the clamp's `scroll` and the observer
+  // have both reached the app and the restore has recorded the clamped view, so
+  // this is not the pending-clamp path that preserves on its own.
+  test("a native end with nothing pending leaves the clamped reader parked (controlled order: move → removal → clamp scroll → observer → end)", async ({
+    page,
+  }) => {
+    try {
+      await heldGesture(page, { upPx: MISSING_UP_PX, fillers: MISSING_FILLERS });
+      const selection = await missingAnchorSelect(page);
+      await followMark(page, "remove");
+      const removal = await missingAnchorRemove(page, selection, () => followRealFrames(page, 3));
+      const ended = await page.evaluate(() => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const rec = window.__followRecorder!;
+        const top = c.scrollTop;
+        const gated = rec.setGate(false);
+        rec.log.push("settle");
+        c.dispatchEvent(new Event("scrollend"));
+        rec.setGate(gated);
+        return { top, after: c.scrollTop, log: rec.log.slice(rec.log.lastIndexOf("remove")).join(" ") };
+      });
+      const what = `${JSON.stringify({ selection, removal, ended })}`;
+      test.info().annotations.push({ type: "missing anchor native end", description: what });
+      expect(ended.log, `premise: the clamp's scroll reached the app, its own end was gated, and only then the settle (${what})`).toMatch(
+        /^remove .*\bscroll\b.* settle end$/,
+      );
+      expect(ended.log, `premise: no end reached the app before the settle (${what})`).not.toMatch(/\bend\b.* settle/);
+      expect(ended.top, `premise: the view had not moved since the clamp's delivered scroll (${what})`).toBe(removal.topAtLastScroll);
+      expect(ended.top, `premise: the settle found the view where the removal left it (${what})`).toBe(removal.after.top);
+      expect(ended.after, `premise: the settle did not move the view (${what})`).toBe(ended.top);
+
+      await followRealFrames(page, 2);
+      await expectParkedThroughArrivals(page, removal.after.top, "the settle measured the clamp as the reader's and re-pinned them");
+
+      // Preservation lasts until the reader moves: a real move back to the new
+      // end is theirs, and following resumes from it.
+      await followMark(page, "back to the end");
+      const back = await followReaderMove(page, (await endMinus(page, 0)) - (await scrollTop(page)));
+      expect(back.delivered, "premise: the reader's move back to the end reached the app").toBe(true);
+      expect(back.max - back.after, "premise: the reader reached the end").toBeLessThanOrEqual(SCROLL_TOP_SLACK_PX);
+      await followRealFrames(page, 2);
+      await followDeliver(page, TALLER("arrival after the reader came back to the end"));
+      await expectSettledAtBottom(page, `the reader's own move back to the end did not resume following (${await followLog(page)})`);
+    } finally {
+      await teardown(page);
+    }
+  });
+});
+
+test.describe("Every saved anchor row removed during a held gesture, on the mobile layout", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  for (const deadlinePassed of [false, true]) {
+    test(`the reveal's restore finds no saved row and leaves the clamped reader parked, ${deadlinePassed ? "after" : "before"} the old quiet deadline`, async ({
+      page,
+    }) => {
+      const chat = page.locator("#chat-scroll-container");
+      await missingAnchorHideScrollbar(page);
+      try {
+        await heldGesture(page, { upPx: MISSING_UP_PX, fillers: MISSING_FILLERS, observeSettle: true });
+        const selection = await missingAnchorSelect(page);
+        // Arm the reader's quiet deadline as a held gesture can: a real anchor
+        // correction, then its end refused.
+        await followGrowAbove(page, GROW_PX);
+        await followRealFrames(page, 3);
+        await page.evaluate(() => {
+          const rec = window.__followRecorder!;
+          rec.setGate(false);
+          document.getElementById("chat-scroll-container")!.dispatchEvent(new Event("scrollend"));
+          rec.setGate(true);
+        });
+        const armed = await followSettleRecord(page);
+        expect(
+          armed.settle.filter((t) => t.cleared === null && t.fired === null),
+          `premise: refusing the correction's end armed the reader's deadline (${JSON.stringify(armed)})`,
+        ).toHaveLength(1);
+        const deadline = armed.settle[0];
+
+        const removal = await missingAnchorRemove(page, selection, () => followRealFrames(page, 3));
+        await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).click();
+        await page.clock.runFor(0);
+        await expect(chat).toBeHidden({ timeout: 5_000 });
+        expect(await viewportHeight(page), "premise: hidden geometry is not measured").toBe(0);
+        await followRealFrames(page, 2);
+        if (deadlinePassed) await page.clock.runFor(QUIET_MS);
+        await page.getByTestId("rooms-back-button").click();
+        // Nested zero-delay work can be scheduled one clock millisecond later.
+        await expect
+          .poll(
+            async () => {
+              await page.clock.runFor(1);
+              return viewportHeight(page);
+            },
+            { message: "premise: the back button reveals the history" },
+          )
+          .toBeGreaterThan(0);
+        await expect(chat).toBeVisible();
+        await followRealFrames(page, 3);
+        const settled = await followSettleRecord(page);
+        const revealed = await page.evaluate(() => {
+          const c = document.getElementById("chat-scroll-container")!;
+          return { top: c.scrollTop, height: c.clientHeight, max: c.scrollHeight - c.clientHeight };
+        });
+        const what = JSON.stringify({ selection, removal, revealed, settled, log: await followLog(page) });
+        test.info().annotations.push({ type: "missing anchor reveal", description: what });
+        const old = settled.settle.find((t) => t.handle === deadline.handle);
+        expect(old, `premise: the old deadline is in the record (${what})`).toBeDefined();
+        if (deadlinePassed) {
+          expect(old!.fired, `premise: the old deadline fired while hidden (${what})`).not.toBeNull();
+        } else {
+          expect(settled.now, `premise: the reveal finished before the old deadline was due (${what})`).toBeLessThan(
+            deadline.at + deadline.delay,
+          );
+          expect(old!.fired, `premise: the old deadline has not fired (${what})`).toBeNull();
+        }
+        expect(
+          settled.settle.filter((t) => t.cleared === null && t.fired === null),
+          `the reveal did not complete the old gesture and cancel its deadline (${what})`,
+        ).toEqual([]);
+        // The reveal writes nothing for a missing anchor, so the view is where
+        // the removal left it, inside the band: measuring it as the reader's
+        // would pin them.
+        expect(
+          Math.abs(revealed.top - removal.after.top),
+          `premise: the reveal found no saved row to restore and left the view where the removal put it (${what})`,
+        ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+        expect(
+          revealed.max - revealed.top,
+          `premise: the revealed view is inside the follow band, so measuring it would pin the reader (${what})`,
+        ).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX - IN_PLACE_TOLERANCE_PX);
+
+        await expectParkedThroughArrivals(page, removal.after.top, "the reveal measured the clamp as the reader's and re-pinned them");
+      } finally {
+        await teardown(page);
+      }
+    });
+  }
 });
 
 // Content can grow above a held reader with `scrollTop` unchanged (an image

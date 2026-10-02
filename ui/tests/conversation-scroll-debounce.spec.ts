@@ -22,6 +22,7 @@ import {
   debounceState,
   debounceUseFallback,
 } from "./history-scroll-fixture";
+import { missingAnchorRemove, missingAnchorSelect } from "./history-missing-anchor-fixture";
 
 // The settle fallback for browsers without `scrollend` (Safari before 17.4):
 // a gesture settles once `scroll` has been quiet for 120ms
@@ -159,6 +160,62 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
       }
     });
   }
+
+  // Every row the reader's anchor remembers is removed while the gesture waits
+  // for its quiet deadline, and the removal clamps the parked reader into the
+  // follow band. The clamp's `scroll` and the observer reach the app first, so
+  // the deadline settles with nothing pending, over a restore that found no
+  // saved row. Before, that settle measured the clamped position as the
+  // reader's and re-pinned them, and the next arrival snapped them; a missing
+  // anchor now preserves their intent, so they stay parked.
+  test("every saved anchor row removed before the quiet deadline leaves the clamped reader parked (controlled order: move → removal → clamp scroll → observer → deadline)", async ({
+    page,
+  }) => {
+    const FILLERS = 30;
+    const PARKED_UP_PX = 300;
+    await debounceOpenFilledRoom(page, "Team Chat Room", "/", FILLERS);
+    await debounceExpectFallbackSelected(page);
+    const setup = await debouncePauseWhenQuiet(page);
+
+    await readerScrollsUp(page, PARKED_UP_PX, "the upward scroll out of the band");
+    const armed = await expectFreshDeadline(page, "premise: the upward scroll armed the debounce");
+    const selection = await missingAnchorSelect(page);
+    const removal = await missingAnchorRemove(page, selection, () => debounceFrames(page, 3));
+    const before = await debounceState(page);
+    const what = JSON.stringify({ selection, removal, registrations: before.registrations.slice(setup) });
+    expect(before.now, `premise: the removal was recorded before the reader's deadline (${what})`).toBeLessThan(
+      armed.at + DEBOUNCE_SETTLE_MS,
+    );
+    expect(
+      debounceOnlyPending(before, `premise: the layout did not re-arm the deadline (${what})`).handle,
+      `premise: the reader's own deadline is the one pending (${what})`,
+    ).toBe(armed.handle);
+
+    await debounceAdvance(page, armed.at + DEBOUNCE_SETTLE_MS - before.now);
+    const state = await debounceState(page);
+    expect(debounceFired(state, setup).map((r) => r.handle), `premise: the reader's deadline settled the gesture (${what})`).toEqual([
+      armed.handle,
+    ]);
+    expect(state.beforeFire, "premise: nothing moved the view in the deadline's task").toEqual([]);
+    expect(debouncePending(state), "the settle left a deadline pending").toEqual([]);
+    expect(
+      Math.abs((await debounceScrollTop(page)) - removal.after.top),
+      `the settle moved the view (${what})`,
+    ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+
+    for (const n of [1, 2]) {
+      const marker = `tall arrival ${n} after the anchor rows were removed`;
+      await debounceDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
+      const drift = Math.abs((await debounceScrollTop(page)) - removal.after.top);
+      expect(
+        drift,
+        `the quiet deadline measured the clamp as the reader's and re-pinned them: arrival ${n} moved the parked view by ${drift}px (${what})`,
+      ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      expect(await debounceDistanceFromBottom(page), `arrival ${n} left the reader inside the band`).toBeGreaterThan(
+        BOTTOM_THRESHOLD_PX,
+      );
+    }
+  });
 
   test("an arrival inside the band is held until the quiet deadline, and the next one follows", async ({ page }) => {
     await debounceOpenFilledRoom(page, "Team Chat Room");
