@@ -7,7 +7,6 @@ import {
   debounceBeforeSettleFire,
   debounceDeliver,
   debounceDeliverJoin,
-  debounceDistanceFromBottom,
   debounceDrift,
   debounceExpectFallbackSelected,
   debounceFired,
@@ -18,10 +17,10 @@ import {
   debouncePauseWhenQuiet,
   debounceRestore,
   debounceScrollTo,
-  debounceScrollTop,
   debounceState,
   debounceUseFallback,
 } from "./history-scroll-fixture";
+import { distanceFromBottom, scrollTop } from "./history-scroll-helpers";
 import { missingAnchorRemove, missingAnchorSelect } from "./history-missing-anchor-fixture";
 
 // The settle fallback for browsers without `scrollend` (Safari before 17.4):
@@ -86,7 +85,7 @@ async function expectHeld(page: Page, at: { id: string; gap: number }, why: stri
 
 /// The reader moves up `px` from where they are; returns what they could see.
 async function readerScrollsUp(page: Page, px: number, why: string) {
-  const target = (await debounceScrollTop(page)) - px;
+  const target = (await scrollTop(page)) - px;
   const moved = await debounceScrollTo(page, target);
   expect(moved.scrolled, `premise: ${why}: the scroll event was delivered`).toBe(true);
   expect(Math.abs(moved.landed - target), `premise: ${why}: the scroll landed where aimed`).toBeLessThanOrEqual(1);
@@ -96,7 +95,7 @@ async function readerScrollsUp(page: Page, px: number, why: string) {
 
 async function expectFollowing(page: Page, text: string, why: string) {
   await debounceDeliver(page, text);
-  expect(await debounceDistanceFromBottom(page), why).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
+  expect(await distanceFromBottom(page), why).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
 }
 
 test.describe("Without scrollend, a gesture settles after 120ms of quiet", () => {
@@ -120,7 +119,7 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
         const setup = await debouncePauseWhenQuiet(page);
         const at = await readerScrollsUp(page, 400, "the upward scroll into the overhang");
         const armed = await expectFreshDeadline(page, "premise: the held gesture's deadline is pending");
-        expect(await debounceDistanceFromBottom(page), "premise: the reader is outside the follow band").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+        expect(await distanceFromBottom(page), "premise: the reader is outside the follow band").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
         if (deliveredFirst) {
           const removed = await page.evaluate(() => window.__historyClamp.remove());
           expectFinalEndClamp(removed);
@@ -147,14 +146,14 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
         }
         expect(debounceFired(state, setup).map((r) => r.handle), "premise: the original deadline fired").toEqual([armed.handle]);
         expect(debouncePending(state), "the layout clamp must not re-arm the reader's deadline").toEqual([]);
-        expect(await debounceScrollTop(page), "the unreachable anchor leaves the view at the clamped end").toBeCloseTo(removed!.after.top, 0);
+        expect(await scrollTop(page), "the unreachable anchor leaves the view at the clamped end").toBeCloseTo(removed!.after.top, 0);
 
         const marker = "arrival after quiet clamp settle";
         await debounceDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
         const height = await page.getByText(marker, { exact: false }).last().evaluate((el) => el.getBoundingClientRect().height);
         expect(height, "premise: the arrival restores the lost range plus the follow band").toBeGreaterThan(500);
         expect(await clampRowDrift(page, at), "the quiet deadline captured the clamp and followed the tall arrival").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
-        expect(await debounceDistanceFromBottom(page), "the arrival must leave the reader parked").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+        expect(await distanceFromBottom(page), "the arrival must leave the reader parked").toBeGreaterThan(BOTTOM_THRESHOLD_PX);
       } finally {
         await clampCleanup(page);
       }
@@ -199,19 +198,19 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     expect(state.beforeFire, "premise: nothing moved the view in the deadline's task").toEqual([]);
     expect(debouncePending(state), "the settle left a deadline pending").toEqual([]);
     expect(
-      Math.abs((await debounceScrollTop(page)) - removal.after.top),
+      Math.abs((await scrollTop(page)) - removal.after.top),
       `the settle moved the view (${what})`,
     ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
 
     for (const n of [1, 2]) {
       const marker = `tall arrival ${n} after the anchor rows were removed`;
       await debounceDeliver(page, `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`);
-      const drift = Math.abs((await debounceScrollTop(page)) - removal.after.top);
+      const drift = Math.abs((await scrollTop(page)) - removal.after.top);
       expect(
         drift,
         `the quiet deadline measured the clamp as the reader's and re-pinned them: arrival ${n} moved the parked view by ${drift}px (${what})`,
       ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
-      expect(await debounceDistanceFromBottom(page), `arrival ${n} left the reader inside the band`).toBeGreaterThan(
+      expect(await distanceFromBottom(page), `arrival ${n} left the reader inside the band`).toBeGreaterThan(
         BOTTOM_THRESHOLD_PX,
       );
     }
@@ -232,11 +231,12 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     expect(debounceFired(await debounceState(page), setup), "the gesture settled before 120ms of quiet").toEqual([]);
     await expectHeld(page, at, "the hold let go before the deadline");
 
-    const beforeSettle = await debounceScrollTop(page);
+    const beforeSettle = await scrollTop(page);
+    expect(beforeSettle, "premise: the history container is mounted").not.toBeNaN();
     await debounceAdvance(page, 1);
-    expect(await debounceScrollTop(page), "the settle moved the view").toBe(beforeSettle);
+    expect(await scrollTop(page), "the settle moved the view").toBe(beforeSettle);
     expect(
-      await debounceDistanceFromBottom(page),
+      await distanceFromBottom(page),
       "premise: the reader settled inside the band",
     ).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
     await expectFollowing(page, "arrival after the settle", "a reader who settled inside the band was not followed");
@@ -259,7 +259,7 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     const second = await expectNewDeadline(page, "premise: the second scroll re-armed the debounce");
     expect(second.at - first.at, "premise: the second scroll re-armed 60ms later").toBe(60);
     expect(
-      await debounceDistanceFromBottom(page),
+      await distanceFromBottom(page),
       "premise: the reader is still inside the band",
     ).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
 
@@ -275,7 +275,7 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     await expectHeld(page, at, "the hold let go before the second deadline");
     await debounceAdvance(page, 1);
     expect(
-      await debounceDistanceFromBottom(page),
+      await distanceFromBottom(page),
       "premise: the reader settled inside the band",
     ).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
     await expectFollowing(page, "arrival after the second deadline", "the gesture never settled after its quiet interval");
@@ -297,19 +297,20 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     await debounceDeliver(page, TALL("tall arrival while held"));
     await expectHeld(page, at, "the tall arrival snapped a reader scrolling up");
     expect(
-      await debounceDistanceFromBottom(page),
+      await distanceFromBottom(page),
       "premise: the tall arrival leaves the reader outside the band",
     ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
     await expectFreshDeadline(page, "premise: the arrival did not re-arm the debounce");
 
     await debounceAdvance(page, DEBOUNCE_SETTLE_MS - 1);
     expect(debounceFired(await debounceState(page), setup), "the gesture settled before 120ms of quiet").toEqual([]);
-    const beforeSettle = await debounceScrollTop(page);
+    const beforeSettle = await scrollTop(page);
+    expect(beforeSettle, "premise: the history container is mounted").not.toBeNaN();
     await debounceAdvance(page, 1);
     expect(debounceFired(await debounceState(page), setup).map((r) => r.handle), "premise: the gesture settled").toEqual([
       armed.handle,
     ]);
-    expect(await debounceScrollTop(page), "the settle moved the view").toBe(beforeSettle);
+    expect(await scrollTop(page), "the settle moved the view").toBe(beforeSettle);
     await expectHeld(page, at, "the settle moved the reader's message");
 
     await debounceDeliver(page, `arrival after the settle: ${"r".repeat(200)}`);
@@ -354,7 +355,7 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     const at = await page.evaluate(() => window.__riverDebounce.newestVisible());
     expect(at, "premise: a message is visible").not.toBeNull();
     expect(
-      await debounceDistanceFromBottom(page),
+      await distanceFromBottom(page),
       "premise: the reader is still inside the band",
     ).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX - 40 - IN_PLACE_TOLERANCE_PX);
 
@@ -371,9 +372,10 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     ).toEqual([armed.handle]);
     await expectHeld(page, at!, "the hold let go before the fresh deadline");
 
-    const beforeSettle = await debounceScrollTop(page);
+    const beforeSettle = await scrollTop(page);
+    expect(beforeSettle, "premise: the history container is mounted").not.toBeNaN();
     await debounceAdvance(page, 1);
-    expect(await debounceScrollTop(page), "the settle moved the view").toBe(beforeSettle);
+    expect(await scrollTop(page), "the settle moved the view").toBe(beforeSettle);
     expect(
       debounceFired(await debounceState(page), setup).map((r) => r.handle),
       "premise: the fresh deadline settled the gesture",
@@ -408,7 +410,7 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
       return before;
     }, GROW_PX);
     await debounceFrames(page, 3);
-    const correction = (await debounceScrollTop(page)) - before;
+    const correction = (await scrollTop(page)) - before;
     expect(
       Math.abs(correction - GROW_PX),
       `premise: the restore corrected the view by the growth above (${correction}px)`,
@@ -422,7 +424,7 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     await expectHeld(page, at, "the hold let go before the reader's deadline");
     await debounceAdvance(page, 1);
     expect(
-      await debounceDistanceFromBottom(page),
+      await distanceFromBottom(page),
       "premise: the reader settled inside the band",
     ).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
     await expectFollowing(
@@ -465,7 +467,7 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     // old deadline.
     await debounceAdvance(page, 5);
     expect(
-      await debounceDistanceFromBottom(page),
+      await distanceFromBottom(page),
       "premise: the new room opened at its newest message",
     ).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
     // The new room's newest message can be from yesterday in the browser's
@@ -496,7 +498,7 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     await expectHeld(page, at, "the fresh hold let go before its deadline");
     await debounceAdvance(page, 1);
     expect(
-      await debounceDistanceFromBottom(page),
+      await distanceFromBottom(page),
       "premise: the reader settled inside the band",
     ).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
     await expectFollowing(page, "arrival after the fresh settle", "the new room's gesture never settled");

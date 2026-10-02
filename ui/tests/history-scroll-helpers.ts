@@ -2,12 +2,14 @@ import { expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { waitForApp, selectRoom } from "./example-room";
 
-// Node-side helpers shared by conversation-autoscroll.spec.ts and
-// conversation-seek-speed.spec.ts. A spec cannot import another without
-// registering its tests twice, so they live here.
+// Node-side helpers shared by the conversation-* specs. A spec cannot import
+// another without registering its tests twice, so they live here.
 //
-// They run on the browser's own clock. The debounce spec, whose clock is
-// paused, has its own delivery and frame waits in history-scroll-fixture.ts.
+// The waits here run on the browser's own clock. The debounce spec, whose
+// clock is paused, has its own delivery and frame waits in
+// history-scroll-fixture.ts; it shares only the geometry reads, which use no
+// timer. Those return NaN when `#chat-scroll-container` is missing, so a caller
+// comparing two reads for equality must first rule NaN out.
 
 /// Slack for fractional layout after a scroll that did land at the bottom.
 export const AT_BOTTOM_EPSILON_PX = 4;

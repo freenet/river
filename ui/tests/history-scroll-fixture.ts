@@ -1,6 +1,7 @@
 import { expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { waitForApp, selectRoom } from "./example-room";
+import { distanceFromBottom } from "./history-scroll-helpers";
 
 // Browser-test utilities for the history-scroll specs, in three sections:
 //
@@ -972,17 +973,6 @@ export async function debouncePauseWhenQuiet(page: Page): Promise<number> {
   return state.registrations.length;
 }
 
-export function debounceDistanceFromBottom(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const c = document.getElementById("chat-scroll-container")!;
-    return c.scrollHeight - c.scrollTop - c.clientHeight;
-  });
-}
-
-export function debounceScrollTop(page: Page): Promise<number> {
-  return page.evaluate(() => document.getElementById("chat-scroll-container")!.scrollTop);
-}
-
 export function debounceScrollTo(page: Page, top: number) {
   return page.evaluate((top) => window.__riverDebounce.scrollTo(top), top);
 }
@@ -1033,7 +1023,7 @@ export async function debounceOpenFilledRoom(page: Page, roomName: string, path 
     await expect(page.getByText(text.slice(0, 40), { exact: false }).last()).toBeVisible({ timeout: 5_000 });
   }
   await expect
-    .poll(() => debounceDistanceFromBottom(page), {
+    .poll(() => distanceFromBottom(page), {
       timeout: 5_000,
       message: "premise: the fillers should have been followed",
     })
