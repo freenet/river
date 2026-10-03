@@ -44,6 +44,6 @@ rand.workspace = true
 tempfile = "3.0"
 testresult = "0.4"
 tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = "0.27"
+tokio-tungstenite = "0.29"
 tracing.workspace = true
 tracing-subscriber = "0.3"
