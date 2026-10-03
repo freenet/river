@@ -115,8 +115,13 @@ mod tests {
         // endpoint in the global-cap ranking, so a DM destined for deletion
         // could evict a legitimate one. Fixing it re-keys the contract, and
         // rooms on the old key need the backward probe to still find them.
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 32);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "f6e6f99520959a6d");
+        //
+        // V33 registers the generation before bans were resolved from
+        // converged state (freenet/river#423, PR #702): `BansV1::apply_delta`
+        // rejected a WHOLE delta on the orphaned-ban rule judged against the
+        // pre-update member set, which could fork a room permanently.
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 33);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "99df10ade9fcb201");
     }
 
     #[test]

@@ -984,9 +984,12 @@ mod tests {
         let params = ChatRoomParametersV1 {
             owner: owner.verifying_key(),
         };
-        let excluded = state
-            .members
-            .banned_member_ids(&state.bans, &state.member_info, &params);
+        let excluded = state.members.banned_member_ids(
+            &state.ban_evidence,
+            &state.bans,
+            &state.member_info,
+            &params,
+        );
         state
             .members
             .members
@@ -1120,7 +1123,12 @@ mod tests {
         assert!(
             !state
                 .members
-                .banned_member_ids(&state.bans, &state.member_info, &params)
+                .banned_member_ids(
+                    &state.ban_evidence,
+                    &state.bans,
+                    &state.member_info,
+                    &params
+                )
                 .contains(&id(&alice)),
             "precondition: the contract refuses to enforce a mis-signed ban"
         );
@@ -1213,7 +1221,12 @@ mod tests {
 
             let actually_excluded = state
                 .members
-                .banned_member_ids(&state.bans, &state.member_info, &params)
+                .banned_member_ids(
+                    &state.ban_evidence,
+                    &state.bans,
+                    &state.member_info,
+                    &params,
+                )
                 .contains(&target);
 
             assert_eq!(

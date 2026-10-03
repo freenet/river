@@ -3891,9 +3891,15 @@ mod tests {
     /// from the registry). Either way the entry is required: the committed
     /// bytes are what users' delegate key is derived from, whatever moved
     /// them.
+    ///
+    /// Updated for V32 (the freenet/river#423 release, PR #702). This time the
+    /// fix itself moves the delegate: at the same `river-core` 0.1.22, before
+    /// the fix, it built as `91d5fa8e…` (chat-delegate links river-core
+    /// room-state code). The `river-core` 0.1.21 -> 0.1.22 bump, mandatory for
+    /// the same reason as V30 and V31, would move it regardless.
     #[test]
     fn legacy_set_fingerprint_is_stable_across_codegen_changes() {
-        assert_eq!(legacy_set_fingerprint(), "c32c326c1328de9a");
+        assert_eq!(legacy_set_fingerprint(), "10f72d68c4c4ad91");
     }
 
     /// The "migration in progress" and "migration done" localStorage keys MUST
@@ -5588,7 +5594,7 @@ mod tests {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "c2e6063899624b65715d683fbbba04637ba89b72dc17f5b1610343922356fc46",
+            "c5142d3c2f315a0e27ffd161a9759ee69f8304f2284e4a7b451772c70b5cc84a",
             "chat_delegate.wasm changed — this branch must not alter the delegate WASM; \
              if the change is intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
