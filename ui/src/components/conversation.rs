@@ -4257,8 +4257,7 @@ pub fn Conversation() -> Element {
                             match message_groups.read().as_ref() {
                                 Some((groups, self_member_id, member_names)) => {
                                     // Read a reader scroll whose event has not arrived yet,
-                                    // while the DOM is still the previous render's (see the
-                                    // `history_scroll.rs` module doc).
+                                    // while the DOM is still the previous render's.
                                     #[cfg(target_arch = "wasm32")]
                                     if !room_changed_this_render {
                                         history.take_in_undelivered_scroll();

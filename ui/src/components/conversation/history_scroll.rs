@@ -189,9 +189,8 @@ fn newest_visible_row(
     Some(newest)
 }
 
-/// Read a `scroll` event as an echo, a layout change's doing or the reader's
-/// (the module doc has the rules and what each gets wrong). `max` is the live
-/// scroll range (`max_scroll_top`), never a recorded one.
+/// Read a `scroll` event as an echo, a layout change's doing or the reader's.
+/// `max` is the live scroll range (`max_scroll_top`), never a recorded one.
 ///
 /// Layout is any of three clauses: **final-end clamp**, the recorded `scrollTop`
 /// is past `max` by more than rounding and the view sits at `max` (within
@@ -265,7 +264,7 @@ enum Placement {
     Saved,
 }
 
-/// The history's scroll state. See the module doc.
+/// The history's scroll state.
 pub(super) struct HistoryScroll {
     /// The one newest visible row. `None` until something has been captured,
     /// and again once that row is gone and the latest landing has not yet.
@@ -538,8 +537,8 @@ impl HistoryScroll {
         container.query_selector(&selector).ok()?
     }
 
-    /// Measure the saved rows where the view is now (see "The saved position"),
-    /// and record. With no rows rendered it only records: an empty render is
+    /// Measure the saved anchor where the view is now, and record.
+    /// With no rows rendered it only records: an empty render is
     /// not a position, and the saved anchor waits for the rows.
     fn capture(&self, container: &web_sys::Element) {
         if !self.has_rows() {

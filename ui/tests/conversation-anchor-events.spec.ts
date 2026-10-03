@@ -34,8 +34,7 @@ import {
 } from "./history-scroll-helpers";
 
 // The reader's saved row across layout and native-event orderings that a
-// geometry heuristic could get wrong (history_scroll.rs, "Classifying a
-// `scroll` event" and "Timing and visibility"): a clamp to a shorter range, a
+// geometry heuristic could get wrong: a clamp to a shorter range, a
 // clamp while hidden, the one reading anchor deleted, and a reflow above the reader
 // that the ResizeObserver reports after some other event.
 //
