@@ -2979,6 +2979,8 @@ pub fn Conversation() -> Element {
                 }
             }
             prev_render_room.set(Some(room));
+            #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+            crate::test_hooks::end_history_renders_empty();
             let saved = room
                 .and_then(|key| room_positions.borrow().get(&key).cloned())
                 .unwrap_or(RoomPosition {
@@ -3140,6 +3142,13 @@ pub fn Conversation() -> Element {
         // into a room full of history. freenet/river#555.
         crate::util::signal_guard::anchor();
         let current_room = CURRENT_ROOM.read();
+        // Example/no-sync builds only: `__riverTest.setHistoryEmpty` renders
+        // this room's history the way a contended read does, with every
+        // message kept (test_hooks.rs).
+        #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+        if crate::test_hooks::history_renders_empty(current_room.owner_key) {
+            return None;
+        }
         if let Some(key) = current_room.owner_key {
             let Ok(rooms) = ROOMS.try_read() else {
                 crate::util::signal_guard::schedule_nudge();

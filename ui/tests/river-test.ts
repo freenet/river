@@ -17,6 +17,11 @@ type RiverTestHooks = {
   /// Removes the messages whose rows have these DOM ids (`msg-...`) in one
   /// state change. Resolves with the ids that matched no message.
   removeMessages(domIds: string[]): Promise<string[]>;
+  /// Renders the current room's history with no rows (`true`), through the
+  /// real memo and render, or with its unchanged rows again (`false`). Resolves
+  /// once the deferred state change has run, not once the DOM shows it. A room
+  /// switch ends it.
+  setHistoryEmpty(on: boolean): Promise<void>;
 };
 
 declare global {

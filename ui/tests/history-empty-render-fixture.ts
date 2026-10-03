@@ -99,3 +99,167 @@ export async function afterObserverAndTask(page: Page) {
   );
   await afterLayoutSettles(page);
 }
+
+/// Where the history stood when its rows went away during a navigation.
+export type EmptyAtRemoval = {
+  /// `scrollTop`, the scroll range's inputs and the distance left to the
+  /// click's destination, read once the rows are gone. For `render`, the
+  /// history's height has collapsed by then, so `top` is the browser's clamp.
+  top: number;
+  scrollHeight: number;
+  clientHeight: number;
+  toDestination: number;
+  /// Anchor rows rendered (0 for an empty history).
+  rows: number;
+  /// The last native `scroll` before the removal, and the browser's clamp
+  /// (that minus `top`; 0 when the height was kept).
+  lastScroll: number;
+  clamp: number;
+  endedBefore: boolean;
+};
+
+/// What `navigateWithEmptyHistory` saw.
+export type NavigationEmpty = {
+  start: number;
+  destination: number;
+  /// The newest visible message as the app last captured it before the rows
+  /// went away: at the click, then at each native `scroll` or `end`.
+  captured: { id: string; gap: number } | null;
+  removal: EmptyAtRemoval;
+  /// The first `scrollTop` write the app made after the removal (its stop),
+  /// and where the view came to rest.
+  firstWriteAfter: { pre: number; value: number } | null;
+  rest: number;
+  /// Every step on one clock: `click`, `scroll`, `end`, `emptied`, `write`
+  /// (an app `scrollTop` write, `pre→value`), `observed` (the first
+  /// ResizeObserver delivery after the removal) and `rest`.
+  timeline: string;
+};
+
+/// Click scroll-to-latest and, in the click's own task, make the history
+/// render no rows: `synthetic` swaps them for a placeholder of the same height
+/// (`__riverEmptyRender`), `render` asks the app for an empty render
+/// (`__riverTest.setHistoryEmpty`), which is deferred and collapses the height.
+/// Everything is installed before the click and records on one clock. Resolves
+/// once the rows are gone and no `scroll` has come for 400ms. The caller puts
+/// the rows back (`restoreHistory`, or `setHistoryEmpty(false)`).
+///
+/// The click's own task, not a later `scroll`: the whole animation is a handful
+/// of frames on CI's Linux WebKit (~1,800px in its first), so a removal at the
+/// first `scroll` can leave the next frame landing on the destination, and the
+/// controller would then have nothing left to stop.
+export function navigateWithEmptyHistory(page: Page, how: "synthetic" | "render") {
+  return page.evaluate(
+    (how) =>
+      new Promise<NavigationEmpty>((resolve, reject) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const content = document.getElementById("chat-content")!;
+        const geometry = window.__riverHistoryGeometry!;
+        const start = c.scrollTop;
+        const destination = c.scrollHeight - c.clientHeight;
+        const t0 = performance.now();
+        const timeline: string[] = [];
+        const native = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!;
+        const top = () => native.get!.call(c) as number;
+        const log = (kind: string) =>
+          timeline.push(`${kind}@${top().toFixed(1)}+${(performance.now() - t0).toFixed(0)}ms`);
+        const rowCount = () => content.querySelectorAll("[data-anchor-row]").length;
+        let captured = geometry.newestVisible(c);
+        let lastScroll = start;
+        let endedBefore = false;
+        let removal: EmptyAtRemoval | null = null;
+        let firstWriteAfter: { pre: number; value: number } | null = null;
+        let quiet = 0;
+        const cleanup = () => {
+          clearTimeout(timer);
+          clearTimeout(quiet);
+          observer.disconnect();
+          resize.disconnect();
+          c.removeEventListener("scroll", onScroll);
+          c.removeEventListener("scrollend", onEnd);
+          delete (c as unknown as { scrollTop?: number }).scrollTop;
+        };
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`navigation empty: the rows never went away and settled: ${timeline.join(" ")}`));
+        }, 10_000);
+        const settle = () => {
+          clearTimeout(quiet);
+          quiet = window.setTimeout(() => {
+            log("rest");
+            const rest = top();
+            cleanup();
+            resolve({
+              start,
+              destination,
+              captured,
+              removal: removal!,
+              firstWriteAfter,
+              rest,
+              timeline: timeline.join(" "),
+            });
+          }, 400);
+        };
+        const noteRemoval = () => {
+          if (removal || rowCount() > 0) return;
+          const now = top();
+          removal = {
+            top: now,
+            scrollHeight: c.scrollHeight,
+            clientHeight: c.clientHeight,
+            toDestination: destination - now,
+            rows: rowCount(),
+            lastScroll,
+            clamp: lastScroll - now,
+            endedBefore,
+          };
+          log("emptied");
+          resize.observe(content);
+          settle();
+        };
+        // Every position the app writes, recorded at the setter.
+        Object.defineProperty(c, "scrollTop", {
+          configurable: true,
+          get: top,
+          set: (value: number) => {
+            const pre = top();
+            native.set!.call(c, value);
+            if (removal && !firstWriteAfter) firstWriteAfter = { pre, value };
+            timeline.push(`write@${pre.toFixed(1)}→${value}+${(performance.now() - t0).toFixed(0)}ms`);
+          },
+        });
+        let observedOnce = false;
+        const resize = new ResizeObserver(() => {
+          if (observedOnce) return;
+          observedOnce = true;
+          log("observed");
+        });
+        const observer = new MutationObserver(noteRemoval);
+        observer.observe(content, { childList: true, subtree: true });
+        // After the app's own listeners: the app has had each event.
+        const onScroll = () => {
+          log("scroll");
+          if (removal) return settle();
+          lastScroll = top();
+          captured = geometry.newestVisible(c);
+        };
+        const onEnd = () => {
+          log("end");
+          if (removal) return settle();
+          endedBefore = true;
+          captured = geometry.newestVisible(c);
+        };
+        c.addEventListener("scroll", onScroll);
+        c.addEventListener("scrollend", onEnd);
+        log("click");
+        document.querySelector<HTMLElement>('[data-testid="scroll-to-bottom"]')!.click();
+        if (how === "synthetic") {
+          window.__riverEmptyRender!.empty(true);
+          noteRemoval();
+        } else {
+          void window.__riverTest!.setHistoryEmpty(true);
+        }
+      }),
+    how,
+  );
+}

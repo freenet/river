@@ -1,5 +1,6 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
-//! INBOUND messages and to drive the no-room screen's load states.
+//! INBOUND messages, to drive the no-room screen's load states, and to render
+//! a room's history empty without touching its messages.
 //!
 //! The composer is not a substitute: a message sent through the UI is the
 //! reader's own, and goes through `apply_delta`'s verification, which drops
@@ -31,6 +32,36 @@ use river_core::room_state::{
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::convert::{FromWasmAbi, ReturnWasmAbi};
 use wasm_bindgen::JsValue;
+
+/// The room whose history `setHistoryEmpty` holds empty: the render the
+/// `message_groups` memo produces when a contended read leaves it `None`
+/// (#555) while the room's messages are all still there. Nothing is deleted,
+/// so clearing it renders the identical rows and anchor keys again. Keyed by
+/// room, and cleared by a room switch (`end_history_renders_empty`), so it
+/// never outlives the room it was set in.
+static HISTORY_RENDERS_EMPTY: GlobalSignal<Option<VerifyingKey>> = Global::new(|| None);
+
+/// Whether `setHistoryEmpty` holds `room`'s history empty. Read by the
+/// `message_groups` memo after its anchor, so the memo subscribes to it. A
+/// contended read is not "empty": it nudges, as every fallible memo read must
+/// (.claude/rules/dioxus-signal-safety.md), and the rows render.
+pub fn history_renders_empty(room: Option<VerifyingKey>) -> bool {
+    match HISTORY_RENDERS_EMPTY.try_read() {
+        Ok(emptied) => emptied.is_some() && *emptied == room,
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            false
+        }
+    }
+}
+
+/// A room switch ends `setHistoryEmpty`. Called from the render that switches,
+/// so the write is deferred.
+pub fn end_history_renders_empty() {
+    if HISTORY_RENDERS_EMPTY.peek().is_some() {
+        crate::util::defer(|| *HISTORY_RENDERS_EMPTY.write() = None);
+    }
+}
 
 /// Exercise the real history controller at a chosen DOM boundary. These
 /// callbacks mutate no application state directly: controller signal work
@@ -182,6 +213,26 @@ pub fn install_test_hooks() {
                 .map(|id| JsValue::from_str(&id))
                 .collect();
             let _ = resolve.call1(&JsValue::NULL, &unmatched);
+        });
+        promise
+    });
+
+    // Render the current room's history empty (`true`) or with its rows again
+    // (`false`) through the real `message_groups` memo and render arm. The
+    // promise resolves once the deferred state change has run; it says nothing
+    // about whether the render has reached the DOM.
+    expose(&hooks, "setHistoryEmpty", move |on: bool| {
+        let mut resolve = None;
+        let promise = js_sys::Promise::new(&mut |res, _rej| resolve = Some(res));
+        let resolve = resolve.expect("Promise::new runs its executor synchronously");
+        // Reading CURRENT_ROOM needs the Dioxus runtime, which a raw JS call lacks.
+        crate::util::defer(move || {
+            *HISTORY_RENDERS_EMPTY.write() = if on {
+                CURRENT_ROOM.peek().owner_key
+            } else {
+                None
+            };
+            let _ = resolve.call0(&JsValue::NULL);
         });
         promise
     });

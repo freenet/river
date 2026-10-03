@@ -21,9 +21,12 @@ import {
   afterObserverAndTask,
   emptyHistory,
   expectEmptyButVisible,
+  navigateWithEmptyHistory,
   registerEmptyRender,
   restoreHistory,
+  type NavigationEmpty,
 } from "./history-empty-render-fixture";
+import { callRiverTest } from "./river-test";
 
 const PARK_PX = 3_000;
 /// The scroll model's layout-movement allowance; this is only a fixture premise.
@@ -165,42 +168,90 @@ test.describe("A render with no rows is not a deleted anchor", () => {
     );
   });
 
-  test("navigation: rows disappearing mid-flight stop it, and the last captured message comes back", async ({ page }) => {
+  // The rows go in the click's own task (see `navigateWithEmptyHistory`): the
+  // navigation is running, the animation has not drawn a frame, and the app
+  // first meets the empty history at the animation's first `scroll`. The
+  // placeholder keeps the height, so nothing clamps and only the app's stop
+  // can keep the view short of the destination.
+  test("navigation: rows disappearing once it is running stop it, and the last captured message comes back", async ({
+    page,
+  }) => {
     await parkAboveTheEnd(page, PARK_PX);
     await recordScrollRequests(page);
-    const parkedAt = await scrollTop(page);
-    await button(page).click();
-    await animationUnderway(page, parkedAt);
-    let captured: RowPosition | null = null;
+    let run: NavigationEmpty | null = null;
     try {
-      const emptied = await page.evaluate(
-        () =>
-          new Promise<{ anchor: RowPosition | null; before: number; after: number }>((resolve) => {
-            const c = document.getElementById("chat-scroll-container")!;
-            c.addEventListener(
-              "scroll",
-              () => {
-                const anchor = window.__riverHistoryGeometry!.newestVisible(c);
-                resolve({ anchor, ...window.__riverEmptyRender!.empty(true) });
-              },
-              { once: true },
-            );
-          }),
-      );
-      expect(emptied.anchor, "premise: a message was visible at the navigation's scroll").not.toBeNull();
-      expect(Math.abs(emptied.after - emptied.before), "premise: the placeholder keeps the height").toBeLessThanOrEqual(1);
-      captured = emptied.anchor;
+      run = await navigateWithEmptyHistory(page, "synthetic");
+      const what = JSON.stringify(run);
+      test.info().annotations.push({ type: "navigation empty", description: what });
+      expect(run.captured, `premise: a message was visible at the click (${what})`).not.toBeNull();
+      expect(run.removal.rows, `premise: no anchor rows render (${what})`).toBe(0);
+      expect(run.removal.clamp, `premise: the placeholder kept the height, so nothing clamped (${what})`).toBe(0);
+      expect(run.removal.endedBefore, `premise: the rows went before the navigation ended (${what})`).toBe(false);
+      expect(
+        run.removal.toDestination,
+        `premise: the rows went materially before the destination (${what})`,
+      ).toBeGreaterThan(PARK_PX / 2);
+      expect(run.firstWriteAfter, `the app never stopped the animation (${what})`).not.toBeNull();
       await expectEmptyButVisible(page);
-      await viewAtRest(page, "the navigation should stop once its rows are gone");
-      expect(await distanceFromBottom(page), "the navigation went on to the end with no rows").toBeGreaterThan(200);
+      const rest = await viewAtRest(page, "the navigation should stop once its rows are gone");
+      expect(Math.abs(rest - run.rest), `the view moved on after it came to rest (${what})`).toBeLessThanOrEqual(1);
+      expect(await distanceFromBottom(page), `the navigation went on to the end with no rows (${what})`).toBeGreaterThan(
+        LAYOUT_SHIFT_ALLOWANCE_PX,
+      );
       await expectEmptyButVisible(page);
     } finally {
       await restoreHistory(page);
     }
     await afterLayoutSettles(page);
     await deliver(page, ARRIVAL("arrival after the rows came back"));
-    await expectVisibleRowHolds(page, captured!, "the navigation's last captured message was lost to the empty render");
+    await expectVisibleRowHolds(page, run!.captured!, "the navigation's last captured message was lost to the empty render");
     expect(await scrollRequests(page), "nothing re-issued the animation").toEqual({ smooth: 1, other: 0 });
+  });
+
+  // The same through the app itself: the `message_groups` memo returns `None`
+  // and the render shows "No messages yet", with every message still in the
+  // room, as a contended read does (#555); then the identical rows come back.
+  // The history's height collapses, so the browser clamps the view, and a
+  // distance from the shortened end proves nothing about the animation; what
+  // is checked is that the anchor the app held comes back at its gap and that
+  // nothing animates or moves the view afterwards. The empty render is deferred
+  // and can land after the animation has ended on a fast engine; the
+  // annotation says which happened.
+  test("navigation: the app rendering no rows keeps the last captured message for when they return", async ({
+    page,
+  }) => {
+    await parkAboveTheEnd(page, PARK_PX);
+    await recordScrollRequests(page);
+    let run: NavigationEmpty | null = null;
+    try {
+      run = await navigateWithEmptyHistory(page, "render");
+      const what = JSON.stringify(run);
+      test.info().annotations.push({
+        type: "navigation empty render",
+        description: `${run.removal.endedBefore ? "after the navigation's end" : "during the navigation"}; ${what}`,
+      });
+      expect(run.captured, `premise: a message was visible before the rows went (${what})`).not.toBeNull();
+      expect(run.removal.rows, `premise: no anchor rows render (${what})`).toBe(0);
+      await expect(page.getByText("No messages yet"), "premise: the app's own empty render is showing").toBeVisible();
+      await expectEmptyButVisible(page);
+      await afterLayoutSettles(page);
+      await expectEmptyButVisible(page);
+    } finally {
+      await callRiverTest(page, "setHistoryEmpty", false);
+    }
+    await expect
+      .poll(() => page.locator("#chat-content [data-anchor-row]").count(), { message: "premise: the rows came back" })
+      .toBeGreaterThan(0);
+    await afterLayoutSettles(page);
+    await expectVisibleRowHolds(
+      page,
+      run!.captured!,
+      `the rows came back somewhere other than the last captured message (${run!.timeline})`,
+    );
+    expect(await scrollRequests(page), "nothing re-issued the animation").toEqual({ smooth: 1, other: 0 });
+    await deliver(page, ARRIVAL("arrival after the rows came back"));
+    await expectVisibleRowHolds(page, run!.captured!, "an arrival after the rows came back moved the view");
+    expect(await distanceFromBottom(page), "the arrival was followed").toBeGreaterThan(AT_BOTTOM_EPSILON_PX);
   });
 
   test("navigation: rows gone at its native end leave the last captured message for when they return", async ({
