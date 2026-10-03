@@ -52,22 +52,28 @@ export async function openRoomWithComposer(page: Page) {
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
 }
 
-// The edit form on the first own (accent) message: its kebab on touch, its hover
-// actions otherwise (freenet/river#402). Returns the edit textarea.
+// The edit form on an own message's row: its kebab on touch, its hover actions
+// otherwise (freenet/river#402). Does not scroll the row into view first.
+// Returns the edit textarea.
+export async function openEditOnRow(page: Page, row: Locator): Promise<Locator> {
+  if (await page.evaluate(() => window.matchMedia("(hover: none)").matches)) {
+    await row.getByTestId("message-kebab").click();
+    await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();
+  } else {
+    await row.getByTestId("message-bubble").hover();
+    await row.getByRole("button", { name: /edit/i }).click();
+  }
+  const editArea = row.locator('textarea[id^="edit-msg-"]');
+  await expect(editArea).toBeVisible({ timeout: 5_000 });
+  return editArea;
+}
+
+// The edit form on the first own (accent) message, scrolled into view.
 export async function openOwnMessageEdit(page: Page): Promise<Locator> {
   const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
   await expect(ownRow).toBeVisible();
   await ownRow.scrollIntoViewIfNeeded();
-  if (await page.evaluate(() => window.matchMedia("(hover: none)").matches)) {
-    await ownRow.getByTestId("message-kebab").click();
-    await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();
-  } else {
-    await ownRow.getByTestId("message-bubble").hover();
-    await ownRow.getByRole("button", { name: /edit/i }).click();
-  }
-  const editArea = page.locator('textarea[id^="edit-msg-"]');
-  await expect(editArea).toBeVisible({ timeout: 5_000 });
-  return editArea;
+  return openEditOnRow(page, ownRow);
 }
 
 // Any CSS colour (tokens, color-mix, oklab) as sRGB [r, g, b, a], so engines compare equal.

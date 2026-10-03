@@ -335,6 +335,7 @@ pub fn RoomList() -> Element {
             // Mobile back button (hidden on desktop)
             div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
                 button {
+                    "data-testid": "rooms-back-button",
                     class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Chat),
                     Icon { icon: FaArrowLeft, width: 16, height: 16 }

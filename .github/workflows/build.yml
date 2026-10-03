@@ -383,28 +383,61 @@ jobs:
     - name: Build UI with example data
       run: cargo make build-ui-example-no-sync
 
-    - name: Start dev server and wait for readiness
+    # Serve the artifact the previous step built, unchanged. `dx serve` used to
+    # run here: it rebuilds and watches, so the suite measured whatever that
+    # second build produced rather than the release build above, and a watcher
+    # can serve a stale binary (AGENTS.md, "Verify what you are actually
+    # testing"). A static server has no build of its own.
+    #
+    # The readiness check only looks for "river-ui" in the served index.html;
+    # it confirms the server is up, not which build it serves. The page's
+    # startup log ("River UI loaded - Built: … | Commit: …") identifies the
+    # exact build if a run needs checking.
+    - name: Serve built UI and wait for readiness
       run: |
-        cd ui && dx serve --port 8082 --features example-data,no-sync &
-        echo "Waiting for dev server to serve the app..."
+        python3 -m http.server 8082 --bind 127.0.0.1 \
+          --directory target/dx/river-ui/release/web/public \
+          > /tmp/static-server.log 2>&1 &
+        echo "Waiting for static server to serve the built app..."
         SERVER_READY=false
-        for i in $(seq 1 90); do
-          if curl -s http://localhost:8082 2>/dev/null | grep -q "river-ui"; then
-            echo "Server ready after $((i * 3))s"
-            sleep 5
+        for i in $(seq 1 30); do
+          if curl -s http://127.0.0.1:8082/ 2>/dev/null | grep -q "river-ui"; then
+            echo "Server ready after ${i}s"
             SERVER_READY=true
             break
           fi
-          sleep 3
+          sleep 1
         done
         if [ "$SERVER_READY" != "true" ]; then
-          echo "ERROR: Dev server failed to start within 270s"
+          echo "ERROR: Static server did not serve the built app within 30s"
+          cat /tmp/static-server.log
           exit 1
         fi
 
     - name: Run Playwright tests
       run: npx playwright test
       working-directory: ./ui/tests
+      env:
+        PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082
+
+    # The native wheel/image timing probe is opt-in in the default suite (five
+    # image delays per desktop browser), so it runs here as its own step. It is
+    # the only native-input coverage of that ordering; do not drop this step.
+    # Its own --output: Playwright empties the selected projects' output
+    # directories before a run, and this step runs after a failed suite too,
+    # so sharing `test-results/` would erase that suite's traces before the
+    # upload below. The upload is recursive, so it keeps both.
+    - name: Run native wheel/image probe
+      if: ${{ !cancelled() }}
+      run: >-
+        npx playwright test conversation-anchor-events.spec.ts
+        --grep "native input probe"
+        --project=chromium --project=firefox --project=webkit
+        --output=test-results/native-wheel-image-probe
+      working-directory: ./ui/tests
+      env:
+        PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082
+        RIVER_NATIVE_WHEEL_IMAGE_PROBE: "1"
 
     # `always()`, not `failure()`: with `retries: 2` an intermittent test is
     # reported as "flaky" and the job still succeeds, so a `failure()` guard

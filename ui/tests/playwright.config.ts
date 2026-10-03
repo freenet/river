@@ -43,6 +43,16 @@ export default defineConfig({
       grepInvert: CHROMIUM_ONLY,
       use: { ...devices["Desktop Safari"] },
     },
+    // A fractional device scale, so rows and scroll offsets land on fractional
+    // CSS pixels. Only the geometry cases that opt in with @fractional-geometry;
+    // they run on every other project too.
+    {
+      name: "chromium-dpr-1.5",
+      testMatch: "conversation-history-position.spec.ts",
+      grep: /@fractional-geometry/,
+      grepInvert: CHROMIUM_ONLY,
+      use: { ...devices["Desktop Chrome"], deviceScaleFactor: 1.5 },
+    },
     // Mobile viewports (Chromium engine)
     {
       name: "mobile-chrome",
@@ -55,6 +65,11 @@ export default defineConfig({
       use: { ...devices["iPhone 13"] },
     },
   ],
-  // The dev server must already be running:
-  // cd ui && dx serve --port 8082 --features example-data,no-sync
+  // Serve an already-built artifact statically; nothing here starts a server.
+  //   cargo make build-ui-example-no-sync
+  //   python3 -m http.server 8082 --bind 127.0.0.1 \
+  //     --directory target/dx/river-ui/release/web/public
+  // Not `dx serve`: it rebuilds and watches, so it can serve a stale build.
+  // Port 8082 may already belong to another worktree's server; pick a free
+  // port and set PLAYWRIGHT_BASE_URL (read above) to point at it.
 });

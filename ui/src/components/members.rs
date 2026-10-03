@@ -1589,6 +1589,7 @@ pub fn MemberList() -> Element {
                 div { class: "flex items-center gap-2",
                     // Mobile back button
                     button {
+                        "data-testid": "members-back-button",
                         class: "md:hidden p-1 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
                         onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Chat),
                         Icon { icon: FaArrowLeft, width: 14, height: 14 }
