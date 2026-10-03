@@ -4778,7 +4778,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "toml 0.8.23",
+ "toml 1.1.2+spec-1.1.0",
  "x25519-dalek",
 ]
 
@@ -4852,7 +4852,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.27.0",
- "toml 0.8.23",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -6828,7 +6828,7 @@ dependencies = [
  "ed25519-dalek",
  "rand 0.8.6",
  "river-core",
- "toml 0.8.23",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
 ]
 
