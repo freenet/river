@@ -423,12 +423,17 @@ jobs:
     # The native wheel/image timing probe is opt-in in the default suite (five
     # image delays per desktop browser), so it runs here as its own step. It is
     # the only native-input coverage of that ordering; do not drop this step.
+    # Its own --output: Playwright empties the selected projects' output
+    # directories before a run, and this step runs after a failed suite too,
+    # so sharing `test-results/` would erase that suite's traces before the
+    # upload below. The upload is recursive, so it keeps both.
     - name: Run native wheel/image probe
       if: ${{ !cancelled() }}
       run: >-
         npx playwright test conversation-anchor-events.spec.ts
         --grep "native input probe"
         --project=chromium --project=firefox --project=webkit
+        --output=test-results/native-wheel-image-probe
       working-directory: ./ui/tests
       env:
         PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082

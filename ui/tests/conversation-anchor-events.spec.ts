@@ -403,6 +403,12 @@ test.describe("A reflow above the reader, reported after another event", () => {
   // their last scroll left it. Ordering evidence only: it says nothing about
   // real wheel lifetime.
   //
+  // A delay where the engine was still scrolling the reader up after the
+  // growth is not checked, since their last scroll is then a moving target.
+  // That is decided from provenance: the page also records every position the
+  // app writes, and only an upward move no write accounts for counts as the
+  // reader. At least one delay must be checked.
+  //
   // Measured on the old controller (2026-10-02, headless): Chromium ends every
   // wheel tick at once, and Firefox sent no end of its own before the
   // correction's; WebKit ends the wheel ~100ms after its last scroll, in the
@@ -427,6 +433,8 @@ test.describe("A reflow above the reader, reported after another event", () => {
     test.setTimeout(120_000);
     const PROBE_DELAYS_MS = [25, 75, 80, 85, 110];
     const WHEEL_PX = 60;
+    // Delays whose drift was asserted, i.e. where the reader had stopped.
+    let checked = 0;
     for (const [i, delay] of PROBE_DELAYS_MS.entries()) {
       const url = `/late-probe-${i}.svg`;
       let held: Route | null = null;
@@ -452,15 +460,37 @@ test.describe("A reflow above the reader, reported after another event", () => {
             if (!geo) throw new Error("history geometry is not installed");
             return geo.newestVisible(c);
           };
-          const push = (kind: string) =>
+          const native = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!;
+          const push = (kind: string, write?: { pre: number; smooth: boolean }) =>
             events.push({
               kind,
               t: performance.now(),
-              top: c.scrollTop,
+              top: native.get!.call(c),
+              ...write,
               rowHeight: row.getBoundingClientRect().height,
               rowBottom: row.getBoundingClientRect().bottom - c.getBoundingClientRect().top,
               at: newest(),
             });
+          // Every position the app writes, so a later move can be told apart
+          // from the engine's own scrolling by provenance rather than by size.
+          Object.defineProperty(c, "scrollTop", {
+            configurable: true,
+            get: () => native.get!.call(c),
+            set: (v: number) => {
+              const pre = native.get!.call(c);
+              native.set!.call(c, v);
+              push("write", { pre, smooth: false });
+            },
+          });
+          for (const name of ["scrollTo", "scroll", "scrollBy"] as const) {
+            const original = c[name].bind(c) as (...args: unknown[]) => void;
+            (c as unknown as Record<string, unknown>)[name] = (...args: unknown[]) => {
+              const pre = native.get!.call(c);
+              original(...args);
+              const smooth = typeof args[0] === "object" && (args[0] as ScrollToOptions | null)?.behavior === "smooth";
+              push("write", { pre, smooth });
+            };
+          }
           // At the target, after the app's own listeners.
           c.addEventListener("scroll", () => push("scroll"));
           c.addEventListener("scrollend", () => push("end"));
@@ -506,21 +536,35 @@ test.describe("A reflow above the reader, reported after another event", () => {
         const firstObserved = afterGrowth.findIndex((e) => e.kind === "observed");
         const endFirst =
           !endedBefore && afterGrowth.slice(0, firstObserved < 0 ? undefined : firstObserved).some((e) => e.kind === "end");
-        // A scroll after the growth that is neither the growth's (no move) nor
-        // its correction is the reader still moving.
-        const readerAfter = afterGrowth.some(
-          (e) =>
-            e.kind === "scroll" &&
-            Math.abs(e.top - events[grownAt].top) > 1 &&
-            Math.abs(e.top - events[grownAt].top - growth) > 1,
-        );
+        // The reader is still moving after the growth only if the ENGINE moved
+        // the view up after the last pre-growth scroll: a change between two
+        // records that no app write accounts for (a write's own record splits
+        // into what moved before it and what it moved). Writes are recorded at
+        // the setter, so a wrong correction is never mistaken for the reader,
+        // whatever its size; a downward engine move (no wheel goes down) is not
+        // the reader either, and neither is anything after a smooth request
+        // the app made, which the engine would animate.
+        let nativeUp = 0;
+        let nativeDown = 0;
+        for (let n = lastScroll + 1; n < events.length; n++) {
+          const e = events[n];
+          const moved = (e.kind === "write" ? e.pre! : e.top) - events[n - 1].top;
+          if (moved < -1) nativeUp -= moved;
+          else if (moved > 1) nativeDown += moved;
+        }
+        const smoothWrite = events.slice(lastScroll).some((e) => e.kind === "write" && e.smooth);
+        const writes = events.slice(lastScroll).filter((e) => e.kind === "write").length;
+        const readerAfter = nativeUp > 0 && nativeDown === 0 && !smoothWrite;
         const drift = final?.id === base.at?.id ? Math.abs(final!.gap - base.at!.gap) : Infinity;
         const description =
           `delay ${delay}ms: ${timeline} (* first sight of the ${growth.toFixed(0)}px growth); ` +
           `end before observer: ${endFirst ? "OBSERVED" : "not observed"}${endedBefore ? " (ended before the growth)" : ""}; ` +
+          `app writes ${writes}${smoothWrite ? " (one smooth)" : ""}; engine moved the view ` +
+          `${nativeUp.toFixed(0)}px up, ${nativeDown.toFixed(0)}px down; ` +
           `reader moved after the growth: ${readerAfter}; drift ${drift.toFixed(1)}px`;
         test.info().annotations.push({ type: "native late image", description });
         if (!readerAfter) {
+          checked++;
           expect(drift, `the reader's message moved (${description})`).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
         }
       } finally {
@@ -528,6 +572,8 @@ test.describe("A reflow above the reader, reported after another event", () => {
         await page.unroute(`**${url}`);
       }
     }
+    // A sweep where the reader was still moving at every delay checked nothing.
+    expect(checked, "at least one delay should find the reader stopped and check preservation").toBeGreaterThan(0);
   });
 });
 
@@ -535,7 +581,12 @@ test.describe("A reflow above the reader, reported after another event", () => {
 type ProbeEvent = {
   kind: string;
   t: number;
+  /// `scrollTop` after the event; for a "write", after the app's write.
   top: number;
+  /// For a "write": `scrollTop` just before it, and whether it asked for a
+  /// smooth scroll.
+  pre?: number;
+  smooth?: boolean;
   rowHeight: number;
   /// The image row's bottom edge, from the container's top edge.
   rowBottom: number;
