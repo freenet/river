@@ -15,8 +15,10 @@ import {
   orderRecorderStop,
   recordMidflightArrival,
   registerEndReflow,
+  removeSyntheticArrivals,
   type EndReflow,
   type EndReflowKind,
+  type MidflightArrival,
 } from "./history-event-order-fixture";
 import {
   ARRIVAL,
@@ -101,18 +103,15 @@ test.describe("Scroll to latest is one native smooth scroll", () => {
     );
   });
 
-  test("arrivals during the animation do not retarget it or snap it to the new end", async ({ page }) => {
-    const { destination } = await parkAndRecord(page);
-    const arrivals = [0, 1, 2].map((i) => ARRIVAL(`arrival ${i} mid-flight`));
-    const proof = await recordMidflightArrival(page, arrivals);
-    expect(proof.attached).toEqual(arrivals);
-    expect(proof.midflightAtAttachment, `arrivals must attach before the click destination; ${JSON.stringify(proof)}`).toBe(true);
-    expect(proof.progressedAfterAttachment, `navigation must advance after attachment; ${JSON.stringify(proof)}`).toBe(true);
-    expect(proof.destination).toBeCloseTo(destination, 0);
-
+  /// Where arrivals asked for at the navigation's first `scroll` must leave it:
+  /// at the click's destination, one request, the arrivals below the view, and
+  /// nothing moving that landing afterwards.
+  async function expectArrivalsNotFollowed(page: Page, proof: MidflightArrival, destination: number) {
+    const what = JSON.stringify(proof);
+    expect(proof.destination, `premise: the probe clicked at the parked end (${what})`).toBeCloseTo(destination, 0);
     const rest = await viewAtRest(page, "the view should come to rest");
     expect(await scrollRequests(page), "the click's request is the only one").toEqual({ smooth: 1, other: 0 });
-    expect(Math.abs(rest - destination), "it should land at the end measured at the click").toBeLessThanOrEqual(
+    expect(Math.abs(rest - destination), `it should land at the end measured at the click (${what})`).toBeLessThanOrEqual(
       AT_BOTTOM_EPSILON_PX,
     );
     expect(await distanceFromBottom(page), "the newer arrivals stay below the view").toBeGreaterThan(200);
@@ -120,16 +119,56 @@ test.describe("Scroll to latest is one native smooth scroll", () => {
 
     // Nothing comes back for it later: no completion snap, no quiet-interval jump.
     const landed = await newestVisibleRow(page);
+    expect(landed, "premise: a message should be visible").not.toBeNull();
     await page.waitForTimeout(1_500);
     await expectRowHolds(page, landed!, "the landing moved after the animation ended");
     await deliver(page, ARRIVAL("arrival after the landing"));
     await expectRowHolds(page, landed!, "an arrival after the landing moved the view");
+  }
+
+  // The real arrival path: state change, render, ResizeObserver. The hook
+  // defers, and a fast engine (CI's Linux WebKit moves ~2,000px a frame) can
+  // land before the render, so this case reports whether the rows attached
+  // mid-flight and checks the outcome either way. The synchronous case below
+  // is the one that proves mid-flight attachment on every engine.
+  test("arrivals asked for during the animation do not retarget it or snap it to the new end", async ({ page }) => {
+    const { destination } = await parkAndRecord(page);
+    const arrivals = [0, 1, 2].map((i) => ARRIVAL(`arrival ${i} mid-flight`));
+    const proof = await recordMidflightArrival(page, arrivals);
+    expect(proof.attached).toEqual(arrivals);
+    test.info().annotations.push({
+      type: "arrival attachment",
+      description: `${proof.midflightAtAttachment ? "mid-flight (proven)" : "late, not counted as mid-flight"}; ${
+        proof.timeline
+      }`,
+    });
+    await expectArrivalsNotFollowed(page, proof, destination);
+  });
+
+  test("rows attached while the animation runs do not retarget it or snap it to the new end", async ({ page }) => {
+    const { destination } = await parkAndRecord(page);
+    try {
+      const arrivals = [0, 1, 2].map((i) => `synthetic arrival ${i}`);
+      const proof = await recordMidflightArrival(page, arrivals, { attach: "synchronous" });
+      expect(proof.attached).toEqual(arrivals);
+      expect(proof.attachedBeforeEnd, `premise: the rows attached before the navigation ended (${proof.timeline})`).toBe(
+        true,
+      );
+      expect(
+        proof.progressedAfterAttachment,
+        `premise: the animation moved on with the rows attached (${proof.timeline})`,
+      ).toBe(true);
+      await expectArrivalsNotFollowed(page, proof, destination);
+    } finally {
+      await removeSyntheticArrivals(page);
+    }
   });
 
   test("the attachment-time probe rejects arrivals requested after the landing", async ({ page }) => {
     await parkAndRecord(page);
-    const proof = await recordMidflightArrival(page, [ARRIVAL("arrival after native landing")], "after-end");
-    expect(proof.midflightAtAttachment, `negative control unexpectedly looked mid-flight: ${JSON.stringify(proof)}`).toBe(false);
+    const proof = await recordMidflightArrival(page, [ARRIVAL("arrival after native landing")], { mode: "after-end" });
+    expect(proof.attachedBeforeEnd, `negative control attached before the end: ${proof.timeline}`).toBe(false);
+    expect(proof.midflightAtAttachment, `negative control unexpectedly looked mid-flight: ${proof.timeline}`).toBe(false);
   });
 
   test("a second click asks for the end as it is then", async ({ page }) => {
@@ -187,45 +226,54 @@ test.describe("Scroll to latest is one native smooth scroll", () => {
 
   test("deleting the reading anchor during the animation places at the latest message once", async ({ page }) => {
     const { parkedAt, destination } = await parkAndRecord(page);
-    await button(page).click();
-    // Delete the visible row and the rows navigation can reach before the
-    // deferred deletion renders, retaining KEEP_LATEST rows for the landing.
-    // An immediate arrival exposes an animation that survives the landing.
-    // The fixture never writes scrollTop or sends input, but a browser clamp
-    // or same-offset placement may itself stop the animation; this test proves
-    // the landing holds, not that the explicit stop caused it.
-    // Measure progress before deletion clamps the offset: the remaining
-    // distance must exceed every sampled step and scrollend must not precede
-    // deletion, proving navigation was still underway.
+    // At the navigation's first native `scroll`, delete the visible row and
+    // every row after it but KEEP_LATEST, so the deferred deletion leaves the
+    // view past the new end whenever it renders. An immediate arrival exposes
+    // an animation that survives the landing. The fixture never writes
+    // scrollTop or sends input, but a browser clamp or same-offset placement
+    // may itself stop the animation; this test proves the landing holds, not
+    // that the explicit stop caused it.
+    //
+    // Every listener is installed before the click. "During" is decided by
+    // event order at the removal: native progress before it, no `scrollend`
+    // before it, and the last `scroll` before it short of the destination
+    // (the offset read after the removal is already clamped).
     const run = await page.evaluate(
-      ({ keep, arrival, parkedAt }) =>
+      ({ keep, arrival }) =>
         new Promise<{
           ids: string[];
           unmatched: string[];
           requestedAt: number;
+          progressBeforeRemoval: number;
           lastBeforeRemoval: number;
-          maxStep: number;
-          frames: number;
           endedBeforeRemoval: boolean;
           maxThen: number;
           landed: { id: string; gap: number } | null;
           landedAt: number;
+          timeline: string;
         }>((resolve, reject) => {
           const c = document.getElementById("chat-scroll-container")!;
-          const timer = setTimeout(() => reject(new Error("the deletion never landed at the end")), 8_000);
-          const samples: number[] = [];
-          let removed: { maxThen: number; lastBeforeRemoval: number } | null = null;
-          let endedBeforeRemoval = false;
-          c.addEventListener("scrollend", () => {
-            if (!removed) endedBeforeRemoval = true;
-          });
-          const sample = () => {
-            if (removed) return;
-            samples.push(c.scrollTop);
-            requestAnimationFrame(sample);
+          const start = c.scrollTop;
+          const t0 = performance.now();
+          const timeline: string[] = [];
+          const log = (kind: string, top = c.scrollTop) =>
+            timeline.push(`${kind}@${top.toFixed(1)}+${(performance.now() - t0).toFixed(0)}ms`);
+          let observer: MutationObserver | null = null;
+          const cleanup = () => {
+            clearTimeout(timer);
+            observer?.disconnect();
+            c.removeEventListener("scroll", onScroll);
+            c.removeEventListener("scrollend", onEnd);
           };
+          const timer = setTimeout(() => {
+            cleanup();
+            reject(new Error(`the deletion never landed at the end: ${timeline.join(" ")}`));
+          }, 8_000);
+          let removed: { maxThen: number; lastBeforeRemoval: number; progressBeforeRemoval: number } | null = null;
+          let endedBeforeRemoval = false;
+          let lastScroll = start;
           let ids: string[] = [];
-          let requestedAt = 0;
+          let requestedAt = Number.NaN;
           let unmatched: string[] | null = null;
           // Once the removal has rendered, wait for the view to reach the end
           // (the clamp and the app's placement), then deliver at once.
@@ -233,27 +281,21 @@ test.describe("Scroll to latest is one native smooth scroll", () => {
             if (c.scrollHeight - c.scrollTop - c.clientHeight > 4) return void requestAnimationFrame(awaitLanding);
             const landed = window.__riverHistoryGeometry!.newestVisible(c);
             const landedAt = c.scrollTop;
+            log("landed");
             window.__riverTest!.appendMessage(arrival);
-            clearTimeout(timer);
-            const steps = samples.slice(1).map((top, i) => top - samples[i]);
+            cleanup();
             resolve({
               ids,
               unmatched: unmatched!,
               requestedAt,
               ...removed!,
-              maxStep: Math.max(0, ...steps),
-              frames: samples.length,
               endedBeforeRemoval,
               landed,
               landedAt,
+              timeline: timeline.join(" "),
             });
           };
           const request = () => {
-            // Until a frame shows the animation under way.
-            if (c.scrollTop <= parkedAt + 40) {
-              samples.push(c.scrollTop);
-              return void requestAnimationFrame(request);
-            }
             const box = c.getBoundingClientRect();
             const rows = Array.from(c.querySelectorAll<HTMLElement>('[id^="msg-"]'));
             const first = rows.findIndex((r) => {
@@ -262,14 +304,15 @@ test.describe("Scroll to latest is one native smooth scroll", () => {
             });
             ids = rows.slice(first, rows.length - keep).map((r) => r.id);
             requestedAt = c.scrollTop;
-            sample();
-            const observer = new MutationObserver(() => {
-              if (ids.some((id) => document.getElementById(id))) return;
-              observer.disconnect();
-              // The last frame's offset, read before anything here reads the
-              // clamped one.
-              const lastBeforeRemoval = samples[samples.length - 1];
-              removed = { lastBeforeRemoval, maxThen: c.scrollHeight - c.clientHeight };
+            log("request");
+            observer = new MutationObserver(() => {
+              if (removed || ids.some((id) => document.getElementById(id))) return;
+              removed = {
+                lastBeforeRemoval: lastScroll,
+                progressBeforeRemoval: lastScroll - start,
+                maxThen: c.scrollHeight - c.clientHeight,
+              };
+              log("removed");
               if (unmatched) requestAnimationFrame(awaitLanding);
             });
             observer.observe(document.getElementById("chat-content")!, { childList: true, subtree: true });
@@ -278,24 +321,39 @@ test.describe("Scroll to latest is one native smooth scroll", () => {
               if (removed) requestAnimationFrame(awaitLanding);
             });
           };
-          requestAnimationFrame(request);
+          // After the app's own listeners: the app has had each event.
+          const onScroll = () => {
+            log("scroll");
+            if (removed) return;
+            lastScroll = c.scrollTop;
+            if (Number.isNaN(requestedAt) && c.scrollTop > start + 1) request();
+          };
+          const onEnd = () => {
+            log("end");
+            if (!removed) endedBeforeRemoval = true;
+          };
+          c.addEventListener("scroll", onScroll);
+          c.addEventListener("scrollend", onEnd);
+          log("click");
+          document.querySelector<HTMLElement>('[data-testid="scroll-to-bottom"]')!.click();
         }),
-      { keep: KEEP_LATEST, arrival: ARRIVAL("arrival right after the landing"), parkedAt },
+      { keep: KEEP_LATEST, arrival: ARRIVAL("arrival right after the landing") },
     );
     const what = `${JSON.stringify(run)}; parked at ${parkedAt}; destination ${destination}`;
+    test.info().annotations.push({ type: "deletion order", description: what });
     expect(run.unmatched, `premise: every id named a message (${what})`).toEqual([]);
     expect(run.ids.length, `premise: the visible message and those after it were removed (${what})`).toBeGreaterThan(1);
     expect(
-      destination - run.requestedAt,
-      `premise: the deletion was asked for well short of the destination (${what})`,
-    ).toBeGreaterThan(PARK_PX / 2);
+      run.progressBeforeRemoval,
+      `premise: the animation had moved the view before the deletion rendered (${what})`,
+    ).toBeGreaterThan(1);
     expect(run.endedBeforeRemoval, `premise: the animation had not ended before the deletion rendered (${what})`).toBe(
       false,
     );
     expect(
       destination - run.lastBeforeRemoval,
-      `premise: at the last frame before the deletion rendered, the animation was further from its destination than any step it took (${what})`,
-    ).toBeGreaterThan(Math.max(run.maxStep, AT_BOTTOM_EPSILON_PX));
+      `premise: the last scroll before the deletion rendered was short of the destination (${what})`,
+    ).toBeGreaterThan(AT_BOTTOM_EPSILON_PX);
     // The animation only moves down, so an end above where it was at the
     // request is one the view had passed: the browser clamped it there.
     expect(run.maxThen, `premise: the removal left the view past the new end, to be clamped (${what})`).toBeLessThan(
@@ -416,11 +474,24 @@ test.describe("A reflow correction that clamps still stops the animation", () =>
     await expect(button(page), "premise: the button is offered at the top").toBeVisible();
     await recordScrollRequests(page);
 
-    // Firefox can animate at zero in frame two, but may still be pending.
-    // A mutation check verifies that this setup catches a missing explicit stop.
-    // If the offset has already moved, try the setup again; assertion failures
-    // are never retried. Other engines use frame one.
-    const frame = browserName === "firefox" ? 2 : 1;
+    // The reflow has to reach the app while the view is still at 0, so the
+    // correction clamps to the offset it is already at. Chromium and WebKit
+    // get it in the click's own task (frame 0): nothing has moved yet by
+    // construction, and CI's Linux WebKit had moved by frame one on every try.
+    // Firefox waits for frame three: its defect is that a write to the current
+    // offset does not abort an ANIMATING smooth scroll, and it can still be at
+    // zero then with the animation running. Measured with the explicit stop
+    // removed (2026-10-03, 10 runs each): frame one caught it 0 times, frame
+    // two 5, frame three 10. Chromium and WebKit abort on that write anyway, so
+    // there the test checks the outcome, not the stop.
+    //
+    // Where the view has already moved by then, the reflow still runs, sized
+    // to clamp: rows from the top of the view collapse until the correction
+    // (where the view is plus the anchor's shift) is below 0. That try asserts
+    // the view stops at the clamped correction and stays, then the setup runs
+    // again for the same-offset case. Assertion failures are never retried.
+    const frame = browserName === "firefox" ? 3 : 0;
+    let movedTries = 0;
     for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
       if (attempt > 1) {
         await page.evaluate(() => {
@@ -440,10 +511,10 @@ test.describe("A reflow correction that clamps still stops the animation", () =>
             const before = window.__riverScrollRequests!.smooth;
             (document.querySelector('[data-testid="scroll-to-bottom"]') as HTMLElement).click();
             const smooth = window.__riverScrollRequests!.smooth - before;
+            // Frames counted from the click; frame 0 is the click's own task.
             let frames = 0;
             const tick = () => {
-              if (++frames < frame) return void requestAnimationFrame(tick);
-              if (c.scrollTop !== 0) return resolve({ topAtClick, smooth, frames, moved: c.scrollTop });
+              if (frames < frame && ++frames < frame) return void requestAnimationFrame(tick);
               const box = c.getBoundingClientRect();
               const visible = Array.from(c.querySelectorAll<HTMLElement>("#chat-content [data-anchor-row]")).filter(
                 (r) => {
@@ -451,12 +522,21 @@ test.describe("A reflow correction that clamps still stops the animation", () =>
                   return rect.bottom > box.top && rect.top < box.bottom;
                 },
               );
+              // Never the newest two visible rows: the app's anchor is the
+              // newest visible row as of its last capture, which a view that
+              // moved since may have scrolled past by one.
               const anchor = visible.at(-1)!;
-              const collapse = visible.find((r) => r !== anchor && r.id.startsWith("msg-"))!;
+              const collapsible = visible.slice(0, -2).filter((r) => r.id.startsWith("msg-"));
               const topBefore = c.scrollTop;
               const anchorBefore = anchor.getBoundingClientRect().top;
-              collapse.style.display = "none";
-              const shift = anchor.getBoundingClientRect().top - anchorBefore;
+              let shift = 0;
+              let collapsed = 0;
+              for (const row of collapsible) {
+                row.style.display = "none";
+                collapsed++;
+                shift = anchor.getBoundingClientRect().top - anchorBefore;
+                if (topBefore + shift < 0) break;
+              }
               c.dispatchEvent(new Event("scroll"));
               resolve({
                 topAtClick,
@@ -464,11 +544,13 @@ test.describe("A reflow correction that clamps still stops the animation", () =>
                 frames,
                 topBefore,
                 shift,
+                collapsed,
                 topAfterCorrection: c.scrollTop,
                 max: c.scrollHeight - c.clientHeight,
               });
             };
-            requestAnimationFrame(tick);
+            if (frame === 0) tick();
+            else requestAnimationFrame(tick);
           }),
         frame,
       );
@@ -476,14 +558,16 @@ test.describe("A reflow correction that clamps still stops the animation", () =>
       expect(run.topAtClick, `premise: the view starts at the top (${what})`).toBe(0);
       expect(run.smooth, `premise: the click started a smooth scroll (${what})`).toBe(1);
       expect(run.frames, `premise: the reflow came in the intended frame (${what})`).toBe(frame);
-      if (run.moved !== undefined) {
-        await viewAtRest(page, `the uncounted try should come to rest (${what})`);
-        continue;
-      }
-      expect(run.topBefore, `premise: the animation had not moved the view yet (${what})`).toBe(0);
       expect(run.shift, `premise: the reflow moved the anchor up (${what})`).toBeLessThan(-IN_PLACE_TOLERANCE_PX);
-      expect(run.topAfterCorrection, `premise: the correction clamped to the same offset (${what})`).toBe(0);
+      expect(
+        run.topBefore + run.shift,
+        `premise: the correction is below 0, so the browser clamps it to 0 (${what})`,
+      ).toBeLessThan(0);
+      expect(run.topAfterCorrection, `premise: the correction clamped to 0 (${what})`).toBe(0);
       expect(run.max, `premise: there is far to go (${what})`).toBeGreaterThan(1_000);
+      if (frame === 0) {
+        expect(run.topBefore, `premise: nothing moves in the click's own task (${what})`).toBe(0);
+      }
 
       await afterLayoutSettles(page);
       const rest = await viewAtRest(page, `the view should be stopped (${what})`);
@@ -493,9 +577,20 @@ test.describe("A reflow correction that clamps still stops the animation", () =>
       await page.waitForTimeout(500);
       expect(await scrollTop(page), `the animation resumed later (${what})`).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
       expect(await scrollRequests(page), "one smooth request per click").toEqual({ smooth: attempt, other: 0 });
-      return;
+      if (run.topBefore === 0) {
+        test.info().annotations.push({
+          type: "clamp cancel",
+          description: `same offset on ${what}; moved tries ${movedTries}`,
+        });
+        return;
+      }
+      // A real move to 0 aborts in every engine; it is checked, but it is not
+      // the same-offset case this test exists for.
+      movedTries++;
     }
-    throw new Error(`premise: the view had already moved in frame ${frame} on all ${MAX_TRIES} tries`);
+    throw new Error(
+      `premise: the view had already moved in frame ${frame} on all ${MAX_TRIES} tries (each was checked at its clamp)`,
+    );
   });
 });
 

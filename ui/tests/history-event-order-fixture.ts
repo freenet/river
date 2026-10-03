@@ -83,93 +83,174 @@ export async function orderRecorderStop(page: Page) {
   });
 }
 
-type MidflightArrival = {
+/// What `recordMidflightArrival` saw, on one `performance.now()` clock.
+export type MidflightArrival = {
+  /// `scrollTop` and the live end at the click: the navigation's destination.
   start: number;
   destination: number;
+  /// `scrollTop` when the arrivals were asked for, and when the last of them
+  /// was in the DOM.
   atRequest: number;
   atAttachment: number;
-  afterAttachment: number;
   attached: string[];
-  events: string[];
-  midflightAtAttachment: boolean;
+  /// Every step in order: `click`, `request`, `attached`, each `scroll` and
+  /// `end` the container delivered (after the app's own listeners), and
+  /// `settled`, each `kind@scrollTop+ms` since the click.
+  timeline: string;
+  /// The rows were in the DOM before any `scrollend` and short of the
+  /// destination, so the navigation had not finished.
+  attachedBeforeEnd: boolean;
+  /// A native `scroll` after the attachment moved the view further: the
+  /// animation was still running with the rows below it.
   progressedAfterAttachment: boolean;
+  /// Both: proven mid-flight attachment, by event order rather than distance.
+  midflightAtAttachment: boolean;
 };
 
-/// Request arrivals from the page's real animation clock and record when their
-/// rows actually attach. The probe is installed before it clicks the button,
-/// so both the start and destination are the click-time values. `after-end` is
-/// the negative control: it requests only after that destination is reached.
-export function recordMidflightArrival(page: Page, messages: string[], mode: "midflight" | "after-end" = "midflight") {
+/// How the probe adds the arrivals.
+///
+/// * `hook`: `window.__riverTest.appendMessage`, the real state change and
+///   render. It is deferred, so on a fast animation the rows can attach after
+///   the landing; the result then says so rather than claiming mid-flight.
+/// * `synchronous`: clones of the newest history row, appended to
+///   `#chat-content` after the history list (outside what Dioxus renders)
+///   inside the `scroll` handler that requested them, so they are in
+///   the DOM while that frame's animation is still running. Their ids and
+///   anchor attributes are removed and they carry `data-synthetic-arrival`:
+///   to the scroll model they are content growing below the view, which is
+///   what an arrival is during a navigation. The margin matches the history's
+///   own row spacing, so the click-time end is their top edge as it would be
+///   for a real row. Remove them with `removeSyntheticArrivals`.
+export type ArrivalAttachment = "hook" | "synchronous";
+
+/// Click scroll-to-latest and, at the navigation's first native `scroll` that
+/// has moved the view (`midflight`) or once it reached its destination
+/// (`after-end`, the negative control), add `messages` below the view. Every
+/// listener is installed before the click, so the start, the destination and
+/// the whole timeline are the click's own. Resolves once the navigation has
+/// settled after the attachment: its `scrollend`, or 400ms with no `scroll`.
+export function recordMidflightArrival(
+  page: Page,
+  messages: string[],
+  { mode = "midflight", attach = "hook" }: { mode?: "midflight" | "after-end"; attach?: ArrivalAttachment } = {},
+) {
   return page.evaluate(
-    ({ messages, mode }) =>
+    ({ messages, mode, attach }) =>
       new Promise<MidflightArrival>((resolve, reject) => {
+        const AT_END_PX = 4;
+        const SETTLED_MS = 400;
         const c = document.getElementById("chat-scroll-container")!;
+        const content = document.getElementById("chat-content")!;
         const start = c.scrollTop;
         const destination = c.scrollHeight - c.clientHeight;
-        const events: string[] = [];
-        events.push(`click-target@${start.toFixed(1)}→${destination.toFixed(1)}`);
+        let t0 = performance.now();
+        const timeline: string[] = [];
+        const log = (kind: string) =>
+          timeline.push(`${kind}@${c.scrollTop.toFixed(1)}+${(performance.now() - t0).toFixed(0)}ms`);
         const attached: string[] = [];
-        let raf = 0;
+        let requested = false;
+        let atRequest = Number.NaN;
+        let atAttachment = Number.NaN;
+        let endedBeforeAttachment = false;
+        let progressed = false;
+        let settleTimer = 0;
         const cleanup = () => {
           window.clearTimeout(timeout);
-          cancelAnimationFrame(raf);
+          window.clearTimeout(settleTimer);
           observer.disconnect();
           c.removeEventListener("scroll", onScroll);
           c.removeEventListener("scrollend", onEnd);
         };
         const timeout = window.setTimeout(() => {
           cleanup();
-          reject(new Error(`arrival probe timed out: ${JSON.stringify({ start, destination, events, attached })}`));
+          reject(new Error(`arrival probe timed out: ${JSON.stringify({ start, destination, attached, timeline })}`));
         }, 10_000);
-        let requested = false;
-        let atRequest = Number.NaN;
-        let atAttachment = Number.NaN;
-        const finish = () => {
+        let done = false;
+        const settle = () => {
+          if (done) return;
+          done = true;
+          log("settled");
+          cleanup();
+          const attachedBeforeEnd = !endedBeforeAttachment && atAttachment < destination - AT_END_PX;
+          resolve({
+            start,
+            destination,
+            atRequest,
+            atAttachment,
+            attached,
+            timeline: timeline.join(" "),
+            attachedBeforeEnd,
+            progressedAfterAttachment: progressed,
+            midflightAtAttachment: attachedBeforeEnd && progressed,
+          });
+        };
+        const armSettle = () => {
+          window.clearTimeout(settleTimer);
+          settleTimer = window.setTimeout(settle, SETTLED_MS);
+        };
+        const noteAttached = () => {
           if (attached.length !== messages.length || !Number.isNaN(atAttachment)) return;
           atAttachment = c.scrollTop;
-          events.push(`attached@${atAttachment.toFixed(1)}`);
-          requestAnimationFrame(() => {
-            const afterAttachment = c.scrollTop;
-            events.push(`frame@${afterAttachment.toFixed(1)}`);
-            cleanup();
-            resolve({
-              start,
-              destination,
-              atRequest,
-              atAttachment,
-              afterAttachment,
-              attached,
-              events,
-              midflightAtAttachment: atAttachment > start + 40 && destination - atAttachment > 250,
-              progressedAfterAttachment: afterAttachment > atAttachment + 1 && afterAttachment < destination + 4,
-            });
-          });
+          log("attached");
+          armSettle();
         };
         const observer = new MutationObserver(() => {
           for (const text of messages) {
-            if (!attached.includes(text) && c.textContent?.includes(text)) attached.push(text);
+            if (!attached.includes(text) && content.textContent?.includes(text)) attached.push(text);
           }
-          finish();
+          noteAttached();
         });
-        observer.observe(document.getElementById("chat-content")!, {
-          childList: true,
-          subtree: true,
-          characterData: true,
-        });
+        observer.observe(content, { childList: true, subtree: true, characterData: true });
         const request = () => {
-          if (requested) return;
           requested = true;
           atRequest = c.scrollTop;
-          events.push(`request@${atRequest.toFixed(1)}`);
-          const hooks = (window as Window & { __riverTest?: { appendMessage(text: string): void } }).__riverTest;
-          if (!hooks) throw new Error("arrival probe: window.__riverTest is unavailable");
-          for (const text of messages) hooks.appendMessage(text);
-          // Catch hooks that synchronously alter text as well as deferred DOM attachment.
-          for (const text of messages) if (c.textContent?.includes(text)) attached.push(text);
-          finish();
+          log("request");
+          if (attach === "hook") {
+            const hooks = (window as Window & { __riverTest?: { appendMessage(text: string): void } }).__riverTest;
+            if (!hooks) throw new Error("arrival probe: window.__riverTest is unavailable");
+            for (const text of messages) hooks.appendMessage(text);
+            return;
+          }
+          const rows = content.querySelectorAll<HTMLElement>('[data-testid="conversation-history"] > *');
+          const template = rows[rows.length - 1];
+          if (!template) throw new Error("arrival probe: no history row to clone");
+          for (const text of messages) {
+            const row = template.cloneNode(true) as HTMLElement;
+            for (const el of [row, ...row.querySelectorAll<HTMLElement>("*")]) {
+              el.removeAttribute("id");
+              el.removeAttribute("data-anchor-row");
+              el.removeAttribute("data-testid");
+              el.classList.remove("anchor-row");
+            }
+            row.setAttribute("data-synthetic-arrival", text);
+            // `space-y-4` between history rows: the gap above a new last row.
+            row.style.margin = "1rem 0 0";
+            content.appendChild(row);
+          }
+          // The MutationObserver reports these after this handler returns; the
+          // rows are in the DOM now, so attachment is now.
+          for (const text of messages) attached.push(text);
+          noteAttached();
         };
-        const onScroll = () => events.push(`scroll@${c.scrollTop.toFixed(1)}`);
-        const onEnd = () => events.push(`end@${c.scrollTop.toFixed(1)}`);
+        const onScroll = () => {
+          log("scroll");
+          const top = c.scrollTop;
+          if (!Number.isNaN(atAttachment)) {
+            if (top > atAttachment + 1) progressed = true;
+            armSettle();
+          } else if (!requested) {
+            const due =
+              mode === "midflight" ? top > start + 1 && top < destination - AT_END_PX : top >= destination - AT_END_PX;
+            if (due) request();
+          }
+        };
+        const onEnd = () => {
+          log("end");
+          if (Number.isNaN(atAttachment)) endedBeforeAttachment = true;
+          else return void window.setTimeout(settle, 0);
+          if (mode === "after-end" && !requested) request();
+        };
+        // Added after the app's own listeners: the app has had each event.
         c.addEventListener("scroll", onScroll);
         c.addEventListener("scrollend", onEnd);
         const button = document.querySelector<HTMLElement>('[data-testid="scroll-to-bottom"]');
@@ -178,18 +259,19 @@ export function recordMidflightArrival(page: Page, messages: string[], mode: "mi
           reject(new Error("arrival probe: scroll-to-bottom button is unavailable"));
           return;
         }
+        t0 = performance.now();
+        log("click");
         button.click();
-        const sample = () => {
-          if (requested) return;
-          const top = c.scrollTop;
-          if (mode === "midflight" && top > start + 40 && destination - top > 250) request();
-          else if (mode === "after-end" && top >= destination - 4) request();
-          else raf = requestAnimationFrame(sample);
-        };
-        raf = requestAnimationFrame(sample);
       }),
-    { messages, mode },
+    { messages, mode, attach },
   );
+}
+
+/// Remove what an `attach: "synchronous"` probe inserted. Safe in `finally`.
+export function removeSyntheticArrivals(page: Page) {
+  return page.evaluate(() => {
+    for (const row of document.querySelectorAll("[data-synthetic-arrival]")) row.remove();
+  });
 }
 
 /// The event log so far, as one line.

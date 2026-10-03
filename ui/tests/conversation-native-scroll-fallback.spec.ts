@@ -6,8 +6,10 @@ import {
   endReflowUnhide,
   registerEndReflow,
   recordMidflightArrival,
+  removeSyntheticArrivals,
   type EndReflow,
   type EndReflowKind,
+  type MidflightArrival,
 } from "./history-event-order-fixture";
 import {
   ARRIVAL,
@@ -239,20 +241,15 @@ test.describe("Without scrollend, scroll to latest ends after a quiet interval",
     );
   });
 
-  test("arrivals during the animation do not retarget it, and it lands at the end measured at the click", async ({
-    page,
-  }) => {
-    const { destination } = await parkAndCount(page);
-    const arrivals = [0, 1, 2].map((i) => ARRIVAL(`arrival ${i} mid-flight`));
-    const proof = await recordMidflightArrival(page, arrivals);
-    expect(proof.attached).toEqual(arrivals);
-    expect(proof.midflightAtAttachment, `arrivals must attach before the click destination; ${JSON.stringify(proof)}`).toBe(true);
-    expect(proof.progressedAfterAttachment, `navigation must advance after attachment; ${JSON.stringify(proof)}`).toBe(true);
-    expect(proof.destination).toBeCloseTo(destination, 0);
-
+  /// Where arrivals asked for at the navigation's first `scroll` must leave it:
+  /// at the click's destination, one request, ended by the quiet interval, and
+  /// nothing moving that landing afterwards.
+  async function expectArrivalsNotFollowed(page: Page, proof: MidflightArrival, destination: number) {
+    const what = JSON.stringify(proof);
+    expect(proof.destination, `premise: the probe clicked at the parked end (${what})`).toBeCloseTo(destination, 0);
     const rest = await viewAtRest(page, "the view should come to rest");
     expect((await fallback(page)).requests, "the click's request is the only one").toEqual({ smooth: 1, other: 0 });
-    expect(Math.abs(rest - destination), "it should land at the end measured at the click").toBeLessThanOrEqual(
+    expect(Math.abs(rest - destination), `it should land at the end measured at the click (${what})`).toBeLessThanOrEqual(
       AT_BOTTOM_EPSILON_PX,
     );
     expect(await distanceFromBottom(page), "the newer arrivals stay below the view").toBeGreaterThan(200);
@@ -265,6 +262,46 @@ test.describe("Without scrollend, scroll to latest ends after a quiet interval",
     await expectVisibleRowHolds(page, landed!, "the landing moved after the quiet interval");
     await deliver(page, ARRIVAL("arrival after the landing"));
     await expectVisibleRowHolds(page, landed!, "an arrival after the landing moved the view");
+  }
+
+  // The real, deferred arrival path; see the same pair in
+  // conversation-native-scroll.spec.ts. This one reports whether the rows
+  // attached mid-flight; the synchronous one requires it.
+  test("arrivals asked for during the animation do not retarget it, and it lands at the end measured at the click", async ({
+    page,
+  }) => {
+    const { destination } = await parkAndCount(page);
+    const arrivals = [0, 1, 2].map((i) => ARRIVAL(`arrival ${i} mid-flight`));
+    const proof = await recordMidflightArrival(page, arrivals);
+    expect(proof.attached).toEqual(arrivals);
+    test.info().annotations.push({
+      type: "arrival attachment",
+      description: `${proof.midflightAtAttachment ? "mid-flight (proven)" : "late, not counted as mid-flight"}; ${
+        proof.timeline
+      }`,
+    });
+    await expectArrivalsNotFollowed(page, proof, destination);
+  });
+
+  test("rows attached while the animation runs do not retarget it, and it lands at the end measured at the click", async ({
+    page,
+  }) => {
+    const { destination } = await parkAndCount(page);
+    try {
+      const arrivals = [0, 1, 2].map((i) => `synthetic arrival ${i}`);
+      const proof = await recordMidflightArrival(page, arrivals, { attach: "synchronous" });
+      expect(proof.attached).toEqual(arrivals);
+      expect(proof.attachedBeforeEnd, `premise: the rows attached before the navigation ended (${proof.timeline})`).toBe(
+        true,
+      );
+      expect(
+        proof.progressedAfterAttachment,
+        `premise: the animation moved on with the rows attached (${proof.timeline})`,
+      ).toBe(true);
+      await expectArrivalsNotFollowed(page, proof, destination);
+    } finally {
+      await removeSyntheticArrivals(page);
+    }
   });
 });
 
