@@ -1,143 +1,10 @@
-//! Where the history's view goes: the reader's position is one message, not an offset.
+//! Keep the reader's place when messages or layout change.
 //!
-//! # The saved position
+//! Save a visible message because content changes make scroll offsets unreliable.
+//! Measure its gap from the bottom so a growing composer does not cover it.
+//! New messages wait below the view until the reader chooses to scroll.
 //!
-//! We remember exactly one row: the newest row that is visible (`data-anchor-row`).
-//! A [`SavedAnchor`] keeps its `gap` (the container's bottom edge minus the row's
-//! top edge) and its `offset` (the row's top inside `#chat-content`, which
-//! scrolling does not change). The gap is measured from the BOTTOM edge on
-//! purpose: a growing composer takes height off that edge, so the reader's text
-//! moves up with it rather than being covered. Nothing else is saved. A neighbor
-//! that survives the anchor's deletion is not a substitute for it.
-//!
-//! One rule holds everywhere, at the very end of the history too: only the
-//! reader, or their click on "Scroll to latest messages", moves the view.
-//! Arrivals (including the reader's own sends), joins, reactions, edits, late
-//! images, resizes and a hide and reveal all put that one row back at its gap.
-//! There is no following mode, and no distance from the end that turns one on.
-//!
-//! * **Capture** measures that one row where the view is now: for a `scroll`
-//!   the reader caused, after a room's initial placement, and where a
-//!   scroll-to-latest navigation comes to rest or is cut short.
-//! * **Restore** puts that row back at its gap after a content or layout change,
-//!   when it is still rendered. It never captures, so a gap the browser cannot
-//!   reach yet (the range is too short) stays saved for when it can.
-//! * **Missing** is the same transition everywhere the row is gone while other
-//!   rows render: end any native navigation, forget the anchor, place at the
-//!   current end once, and capture the one row that lands there. A later
-//!   arrival preserves that new row. A hidden container (every measurement is
-//!   0) is not this case: the anchor waits until the history has a box again.
-//! * **Empty** is not Missing either. A render with no rows at all (the "No
-//!   messages yet" branch while a contended read leaves `message_groups` empty,
-//!   #555) is no evidence the saved row was deleted. Restore, capture and the
-//!   missing-anchor transition only record while no row renders, a click on
-//!   "Scroll to latest messages" asks for nothing, and a navigation in flight
-//!   is stopped where it is. The saved anchor, its gap and any pending
-//!   placement wait for the rows; the first restore that finds them puts the
-//!   anchor back.
-//! * **Recording** notes the layout signature and `scrollTop` after anything
-//!   moves the view, ours or not, so the next `scroll` event can be classified.
-//!
-//! An anchor correction is an instant `scrollTop` write. The container keeps
-//! `overflow-anchor:none` so browser scroll anchoring does not compete with it,
-//! and `scroll-behavior:auto` so those writes stay instant.
-//!
-//! # Placement
-//!
-//! A room opened for the first time this session starts at its newest message,
-//! once, as soon as it has rows and a laid-out container, and captures there.
-//! That is a starting position, not a mode: the next arrival is preserved like
-//! any other. Revisiting a room restores the one anchor saved when the reader
-//! left it (`leave_room`; the component restores that room's rendered window
-//! too, so the row can exist). If that anchor is not rendered any more, the
-//! revisit is placed like a first open. An empty room places when its first
-//! rows arrive. Either way the component is told (`HistoryHooks::positioned`),
-//! which is what lets the backfill sentinel mount.
-//!
-//! # Scroll-to-latest
-//!
-//! One native smooth `scrollTo` to the end as measured at the click. The browser
-//! owns its duration, easing and progress. While it runs:
-//!
-//! * its `scroll` events capture the position reached (so a hide keeps it);
-//! * restores do not write `scrollTop`: content landing below the view moves
-//!   nothing on screen, so nothing fights the animation and nothing retargets
-//!   it. A reflow ABOVE the view moves the saved anchor's `offset`; that cancels
-//!   the navigation once, keeping the row where the reader last saw it. The
-//!   cancel stops the animation explicitly before it corrects, since the
-//!   correction can clamp to the offset the view is already at. The anchor
-//!   disappearing is not a zero-pixel reflow: the navigation is cancelled and
-//!   the missing-anchor transition places at the latest message once. No rows
-//!   rendering at all stops it where it is (see Empty above).
-//!
-//! It finishes at a `scrollend` that finds the view at its destination (or the
-//! clamped end), or after `navigation_quiet_ms` with no `scroll` event. Either
-//! end first handles a reflow, a missing anchor or an empty render since the
-//! last `scroll`, exactly as a `scroll` would, and only then captures the
-//! landing, which may be above an end that has moved on since the click. Another click is how the reader asks for that. The reader's own input
-//! (`wheel`, `touchstart`, `pointerdown`, `keydown` on the history), a hide, a
-//! room switch and a second click each cancel it. Cancelling writes `scrollTop`
-//! one pixel off and back: Firefox does not abort a smooth scroll for a write to
-//! the position it is already at, and all three engines do for a real move.
-//!
-//! # Classifying a `scroll` event (`classify_scroll`)
-//!
-//! A geometry heuristic, not provenance.
-//!
-//! * **Echo**: the signature and `scrollTop` are exactly as recorded. Nothing
-//!   moved that is not already accounted for, so the saved position stays as it
-//!   was. Usually our own write's event (or WebKit's duplicate of an event after
-//!   a `wheel`), but that is inferred, not proven.
-//! * **Layout** (a browser clamp): the recorded `scrollTop` is out of reach of
-//!   the live scroll range and the view now sits at its end, whether or not
-//!   anything was resized (removing a positioned overhang clamps with nothing
-//!   resized); or the signature changed since it was recorded AND `scrollTop`
-//!   moved no more than `LAYOUT_SHIFT_ALLOWANCE_PX`, for a clamp taken during a
-//!   shorter intermediate layout that ends short of the end; or the container
-//!   grew, `scrollTop` went down, and the view's bottom edge stayed where it was
-//!   (within rounding), however far: a composer collapsing grows the container
-//!   and the browser clamps the top up by the same amount, and content that
-//!   arrives before the event is read leaves that clamp short of the end and
-//!   past the allowance (a cap-height composer moves it ~400px). It restores.
-//! * **Reader**: anything else. It captures.
-//!
-//! Residuals: a reader who moves less than the allowance in the very frame a
-//! layout change lands loses that frame's movement; an intermediate clamp larger
-//! than the allowance that also moves the bottom edge is taken as the reader; a
-//! reader who scrolls to the end in the frame of a final-end clamp is
-//! indistinguishable from it; and so is one who scrolls up by exactly what the
-//! container grew in the frame it grows. The signature records the layout's
-//! shape (content and container sizes); the scroll range is always read live. It
-//! can still be stale when an event is classified: ResizeObserver delivery is
-//! asynchronous, a hidden history records nothing, and the sizes read are client
-//! sizes, not exactly the boxes the observer watches.
-//!
-//! # Timing and visibility
-//!
-//! * **Late scroll events**: a `scroll` event arrives a frame after the scroll,
-//!   and a content change can land first. So a restore, the render before a
-//!   patch, a room switch and a hide first take in a pending reader scroll
-//!   (`take_in_undelivered_scroll`), or the next restore would put the reader
-//!   back where their previous event left them.
-//!   A pending Layout move is recorded there too: a clamp read against an
-//!   empty DOM must not be classified again as Reader against a later refill.
-//! * **The bottom trim** is decided where the view comes to rest at the end and
-//!   applied on a later task (`defer`), so that task decides it again: the same
-//!   room visit, the window still overgrown, rows rendered in a laid-out
-//!   container, the view still at the end and the tail still clear of the
-//!   backfill. A rejected trim changes nothing and stays eligible.
-//! * **Hidden**: the mobile layout hides the history (`display:none`), and every
-//!   read is then 0. It stays observed, but nothing measures, records or
-//!   restores it until it has height again; the saved anchor waits. The first
-//!   callback that finds it laid out again (the ResizeObserver, or the reveal's
-//!   own `scroll` in desktop WebKit) restores rather than capturing, so a
-//!   reveal never turns where the browser put the view into the reader's
-//!   choice. A hide also cancels a navigation: the mobile panel buttons call
-//!   `before_hide` while the history still has a box to cancel it in, and the
-//!   ResizeObserver seeing it hidden forgets the navigation (a breakpoint hide).
-//!   A reveal restores; it never resumes an animation.
-//!
-//! State is `Cell`/`RefCell`, never signals: raw JS callbacks write it.
+//! Background: <https://github.com/freenet/river/pull/732>.
 
 // Only the wasm build drives the DOM half; natively the pure half is exercised by
 // the unit tests.
@@ -155,13 +22,8 @@ use dioxus::prelude::WritableExt;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{prelude::*, JsCast};
 
-/// The most a `scroll` event may move `scrollTop`, after the layout signature
-/// changed, and still be read as the browser's clamp rather than the reader.
-///
-/// Only needed for a clamp that does NOT end at the final end (see the module
-/// doc). The 8px (Linux CI) and 56px clamps quoted for this before came from
-/// other trees with CSS size containers, and the 111px one from a synthetic
-/// test, so they are context rather than measurements of this code.
+/// Allow for browser clamping during reflow so it does not overwrite the
+/// reader's saved position, even if later growth leaves the view above the end.
 const LAYOUT_SHIFT_ALLOWANCE_PX: i32 = 200;
 
 /// How long a scroll-to-latest navigation may go without a `scroll` event before
