@@ -1,4 +1,4 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect, Locator, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { clampOverhang, removeOverhang, resizeOverhang, type Shape } from "./history-clamp-fixture";
 import { openEditOnRow, selectListedRoom } from "./example-room";
@@ -1002,19 +1002,108 @@ test.describe("The newest visible message stays in place", () => {
     });
   });
 
-  // An edit is a content change to a row the reader is not anchored on: the
-  // edited message, and its edit form before it, grow above them, and their row
-  // stays where it was.
-  //
-  // The message is parked well inside the view, so that the form it opens stays
-  // on screen once the reader's row has been put back below it: a focused
-  // textarea moved out of view is scrolled back by WebKit, which is the browser
-  // revealing the focus (a reader's scroll, by the module's rules), not a
-  // restore. Where the example room puts its own messages varies from run to
-  // run (its keys are generated), so the message is chosen by position. (No
-  // `fillHistory`: the edit's state change drops the test hook's fillers, whose
-  // authors are not members.)
-  test("an edit that grows a message above the reader keeps their row", async ({ page }) => {
+  /// What happened to the view while an edit form opened, on one clock:
+  /// `scrollIntoView` calls (and on what), the app's `scrollTop` writes, the
+  /// container's `scroll`/`scrollend`, the first content resize, focus moves,
+  /// and the open editor's and scrollport's bounds once it has settled.
+  /// Diagnostic: it changes nothing the app sees, and the evaluation that
+  /// reads it removes every instrument.
+  ///
+  /// `revealAfterRestore` holds each `scrollIntoView` call until the app has
+  /// written `scrollTop` (its restore of the reader's row) and a frame has
+  /// passed, then makes it: the order a slower engine can produce on its own.
+  async function recordEditOpening(page: Page, { revealAfterRestore = false } = {}) {
+    await page.evaluate((revealAfterRestore) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const content = document.getElementById("chat-content")!;
+      const t0 = performance.now();
+      const log: string[] = [];
+      const native = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!;
+      const top = () => (native.get!.call(c) as number).toFixed(1);
+      const at = () => `+${(performance.now() - t0).toFixed(0)}ms`;
+      const push = (what: string) => log.push(`${what}@${top()}${at()}`);
+      let written = false;
+      Object.defineProperty(c, "scrollTop", {
+        configurable: true,
+        get: () => native.get!.call(c),
+        set: (v: number) => {
+          const pre = top();
+          native.set!.call(c, v);
+          written = true;
+          log.push(`write@${pre}→${v}${at()}`);
+        },
+      });
+      const into = Element.prototype.scrollIntoView;
+      Element.prototype.scrollIntoView = function (this: Element, arg?: boolean | ScrollIntoViewOptions) {
+        const target = `${this.tagName.toLowerCase()}${this.id ? "#" + this.id : ""}`;
+        const what = `scrollIntoView(${target},${JSON.stringify(arg)})`;
+        if (!revealAfterRestore) {
+          push(what);
+          return into.call(this, arg as ScrollIntoViewOptions);
+        }
+        push(`held ${what}`);
+        const asked = performance.now();
+        const later = () => {
+          if (!written && performance.now() - asked < 1_000) return void requestAnimationFrame(later);
+          requestAnimationFrame(() =>
+            setTimeout(() => {
+              push(what);
+              into.call(this, arg as ScrollIntoViewOptions);
+            }, 0),
+          );
+        };
+        later();
+      };
+      const onScroll = () => push("scroll");
+      const onEnd = () => push("end");
+      const onFocus = (e: FocusEvent) => push(`focus(${(e.target as Element).tagName.toLowerCase()})`);
+      c.addEventListener("scroll", onScroll);
+      c.addEventListener("scrollend", onEnd);
+      document.addEventListener("focusin", onFocus);
+      let resized = 0;
+      const resize = new ResizeObserver(() => {
+        if (resized++ < 3) push("resize");
+      });
+      resize.observe(content);
+      (window as unknown as { __editOpening: () => string }).__editOpening = () => {
+        c.removeEventListener("scroll", onScroll);
+        c.removeEventListener("scrollend", onEnd);
+        document.removeEventListener("focusin", onFocus);
+        resize.disconnect();
+        Element.prototype.scrollIntoView = into;
+        delete (c as unknown as { scrollTop?: number }).scrollTop;
+        const box = c.getBoundingClientRect();
+        const area = document.querySelector<HTMLElement>('textarea[id^="edit-msg-"]');
+        const form = area?.closest<HTMLElement>("[tabindex]");
+        const order = log
+          .filter((e) => e.startsWith("write@") || e.startsWith("scrollIntoView("))
+          .map((e) => e.split("@")[0]);
+        const firstWrite = order.indexOf("write");
+        const rel = (el: HTMLElement | null | undefined) => {
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { top: Math.round(r.top - box.top), bottom: Math.round(r.bottom - box.top) };
+        };
+        return JSON.stringify({
+          scrollport: { height: c.clientHeight, top: c.scrollTop, scrollHeight: c.scrollHeight },
+          form: rel(form),
+          textarea: rel(area),
+          focused: document.activeElement?.tagName.toLowerCase(),
+          writeBeforeReveal: firstWrite >= 0 && firstWrite < order.findIndex((e) => e.startsWith("scrollIntoView(")),
+          log,
+        });
+      };
+    }, revealAfterRestore);
+    return () => page.evaluate(() => (window as unknown as { __editOpening: () => string }).__editOpening());
+  }
+
+  /// Park in "Your Private Room" with one of the reader's own messages
+  /// OWN_ROW_TOP_PX down the view, below which the reader's newest visible row
+  /// is a different message. Where the example room puts its own messages
+  /// varies from run to run (its keys are generated), so it is chosen by
+  /// position. (No `fillHistory`: an edit's state change drops the test hook's
+  /// fillers, whose authors are not members.)
+  async function parkBelowOwnMessage(page: Page) {
     const OWN_ROW_TOP_PX = 350;
     await openRoomAtBottom(page, "Your Private Room");
     const pick = await page.evaluate((want) => {
@@ -1028,9 +1117,6 @@ test.describe("The newest visible message stays in place", () => {
       return null;
     }, OWN_ROW_TOP_PX);
     expect(pick, `premise: an own message can sit ${OWN_ROW_TOP_PX}px down the view`).not.toBeNull();
-    const ownId = pick!.id;
-    const ownHeight = () => page.evaluate((id) => document.getElementById(id)!.getBoundingClientRect().height, ownId);
-    const heightBefore = await ownHeight();
     await readerParksAt(page, pick!.target);
     await afterLayoutSettles(page);
     expect(
@@ -1038,12 +1124,77 @@ test.describe("The newest visible message stays in place", () => {
       "premise: the history is taller than the view, so the reader is up in it",
     ).toBeGreaterThan(PARKED_ABOVE_END_PX);
     const before = await requireNewestVisibleRow(page);
-    expect(before.id, `premise: the reader's newest visible row is not the one being edited (${ownId})`).not.toBe(ownId);
+    expect(before.id, `premise: the reader's newest visible row is not the one being edited (${pick!.id})`).not.toBe(
+      pick!.id,
+    );
+    return { ownId: pick!.id, before };
+  }
 
-    const editArea = await openEditOnRow(page, page.locator(`[id="${ownId}"]`));
+  /// Open the edit form on `ownId` while recording, and check that the open
+  /// form is wholly inside the view (so nothing had a reason to reveal it).
+  async function openEditRecorded(page: Page, ownId: string, { revealAfterRestore = false } = {}) {
+    const opening = await recordEditOpening(page, { revealAfterRestore });
+    let diagnosis = "";
+    let editArea: Locator;
+    try {
+      editArea = await openEditOnRow(page, page.locator(`[id="${ownId}"]`));
+      await afterLayoutSettles(page);
+    } finally {
+      diagnosis = await opening();
+      test.info().annotations.push({ type: "edit opening", description: diagnosis });
+    }
+    const seen = JSON.parse(diagnosis) as {
+      scrollport: { height: number };
+      form: { top: number; bottom: number } | null;
+      writeBeforeReveal: boolean;
+    };
+    expect(seen.form, `premise: the edit form is open (${diagnosis})`).not.toBeNull();
+    expect(
+      seen.form!.top >= 0 && seen.form!.bottom <= seen.scrollport.height,
+      `premise: the open edit form is wholly inside the view (${diagnosis})`,
+    ).toBe(true);
+    return { editArea: editArea!, diagnosis, writeBeforeReveal: seen.writeBeforeReveal };
+  }
+
+  // An edit is a content change to a row the reader is not anchored on: the
+  // edited message, and its edit form before it, grow above them, and their row
+  // stays where it was.
+  //
+  // The message is parked well inside the view, so that the form it opens stays
+  // on screen once the reader's row has been put back below it (checked, from
+  // the form's measured bounds): a form out of view is revealed by the app
+  // (#93) or by the browser for the focused textarea, and that scroll is the
+  // reader's by the module's rules, not a restore.
+  //
+  // The edit form reveals itself when it mounts (`scroll_to` in its
+  // `onmounted`, #93), and the app restores the reader's row when the form's
+  // growth reaches its ResizeObserver. Either can come first. When the reveal
+  // comes second, the restore has already recorded the new layout, so the
+  // reveal's `scroll` events read as the reader's, and a reveal that moves a
+  // form already in view takes the reader's row with it (CI WebKit: 116.5px,
+  // the form's own offset from the top of the view). This holds the reveal
+  // until after the restore, on every engine.
+  test("an edit form opening above the reader keeps their row when its reveal comes after the restore", async ({
+    page,
+  }) => {
+    const { ownId, before } = await parkBelowOwnMessage(page);
+    const { diagnosis, writeBeforeReveal } = await openEditRecorded(page, ownId, { revealAfterRestore: true });
+    expect(writeBeforeReveal, `premise: the restore wrote before the form's reveal ran (${diagnosis})`).toBe(true);
+    await expectInPlace(page, before, `the form's reveal after the restore moved the reader's row (${diagnosis})`, {
+      newest: false,
+      hold: true,
+    });
+  });
+
+  test("an edit that grows a message above the reader keeps their row", async ({ page }) => {
+    const { ownId, before } = await parkBelowOwnMessage(page);
+    const ownHeight = () => page.evaluate((id) => document.getElementById(id)!.getBoundingClientRect().height, ownId);
+    const heightBefore = await ownHeight();
+
+    const { editArea, diagnosis } = await openEditRecorded(page, ownId);
     // `newest: false`: the reader's row may show only a sliver at the bottom
     // edge, where a pixel of rounding decides whether it still counts as visible.
-    await expectInPlace(page, before, "the edit form opening above the reader moved their row", {
+    await expectInPlace(page, before, `the edit form opening above the reader moved their row (${diagnosis})`, {
       newest: false,
       hold: true,
     });

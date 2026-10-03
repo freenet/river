@@ -5194,11 +5194,23 @@ fn MessageGroupComponent(
                                                     ),
                                                     style: "width: 100%; max-width: 550px; overflow: visible;",
                                                     tabindex: "0",
-                                                    // Scroll into view when edit dialog appears (#93)
+                                                    // Scroll into view when edit dialog appears (#93), only
+                                                    // as far as it takes: `Nearest` leaves a form that is
+                                                    // already in view where it is. `scroll_to`'s default
+                                                    // (`block: "start"`) moved every form to the top of the
+                                                    // view, and when that reveal ran after the history had
+                                                    // restored the reader's row for the form's growth, the
+                                                    // history took its scroll for the reader's and kept it.
                                                     onmounted: move |cx| {
                                                         let el = cx.data();
                                                         wasm_bindgen_futures::spawn_local(async move {
-                                                            let _ = el.scroll_to(ScrollBehavior::Smooth).await;
+                                                            let _ = el
+                                                                .scroll_to_with_options(ScrollToOptions {
+                                                                    behavior: ScrollBehavior::Smooth,
+                                                                    vertical: ScrollLogicalPosition::Nearest,
+                                                                    horizontal: ScrollLogicalPosition::Nearest,
+                                                                })
+                                                                .await;
                                                         });
                                                     },
                                                     // Global key bindings on the container (#94): Esc cancels,
