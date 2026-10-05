@@ -5770,6 +5770,51 @@ pub fn Conversation() -> Element {
     }
 }
 
+/// Preferred height of the reactor-name list, including an optional Remove
+/// row. Used only to pick a side of the chip; the popover then caps itself
+/// to the space actually available there and scrolls.
+const REACTION_OWNERS_POPOVER_HEIGHT_PX: f64 = 160.0;
+
+/// Position of an open reactor list. Stored as one signal so the flip, the
+/// anchor, and the height cap update together.
+#[derive(Clone, PartialEq)]
+struct ReactionOwnersPopover {
+    key: String,
+    above: bool,
+    align_right: bool,
+    max_h: f64,
+}
+
+/// True when a finger can be the pointer.
+///
+/// Same query as the touch rules in `ui/assets/main.css`: `(hover: none)` is a
+/// phone or tablet, and `(any-pointer: coarse)` also matches a touchscreen
+/// laptop whose primary pointer still reports `hover: hover`. A tap on those
+/// devices never shows a native `title` tooltip.
+fn coarse_pointer() -> bool {
+    web_sys::window()
+        .and_then(|w| {
+            w.match_media("(hover: none), (any-pointer: coarse)")
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|mq| mq.matches())
+}
+
+/// Top and bottom of the chat scrollport, in viewport coordinates. The list
+/// has to open inside this box: an ancestor with `overflow-y-auto` clips a
+/// popover that sticks out of it. Fallback matches the kebab menu.
+fn chat_scrollport_bounds() -> (f64, f64) {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("chat-scroll-container"))
+        .map(|el| {
+            let rect = el.get_bounding_client_rect();
+            (rect.top(), rect.bottom())
+        })
+        .unwrap_or((60.0, 600.0))
+}
+
 /// Corner radii for a bubble at this position in its group: every corner is
 /// round except the ones on the sender's side that face a neighbouring bubble.
 /// Takes position only, so nothing else (reactions, edits) can reshape it.
@@ -5856,6 +5901,13 @@ fn MessageGroupComponent(
 
     // Track if emoji picker should appear above (true) or below (false) the button
     let mut picker_show_above: Signal<bool> = use_signal(|| false);
+
+    // Reactor list for one chip in this group. Touch has no hover, and the
+    // chip's `title` tooltip — the only place those names were rendered — does
+    // not appear on tap (freenet/river#714). One open list per group; its
+    // backdrop covers every other chip, kebab, and "+" so a second popover
+    // cannot stack on top of it.
+    let mut open_reaction_owners: Signal<Option<ReactionOwnersPopover>> = use_signal(|| None);
 
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
@@ -6537,9 +6589,10 @@ fn MessageGroupComponent(
                                                                 menu_show_above.set(above);
                                                                 menu_align_left.set(align_left);
                                                                 menu_max_h.set(max_h);
-                                                                // Dismiss any open reaction picker so the two
-                                                                // popovers can't stack (#402 review).
+                                                                // Dismiss any open reaction picker or reactor
+                                                                // list so the popovers can't stack (#402, #714).
                                                                 open_emoji_picker.set(None);
+                                                                open_reaction_owners.set(None);
                                                                 open_action_menu.set(Some(id));
                                                             });
                                                         }
@@ -6594,6 +6647,7 @@ fn MessageGroupComponent(
                                                                 let above = *menu_show_above.peek();
                                                                 crate::util::defer(move || {
                                                                     picker_show_above.set(above);
+                                                                    open_reaction_owners.set(None);
                                                                     open_emoji_picker.set(Some(picker_id));
                                                                     open_action_menu.set(None);
                                                                 });
@@ -6687,33 +6741,150 @@ fn MessageGroupComponent(
                                                     let names_str = reactor_names.join(", ");
 
                                                     let tooltip = if is_user_reaction {
-                                                        format!("{} (click to remove)", names_str)
+                                                        format!("{names_str} (click to remove)")
                                                     } else {
                                                         names_str
                                                     };
+                                                    // Stable per chip inside this group. The list signal
+                                                    // holds at most one of these.
+                                                    let owners_key = format!("{msg_id_for_inline}:{emoji}");
+                                                    let (owners_open, owners_above, owners_align_right, owners_max_h) = {
+                                                        let open = open_reaction_owners.read();
+                                                        let mine = open.as_ref().filter(|popup| popup.key == owners_key);
+                                                        (
+                                                            mine.is_some(),
+                                                            mine.is_some_and(|popup| popup.above),
+                                                            mine.is_some_and(|popup| popup.align_right),
+                                                            mine.map(|popup| popup.max_h)
+                                                                .unwrap_or(REACTION_OWNERS_POPOVER_HEIGHT_PX),
+                                                        )
+                                                    };
+                                                    let msg_id_for_remove = msg_id_for_click.clone();
+                                                    let emoji_for_remove = emoji_for_click.clone();
+                                                    let owners_key_for_click = owners_key.clone();
 
                                                     rsx! {
-                                                        span {
+                                                        // `relative` only — no transform/filter on this wrapper.
+                                                        // A transform would become the containing block for the
+                                                        // `fixed` backdrop and shrink it to the chip (#402).
+                                                        // The scale animation stays on the emoji span, below.
+                                                        div {
                                                             key: "{emoji}",
-                                                            "data-testid": "reaction-chip",
                                                             class: format!(
-                                                                "inline-flex items-center gap-0.5 text-base transition-transform {}",
-                                                                if is_user_reaction {
-                                                                    // Subtle indicator: underline for user's reaction
-                                                                    "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
-                                                                } else {
-                                                                    "cursor-default hover:scale-110"
-                                                                }
+                                                                "relative inline-flex items-center {}",
+                                                                if owners_open { "z-[60]" } else { "" }
                                                             ),
-                                                            title: "{tooltip}",
-                                                            onclick: move |_| {
-                                                                if is_user_reaction {
-                                                                    on_react.call((msg_id_for_click.clone(), emoji_for_click.clone()));
+                                                            if owners_open {
+                                                                div {
+                                                                    class: "fixed inset-0 z-40",
+                                                                    onclick: move |_| {
+                                                                        crate::util::defer(move || {
+                                                                            open_reaction_owners.set(None);
+                                                                        });
+                                                                    },
                                                                 }
-                                                            },
-                                                            "{emoji}"
-                                                            if count > 1 {
-                                                                span { class: "text-xs text-text-muted", "{count}" }
+                                                                div {
+                                                                    "data-testid": "reaction-owners",
+                                                                    role: "dialog",
+                                                                    "aria-label": "Who reacted",
+                                                                    class: format!(
+                                                                        "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
+                                                                        if owners_above { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                                        if owners_align_right { "right-0" } else { "left-0" }
+                                                                    ),
+                                                                    style: format!("max-height: {owners_max_h}px"),
+                                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                                    {reactor_names.iter().enumerate().map(|(index, name)| {
+                                                                        rsx! {
+                                                                            div {
+                                                                                key: "{index}",
+                                                                                "data-testid": "reaction-owner",
+                                                                                class: "px-3 py-1.5 text-sm text-text text-left break-words",
+                                                                                "{name}"
+                                                                            }
+                                                                        }
+                                                                    })}
+                                                                    if is_user_reaction {
+                                                                        button {
+                                                                            "data-testid": "reaction-remove",
+                                                                            class: "px-3 py-2 text-sm text-left text-red-500 hover:bg-error-bg",
+                                                                            onclick: move |_| {
+                                                                                let id = msg_id_for_remove.clone();
+                                                                                let emoji = emoji_for_remove.clone();
+                                                                                crate::util::defer(move || {
+                                                                                    on_react.call((id, emoji));
+                                                                                    open_reaction_owners.set(None);
+                                                                                });
+                                                                            },
+                                                                            "Remove"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            span {
+                                                                "data-testid": "reaction-chip",
+                                                                "aria-expanded": "{owners_open}",
+                                                                class: format!(
+                                                                    "inline-flex items-center gap-0.5 text-base transition-transform {}",
+                                                                    if is_user_reaction {
+                                                                        // Subtle indicator: underline for user's reaction
+                                                                        "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
+                                                                    } else {
+                                                                        "cursor-default hover:scale-110"
+                                                                    }
+                                                                ),
+                                                                title: "{tooltip}",
+                                                                onclick: move |e: MouseEvent| {
+                                                                    // Geometry is read here, outside `defer`: the
+                                                                    // event is gone by the time the timeout fires.
+                                                                    let click_y = e.client_coordinates().y;
+                                                                    let click_x = e.client_coordinates().x;
+                                                                    if coarse_pointer() {
+                                                                        let key = owners_key_for_click.clone();
+                                                                        let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
+                                                                        let space_below = scroll_bottom - click_y;
+                                                                        let space_above = click_y - scroll_top;
+                                                                        let above = space_below < REACTION_OWNERS_POPOVER_HEIGHT_PX
+                                                                            && space_above > space_below;
+                                                                        let max_h = ((if above { space_above } else { space_below }) - 16.0).max(1.0);
+                                                                        let win_w = web_sys::window()
+                                                                            .and_then(|w| w.inner_width().ok())
+                                                                            .and_then(|v| v.as_f64())
+                                                                            .unwrap_or(400.0);
+                                                                        // Open toward the viewport centre so a chip
+                                                                        // against either edge cannot run the list
+                                                                        // off-screen (#402 review, applied here).
+                                                                        let align_right = click_x > win_w * 0.5;
+                                                                        crate::util::defer(move || {
+                                                                            let already_open = open_reaction_owners
+                                                                                .peek()
+                                                                                .as_ref()
+                                                                                .is_some_and(|popup| popup.key == key);
+                                                                            if already_open {
+                                                                                open_reaction_owners.set(None);
+                                                                            } else {
+                                                                                open_emoji_picker.set(None);
+                                                                                open_action_menu.set(None);
+                                                                                open_reaction_owners.set(Some(ReactionOwnersPopover {
+                                                                                    key,
+                                                                                    above,
+                                                                                    align_right,
+                                                                                    max_h,
+                                                                                }));
+                                                                            }
+                                                                        });
+                                                                    } else if is_user_reaction {
+                                                                        let id = msg_id_for_click.clone();
+                                                                        let emoji = emoji_for_click.clone();
+                                                                        crate::util::defer(move || {
+                                                                            on_react.call((id, emoji));
+                                                                        });
+                                                                    }
+                                                                },
+                                                                "{emoji}"
+                                                                if count > 1 {
+                                                                    span { class: "text-xs text-text-muted", "{count}" }
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -6747,6 +6918,10 @@ fn MessageGroupComponent(
                                                         let picker_id = format!("inline-{}", msg_id_for_inline);
                                                         move |e: MouseEvent| {
                                                             e.stop_propagation();
+                                                            // The chip list and the picker must not both stay
+                                                            // open. Deferred, same as every other signal write
+                                                            // from a handler (.claude/rules/dioxus-signal-safety.md).
+                                                            crate::util::defer(move || open_reaction_owners.set(None));
                                                             let current = open_emoji_picker.read().clone();
                                                             if current.as_ref() == Some(&picker_id) {
                                                                 open_emoji_picker.set(None);

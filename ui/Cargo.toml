@@ -51,6 +51,7 @@ web-sys = { workspace = true, features = [
     "IntersectionObserver",
     "IntersectionObserverEntry",
     "IntersectionObserverInit",
+    "MediaQueryList",
     "Navigator",
     "Notification",
     "NotificationOptions",
