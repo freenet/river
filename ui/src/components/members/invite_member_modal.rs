@@ -2,7 +2,7 @@ use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::components::members::Invitation;
 use crate::room_data::RoomData;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaArrowsRotate, FaCopy, FaXmark};
+use dioxus_free_icons::icons::fa_solid_icons::{FaArrowsRotate, FaCopy, FaQrcode, FaXmark};
 use dioxus_free_icons::Icon;
 
 /// Fallback URL for non-browser environments or when `window.location` is
@@ -259,6 +259,7 @@ fn InvitationContent(
     let invitation_text_for_clipboard = invitation_text.clone();
     let invitation_url_for_clipboard = invitation_url.clone();
     let invitation_code_for_clipboard = invitation_code.clone();
+    let qr_markup = crate::invite_qr::invitation_qr_svg(&invitation_code);
 
     let copy_message_to_clipboard = move |_| {
         crate::util::copy_to_clipboard(&invitation_text_for_clipboard);
@@ -337,6 +338,37 @@ fn InvitationContent(
                     Icon { icon: FaCopy, width: 14, height: 14 }
                     span { "{copy_code_text}" }
                 }
+            }
+        }
+
+        // Same bearer credential as the code above, drawn so two people in
+        // the same place can pass it without another app (freenet/river#741).
+        // The QR is the portable code, not the invite link: the link bakes in
+        // this host, and the other phone is often on a different one.
+        div {
+            "data-testid": "invite-qr",
+            class: "mb-4",
+            div { class: "flex items-center gap-2 mb-1",
+                Icon { icon: FaQrcode, width: 14, height: 14 }
+                span { class: "text-sm font-medium text-text", "QR code" }
+            }
+            p { class: "text-xs text-text-muted mb-2",
+                "Have the other person open Enter Invite Code and tap Scan QR code. This is the same single-use code as above."
+            }
+            match qr_markup {
+                Ok(svg) => rsx! {
+                    div {
+                        class: "bg-white rounded-lg p-3",
+                        dangerous_inner_html: "{svg}",
+                    }
+                },
+                Err(err) => rsx! {
+                    p {
+                        "data-testid": "invite-qr-error",
+                        class: "text-sm text-red-500",
+                        "{err}"
+                    }
+                },
             }
         }
 
