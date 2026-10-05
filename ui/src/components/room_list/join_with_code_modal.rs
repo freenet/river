@@ -99,6 +99,23 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
         }
         #[cfg(target_arch = "wasm32")]
         {
+            // Opaque shell iframe: getUserMedia throws SecurityError and the
+            // browser never shows a prompt. Open the camera app instead.
+            // This click is the user gesture the file input needs.
+            if invite_qr_scan::camera_prompt_unavailable() {
+                match invite_qr_scan::open_still_capture() {
+                    Ok(()) => {
+                        crate::util::defer(move || {
+                            scan_error.set(None);
+                            error_msg.set(None);
+                        });
+                    }
+                    Err(msg) => {
+                        crate::util::defer(move || scan_error.set(Some(msg)));
+                    }
+                }
+                return;
+            }
             let promise = match invite_qr_scan::request_rear_camera() {
                 Ok(promise) => promise,
                 Err(msg) => {
@@ -192,12 +209,66 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                         "Stop scanning"
                     }
                 } else {
+                    if invite_qr_scan::camera_prompt_unavailable() {
+                        p { class: "text-xs text-text-muted mb-3",
+                            "This page is inside the Freenet frame, so the browser cannot ask for camera permission here. Scan opens your camera app; take one photo of the QR code."
+                        }
+                    }
                     button {
                         "data-testid": "join-with-code-scan-button",
                         class: "w-full mb-3 px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors flex items-center justify-center gap-2",
                         onclick: start_scan,
                         Icon { icon: FaCamera, width: 14, height: 14 }
                         span { "Scan QR code" }
+                    }
+                    input {
+                        id: invite_qr_scan::STILL_INPUT_ID,
+                        "data-testid": "join-with-code-scan-file",
+                        r#type: "file",
+                        accept: "image/*",
+                        capture: "environment",
+                        style: "position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0",
+                        onchange: move |evt| {
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let Some(file) = evt.files().into_iter().next().and_then(|data| {
+                                    data.inner().downcast_ref::<web_sys::File>().cloned()
+                                }) else {
+                                    return;
+                                };
+                                if let Some(input) = invite_qr_scan::still_input() {
+                                    input.set_value("");
+                                }
+                                crate::util::safe_spawn_local(async move {
+                                    let decoded = invite_qr_scan::decode_still(file).await;
+                                    crate::util::defer(move || match decoded {
+                                        Ok(raw) => {
+                                            let extracted =
+                                                crate::invite_qr::invitation_text_from_scan(&raw);
+                                            scanning.set(false);
+                                            match accept_invite_code(&extracted) {
+                                                Ok(()) => {
+                                                    is_active.set(false);
+                                                    error_msg.set(None);
+                                                    scan_error.set(None);
+                                                    code_input.set(String::new());
+                                                }
+                                                Err(msg) => {
+                                                    code_input.set(extracted);
+                                                    error_msg.set(Some(msg));
+                                                    scan_error.set(None);
+                                                }
+                                            }
+                                        }
+                                        Err(msg) => scan_error.set(Some(msg)),
+                                    });
+                                });
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let _ = evt;
+                            }
+                        },
                     }
                 }
                 if let Some(err) = scan_error.read().as_ref() {

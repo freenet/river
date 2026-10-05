@@ -1,10 +1,19 @@
-//! Rear-camera QR scan for "Enter Invite Code" (freenet/river#741).
+//! QR scan for "Enter Invite Code" (freenet/river#741).
 //!
-//! `getUserMedia` is started from the button's click, before any timeout, so
-//! the permission prompt stays attached to the tap. The preview element is
-//! mounted on the next render; [`capture_code`] waits for it, then polls
-//! `BarcodeDetector`. Browsers without that API (and native test builds) report
-//! that scanning is unavailable. The paste box stays either way.
+//! On a top-level page, `getUserMedia` is started from the button's click,
+//! before any timeout, so the permission prompt stays attached to the tap.
+//! The preview element is mounted on the next render; [`capture_code`] waits
+//! for it, then polls `BarcodeDetector`.
+//!
+//! The deployed page does not get that prompt. The Freenet shell loads River
+//! in a sandboxed iframe (`allow-scripts allow-forms allow-popups`, no
+//! `allow-same-origin`), so the document's origin is opaque. `getUserMedia`
+//! rejects with `SecurityError` and the browser never asks. Adding
+//! `allow-same-origin` would make the contract same-origin with the node, so
+//! the scan takes one photo through a file input instead and reads that still
+//! with the same detector. Browsers without `BarcodeDetector` (and native
+//! test builds) report that scanning is unavailable. The paste box stays
+//! either way.
 
 use std::cell::Cell;
 #[cfg(target_arch = "wasm32")]
@@ -15,6 +24,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 pub(crate) const PREVIEW_ID: &str = "invite-qr-preview";
+pub(crate) const STILL_INPUT_ID: &str = "invite-qr-still";
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) enum Capture {
@@ -83,6 +93,21 @@ pub(crate) fn detector_available() -> bool {
     false
 }
 
+/// The shell iframe's origin is the string `"null"`. A top-level page has a
+/// real origin and can show the camera prompt.
+pub(crate) fn camera_prompt_unavailable() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .map(|window| window.origin() == "null")
+            .unwrap_or(true)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn detector_available() -> bool {
     let Some(window) = web_sys::window() else {
@@ -116,6 +141,49 @@ pub(crate) fn request_rear_camera() -> Result<js_sys::Promise, String> {
     devices
         .get_user_media_with_constraints(&constraints)
         .map_err(js_error)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn open_still_capture() -> Result<(), String> {
+    let input = still_input().ok_or_else(|| "The camera control is not on screen.".to_string())?;
+    // Clearing first lets a second photo of the same name fire `change`.
+    input.set_value("");
+    input.click();
+    Ok(())
+}
+
+/// Read a QR from one photo. Used when the page cannot call `getUserMedia`.
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn decode_still(file: web_sys::File) -> Result<String, String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let window = web_sys::window().ok_or_else(|| "No window.".to_string())?;
+    let blob: &web_sys::Blob = file.unchecked_ref();
+    let bitmap = JsFuture::from(
+        window
+            .create_image_bitmap_with_blob(blob)
+            .map_err(|_| "Could not read that photo. Try again.".to_string())?,
+    )
+    .await
+    .map_err(|_| "Could not read that photo. Try again.".to_string())?;
+    let detector = barcode_detector()?;
+    match detect_codes(&detector, &bitmap).await? {
+        Some(text) => Ok(text),
+        None => {
+            Err("No QR code was found in that photo. Try again, or paste the code.".to_string())
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn still_input() -> Option<web_sys::HtmlInputElement> {
+    use wasm_bindgen::JsCast;
+    web_sys::window()?
+        .document()?
+        .get_element_by_id(STILL_INPUT_ID)?
+        .dyn_into()
+        .ok()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -264,10 +332,18 @@ async fn detect_once(
     detector: &BarcodeDetector,
     video: &web_sys::HtmlVideoElement,
 ) -> Result<Option<String>, String> {
+    detect_codes(detector, video.as_ref()).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn detect_codes(
+    detector: &BarcodeDetector,
+    source: &wasm_bindgen::JsValue,
+) -> Result<Option<String>, String> {
     use wasm_bindgen::JsValue;
     use wasm_bindgen_futures::JsFuture;
 
-    let promise = detector.detect(video).map_err(js_error)?;
+    let promise = detector.detect(source).map_err(js_error)?;
     let value = JsFuture::from(promise).await.map_err(js_error)?;
     let list = js_sys::Array::from(&value);
     for index in 0..list.length() {
@@ -327,8 +403,5 @@ extern "C" {
     fn new(options: &JsValue) -> Result<BarcodeDetector, JsValue>;
 
     #[wasm_bindgen(method, catch)]
-    fn detect(
-        this: &BarcodeDetector,
-        source: &web_sys::HtmlVideoElement,
-    ) -> Result<js_sys::Promise, JsValue>;
+    fn detect(this: &BarcodeDetector, source: &JsValue) -> Result<js_sys::Promise, JsValue>;
 }
