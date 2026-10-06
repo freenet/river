@@ -307,11 +307,14 @@ fn deputy_cannot_ban_fellow_deputizer_across_subtrees() {
     );
 }
 
-/// Owner-deputized global moderator can ban any member — including their own
-/// inviter (an acknowledged consequence of appointing someone who outranks the
-/// invite tree).
+/// Owner-deputized global moderator can ban any member, but NOT their own
+/// inviter. Since freenet/river#702 a ban whose cascade would remove its own
+/// issuer is void (`MembersV1::resolve_bans` step 3); the UI already refused
+/// to offer it (`self_removing_ban_reason`). Before, the ban removed the
+/// inviter and the moderator with them, and then decayed once the moderator's
+/// ban was swept.
 #[test]
-fn owner_deputized_global_mod_can_ban_anyone_including_inviter() {
+fn owner_deputized_global_mod_can_ban_anyone_but_their_inviter() {
     let owner = Peer::new();
     let inviter = Peer::new();
     let mod_peer = Peer::new();
@@ -357,8 +360,8 @@ fn owner_deputized_global_mod_can_ban_anyone_including_inviter() {
     let ids = member_ids(&state);
     assert!(!ids.contains(&victim.id), "global mod can ban any member");
     assert!(
-        !ids.contains(&inviter.id) && !ids.contains(&mod_peer.id),
-        "global mod can ban their own inviter (cascades to mod, who is downstream)"
+        ids.contains(&inviter.id) && ids.contains(&mod_peer.id),
+        "a ban on one's own inviter would remove its issuer, so it is void"
     );
 }
 

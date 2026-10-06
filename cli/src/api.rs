@@ -1306,6 +1306,24 @@ pub(crate) fn authorize_send(
     sender_vk: &VerifyingKey,
     rejoin_members_delta: Option<&MembersDelta>,
 ) -> Result<()> {
+    // A banned sender's message is dropped by the room contract, so refuse it
+    // here with the reason instead of reporting a send that never lands
+    // (freenet/river#702 rehearsal). A removed member's record is kept as ban
+    // evidence while a ban needs it, so this holds after removal too.
+    let params = ChatRoomParametersV1 {
+        owner: *room_owner_key,
+    };
+    let banned = room_state.members.banned_member_ids(
+        &room_state.ban_evidence,
+        &room_state.bans,
+        &room_state.member_info,
+        &params,
+    );
+    if banned.contains(&MemberId::from(sender_vk)) {
+        return Err(anyhow!(
+            "You are banned from this room, so the room would drop this message."
+        ));
+    }
     if room_has_member_key(room_state, room_owner_key, sender_vk) {
         return Ok(());
     }
@@ -4568,6 +4586,20 @@ impl ApiClient {
         room_state
             .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Failed to apply message delta: {:?}", e))?;
+        // The contract runs exactly this apply. If it dropped the message here
+        // it will drop it on the network too, so say so rather than report a
+        // send that never lands.
+        if !room_state
+            .recent_messages
+            .messages
+            .iter()
+            .any(|m| m.id() == sent_message_id)
+        {
+            return Err(anyhow!(
+                "The room would drop this message (applying it locally removed it), \
+                 so it was not sent."
+            ));
+        }
 
         // Send the delta to the network
         let contract_key = self
@@ -11430,6 +11462,45 @@ mod authorize_send_tests {
             err.contains("Owner should not be included"),
             "unexpected rejection reason: {err}"
         );
+    }
+
+    /// freenet/river#702: a banned member is refused with the reason, even
+    /// with stored rejoin credentials, instead of sending a message the room
+    /// contract drops. Covers both a member still listed (the ban has not been
+    /// applied to this copy yet) and one already removed, whose record the
+    /// room keeps as ban evidence.
+    #[test]
+    fn banned_member_is_refused_with_the_reason() {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        let owner = key(1);
+        let member = key(2);
+        let owner_vk = owner.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let mut state = room(&owner, &[&member]);
+        state.configuration.configuration.max_user_bans = 10;
+        state.bans = BansV1(vec![AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: std::time::SystemTime::UNIX_EPOCH,
+                banned_user: MemberId::from(&member.verifying_key()),
+            },
+            owner_id,
+            &owner,
+        )]);
+        let rejoin = MembersDelta::new(state.members.members.clone());
+        for (label, state) in [
+            ("listed", state.clone()),
+            ("removed", {
+                let mut s = state.clone();
+                s.post_apply_cleanup(&ChatRoomParametersV1 { owner: owner_vk })
+                    .unwrap();
+                s
+            }),
+        ] {
+            let err = authorize_send(&state, &owner_vk, &member.verifying_key(), Some(&rejoin))
+                .expect_err("a banned member must be refused");
+            assert!(err.to_string().contains("banned"), "{label}: {err}");
+        }
     }
 
     /// The ordinary case must keep working: a listed member sends with no
