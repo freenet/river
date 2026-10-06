@@ -33,8 +33,8 @@ use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile,
-    FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
+    FaBars, FaBell, FaBellSlash, FaChevronDown, FaChevronUp, FaCircleInfo, FaEllipsisVertical,
+    FaFaceSmile, FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -1097,6 +1097,36 @@ fn line_container_depth(line: &str) -> usize {
         }
         depth += 1;
         i = marker_end;
+    }
+}
+
+/// Classes for the header description. Collapsed is one line (`truncate`);
+/// expanded wraps and scrolls so a long description stays in the header
+/// instead of pushing the messages off the screen (freenet/river#718).
+fn room_description_class(expanded: bool) -> &'static str {
+    if expanded {
+        "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted [&>p]:m-0 break-words cursor-pointer max-h-48 overflow-y-auto"
+    } else {
+        "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline cursor-pointer"
+    }
+}
+
+/// A tap on a description link must follow the link. A tap on the rest of
+/// the line reveals or hides the full text.
+fn description_click_is_link(evt: &dioxus_core::Event<MouseData>) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        evt.data()
+            .downcast::<web_sys::MouseEvent>()
+            .and_then(|mouse| mouse.target())
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+            .and_then(|element| element.closest("a").ok().flatten())
+            .is_some()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = evt;
+        false
     }
 }
 
@@ -3641,6 +3671,11 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // Which room's header description is expanded. Compared to the open room,
+    // so switching rooms collapses it without an effect that would also
+    // collapse on unrelated CURRENT_ROOM writes (freenet/river#718).
+    let mut expanded_description_room = use_signal(|| None::<ed25519_dalek::VerifyingKey>);
+
     // Memoize expensive message grouping (decryption + markdown parsing)
     // This prevents re-computing on every render/keystroke
     // Returns (groups, self_member_id, member_names) so we can highlight user's reactions and show names in tooltips
@@ -4871,6 +4906,22 @@ pub fn Conversation() -> Element {
                             }
                         });
                     };
+                    // The open room's key. Expansion is stored as that key, so
+                    // another room's header renders collapsed (freenet/river#718).
+                    let room_key = CURRENT_ROOM.read().owner_key;
+                    let description_expanded = expanded_description_room.read().as_ref()
+                        == room_key.as_ref()
+                        && room_key.is_some();
+                    let toggle_description = {
+                        let room_key = room_key;
+                        move || {
+                            crate::util::defer(move || {
+                                let open = expanded_description_room.peek().as_ref()
+                                    == room_key.as_ref();
+                                expanded_description_room.set(if open { None } else { room_key });
+                            });
+                        }
+                    };
                     rsx! {
                         div { class: "flex-shrink-0 px-3 md:px-6 py-3 border-b border-border bg-panel",
                             div {
@@ -5002,10 +5053,38 @@ pub fn Conversation() -> Element {
                                         }
                                     }
                                     if let Some(desc_html) = current_room_description_html.read().as_ref() {
-                                        div {
-                                            "data-testid": "room-header-description",
-                                            class: "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline",
-                                            dangerous_inner_html: "{desc_html}"
+                                        div { class: "flex items-start gap-1 min-w-0",
+                                            div {
+                                                "data-testid": "room-header-description",
+                                                "data-expanded": if description_expanded { "true" } else { "false" },
+                                                class: room_description_class(description_expanded),
+                                                onclick: {
+                                                    let toggle_description = toggle_description.clone();
+                                                    move |evt| {
+                                                        // Links stay links. The rest of the line
+                                                        // is the control the truncated ellipsis
+                                                        // was missing (#718).
+                                                        if description_click_is_link(&evt) {
+                                                            return;
+                                                        }
+                                                        toggle_description();
+                                                    }
+                                                },
+                                                dangerous_inner_html: "{desc_html}"
+                                            }
+                                            button {
+                                                "data-testid": "room-description-toggle",
+                                                class: "flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                                "aria-expanded": if description_expanded { "true" } else { "false" },
+                                                "aria-label": if description_expanded { "Hide room description" } else { "Show room description" },
+                                                title: if description_expanded { "Hide room description" } else { "Show room description" },
+                                                onclick: move |_| toggle_description(),
+                                                if description_expanded {
+                                                    Icon { icon: FaChevronUp, width: 14, height: 14 }
+                                                } else {
+                                                    Icon { icon: FaChevronDown, width: 14, height: 14 }
+                                                }
+                                            }
                                         }
                                     }
                                 }
