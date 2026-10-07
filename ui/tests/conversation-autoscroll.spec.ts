@@ -25,6 +25,7 @@ import {
   releaseSettleEvents,
   scrollTop,
   viewportHeight,
+  withheld,
 } from "./history-geometry";
 
 /// A draft long enough to take more than BOTTOM_THRESHOLD_PX off the history.
@@ -951,14 +952,6 @@ function observeRowCounts(page: Page, { returnToEnd = false } = {}): Promise<num
 test.describe("Render ceiling and trimming (A04, A05)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  /// How many newer items the rendered range is holding back.
-  function withheld(page: Page): Promise<number> {
-    return page
-      .getByTestId("conversation-history")
-      .getAttribute("data-newer-withheld")
-      .then((n) => Number(n));
-  }
-
   /// Park in the Deep History Room, then send a 200-message burst that passes
   /// the ceiling and prunes the oldest messages, but not the reader's.
   async function parkPastTheCeiling(page: Page) {
@@ -991,9 +984,8 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     return row!;
   }
 
-  // The 240-item ceiling used to slide the range past a parked reader's row,
-  // although the room still held the message. Now the range holds: the row
-  // stays, later arrivals are withheld, and jump to latest still works.
+  // Past the ceiling a parked reader's range holds: the row stays, later
+  // arrivals are withheld, and jump to latest still works.
   test("repeated bursts past the ceiling keep the reader put and the DOM bounded", async ({ page }) => {
     const row = await parkPastTheCeiling(page);
     await expectRowHeld(page, row.key, row.top, "a burst past the render ceiling took the reader off a message the room still holds");

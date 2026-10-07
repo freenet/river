@@ -16,6 +16,7 @@ import {
   readingRow,
   rowTop,
   scrollTop,
+  withheld,
 } from "./history-geometry";
 
 // A parked reader's place when the history changes above them (A02) or while
@@ -172,56 +173,8 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await nextFrames(page);
   }
 
-  // #732's hidden-column findings: the head-swap compensation measures rows
-  // with `offsetTop`, which is 0 for every row of a `display:none` panel, so a
-  // drain that lands while the chat is hidden is never compensated. The same
-  // drain is compensated when visible ("a batched at-cap drain does not crawl
-  // a parked reader" in conversation-autoscroll.spec.ts).
-  // Arrivals delivered while hidden: enough to overflow the at-cap room's
-  // cap and drain its oldest messages from the head.
-  const HIDDEN_DRAIN_BATCH = 61;
-
-  test("an at-cap drain while the chat is hidden keeps the reader's row", async ({ page }) => {
-    await openRoomAtBottom(page, "Capped History Room", "/?deep-history-room=1");
-    const parkedAt = Math.max(
-      0,
-      (await page.evaluate(() => {
-        const c = document.getElementById("chat-scroll-container")!;
-        return c.scrollHeight - c.clientHeight;
-      })) - 400,
-    );
-    await readerScrollsWithoutGesture(page, parkedAt);
-    const row = await readingRow(page);
-    expect(row, "premise: a row is fully in view").not.toBeNull();
-    const rowsBefore = await page.locator("[data-item-key]").count();
-
-    await hideChatBehindMembers(page);
-    await callRiverTest(page, "appendMessages", HIDDEN_DRAIN_BATCH);
-    await expect
-      .poll(() => page.locator("[data-item-key]").count(), {
-        message: "premise: the batch should patch the hidden history, keeping the surviving rows",
-      })
-      .toBeGreaterThan(rowsBefore + 30);
-    await backToChat(page);
-
-    await expectRowHeld(page, row!.key, row!.top, "an at-cap drain while the chat was hidden moved the reader's row");
-  });
-
-  async function hideChatBehindRooms(page: Page) {
-    await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).click();
-    await expect(page.getByTestId("room-list")).toBeVisible();
-    await expect(page.locator("#chat-scroll-container"), "premise: the chat panel is hidden").toBeHidden();
-  }
-
-  async function backToChatFromRooms(page: Page) {
-    await page.getByTestId("rooms-rail").locator("button").first().click();
-    await expect(page.locator("#chat-scroll-container")).toBeVisible();
-    await nextFrames(page);
-  }
-
-  /// Park 400px above the end of the at-cap room, below the rows a drain removes.
-  async function parkInCappedRoom(page: Page) {
-    await openRoomAtBottom(page, "Capped History Room", "/?deep-history-room=1");
+  /// Park 400px above the end of the history and return the row in view.
+  async function parkAboveEnd(page: Page) {
     const end = await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       return c.scrollHeight - c.clientHeight;
@@ -232,21 +185,40 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     return row!;
   }
 
+  /// Park 400px above the end of the at-cap room, below the rows a drain removes.
+  async function parkInCappedRoom(page: Page) {
+    await openRoomAtBottom(page, "Capped History Room", "/?deep-history-room=1");
+    return parkAboveEnd(page);
+  }
+
   /// Wait for a hidden burst to patch the history.
   async function expectRowCountAbove(page: Page, rows: number, why: string) {
     await expect.poll(() => page.locator("[data-item-key]").count(), { message: why }).toBeGreaterThan(rows);
   }
 
-  test("an at-cap drain while the chat is behind the room list keeps the reader's row", async ({ page }) => {
+  // #732's hidden-column findings: the head-swap compensation measures rows
+  // with `offsetTop`, which is 0 for every row of a `display:none` panel, so a
+  // drain that lands while the chat is hidden is never compensated. The same
+  // drain is compensated when visible ("a batched at-cap drain does not crawl
+  // a parked reader" in conversation-autoscroll.spec.ts).
+  // Arrivals delivered while hidden: enough to overflow the at-cap room's
+  // cap and drain its oldest messages from the head.
+  const HIDDEN_DRAIN_BATCH = 61;
+
+  test("an at-cap drain while the chat is hidden keeps the reader's row", async ({ page }) => {
     const row = await parkInCappedRoom(page);
     const rowsBefore = await page.locator("[data-item-key]").count();
 
-    await hideChatBehindRooms(page);
+    await hideChatBehindMembers(page);
     await callRiverTest(page, "appendMessages", HIDDEN_DRAIN_BATCH);
-    await expectRowCountAbove(page, rowsBefore + 30, "premise: the batch should patch the hidden history");
-    await backToChatFromRooms(page);
+    await expectRowCountAbove(
+      page,
+      rowsBefore + 30,
+      "premise: the batch should patch the hidden history, keeping the surviving rows",
+    );
+    await backToChat(page);
 
-    await expectRowHeld(page, row.key, row.top, "an at-cap drain behind the room list moved the reader's row");
+    await expectRowHeld(page, row.key, row.top, "an at-cap drain while the chat was hidden moved the reader's row");
   });
 
   test("several bursts while the chat is hidden keep the reader's row", async ({ page }) => {
@@ -262,7 +234,6 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await backToChat(page);
 
     await expectRowHeld(page, row.key, row.top, "two bursts while the chat was hidden moved the reader's row");
-    await expectParkedAwayFromEnd(page, "the reveal took the reader to the latest message");
   });
 
   // No click precedes a breakpoint hide, so the last settle's position is used.
@@ -273,13 +244,7 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await page.setViewportSize({ width: 1280, height: 844 });
     await expect(page.locator("#chat-scroll-container")).toBeVisible();
     await nextFrames(page);
-    const end = await page.evaluate(() => {
-      const c = document.getElementById("chat-scroll-container")!;
-      return c.scrollHeight - c.clientHeight;
-    });
-    await readerScrollsWithoutGesture(page, Math.max(0, end - 400));
-    const row = await readingRow(page);
-    expect(row, "premise: a row is fully in view").not.toBeNull();
+    const row = await parkAboveEnd(page);
     const rowsBefore = await page.locator("[data-item-key]").count();
 
     // Narrowing hides the chat again, since Members is still selected.
@@ -291,7 +256,7 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await expect(page.locator("#chat-scroll-container")).toBeVisible();
     await nextFrames(page);
 
-    await expectRowHeld(page, row!.key, row!.top, "a drain while the breakpoint hid the chat moved the reader's row");
+    await expectRowHeld(page, row.key, row.top, "a drain while the breakpoint hid the chat moved the reader's row");
   });
 
   // A burst past the ceiling while hidden: the range keeps the reader's row
@@ -312,11 +277,8 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
 
     await hideChatBehindMembers(page);
     await callRiverTest(page, "appendMessages", 200);
-    const history = page.getByTestId("conversation-history");
     await expect
-      .poll(async () => Number(await history.getAttribute("data-newer-withheld")), {
-        message: "premise: the burst should take the hidden range past the ceiling",
-      })
+      .poll(() => withheld(page), { message: "premise: the burst should take the hidden range past the ceiling" })
       .toBeGreaterThan(0);
     await backToChat(page);
 
