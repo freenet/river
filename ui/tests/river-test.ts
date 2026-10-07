@@ -3,10 +3,11 @@ import { Page } from "@playwright/test";
 export type RoomsLoadState = "loading" | "migrating" | "failed" | "loaded";
 
 // Mirrors the window.__riverTest hooks ui/src/test_hooks.rs installs.
-export type RiverTestHooks = {
+type RiverTestHooks = {
   appendMessage(text: string): void;
   insertMessageBeforeLast(text: string): void;
   appendMessages(count: number): void;
+  removeMessages(containing: string): void;
   setRoomsLoadState(state: RoomsLoadState): void;
   switchRoom(name: string): void;
 };

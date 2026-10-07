@@ -52,12 +52,14 @@ export async function openRoomWithComposer(page: Page) {
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
 }
 
-// The edit form on the first own (accent) message: its kebab on touch, its hover
-// actions otherwise (freenet/river#402). Returns the edit textarea.
-export async function openOwnMessageEdit(page: Page): Promise<Locator> {
-  const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
+// The edit form on an own (accent) message: its kebab on touch, its hover
+// actions otherwise (freenet/river#402). Returns the edit textarea. Without a
+// `message`, the first own message is scrolled into view first; a given
+// `message` is used from wherever it already is.
+export async function openOwnMessageEdit(page: Page, message?: Locator): Promise<Locator> {
+  const ownRow = message ?? page.locator('[id^="msg-"]:has(.bg-accent)').first();
   await expect(ownRow).toBeVisible();
-  await ownRow.scrollIntoViewIfNeeded();
+  if (!message) await ownRow.scrollIntoViewIfNeeded();
   if (await page.evaluate(() => window.matchMedia("(hover: none)").matches)) {
     await ownRow.getByTestId("message-kebab").click();
     await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();

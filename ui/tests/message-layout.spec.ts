@@ -776,3 +776,55 @@ test.describe("Unavailable reply quote", () => {
     expect(bothInOneBubble).toBe(0);
   });
 });
+
+// freenet/river#93 follow-up reported on #732 (A08). Editing the LAST message must
+// leave its Save and Cancel controls on screen and hit-testable, whatever the
+// conversation's scroll policy. Run at each project's own device viewport.
+test.describe("Editing the last message keeps its controls reachable (A08)", () => {
+  test("Save and Cancel are inside the visible history and hit-testable", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoomWithComposer(page);
+    const input = page.getByTestId("message-input");
+    await input.fill("edit me, I am the last message");
+    await input.press("Enter");
+    const lastRow = page.locator("[data-item-key]").last();
+    await expect(lastRow, "premise: the sent message is the newest row").toContainText(
+      "edit me, I am the last message",
+    );
+
+    await openOwnMessageEdit(page, lastRow.locator('[id^="msg-"]').last());
+    // The form reveals itself with a smooth scroll; measure once it has stopped.
+    await expect
+      .poll(
+        async () => {
+          const a = await page.evaluate(() => document.getElementById("chat-scroll-container")!.scrollTop);
+          await page.waitForTimeout(200);
+          const b = await page.evaluate(() => document.getElementById("chat-scroll-container")!.scrollTop);
+          return a === b;
+        },
+        { timeout: 5_000 },
+      )
+      .toBe(true);
+
+    for (const name of [/^Save/, /^Cancel/]) {
+      const button = page.getByRole("button", { name });
+      const reach = await button.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        const c = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+        const x = r.left + r.width / 2;
+        const y = r.top + r.height / 2;
+        const hit = document.elementFromPoint(x, y);
+        return {
+          inHistory: r.top >= c.top - 0.5 && r.bottom <= c.bottom + 0.5,
+          inWindow: r.top >= 0 && r.bottom <= window.innerHeight,
+          hit: hit !== null && (hit === el || el.contains(hit)),
+          box: `${Math.round(r.top)}..${Math.round(r.bottom)} in ${Math.round(c.top)}..${Math.round(c.bottom)}`,
+        };
+      });
+      expect(reach.inHistory, `${name} is outside the visible history (${reach.box})`).toBe(true);
+      expect(reach.inWindow, `${name} is outside the window (${reach.box})`).toBe(true);
+      expect(reach.hit, `${name} is covered by something else (${reach.box})`).toBe(true);
+    }
+  });
+});

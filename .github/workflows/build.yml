@@ -297,6 +297,11 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Test Playwright bundle provenance guards
+      # Guards against serving cached target/ output as this build's; runs
+      # before the expensive installs because it needs none of them.
+      run: ./scripts/tests/playwright-bundle-provenance-test.sh
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -383,28 +388,16 @@ jobs:
     - name: Build UI with example data
       run: cargo make build-ui-example-no-sync
 
-    - name: Start dev server and wait for readiness
-      run: |
-        cd ui && dx serve --port 8082 --features example-data,no-sync &
-        echo "Waiting for dev server to serve the app..."
-        SERVER_READY=false
-        for i in $(seq 1 90); do
-          if curl -s http://localhost:8082 2>/dev/null | grep -q "river-ui"; then
-            echo "Server ready after $((i * 3))s"
-            sleep 5
-            SERVER_READY=true
-            break
-          fi
-          sleep 3
-        done
-        if [ "$SERVER_READY" != "true" ]; then
-          echo "ERROR: Dev server failed to start within 270s"
-          exit 1
-        fi
+    # Serves the build just made and checks it is this build's output; see
+    # scripts/serve-playwright-ui.sh and the provenance suite run earlier.
+    - name: Serve the built UI and wait for readiness
+      run: ./scripts/serve-playwright-ui.sh
 
     - name: Run Playwright tests
       run: npx playwright test
       working-directory: ./ui/tests
+      env:
+        PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082
 
     # `always()`, not `failure()`: with `retries: 2` an intermittent test is
     # reported as "flaky" and the job still succeeds, so a `failure()` guard

@@ -1,5 +1,16 @@
-import { test, expect } from "@playwright/test";
-import { waitForApp } from "./example-room";
+import { test, expect, Page } from "@playwright/test";
+import { waitForApp, selectListedRoom } from "./example-room";
+import {
+  BOTTOM_THRESHOLD_PX,
+  deliverOffscreen,
+  distanceFromBottom,
+  expectParkedAwayFromEnd,
+  expectStaysPut,
+  fillHistory,
+  openRoomAtBottom,
+  readerScrollsWithoutGesture,
+  scrollTop,
+} from "./history-geometry";
 
 // Regression test for: unread message counts were surfaced in the document
 // <title> and the DM rail, but rooms in the Rooms list had no unread
@@ -125,5 +136,65 @@ test.describe("Muted rooms and the cross-surface totals", { tag: "@chromium-only
     const badges = await badgeLocator.allTextContents();
     const sum = badges.reduce((acc, t) => acc + Number(t), 0);
     expect(sum).toBe(total);
+  });
+});
+
+// A short arrival related to where the view actually is (A07): is it on screen,
+// is the scroll-to-latest button offered, and is the room marked read anyway?
+// CURRENT POLICY throughout this block: catch-up visibility and read
+// acknowledgment are deliberate behavior that may be changed on purpose. The
+// viewport witness (is the arrival on screen?) is what stays.
+test.describe("Unseen arrivals versus the viewport (A07)", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  /// Whether the text's bubble overlaps the visible part of the history.
+  function onScreen(page: Page, text: string): Promise<boolean> {
+    return page.getByText(text, { exact: false }).evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const c = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+      return r.bottom > c.top && r.top < c.bottom;
+    });
+  }
+
+  test("an arrival below a parked reader stays off screen, offers catch-up, and still marks the room read", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await readerScrollsWithoutGesture(page, 0);
+    await expectParkedAwayFromEnd(page);
+    const before = await scrollTop(page);
+
+    await deliverOffscreen(page, "short unseen arrival");
+    expect(await onScreen(page, "short unseen arrival"), "the arrival was brought on screen").toBe(false);
+    expect(await scrollTop(page), "the arrival moved a parked reader").toBeCloseTo(before, 0);
+    await expect(page.getByTestId("scroll-to-bottom"), "no catch-up offered for an unseen arrival").toBeVisible();
+
+    // The open, visible room is marked read up to its newest message although
+    // that message never reached the viewport.
+    await selectListedRoom(page, "Public Discussion Room");
+    const teamChat = page.getByTestId("room-list").getByRole("button", { name: "Team Chat Room" });
+    await expect(teamChat.locator('[data-testid="room-unread-badge"]')).toHaveCount(0);
+  });
+
+  test("an arrival for a reader inside the bottom band is followed while catch-up stays hidden", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    // Inside the band the reader still counts as following, so a late layout
+    // change from the fillers would snap them back; let it land first.
+    await expectStaysPut(page, "the history was still moving after the fillers");
+    // Up, but inside the 100px band that still counts as "at the bottom".
+    await readerScrollsWithoutGesture(page, (await scrollTop(page)) - 60);
+    const distance = await distanceFromBottom(page);
+    expect(distance, "premise: inside the bottom band").toBeGreaterThan(40);
+    expect(distance, "premise: inside the bottom band").toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+    await expect(page.getByTestId("scroll-to-bottom"), "premise: no catch-up inside the band").toHaveCount(0);
+
+    await deliverOffscreen(page, "short arrival inside the band");
+    // Followed, so hiding catch-up is consistent with the view.
+    await expect.poll(() => onScreen(page, "short arrival inside the band")).toBe(true);
+    await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);
   });
 });

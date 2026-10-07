@@ -55,6 +55,8 @@ export default defineConfig({
       use: { ...devices["iPhone 13"] },
     },
   ],
-  // The dev server must already be running:
-  // cd ui && dx serve --port 8082 --features example-data,no-sync
+  // Serve a release build already made (`cargo make build-ui-example-no-sync`):
+  // cd target/dx/river-ui/release/web/public && python3 -m http.server 8082
+  // Not `dx serve`, which can rebuild underneath a run or serve a stale build.
+  // Port taken by another checkout? Pick a free one and set PLAYWRIGHT_BASE_URL.
 });

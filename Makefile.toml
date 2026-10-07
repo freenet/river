@@ -273,6 +273,13 @@ command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
 
+[tasks.clean-ui-example-output]
+private = true
+description = "Remove cached example UI output before rebuilding"
+# Why this must run before every build: see scripts/clean-ui-example-output.sh.
+command = "bash"
+args = ["scripts/clean-ui-example-output.sh"]
+
 [tasks.build-ui-example-no-sync]
 description = "Build the Dioxus UI with example data and no Freenet sync"
 env = { UI_FEATURES = "example-data,no-sync" }
@@ -280,7 +287,11 @@ env = { UI_FEATURES = "example-data,no-sync" }
 # build-tailwind is required — see the note on build-ui-example. This is the
 # task AGENTS.md tells you to run before the Playwright suite, so it has to
 # work from a clean checkout.
-dependencies = ["build-chat-delegate", "build-tailwind"]
+# clean-ui-example-output: see scripts/clean-ui-example-output.sh. touch-ui-files
+# is the established trigger (see compress-webapp-test) that makes dx rebuild
+# rather than trust its incremental decision. Pinned by
+# scripts/tests/playwright-bundle-provenance-test.sh.
+dependencies = ["build-chat-delegate", "build-tailwind", "clean-ui-example-output", "touch-ui-files"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -320,7 +331,7 @@ description = "Run all tests"
 dependencies = ["test-web-container", "test-web-container-integration", "test-room-contract", "test-scaffold", "test-common", "test-chat-delegate"]
 
 [tasks.test-ui-playwright]
-description = "Run Playwright UI tests (requires dx serve on port 8082)"
+description = "Run Playwright UI tests against a served build-ui-example-no-sync release (see ui/tests/playwright.config.ts)"
 script = '''
 cd ui/tests && npx playwright test "$@"
 '''

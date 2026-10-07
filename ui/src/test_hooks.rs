@@ -1,5 +1,6 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
-//! INBOUND messages and to drive the no-room screen's load states.
+//! INBOUND messages, remove messages, and drive the no-room screen's load
+//! states.
 //!
 //! The composer is not a substitute: `handle_send_message` raises
 //! `force_scroll`, which deliberately bypasses the pin that the scroll specs
@@ -69,6 +70,14 @@ pub fn install_test_hooks() {
         crate::util::defer(move || {
             deliver((0..count).map(|i| (format!("batched arrival {i:02}"), Delivery::Append)))
         });
+    });
+
+    // Remove every message in the current room whose text contains the given
+    // substring, in ONE mutation — the shape of a ban purge or a retention
+    // drain, which take messages out of the list rather than adding a delete
+    // action. The scroll specs use it for deletions above and at the reader.
+    expose(&hooks, "removeMessages", move |needle: String| {
+        crate::util::defer(move || remove_messages(&needle));
     });
 
     // Drive the no-room screen's load states (freenet/river#509), which the
@@ -228,6 +237,23 @@ fn prune_to_cap(room: &mut RoomData) {
         let excess = messages.len() - max;
         messages.drain(0..excess);
     }
+}
+
+/// Drop the current room's messages whose public text contains `needle`.
+fn remove_messages(needle: &str) {
+    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+        return;
+    };
+    ROOMS.with_mut(|rooms| {
+        if let Some(room) = rooms.map.get_mut(&room_key) {
+            room.room_state.recent_messages.messages.retain(|m| {
+                !m.message
+                    .content
+                    .as_public_string()
+                    .is_some_and(|text| text.contains(needle))
+            });
+        }
+    });
 }
 
 /// Deliver every message to the current room in ONE `ROOMS` mutation, so one
