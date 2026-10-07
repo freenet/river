@@ -123,6 +123,9 @@ test.describe("Reaction owner list (#714)", () => {
 
     const owners = page.getByTestId("reaction-owners");
     const coarse = await coarsePointer(page);
+    // A mobile project that reports a fine pointer must not silently run the
+    // desktop half and pass (freenet/river#714 review).
+    expect(coarse).toBe(test.info().project.name.startsWith("mobile"));
 
     if (coarse) {
       const ownCount = await page

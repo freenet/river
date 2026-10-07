@@ -7322,5 +7322,37 @@ mod tests {
             "the member-info modal no longer renders the warning's explanation \
              element"
         );
+
+        // --- Reaction owner list (freenet/river#714) ---------------------
+        // On touch this list is where reactor names are read. A plain
+        // nickname here drops the ⚠ the author line and the member list show.
+        let marks = between(
+            conversation,
+            "fn reaction_owner_marks(",
+            "\n/// Top and bottom of the chat scrollport",
+            "reaction_owner_marks",
+        );
+        assert!(
+            squashed(marks).contains(
+                "impersonation_warning_for_display( impersonation, reactor_id, display_name, \
+                 privilege_in_view(reactor_id, owner_id, deputy_badges), )"
+            ),
+            "the reactor list no longer passes the reactor's own id (and that \
+             reactor's privilege) to `impersonation_warning_for_display`"
+        );
+        assert!(
+            conversation.contains("\"data-testid\": \"reaction-owner-impersonation-warning\""),
+            "the reactor list no longer renders the warning element"
+        );
+        assert!(
+            between(
+                conversation,
+                "\"data-testid\": \"reaction-owner-impersonation-warning\"",
+                "\"data-testid\": \"reaction-owner-deputy-badge\"",
+                "reactor-list warning element",
+            )
+            .contains("WARNING_GLYPH"),
+            "the reactor-list warning element no longer renders the warning glyph"
+        );
     }
 }
