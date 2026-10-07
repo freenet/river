@@ -777,8 +777,7 @@ test.describe("Unavailable reply quote", () => {
   });
 });
 
-// 10a coverage, A08 (docs/plans/ui-ux-reimplementation/10a-scroll-regression-coverage.plan.md):
-// freenet/river#93 follow-up reported on #732. Editing the LAST message must
+// freenet/river#93 follow-up reported on #732 (A08). Editing the LAST message must
 // leave its Save and Cancel controls on screen and hit-testable, whatever the
 // conversation's scroll policy. Run at each project's own device viewport.
 test.describe("Editing the last message keeps its controls reachable (A08)", () => {

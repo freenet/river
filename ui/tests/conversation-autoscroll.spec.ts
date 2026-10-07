@@ -813,9 +813,11 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   });
 });
 
-// 10a coverage (docs/plans/ui-ux-reimplementation/10a-scroll-regression-coverage.plan.md).
-// A-IDs name the plan's eight focused areas. Tests marked CURRENT POLICY
-// characterize behavior 10b changes on purpose; the rest are invariants.
+// Scroll regression coverage, A01–A08: settle timing, content above a parked
+// reader, a hidden panel, the render ceiling, uneven-row trim, own-send snap,
+// unseen arrivals, and edit-form reachability. Tests marked CURRENT POLICY
+// characterize behavior the later simplification changes on purpose; the rest
+// are invariants.
 
 test.describe("Arrival before the reader's settle (A01)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });

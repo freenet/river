@@ -138,9 +138,8 @@ test.describe("Muted rooms and the cross-surface totals", { tag: "@chromium-only
   });
 });
 
-// 10a coverage, A07 (docs/plans/ui-ux-reimplementation/10a-scroll-regression-coverage.plan.md).
-// A short arrival related to where the view actually is: is it on screen, is
-// the scroll-to-latest button offered, and is the room marked read anyway?
+// A short arrival related to where the view actually is (A07): is it on screen,
+// is the scroll-to-latest button offered, and is the room marked read anyway?
 // CURRENT POLICY throughout: 10b changes catch-up and read acknowledgment on
 // purpose. The viewport witness is what stays.
 test.describe("Unseen arrivals versus the viewport (A07)", () => {

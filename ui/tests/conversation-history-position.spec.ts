@@ -16,8 +16,7 @@ import {
   scrollTop,
 } from "./history-geometry";
 
-// 10a coverage (docs/plans/ui-ux-reimplementation/10a-scroll-regression-coverage.plan.md):
-// a parked reader's place when the history changes above them (A02) or while
+// A parked reader's place when the history changes above them (A02) or while
 // the chat panel is hidden (A03). The reading row is measured relative to the
 // container, by message identity, against READING_ROW_BUDGET_PX.
 
@@ -52,9 +51,11 @@ test.describe("Reading position when content above changes (A02)", () => {
   // above a parked reader pushes their text down by its height.
   test("an image loading above a parked reader keeps their row in place", async ({ page }) => {
     let release: (route: Route) => Promise<void> = async () => {};
+    let resolveRequested: (route: Route) => void = () => {};
     const requested = new Promise<Route>((resolve) => {
-      page.route("**/test-image.svg", (route) => resolve(route));
+      resolveRequested = resolve;
     });
+    await page.route("**/test-image.svg", (route) => resolveRequested(route));
     release = (route) =>
       route.fulfill({
         contentType: "image/svg+xml",

@@ -1,7 +1,8 @@
 import { test, expect } from "@playwright/test";
 import { waitForApp } from "./example-room";
 
-// Only the node API socket: `dx serve` (CI) adds its own hot-reload socket.
+// Only the node API socket. CI serves the static release build, which opens no
+// sockets; a local `dx serve` still adds its own hot-reload socket.
 const NODE_SOCKET = "/v1/contract/command";
 
 test("a no-sync build opens no node socket and starts Disconnected", { tag: "@chromium-only" }, async ({ page }) => {
