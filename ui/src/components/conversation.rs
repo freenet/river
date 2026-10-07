@@ -1120,13 +1120,33 @@ fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
 /// The collapsed header line is wider than its box. Measured on the element
 /// itself: a chevron on a line that already fits only makes the header taller
 /// (freenet/river#718 review).
+fn header_description_element() -> Option<web_sys::Element> {
+    web_sys::window()?
+        .document()?
+        .get_element_by_id("room-header-description")
+}
+
+fn header_column_element() -> Option<web_sys::Element> {
+    web_sys::window()?
+        .document()?
+        .get_element_by_id("room-header-column")
+}
+
+/// Skip while the line is expanded: wrapping makes `scrollWidth` fit, and
+/// storing that would hide the chevron on the way back to one line.
+fn header_description_is_expanded() -> bool {
+    header_description_element()
+        .and_then(|element| element.get_attribute("data-expanded"))
+        .is_some_and(|value| value == "true")
+}
+
 fn header_description_overflows() -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        return web_sys::window()
-            .and_then(|window| window.document())
-            .and_then(|document| document.get_element_by_id("room-header-description"))
-            .is_some_and(|element| element.scroll_width() > element.client_width());
+        // The 1px slack matches the spec. A flex item at a fractional text
+        // width can round a pixel apart and look truncated when it fits.
+        return header_description_element()
+            .is_some_and(|element| element.scroll_width() > element.client_width() + 1);
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -3719,14 +3739,77 @@ pub fn Conversation() -> Element {
     {
         let mut description_overflows = description_overflows;
         use_effect(move || {
-            let _html = current_room_description_html.read().clone();
-            let expanded = expanded_description_room.read().is_some();
-            if expanded {
+            crate::util::signal_guard::anchor();
+            let Ok(_html) = current_room_description_html.try_read() else {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            };
+            // Read so a collapse remeasures. Do not return early when some
+            // OTHER room is the expanded one: that left the flag stuck and
+            // the next room showed a chevron on a line that already fit.
+            let Ok(_expanded_room) = expanded_description_room.try_read() else {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            };
+            crate::util::defer(move || {
+                if header_description_is_expanded() {
+                    return;
+                }
+                let next = header_description_overflows();
+                let changed = description_overflows
+                    .try_read()
+                    .is_ok_and(|current| *current != next);
+                if changed {
+                    description_overflows.set(next);
+                }
+            });
+        });
+    }
+    // Width changes (rotation, a narrow window, the mobile panel coming
+    // back) do not change the description text. Watch the header column,
+    // not the description: the description's width depends on the chevron.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let description_overflows = description_overflows;
+        let observed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+        use_effect(move || {
+            use wasm_bindgen::prelude::*;
+
+            crate::util::signal_guard::anchor();
+            let Ok(_html) = current_room_description_html.try_read() else {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            };
+            let _room = CURRENT_ROOM.read().owner_key;
+            if observed.get() {
                 return;
             }
-            crate::util::defer(move || {
-                description_overflows.set(header_description_overflows());
-            });
+            let Some(column) = header_column_element() else {
+                return;
+            };
+            let mut description_overflows = description_overflows;
+            let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
+                crate::util::defer(move || {
+                    if header_description_is_expanded() {
+                        return;
+                    }
+                    let next = header_description_overflows();
+                    let changed = description_overflows
+                        .try_read()
+                        .is_ok_and(|current| *current != next);
+                    if changed {
+                        description_overflows.set(next);
+                    }
+                });
+            }) as Box<dyn FnMut(js_sys::Array)>);
+            if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
+                observer.observe(&column);
+                // The conversation stays mounted while the panel is hidden,
+                // so the observer lives as long as the page. Same leak as the
+                // history observers above.
+                cb.forget();
+                observed.set(true);
+            }
         });
     }
 
@@ -5017,7 +5100,7 @@ pub fn Conversation() -> Element {
                                 // `<a>` is interactive content and cannot be nested inside
                                 // `<button>` per the HTML spec. Nesting also bubbles link
                                 // clicks to the modal-opening onclick handler.
-                                div { class: "min-w-0 flex-1",
+                                div { id: "room-header-column", class: "min-w-0 flex-1",
                                     // Title on the left; `ml-auto` on the (i) pushes (i)
                                     // and the bell to the right edge.
                                     div { class: "flex items-center gap-1 min-w-0",
