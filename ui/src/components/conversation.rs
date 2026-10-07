@@ -3301,7 +3301,7 @@ impl ScrollMark {
 /// therefore lands short, and past the render ceiling it holds the range's end
 /// as if the reader had parked. The next content change corrects both: the
 /// landing settles as ours, so the pin stays armed, and a following reader's
-/// range never keeps a held end (the `RangeHold` in the history render). Only
+/// range never keeps a held end (`prev_tail` in the history render). Only
 /// the button animates; every automatic scroll is instant and lands within the
 /// same task.
 #[cfg(target_arch = "wasm32")]
@@ -5515,36 +5515,15 @@ pub fn Conversation() -> Element {
                                     // held range for the latest one.
                                     let select_latest = reader_position.select_latest.replace(false)
                                         || (force_scroll.get() && reader_position.has_newer.get());
+                                    let key_at =
+                                        |i: usize, key: &str| display_item_key_matches(&groups[i], key);
                                     let prev_anchor = if select_latest {
                                         None
                                     } else {
                                         window_anchor.borrow().clone()
                                     };
                                     let relocated = prev_anchor.as_ref().map(|a| {
-                                        relocate_window(groups.len(), a, |i, key| {
-                                            display_item_key_matches(&groups[i], key)
-                                        })
-                                    });
-                                    let prev_tail = if select_latest {
-                                        None
-                                    } else {
-                                        window_tail.borrow().clone()
-                                    };
-                                    let extend_newer = reader_position.extend_newer.replace(false);
-                                    let held_end = prev_tail.as_ref().map(|t| {
-                                        let end = relocate_tail(groups.len(), t, |i, key| {
-                                            display_item_key_matches(&groups[i], key)
-                                        })
-                                        // Every held item gone: keep the count.
-                                        .unwrap_or_else(|| {
-                                            relocated.map_or(0, |r| r.start)
-                                                + window_rendered.get()
-                                        });
-                                        if extend_newer {
-                                            end + WINDOW_GROWTH_ITEMS
-                                        } else {
-                                            end
-                                        }
+                                        relocate_window(groups.len(), a, key_at)
                                     });
                                     // Parked unless following or about to
                                     // be taken to the latest. Hidden, trust
@@ -5559,6 +5538,28 @@ pub fn Conversation() -> Element {
                                     #[cfg(not(target_arch = "wasm32"))]
                                     let following = force_scroll.get() || pinned_to_bottom.get();
                                     let parked = !following && !select_latest;
+                                    // Only a parked reader keeps a held end;
+                                    // a following reader's range reaches the
+                                    // newest item.
+                                    let prev_tail = if parked {
+                                        window_tail.borrow().clone()
+                                    } else {
+                                        None
+                                    };
+                                    let extend_newer = reader_position.extend_newer.replace(false);
+                                    let held_end = prev_tail.as_ref().map(|t| {
+                                        let end = relocate_tail(groups.len(), t, key_at)
+                                            // Every held item gone: keep the count.
+                                            .unwrap_or_else(|| {
+                                                relocated.map_or(0, |r| r.start)
+                                                    + window_rendered.get()
+                                            });
+                                        if extend_newer {
+                                            end + WINDOW_GROWTH_ITEMS
+                                        } else {
+                                            end
+                                        }
+                                    });
                                     // Keep the reading row, plus one item
                                     // for a group the view top cuts through.
                                     let keep = if parked {
@@ -5576,13 +5577,7 @@ pub fn Conversation() -> Element {
                                         requested_window,
                                         relocated.as_ref().map(|r| r.start),
                                         RangeHold {
-                                            // Only a parked reader keeps a
-                                            // held end. One left by a burst
-                                            // during the button's smooth
-                                            // scroll would otherwise stop a
-                                            // following reader's range short
-                                            // of every later arrival.
-                                            end: if following { None } else { held_end },
+                                            end: held_end,
                                             parked,
                                             keep,
                                         },
