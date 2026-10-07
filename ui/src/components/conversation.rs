@@ -2518,6 +2518,13 @@ const WINDOW_GROWTH_ITEMS: usize = 60;
 /// bottom-settle trim usually fires long before), shallow enough that the
 /// worst-case DOM stays ~4x the room-open cost rather than unbounded.
 ///
+/// What happens AT the ceiling depends on the reader. A reader following the
+/// latest message has the range's start slide forward behind them, which is
+/// invisible at the bottom. A parked reader's range stops taking newer items
+/// instead and holds them back (`HistoryWindow::has_newer`) until the reader
+/// pages down to them or jumps to the latest: sliding the start past a parked
+/// reader is what took their row out of the DOM.
+///
 /// The ceiling caps ARRIVAL growth only. A reader paging back through history
 /// raises `window_items` explicitly, and that requested size always wins over
 /// the ceiling — capping it would make the backfill sentinel a no-op past 240
@@ -2553,8 +2560,118 @@ const BACKFILL_LEAD_PX: i32 = 800;
 struct HistoryWindow {
     /// Index of the first display item to render.
     start: usize,
+    /// One past the last display item to render. Equal to the item count
+    /// unless a parked reader's range is holding newer items back.
+    end: usize,
     /// Whether older items are held back — drives the backfill sentinel.
     has_older: bool,
+    /// Whether newer items are held back below a parked reader — drives the
+    /// newer-history sentinel and keeps the catch-up button up. The rendered
+    /// bottom is then NOT the room's latest message.
+    has_newer: bool,
+}
+
+/// What the previous render and the reader's position say about the lower
+/// edge of the rendered range. `Default` is a range that follows the latest
+/// message, which is every range until a parked reader meets the ceiling.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct RangeHold {
+    /// The relocated end of a range that stopped short of the newest item
+    /// last render. `None` means the range reached the newest item.
+    end: Option<usize>,
+    /// The reader is not following the latest message. At the ceiling their
+    /// range stops taking newer rows instead of dropping older ones: sliding
+    /// the start forward is what evicted a parked reader's row (#732 review).
+    parked: bool,
+    /// Index of the display item the reader is looking at, if it is known.
+    /// The start never moves past it, whatever the ceiling says: a cap must
+    /// not override what is on screen.
+    keep: Option<usize>,
+}
+
+/// Where the reader was looking, remembered by message identity so it can be
+/// put back after the history has been hidden.
+///
+/// A hidden panel has no layout: every `offsetTop` reads 0, so nothing that
+/// measures rows can compensate a change made while it is hidden. This is
+/// the last position measured while it was visible.
+#[derive(Clone, PartialEq, Debug)]
+struct ReadingAnchor {
+    /// `(data-anchor-key, top relative to the visible top of the history)`:
+    /// the row the reader was reading first, then its neighbours nearest
+    /// first. A neighbour stands in when the reading row itself was removed
+    /// from the room, so a deletion never becomes "go to the latest message".
+    /// Keyed by MESSAGE, not by display item: a group re-keys when its first
+    /// message is pruned, a message never does.
+    rows: Vec<(String, i32)>,
+    /// The display-item index of the reading row when it was captured — a
+    /// relocation hint, like `WindowAnchor::index`.
+    item_hint: usize,
+}
+
+/// How many rows a [`ReadingAnchor`] remembers: the reading row and its
+/// nearest neighbours.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const READING_ANCHOR_ROWS: usize = 7;
+
+/// Reader-position state shared between the render, its effects and the raw
+/// scroll and resize callbacks. Plain cells: the callbacks run with no Dioxus
+/// scope, and nothing renders from these except through `window_items`.
+#[derive(Default)]
+struct ReaderPosition {
+    /// The last reading position measured while the history had layout.
+    anchor: std::cell::RefCell<Option<ReadingAnchor>>,
+    /// The history has been seen without layout since it was last restored;
+    /// the next resize that finds layout restores the reader.
+    hidden: std::cell::Cell<bool>,
+    /// The first display item the last render put on screen, so a capture
+    /// can turn a row's position into an item index hint.
+    range_start: std::cell::Cell<usize>,
+    /// The last render held newer items back (see `HistoryWindow::has_newer`).
+    has_newer: std::cell::Cell<bool>,
+    /// The next render selects the latest range (manual jump to latest).
+    select_latest: std::cell::Cell<bool>,
+    /// After that render, take the view to the newest message.
+    snap_latest: std::cell::Cell<bool>,
+    /// The next render extends a held range by one page of newer items.
+    extend_newer: std::cell::Cell<bool>,
+    /// Bumped on every room change, so a deferred trim scheduled in one room
+    /// can tell that it is running in another.
+    room_epoch: std::cell::Cell<u64>,
+}
+
+/// Does `item` render the row a [`ReadingAnchor`] key names?
+fn item_holds_anchor_key(item: &DisplayItem, key: &str) -> bool {
+    match item {
+        DisplayItem::Messages(group) => group.messages.iter().any(|m| m.id == key),
+        DisplayItem::Event(summary) => summary.id == key,
+    }
+}
+
+/// The display-item index of the first remembered row that is still in the
+/// room, searched outward from the capture's hint.
+fn locate_reading_item(items: &[DisplayItem], anchor: &ReadingAnchor) -> Option<usize> {
+    anchor.rows.iter().find_map(|(key, _)| {
+        relocate_anchor(items.len(), anchor.item_hint, |i| {
+            item_holds_anchor_key(&items[i], key)
+        })
+    })
+}
+
+/// How far to scroll so the first remembered row that is still rendered sits
+/// at its remembered offset again. `None` when none of them is rendered.
+///
+/// Only the wasm reveal path calls this at runtime; natively it is exercised
+/// by the unit tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn reading_anchor_shift(
+    anchor: &ReadingAnchor,
+    top_now: impl Fn(&str) -> Option<i32>,
+) -> Option<i32> {
+    anchor
+        .rows
+        .iter()
+        .find_map(|(key, saved)| top_now(key).map(|now| now - saved))
 }
 
 /// The identity of the window's head: which display item the last render
@@ -2662,6 +2779,26 @@ fn relocate_window(
     }
 }
 
+/// Re-locate the end of a held range: its last item by its own key, else by
+/// the first surviving spare before it. `anchor.keys` are newest first and
+/// `anchor.index` is the last rendered item's index. `None` when every key is
+/// gone.
+///
+/// Unlike the head, a spare needs no offset: finding spare `k` means every
+/// newer key was not found, so the spare IS the last surviving held item.
+fn relocate_tail(
+    total: usize,
+    anchor: &WindowAnchor,
+    key_at: impl Fn(usize, &str) -> bool,
+) -> Option<usize> {
+    anchor.keys.iter().enumerate().find_map(|(spare, key)| {
+        relocate_anchor(total, anchor.index.saturating_sub(spare), |i| {
+            key_at(i, key)
+        })
+        .map(|i| i + 1)
+    })
+}
+
 /// How many rows past the window head the reposition capture will probe for a
 /// row that exists in the PRE-patch DOM.
 ///
@@ -2743,38 +2880,34 @@ struct BackfillAnchor {
     scroll_height: i32,
 }
 
-/// Extra estimated px the retained tail must clear beyond "sentinel exactly
-/// out of range" before a bottom-settle trim is allowed. Absorbs the error in
-/// estimating the trimmed height from the average row height.
+/// Extra px the retained tail must clear beyond "sentinel exactly out of
+/// range" before a bottom-settle trim is allowed. Absorbs what the
+/// measurement leaves out: the history's padding and the date separator the
+/// retained first item gains once it heads the range.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const TRIM_HEADROOM_PX: f64 = 200.0;
 
-/// Would trimming the rendered window down to `target` items leave the
-/// backfill sentinel strip inside the bottom viewport?
+/// Would a trim that leaves `retained_tail_px` of history leave the backfill
+/// sentinel strip inside the bottom viewport?
 ///
 /// At the bottom, the sentinel strip `[0, BACKFILL_LEAD_PX]` intersects the
 /// viewport iff `content_height < client_height + BACKFILL_LEAD_PX`. A tail
 /// short enough for that (browser zoom-out, a tall portrait monitor over a
 /// modest window) would re-fire the backfill the moment the trim lands:
 /// grow → snap → settle → trim → grow, a silent render loop at full speed
-/// (#505 re-review). The settle handler skips the trim when the retained
-/// tail's ESTIMATED height (current height scaled by the retained fraction)
-/// would sit within the strip's reach; the window then simply stays grown,
-/// bounded by the ceiling as ever.
+/// (#505 re-review). The settle handler skips the trim when it would; the
+/// window then simply stays grown, bounded by the ceiling as ever.
+///
+/// The tail is MEASURED: the rendered height from the first retained row to
+/// the end. An estimate from the average row height is what looped on rooms
+/// whose older rows are much taller than the newest ones — the tall rows
+/// inflated the average, so the estimate cleared the strip while the real
+/// tail did not.
 /// Only the wasm settle handler calls this at runtime; natively it is
 /// exercised by the unit tests, hence the targeted allow.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn trim_would_rearm_backfill(
-    scroll_height: i32,
-    client_height: i32,
-    rendered: usize,
-    target: usize,
-) -> bool {
-    if rendered == 0 || target >= rendered {
-        return false;
-    }
-    let estimated_tail = scroll_height as f64 * target as f64 / rendered as f64;
-    estimated_tail < client_height as f64 + BACKFILL_LEAD_PX as f64 + TRIM_HEADROOM_PX
+fn trim_would_rearm_backfill(retained_tail_px: i32, client_height: i32) -> bool {
+    (retained_tail_px as f64) < client_height as f64 + BACKFILL_LEAD_PX as f64 + TRIM_HEADROOM_PX
 }
 
 /// The requested window size after one backfill growth step.
@@ -2820,10 +2953,43 @@ impl HistoryWindow {
     /// room switch) that clears the anchor and resets `window`, because a trim
     /// is only invisible when the view is at the bottom, where the browser's
     /// scrollTop clamp keeps the tail glued in place.
+    ///
+    /// This is the range of a reader who follows the latest message; see
+    /// [`Self::resolve_held`] for a parked one.
+    #[cfg(test)]
     fn resolve(total_items: usize, window: usize, anchor: Option<usize>) -> Self {
-        // `max(1)` so the newest item is always on screen: a zero window would
+        Self::resolve_held(total_items, window, anchor, RangeHold::default())
+    }
+
+    /// [`Self::resolve`] with the lower edge `hold` describes.
+    ///
+    /// * A range that reached the newest item keeps following it, as above,
+    ///   until arrivals take it past the ceiling. Then a FOLLOWING reader's
+    ///   start slides (they are at the bottom, where that is invisible), and
+    ///   a PARKED reader's end stops instead: newer rows are held back, so
+    ///   arrivals no longer grow the DOM and nothing is removed above them.
+    /// * A held end stays on its item. It moves only when the reader pages
+    ///   newer history in (the caller passes the extended end), and the
+    ///   ceiling then slides the start forward behind them.
+    /// * `keep` bounds every forward move of the start.
+    ///
+    /// `window` counts back from the END, so a backfill grows a held range
+    /// upward exactly as it grows a following one.
+    fn resolve_held(
+        total_items: usize,
+        window: usize,
+        anchor: Option<usize>,
+        hold: RangeHold,
+    ) -> Self {
+        // A held end can never pass the newest item, and never empties the
+        // range: if every item it held is gone, fall back to the newest.
+        let mut end = match hold.end {
+            Some(e) if e > 0 => e.min(total_items),
+            _ => total_items,
+        };
+        // `max(1)` so an item is always on screen: a zero window would
         // render an empty history that the reader has no way to scroll into.
-        let base = total_items.saturating_sub(window.max(1));
+        let base = end.saturating_sub(window.max(1));
         // Grow, never slide: keep the anchored start unless a backfill asked
         // for an even earlier one. `min` also repairs an anchor past the end
         // (messages pruned out from under it).
@@ -2839,12 +3005,21 @@ impl HistoryWindow {
         let cap = (window + WINDOW_GROWTH_ITEMS)
             .max(WINDOW_ITEMS_CEILING)
             .max(1);
-        if total_items - start > cap {
-            start = total_items - cap;
+        if end - start > cap {
+            if hold.parked && hold.end.is_none() {
+                end = start + cap;
+            } else {
+                start = end - cap;
+            }
+        }
+        if let Some(keep) = hold.keep {
+            start = start.min(keep.min(end.saturating_sub(1)));
         }
         Self {
             start,
+            end,
             has_older: start > 0,
+            has_newer: end < total_items,
         }
     }
 }
@@ -2853,6 +3028,18 @@ impl HistoryWindow {
 /// `scrollend` event (Safari before 17.4).
 #[cfg(target_arch = "wasm32")]
 const SCROLL_SETTLE_DEBOUNCE_MS: i32 = 120;
+
+/// Refresh the saved reading position from the live view. Called just before
+/// the chat panel is hidden: once it is, there is no geometry left to read,
+/// and the last settle may predate a scroll still in flight.
+fn remember_reading_position(reader: &ReaderPosition) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(anchor) = capture_reading_anchor(reader.range_start.get()) {
+        *reader.anchor.borrow_mut() = Some(anchor);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = reader;
+}
 
 /// Read the chat history's scroll container, if it is currently in the DOM.
 #[cfg(target_arch = "wasm32")]
@@ -2940,6 +3127,164 @@ fn first_history_row_identity() -> Option<(String, i32)> {
     let key = el.get_attribute("data-item-key")?;
     let html = el.dyn_ref::<web_sys::HtmlElement>()?;
     Some((key, html.offset_top()))
+}
+
+/// Does the history have layout right now?
+///
+/// On a phone the chat panel is `display:none` while the Rooms or Members
+/// panel is shown, and also when the window crosses the breakpoint with one
+/// of those selected. Every row then measures 0, so any measurement taken is
+/// garbage and any compensation computed from it is wrong. `MOBILE_VIEW` alone
+/// cannot answer this: on desktop all three panels are visible whatever it
+/// says.
+#[cfg(target_arch = "wasm32")]
+fn history_has_layout(container: &web_sys::Element) -> bool {
+    container.client_height() > 0
+}
+
+/// Measure where the reader is looking: the first message (or event) row that
+/// starts inside the visible history, with its nearest neighbours.
+///
+/// Bounded: a binary search over the rendered item rows finds the first one
+/// reaching into view, then only that row and its neighbours are read. Cheap
+/// enough for every settle, never run per raw scroll event.
+#[cfg(target_arch = "wasm32")]
+fn capture_reading_anchor(range_start: usize) -> Option<ReadingAnchor> {
+    use wasm_bindgen::JsCast;
+    let container = chat_scroll_container()?;
+    if !history_has_layout(&container) {
+        return None;
+    }
+    let view_top = container.get_bounding_client_rect().top();
+    let rows = container.query_selector_all("[data-item-key]").ok()?;
+    let row = |i: u32| {
+        rows.item(i)
+            .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+    };
+    let n = rows.length();
+    // The first item row whose bottom is below the visible top.
+    let (mut lo, mut hi) = (0u32, n);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let bottom = row(mid).map_or(f64::MAX, |r| r.get_bounding_client_rect().bottom());
+        if bottom <= view_top {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == n {
+        return None;
+    }
+    // The anchor-keyed rows in that item and its neighbours, in page order.
+    let mut found: Vec<(String, f64, f64)> = Vec::new();
+    for i in lo.saturating_sub(1)..(lo + 3).min(n) {
+        let Some(item) = row(i) else { continue };
+        let mut push = |el: &web_sys::Element| {
+            if let Some(key) = el.get_attribute("data-anchor-key") {
+                let rect = el.get_bounding_client_rect();
+                found.push((key, rect.top(), rect.bottom()));
+            }
+        };
+        if item.has_attribute("data-anchor-key") {
+            push(&item);
+        } else if let Ok(inner) = item.query_selector_all("[data-anchor-key]") {
+            for j in 0..inner.length() {
+                if let Some(el) = inner
+                    .item(j)
+                    .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+                {
+                    push(&el);
+                }
+            }
+        }
+    }
+    // The row being read: the first one whose top is in view, else the one
+    // the visible top cuts through.
+    let reading = found
+        .iter()
+        .position(|(_, top, _)| *top >= view_top - 0.5)
+        .or_else(|| found.iter().position(|(_, _, bottom)| *bottom > view_top))?;
+    let mut rows = Vec::with_capacity(READING_ANCHOR_ROWS);
+    let entry = |i: usize| (found[i].0.clone(), (found[i].1 - view_top).round() as i32);
+    rows.push(entry(reading));
+    for d in 1..found.len() {
+        if rows.len() >= READING_ANCHOR_ROWS {
+            break;
+        }
+        if reading + d < found.len() {
+            rows.push(entry(reading + d));
+        }
+        if d <= reading && rows.len() < READING_ANCHOR_ROWS {
+            rows.push(entry(reading - d));
+        }
+    }
+    Some(ReadingAnchor {
+        rows,
+        item_hint: range_start + lo as usize,
+    })
+}
+
+/// Put the reader back on the row `anchor` remembers, at the offset it was
+/// remembered at. Returns false when none of its rows is rendered.
+///
+/// The position is recorded as ours, so the settle this scroll produces does
+/// not read as the reader moving.
+#[cfg(target_arch = "wasm32")]
+fn restore_reading_anchor(anchor: &ReadingAnchor, last_top: &Rc<ScrollMark>) -> bool {
+    use wasm_bindgen::JsCast;
+    let Some(container) = chat_scroll_container() else {
+        return false;
+    };
+    let view_top = container.get_bounding_client_rect().top();
+    let Ok(els) = container.query_selector_all("[data-anchor-key]") else {
+        return false;
+    };
+    // One pass, keeping only the remembered keys. Rare (once per reveal).
+    let mut tops: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    for i in 0..els.length() {
+        let Some(el) = els
+            .item(i)
+            .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+        else {
+            continue;
+        };
+        if let Some(key) = el.get_attribute("data-anchor-key") {
+            if anchor.rows.iter().any(|(k, _)| *k == key) {
+                let top = (el.get_bounding_client_rect().top() - view_top).round() as i32;
+                tops.entry(key).or_insert(top);
+            }
+        }
+    }
+    let Some(shift) = reading_anchor_shift(anchor, |key| tops.get(key).copied()) else {
+        return false;
+    };
+    if shift != 0 {
+        container.set_scroll_top(container.scroll_top() + shift);
+    }
+    last_top.record(container.scroll_top(), container.client_height());
+    true
+}
+
+/// The rendered height from the first of the newest `retained` item rows to
+/// the end of the history: what a trim to `retained` items would leave.
+/// `None` when no more than that many rows are rendered.
+#[cfg(target_arch = "wasm32")]
+fn retained_tail_height(container: &web_sys::Element, retained: usize) -> Option<i32> {
+    let rows = container.query_selector_all("[data-item-key]").ok()?;
+    let n = rows.length() as usize;
+    if n <= retained {
+        return None;
+    }
+    use wasm_bindgen::JsCast;
+    let first = rows
+        .item((n - retained) as u32)?
+        .dyn_into::<web_sys::Element>()
+        .ok()?;
+    // Content coordinates, from the same rects as the container's own.
+    let top_in_content = container.scroll_top() as f64 + first.get_bounding_client_rect().top()
+        - container.get_bounding_client_rect().top();
+    Some(container.scroll_height() - top_in_content.round() as i32)
 }
 
 /// Slack for comparing one scroll offset against another.
@@ -3038,11 +3383,41 @@ fn scroll_history_to_bottom(
         return;
     };
     pinned.set(true);
+    // Hidden: there is no bottom to measure. The pin is what the reveal acts
+    // on (the resize observer snaps a pinned reader once there is layout), so
+    // recording a zero-height position here would only mislead it.
+    if !history_has_layout(&container) {
+        return;
+    }
     last_top.record(max_scroll_top(&container), container.client_height());
     let opts = web_sys::ScrollToOptions::new();
     opts.set_top(container.scroll_height() as f64);
     opts.set_behavior(behavior);
     container.scroll_to_with_scroll_to_options(&opts);
+}
+
+/// May a bottom-settle trim run now? The view must have layout, sit at the
+/// exact bottom of a range that reaches the room's latest message, hold more
+/// than a fresh room-open renders, have no reveal restore or latest-range
+/// navigation pending, and leave a MEASURED tail that clears the backfill
+/// strip (see `trim_would_rearm_backfill`).
+#[cfg(target_arch = "wasm32")]
+fn trim_is_due(container: &web_sys::Element, overgrown: bool, reader: &ReaderPosition) -> bool {
+    if !overgrown
+        || !history_has_layout(container)
+        || reader.has_newer.get()
+        || reader.hidden.get()
+        || reader.select_latest.get()
+        || reader.snap_latest.get()
+    {
+        return false;
+    }
+    let distance = container.scroll_height() - container.scroll_top() - container.client_height();
+    if distance > SCROLL_TOP_SLACK_PX {
+        return false;
+    }
+    retained_tail_height(container, INITIAL_WINDOW_ITEMS)
+        .is_some_and(|tail| !trim_would_rearm_backfill(tail, container.client_height()))
 }
 
 /// Wire up the "the reader is pinned to the newest message" flag.
@@ -3086,8 +3461,8 @@ fn install_scroll_pin_listeners(
     window_items: Signal<usize>,
     window_anchor: Rc<std::cell::RefCell<Option<WindowAnchor>>>,
     window_overgrown: Rc<std::cell::Cell<bool>>,
-    window_rendered: Rc<std::cell::Cell<usize>>,
     trim_landed: Rc<std::cell::Cell<bool>>,
+    reader: Rc<ReaderPosition>,
 ) -> bool {
     use wasm_bindgen::prelude::*;
 
@@ -3107,10 +3482,22 @@ fn install_scroll_pin_listeners(
         let window_anchor = window_anchor.clone();
         let window_overgrown = window_overgrown.clone();
         let trim_landed = trim_landed.clone();
+        let reader = reader.clone();
         Closure::wrap(Box::new(move || {
             let Some(container) = chat_scroll_container() else {
                 return;
             };
+            // A hidden history measures 0 everywhere: a "settle" there would
+            // read as the reader sitting at the bottom, re-arm the pin and
+            // trim. Nothing about the reader's place can be learned from it.
+            if !history_has_layout(&container) {
+                return;
+            }
+            // Revealed but not yet restored: this position is the hidden
+            // period's, not the reader's. The restore records its own.
+            if reader.hidden.get() {
+                return;
+            }
             let settled_at = container.scroll_top();
             let ours = (settled_at - last_top.top()).abs() <= SCROLL_TOP_SLACK_PX;
             // Where the view ended up is a fact whoever caused it, and it is
@@ -3145,20 +3532,20 @@ fn install_scroll_pin_listeners(
             // re-fires the backfill and the two oscillate at render speed
             // (#505 re-review; see `trim_would_rearm_backfill`).
             //
+            //
+            // Only at the room's LATEST message: the bottom of a held range
+            // (`has_newer`) is not it, and a trim there would jump the reader
+            // forward to the newest rows.
+            //
             // Deferred: this runs from a raw JS callback with no Dioxus scope,
             // and `window_items` is a signal the render subscribes to. See
             // .claude/rules/dioxus-signal-safety.md.
-            if distance <= SCROLL_TOP_SLACK_PX as f64
-                && window_overgrown.get()
-                && !trim_would_rearm_backfill(
-                    container.scroll_height(),
-                    container.client_height(),
-                    window_rendered.get(),
-                    INITIAL_WINDOW_ITEMS,
-                )
-            {
+            if trim_is_due(&container, window_overgrown.get(), &reader) {
                 window_overgrown.set(false);
                 let window_anchor = window_anchor.clone();
+                let window_overgrown = window_overgrown.clone();
+                let reader = reader.clone();
+                let epoch = reader.room_epoch.get();
                 let mut window_items = window_items;
                 // The trim removes rows ABOVE a view that is at the bottom, so
                 // the browser clamps `scrollTop` down by their height. That
@@ -3171,6 +3558,18 @@ fn install_scroll_pin_listeners(
                 // by the effect that watches `window_items`.
                 let trim_landed = trim_landed.clone();
                 crate::util::defer(move || {
+                    // What authorized the trim was measured a task ago. The
+                    // reader may have scrolled away, switched rooms or hidden
+                    // the panel since, and a trim then removes rows above
+                    // wherever they are now — so everything is re-measured.
+                    if reader.room_epoch.get() != epoch {
+                        return;
+                    }
+                    if !chat_scroll_container().is_some_and(|c| trim_is_due(&c, true, &reader)) {
+                        // Still overgrown; a later settle at the bottom may trim.
+                        window_overgrown.set(true);
+                        return;
+                    }
                     *window_anchor.borrow_mut() = None;
                     // Raised in the SAME task as the write it describes, so
                     // no other `window_items` writer can run between the two
@@ -3179,10 +3578,17 @@ fn install_scroll_pin_listeners(
                     window_items.set(INITIAL_WINDOW_ITEMS);
                 });
             }
+            // Wherever the view came to rest is the reading position a later
+            // hide and reveal puts back, whoever moved it there.
+            if let Some(anchor) = capture_reading_anchor(reader.range_start.get()) {
+                *reader.anchor.borrow_mut() = Some(anchor);
+            }
             if ours {
                 return;
             }
-            pinned.set(distance <= BOTTOM_THRESHOLD_PX);
+            // The bottom of a range holding newer items back is not the
+            // latest message, so it does not arm the follow.
+            pinned.set(distance <= BOTTOM_THRESHOLD_PX && !reader.has_newer.get());
         }) as Box<dyn FnMut()>)
     };
     let settle_fn: js_sys::Function = settle.as_ref().unchecked_ref::<js_sys::Function>().clone();
@@ -3299,6 +3705,14 @@ pub fn Conversation() -> Element {
     // memory written back during render; nothing renders FROM it, so there is
     // no subscriber to notify.
     let window_anchor = use_hook(|| Rc::new(std::cell::RefCell::new(None::<WindowAnchor>)));
+    // The identity of the range's LAST item, kept only while the range stops
+    // short of the newest one (`HistoryWindow::has_newer`): a parked reader's
+    // range held at the ceiling. Keys newest first, like `window_anchor`'s
+    // are head first, so the held end survives the same index shifts.
+    let window_tail = use_hook(|| Rc::new(std::cell::RefCell::new(None::<WindowAnchor>)));
+    // Where the reader is looking, and the flags that move the range on
+    // their behalf. See `ReaderPosition`.
+    let reader_position = use_hook(|| Rc::new(ReaderPosition::default()));
     // How many display items the last render actually put on screen. The
     // backfill growth step reads this instead of the requested size: after
     // arrivals grow an anchored window, growing from the stale requested size
@@ -3374,6 +3788,18 @@ pub fn Conversation() -> Element {
         if changed {
             prev_render_room.set(Some(room));
             *window_anchor.borrow_mut() = None;
+            *window_tail.borrow_mut() = None;
+            // The new room opens at its newest message; a reading position
+            // from the old one must never be restored into it. `hidden` is
+            // kept: a reveal still has to snap the new room into place.
+            *reader_position.anchor.borrow_mut() = None;
+            reader_position.has_newer.set(false);
+            reader_position.select_latest.set(false);
+            reader_position.snap_latest.set(false);
+            reader_position.extend_newer.set(false);
+            reader_position
+                .room_epoch
+                .set(reader_position.room_epoch.get().wrapping_add(1));
             window_rendered.set(0);
             window_overgrown.set(false);
             trim_landed.set(false);
@@ -3442,14 +3868,29 @@ pub fn Conversation() -> Element {
     // push them past `BOTTOM_THRESHOLD_PX` and clear the pin for good.
     // Routing through `scroll_history_to_bottom` fixes both halves: it puts
     // the view on the bottom and records that offset as ours.
+    //
+    // The same effect finishes a manual jump to the latest message from a
+    // range that was holding newer items back: that render swapped in the
+    // latest range, and only now is there a newest row to scroll to. The
+    // reader asked for it, so no gate applies.
     #[cfg(target_arch = "wasm32")]
     {
         let trim_landed = trim_landed.clone();
         let pinned_to_bottom = pinned_to_bottom.clone();
         let last_scroll_top = last_scroll_top.clone();
+        let reader_position = reader_position.clone();
         use_effect(move || {
             // Subscribe, so this runs after the render the trim caused.
             let _ = window_items();
+            if reader_position.snap_latest.replace(false) {
+                trim_landed.set(false);
+                scroll_history_to_bottom(
+                    &pinned_to_bottom,
+                    &last_scroll_top,
+                    web_sys::ScrollBehavior::Instant,
+                );
+                return;
+            }
             if !trim_landed.get() {
                 return;
             }
@@ -3830,8 +4271,8 @@ pub fn Conversation() -> Element {
         let last_scroll_top = last_scroll_top.clone();
         let window_anchor = window_anchor.clone();
         let window_overgrown = window_overgrown.clone();
-        let window_rendered = window_rendered.clone();
         let trim_landed = trim_landed.clone();
+        let reader_position = reader_position.clone();
         let installed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
         use_effect(move || {
             let _retry_on_content_change = message_groups.read().is_some();
@@ -3844,8 +4285,8 @@ pub fn Conversation() -> Element {
                 window_items,
                 window_anchor.clone(),
                 window_overgrown.clone(),
-                window_rendered.clone(),
                 trim_landed.clone(),
+                reader_position.clone(),
             ) {
                 installed.set(true);
             }
@@ -3899,6 +4340,11 @@ pub fn Conversation() -> Element {
             let Some(container) = chat_scroll_container() else {
                 return;
             };
+            // Hidden rows all measure 0, so there is no shift to measure; the
+            // reveal restores the reader from their saved anchor instead.
+            if !history_has_layout(&container) {
+                return;
+            }
             // The scroll-to-latest button's SMOOTH scroll is the one animated
             // scroll in the app, and while it is in flight the state reads
             // exactly like a parked reader (pinned, position above the
@@ -4066,6 +4512,7 @@ pub fn Conversation() -> Element {
     {
         let pinned_to_bottom = pinned_to_bottom.clone();
         let last_scroll_top = last_scroll_top.clone();
+        let reader_position = reader_position.clone();
         let observed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
         use_effect(move || {
             use wasm_bindgen::prelude::*;
@@ -4082,7 +4529,30 @@ pub fn Conversation() -> Element {
 
             let pinned_to_bottom = pinned_to_bottom.clone();
             let last_scroll_top = last_scroll_top.clone();
+            let reader_position = reader_position.clone();
             let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
+                // Hiding the chat panel (Rooms or Members on a phone, or the
+                // window crossing the breakpoint) resizes the container to
+                // nothing, and showing it resizes it back. That pair is the
+                // only notice the history gets, so the reveal is handled
+                // here, before anything else gets to move the view.
+                let Some(container) = chat_scroll_container() else {
+                    return;
+                };
+                if !history_has_layout(&container) {
+                    reader_position.hidden.set(true);
+                    return;
+                }
+                if reader_position.hidden.replace(false) && !pinned_to_bottom.get() {
+                    // A parked reader goes back to the row they were reading,
+                    // at the offset they left it, however the history changed
+                    // while hidden. A following reader falls through to the
+                    // snap below.
+                    if let Some(anchor) = reader_position.anchor.borrow().clone() {
+                        restore_reading_anchor(&anchor, &last_scroll_top);
+                    }
+                    return;
+                }
                 if !pinned_to_bottom.get() {
                     return;
                 }
@@ -4892,7 +5362,13 @@ pub fn Conversation() -> Element {
                                     } else {
                                         "Open room list".to_string()
                                     },
-                                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
+                                    onclick: {
+                                        let reader_position = reader_position.clone();
+                                        move |_| {
+                                            remember_reading_position(&reader_position);
+                                            crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms)
+                                        }
+                                    },
                                     Icon { icon: FaBars, width: 18, height: 18 }
                                     // Unread-elsewhere badge: new messages in OTHER rooms
                                     // (and DMs) are invisible on mobile while a room fills
@@ -5013,7 +5489,13 @@ pub fn Conversation() -> Element {
                                 button {
                                     "data-testid": "header-members-button",
                                     class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors flex-shrink-0",
-                                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Members),
+                                    onclick: {
+                                        let reader_position = reader_position.clone();
+                                        move |_| {
+                                            remember_reading_position(&reader_position);
+                                            crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Members)
+                                        }
+                                    },
                                     Icon { icon: FaUsers, width: 18, height: 18 }
                                 }
                             }
@@ -5079,16 +5561,83 @@ pub fn Conversation() -> Element {
                                     // while its neighbors survive (#505
                                     // blockers; see `WindowAnchor` and
                                     // `relocate_window`).
-                                    let prev_anchor = window_anchor.borrow().clone();
+                                    //
+                                    // A held range (newer items withheld)
+                                    // is given up for the latest one when
+                                    // the reader asks for the newest
+                                    // message, or sends their own: both
+                                    // navigate there once this render has
+                                    // put it on screen.
+                                    let select_latest = reader_position.select_latest.replace(false)
+                                        || (force_scroll.get() && reader_position.has_newer.get());
+                                    let prev_anchor = if select_latest {
+                                        None
+                                    } else {
+                                        window_anchor.borrow().clone()
+                                    };
                                     let relocated = prev_anchor.as_ref().map(|a| {
                                         relocate_window(groups.len(), a, |i, key| {
                                             display_item_key_matches(&groups[i], key)
                                         })
                                     });
-                                    let history_window = HistoryWindow::resolve(
+                                    let prev_tail = if select_latest {
+                                        None
+                                    } else {
+                                        window_tail.borrow().clone()
+                                    };
+                                    let extend_newer = reader_position.extend_newer.replace(false);
+                                    let held_end = prev_tail.as_ref().map(|t| {
+                                        let end = relocate_tail(groups.len(), t, |i, key| {
+                                            display_item_key_matches(&groups[i], key)
+                                        })
+                                        // Every held item gone: keep the
+                                        // rendered count from the head.
+                                        .unwrap_or_else(|| {
+                                            relocated.map_or(0, |r| r.start)
+                                                + window_rendered.get()
+                                        });
+                                        if extend_newer {
+                                            end + WINDOW_GROWTH_ITEMS
+                                        } else {
+                                            end
+                                        }
+                                    });
+                                    // Parked unless the reader is following
+                                    // the latest message, or about to be
+                                    // taken there. Hidden, the pin is all
+                                    // there is: the geometry reads 0.
+                                    #[cfg(target_arch = "wasm32")]
+                                    let following = force_scroll.get()
+                                        || (pinned_to_bottom.get()
+                                            && !chat_scroll_container().is_some_and(|c| {
+                                                history_has_layout(&c)
+                                                    && reader_moved_up_since(&last_scroll_top)
+                                            }));
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    let following = force_scroll.get() || pinned_to_bottom.get();
+                                    let parked = !following && !select_latest;
+                                    // The row being read stays rendered.
+                                    // One item of margin above it covers a
+                                    // group the visible top cuts through.
+                                    let keep = if parked {
+                                        reader_position
+                                            .anchor
+                                            .borrow()
+                                            .as_ref()
+                                            .and_then(|a| locate_reading_item(groups, a))
+                                            .map(|i| i.saturating_sub(1))
+                                    } else {
+                                        None
+                                    };
+                                    let history_window = HistoryWindow::resolve_held(
                                         groups.len(),
                                         requested_window,
                                         relocated.as_ref().map(|r| r.start),
+                                        RangeHold {
+                                            end: held_end,
+                                            parked,
+                                            keep,
+                                        },
                                     );
                                     // Was rendered content at or above the new
                                     // head removed in this very patch? True
@@ -5123,12 +5672,13 @@ pub fn Conversation() -> Element {
                                         #[cfg(target_arch = "wasm32")]
                                         if let (Some((key, pre_top)), Some(container)) = (
                                             select_reposition_probe(
-                                                groups[history_window.start..]
+                                                groups[history_window.start..history_window.end]
                                                     .iter()
                                                     .map(display_item_key),
                                                 first_history_row_offset,
                                             ),
-                                            chat_scroll_container(),
+                                            // Hidden rows all measure 0.
+                                            chat_scroll_container().filter(history_has_layout),
                                         ) {
                                             *reposition_pending.borrow_mut() =
                                                 Some((key, pre_top, container.scroll_top()));
@@ -5151,15 +5701,33 @@ pub fn Conversation() -> Element {
                                     // What the backfill growth step grows FROM
                                     // (#505 blocker 2; see `grown_window`).
                                     window_rendered
-                                        .set(groups.len() - history_window.start);
+                                        .set(history_window.end - history_window.start);
+                                    // The held end's identity, kept only
+                                    // while newer items are withheld; a range
+                                    // that reaches the newest item follows it.
+                                    *window_tail.borrow_mut() = history_window.has_newer.then(|| {
+                                        WindowAnchor {
+                                            keys: groups[history_window.start..history_window.end]
+                                                .iter()
+                                                .rev()
+                                                .take(WINDOW_ANCHOR_KEYS)
+                                                .map(display_item_key)
+                                                .collect(),
+                                            index: history_window.end - 1,
+                                        }
+                                    });
+                                    reader_position.range_start.set(history_window.start);
+                                    reader_position.has_newer.set(history_window.has_newer);
                                     // Tell the settle handler whether a
                                     // bottom-settle trim would shrink anything.
                                     window_overgrown.set(
                                         requested_window > INITIAL_WINDOW_ITEMS
-                                            || groups.len() - history_window.start
+                                            || history_window.end - history_window.start
                                                 > INITIAL_WINDOW_ITEMS,
                                     );
-                                    let groups = groups[history_window.start..].to_vec();
+                                    let withheld_newer = groups.len() - history_window.end;
+                                    let groups =
+                                        groups[history_window.start..history_window.end].to_vec();
                                     let self_member_id = *self_member_id;
                                     let member_names = member_names.clone();
                                     // Room limits for the in-place edit form's
@@ -5314,6 +5882,12 @@ pub fn Conversation() -> Element {
                                             // history rows (AGENTS.md test-id
                                             // rule); additive markup only.
                                             "data-testid": "conversation-history",
+                                            // How many newer display items a
+                                            // held range is withholding — the
+                                            // only trace arrivals below a
+                                            // parked reader leave in the DOM.
+                                            // Additive automation markup.
+                                            "data-newer-withheld": "{withheld_newer}",
                                             {rows.into_iter().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
@@ -5342,6 +5916,9 @@ pub fn Conversation() -> Element {
                                                                 // head-reposition machinery
                                                                 // (`history_row_offset_top`).
                                                                 "data-item-key": "{key}",
+                                                                // Reading-position identity
+                                                                // (`capture_reading_anchor`).
+                                                                "data-anchor-key": "{key}",
                                                                 class: "flex justify-center py-1",
                                                                 span {
                                                                     class: "text-xs text-text-muted italic",
@@ -5401,6 +5978,49 @@ pub fn Conversation() -> Element {
                                                 }
                                             }})}
                                         }
+                                        // Newer-history trigger, the mirror of
+                                        // the backfill strip: rendered only
+                                        // while a parked reader's range holds
+                                        // newer items back, and spanning the
+                                        // last BACKFILL_LEAD_PX of what is
+                                        // rendered. Rows it adds land BELOW
+                                        // the view, so nothing needs
+                                        // restoring; if the range then passes
+                                        // the ceiling its start slides, and
+                                        // the head reposition compensates
+                                        // that like any head swap.
+                                        if history_window.has_newer
+                                            && opening_snap_done()
+                                            && !room_changed_this_render
+                                        {
+                                            div { style: "position:relative;height:0;",
+                                                div {
+                                                    id: "bottom-newer-sentinel",
+                                                    style: "position:absolute;bottom:0;height:{BACKFILL_LEAD_PX}px;width:1px;",
+                                                    onvisible: {
+                                                        let reader_position = reader_position.clone();
+                                                        move |evt: dioxus::prelude::Event<VisibleData>| {
+                                                            if !evt.data().is_intersecting().unwrap_or(false) {
+                                                                return;
+                                                            }
+                                                            // Refresh the reading position first:
+                                                            // it is what bounds the start's slide.
+                                                            #[cfg(target_arch = "wasm32")]
+                                                            if let Some(anchor) = capture_reading_anchor(
+                                                                reader_position.range_start.get(),
+                                                            ) {
+                                                                *reader_position.anchor.borrow_mut() = Some(anchor);
+                                                            }
+                                                            reader_position.extend_newer.set(true);
+                                                            // `window` counts back from the end, so
+                                                            // the initial size lets the ceiling slide
+                                                            // the start behind a reader paging down.
+                                                            window_items.set(INITIAL_WINDOW_ITEMS);
+                                                        }
+                                                    },
+                                                }
+                                            }
+                                        }
                                     })
                                 }
                                 None => Some(rsx! {
@@ -5430,7 +6050,12 @@ pub fn Conversation() -> Element {
                 // hides once the newest message is in view. Handy on every
                 // device but especially on touch, where there is no scrollbar
                 // to drag.
-                if !is_at_bottom() {
+                //
+                // Also shown whenever the rendered range is holding newer
+                // items back: its bottom is in view but it is not the latest
+                // message. (`has_newer` was written by the history render
+                // above, earlier in this same render.)
+                if !is_at_bottom() || reader_position.has_newer.get() {
                     button {
                         class: "absolute bottom-4 right-4 z-30 flex items-center justify-center w-10 h-10 rounded-full bg-panel shadow-lg border border-border text-text-muted hover:text-accent transition-colors",
                         "aria-label": "Scroll to latest messages",
@@ -5441,7 +6066,24 @@ pub fn Conversation() -> Element {
                         // would leave the button hidden if the user interrupts
                         // the smooth scroll before reaching the bottom (the
                         // observer emits no new change and stays quiet). #402.
-                        onclick: move |_| {
+                        onclick: {
+                            let reader_position = reader_position.clone();
+                            move |_| {
+                            // The newest message is not rendered: swap in the
+                            // latest range first, and scroll once that render
+                            // has landed (the effect that watches
+                            // `window_items` does). Deferred, like every
+                            // signal write from a handler.
+                            if reader_position.has_newer.get() {
+                                let reader_position = reader_position.clone();
+                                let mut window_items = window_items;
+                                crate::util::defer(move || {
+                                    reader_position.select_latest.set(true);
+                                    reader_position.snap_latest.set(true);
+                                    window_items.set(INITIAL_WINDOW_ITEMS);
+                                });
+                                return;
+                            }
                             // Asking for the newest message is the clearest
                             // possible statement of intent, so this re-arms the
                             // pin (inside `scroll_history_to_bottom`) even
@@ -5459,7 +6101,7 @@ pub fn Conversation() -> Element {
                                     );
                                 });
                             }
-                        },
+                        }},
                         Icon { icon: FaChevronDown, width: 18, height: 18 }
                     }
                 }
@@ -5623,7 +6265,13 @@ pub fn Conversation() -> Element {
                                 } else {
                                     "Open room list".to_string()
                                 },
-                                onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
+                                onclick: {
+                                        let reader_position = reader_position.clone();
+                                        move |_| {
+                                            remember_reading_position(&reader_position);
+                                            crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms)
+                                        }
+                                    },
                                 Icon { icon: FaBars, width: 18, height: 18 }
                                 // Same unread-elsewhere badge as the room-header
                                 // hamburger; with no room selected every room's
@@ -6013,6 +6661,10 @@ fn MessageGroupComponent(
                             div {
                                 key: "{msg.id}",
                                 id: "msg-{msg.id}",
+                                // Reading-position identity: stable across
+                                // the group re-keying when its first message
+                                // is pruned (`capture_reading_anchor`).
+                                "data-anchor-key": "{msg.id}",
                                 class: "flex flex-col group min-w-0 max-w-full",
                                 // Container for message bubble + hover actions
                                 div {
@@ -7436,25 +8088,258 @@ mod tests {
         );
     }
 
-    /// The trim guard: skip the bottom-settle trim when the retained tail
-    /// would leave the backfill sentinel strip inside the bottom viewport —
-    /// trimming then re-fires the backfill and the two oscillate at render
+    /// The trim guard: skip the bottom-settle trim when the MEASURED retained
+    /// tail would leave the backfill sentinel strip inside the bottom viewport
+    /// — trimming then re-fires the backfill and the two oscillate at render
     /// speed (#505 re-review).
     #[test]
     fn the_trim_skips_when_the_tail_would_rearm_the_sentinel() {
-        // Ordinary desktop shape: 120 rendered items ~8000px tall, 900px
-        // viewport. Trimming to 60 retains ~4000px >> 900 + 800 + slack.
-        assert!(!trim_would_rearm_backfill(8000, 900, 120, 60));
+        let reach = |client: i32| client + BACKFILL_LEAD_PX + TRIM_HEADROOM_PX as i32;
+        // Ordinary desktop shape: the newest 60 items measure ~4000px over a
+        // 900px viewport, far past the strip's reach. Trim.
+        assert!(!trim_would_rearm_backfill(4000, 900));
+        // Exactly at the reach clears it; one px short does not.
+        assert!(!trim_would_rearm_backfill(reach(900), 900));
+        assert!(trim_would_rearm_backfill(reach(900) - 1, 900));
+        // The Uneven Tail Room on a 5800px-tall window: 60 short rows
+        // (~2500px) under tall older ones. The old estimate scaled the whole
+        // rendered height by 60/rendered and, inflated by the tall rows,
+        // cleared the reach; the real tail does not, so no trim and no loop.
+        let (rendered_height, rendered, client) = (40 * 400 + 60 * 42, 100, 5800);
+        let averaged = rendered_height * 60 / rendered;
+        assert!(
+            averaged > reach(client),
+            "premise: the average-height estimate would have trimmed"
+        );
+        assert!(trim_would_rearm_backfill(60 * 42, client));
+    }
 
-        // Tall portrait monitor / zoomed out: the same 120 items are only
-        // ~2600px tall over a 2000px viewport. The retained ~1300px tail sits
-        // entirely within client + BACKFILL_LEAD reach — trimming would
-        // re-fire the sentinel immediately.
-        assert!(trim_would_rearm_backfill(2600, 2000, 120, 60));
+    /// Item keys `m0..m{total}` for the range tests.
+    fn item_keys(total: usize) -> Vec<String> {
+        (0..total).map(|i| format!("m{i}")).collect()
+    }
 
-        // Degenerate inputs never divide by zero or "trim" upward.
-        assert!(!trim_would_rearm_backfill(8000, 900, 0, 60));
-        assert!(!trim_would_rearm_backfill(8000, 900, 50, 60));
+    /// The tail anchor the render stores for a held range.
+    fn tail_of(keys: &[String], end: usize) -> WindowAnchor {
+        WindowAnchor {
+            keys: keys[..end]
+                .iter()
+                .rev()
+                .take(WINDOW_ANCHOR_KEYS)
+                .cloned()
+                .collect(),
+            index: end - 1,
+        }
+    }
+
+    /// A burst that takes a PARKED reader's range past the ceiling holds the
+    /// range's end instead of sliding its start: nothing above the reader is
+    /// removed, the newest rows are withheld, and further arrivals do not grow
+    /// the range at all (#732 review 42f541b6).
+    #[test]
+    fn a_parked_reader_s_range_holds_its_end_at_the_ceiling() {
+        let opened = HistoryWindow::resolve(201, INITIAL_WINDOW_ITEMS, None);
+        let parked = RangeHold {
+            parked: true,
+            ..RangeHold::default()
+        };
+        // 200 arrivals in one patch, start anchored.
+        let held =
+            HistoryWindow::resolve_held(401, INITIAL_WINDOW_ITEMS, Some(opened.start), parked);
+        assert_eq!(
+            held.start, opened.start,
+            "the start must not slide past the reader"
+        );
+        assert_eq!(held.end - held.start, WINDOW_ITEMS_CEILING);
+        assert!(held.has_newer, "the newest items are withheld");
+
+        // More arrivals: the held end stays on its item, so the DOM stops growing.
+        let again = HistoryWindow::resolve_held(
+            501,
+            INITIAL_WINDOW_ITEMS,
+            Some(held.start),
+            RangeHold {
+                end: Some(held.end),
+                ..parked
+            },
+        );
+        assert_eq!((again.start, again.end), (held.start, held.end));
+
+        // The same burst under a FOLLOWING reader still slides the start: they
+        // are at the bottom, where dropping old rows above them is invisible.
+        let followed = HistoryWindow::resolve(401, INITIAL_WINDOW_ITEMS, Some(opened.start));
+        assert_eq!(
+            (followed.start, followed.end),
+            (401 - WINDOW_ITEMS_CEILING, 401)
+        );
+        assert!(!followed.has_newer);
+
+        // Below the ceiling nothing changes for a parked reader either.
+        let small =
+            HistoryWindow::resolve_held(230, INITIAL_WINDOW_ITEMS, Some(opened.start), parked);
+        assert_eq!((small.start, small.end), (opened.start, 230));
+        assert!(!small.has_newer);
+    }
+
+    /// A held range is relocated by identity at BOTH edges, so an at-cap
+    /// room's drain (every index shifts down) moves neither edge in content.
+    #[test]
+    fn a_held_range_follows_its_items_through_pruning() {
+        let mut keys = item_keys(400);
+        let (start, end) = (100, 100 + WINDOW_ITEMS_CEILING);
+        let head = anchor_of(&keys, start);
+        let tail = tail_of(&keys, end);
+        let (first, last) = (keys[start].clone(), keys[end - 1].clone());
+        // A batch of 40 arrivals drains the 40 oldest items.
+        keys.drain(..40);
+        keys.extend((0..40).map(|i| format!("new{i}")));
+        let relocated = relocate_window(keys.len(), &head, |i, k| keys[i] == k);
+        let held_end = relocate_tail(keys.len(), &tail, |i, k| keys[i] == k);
+        assert_eq!(held_end, Some(end - 40));
+        let w = HistoryWindow::resolve_held(
+            keys.len(),
+            INITIAL_WINDOW_ITEMS,
+            Some(relocated.start),
+            RangeHold {
+                end: held_end,
+                parked: true,
+                keep: None,
+            },
+        );
+        assert_eq!(keys[w.start], first);
+        assert_eq!(keys[w.end - 1], last);
+        assert!(w.has_newer);
+
+        // The last held item deleted outright: its spare places the end.
+        let gone = keys[w.end - 1].clone();
+        keys.retain(|k| *k != gone);
+        assert_eq!(
+            relocate_tail(
+                keys.len(),
+                &tail_of_keys(&[gone, keys[w.end - 2].clone()]),
+                |i, k| keys[i] == k
+            ),
+            Some(w.end - 1)
+        );
+        assert_eq!(
+            relocate_tail(keys.len(), &tail_of_keys(&["nope".into()]), |i, k| keys[i]
+                == k),
+            None
+        );
+    }
+
+    /// A tail anchor from explicit keys (newest first), hint past the end.
+    fn tail_of_keys(keys: &[String]) -> WindowAnchor {
+        WindowAnchor {
+            keys: keys.to_vec(),
+            index: 10_000,
+        }
+    }
+
+    /// Both directions of paging work in a held range: a backfill grows it
+    /// upward from its end, and a newer page extends the end while the
+    /// ceiling slides the start behind the reader — never past the row they
+    /// are reading.
+    #[test]
+    fn a_held_range_pages_older_and_newer() {
+        let total = 1000;
+        let (start, end) = (300, 300 + WINDOW_ITEMS_CEILING);
+        let parked = |end, keep| RangeHold {
+            end: Some(end),
+            parked: true,
+            keep,
+        };
+        // Older: one growth step from the rendered size reveals exactly one page.
+        let requested = grown_window(INITIAL_WINDOW_ITEMS, end - start);
+        let older = HistoryWindow::resolve_held(total, requested, Some(start), parked(end, None));
+        assert_eq!((older.start, older.end), (start - WINDOW_GROWTH_ITEMS, end));
+
+        // Newer: the end moves one page down and the ceiling slides the start.
+        let newer = HistoryWindow::resolve_held(
+            total,
+            INITIAL_WINDOW_ITEMS,
+            Some(start),
+            parked(end + WINDOW_GROWTH_ITEMS, None),
+        );
+        assert_eq!(newer.end, end + WINDOW_GROWTH_ITEMS);
+        assert_eq!(newer.end - newer.start, WINDOW_ITEMS_CEILING);
+
+        // The reader's row bounds that slide: the cap gives way, not the row.
+        let keep = start + 20;
+        let kept = HistoryWindow::resolve_held(
+            total,
+            INITIAL_WINDOW_ITEMS,
+            Some(start),
+            parked(end + WINDOW_GROWTH_ITEMS, Some(keep)),
+        );
+        assert_eq!(kept.start, keep);
+        assert!(kept.end - kept.start > WINDOW_ITEMS_CEILING);
+
+        // Paging newer until the end reaches the newest item ends the hold.
+        let last = HistoryWindow::resolve_held(
+            total,
+            INITIAL_WINDOW_ITEMS,
+            Some(900),
+            parked(total + 30, None),
+        );
+        assert_eq!(last.end, total);
+        assert!(!last.has_newer);
+    }
+
+    /// Selecting the latest range (jump to latest, own send, room open) is a
+    /// resolve with no anchors: the newest items, nothing withheld.
+    #[test]
+    fn selecting_the_latest_range_drops_the_hold() {
+        let w = HistoryWindow::resolve_held(1000, INITIAL_WINDOW_ITEMS, None, RangeHold::default());
+        assert_eq!((w.start, w.end), (1000 - INITIAL_WINDOW_ITEMS, 1000));
+        assert!(w.has_older && !w.has_newer);
+        // A degenerate held end (everything it held is gone) falls back to the
+        // newest item rather than rendering nothing.
+        let empty = HistoryWindow::resolve_held(
+            50,
+            INITIAL_WINDOW_ITEMS,
+            Some(0),
+            RangeHold {
+                end: Some(0),
+                parked: true,
+                keep: None,
+            },
+        );
+        assert_eq!(empty.end, 50);
+    }
+
+    /// The reading position is found by MESSAGE identity, and a deleted row
+    /// falls back to its nearest surviving neighbour — never to "no anchor",
+    /// which would let the reveal leave the view wherever the change put it.
+    #[test]
+    fn the_reading_anchor_restores_through_its_neighbours() {
+        let anchor = ReadingAnchor {
+            rows: vec![
+                ("read".into(), 40),
+                ("below".into(), 120),
+                ("above".into(), -30),
+            ],
+            item_hint: 0,
+        };
+        // Everything survives: the reading row goes back to 40px.
+        let dom = |rows: &'static [(&'static str, i32)]| {
+            move |k: &str| rows.iter().find(|(rk, _)| *rk == k).map(|(_, t)| *t)
+        };
+        assert_eq!(
+            reading_anchor_shift(&anchor, dom(&[("read", -600), ("below", -520)])),
+            Some(-640)
+        );
+        // The reading row was deleted: its neighbour is restored to ITS offset.
+        assert_eq!(
+            reading_anchor_shift(&anchor, dom(&[("below", 700)])),
+            Some(580)
+        );
+        assert_eq!(
+            reading_anchor_shift(&anchor, dom(&[("above", 10)])),
+            Some(40)
+        );
+        // Nothing survives: no move at all.
+        assert_eq!(reading_anchor_shift(&anchor, dom(&[("other", 0)])), None);
     }
 
     /// `relocate_anchor` search order and fallbacks.
@@ -7532,7 +8417,7 @@ mod tests {
         let squashed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
 
         assert!(
-            squashed.contains("HistoryWindow::resolve(groups.len(),requested_window,"),
+            squashed.contains("HistoryWindow::resolve_held(groups.len(),requested_window,"),
             "the history must slice its display items through `HistoryWindow`"
         );
         assert!(
@@ -7548,7 +8433,7 @@ mod tests {
              NEXT render grows instead of sliding (#501)"
         );
         assert!(
-            squashed.contains("window_rendered.set(groups.len()-history_window.start);"),
+            squashed.contains("window_rendered.set(history_window.end-history_window.start);"),
             "the render must record the RENDERED size — the backfill growth \
              step grows from it, or paging dead-ends after arrivals (#505 \
              blocker 2)"
@@ -7559,7 +8444,7 @@ mod tests {
              rendered size (#505 blocker 2)"
         );
         assert!(
-            squashed.contains("groups[history_window.start..].to_vec()"),
+            squashed.contains("groups[history_window.start..history_window.end].to_vec()"),
             "the render must clone only the windowed tail — cloning all groups \
              re-introduces the per-render cost the window exists to avoid"
         );
@@ -11326,12 +12211,13 @@ mod autoscroll_wiring_pins {
         assert_eq!(
             prod.matches("reader_moved_up_since(&last_scroll_top)")
                 .count(),
-            4,
-            "the guard has exactly four consumers: the content-change effect \
+            5,
+            "the guard has exactly five consumers: the content-change effect \
              and the ResizeObserver (which scroll on the strength of the pin), \
-             plus the backfill restore and the head reposition (which distrust \
-             a stale-true pin mid-fling, #505 review); found a different \
-             number of call sites"
+             the backfill restore and the head reposition (which distrust a \
+             stale-true pin mid-fling, #505 review), and the render deciding \
+             whether a reader is parked (which holds their range at the \
+             ceiling); found a different number of call sites"
         );
         // Whitespace-insensitive: `cargo fmt` decides how this condition wraps,
         // and a pin that a reformat can break is a pin that gets deleted.
@@ -11431,9 +12317,21 @@ mod autoscroll_wiring_pins {
         let prod = production_source();
         let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            dense.contains("ifdistance<=SCROLL_TOP_SLACK_PXasf64&&window_overgrown.get()"),
+            dense.contains("iftrim_is_due(&container,window_overgrown.get(),&reader)"),
             "the settle handler must trim the grown window when a settle — \
              the reader's or ours — lands at the exact bottom"
+        );
+        assert!(
+            dense.contains("ifdistance>SCROLL_TOP_SLACK_PX{returnfalse;}"),
+            "a trim is due only at the exact bottom (the slack), never inside \
+             the 100px band, where it would clamp a parked reader to the end"
+        );
+        assert!(
+            dense.contains("ifreader.room_epoch.get()!=epoch{return;}")
+                && dense.contains("trim_is_due(&c,true,&reader)"),
+            "the deferred trim must re-check the room and re-measure \
+             eligibility: the settle that scheduled it is a task old, and the \
+             reader may have moved, hidden the panel or switched rooms since"
         );
         assert!(
             dense.contains("trim_landed.set(true);"),
@@ -11468,8 +12366,9 @@ mod autoscroll_wiring_pins {
                     "scroll_history_to_bottom(&pinned_to_bottom,&last_scroll_top,web_sys::ScrollBehavior::Instant,);"
                 )
                 .count(),
-            2,
-            "both the arrival snap and the trim re-anchor must scroll through \
+            3,
+            "the arrival snap, the trim re-anchor and the jump into a held \
+             range's latest messages must all scroll through \
              `scroll_history_to_bottom`, which is what records the offset as \
              ours; consuming the trim flag without scrolling silently reverts \
              the fix"
@@ -11483,13 +12382,13 @@ mod autoscroll_wiring_pins {
              to `window_items`"
         );
         assert!(
-            dense.contains("&&!trim_would_rearm_backfill("),
+            dense.contains("!trim_would_rearm_backfill(tail,container.client_height())"),
             "the trim must be geometry-gated: on a viewport tall enough that \
              the trimmed tail leaves the sentinel strip in range, trim and \
              backfill oscillate at render speed (#505 re-review)"
         );
         let trim_at = dense
-            .find("ifdistance<=SCROLL_TOP_SLACK_PXasf64&&window_overgrown.get()")
+            .find("iftrim_is_due(&container,window_overgrown.get(),&reader)")
             .expect("asserted above");
         let ours_early_out = dense
             .find("ifours{return;}")

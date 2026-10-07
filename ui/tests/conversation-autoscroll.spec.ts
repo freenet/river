@@ -951,10 +951,10 @@ function observeRowCounts(page: Page, { returnToEnd = false } = {}): Promise<num
 test.describe("Render ceiling and trimming (A04, A05)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  // The arrival-growth ceiling (WINDOW_ITEMS_CEILING, 240 items) slides the
-  // rendered range forward past a parked reader's row although the room still
-  // holds that message. Removing it from the DOM is not deleting it: the row
-  // must stay renderable where the reader left it.
+  // The arrival-growth ceiling (WINDOW_ITEMS_CEILING, 240 items) used to slide
+  // the rendered range forward past a parked reader's row although the room
+  // still held that message. Removing it from the DOM is not deleting it: the
+  // row must stay rendered where the reader left it.
   test("a burst past the render ceiling keeps a parked reader's row rendered", async ({ page }) => {
     await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1");
     // Below the backfill strip (top 800px), near the head of the window.
@@ -974,16 +974,126 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
       "premise: the reader's message survives the prune, so it is still in the room",
     ).toBeGreaterThanOrEqual(pruned);
     await callRiverTest(page, "appendMessages", BURST);
-    await expect(page.getByText(`batched arrival ${BURST - 1}`, { exact: false })).toHaveCount(1, {
+    // The burst's newest rows are held back below the parked reader, so its
+    // landing is seen at its oldest arrival and at the catch-up button.
+    await expect(page.getByText("batched arrival 00", { exact: false })).toHaveCount(1, {
       timeout: 10_000,
     });
+    await expect(page.getByTestId("scroll-to-bottom"), "premise: the burst should have landed").toBeVisible();
     await expect(
       page.getByText(`history filler ${String(pruned - 1).padStart(2, "0")}:`, { exact: false }),
       "premise: the prune should have landed",
     ).toHaveCount(0);
 
-    knownFailure(ALL_PROJECTS, "render-ceiling eviction of a surviving row (freenet/river#732 review 42f541b6)");
     await expectRowHeld(page, row!.key, row!.top, "a burst past the render ceiling took the reader off a message the room still holds");
+  });
+
+  /// How many newer items the rendered range is holding back.
+  function withheld(page: Page): Promise<number> {
+    return page
+      .getByTestId("conversation-history")
+      .getAttribute("data-newer-withheld")
+      .then((n) => Number(n));
+  }
+
+  /// Park in the Deep History Room and take its range past the ceiling with a
+  /// 200-message burst. Returns the reader's row.
+  async function parkPastTheCeiling(page: Page) {
+    await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1");
+    await readerScrollsWithoutGesture(page, 1_000);
+    const row = await readingRow(page, "history filler");
+    expect(row, "premise: a filler row is fully in view").not.toBeNull();
+    await callRiverTest(page, "appendMessages", 200);
+    await expect.poll(() => withheld(page), { message: "premise: the burst should pass the ceiling" }).toBeGreaterThan(0);
+    return row!;
+  }
+
+  // Once the range is held, further arrivals are withheld rather than
+  // rendered: the reader stays put, the DOM stops growing, and the newest
+  // message is still one click away.
+  test("repeated bursts past the ceiling keep the reader put and the DOM bounded", async ({ page }) => {
+    const row = await parkPastTheCeiling(page);
+    await expectRowHeld(page, row.key, row.top, "the first burst moved the reader's row");
+    const rows = await page.locator("[data-item-key]").count();
+    const before = await withheld(page);
+
+    // Small enough that the prune it causes stays above the rendered range.
+    await callRiverTest(page, "appendMessages", 20);
+    await expect.poll(() => withheld(page), { message: "premise: the second burst should land" }).toBeGreaterThan(before);
+    await callRiverTest(page, "appendMessage", "newest after the bursts");
+    await expect.poll(() => withheld(page), { message: "premise: the last arrival should land" }).toBeGreaterThan(before + 20);
+
+    expect(await page.locator("[data-item-key]").count(), "arrivals below a held range grew the DOM").toBe(rows);
+    await expectRowHeld(page, row.key, row.top, "a burst below a held range moved the reader's row");
+
+    await page.getByTestId("scroll-to-bottom").click();
+    await expect(page.locator("[data-item-key]").last(), "jump to latest did not reach the newest message").toContainText(
+      "newest after the bursts",
+    );
+    await expectSettledAtBottom(page, "jump to latest did not land at the newest message");
+    expect(await withheld(page), "the latest range still withholds newer items").toBe(0);
+  });
+
+  // The rows a held range withholds page in when the reader reads down to
+  // them, until the range reaches the newest message again.
+  test("reading down a held range pages the withheld messages in", async ({ page }) => {
+    const row = await parkPastTheCeiling(page);
+    await expectRowHeld(page, row.key, row.top, "the burst moved the reader's row");
+    await callRiverTest(page, "appendMessage", "newest after the burst");
+    await expect.poll(() => withheld(page)).toBeGreaterThan(0);
+
+    // Scroll to the rendered end, unless the view is already there (no
+    // scroll, so no settle to wait for).
+    const readToEnd = async () => {
+      if ((await distanceFromBottom(page)) > AT_BOTTOM_EPSILON_PX) {
+        await readerScrollsWithoutGesture(page, await historyHeight(page));
+      }
+    };
+    for (let i = 0; i < 10 && (await withheld(page)) > 0; i++) {
+      const before = await withheld(page);
+      await readToEnd();
+      await expect.poll(() => withheld(page), { message: "reading down revealed no newer messages" }).toBeLessThan(before);
+    }
+    expect(await withheld(page), "the newer messages never all paged in").toBe(0);
+    await readToEnd();
+    await expect(page.locator("[data-item-key]").last()).toContainText("newest after the burst");
+    await expectSettledAtBottom(page, "the end of the paged range is not the newest message");
+    await expect(page.getByTestId("scroll-to-bottom"), "the catch-up button is still shown at the newest message").toBeHidden();
+    expect(
+      await page.locator("[data-item-key]").count(),
+      "paging newer history must stay bounded by the ceiling",
+    ).toBeLessThanOrEqual(INITIAL_RENDERED_ITEMS * 4 + INITIAL_RENDERED_ITEMS);
+  });
+
+  // The trim is scheduled by a settle at the bottom and runs a task later. A
+  // reader who moves inside that gap must not have rows removed above them.
+  test("a trim scheduled at the bottom stands down when the reader moves before it runs", async ({ page }) => {
+    await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1");
+    // Grown by a backfill, the reader still up at the top of the history.
+    await backfillOnce(page, "premise: backfill should grow the window past its initial size");
+    const rows = await page.locator("[data-item-key]").count();
+    expect(rows, "premise: the window is grown").toBeGreaterThan(INITIAL_RENDERED_ITEMS);
+
+    // In one task: land at the end, settle (which schedules the trim), then
+    // move up before the deferred trim runs.
+    const row = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.scrollTop = c.scrollHeight;
+      c.dispatchEvent(new Event("scrollend"));
+      c.scrollTop = c.scrollHeight - c.clientHeight - 1_500;
+      const cTop = c.getBoundingClientRect().top;
+      for (const r of Array.from(c.querySelectorAll<HTMLElement>("[data-item-key]"))) {
+        const rect = r.getBoundingClientRect();
+        if (rect.height > 0 && rect.top >= cTop && rect.bottom <= cTop + c.clientHeight) {
+          return { key: r.getAttribute("data-item-key")!, top: rect.top - cTop };
+        }
+      }
+      return null;
+    });
+    expect(row, "premise: a row is fully in view after moving up").not.toBeNull();
+
+    await expectRowHeld(page, row!.key, row!.top, "a trim scheduled before the reader moved shifted their row");
+    expect(await page.locator("[data-item-key]").count(), "the stale trim removed rows").toBe(rows);
   });
 
   // Tall older rows and a short retained tail: the trim decision estimates
@@ -1024,10 +1134,6 @@ test.describe("Trimming on a very tall viewport (A05)", () => {
     ).toBeLessThan((await viewportHeight(page)) + 800);
 
     const counts = await observeRowCounts(page);
-    knownFailure(
-      ALL_PROJECTS,
-      "trim and backfill oscillate: the trim estimate averages row heights (the #505 loop, via uneven rows)",
-    );
     expect(
       counts.length,
       `the window kept trimming and refilling with no reader input (row counts: ${counts.slice(0, 8).join(" → ")}…)`,
