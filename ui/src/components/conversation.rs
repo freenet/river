@@ -3296,7 +3296,10 @@ impl ScrollMark {
 /// Known limit: `last_top` records the offset a scroll ASKED for, so while the
 /// scroll-to-latest button's smooth scroll is animating this reports true and
 /// stands both follow paths down. A message arriving inside that ~300ms window
-/// therefore lands short until the next content change, which corrects it. Only
+/// therefore lands short, and past the render ceiling it holds the range's end
+/// as if the reader had parked. The next content change corrects both: the
+/// landing settles as ours, so the pin stays armed, and a following reader's
+/// range never keeps a held end (the `RangeHold` in the history render). Only
 /// the button animates; every automatic scroll is instant and lands within the
 /// same task.
 #[cfg(target_arch = "wasm32")]
@@ -5554,7 +5557,13 @@ pub fn Conversation() -> Element {
                                         requested_window,
                                         relocated.as_ref().map(|r| r.start),
                                         RangeHold {
-                                            end: held_end,
+                                            // Only a parked reader keeps a
+                                            // held end. One left by a burst
+                                            // during the button's smooth
+                                            // scroll would otherwise stop a
+                                            // following reader's range short
+                                            // of every later arrival.
+                                            end: if following { None } else { held_end },
                                             parked,
                                             keep,
                                         },

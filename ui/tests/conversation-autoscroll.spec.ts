@@ -1047,6 +1047,112 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     ).toBeLessThanOrEqual(INITIAL_RENDERED_ITEMS * 4 + INITIAL_RENDERED_ITEMS);
   });
 
+  // While the scroll-to-latest button's smooth scroll is in flight the reader
+  // reads as parked, so a burst past the ceiling holds the range's end. The
+  // scroll then lands where the app recorded it, so the pin stays armed and
+  // the reader is following. A following reader's range must reach the newest
+  // message again; it used to keep the held end, and later arrivals never
+  // rendered until the button was tapped again (#747 review, item 2).
+  test("a later arrival renders and is followed after a burst during a smooth return", async ({ page }) => {
+    // BACKFILL_LEAD_PX: how far above the end the newer-history trigger reaches.
+    const NEWER_TRIGGER_REACH_PX = 800;
+    // Past the ceiling from the opening window, leaving several pages withheld;
+    // the retention variant keeps the room below its cap.
+    const BURST = 450;
+    await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1&deep-history-retention=1");
+    expect(await withheld(page), "premise: the room opens on the latest range").toBe(0);
+    // Below the backfill strip (top 800px), as in `parkPastTheCeiling`.
+    await readerScrollsWithoutGesture(page, 1_000);
+    const chevron = page.getByTestId("scroll-to-bottom");
+    await expect(chevron, "premise: the reader is far enough up to be offered the button").toBeVisible();
+
+    // Hold the button's smooth scroll. The app has already recorded its
+    // destination and armed the pin when it calls `scrollTo`; keep that
+    // destination (the bottom at call time) so the replay lands where the app
+    // expects. Browser movement only: no application state is read or set.
+    await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const gate: { destination: number | null } = { destination: null };
+      c.scrollTo = function (this: HTMLElement, ...args: unknown[]) {
+        const opts = args[0] as ScrollToOptions | undefined;
+        if (args.length === 1 && opts?.behavior === "smooth") {
+          gate.destination = this.scrollHeight - this.clientHeight;
+          return;
+        }
+        return (Element.prototype.scrollTo as (...a: unknown[]) => void).apply(this, args);
+      } as typeof c.scrollTo;
+      (window as any).__riverSmoothGate = gate;
+    });
+    try {
+      await chevron.click();
+      await expect
+        .poll(() => page.evaluate(() => (window as any).__riverSmoothGate.destination), {
+          message: "premise: the button should start a smooth scroll",
+        })
+        .not.toBeNull();
+      const destination: number = await page.evaluate(() => (window as any).__riverSmoothGate.destination);
+      const heldTop = await scrollTop(page);
+
+      await callRiverTest(page, "appendMessages", BURST);
+      // The newest arrivals are withheld, so check the oldest one instead.
+      await expect(page.getByText("batched arrival 00", { exact: false })).toHaveCount(1, { timeout: 10_000 });
+      await expect(
+        page.getByText(`batched arrival ${BURST - 1}`, { exact: false }),
+        "premise: the burst should pass the ceiling and hold the end",
+      ).toHaveCount(0);
+      const held = await withheld(page);
+      expect(held, "premise: more than one newer page should be withheld").toBeGreaterThan(INITIAL_RENDERED_ITEMS);
+      expect(Math.abs((await scrollTop(page)) - heldTop), "premise: nothing moved the view mid-return").toBeLessThanOrEqual(
+        AT_BOTTOM_EPSILON_PX,
+      );
+
+      // Let the return finish, instantly, at the recorded destination.
+      await page.evaluate(async (top) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const settled = new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("the return never settled")), 5_000);
+          c.addEventListener(
+            "scrollend",
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true },
+          );
+        });
+        Element.prototype.scrollTo.call(c, { top, behavior: "instant" });
+        await settled;
+      }, destination);
+      await nextFrames(page);
+      expect(
+        Math.abs((await scrollTop(page)) - destination),
+        "premise: the return should land where the app recorded it",
+      ).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
+      await expect(chevron, "premise: newer messages are still held back").toBeVisible();
+      expect(await withheld(page), "premise: the return should page nothing in").toBe(held);
+      expect(
+        await distanceFromBottom(page),
+        "premise: the burst grew the range below the return, out of the newer-history trigger's reach",
+      ).toBeGreaterThan(NEWER_TRIGGER_REACH_PX);
+
+      await callRiverTest(page, "appendMessage", "arrival after smooth-return burst");
+      await expect(
+        page.locator("[data-item-key]").last(),
+        "a following reader's range kept its held end, so the later arrival never rendered",
+      ).toContainText("arrival after smooth-return burst", { timeout: 5_000 });
+      await expect
+        .poll(() => withheld(page), { message: "newer messages are still withheld from a following reader" })
+        .toBe(0);
+      await expectSettledAtBottom(page, "the later arrival was not followed");
+    } finally {
+      await page.evaluate(() => {
+        const c = document.getElementById("chat-scroll-container");
+        if (c) delete (c as any).scrollTo;
+        delete (window as any).__riverSmoothGate;
+      });
+    }
+  });
+
   // A settle at the bottom schedules the trim for the next task. A reader who
   // moves in between must keep their rows.
   test("a trim scheduled at the bottom stands down when the reader moves before it runs", async ({ page }) => {

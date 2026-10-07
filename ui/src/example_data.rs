@@ -48,6 +48,13 @@ const DEEP_HISTORY_FILLER_MESSAGES: usize = 188;
 /// has its own dedicated fixture room below).
 const DEEP_ROOM_MAX_RECENT_MESSAGES: usize = 300;
 
+/// `max_recent_messages` for the deep room when the page opts in with
+/// `deep-history-retention`. At 300, a burst past the 240-item render ceiling
+/// leaves at most ~60 items withheld, which one newer page clears; this lets a
+/// spec hold back several pages. Opt-in because other specs rely on the 300
+/// cap pruning.
+const DEEP_ROOM_LONG_RETENTION: usize = 1_000;
+
 /// Fillers for the AT-CAP fixture room: 148 + the 13 standard messages lands
 /// exactly on that room's `max_recent_messages`
 /// ([`AT_CAP_MAX_RECENT_MESSAGES`]), so every delivered arrival drains the
@@ -257,6 +264,9 @@ fn create_room(
     config.owner_member_id = owner_id;
     match history_depth {
         HistoryDepth::Standard => {}
+        HistoryDepth::Deep if fixture_requested("deep-history-retention") => {
+            config.max_recent_messages = DEEP_ROOM_LONG_RETENTION
+        }
         // Headroom over the seeded messages so the specs can deliver
         // arrival batches without the at-cap prune shifting the fixture out
         // from under them. The uneven tail room needs the same headroom.
