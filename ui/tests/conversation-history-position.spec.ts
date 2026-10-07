@@ -219,8 +219,7 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await nextFrames(page);
   }
 
-  /// Park a reader 400px above the end of the at-cap room, where a drain of
-  /// its oldest messages removes rows above them.
+  /// Park 400px above the end of the at-cap room, below the rows a drain removes.
   async function parkInCappedRoom(page: Page) {
     await openRoomAtBottom(page, "Capped History Room", "/?deep-history-room=1");
     const end = await page.evaluate(() => {
@@ -233,7 +232,7 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     return row!;
   }
 
-  /// Wait until a hidden burst has patched the history: the row count moves.
+  /// Wait for a hidden burst to patch the history.
   async function expectRowCountAbove(page: Page, rows: number, why: string) {
     await expect.poll(() => page.locator("[data-item-key]").count(), { message: why }).toBeGreaterThan(rows);
   }
@@ -266,11 +265,10 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await expectParkedAwayFromEnd(page, "the reveal took the reader to the latest message");
   });
 
-  // The window crossing the breakpoint hides the chat with no click to
-  // capture on: the position saved by the reader's last settle is what holds.
+  // No click precedes a breakpoint hide, so the last settle's position is used.
   test("a reader hidden and revealed by the breakpoint keeps their row", async ({ page }) => {
     await openRoomAtBottom(page, "Capped History Room", "/?deep-history-room=1");
-    // Members selected on a phone, then the window widened: every panel shows.
+    // Members selected on a phone, then widened: every panel shows.
     await hideChatBehindMembers(page);
     await page.setViewportSize({ width: 1280, height: 844 });
     await expect(page.locator("#chat-scroll-container")).toBeVisible();
@@ -284,7 +282,7 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     expect(row, "premise: a row is fully in view").not.toBeNull();
     const rowsBefore = await page.locator("[data-item-key]").count();
 
-    // Narrowing back hides the chat: Members is still the selected panel.
+    // Narrowing hides the chat again, since Members is still selected.
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(page.locator("#chat-scroll-container"), "premise: the breakpoint hid the chat").toBeHidden();
     await callRiverTest(page, "appendMessages", HIDDEN_DRAIN_BATCH);
@@ -296,9 +294,8 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await expectRowHeld(page, row!.key, row!.top, "a drain while the breakpoint hid the chat moved the reader's row");
   });
 
-  // A burst large enough to reach the render ceiling lands while hidden: the
-  // range must hold the reader's row rather than slide past it, and the
-  // reveal must put it back where it was.
+  // A burst past the ceiling while hidden: the range keeps the reader's row
+  // and the reveal restores it.
   test("a burst past the render ceiling while the chat is hidden keeps the reader's row rendered", async ({
     page,
   }) => {
