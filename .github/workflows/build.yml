@@ -297,6 +297,14 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Test Playwright bundle provenance guards
+      # The cache below restores all of target/, including a previous UI
+      # build. This asserts that the example build deletes that output first
+      # and that readiness rejects a missing index, so a build that writes
+      # nothing cannot pass by serving the restored index. Runs before the
+      # expensive installs because it needs none of them.
+      run: ./scripts/tests/playwright-bundle-provenance-test.sh
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -385,10 +393,18 @@ jobs:
 
     # Serve the release build just made, not `dx serve`: the watcher can
     # rebuild underneath the run or serve a stale binary, and then the suite
-    # measures something other than this commit.
+    # measures something other than this commit. The build task deletes the
+    # restored public/ before dx runs, so an index here was written by this
+    # build; if dx wrote nothing, fail now rather than start a server on an
+    # empty directory. Matching disk and HTTP names alone cannot show that,
+    # since both would come from the same restored index.
     - name: Serve the built UI and wait for readiness
       run: |
         PUBLIC=target/dx/river-ui/release/web/public
+        if [ ! -s "$PUBLIC/index.html" ]; then
+          echo "ERROR: the example UI build did not produce a nonempty $PUBLIC/index.html" >&2
+          exit 1
+        fi
         (cd "$PUBLIC" && python3 -m http.server 8082 --bind 127.0.0.1 &)
         BUILT_JS=$(grep -o 'river-ui-dxh[0-9a-f]*\.js' "$PUBLIC/index.html" | head -1)
         for i in $(seq 1 30); do
