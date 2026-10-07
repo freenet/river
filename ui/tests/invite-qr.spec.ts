@@ -47,9 +47,8 @@ test.describe("Invite QR code (issue #741)", { tag: "@chromium-only" }, () => {
     await expect(page.getByTestId("join-with-code-modal")).toBeVisible({
       timeout: 5_000,
     });
-    await expect(page.getByTestId("join-with-code-scan-button")).toBeVisible();
-    await expect(page.getByTestId("join-with-code-scan-button")).toHaveText(
-      /Scan QR code/
-    );
+    // Headless Chromium has no BarcodeDetector, so the button is omitted.
+    // Android Chrome, which has the detector, is the scan path.
+    await expect(page.getByTestId("join-with-code-scan-button")).toHaveCount(0);
   });
 });

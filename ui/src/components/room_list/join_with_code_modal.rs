@@ -50,10 +50,20 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
     // synchronously.
     let session_for_close = scan_session.clone();
     use_effect(move || {
-        if !*is_active.read() {
+        // Anchor before the fallible read. A contended `try_read` that is the
+        // effect's only read would otherwise drop the subscription
+        // (freenet/river#555, and the #741 review).
+        crate::util::signal_guard::anchor();
+        let Ok(active) = is_active.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return;
+        };
+        if !*active {
             session_for_close.stop();
         }
     });
+    let session_for_drop = scan_session.clone();
+    use_drop(move || session_for_drop.stop());
 
     if !*is_active.read() {
         return rsx! {};
@@ -128,9 +138,14 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
             // deferred render below; the task waits for it.
             let generation = session_for_scan.begin();
             let session = session_for_scan.clone();
+            let session_after = session.clone();
             crate::util::safe_spawn_local(async move {
-                match invite_qr_scan::capture_code(session, generation, promise).await {
-                    Capture::Code(raw) => {
+                let outcome = invite_qr_scan::capture_code(session, generation, promise).await;
+                // Checked after the await. A Stop or a newer scan during the
+                // poll must not open an invitation or clear the new scan's flag.
+                let still = session_after.generation_is(generation);
+                match outcome {
+                    Capture::Code(raw) if still => {
                         let extracted = crate::invite_qr::invitation_text_from_scan(&raw);
                         crate::util::defer(move || {
                             scanning.set(false);
@@ -148,15 +163,14 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                             }
                         });
                     }
-                    Capture::Cancelled => {
-                        crate::util::defer(move || scanning.set(false));
-                    }
-                    Capture::Failed(msg) => {
+                    Capture::Code(_) | Capture::Cancelled => {}
+                    Capture::Failed(msg) if still => {
                         crate::util::defer(move || {
                             scanning.set(false);
                             scan_error.set(Some(msg));
                         });
                     }
+                    Capture::Failed(_) => {}
                 }
             });
             crate::util::defer(move || {
@@ -167,6 +181,8 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
         }
     };
 
+    #[cfg(target_arch = "wasm32")]
+    let session_for_photo = scan_session.clone();
     let session_for_stop = scan_session;
     let stop_scan = move |_| {
         session_for_stop.stop();
@@ -208,15 +224,19 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                         onclick: stop_scan,
                         "Stop scanning"
                     }
-                } else {
+                } else if invite_qr_scan::detector_available() {
+                    // Browsers without BarcodeDetector (iOS Safari, Firefox,
+                    // desktop Chrome on Linux and Windows) keep the paste box
+                    // only. A Scan button there can only report that scanning
+                    // is unavailable (freenet/river#741 review).
                     if invite_qr_scan::camera_prompt_unavailable() {
                         p { class: "text-xs text-text-muted mb-3",
-                            "This page is inside the Freenet frame, so the browser cannot ask for camera permission here. Scan opens your camera app; take one photo of the QR code."
+                            "Opens your camera to take a photo of the QR code."
                         }
                     }
                     button {
                         "data-testid": "join-with-code-scan-button",
-                        class: "w-full mb-3 px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors flex items-center justify-center gap-2",
+                        class: "w-full mb-3 px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border flex items-center justify-center gap-2",
                         onclick: start_scan,
                         Icon { icon: FaCamera, width: 14, height: 14 }
                         span { "Scan QR code" }
@@ -239,8 +259,16 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                                 if let Some(input) = invite_qr_scan::still_input() {
                                     input.set_value("");
                                 }
+                                // Same generation as a live scan: closing the
+                                // modal or starting another scan invalidates
+                                // this photo before its decode finishes.
+                                let generation = session_for_photo.begin();
+                                let session = session_for_photo.clone();
                                 crate::util::safe_spawn_local(async move {
                                     let decoded = invite_qr_scan::decode_still(file).await;
+                                    if !session.generation_is(generation) {
+                                        return;
+                                    }
                                     crate::util::defer(move || match decoded {
                                         Ok(raw) => {
                                             let extracted =

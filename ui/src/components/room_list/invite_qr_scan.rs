@@ -62,8 +62,10 @@ impl ScanSession {
         self.stop_tracks();
     }
 
-    #[cfg(target_arch = "wasm32")]
-    fn generation_is(&self, generation: u32) -> bool {
+    /// False once [`Self::stop`] or a newer [`Self::begin`] has run. A task
+    /// that no longer owns the generation must not stop tracks or accept a
+    /// code: those belong to the scan that replaced it.
+    pub(crate) fn generation_is(&self, generation: u32) -> bool {
         self.generation.get() == generation
     }
 
@@ -212,7 +214,16 @@ pub(crate) async fn capture_code(
 
     let video = match wait_for_preview(&session, generation).await {
         Ok(video) => video,
-        Err(capture) => return capture,
+        Err(capture) => {
+            // The stream is already stored. Leaving it here keeps the camera
+            // light on after "Camera preview is not on screen." Only stop it
+            // when this task still owns the session; a newer scan's tracks
+            // must stay up.
+            if session.generation_is(generation) {
+                session.stop_tracks();
+            }
+            return capture;
+        }
     };
     video.set_src_object(Some(&stream));
     video.set_muted(true);
@@ -220,7 +231,6 @@ pub(crate) async fn capture_code(
         let _ = JsFuture::from(play).await;
     }
     if !session.generation_is(generation) {
-        session.stop_tracks();
         return Capture::Cancelled;
     }
 
@@ -238,13 +248,15 @@ pub(crate) async fn capture_code(
     let mut transient_errors = 0u32;
     loop {
         if !session.generation_is(generation) {
-            session.stop_tracks();
             return Capture::Cancelled;
         }
         if video.ready_state() >= 2 {
             attempts_without_frame = 0;
             match detect_once(&detector, &video).await {
                 Ok(Some(text)) => {
+                    if !session.generation_is(generation) {
+                        return Capture::Cancelled;
+                    }
                     session.stop_tracks();
                     return Capture::Code(text);
                 }
@@ -253,15 +265,21 @@ pub(crate) async fn capture_code(
                     transient_errors += 1;
                 }
                 Err(err) => {
-                    session.stop_tracks();
-                    return Capture::Failed(err);
+                    if session.generation_is(generation) {
+                        session.stop_tracks();
+                        return Capture::Failed(err);
+                    }
+                    return Capture::Cancelled;
                 }
             }
         } else {
             attempts_without_frame += 1;
             if attempts_without_frame > 50 {
-                session.stop_tracks();
-                return Capture::Failed("The camera preview did not start.".to_string());
+                if session.generation_is(generation) {
+                    session.stop_tracks();
+                    return Capture::Failed("The camera preview did not start.".to_string());
+                }
+                return Capture::Cancelled;
             }
         }
         futures_timer::Delay::new(Duration::from_millis(200)).await;
