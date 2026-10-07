@@ -12,14 +12,16 @@
 use crate::components::app::chat_delegate::{save_outbound_dm, unhide_dm_thread};
 use crate::components::app::{mark_needs_sync, ROOMS};
 use crate::components::direct_messages::{
-    lookup_outbound_plaintext, mark_thread_read, open_invite_via_dm_picker,
-    parse_outbound_invite_summary, DM_DRAFT, OPEN_DM_THREAD, OUTBOUND_DMS,
+    lookup_outbound_plaintext, open_invite_via_dm_picker, parse_outbound_invite_summary, DM_DRAFT,
+    OPEN_DM_THREAD, OUTBOUND_DMS,
 };
 use crate::components::members::Invitation;
 use crate::components::room_list::receive_invitation_modal::present_invitation;
 use crate::room_data::SendMessageError;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
+use dioxus_free_icons::icons::fa_solid_icons::FaChevronDown;
+use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::direct_messages::{
@@ -39,9 +41,9 @@ const DM_BODY_BYTE_CAP: usize = MAX_DM_CIPHERTEXT_BYTES - 256;
 /// Monotonic counter bumped every time the local user sends a DM from
 /// any open thread modal. The auto-scroll effect reads this via
 /// `.peek()` (non-reactive) to distinguish "user sent a message"
-/// (always scroll) from "peer sent a message" (only scroll if reader
-/// is near the bottom). Wrap-around is fine — the effect compares for
-/// inequality with a stored previous value.
+/// (scroll to it once) from "peer sent a message" (never scroll; the
+/// Latest control offers it). Wrap-around is fine — the effect compares
+/// for inequality with a stored previous value.
 ///
 /// Lives at module scope rather than inside the modal so a re-render
 /// caused by `OPEN_DM_THREAD` flipping doesn't reset it; the effect
@@ -105,8 +107,11 @@ pub fn DmThreadModal() -> Element {
         return rsx! {};
     };
 
+    // Keyed on the thread, so opening another one while this is open mounts a
+    // fresh body: its hooks (the read rule's witness, the draft, the opening
+    // jump) are each for one thread.
     rsx! {
-        DmThreadModalBody { room, peer }
+        DmThreadModalBody { key: "{room:?}-{peer:?}", room, peer }
     }
 }
 
@@ -409,20 +414,58 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         return rsx! { div { "Room state not available" } };
     };
 
-    // Mark thread read once we have actually rendered the latest inbound
-    // timestamp. `defer` keeps the write off the current render frame.
-    if view_data.latest_inbound_ts > 0 {
-        let ts = view_data.latest_inbound_ts;
-        mark_thread_read(room, peer, ts);
+    // The read rule (10c decision 11): the thread is marked seen only up to an
+    // inbound DM the reader has had on screen with the tab visible, never from
+    // render. Rendering an arrival is not seeing it: it lands below the fold.
+    // `ThreadSeenWitness::check` applies the rule; it runs after the thread's
+    // messages change, when the tab becomes visible, from the newest-DM
+    // observer, and after the opening, own-send and Latest placements.
+    let seen_witness = use_hook(|| ThreadSeenWitness {
+        room,
+        peer,
+        newest_inbound_ts: Rc::new(std::cell::Cell::new(0)),
+    });
+    // Inter-render memory, written here and read by the triggers above, some
+    // of which are raw DOM callbacks with no Dioxus runtime. Nothing renders
+    // from it.
+    seen_witness
+        .newest_inbound_ts
+        .set(view_data.latest_inbound_ts);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let seen_witness = seen_witness.clone();
+        use_effect(move || {
+            // Anchored before the fallible reads below, which are this effect's
+            // only subscriptions (freenet/river#555).
+            crate::util::signal_guard::anchor();
+            // Re-run after the thread's messages change...
+            if view.try_read().is_err() {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            }
+            // ...and when the tab becomes visible.
+            if crate::components::app::document_title::DOCUMENT_VISIBLE
+                .try_read()
+                .is_err()
+            {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            }
+            seen_witness.check();
+        });
     }
 
-    // Auto-scroll behaviour (Phase 3 of #243 invite-DM redesign):
+    // Auto-scroll behaviour (Phase 3 of #243 invite-DM redesign, then 10c):
     //
     //   1. Modal mount       → jump to bottom (always, instant).
-    //   2. Outbound send     → scroll to bottom (always, smooth).
-    //   3. Inbound new msg   → scroll only if the user was already
-    //                          near the bottom (within ~50px). Don't
-    //                          yank a reader who's scrolled up.
+    //   2. Outbound send     → jump to bottom once (always, instant).
+    //   3. Inbound new msg   → never scroll, even at the bottom: it lands
+    //                          below and the Latest control offers it
+    //                          (10c decision 1). The old "near the bottom
+    //                          (50px)" follow measured after the arrival
+    //                          had rendered, so in practice it only fired
+    //                          for the DM that first made a short thread
+    //                          scroll.
     //
     // For the effect to re-fire when a new bubble lands we need an
     // actual subscribed signal read inside the closure. Dioxus 0.7's
@@ -449,6 +492,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     {
         let first_scroll_done = first_scroll_done.clone();
         let prev_outbound_bump = prev_outbound_bump.clone();
+        let seen_witness = seen_witness.clone();
         use_effect(move || {
             // Read the last-bubble signal as a SUBSCRIBING read so the
             // effect re-runs whenever a fresh bubble mounts (i.e. new
@@ -472,26 +516,20 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             if is_first {
                 first_scroll_done.set(true);
             }
-            // For inbound-only triggers we want to scroll only if the
-            // user is near the bottom right now. Read the DOM
-            // synchronously before any further layout shifts hit the
-            // viewport — we're inside the effect, post-render.
-            let near_bottom = is_near_bottom("dm-scroll-container", 50.0);
             // Trigger types:
-            //   * is_first         — mount: always jump (instant).
-            //   * outbound_changed — user sent: always (smooth).
-            //   * else             — inbound: only when near bottom.
-            let should_scroll = is_first || outbound_changed || near_bottom;
+            //   * is_first         — mount: always jump.
+            //   * outbound_changed — user sent: always, once.
+            //   * else             — inbound (or a purge): never.
+            // Both jumps are instant, like the room's (10c decisions 6, 12).
+            let should_scroll = is_first || outbound_changed;
             if !should_scroll {
                 return;
             }
-            let behavior = if is_first {
-                web_sys::ScrollBehavior::Instant
-            } else {
-                web_sys::ScrollBehavior::Smooth
-            };
+            let seen_witness = seen_witness.clone();
             crate::util::safe_spawn_local(async move {
-                scroll_dm_container_to_bottom(behavior);
+                scroll_dm_container_to_bottom();
+                // The end is on screen now, so it counts as seen.
+                seen_witness.check();
             });
         });
     }
@@ -499,6 +537,22 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     {
         // Touch the values so they're not flagged as unused on native.
         let _ = (&last_dm_bubble, &first_scroll_done, &prev_outbound_bump);
+    }
+
+    // Drives the Latest control: is the newest DM's bottom on screen, give or
+    // take `NEWEST_DM_IN_VIEW_SLACK_PX`? Written only by the observer on
+    // `dm-bottom-sentinel` (see `observe_newest_dm`), so nothing reads layout
+    // on scroll. Starts `true` so the control stays hidden until it reports.
+    let newest_in_view = use_signal(|| true);
+    // That observer, held for as long as the modal is open: replaced when the
+    // sentinel remounts, disconnected when the modal closes.
+    #[cfg(target_arch = "wasm32")]
+    let newest_dm_observer =
+        use_hook(|| Rc::new(std::cell::RefCell::new(None::<NewestDmObserver>)));
+    #[cfg(target_arch = "wasm32")]
+    {
+        let newest_dm_observer = newest_dm_observer.clone();
+        use_drop(move || drop(newest_dm_observer.borrow_mut().take()));
     }
 
     let peer_label = view_data.peer_nickname.clone();
@@ -915,46 +969,104 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                 }
 
-                // Thread body. Stable id so the auto-scroll effect can
-                // reach the same DOM node across re-renders without
-                // having to walk the tree.
-                div {
-                    id: "dm-scroll-container",
-                    class: "flex-1 overflow-y-auto px-5 py-4 space-y-2",
-                    if view_data.messages.is_empty() && !identity_known {
-                        // NOT "No messages yet". With no local identity every
-                        // DM in this thread was skipped rather than shown (see
-                        // the memo), so the history may be substantial — and
-                        // telling the reader it is empty is a claim about their
-                        // data that happens to be false. Same register as the
-                        // send path's refusal below.
-                        p {
-                            "data-testid": "dm-thread-identity-unavailable",
-                            class: "text-sm text-text-muted italic",
-                            "This device doesn't hold your key for this room, so this conversation can't be shown here."
-                        }
-                    } else if view_data.messages.is_empty() {
-                        p { class: "text-sm text-text-muted italic",
-                            "No messages yet. Say hello!"
-                        }
-                    } else {
-                        {
-                            let messages_len = view_data.messages.len();
-                            view_data.messages.iter().enumerate().map(move |(idx, m)| {
-                                let is_last = idx + 1 == messages_len;
-                                let on_mount = if is_last {
-                                    Some(last_dm_bubble)
-                                } else {
-                                    None
-                                };
-                                rsx! {
-                                    DmBubble {
-                                        key: "{idx}_{m.timestamp}",
-                                        message: m.clone(),
-                                        last_bubble_sink: on_mount,
-                                    }
+                // Thread body, wrapped so the Latest control can sit over its
+                // bottom-right corner.
+                div { class: "relative flex-1 min-h-0 flex flex-col",
+                    // Stable id so the auto-scroll effect can reach the same
+                    // DOM node across re-renders without having to walk the
+                    // tree.
+                    div {
+                        id: "dm-scroll-container",
+                        class: "flex-1 min-h-0 overflow-y-auto px-5 py-4",
+                        // The spacing lives on this inner list, not on the
+                        // container, so the sentinel below gets no gap: its top
+                        // edge is the newest DM's bottom.
+                        div { class: "space-y-2",
+                            if view_data.messages.is_empty() && !identity_known {
+                                // NOT "No messages yet". With no local identity every
+                                // DM in this thread was skipped rather than shown (see
+                                // the memo), so the history may be substantial — and
+                                // telling the reader it is empty is a claim about their
+                                // data that happens to be false. Same register as the
+                                // send path's refusal below.
+                                p {
+                                    "data-testid": "dm-thread-identity-unavailable",
+                                    class: "text-sm text-text-muted italic",
+                                    "This device doesn't hold your key for this room, so this conversation can't be shown here."
                                 }
-                            })
+                            } else if view_data.messages.is_empty() {
+                                p { class: "text-sm text-text-muted italic",
+                                    "No messages yet. Say hello!"
+                                }
+                            } else {
+                                {
+                                    let messages_len = view_data.messages.len();
+                                    view_data.messages.iter().enumerate().map(move |(idx, m)| {
+                                        let is_last = idx + 1 == messages_len;
+                                        let on_mount = if is_last {
+                                            Some(last_dm_bubble)
+                                        } else {
+                                            None
+                                        };
+                                        rsx! {
+                                            DmBubble {
+                                                key: "{idx}_{m.timestamp}",
+                                                message: m.clone(),
+                                                last_bubble_sink: on_mount,
+                                            }
+                                        }
+                                    })
+                                }
+                            }
+                        }
+                        // Right under the newest DM: an IntersectionObserver
+                        // watches it for the Latest control, so scrolling does
+                        // no DOM queries (#151). Remounts with the thread body,
+                        // and each mount replaces the observer.
+                        div {
+                            id: "dm-bottom-sentinel",
+                            class: "h-px pointer-events-none",
+                            onmounted: {
+                                let seen_witness = seen_witness.clone();
+                                move |_| {
+                                    #[cfg(target_arch = "wasm32")]
+                                    observe_newest_dm(
+                                        &newest_dm_observer,
+                                        newest_in_view,
+                                        seen_witness.clone(),
+                                    );
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    let _ = &seen_witness;
+                                }
+                            },
+                        }
+                    }
+                    // Latest (10c): shown whenever the newest DM's bottom is off
+                    // screen by more than the slack, which is how an inbound DM
+                    // that landed below is offered. Same look as the room's
+                    // scroll-to-latest button. Instant (decision 6) and one-shot:
+                    // a later arrival does not extend it. The observer hides it
+                    // once the end is in view; nothing hides it optimistically.
+                    if !newest_in_view() {
+                        button {
+                            class: "absolute bottom-4 right-4 z-30 flex items-center justify-center w-10 h-10 rounded-full bg-panel shadow-lg border border-border text-text-muted hover:text-accent transition-colors",
+                            "aria-label": "Scroll to latest direct messages",
+                            "data-testid": "dm-scroll-to-latest",
+                            // A DOM scroll only, no signal write, so no `defer`
+                            // (`check` defers its own).
+                            onclick: {
+                                let seen_witness = seen_witness.clone();
+                                move |_| {
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        scroll_dm_container_to_bottom();
+                                        seen_witness.check();
+                                    }
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    let _ = &seen_witness;
+                                }
+                            },
+                            Icon { icon: FaChevronDown, width: 18, height: 18 }
                         }
                     }
                 }
@@ -1630,42 +1742,157 @@ fn format_local_time(unix_secs: u64) -> String {
     local.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// Returns `true` if the DM scroll container is currently scrolled to
-/// within `tolerance_px` of its bottom edge. Returns `false` if the
-/// container is missing (e.g. modal not mounted) so callers default to
-/// "don't yank the viewport" — safer than the opposite.
+/// How far below the thread's visible area the newest DM's bottom may sit and
+/// still count as on screen; past it the Latest control shows. The room's
+/// `NEWEST_IN_VIEW_SLACK_PX`, for the same reason: fractional layout can leave
+/// a DM that did scroll fully into view a pixel short.
 #[cfg(target_arch = "wasm32")]
-fn is_near_bottom(container_id: &str, tolerance_px: f64) -> bool {
-    let Some(window) = web_sys::window() else {
-        return false;
-    };
-    let Some(document) = window.document() else {
-        return false;
-    };
-    let Some(container) = document.get_element_by_id(container_id) else {
-        return false;
-    };
-    let scroll_top = container.scroll_top() as f64;
-    let client_height = container.client_height() as f64;
-    let scroll_height = container.scroll_height() as f64;
-    // Distance from current bottom-edge of the viewport to the
-    // content's bottom. Zero when fully scrolled down.
-    let distance_from_bottom = scroll_height - (scroll_top + client_height);
-    distance_from_bottom <= tolerance_px
+const NEWEST_DM_IN_VIEW_SLACK_PX: f64 = 4.0;
+
+/// What the DM read rule (10c decision 11) needs to mark the open thread seen
+/// from any of its triggers, raw DOM callbacks included.
+#[derive(Clone)]
+// Only `check` reads the thread, and it needs the DOM.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+struct ThreadSeenWitness {
+    room: VerifyingKey,
+    peer: MemberId,
+    /// The newest inbound DM the thread's last render showed (0: none).
+    newest_inbound_ts: Rc<std::cell::Cell<u64>>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-fn is_near_bottom(_container_id: &str, _tolerance_px: f64) -> bool {
-    false
+impl ThreadSeenWitness {
+    /// Mark the thread seen up to its newest inbound DM if the reader can see
+    /// the end of the thread right now: the tab is visible and the newest DM's
+    /// bottom is on screen, within [`NEWEST_DM_IN_VIEW_SLACK_PX`]. The newest
+    /// inbound DM is at or above the newest DM, so the reader has reached it.
+    ///
+    /// The same rule as rooms (`conversation.rs`'s `note_newest_seen`), and for
+    /// the same reason it reads live layout rather than the observer's last
+    /// report, which lags the patch that just put an arrival below the fold.
+    /// Safe from a raw DOM callback: it reads no signal, and
+    /// `mark_thread_read` defers its write and never moves backwards.
+    #[cfg(target_arch = "wasm32")]
+    fn check(&self) {
+        let ts = self.newest_inbound_ts.get();
+        if ts == 0
+            || !crate::components::app::document_title::get_visibility_state()
+            || !newest_dm_bottom_in_view()
+        {
+            return;
+        }
+        crate::components::direct_messages::mark_thread_read(self.room, self.peer, ts);
+    }
 }
 
-/// Scroll the DM thread container to its bottom edge using the given
-/// behavior (smooth on subsequent triggers, instant on initial mount).
-/// No-op when the container isn't in the DOM yet — safe to call from
-/// effect bodies.
+/// Is the newest DM's bottom on screen, within [`NEWEST_DM_IN_VIEW_SLACK_PX`]?
+/// Measures `dm-bottom-sentinel`: the same edge, and the same slack, as the
+/// Latest control's observer.
 #[cfg(target_arch = "wasm32")]
-fn scroll_dm_container_to_bottom(behavior: web_sys::ScrollBehavior) {
+fn newest_dm_bottom_in_view() -> bool {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return false;
+    };
+    let (Some(container), Some(sentinel)) = (
+        document.get_element_by_id("dm-scroll-container"),
+        document.get_element_by_id("dm-bottom-sentinel"),
+    ) else {
+        return false;
+    };
+    let view = container.get_bounding_client_rect();
+    let edge = sentinel.get_bounding_client_rect().top();
+    view.height() > 0.0 && edge >= view.top() && edge <= view.bottom() + NEWEST_DM_IN_VIEW_SLACK_PX
+}
+
+/// The IntersectionObserver behind the thread's Latest control, with the
+/// callback it calls. Dropping it disconnects the observer before the callback
+/// goes, so a closed modal leaves nothing observing.
+#[cfg(target_arch = "wasm32")]
+struct NewestDmObserver {
+    observer: web_sys::IntersectionObserver,
+    _callback: wasm_bindgen::closure::Closure<dyn FnMut(js_sys::Array)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for NewestDmObserver {
+    fn drop(&mut self) {
+        self.observer.disconnect();
+    }
+}
+
+/// Watch `dm-bottom-sentinel`, whose top edge is the newest DM's bottom, and
+/// publish whether it is on screen (within [`NEWEST_DM_IN_VIEW_SLACK_PX`]) to
+/// `newest_in_view`. Each report also re-applies the read rule, since the
+/// reader scrolling the end into view is what usually changes it. Replaces
+/// any observer already in `slot`.
+#[cfg(target_arch = "wasm32")]
+fn observe_newest_dm(
+    slot: &std::cell::RefCell<Option<NewestDmObserver>>,
+    newest_in_view: Signal<bool>,
+    seen_witness: ThreadSeenWitness,
+) {
+    use wasm_bindgen::JsCast;
+
+    drop(slot.borrow_mut().take());
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let (Some(root), Some(sentinel)) = (
+        document.get_element_by_id("dm-scroll-container"),
+        document.get_element_by_id("dm-bottom-sentinel"),
+    ) else {
+        return;
+    };
+    let callback = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(
+        move |entries: js_sys::Array| {
+            // Several reports can queue between callbacks; the last is current.
+            let Some(entry) = entries
+                .iter()
+                .last()
+                .and_then(|e| e.dyn_into::<web_sys::IntersectionObserverEntry>().ok())
+            else {
+                return;
+            };
+            let in_view = entry.is_intersecting();
+            seen_witness.check();
+            // A raw observer callback runs with no Dioxus scope, and the Latest
+            // control renders from this signal, so the write goes through
+            // `defer` (.claude/rules/dioxus-signal-safety.md). By then the modal
+            // may have closed and taken the signal with it: `try_*` skips that,
+            // and skips a write that would change nothing.
+            crate::util::defer(move || {
+                let mut newest_in_view = newest_in_view;
+                if newest_in_view.try_peek().is_ok_and(|v| *v != in_view) {
+                    if let Ok(mut v) = newest_in_view.try_write() {
+                        *v = in_view;
+                    }
+                }
+            });
+        },
+    );
+    let options = web_sys::IntersectionObserverInit::new();
+    options.set_root(Some(&root));
+    options.set_root_margin(&format!("0px 0px {NEWEST_DM_IN_VIEW_SLACK_PX}px 0px"));
+    options.set_threshold(&wasm_bindgen::JsValue::from_f64(0.0));
+    let Ok(observer) = web_sys::IntersectionObserver::new_with_options(
+        callback.as_ref().unchecked_ref(),
+        &options,
+    ) else {
+        return;
+    };
+    observer.observe(&sentinel);
+    *slot.borrow_mut() = Some(NewestDmObserver {
+        observer,
+        _callback: callback,
+    });
+}
+
+/// Jump the DM thread container to its bottom edge. Instant for opening, an
+/// own send and Latest alike (10c decisions 6, 12): a smooth scroll would
+/// leave the end off screen while it animates. No-op when the container isn't
+/// in the DOM yet — safe to call from effect bodies.
+#[cfg(target_arch = "wasm32")]
+fn scroll_dm_container_to_bottom() {
     let Some(window) = web_sys::window() else {
         return;
     };
@@ -1677,7 +1904,7 @@ fn scroll_dm_container_to_bottom(behavior: web_sys::ScrollBehavior) {
     };
     let opts = web_sys::ScrollToOptions::new();
     opts.set_top(container.scroll_height() as f64);
-    opts.set_behavior(behavior);
+    opts.set_behavior(web_sys::ScrollBehavior::Instant);
     container.scroll_to_with_scroll_to_options(&opts);
 }
 

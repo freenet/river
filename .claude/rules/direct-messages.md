@@ -78,6 +78,18 @@ seeds `DM_LAST_SEEN` from the max inbound DM timestamp per
 arriving inbound DM would be instantly marked seen and never surface as
 unread.
 
+**Read rule and scrolling (10c decisions 11, 12).** An open thread
+advances `DM_LAST_SEEN` (`mark_thread_read`) only up to an inbound DM
+that was on screen with the tab visible — never from render, since an
+arrival renders below the fold. `ThreadSeenWitness::check` in
+`dm_thread_modal.rs` measures `dm-bottom-sentinel` against the thread's
+view; it runs after the thread changes, when the tab becomes visible,
+from the newest-DM observer, and after the opening, own-send and Latest
+jumps. Inbound DMs never scroll the thread: the Latest control
+(`dm-scroll-to-latest`) shows while the newest DM's bottom is more than
+a few px off screen, and jumps instantly. The modal body is keyed by
+`(room, peer)`, so opening another thread remounts it (and its witness).
+
 ## Share-invite-via-DM picker
 
 `INVITE_VIA_DM_PICKER` global signal opens

@@ -12,6 +12,8 @@ type RiverTestHooks = {
   makeRoomPrivateWithoutSecret(): void;
   setRoomsLoadState(state: RoomsLoadState): void;
   switchRoom(name: string): void;
+  appendDms(count: number): void;
+  deliverDm(text: string): void;
 };
 
 // One hook per round trip.

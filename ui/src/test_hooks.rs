@@ -15,10 +15,15 @@
 //!
 //! None of these hooks scroll. Where the view ends up is the app's doing.
 //!
-//! They skip `apply_delta`'s verification on purpose, and admit test
-//! identities on self's say-so, so they must never be reachable anywhere the
-//! result could be pushed to the network. The module compiles only for wasm32
-//! with two features, both required:
+//! The DM hooks (`appendDms`, `deliverDm`) do the same for a DM thread between
+//! self and one fixed test identity, which they admit like the others. Unlike
+//! the room hooks they run the DM field's own `apply_delta`, so every DM is
+//! sealed to self, sender-signed, and kept in the contract's order and caps.
+//!
+//! The room hooks skip `apply_delta`'s verification on purpose, and every hook
+//! admits test identities on self's say-so, so none may be reachable anywhere
+//! the result could be pushed to the network. The module compiles only for
+//! wasm32 with two features, both required:
 //!
 //! * `example-data`, which is off for the published webapp (`UI_FEATURES` is
 //!   empty for `build-webapp`) and for every non-example build;
@@ -32,12 +37,15 @@ use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::{CurrentRoom, RoomData};
 use dioxus::prelude::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use freenet_scaffold::ComposableState;
 use river_core::room_state::{
     configuration::AuthorizedConfigurationV1,
+    direct_messages::{compose_direct_message, DirectMessagesDelta},
     member::{AuthorizedMember, Member, MemberId},
     member_info::{AuthorizedMemberInfo, MemberInfo},
     message::{AuthorizedMessageV1, MessageV1, RoomMessageBody},
     privacy::{PrivacyMode, SealedBytes},
+    ChatRoomParametersV1,
 };
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::convert::FromWasmAbi;
@@ -86,6 +94,25 @@ pub fn install_test_hooks() {
             crate::util::defer(move || deliver([(text, Delivery::Ahead(seconds))]));
         },
     );
+
+    // A DM history from the test peer to self, in ONE mutation: `count`
+    // messages labelled `dm history NN`, a minute apart and all in the past,
+    // so a DM sent or delivered afterwards sorts below them. Long enough at 30
+    // to make the thread scroll on every test viewport.
+    expose(&hooks, "appendDms", move |count: u32| {
+        crate::util::defer(move || {
+            deliver_dms(
+                (0..count).map(|i| format!("dm history {i:02}")).collect(),
+                DmStamp::History,
+            )
+        });
+    });
+
+    // One inbound DM from the test peer, stamped after every DM in the thread
+    // so it renders as the newest.
+    expose(&hooks, "deliverDm", move |text: String| {
+        crate::util::defer(move || deliver_dms(vec![text], DmStamp::Newest));
+    });
 
     expose(&hooks, "insertMessageBeforeLast", move |text: String| {
         crate::util::defer(move || deliver([(text, Delivery::BeforeLast)]));
@@ -270,10 +297,41 @@ fn admit_test_member(room: &mut RoomData, room_key: &VerifyingKey, member_vk: Ve
     ));
 }
 
+/// Admit `sk`'s identity (see `admit_test_member`) and register its nickname
+/// the first time it speaks, so it renders like any other member rather than
+/// as "Unknown".
+fn admit_with_nickname(
+    room: &mut RoomData,
+    room_key: &VerifyingKey,
+    sk: &SigningKey,
+    nickname: &str,
+) {
+    let id = MemberId::from(&sk.verifying_key());
+    admit_test_member(room, room_key, sk.verifying_key());
+    if !room
+        .room_state
+        .member_info
+        .member_info
+        .iter()
+        .any(|entry| entry.member_info.member_id == id)
+    {
+        room.room_state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo {
+                    member_id: id,
+                    version: 0,
+                    preferred_nickname: SealedBytes::public(nickname.as_bytes().to_vec()),
+                    deputies: Vec::new(),
+                },
+                sk,
+            ));
+    }
+}
+
 /// Insert `text` into `room` where `delivery` says, as that delivery's test
-/// identity, admitting it as a member (see `admit_test_member`) and
-/// registering its nickname the first time it speaks so the bubble renders
-/// like any other member's rather than as "Unknown".
+/// identity.
 fn push_test_message(
     room: &mut RoomData,
     room_key: &VerifyingKey,
@@ -282,27 +340,7 @@ fn push_test_message(
 ) {
     let (sk, nickname) = test_author(delivery);
     let author = MemberId::from(&sk.verifying_key());
-    admit_test_member(room, room_key, sk.verifying_key());
-    if !room
-        .room_state
-        .member_info
-        .member_info
-        .iter()
-        .any(|entry| entry.member_info.member_id == author)
-    {
-        room.room_state
-            .member_info
-            .member_info
-            .push(AuthorizedMemberInfo::new_with_member_key(
-                MemberInfo {
-                    member_id: author,
-                    version: 0,
-                    preferred_nickname: SealedBytes::public(nickname.as_bytes().to_vec()),
-                    deputies: Vec::new(),
-                },
-                &sk,
-            ));
-    }
+    admit_with_nickname(room, room_key, &sk, nickname);
 
     let now = crate::util::get_current_system_time();
     let time = match delivery {
@@ -376,5 +414,95 @@ fn deliver(messages: impl IntoIterator<Item = (String, Delivery)>) {
             push_test_message(room, &room_key, text, delivery);
         }
         prune_to_cap(room);
+    });
+}
+
+/// The other member in the test DM thread. Its nickname is what the specs
+/// open the thread by (`dm-thread-scroll.spec.ts`).
+const DM_PEER_SEED: [u8; 32] = [0x9D; 32];
+const DM_PEER_NICKNAME: &str = "DM Test Peer";
+
+/// How a DM delivery is timestamped.
+#[derive(Clone, Copy)]
+enum DmStamp {
+    /// A minute apart, the last one a minute ago.
+    History,
+    /// Now, or one second after the thread's newest DM if that is later, so
+    /// the delivery sorts last even within one second of the previous one
+    /// (the thread orders same-second DMs by signature).
+    Newest,
+}
+
+/// Deliver `texts` from the test peer to self in the current room, in ONE
+/// `ROOMS` mutation, through the DM field's `apply_delta`: it checks each
+/// signature and both memberships, and keeps the stored order and caps.
+fn deliver_dms(texts: Vec<String>, stamp: DmStamp) {
+    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+        return;
+    };
+    ROOMS.with_mut(|rooms| {
+        let Some(room) = rooms.map.get_mut(&room_key) else {
+            return;
+        };
+        let Some(self_vk) = room.signing_key().map(|sk| sk.verifying_key()) else {
+            web_sys::console::error_1(&"__riverTest DM hooks: self holds no key here".into());
+            return;
+        };
+        let peer_sk = SigningKey::from_bytes(&DM_PEER_SEED);
+        admit_with_nickname(room, &room_key, &peer_sk, DM_PEER_NICKNAME);
+
+        let self_id = MemberId::from(&self_vk);
+        let peer_id = MemberId::from(&peer_sk.verifying_key());
+        let now = crate::util::get_current_system_time()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let count = texts.len() as u64;
+        let first = match stamp {
+            DmStamp::History => now.saturating_sub(count * 60),
+            DmStamp::Newest => room
+                .room_state
+                .direct_messages
+                .messages
+                .iter()
+                .filter(|m| {
+                    let (s, r) = (m.message.sender, m.message.recipient);
+                    (s == self_id && r == peer_id) || (s == peer_id && r == self_id)
+                })
+                .map(|m| m.message.timestamp + 1)
+                .fold(now, u64::max),
+        };
+        let new_messages: Vec<_> = texts
+            .into_iter()
+            .zip(0..)
+            .filter_map(|(text, i)| {
+                let ts = match stamp {
+                    DmStamp::History => first + i * 60,
+                    DmStamp::Newest => first + i,
+                };
+                compose_direct_message(&peer_sk, &self_vk, &room_key, ts, now, text.as_bytes())
+                    .inspect_err(|e| {
+                        web_sys::console::error_1(&format!("__riverTest DM compose: {e}").into())
+                    })
+                    .ok()
+            })
+            .collect();
+        let expected = new_messages.len();
+        let delta = Some(DirectMessagesDelta {
+            new_messages,
+            advanced_purges: vec![],
+        });
+        let parent = room.room_state.clone();
+        let params = ChatRoomParametersV1 { owner: room_key };
+        let held_before = room.room_state.direct_messages.messages.len();
+        if let Err(e) = room
+            .room_state
+            .direct_messages
+            .apply_delta(&parent, &params, &delta)
+        {
+            web_sys::console::error_1(&format!("__riverTest DM apply: {e}").into());
+        } else if room.room_state.direct_messages.messages.len() != held_before + expected {
+            web_sys::console::error_1(&"__riverTest DM apply dropped a delivery".into());
+        }
     });
 }

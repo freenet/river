@@ -312,14 +312,14 @@ mod tests {
 
     #[test]
     fn every_fallible_effect_anchors_before_its_first_try_read_and_nudges() {
-        // 8 across the 4 files; app.rs has 5, members.rs, dm_thread_modal.rs and
-        // conversation.rs 1 each (conversation.rs: the 10c read rule's
-        // tab-visibility check).
+        // 9 across the 4 files; app.rs has 5, dm_thread_modal.rs 2 (the DM_DRAFT
+        // merge and the 10c read rule), members.rs 1, conversation.rs 1 (the
+        // 10c read rule's tab-visibility check).
         assert_fallible_hooks_are_guarded(
             GUARDED_EFFECT_SITES,
             "use_effect(",
             "freenet/river#559",
-            8,
+            9,
         );
     }
 

@@ -49,35 +49,42 @@ pub static DM_LAST_SEEN: GlobalSignal<HashMap<(VerifyingKey, MemberId), u64>> =
 ///
 /// Split out because the answer gates whether `mark_thread_read`
 /// touches the signal at all: `DmThreadModalBody` calls
-/// `mark_thread_read` from its render body on every render while a
-/// thread is open, and `with_mut` notifies subscribers even when the
-/// mutation changed nothing — so an unconditional write turned an open
-/// DM thread into a continuous write pulse on `DM_LAST_SEEN`, widening
-/// the contention window that blanked the DM rail (issue #499).
+/// `mark_thread_read` again and again while a thread is open (it used
+/// to on every render; since 10c, from every read-rule trigger), and
+/// `with_mut` notifies subscribers even when the mutation changed
+/// nothing — so an unconditional write turned an open DM thread into a
+/// continuous write pulse on `DM_LAST_SEEN`, widening the contention
+/// window that blanked the DM rail (issue #499).
 /// Pinned by the `thread_read_needs_write_*` tests plus the wiring pin
 /// `mark_thread_read_write_is_gated_pinned`.
+// Native builds have no caller: see `mark_thread_read`.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn thread_read_needs_write(current: Option<u64>, up_to_ts: u64) -> bool {
     up_to_ts > current.unwrap_or(0)
 }
 
-/// Mark every DM from `peer` in `room` as seen up to (and including) the
-/// most recent inbound message timestamp known to the synchronizer.
+/// Mark every DM from `peer` in `room` as seen up to (and including)
+/// `up_to_ts`. The open thread calls it only with an inbound DM the reader
+/// has had on screen with the tab visible (10c decision 11; see
+/// `ThreadSeenWitness` in `dm_thread_modal.rs`).
+// Its one caller measures the DOM, so it exists only on wasm32.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
     crate::util::defer(move || {
         // Skip the write when the stored cutoff would not advance —
         // `with_mut` notifies subscribers even for a no-op mutation and
-        // this runs on every render of an open thread (issue #499
+        // this runs again and again while a thread is open (issue #499
         // write-pulse). `try_peek` registers no subscription; it fails
         // ONLY while a live WRITE borrow exists on `DM_LAST_SEEN` — and
         // on that same synchronous stack `with_mut` (which is
         // `f(&mut *self.write())`, a panicking borrow) would be a
         // GUARANTEED panic. So a contended peek must SKIP, never fall
-        // through to the write. Skipping is harmless: this function
-        // re-fires on every render of the open thread and again on the
-        // next inbound message, so a skipped advance self-heals on the
-        // next clean pass. The `false` fallback below is load-bearing —
-        // a `true` fallback is the panic path. Pinned by
-        // `mark_thread_read_write_is_gated_pinned`.
+        // through to the write. Skipping is harmless: the open thread
+        // calls this again on its next read-rule trigger (the next
+        // message, the reader reaching the end, the tab becoming
+        // visible, a reopen), so a skipped advance self-heals then. The
+        // `false` fallback below is load-bearing — a `true` fallback is
+        // the panic path. Pinned by `mark_thread_read_write_is_gated_pinned`.
         let needs_write = DM_LAST_SEEN
             .try_peek()
             .map(|seen| thread_read_needs_write(seen.get(&(room, peer)).copied(), up_to_ts))
@@ -94,8 +101,9 @@ pub fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
     });
 }
 
-/// Open the DM thread modal for `(room, peer)`. Closes any other open
-/// thread first.
+/// Open the DM thread modal on `(room, peer)`, deferred. There is one modal,
+/// so this replaces whichever thread is open, and the modal mounts a fresh
+/// body for the new one.
 pub fn open_dm_thread(room: VerifyingKey, peer: MemberId) {
     crate::util::defer(move || {
         *OPEN_DM_THREAD.write() = Some((room, peer));
@@ -961,10 +969,10 @@ mod tests {
         }
     }
 
-    /// Issue #499 write-pulse: `mark_thread_read` is called from
-    /// `DmThreadModalBody`'s render body on every render while a thread
-    /// is open, and `with_mut` notifies subscribers even when the
-    /// mutation is a no-op — so the `with_mut` MUST stay gated on
+    /// Issue #499 write-pulse: `mark_thread_read` is called again and
+    /// again while a thread is open (once on every render; since 10c from
+    /// every read-rule trigger), and `with_mut` notifies subscribers even
+    /// when the mutation is a no-op — so the `with_mut` MUST stay gated on
     /// `thread_read_needs_write`. Source-scrape (the function needs a
     /// Dioxus runtime to exercise): match whitespace-stripped source so
     /// rustfmt reflowing can't fake a failure; cut at `mod tests` (this
@@ -999,8 +1007,8 @@ mod tests {
             decide < gate && gate < write,
             "mark_thread_read's with_mut must come AFTER the needs-write gate \
              (decide at {decide}, gate at {gate}, write at {write}) — an ungated \
-             with_mut notifies DM rail subscribers on every render of an open \
-             thread (issue #499 write-pulse)"
+             with_mut notifies DM rail subscribers each time an open thread \
+             re-applies its read rule (issue #499 write-pulse)"
         );
 
         // The contended-peek fallback must be FALSE (skip the write).
@@ -1008,9 +1016,9 @@ mod tests {
         // DM_LAST_SEEN, and on that same synchronous stack `with_mut`
         // is a panicking borrow — so a `true` fallback converts every
         // contended peek into a guaranteed RefCell panic. `false` is
-        // safe: mark_thread_read re-fires on every render of the open
-        // thread, so a skipped advance self-heals on the next clean
-        // pass. (Needles built with concat! so this comment and the
+        // safe: the open thread calls mark_thread_read again on its next
+        // read-rule trigger, so a skipped advance self-heals then.
+        // (Needles built with concat! so this comment and the
         // assertion literals cannot drift into matching themselves —
         // they sit inside the cut anyway, belt and braces.)
         let fallback_false = concat!(".unwrap_or(", "false)");
