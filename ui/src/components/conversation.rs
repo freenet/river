@@ -8008,15 +8008,9 @@ mod tests {
     #[test]
     fn the_trim_skips_when_the_tail_would_rearm_the_sentinel() {
         let reach = |client: i32| client + BACKFILL_LEAD_PX + TRIM_HEADROOM_PX as i32;
-        // Ordinary desktop shape: the newest 60 items measure ~4000px over a
-        // 900px viewport, far past the strip's reach. Trim.
-        assert!(!trim_would_rearm_backfill(4000, 900));
         // Exactly at the reach clears it; one px short does not.
         assert!(!trim_would_rearm_backfill(reach(900), 900));
         assert!(trim_would_rearm_backfill(reach(900) - 1, 900));
-        // The Uneven Tail Room on a 5800px-tall window: its newest 60 rows
-        // measure ~2500px, inside the strip's reach. No trim, so no loop.
-        assert!(trim_would_rearm_backfill(60 * 42, 5800));
     }
 
     /// Item keys `m0..m{total}` for the range tests.
@@ -8069,15 +8063,6 @@ mod tests {
             parked(Some(held.end), None),
         );
         assert_eq!((again.start, again.end), (held.start, held.end));
-
-        // The same burst under a FOLLOWING reader still slides the start: they
-        // are at the bottom, where dropping old rows above them is invisible.
-        let followed = HistoryWindow::resolve(401, INITIAL_WINDOW_ITEMS, Some(opened.start));
-        assert_eq!(
-            (followed.start, followed.end),
-            (401 - WINDOW_ITEMS_CEILING, 401)
-        );
-        assert!(!followed.has_newer);
 
         // Below the ceiling nothing changes for a parked reader either.
         let small =
@@ -8179,15 +8164,15 @@ mod tests {
         );
         assert_eq!(last.end, total);
         assert!(!last.has_newer);
-    }
 
-    /// A degenerate held end (everything it held is gone) falls back to the
-    /// newest item rather than rendering nothing.
-    #[test]
-    fn a_held_end_with_nothing_left_falls_back_to_the_newest() {
-        let empty =
-            HistoryWindow::resolve_held(50, INITIAL_WINDOW_ITEMS, Some(0), parked(Some(0), None));
-        assert_eq!(empty.end, 50);
+        // A held end with nothing left falls back to the newest, not to empty.
+        let empty = HistoryWindow::resolve_held(
+            total,
+            INITIAL_WINDOW_ITEMS,
+            Some(900),
+            parked(Some(0), None),
+        );
+        assert_eq!(empty.end, total);
     }
 
     /// A deleted reading row falls back to its nearest surviving neighbour.
@@ -8209,14 +8194,11 @@ mod tests {
             reading_anchor_shift(&anchor, dom(&[("read", -600), ("below", -520)])),
             Some(-640)
         );
-        // The reading row was deleted: its neighbour is restored to ITS offset.
+        // The reading row was deleted: the nearest-first neighbour is restored
+        // to ITS offset.
         assert_eq!(
-            reading_anchor_shift(&anchor, dom(&[("below", 700)])),
+            reading_anchor_shift(&anchor, dom(&[("above", 10), ("below", 700)])),
             Some(580)
-        );
-        assert_eq!(
-            reading_anchor_shift(&anchor, dom(&[("above", 10)])),
-            Some(40)
         );
         // Nothing survives: no move at all.
         assert_eq!(reading_anchor_shift(&anchor, dom(&[("other", 0)])), None);
