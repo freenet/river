@@ -15,7 +15,7 @@ export const BOTTOM_THRESHOLD_PX = 100;
 export const AT_BOTTOM_EPSILON_PX = 4;
 /// How far a row the reader is looking at may move and still count as "kept
 /// in place". Independent of the app's own 2px slack and 100px band (#732).
-const READING_ROW_BUDGET_PX = 4;
+export const READING_ROW_BUDGET_PX = 4;
 
 /// The main SHA the known failures below were reproduced on, before the scroll simplification.
 const KNOWN_FAILURE_SHA = "739fd683";
@@ -69,6 +69,12 @@ export function scrollTop(page: Page): Promise<number> {
   });
 }
 
+/// Premise shared by the parked-reader tests: the view is outside the
+/// bottom band, so an arrival must not be followed.
+export async function expectParkedAwayFromEnd(page: Page, why = "premise: parked away from the end") {
+  expect(await distanceFromBottom(page), why).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+}
+
 export async function expectSettledAtBottom(page: Page, why: string, timeout = 5_000) {
   await expect
     .poll(() => distanceFromBottom(page), { timeout, message: why })
@@ -111,8 +117,10 @@ export async function openRoomAtBottom(page: Page, roomName: string, path = "/")
 
 /// Simulate the reader dragging the history with a pointing device.
 ///
-/// A synthetic `wheel` followed by a `scrollTop` assignment rather than
-/// `page.mouse.wheel`, which is unsupported on mobile WebKit.
+/// The synthetic `wheel` signals reader intent; the `scrollTop` assignment is
+/// what moves the viewport, on every engine (`page.mouse.wheel` is unsupported
+/// on mobile WebKit). Returns without waiting for the settle, so callers can
+/// act before it lands.
 export async function readerScrollsTo(page: Page, top: number) {
   await page.evaluate((t) => {
     const el = document.getElementById("chat-scroll-container")!;
@@ -121,7 +129,9 @@ export async function readerScrollsTo(page: Page, top: number) {
   }, top);
 }
 
-/// The same, with NO gesture event at all, and waiting for the settle.
+/// The same, with NO gesture event at all, and waiting for the settle, so the
+/// app has seen the move end before the caller acts. Tests that need an
+/// un-settled move assign `scrollTop` themselves.
 ///
 /// Not a contrivance: a native scrollbar drag dispatches no pointer event to
 /// the content on Firefox, and find-in-page, focus-driven scrolling and browser
@@ -208,12 +218,8 @@ export async function readingRow(page: Page, containing?: string): Promise<Readi
 export function rowTop(page: Page, key: string): Promise<number | null> {
   return page.evaluate((k) => {
     const c = document.getElementById("chat-scroll-container")!;
-    for (const row of c.querySelectorAll<HTMLElement>("[data-item-key]")) {
-      if (row.getAttribute("data-item-key") === k) {
-        return row.getBoundingClientRect().top - c.getBoundingClientRect().top;
-      }
-    }
-    return null;
+    const row = c.querySelector(`[data-item-key="${CSS.escape(k)}"]`);
+    return row ? row.getBoundingClientRect().top - c.getBoundingClientRect().top : null;
   }, key);
 }
 
@@ -257,23 +263,16 @@ export async function holdSettleEvents(page: Page) {
   });
 }
 
-/// How many settle-path events the gate has withheld so far.
-function heldSettleEvents(page: Page): Promise<{ scroll: number; scrollend: number; hasScrollend: boolean }> {
-  return page.evaluate(() => {
-    const gate = (window as any).__riverSettleGate;
-    return { ...gate.held, hasScrollend: gate.hasScrollend };
-  });
-}
-
 /// Wait until the reader's own scroll has produced the event that would settle
 /// it, still withheld: the premise that the settle comes after the patch.
 export async function expectSettleWithheld(page: Page) {
   await expect
     .poll(
-      async () => {
-        const held = await heldSettleEvents(page);
-        return held.hasScrollend ? held.scrollend : held.scroll;
-      },
+      () =>
+        page.evaluate(() => {
+          const gate = (window as any).__riverSettleGate;
+          return gate.hasScrollend ? gate.held.scrollend : gate.held.scroll;
+        }),
       { timeout: 5_000, message: "premise: the reader's scroll should have produced a settle event to hold" },
     )
     .toBeGreaterThan(0);

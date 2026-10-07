@@ -8,6 +8,7 @@ import {
   deliver,
   deliverOffscreen,
   distanceFromBottom,
+  expectParkedAwayFromEnd,
   expectRowHeld,
   expectSettleWithheld,
   expectSettledAtBottom,
@@ -396,10 +397,10 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
 // fixture — so a fixture change that shrinks the room below the window makes
 // these fail loudly instead of quietly regressing into small-room tests.
 //
-// The fixture: `?deep-history-room=1` adds a room of 80 alternating-author
+// The fixture: `?deep-history-room=1` adds a room of 188 alternating-author
 // messages (alternation makes messages == display items, so >60 items is a
-// guarantee) plus the ~13 standard fixture messages. The default fixture is
-// untouched; the describes above still exercise the small-room path.
+// guarantee) plus the 13 standard fixture messages, 201 in all. The default
+// fixture is untouched; the describes above still exercise the small-room path.
 test.describe("Windowed history follows arrivals (#501)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -410,7 +411,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   const DEEP_ROOM_PATH = "/?deep-history-room=1";
 
   /// A windowed tail is ~60 items + a separator or two; the whole fixture is
-  /// ~92 items.
+  /// ~200 items.
   function renderedRowCount(page: Page): Promise<number> {
     return page.locator(HISTORY_ROWS).count();
   }
@@ -813,28 +814,38 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   });
 });
 
-// Scroll regression coverage, A01–A08: settle timing, content above a parked
-// reader, a hidden panel, the render ceiling, uneven-row trim, own-send snap,
-// unseen arrivals, and edit-form reachability. Tests marked CURRENT POLICY
-// characterize behavior the later simplification changes on purpose; the rest
-// are invariants.
+// Scroll regression coverage. Cases A01 and A04–A06 live below: settle timing
+// (A01), the render ceiling and uneven-row trim (A04, A05), and own-send snap
+// (A06). The others are in other specifications: content above a parked reader
+// (A02) and a hidden panel (A03) in conversation-history-position.spec.ts,
+// unseen arrivals (A07) in room-unread-badge.spec.ts, and edit-form
+// reachability (A08) in message-layout.spec.ts. Tests marked CURRENT POLICY
+// characterize behavior that may be changed on purpose; the rest are
+// invariants.
+
+// Fixture assumptions from ui/src/example_data.rs, named where they are consumed.
+/// Rows the history renders when a room opens, and trims back to.
+const INITIAL_RENDERED_ITEMS = 60;
+/// Tall rows at the head of "Tall Head Room" (at its message cap).
+const TALL_HEAD_TALL_ROWS = 8;
+/// Tall rows at the head of "Uneven Tail Room", numbered 00 up.
+const UNEVEN_TAIL_TALL_ROWS = 40;
 
 test.describe("Arrival before the reader's settle (A01)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
   // freenet/river#723. The pin re-arms only when the reader's settle lands, so
   // an arrival patched between "back at the bottom" and that settle is not
-  // followed. CURRENT POLICY: main intends to follow here. The later
-  // simplification drops following and keeps only "no unrequested navigation".
+  // followed. CURRENT POLICY: main intends to follow here. Dropping
+  // arrival-following would keep only "no unrequested navigation" and change
+  // this test.
   test("an arrival patched before the reader's return-to-bottom settles is followed", async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
     await readerScrollsWithoutGesture(page, 0);
-    expect(await distanceFromBottom(page), "premise: parked away from the end").toBeGreaterThan(
-      BOTTOM_THRESHOLD_PX,
-    );
+    await expectParkedAwayFromEnd(page);
 
     await holdSettleEvents(page);
     await page.evaluate(() => {
@@ -877,7 +888,7 @@ test.describe("Arrival before the reader's settle (A01)", () => {
     const heightBefore = await historyHeight(page);
 
     // One arrival per tall row: the at-cap prune drains exactly those.
-    await callRiverTest(page, "appendMessages", 8);
+    await callRiverTest(page, "appendMessages", TALL_HEAD_TALL_ROWS);
     await expect(page.getByText("tall filler", { exact: false })).toHaveCount(0, { timeout: 5_000 });
     expect(
       heightBefore - (await historyHeight(page)),
@@ -891,16 +902,21 @@ test.describe("Arrival before the reader's settle (A01)", () => {
   });
 });
 
+/// Scroll the history to its top and wait for backfill to add rows.
+async function backfillOnce(page: Page, why: string) {
+  const before = await page.locator("[data-item-key]").count();
+  await page.evaluate(() => {
+    document.getElementById("chat-scroll-container")!.scrollTop = 0;
+  });
+  await expect.poll(() => page.locator("[data-item-key]").count(), { message: why }).toBeGreaterThan(before);
+}
+
 /// Backfill until the tall rows render, then return to the end. Returns the
 /// rendered row counts the history went through after the return.
 async function backfillThenReturn(page: Page): Promise<number[]> {
-  const tallest = page.getByText(`tall filler 39 line 00`, { exact: false });
+  const tallest = page.getByText(`tall filler ${UNEVEN_TAIL_TALL_ROWS - 1} line 00`, { exact: false });
   for (let i = 0; i < 5 && (await tallest.count()) === 0; i++) {
-    const before = await page.locator("[data-item-key]").count();
-    await page.evaluate(() => {
-      document.getElementById("chat-scroll-container")!.scrollTop = 0;
-    });
-    await expect.poll(() => page.locator("[data-item-key]").count()).toBeGreaterThan(before);
+    await backfillOnce(page, "backfill revealed no more rows on the way to the tall rows");
   }
   await expect(tallest, "premise: backfill should reach the tall rows").toHaveCount(1);
   return observeRowCounts(page, { returnToEnd: true });
@@ -947,10 +963,12 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     expect(row, "premise: a filler row is fully in view").not.toBeNull();
     const fillerIndex = Number(/history filler (\d+)/.exec(row!.text)![1]);
 
-    // 200 arrivals take the room from 201 messages past its 300 cap, so the
-    // oldest 101 are pruned, and grow the rendered range past the ceiling.
+    // The burst takes the room past its cap, so the oldest messages are
+    // pruned, and grows the rendered range past the ceiling.
+    const DEEP_ROOM_SEEDED = 201; // 188 fillers + 13 standard messages
+    const DEEP_ROOM_CAP = 300; // DEEP_ROOM_MAX_RECENT_MESSAGES
     const BURST = 200;
-    const pruned = 201 + BURST - 300;
+    const pruned = DEEP_ROOM_SEEDED + BURST - DEEP_ROOM_CAP;
     expect(
       fillerIndex,
       "premise: the reader's message survives the prune, so it is still in the room",
@@ -977,38 +995,32 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
   }) => {
     await openRoomAtBottom(page, "Uneven Tail Room", "/?uneven-history=1");
     const counts = await backfillThenReturn(page);
-    expect(counts, "the window should trim back to its initial size exactly once").toEqual([60]);
+    expect(counts, "the window should trim back to its initial size exactly once").toEqual([INITIAL_RENDERED_ITEMS]);
     await expectSettledAtBottom(page, "the trim left the view off the end");
 
-    const before = await page.locator("[data-item-key]").count();
-    await page.evaluate(() => {
-      document.getElementById("chat-scroll-container")!.scrollTop = 0;
-    });
-    await expect
-      .poll(() => page.locator("[data-item-key]").count(), { message: "paging back after the trim revealed nothing" })
-      .toBeGreaterThan(before);
+    await backfillOnce(page, "paging back after the trim revealed nothing");
   });
 });
 
 test.describe("Trimming on a very tall viewport (A05)", () => {
-  // A zoomed-out window or tall portrait monitor: a trimmed (60-row, short)
-  // window sits inside the backfill strip's reach, while the trim decision's
-  // average-height estimate, inflated by the tall older rows, says it clears
-  // it. Opening the room is enough: backfill grows the window, the settle at
+  // A zoomed-out window or tall portrait monitor: a trimmed (initial-size,
+  // short) window sits inside the backfill strip's reach, while the trim
+  // decision's average-height estimate, inflated by the tall older rows, says
+  // it clears it. Opening the room is enough: backfill grows the window, the settle at
   // the end trims it, the trim re-arms the backfill, and so on.
   test.use({ viewport: { width: 1280, height: 5_800 } });
 
   test("an uneven-height room settles instead of trimming and refilling", async ({ page }) => {
     await openRoomAtBottom(page, "Uneven Tail Room", "/?uneven-history=1");
-    // Measured, not estimated: the height of the 60 newest item rows.
-    const tail = await page.evaluate(() => {
+    // Measured, not estimated: the height of the newest INITIAL_RENDERED_ITEMS rows.
+    const tail = await page.evaluate((n) => {
       const c = document.getElementById("chat-scroll-container")!;
       const rows = c.querySelectorAll<HTMLElement>("[data-item-key]");
-      return c.scrollHeight - rows[rows.length - 60].offsetTop;
-    });
+      return c.scrollHeight - rows[rows.length - n].offsetTop;
+    }, INITIAL_RENDERED_ITEMS);
     expect(
       tail,
-      "premise: a trimmed (60-row, short) window must sit within the backfill strip's reach of the viewport",
+      "premise: a trimmed (initial-size, short) window must sit within the backfill strip's reach of the viewport",
     ).toBeLessThan((await viewportHeight(page)) + 800);
 
     const counts = await observeRowCounts(page);
@@ -1027,17 +1039,15 @@ test.describe("Own send while reading history (A06)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
   // CURRENT POLICY: your own message snaps the view to the latest message
-  // (`force_scroll`), wherever you were reading. The later simplification
-  // replaces this with position preservation; the send and the draft clearing stay.
+  // (`force_scroll`), wherever you were reading. Preserving the reading position
+  // instead would change the snap; the send and the draft clearing stay.
   test("sending while scrolled up submits, clears the draft and snaps to the latest message", async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Your Private Room");
     await fillHistory(page);
     await readerScrollsWithoutGesture(page, 0);
-    expect(await distanceFromBottom(page), "premise: reading older messages").toBeGreaterThan(
-      BOTTOM_THRESHOLD_PX,
-    );
+    await expectParkedAwayFromEnd(page, "premise: reading older messages");
 
     const input = page.getByTestId("message-input");
     await input.fill("own send while reading history");

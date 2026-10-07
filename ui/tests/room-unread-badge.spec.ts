@@ -4,6 +4,7 @@ import {
   BOTTOM_THRESHOLD_PX,
   deliverOffscreen,
   distanceFromBottom,
+  expectParkedAwayFromEnd,
   expectStaysPut,
   fillHistory,
   openRoomAtBottom,
@@ -140,8 +141,9 @@ test.describe("Muted rooms and the cross-surface totals", { tag: "@chromium-only
 
 // A short arrival related to where the view actually is (A07): is it on screen,
 // is the scroll-to-latest button offered, and is the room marked read anyway?
-// CURRENT POLICY throughout: the later simplification changes catch-up and
-// read acknowledgment on purpose. The viewport witness is what stays.
+// CURRENT POLICY throughout this block: catch-up visibility and read
+// acknowledgment are deliberate behavior that may be changed on purpose. The
+// viewport witness (is the arrival on screen?) is what stays.
 test.describe("Unseen arrivals versus the viewport (A07)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -160,9 +162,7 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
     await readerScrollsWithoutGesture(page, 0);
-    expect(await distanceFromBottom(page), "premise: parked away from the end").toBeGreaterThan(
-      BOTTOM_THRESHOLD_PX,
-    );
+    await expectParkedAwayFromEnd(page);
     const before = await scrollTop(page);
 
     await deliverOffscreen(page, "short unseen arrival");
@@ -170,8 +170,8 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
     expect(await scrollTop(page), "the arrival moved a parked reader").toBeCloseTo(before, 0);
     await expect(page.getByTestId("scroll-to-bottom"), "no catch-up offered for an unseen arrival").toBeVisible();
 
-    // CURRENT POLICY: the open, visible room is marked read up to its newest
-    // message although that message never reached the viewport.
+    // The open, visible room is marked read up to its newest message although
+    // that message never reached the viewport.
     await selectListedRoom(page, "Public Discussion Room");
     const teamChat = page.getByTestId("room-list").getByRole("button", { name: "Team Chat Room" });
     await expect(teamChat.locator('[data-testid="room-unread-badge"]')).toHaveCount(0);
@@ -193,7 +193,7 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
     await expect(page.getByTestId("scroll-to-bottom"), "premise: no catch-up inside the band").toHaveCount(0);
 
     await deliverOffscreen(page, "short arrival inside the band");
-    // CURRENT POLICY: followed, so hiding catch-up is consistent with the view.
+    // Followed, so hiding catch-up is consistent with the view.
     await expect.poll(() => onScreen(page, "short arrival inside the band")).toBe(true);
     await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);
   });

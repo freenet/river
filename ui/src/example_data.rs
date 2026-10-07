@@ -118,32 +118,19 @@ enum HistoryDepth {
     UnevenTail,
 }
 
-/// Whether the page was loaded with `?deep-history-room=1`, asking for the
-/// extra >window fixture room. Query-gated so the default fixture (and every
-/// existing spec's timing) is untouched; only the windowing specs opt in.
+/// Whether the page was loaded with a query containing `flag` (e.g.
+/// `deep-history-room`, `uneven-history`), opting into an extra fixture room.
+/// Query-gated so the default fixture (and every existing spec's timing) is
+/// untouched; only the specs that need those rooms opt in.
 #[cfg(target_arch = "wasm32")]
-fn deep_history_room_requested() -> bool {
+fn fixture_requested(flag: &str) -> bool {
     web_sys::window()
         .and_then(|w| w.location().search().ok())
-        .is_some_and(|search| search.contains("deep-history-room"))
+        .is_some_and(|search| search.contains(flag))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn deep_history_room_requested() -> bool {
-    false
-}
-
-/// Whether the page was loaded with `?uneven-history=1`, asking for the
-/// uneven-row-height rooms the scroll-position specs use.
-#[cfg(target_arch = "wasm32")]
-fn uneven_history_rooms_requested() -> bool {
-    web_sys::window()
-        .and_then(|w| w.location().search().ok())
-        .is_some_and(|search| search.contains("uneven-history"))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn uneven_history_rooms_requested() -> bool {
+fn fixture_requested(_flag: &str) -> bool {
     false
 }
 
@@ -193,25 +180,17 @@ pub fn create_example_rooms() -> Rooms {
     // Rooms deeper than the render window, for the windowing specs (#501):
     // one with prune headroom, one exactly at its message cap so delivered
     // arrivals exercise the at-cap index-shift path (#505 blocker 1).
-    if deep_history_room_requested() {
-        let room4 = create_room(
-            &"Deep History Room".to_string(),
-            SelfIs::Member,
-            None,
-            HistoryDepth::Deep,
-        );
-        map.insert(room4.owner_vk, room4.room_data);
-
-        let room5 = create_room(
-            &"Capped History Room".to_string(),
-            SelfIs::Member,
-            None,
-            HistoryDepth::AtCap,
-        );
-        map.insert(room5.owner_vk, room5.room_data);
+    if fixture_requested("deep-history-room") {
+        for (name, depth) in [
+            ("Deep History Room", HistoryDepth::Deep),
+            ("Capped History Room", HistoryDepth::AtCap),
+        ] {
+            let room = create_room(&name.to_string(), SelfIs::Member, None, depth);
+            map.insert(room.owner_vk, room.room_data);
+        }
     }
 
-    if uneven_history_rooms_requested() {
+    if fixture_requested("uneven-history") {
         for (name, depth) in [
             ("Tall Head Room", HistoryDepth::TallHead),
             ("Uneven Tail Room", HistoryDepth::UnevenTail),
@@ -278,10 +257,12 @@ fn create_room(
     config.owner_member_id = owner_id;
     match history_depth {
         HistoryDepth::Standard => {}
-        // Headroom over the 200 seeded messages so the specs can deliver
+        // Headroom over the seeded messages so the specs can deliver
         // arrival batches without the at-cap prune shifting the fixture out
-        // from under them.
-        HistoryDepth::Deep => config.max_recent_messages = DEEP_ROOM_MAX_RECENT_MESSAGES,
+        // from under them. The uneven tail room needs the same headroom.
+        HistoryDepth::Deep | HistoryDepth::UnevenTail => {
+            config.max_recent_messages = DEEP_ROOM_MAX_RECENT_MESSAGES
+        }
         // Landing EXACTLY on the cap is this room's entire purpose; the cap
         // is raised so paired fillers still exceed the render window in
         // display items.
@@ -290,7 +271,6 @@ fn create_room(
             config.max_recent_messages =
                 UNEVEN_TALL_FILLERS + TALL_HEAD_SHORT_FILLERS + STANDARD_FIXTURE_MESSAGES
         }
-        HistoryDepth::UnevenTail => config.max_recent_messages = DEEP_ROOM_MAX_RECENT_MESSAGES,
     }
     room_state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
 

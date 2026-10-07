@@ -4,12 +4,14 @@ import {
   ALL_PROJECTS,
   BOTTOM_THRESHOLD_PX,
   distanceFromBottom,
+  expectParkedAwayFromEnd,
   expectRowHeld,
   expectSettledAtBottom,
   fillHistory,
   knownFailure,
   nextFrames,
   openRoomAtBottom,
+  READING_ROW_BUDGET_PX,
   readerScrollsWithoutGesture,
   readingRow,
   rowTop,
@@ -20,15 +22,14 @@ import {
 // the chat panel is hidden (A03). The reading row is measured relative to the
 // container, by message identity, against READING_ROW_BUDGET_PX.
 
-/// Scroll a settled reader so `key`'s row sits `gap` px below the top of the
+/// Scroll a settled reader so `key`'s row sits 40px below the top of the
 /// visible history.
-async function parkWithRowAtTop(page: Page, key: string, gap = 40) {
+async function parkWithRowAtTop(page: Page, key: string) {
+  const gap = 40;
   const target = await page.evaluate(
     ([k, g]) => {
       const c = document.getElementById("chat-scroll-container")!;
-      const row = Array.from(c.querySelectorAll("[data-item-key]")).find(
-        (r) => r.getAttribute("data-item-key") === k,
-      )!;
+      const row = c.querySelector(`[data-item-key="${CSS.escape(k as string)}"]`)!;
       return c.scrollTop + row.getBoundingClientRect().top - c.getBoundingClientRect().top - (g as number);
     },
     [key, gap] as const,
@@ -65,14 +66,13 @@ test.describe("Reading position when content above changes (A02)", () => {
 
     const imageKey = await keyOf(page, "image fixture");
     const afterImage = await page.evaluate((k) => {
-      const rows = Array.from(document.querySelectorAll("#chat-scroll-container [data-item-key]"));
-      const i = rows.findIndex((r) => r.getAttribute("data-item-key") === k);
-      return rows[i + 1].getAttribute("data-item-key")!;
+      const c = document.getElementById("chat-scroll-container")!;
+      const row = c.querySelector(`[data-item-key="${CSS.escape(k)}"]`)!;
+      const rows = Array.from(c.querySelectorAll("[data-item-key]"));
+      return rows[rows.indexOf(row) + 1].getAttribute("data-item-key")!;
     }, imageKey);
     await parkWithRowAtTop(page, afterImage);
-    expect(await distanceFromBottom(page), "premise: parked away from the end").toBeGreaterThan(
-      BOTTOM_THRESHOLD_PX,
-    );
+    await expectParkedAwayFromEnd(page);
     expect(
       (await rowTop(page, imageKey))!,
       "premise: the image row is above the visible history",
@@ -109,9 +109,7 @@ test.describe("Reading position when content above changes (A02)", () => {
     await fillHistory(page, "purge-me");
     await fillHistory(page, "keep");
     await parkWithRowAtTop(page, await keyOf(page, "keep 2:"));
-    expect(await distanceFromBottom(page), "premise: parked away from the end").toBeGreaterThan(
-      BOTTOM_THRESHOLD_PX,
-    );
+    await expectParkedAwayFromEnd(page);
     const row = await readingRow(page, "keep 2:");
     expect(row, "premise: the reader is looking at a surviving row").not.toBeNull();
     expect(
@@ -136,9 +134,7 @@ test.describe("Reading position when content above changes (A02)", () => {
     await fillHistory(page, "keep");
     await fillHistory(page, "tail");
     await parkWithRowAtTop(page, await keyOf(page, "keep 2:"));
-    expect(await distanceFromBottom(page), "premise: parked away from the end").toBeGreaterThan(
-      BOTTOM_THRESHOLD_PX,
-    );
+    await expectParkedAwayFromEnd(page);
     const row = await readingRow(page, "keep 2:");
     expect(row, "premise: the reader is looking at the row to delete").not.toBeNull();
     // The row above stays put. Not the row below: alternating authors mean
@@ -155,7 +151,7 @@ test.describe("Reading position when content above changes (A02)", () => {
       await distanceFromBottom(page),
       "deleting the reader's row took them to the latest message",
     ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
-    expect(Math.abs((await scrollTop(page)) - before), "the view moved when the reader's row was deleted").toBeLessThanOrEqual(4);
+    expect(Math.abs((await scrollTop(page)) - before), "the view moved when the reader's row was deleted").toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
     await expectRowHeld(page, row!.prevKey!, prevTop, "the row above the deleted one moved");
   });
 });
@@ -181,6 +177,10 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
   // drain that lands while the chat is hidden is never compensated. The same
   // drain is compensated when visible ("a batched at-cap drain does not crawl
   // a parked reader" in conversation-autoscroll.spec.ts).
+  // Arrivals delivered while hidden: enough to overflow the at-cap room's
+  // cap and drain its oldest messages from the head.
+  const HIDDEN_DRAIN_BATCH = 61;
+
   test("an at-cap drain while the chat is hidden keeps the reader's row", async ({ page }) => {
     await openRoomAtBottom(page, "Capped History Room", "/?deep-history-room=1");
     const parkedAt = Math.max(
@@ -196,7 +196,7 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     const rowsBefore = await page.locator("[data-item-key]").count();
 
     await hideChatBehindMembers(page);
-    await callRiverTest(page, "appendMessages", 61);
+    await callRiverTest(page, "appendMessages", HIDDEN_DRAIN_BATCH);
     await expect
       .poll(() => page.locator("[data-item-key]").count(), {
         message: "premise: the batch should patch the hidden history, keeping the surviving rows",
@@ -210,7 +210,8 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
 
   // CURRENT POLICY: a room opened while the chat is hidden opens at its
   // newest message, and the geometry on reveal belongs to that room, not the
-  // one that was hidden. The later simplification may restore a saved position instead.
+  // one that was hidden. Restoring a saved reading position instead would be
+  // a deliberate change to this test.
   test("a room switched to while the chat is hidden opens at its newest message on reveal", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
