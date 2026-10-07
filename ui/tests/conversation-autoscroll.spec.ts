@@ -976,12 +976,14 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
 });
 
 test.describe("Trimming on a very tall viewport (A05)", () => {
-  // A zoomed-out window or tall portrait monitor: the real retained tail now
-  // sits inside the backfill strip's reach while the average-height estimate
-  // still says it clears it.
+  // A zoomed-out window or tall portrait monitor: a trimmed (60-row, short)
+  // window sits inside the backfill strip's reach, while the trim decision's
+  // average-height estimate, inflated by the tall older rows, says it clears
+  // it. Opening the room is enough: backfill grows the window, the settle at
+  // the end trims it, the trim re-arms the backfill, and so on.
   test.use({ viewport: { width: 1280, height: 5_800 } });
 
-  test("returning to the end after paging into tall rows does not trim and refill", async ({ page }) => {
+  test("an uneven-height room settles instead of trimming and refilling", async ({ page }) => {
     await openRoomAtBottom(page, "Uneven Tail Room", "/?uneven-history=1");
     // Measured, not estimated: the height of the 60 newest item rows.
     const tail = await page.evaluate(() => {
@@ -993,14 +995,27 @@ test.describe("Trimming on a very tall viewport (A05)", () => {
       tail,
       "premise: a trimmed (60-row, short) window must sit within the backfill strip's reach of the viewport",
     ).toBeLessThan((await viewportHeight(page)) + 800);
-    const counts = await backfillThenReturn(page);
+
+    const counts = await page.evaluate(async () => {
+      const hist = document.querySelector('[data-testid="conversation-history"]')!;
+      const seen: number[] = [];
+      let last = hist.querySelectorAll("[data-item-key]").length;
+      const observer = new MutationObserver(() => {
+        const n = hist.querySelectorAll("[data-item-key]").length;
+        if (n !== last) seen.push((last = n));
+      });
+      observer.observe(hist, { childList: true });
+      await new Promise((r) => setTimeout(r, 2_000));
+      observer.disconnect();
+      return seen;
+    });
     knownFailure(
       ALL_PROJECTS,
       "trim and backfill oscillate: the trim estimate averages row heights (the #505 loop, via uneven rows)",
     );
     expect(
       counts.length,
-      `the window trimmed and refilled after the reader returned to the end (row counts: ${counts.slice(0, 8).join(" → ")}…)`,
+      `the window kept trimming and refilling with no reader input (row counts: ${counts.slice(0, 8).join(" → ")}…)`,
     ).toBeLessThanOrEqual(1);
   });
 });
