@@ -75,6 +75,28 @@ const AT_CAP_FILLER_MESSAGES: usize = 148;
 /// (they must stay an EVEN count to keep the same-author pairing).
 const AT_CAP_MAX_RECENT_MESSAGES: usize = 161;
 
+/// Messages in the standard fixture block every room ends with.
+const STANDARD_FIXTURE_MESSAGES: usize = AT_CAP_MAX_RECENT_MESSAGES - AT_CAP_FILLER_MESSAGES;
+
+/// Tall (multi-paragraph) fillers at the head of the uneven-height rooms.
+///
+/// Uniform filler rows let a height estimate that averages over the rendered
+/// rows pass by accident; these rooms put tall rows and short rows in the
+/// same history so a test can tell an estimate from a measurement.
+const UNEVEN_TALL_FILLERS: usize = 8;
+
+/// Short fillers after the tall ones in the at-cap "Tall Head Room": few
+/// enough that the whole room renders, so an arrival drains a TALL rendered
+/// row and the history shrinks above a reader who just scrolled up (#508).
+const TALL_HEAD_SHORT_FILLERS: usize = 20;
+
+/// Tall fillers at the head of the "Uneven Tail Room".
+const UNEVEN_TAIL_TALL_FILLERS: usize = 40;
+
+/// Short fillers in the "Uneven Tail Room": enough that the 60-item initial
+/// window is short rows only, with the tall rows reached by backfill.
+const UNEVEN_TAIL_SHORT_FILLERS: usize = 70;
+
 /// How deep a fixture room's message history is seeded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HistoryDepth {
@@ -88,6 +110,12 @@ enum HistoryDepth {
     /// [`AT_CAP_FILLER_MESSAGES`] fillers, landing the room EXACTLY on its
     /// `max_recent_messages` cap so arrivals prune.
     AtCap,
+    /// Tall fillers then short ones, small enough to render whole and exactly
+    /// at its cap, so arrivals drain the tall head.
+    TallHead,
+    /// Tall fillers then enough short ones to fill the initial window, with
+    /// prune headroom.
+    UnevenTail,
 }
 
 /// Whether the page was loaded with `?deep-history-room=1`, asking for the
@@ -102,6 +130,20 @@ fn deep_history_room_requested() -> bool {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn deep_history_room_requested() -> bool {
+    false
+}
+
+/// Whether the page was loaded with `?uneven-history=1`, asking for the
+/// uneven-row-height rooms the scroll-position specs use.
+#[cfg(target_arch = "wasm32")]
+fn uneven_history_rooms_requested() -> bool {
+    web_sys::window()
+        .and_then(|w| w.location().search().ok())
+        .is_some_and(|search| search.contains("uneven-history"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn uneven_history_rooms_requested() -> bool {
     false
 }
 
@@ -169,6 +211,16 @@ pub fn create_example_rooms() -> Rooms {
         map.insert(room5.owner_vk, room5.room_data);
     }
 
+    if uneven_history_rooms_requested() {
+        for (name, depth) in [
+            ("Tall Head Room", HistoryDepth::TallHead),
+            ("Uneven Tail Room", HistoryDepth::UnevenTail),
+        ] {
+            let room = create_room(&name.to_string(), SelfIs::Member, None, depth);
+            map.insert(room.owner_vk, room.room_data);
+        }
+    }
+
     Rooms {
         map,
         current_room_key: None,
@@ -234,6 +286,11 @@ fn create_room(
         // is raised so paired fillers still exceed the render window in
         // display items.
         HistoryDepth::AtCap => config.max_recent_messages = AT_CAP_MAX_RECENT_MESSAGES,
+        HistoryDepth::TallHead => {
+            config.max_recent_messages =
+                UNEVEN_TALL_FILLERS + TALL_HEAD_SHORT_FILLERS + STANDARD_FIXTURE_MESSAGES
+        }
+        HistoryDepth::UnevenTail => config.max_recent_messages = DEEP_ROOM_MAX_RECENT_MESSAGES,
     }
     room_state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
 
@@ -526,10 +583,18 @@ fn add_example_messages(
     // the #505 re-review blocker an alternating fixture cannot see.
     // Deterministic content and fixed 60s gaps: nothing here varies run to
     // run.
-    let filler_count = match history_depth {
-        HistoryDepth::Standard => 0,
-        HistoryDepth::Deep => DEEP_HISTORY_FILLER_MESSAGES,
-        HistoryDepth::AtCap => AT_CAP_FILLER_MESSAGES,
+    let (tall_count, filler_count) = match history_depth {
+        HistoryDepth::Standard => (0, 0),
+        HistoryDepth::Deep => (0, DEEP_HISTORY_FILLER_MESSAGES),
+        HistoryDepth::AtCap => (0, AT_CAP_FILLER_MESSAGES),
+        HistoryDepth::TallHead => (
+            UNEVEN_TALL_FILLERS,
+            UNEVEN_TALL_FILLERS + TALL_HEAD_SHORT_FILLERS,
+        ),
+        HistoryDepth::UnevenTail => (
+            UNEVEN_TAIL_TALL_FILLERS,
+            UNEVEN_TAIL_TALL_FILLERS + UNEVEN_TAIL_SHORT_FILLERS,
+        ),
     };
     for i in 0..filler_count {
         let author_slot = match history_depth {
@@ -537,14 +602,21 @@ fn add_example_messages(
             _ => i % 2,
         };
         let (author_id, signing_key) = authors[author_slot.min(authors.len() - 1)];
+        // Paragraphs, not wrapped prose, so a tall row is tall at every width.
+        let content = if i < tall_count {
+            (0..16)
+                .map(|line| format!("tall filler {i:02} line {line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        } else {
+            format!("history filler {i:02}: the window only renders a tail")
+        };
         let msg = AuthorizedMessageV1::new(
             MessageV1 {
                 room_owner: *owner_id,
                 author: author_id,
                 time: get_time_from_millis(current_time_ms),
-                content: RoomMessageBody::public(format!(
-                    "history filler {i:02}: the window only renders a tail"
-                )),
+                content: RoomMessageBody::public(content),
             },
             signing_key,
         );
@@ -1034,6 +1106,34 @@ mod tests {
              items or the windowing specs quietly degrade to the small-room \
              path; got {display_items}"
         );
+    }
+
+    /// The tall-head room must sit at its cap with its tall rows oldest, so a
+    /// burst of arrivals drains exactly those rows and the history shrinks.
+    #[test]
+    fn tall_head_room_drains_tall_rows_first() {
+        let room = create_room(
+            &"Tall Head Room".to_string(),
+            SelfIs::Member,
+            None,
+            HistoryDepth::TallHead,
+        );
+        let state = &room.room_data.room_state;
+        assert_eq!(
+            state.recent_messages.messages.len(),
+            state.configuration.configuration.max_recent_messages,
+            "the tall-head room must sit exactly at its cap so arrivals drain"
+        );
+        let texts: Vec<String> = state
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| m.message.content.as_public_string().unwrap_or_default())
+            .collect();
+        assert!(texts[..UNEVEN_TALL_FILLERS]
+            .iter()
+            .all(|t| t.starts_with("tall filler")));
+        assert!(!texts[UNEVEN_TALL_FILLERS].starts_with("tall filler"));
     }
 
     /// The impostor's name must ACTUALLY collide with the deputy's, for every

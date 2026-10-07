@@ -383,28 +383,30 @@ jobs:
     - name: Build UI with example data
       run: cargo make build-ui-example-no-sync
 
-    - name: Start dev server and wait for readiness
+    # Serve the release build just made, not `dx serve`: the watcher can
+    # rebuild underneath the run or serve a stale binary, and then the suite
+    # measures something other than this commit.
+    - name: Serve the built UI and wait for readiness
       run: |
-        cd ui && dx serve --port 8082 --features example-data,no-sync &
-        echo "Waiting for dev server to serve the app..."
-        SERVER_READY=false
-        for i in $(seq 1 90); do
-          if curl -s http://localhost:8082 2>/dev/null | grep -q "river-ui"; then
-            echo "Server ready after $((i * 3))s"
-            sleep 5
-            SERVER_READY=true
-            break
-          fi
-          sleep 3
+        PUBLIC=target/dx/river-ui/release/web/public
+        (cd "$PUBLIC" && python3 -m http.server 8082 --bind 127.0.0.1 &)
+        BUILT_JS=$(grep -o 'river-ui-dxh[0-9a-f]*\.js' "$PUBLIC/index.html" | head -1)
+        for i in $(seq 1 30); do
+          SERVED_JS=$(curl -s http://127.0.0.1:8082/ | grep -o 'river-ui-dxh[0-9a-f]*\.js' | head -1)
+          if [ -n "$SERVED_JS" ]; then break; fi
+          sleep 1
         done
-        if [ "$SERVER_READY" != "true" ]; then
-          echo "ERROR: Dev server failed to start within 270s"
+        echo "built: $BUILT_JS served: $SERVED_JS"
+        if [ -z "$BUILT_JS" ] || [ "$BUILT_JS" != "$SERVED_JS" ]; then
+          echo "ERROR: the server is not serving this build"
           exit 1
         fi
 
     - name: Run Playwright tests
       run: npx playwright test
       working-directory: ./ui/tests
+      env:
+        PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082
 
     # `always()`, not `failure()`: with `retries: 2` an intermittent test is
     # reported as "flaky" and the job still succeeds, so a `failure()` guard

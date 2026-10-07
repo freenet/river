@@ -1,6 +1,33 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { waitForApp, selectRoom } from "./example-room";
+import {
+  ALL_PROJECTS,
+  AT_BOTTOM_EPSILON_PX,
+  BOTTOM_THRESHOLD_PX,
+  HISTORY_ROWS,
+  deliver,
+  deliverOffscreen,
+  distanceFromBottom,
+  expectRowHeld,
+  expectSettleWithheld,
+  expectSettledAtBottom,
+  expectStaysPut,
+  fillHistory,
+  historyHeight,
+  holdSettleEvents,
+  knownFailure,
+  nextFrames,
+  openRoomAtBottom,
+  readerScrollsTo,
+  readerScrollsWithoutGesture,
+  readingRow,
+  releaseSettleEvents,
+  scrollTop,
+  viewportHeight,
+} from "./history-geometry";
+
+/// A draft long enough to take more than BOTTOM_THRESHOLD_PX off the history.
+const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
 
 // Regression tests for freenet/river#486: new messages arrived and the view
 // did not follow them.
@@ -39,151 +66,6 @@ import { waitForApp, selectRoom } from "./example-room";
 // Assumes the example-data build, which exposes `window.__riverTest` for
 // delivering INBOUND messages. Sending through the composer would prove
 // nothing: that path raises `force_scroll`, deliberately bypassing the pin.
-
-// Rendered history rows: display items plus date separators.
-const HISTORY_ROWS = '[data-testid="conversation-history"] > *';
-
-/// Matches BOTTOM_THRESHOLD_PX in ui/src/components/conversation.rs.
-const BOTTOM_THRESHOLD_PX = 100;
-/// Slack for fractional layout after a scroll that did land at the bottom.
-const AT_BOTTOM_EPSILON_PX = 4;
-
-/// A draft long enough to take more than BOTTOM_THRESHOLD_PX off the history.
-const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
-
-/// scrollHeight - scrollTop - clientHeight: how far the end of the history is
-/// below the visible area. 0 means the newest message is fully in view.
-function distanceFromBottom(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.getElementById("chat-scroll-container");
-    if (!el) return Number.NaN;
-    return el.scrollHeight - el.scrollTop - el.clientHeight;
-  });
-}
-
-/// Total height of the rendered history, independent of where it is scrolled.
-function historyHeight(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.getElementById("chat-scroll-container");
-    return el ? el.scrollHeight : Number.NaN;
-  });
-}
-
-/// Height of the WINDOW onto the history. Shrinks when the composer grows.
-function viewportHeight(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.getElementById("chat-scroll-container");
-    return el ? el.clientHeight : Number.NaN;
-  });
-}
-
-function scrollTop(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.getElementById("chat-scroll-container");
-    return el ? el.scrollTop : Number.NaN;
-  });
-}
-
-async function expectSettledAtBottom(page: Page, why: string) {
-  await expect
-    .poll(() => distanceFromBottom(page), {
-      timeout: 5_000,
-      message: why,
-    })
-    .toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
-}
-
-/// Deliver an inbound message, exactly as an arriving network update does, and
-/// wait until it is actually on the page.
-///
-/// Waiting on the text rather than on a fixed delay matters for the tests that
-/// assert the view did NOT move: a timeout that expires before the render lands
-/// passes whether or not the bug is present, and `retries: 2` would keep that
-/// invisible.
-async function deliver(page: Page, text: string) {
-  await callRiverTest(page, "appendMessage", text);
-  await expect(page.getByText(text, { exact: false }).last()).toBeVisible({
-    timeout: 5_000,
-  });
-}
-
-/// Open a room and wait until the history has settled at its newest message.
-///
-/// `path` lets a test opt into fixture variants the default build hides —
-/// the windowed-history tests load `/?deep-history-room=1` to get a room
-/// deeper than the render window without changing what every other spec sees.
-async function openRoomAtBottom(page: Page, roomName: string, path = "/") {
-  await page.goto(path);
-  await waitForApp(page);
-  await selectRoom(page, roomName);
-  // Mobile projects run at the desktop viewport, so the chat panel is visible;
-  // asserted since a hidden panel would make every geometry read below return 0.
-  await expect(page.locator("#chat-scroll-container")).toBeVisible({ timeout: 5_000 });
-  await expectSettledAtBottom(page, "opening a room should land on its newest message");
-}
-
-/// Simulate the reader dragging the history with a pointing device.
-///
-/// A synthetic `wheel` followed by a `scrollTop` assignment rather than
-/// `page.mouse.wheel`, which is unsupported on mobile WebKit. Both halves
-/// matter: the `wheel` is what tells the pin that the settle about to arrive is
-/// the reader's, and the `scrollTop` write is what produces that settle.
-async function readerScrollsTo(page: Page, top: number) {
-  await page.evaluate((t) => {
-    const el = document.getElementById("chat-scroll-container")!;
-    el.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }));
-    el.scrollTop = t;
-  }, top);
-}
-
-/// The same, with NO gesture event at all.
-///
-/// Not a contrivance: a native scrollbar drag dispatches no pointer event to
-/// the content on Firefox, and find-in-page, focus-driven scrolling and browser
-/// scroll restoration produce none either. Nothing in the implementation
-/// listens for gestures — whose settle it is, is decided by where the view came
-/// to rest — so this is the ordinary path rather than a fallback. Unlike
-/// `readerScrollsTo`, this helper waits for `scrollend` because the pin
-/// re-arms there, so an arrival before that races the handler. The pre-settle
-/// window is still covered on purpose by the batched at-cap test, which
-/// deliberately does not wait.
-async function readerScrollsWithoutGesture(page: Page, top: number) {
-  await page.evaluate(async (t) => {
-    const el = document.getElementById("chat-scroll-container")!;
-    const settled = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
-      el.addEventListener(
-        "scrollend",
-        () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        { once: true },
-      );
-    });
-    el.scrollTop = t;
-    await settled;
-  }, top);
-}
-
-/// Hold for a moment and assert the view did not move.
-///
-/// Compares `scrollTop` rather than distance-from-bottom: distance also moves
-/// when content grows, so it would tolerate a partial yank of up to the new
-/// message's height.
-async function expectStaysPut(page: Page, why: string) {
-  const before = await scrollTop(page);
-  await page.waitForTimeout(600);
-  expect(await scrollTop(page), why).toBeCloseTo(before, 0);
-}
-
-/// Add enough history to have somewhere to scroll back through.
-async function fillHistory(page: Page) {
-  for (let i = 0; i < 8; i++) {
-    await deliver(page, `filler ${i}: ${"y".repeat(200)}`);
-  }
-  await expectSettledAtBottom(page, "filler messages should have been followed");
-}
 
 test.describe("Conversation follows new messages (#486)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
@@ -928,5 +810,226 @@ test.describe("Windowed history follows arrivals (#501)", () => {
       page,
       "the room should still be at its newest message after settling"
     );
+  });
+});
+
+// 10a coverage (docs/plans/ui-ux-reimplementation/10a-scroll-regression-coverage.plan.md).
+// A-IDs name the plan's eight focused areas. Tests marked CURRENT POLICY
+// characterize behavior 10b changes on purpose; the rest are invariants.
+
+test.describe("Arrival before the reader's settle (A01)", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  // freenet/river#723. The pin re-arms only when the reader's settle lands, so
+  // an arrival patched between "back at the bottom" and that settle is not
+  // followed. CURRENT POLICY: main intends to follow here; 10b drops following
+  // and keeps only "no unrequested navigation".
+  test("an arrival patched before the reader's return-to-bottom settles is followed", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await readerScrollsWithoutGesture(page, 0);
+    expect(await distanceFromBottom(page), "premise: parked away from the end").toBeGreaterThan(
+      BOTTOM_THRESHOLD_PX,
+    );
+
+    await holdSettleEvents(page);
+    await page.evaluate(() => {
+      const el = document.getElementById("chat-scroll-container")!;
+      el.scrollTop = el.scrollHeight;
+    });
+    await expectSettleWithheld(page);
+    expect(await distanceFromBottom(page), "premise: the reader is back at the end").toBeLessThanOrEqual(
+      AT_BOTTOM_EPSILON_PX,
+    );
+    await deliverOffscreen(page, "arrived before the reader's settle");
+    await nextFrames(page);
+    await releaseSettleEvents(page);
+
+    knownFailure(ALL_PROJECTS, "freenet/river#723");
+    await expectSettledAtBottom(
+      page,
+      "the reader returned to the end, a message landed before their settle, and it was not followed",
+      2_000,
+    );
+  });
+
+  // freenet/river#508. The reader scrolls up and, before their settle, a burst
+  // drains TALL rows from the head of an at-cap room, so the history shrinks
+  // under them and the browser clamps their offset. With the pin still
+  // stale-true that clamp reads as "not moved", and the view is taken to the
+  // end. Invariant: the row they scrolled to stays where it is.
+  test("a shrinking at-cap burst before the reader's settle keeps their row", async ({ page }) => {
+    await openRoomAtBottom(page, "Tall Head Room", "/?uneven-history=1");
+    await expect(
+      page.locator("[data-item-key]").first(),
+      "premise: the room's oldest rows are the tall ones",
+    ).toContainText("tall filler");
+
+    await holdSettleEvents(page);
+    await readerScrollsTo(page, (await scrollTop(page)) - 300);
+    await expectSettleWithheld(page);
+    const row = await readingRow(page);
+    expect(row, "premise: a row is fully in view after scrolling up").not.toBeNull();
+    const heightBefore = await historyHeight(page);
+
+    // One arrival per tall row: the at-cap prune drains exactly those.
+    await callRiverTest(page, "appendMessages", 8);
+    await expect(page.getByText("tall filler", { exact: false })).toHaveCount(0, { timeout: 5_000 });
+    expect(
+      heightBefore - (await historyHeight(page)),
+      "premise: the burst should shrink the history by more than the reader scrolled",
+    ).toBeGreaterThan(300);
+    await nextFrames(page);
+    await releaseSettleEvents(page);
+
+    knownFailure(ALL_PROJECTS, "freenet/river#508");
+    await expectRowHeld(page, row!.key, row!.top, "the reader's row moved when a burst shrank the history before their settle");
+  });
+});
+
+/// Backfill until the tall rows render, then return to the end. Returns the
+/// rendered row counts the history went through after the return.
+async function backfillThenReturn(page: Page): Promise<number[]> {
+  const tallest = page.getByText(`tall filler 39 line 00`, { exact: false });
+  for (let i = 0; i < 5 && (await tallest.count()) === 0; i++) {
+    const before = await page.locator("[data-item-key]").count();
+    await page.evaluate(() => {
+      document.getElementById("chat-scroll-container")!.scrollTop = 0;
+    });
+    await expect.poll(() => page.locator("[data-item-key]").count()).toBeGreaterThan(before);
+  }
+  await expect(tallest, "premise: backfill should reach the tall rows").toHaveCount(1);
+  await page.evaluate(() => {
+    const hist = document.querySelector('[data-testid="conversation-history"]')!;
+    const counts: number[] = [];
+    (window as any).__riverRowCounts = counts;
+    let last = hist.querySelectorAll("[data-item-key]").length;
+    new MutationObserver(() => {
+      const n = hist.querySelectorAll("[data-item-key]").length;
+      if (n !== last) counts.push((last = n));
+    }).observe(hist, { childList: true });
+    const c = document.getElementById("chat-scroll-container")!;
+    c.scrollTop = c.scrollHeight;
+  });
+  await page.waitForTimeout(2_000);
+  return page.evaluate(() => (window as any).__riverRowCounts);
+}
+
+test.describe("Render ceiling and trimming (A04, A05)", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  // The arrival-growth ceiling (WINDOW_ITEMS_CEILING, 240 items) slides the
+  // rendered range forward past a parked reader's row although the room still
+  // holds that message. Removing it from the DOM is not deleting it: the row
+  // must stay renderable where the reader left it.
+  test("a burst past the render ceiling keeps a parked reader's row rendered", async ({ page }) => {
+    await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1");
+    // Below the backfill strip (top 800px), near the head of the window.
+    await readerScrollsWithoutGesture(page, 1_000);
+    const row = await readingRow(page, "history filler");
+    expect(row, "premise: a filler row is fully in view").not.toBeNull();
+    const fillerIndex = Number(/history filler (\d+)/.exec(row!.text)![1]);
+
+    // 200 arrivals take the room from 201 messages past its 300 cap, so the
+    // oldest 101 are pruned, and grow the rendered range past the ceiling.
+    const BURST = 200;
+    const pruned = 201 + BURST - 300;
+    expect(
+      fillerIndex,
+      "premise: the reader's message survives the prune, so it is still in the room",
+    ).toBeGreaterThanOrEqual(pruned);
+    await callRiverTest(page, "appendMessages", BURST);
+    await expect(page.getByText(`batched arrival ${BURST - 1}`, { exact: false })).toHaveCount(1, {
+      timeout: 10_000,
+    });
+    await expect(
+      page.getByText(`history filler ${String(pruned - 1).padStart(2, "0")}:`, { exact: false }),
+      "premise: the prune should have landed",
+    ).toHaveCount(0);
+
+    knownFailure(ALL_PROJECTS, "render-ceiling eviction of a surviving row (freenet/river#732 review 42f541b6)");
+    await expectRowHeld(page, row!.key, row!.top, "a burst past the render ceiling took the reader off a message the room still holds");
+  });
+
+  // Tall older rows and a short retained tail: the trim decision estimates
+  // the tail from the AVERAGE rendered row height. At an ordinary height the
+  // real tail still clears the backfill strip, so the window trims once and
+  // stays trimmed, and paging back still works.
+  test("returning to the end after paging into tall rows trims once and stays bounded", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Uneven Tail Room", "/?uneven-history=1");
+    const counts = await backfillThenReturn(page);
+    expect(counts, "the window should trim back to its initial size exactly once").toEqual([60]);
+    await expectSettledAtBottom(page, "the trim left the view off the end");
+
+    const before = await page.locator("[data-item-key]").count();
+    await page.evaluate(() => {
+      document.getElementById("chat-scroll-container")!.scrollTop = 0;
+    });
+    await expect
+      .poll(() => page.locator("[data-item-key]").count(), { message: "paging back after the trim revealed nothing" })
+      .toBeGreaterThan(before);
+  });
+});
+
+test.describe("Trimming on a very tall viewport (A05)", () => {
+  // A zoomed-out window or tall portrait monitor: the real retained tail now
+  // sits inside the backfill strip's reach while the average-height estimate
+  // still says it clears it.
+  test.use({ viewport: { width: 1280, height: 5_800 } });
+
+  test("returning to the end after paging into tall rows does not trim and refill", async ({ page }) => {
+    await openRoomAtBottom(page, "Uneven Tail Room", "/?uneven-history=1");
+    // Measured, not estimated: the height of the 60 newest item rows.
+    const tail = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const rows = c.querySelectorAll<HTMLElement>("[data-item-key]");
+      return c.scrollHeight - rows[rows.length - 60].offsetTop;
+    });
+    expect(
+      tail,
+      "premise: a trimmed (60-row, short) window must sit within the backfill strip's reach of the viewport",
+    ).toBeLessThan((await viewportHeight(page)) + 800);
+    const counts = await backfillThenReturn(page);
+    knownFailure(
+      ALL_PROJECTS,
+      "trim and backfill oscillate: the trim estimate averages row heights (the #505 loop, via uneven rows)",
+    );
+    expect(
+      counts.length,
+      `the window trimmed and refilled after the reader returned to the end (row counts: ${counts.slice(0, 8).join(" → ")}…)`,
+    ).toBeLessThanOrEqual(1);
+  });
+});
+
+test.describe("Own send while reading history (A06)", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  // CURRENT POLICY: your own message snaps the view to the latest message
+  // (`force_scroll`), wherever you were reading. 10b replaces this with
+  // position preservation; the send and the draft clearing stay.
+  test("sending while scrolled up submits, clears the draft and snaps to the latest message", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Your Private Room");
+    await fillHistory(page);
+    await readerScrollsWithoutGesture(page, 0);
+    expect(await distanceFromBottom(page), "premise: reading older messages").toBeGreaterThan(
+      BOTTOM_THRESHOLD_PX,
+    );
+
+    const input = page.getByTestId("message-input");
+    await input.fill("own send while reading history");
+    await input.press("Enter");
+
+    await expect(input, "the draft was not cleared").toHaveValue("");
+    await expect(
+      page.locator("[data-item-key]").last(),
+      "the sent message is not the newest row",
+    ).toContainText("own send while reading history");
+    await expectSettledAtBottom(page, "own send did not snap to the latest message (current policy)");
   });
 });

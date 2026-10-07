@@ -7,6 +7,7 @@ export type RiverTestHooks = {
   appendMessage(text: string): void;
   insertMessageBeforeLast(text: string): void;
   appendMessages(count: number): void;
+  removeMessages(containing: string): void;
   setRoomsLoadState(state: RoomsLoadState): void;
   switchRoom(name: string): void;
 };
