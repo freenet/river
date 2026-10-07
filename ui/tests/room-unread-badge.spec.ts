@@ -1,12 +1,16 @@
 import { test, expect, Page } from "@playwright/test";
 import { waitForApp, selectListedRoom } from "./example-room";
 import {
+  AT_BOTTOM_EPSILON_PX,
   BOTTOM_THRESHOLD_PX,
   deliverOffscreen,
   distanceFromBottom,
   expectParkedAwayFromEnd,
+  expectReadingRow,
+  expectRowHeld,
   expectStaysPut,
   fillHistory,
+  newestRowFromViewBottom,
   openRoomAtBottom,
   readerScrollsWithoutGesture,
   scrollTop,
@@ -140,10 +144,11 @@ test.describe("Muted rooms and the cross-surface totals", { tag: "@chromium-only
 });
 
 // A short arrival related to where the view actually is (A07): is it on screen,
-// is the scroll-to-latest button offered, and is the room marked read anyway?
-// CURRENT POLICY throughout this block: catch-up visibility and read
-// acknowledgment are deliberate behavior that may be changed on purpose. The
-// viewport witness (is the arrival on screen?) is what stays.
+// is the Latest button offered, and is the room marked read anyway? The 10c
+// policy for Latest: it shows whenever the newest message's bottom is off
+// screen, without the old 100px band (decision 4). CURRENT POLICY for read
+// acknowledgment: deliberate behavior that may be changed on purpose. The
+// viewport witnesses (`onScreen`, `belowView`) are independent of both.
 test.describe("Unseen arrivals versus the viewport (A07)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -155,6 +160,16 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
       return r.bottom > c.top && r.top < c.bottom;
     });
   }
+
+  /// How far the text's bubble reaches below the visible part of the history.
+  function belowView(page: Page, text: string): Promise<number> {
+    return page.getByText(text, { exact: false }).evaluate((el) => {
+      const c = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+      return el.getBoundingClientRect().bottom - c.bottom;
+    });
+  }
+
+  const latest = (page: Page) => page.getByTestId("scroll-to-bottom");
 
   test("an arrival below a parked reader stays off screen, offers catch-up, and still marks the room read", async ({
     page,
@@ -177,24 +192,82 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
     await expect(teamChat.locator('[data-testid="room-unread-badge"]')).toHaveCount(0);
   });
 
-  test("an arrival for a reader inside the bottom band is followed while catch-up stays hidden", async ({
+  test("a reader parked inside the old 100px band is offered Latest, and an arrival below them leaves the view alone", async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
-    // Inside the band the reader still counts as following, so a late layout
-    // change from the fillers would snap them back; let it land first.
-    await expectStaysPut(page, "the history was still moving after the fillers");
-    // Up, but inside the 100px band that still counts as "at the bottom".
+    await expectStaysPut(page, "premise: the history was still moving after the fillers");
+    // Up, but inside the 100px band that used to count as "at the bottom".
     await readerScrollsWithoutGesture(page, (await scrollTop(page)) - 60);
     const distance = await distanceFromBottom(page);
-    expect(distance, "premise: inside the bottom band").toBeGreaterThan(40);
-    expect(distance, "premise: inside the bottom band").toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
-    await expect(page.getByTestId("scroll-to-bottom"), "premise: no catch-up inside the band").toHaveCount(0);
+    expect(distance, "premise: inside the old bottom band").toBeGreaterThan(40);
+    expect(distance, "premise: inside the old bottom band").toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+    await expect(latest(page), "the newest message's bottom is off screen and Latest is not offered").toBeVisible();
 
+    const row = await expectReadingRow(page);
     await deliverOffscreen(page, "short arrival inside the band");
-    // Followed, so hiding catch-up is consistent with the view.
-    await expect.poll(() => onScreen(page, "short arrival inside the band")).toBe(true);
-    await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);
+    await expectRowHeld(page, row.key, row.top, "an arrival moved a reader inside the old bottom band");
+    expect(await onScreen(page, "short arrival inside the band"), "the arrival was brought on screen").toBe(false);
+    await expect(latest(page)).toBeVisible();
+  });
+
+  test("a short arrival just below a reader at the end shows Latest", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await expect(latest(page), "premise: no Latest at the newest message").toHaveCount(0);
+
+    const row = await expectReadingRow(page);
+    await deliverOffscreen(page, "short arrival below the end");
+    await expectRowHeld(page, row.key, row.top, "an arrival moved a reader at the end");
+    expect(
+      await belowView(page, "short arrival below the end"),
+      "the arrival's bottom was brought on screen",
+    ).toBeGreaterThan(AT_BOTTOM_EPSILON_PX);
+    await expect(latest(page), "the newest message's bottom is off screen and Latest is not offered").toBeVisible();
+  });
+
+  /// conversation.rs `NEWEST_IN_VIEW_SLACK_PX`: how far below the visible
+  /// history the newest message's bottom may sit and still count as on screen.
+  const NEWEST_IN_VIEW_SLACK_PX = 4;
+
+  /// Scroll so the newest row's bottom sits `below` px under the visible
+  /// history's bottom edge (negative: above it). Returns where it landed.
+  async function parkNewestBottom(page: Page, below: number): Promise<number> {
+    const target = await page.evaluate((b) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const rows = c.querySelectorAll("[data-item-key]");
+      const newestBottom = rows[rows.length - 1].getBoundingClientRect().bottom;
+      return c.scrollTop + newestBottom - c.getBoundingClientRect().bottom - b;
+    }, below);
+    await readerScrollsWithoutGesture(page, target);
+    return -(await newestRowFromViewBottom(page)).gap;
+  }
+
+  /// The history's own padding must not count as part of the newest message:
+  /// the slack is a few px past the message's bottom, not past the padding
+  /// below it (10c decision 4).
+  test("the newest message's bottom just below the view offers Latest", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await deliverOffscreen(page, "newest near the bottom edge");
+
+    const below = await parkNewestBottom(page, 10);
+    expect(below, "premise: the newest message's bottom is past the slack").toBeGreaterThan(NEWEST_IN_VIEW_SLACK_PX + 2);
+    expect(below, "premise: ...by a few px").toBeLessThan(14);
+
+    await expect(latest(page), "the newest message's bottom is below the view and Latest is not offered").toBeVisible();
+  });
+
+  test("the newest message's bottom just inside the view hides Latest", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await deliverOffscreen(page, "newest near the bottom edge");
+
+    const below = await parkNewestBottom(page, -6);
+    expect(below, "premise: the newest message's bottom is inside the view").toBeLessThan(-2);
+    expect(below, "premise: ...by a few px, closer than the history's bottom padding").toBeGreaterThan(-11);
+
+    await expect(latest(page), "all of the newest message is on screen and Latest is still offered").toHaveCount(0);
   });
 });

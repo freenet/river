@@ -1,13 +1,17 @@
 import { test, expect, Page, Route } from "@playwright/test";
 import { callRiverTest } from "./river-test";
+import { selectListedRoom } from "./example-room";
 import {
   ALL_PROJECTS,
   BOTTOM_THRESHOLD_PX,
+  deliverOffscreen,
   distanceFromBottom,
   expectParkedAwayFromEnd,
+  expectReadingRow,
   expectRowHeld,
   expectSettledAtBottom,
   fillHistory,
+  historyHeight,
   knownFailure,
   nextFrames,
   openRoomAtBottom,
@@ -16,10 +20,11 @@ import {
   readingRow,
   rowTop,
   scrollTop,
+  viewportHeight,
 } from "./history-geometry";
 
 // A parked reader's place when the history changes above them (A02) or while
-// the chat panel is hidden (A03). The reading row is measured relative to the
+// the chat panel is hidden or the room empty (A03). The reading row is measured relative to the
 // container, by message identity, against READING_ROW_BUDGET_PX.
 
 /// Scroll a settled reader so `key`'s row sits 40px below the top of the
@@ -42,6 +47,19 @@ async function keyOf(page: Page, text: string): Promise<string> {
   const row = page.locator("[data-item-key]", { hasText: text });
   await expect(row).toHaveCount(1);
   return (await row.getAttribute("data-item-key"))!;
+}
+
+/// Below the 768px breakpoint, open the members panel, which replaces the chat.
+async function hideChatBehindMembers(page: Page) {
+  await page.getByTestId("header-members-button").click();
+  await expect(page.locator("aside").filter({ hasText: "Active Members" })).toBeVisible();
+  await expect(page.locator("#chat-scroll-container"), "premise: the chat panel is hidden").toBeHidden();
+}
+
+async function backToChat(page: Page) {
+  await page.locator("aside").filter({ hasText: "Active Members" }).locator("button").first().click();
+  await expect(page.locator("#chat-scroll-container")).toBeVisible();
+  await nextFrames(page);
 }
 
 test.describe("Reading position when content above changes (A02)", () => {
@@ -156,21 +174,43 @@ test.describe("Reading position when content above changes (A02)", () => {
   });
 });
 
-test.describe("Reading position across a hidden chat panel (A03)", () => {
+test.describe("Deleting the reading row while the chat is hidden (A02)", () => {
   // Below the 768px breakpoint, so the members panel replaces the chat.
   test.use({ viewport: { width: 390, height: 844 } });
 
-  async function hideChatBehindMembers(page: Page) {
-    await page.getByTestId("header-members-button").click();
-    await expect(page.locator("aside").filter({ hasText: "Active Members" })).toBeVisible();
-    await expect(page.locator("#chat-scroll-container"), "premise: the chat panel is hidden").toBeHidden();
-  }
+  // The visible variant above holds the row above because nothing corrects a
+  // mid-window removal. Hidden, the reveal restores the reader from the anchor
+  // saved before the panel hid, and that restore has to hold the same row: the
+  // one above the deleted row, not the one below (10c decision 7).
+  test("deleting the row a reader is looking at while the chat is hidden holds the row above on reveal", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page, "keep");
+    await fillHistory(page, "tail");
+    await parkWithRowAtTop(page, await keyOf(page, "keep 2:"));
+    await expectParkedAwayFromEnd(page);
+    const row = await readingRow(page, "keep 2:");
+    expect(row, "premise: the reader is looking at the row to delete").not.toBeNull();
+    expect((await readingRow(page))!.key, "premise: the row to delete is the first one fully in view").toBe(row!.key);
+    // Not the row below: alternating authors mean the rows either side merge
+    // into one group once this one is gone.
+    expect(row!.prevKey, "premise: a row precedes it").not.toBeNull();
+    const prevTop = (await rowTop(page, row!.prevKey!))!;
 
-  async function backToChat(page: Page) {
-    await page.locator("aside").filter({ hasText: "Active Members" }).locator("button").first().click();
-    await expect(page.locator("#chat-scroll-container")).toBeVisible();
-    await nextFrames(page);
-  }
+    await hideChatBehindMembers(page);
+    await callRiverTest(page, "removeMessages", "keep 2:");
+    await expect(page.getByText("keep 2:", { exact: false })).toHaveCount(0, { timeout: 5_000 });
+    await backToChat(page);
+
+    await expectParkedAwayFromEnd(page, "the reveal took the reader to the latest message");
+    await expectRowHeld(page, row!.prevKey!, prevTop, "the row above the deleted one moved across the hidden deletion");
+  });
+});
+
+test.describe("Reading position across a hidden chat panel (A03)", () => {
+  // Below the 768px breakpoint, so the members panel replaces the chat.
+  test.use({ viewport: { width: 390, height: 844 } });
 
   // #732's hidden-column findings: the head-swap compensation measures rows
   // with `offsetTop`, which is 0 for every row of a `display:none` panel, so a
@@ -342,5 +382,33 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await expectSettledAtBottom(page, "the room switched to while hidden did not open at its newest message");
     await page.waitForTimeout(600);
     await expectSettledAtBottom(page, "the newly opened room did not stay at its newest message");
+  });
+});
+
+test.describe("Opening a room that is temporarily empty (A03)", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  // The opening waits for rows. A room opened with no messages lands at its
+  // newest message when the first ones arrive, once, and then stays put.
+  test("a room opened empty lands at its newest message when its first messages arrive", async ({ page }) => {
+    const empty = page.getByText("No messages yet", { exact: false });
+    await openRoomAtBottom(page, "Public Discussion Room");
+    await callRiverTest(page, "removeMessages", "");
+    await expect(empty, "premise: the room should now be empty").toBeVisible();
+    await selectListedRoom(page, "Team Chat Room");
+    await selectListedRoom(page, "Public Discussion Room");
+    await expect(empty, "premise: the room opened empty").toBeVisible();
+
+    await callRiverTest(page, "appendMessages", 30);
+    await expect(page.getByText("batched arrival 29", { exact: false })).toHaveCount(1, { timeout: 5_000 });
+    expect(
+      await historyHeight(page),
+      "premise: the first messages should overflow the view",
+    ).toBeGreaterThan((await viewportHeight(page)) + BOTTOM_THRESHOLD_PX);
+    await expectSettledAtBottom(page, "the room opened empty did not open at its newest message");
+
+    const row = await expectReadingRow(page);
+    await deliverOffscreen(page, "arrival after the opening");
+    await expectRowHeld(page, row.key, row.top, "an arrival after the opening moved the view");
   });
 });

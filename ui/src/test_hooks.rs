@@ -2,22 +2,30 @@
 //! INBOUND messages, remove messages, and drive the no-room screen's load
 //! states.
 //!
-//! The composer is not a substitute: `handle_send_message` raises
-//! `force_scroll`, which deliberately bypasses the pin that the scroll specs
-//! exist to test, so a message sent through the UI proves nothing about how an
-//! arriving one behaves. These write straight into `ROOMS`, as an arriving
-//! network update does.
+//! The composer is not a substitute: an own send is an explicit request to go
+//! to the newest message (10c decision 3), so a message sent through the UI
+//! proves nothing about how an arriving one behaves. These write straight into
+//! `ROOMS`, as an arriving network update does.
 //!
-//! They skip `apply_delta`'s verification on purpose, so they must never be
-//! reachable anywhere the result could be pushed to the network. The module
-//! compiles only for wasm32 with two features, both required:
+//! A real arrival's author is a member, because the contract only keeps
+//! messages signed by a member or the owner, so the hooks admit their test
+//! identities as members too (see `admit_test_member`). Without that, the
+//! first message the reader sends re-applies that rule locally and drops every
+//! message the hooks delivered.
+//!
+//! None of these hooks scroll. Where the view ends up is the app's doing.
+//!
+//! They skip `apply_delta`'s verification on purpose, and admit test
+//! identities on self's say-so, so they must never be reachable anywhere the
+//! result could be pushed to the network. The module compiles only for wasm32
+//! with two features, both required:
 //!
 //! * `example-data`, which is off for the published webapp (`UI_FEATURES` is
 //!   empty for `build-webapp`) and for every non-example build;
 //! * `no-sync`, because `cargo make dev-example` turns `example-data` on
-//!   WITHOUT it. A message minted here is signed by a key that is not a room
-//!   member, so a developer pointing that build at a live node would otherwise
-//!   have the synchronizer try to push contract-invalid state.
+//!   WITHOUT it. A developer pointing that build at a live node would
+//!   otherwise have the synchronizer push the test members and their messages
+//!   into a real room, or contract-invalid state where they do not verify.
 
 use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
@@ -25,10 +33,11 @@ use crate::room_data::{CurrentRoom, RoomData};
 use dioxus::prelude::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::{
-    member::MemberId,
+    configuration::AuthorizedConfigurationV1,
+    member::{AuthorizedMember, Member, MemberId},
     member_info::{AuthorizedMemberInfo, MemberInfo},
     message::{AuthorizedMessageV1, MessageV1, RoomMessageBody},
-    privacy::SealedBytes,
+    privacy::{PrivacyMode, SealedBytes},
 };
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::convert::FromWasmAbi;
@@ -52,11 +61,31 @@ pub fn install_test_hooks() {
         let _ = js_sys::Reflect::set(hooks, &JsValue::from_str(name), &hook);
     }
 
+    fn expose2<A: FromWasmAbi + 'static, B: FromWasmAbi + 'static>(
+        hooks: &js_sys::Object,
+        name: &str,
+        hook: impl FnMut(A, B) + 'static,
+    ) {
+        let hook = Closure::<dyn FnMut(A, B)>::new(hook).into_js_value();
+        let _ = js_sys::Reflect::set(hooks, &JsValue::from_str(name), &hook);
+    }
+
     let hooks = js_sys::Object::new();
 
     expose(&hooks, "appendMessage", move |text: String| {
         crate::util::defer(move || deliver([(text, Delivery::Append)]));
     });
+
+    // An arrival from a member whose clock runs `seconds` ahead of ours. Up to
+    // the 60s skew tolerance in conversation.rs it keeps its own timestamp, so
+    // a message sent here afterwards sorts ABOVE it (the A06 clock-skew case).
+    expose2(
+        &hooks,
+        "appendMessageAhead",
+        move |text: String, seconds: u32| {
+            crate::util::defer(move || deliver([(text, Delivery::Ahead(seconds))]));
+        },
+    );
 
     expose(&hooks, "insertMessageBeforeLast", move |text: String| {
         crate::util::defer(move || deliver([(text, Delivery::BeforeLast)]));
@@ -78,6 +107,44 @@ pub fn install_test_hooks() {
     // action. The scroll specs use it for deletions above and at the reader.
     expose(&hooks, "removeMessages", move |needle: String| {
         crate::util::defer(move || remove_messages(&needle));
+    });
+
+    // Put the current room in the state of a private room whose secret this
+    // device does not hold. A send then falls back to a public body, which
+    // the send's own local `apply_delta` rejects ("Cannot send public messages
+    // in private room"), so the send fails AFTER the composer has handed it
+    // off: the failed-send case of the A06 specs. The rendered history does
+    // not change, since every example message body is public.
+    //
+    // Only for a room self owns: the configuration is re-signed with the
+    // owner's key, because a configuration that fails its signature check
+    // reads as a room still awaiting its initial sync, which has no composer.
+    expose(&hooks, "makeRoomPrivateWithoutSecret", move |_: JsValue| {
+        crate::util::defer(|| {
+            let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+                return;
+            };
+            ROOMS.with_mut(|rooms| {
+                let Some(room) = rooms.map.get_mut(&room_key) else {
+                    return;
+                };
+                let Some(owner_sk) = room
+                    .signing_key()
+                    .filter(|sk| sk.verifying_key() == room_key)
+                    .cloned()
+                else {
+                    web_sys::console::error_1(
+                        &"__riverTest.makeRoomPrivateWithoutSecret: self must own the room".into(),
+                    );
+                    return;
+                };
+                let mut config = room.room_state.configuration.configuration.clone();
+                config.privacy_mode = PrivacyMode::Private;
+                room.room_state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
+                room.secrets.clear();
+                room.current_secret_version = None;
+            });
+        });
     });
 
     // Drive the no-room screen's load states (freenet/river#509), which the
@@ -141,6 +208,8 @@ enum Delivery {
     /// WITHOUT remounting its last row, which is the case the old
     /// `onmounted`-on-the-last-bubble scroll trigger could not see.
     BeforeLast,
+    /// At the end, stamped this many seconds ahead of our clock.
+    Ahead(u32),
 }
 
 // Drives the append-author alternation, across single and batched deliveries.
@@ -168,12 +237,43 @@ fn test_author(delivery: Delivery) -> (SigningKey, &'static str) {
             }
         }
         Delivery::BeforeLast => (SigningKey::from_bytes(&[0x7B; 32]), "Test Sender Insert"),
+        // Its own identity, so it never groups with the arrival before it.
+        Delivery::Ahead(_) => (SigningKey::from_bytes(&[0x8C; 32]), "Test Sender Ahead"),
     }
 }
 
+/// Admit `member_vk` to `room` as a member invited by self, so its messages
+/// survive `MessagesV1::apply_delta`, which keeps only messages signed by a
+/// member or the owner. The invitation chain is test identity -> self ->
+/// owner. Skipped where self cannot vouch: an observer is not a member, and
+/// such a room has no composer, so no local `apply_delta` runs there anyway.
+fn admit_test_member(room: &mut RoomData, room_key: &VerifyingKey, member_vk: VerifyingKey) {
+    let owner_id = MemberId::from(room_key);
+    let members = &room.room_state.members.members;
+    if member_vk == *room_key || members.iter().any(|m| m.member.member_vk == member_vk) {
+        return;
+    }
+    let Some(self_sk) = room.signing_key().cloned() else {
+        return;
+    };
+    let self_vk = self_sk.verifying_key();
+    if self_vk != *room_key && !members.iter().any(|m| m.member.member_vk == self_vk) {
+        return;
+    }
+    room.room_state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: MemberId::from(&self_vk),
+            member_vk,
+        },
+        &self_sk,
+    ));
+}
+
 /// Insert `text` into `room` where `delivery` says, as that delivery's test
-/// identity, registering the identity's nickname the first time it speaks so
-/// the bubble renders like any other member's rather than as "Unknown".
+/// identity, admitting it as a member (see `admit_test_member`) and
+/// registering its nickname the first time it speaks so the bubble renders
+/// like any other member's rather than as "Unknown".
 fn push_test_message(
     room: &mut RoomData,
     room_key: &VerifyingKey,
@@ -182,6 +282,7 @@ fn push_test_message(
 ) {
     let (sk, nickname) = test_author(delivery);
     let author = MemberId::from(&sk.verifying_key());
+    admit_test_member(room, room_key, sk.verifying_key());
     if !room
         .room_state
         .member_info
@@ -203,19 +304,24 @@ fn push_test_message(
             ));
     }
 
+    let now = crate::util::get_current_system_time();
+    let time = match delivery {
+        Delivery::Ahead(seconds) => now + std::time::Duration::from_secs(seconds.into()),
+        Delivery::Append | Delivery::BeforeLast => now,
+    };
     let message = AuthorizedMessageV1::new(
         MessageV1 {
             room_owner: MemberId::from(room_key),
             author,
             content: RoomMessageBody::public(text),
-            time: crate::util::get_current_system_time(),
+            time,
         },
         &sk,
     );
 
     let messages = &mut room.room_state.recent_messages.messages;
     let at = match delivery {
-        Delivery::Append => messages.len(),
+        Delivery::Append | Delivery::Ahead(_) => messages.len(),
         Delivery::BeforeLast => messages.len().saturating_sub(1),
     };
     messages.insert(at, message);
