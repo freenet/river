@@ -56,6 +56,45 @@ async function coarsePointer(page: Page): Promise<boolean> {
   );
 }
 
+// Fixture reactions are written into example state, not sent as signed
+// messages. The first real toggle rebuilds that state from messages and
+// drops every fixture chip, so "one fewer chip in the room" lands on 0.
+// Removal is asserted on a reaction this test adds itself.
+async function addOwnReaction(page: Page): Promise<Locator> {
+  const row = page
+    .locator('[id^="msg-"]')
+    .filter({
+      hasNot: page.locator('[data-testid="reaction-chip"][title*="click to remove"]'),
+    })
+    .last();
+  await expect(row).toBeVisible();
+  const id = await row.getAttribute("id");
+  const pinned = page.locator(`[id="${id}"]`);
+  await pinned.scrollIntoViewIfNeeded();
+  if (!(await coarsePointer(page))) {
+    await pinned.hover();
+  }
+  await pinned.getByTestId("add-reaction-button").click();
+  await page.getByTestId("emoji-picker").getByRole("button").first().click();
+  const chip = pinned.locator('[data-testid="reaction-chip"][title*="click to remove"]');
+  await expect(chip).toHaveCount(1);
+  return chip;
+}
+
+async function removeOwnReaction(page: Page, chip: Locator) {
+  await chip.scrollIntoViewIfNeeded();
+  await chip.click();
+  const owners = page.getByTestId("reaction-owners");
+  if (await coarsePointer(page)) {
+    await expect(owners).toBeVisible();
+    await owners.getByTestId("reaction-remove").click();
+    await expect(owners).toHaveCount(0);
+  } else {
+    await expect(owners).toHaveCount(0);
+  }
+  await expect(chip).toHaveCount(0);
+}
+
 async function chipByOwnReaction(page: Page, own: boolean): Promise<Locator> {
   const selector = own
     ? '[data-testid="reaction-chip"][title*="click to remove"]'
@@ -127,15 +166,12 @@ test.describe("Reaction owner list (#714)", () => {
         page.locator('[data-testid="reaction-chip"][title*="click to remove"]')
       ).toHaveCount(ownCount);
 
-      await owners.getByTestId("reaction-remove").click();
+      await page.mouse.click(8, 8);
       await expect(owners).toHaveCount(0);
-      await expect(
-        page.locator('[data-testid="reaction-chip"][title*="click to remove"]')
-      ).toHaveCount(ownCount - 1);
+
+      const added = await addOwnReaction(page);
+      await removeOwnReaction(page, added);
     } else {
-      const ownCount = await page
-        .locator('[data-testid="reaction-chip"][title*="click to remove"]')
-        .count();
       const otherCount = await page
         .locator('[data-testid="reaction-chip"]:not([title*="click to remove"])')
         .count();
@@ -146,11 +182,19 @@ test.describe("Reaction owner list (#714)", () => {
         page.locator('[data-testid="reaction-chip"]:not([title*="click to remove"])')
       ).toHaveCount(otherCount);
 
+      // A fine pointer does not open the list. The click removes this chip.
+      // Wait for that message to drop it before adding another: the toggle
+      // is deferred, and a room-wide count is not stable (fixture chips
+      // that were never signed messages leave with the first real toggle).
+      const ownMessageId = await own.evaluate((el) => el.closest('[id^="msg-"]')?.id ?? "");
       await own.click();
       await expect(owners).toHaveCount(0);
       await expect(
-        page.locator('[data-testid="reaction-chip"][title*="click to remove"]')
-      ).toHaveCount(ownCount - 1);
+        page.locator(`[id="${ownMessageId}"]`).locator('[data-testid="reaction-chip"][title*="click to remove"]')
+      ).toHaveCount(0);
+
+      const added = await addOwnReaction(page);
+      await removeOwnReaction(page, added);
     }
   });
 });
