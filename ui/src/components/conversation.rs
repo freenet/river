@@ -3810,11 +3810,6 @@ pub fn Conversation() -> Element {
     // It also finishes a jump to latest from a held range: only after the
     // render that swapped in the latest range is there a newest row to scroll
     // to. The reader asked for it, so no gate applies.
-    //
-    // And it re-arms the pin when the final newer page lands. The reader's
-    // settle at the end of the held range cleared the pin (that end was not
-    // the newest message), and a page-in does not scroll the view, so no
-    // settle comes to re-measure it. Same test the settle applies.
     #[cfg(target_arch = "wasm32")]
     {
         let trim_landed = trim_landed.clone();
@@ -3824,17 +3819,6 @@ pub fn Conversation() -> Element {
         use_effect(move || {
             // Subscribe, so this runs after the render the trim caused.
             let _ = window_items();
-            if reader_position.newer_resolved.replace(false)
-                && !reader_position.has_newer.get()
-                && !reader_position.hidden.get()
-                && chat_scroll_container().is_some_and(|c| {
-                    history_has_layout(&c)
-                        && ((max_scroll_top(&c) - c.scroll_top()) as f64) <= BOTTOM_THRESHOLD_PX
-                })
-                && !reader_moved_up_since(&last_scroll_top)
-            {
-                pinned_to_bottom.set(true);
-            }
             if reader_position.snap_latest.replace(false) {
                 trim_landed.set(false);
                 scroll_history_to_bottom(
@@ -4273,73 +4257,91 @@ pub fn Conversation() -> Element {
         let last_scroll_top = last_scroll_top.clone();
         let pinned_to_bottom = pinned_to_bottom.clone();
         let force_scroll = force_scroll.clone();
+        let reader_position = reader_position.clone();
         use_effect(move || {
-            // Subscribe: head swaps only happen on content changes.
+            // Subscribe: heads swap on content changes and on newer pages.
             let _ = message_groups.read().is_some();
-            let Some((key, pre_top, pre_scroll_top)) = reposition_pending.borrow_mut().take()
-            else {
-                return;
-            };
-            // A pinned reader needs no compensation — the arrival effect
-            // snaps to the bottom — and a forced snap owns the view outright.
-            // The pin is distrusted mid-gesture exactly as in the restore
-            // above: a reader flinging upward has moved even if their settle
-            // has not landed yet.
-            if force_scroll.get()
-                || (pinned_to_bottom.get() && !reader_moved_up_since(&last_scroll_top))
+            let _ = window_items();
+            'reposition: {
+                let Some((key, pre_top, pre_scroll_top)) = reposition_pending.borrow_mut().take()
+                else {
+                    break 'reposition;
+                };
+                // A pinned reader needs no compensation — the arrival effect
+                // snaps to the bottom — and a forced snap owns the view outright.
+                // The pin is distrusted mid-gesture exactly as in the restore
+                // above: a reader flinging upward has moved even if their settle
+                // has not landed yet.
+                if force_scroll.get()
+                    || (pinned_to_bottom.get() && !reader_moved_up_since(&last_scroll_top))
+                {
+                    break 'reposition;
+                }
+                let Some(container) = chat_scroll_container() else {
+                    break 'reposition;
+                };
+                // Hidden rows measure 0; the reveal restores the reader instead.
+                if !history_has_layout(&container) {
+                    break 'reposition;
+                }
+                // The scroll-to-latest button's SMOOTH scroll is the one animated
+                // scroll in the app, and while it is in flight the state reads
+                // exactly like a parked reader (pinned, position above the
+                // recorded target). Its recorded target is the bottom — so when
+                // the view is PINNED and `last_scroll_top` already points at the
+                // maximum, a scrollTop write here would cancel that animation
+                // mid-flight for a reader who is headed to the bottom anyway
+                // (#505 re-review). Gated on the pin as well as the offset: with
+                // `pinned == false` no animation can be in flight, so an unpinned
+                // reader whose patch pulled `max_scroll_top` under their recorded
+                // offset still gets compensated.
+                if pinned_to_bottom.get() && last_scroll_top.top() >= max_scroll_top(&container) {
+                    break 'reposition;
+                }
+                let Some(post_top) = history_row_offset_top(&key) else {
+                    break 'reposition;
+                };
+                let shift = post_top - pre_top;
+                if shift != 0 {
+                    // From the PRE-patch offset, not the live one: when the patch
+                    // shortens the content the browser has already clamped
+                    // `scrollTop` down by the time this runs, and shifting from
+                    // the clamped value applies the clamp twice (#505 delta
+                    // review). Clamping the result is left to the browser.
+                    let target = (pre_scroll_top + shift).max(0);
+                    // Move the reference BY THE SHIFT, not to the new absolute
+                    // offset. `last_scroll_top` is what `reader_moved_up_since`
+                    // measures against, and it is only meaningful in the window
+                    // between the reader moving and their `scrollend` landing —
+                    // writing their freshly-compensated position into it collapses
+                    // that signal to "has not moved", and with `pinned_to_bottom`
+                    // still stale-true BOTH follow paths then yank them to the
+                    // bottom (#505 delta review). A relative update preserves
+                    // their gap to the reference in both directions, so the guard
+                    // keeps answering truthfully. The pin resolves correctly
+                    // either way: in the pre-settle window the reference and the
+                    // view differ, so this settle reads as the READER's and the
+                    // handler re-measures and clears the stale pin; for a reader
+                    // whose settle already landed the two move together, so it
+                    // reads as ours and leaves their (already correct) pin
+                    // alone.
+                    last_scroll_top.shift(shift);
+                    container.set_scroll_top(target);
+                }
+            }
+            // A reader whose settle at a held end cleared the pin is at the newest
+            // message once the last withheld items land, but nothing scrolls, so
+            // no settle re-measures it. After the compensation above, same test.
+            if reader_position.newer_resolved.replace(false)
+                && !reader_position.has_newer.get()
+                && !reader_position.hidden.get()
+                && chat_scroll_container().is_some_and(|c| {
+                    history_has_layout(&c)
+                        && ((max_scroll_top(&c) - c.scroll_top()) as f64) <= BOTTOM_THRESHOLD_PX
+                })
+                && !reader_moved_up_since(&last_scroll_top)
             {
-                return;
-            }
-            let Some(container) = chat_scroll_container() else {
-                return;
-            };
-            // Hidden rows measure 0; the reveal restores the reader instead.
-            if !history_has_layout(&container) {
-                return;
-            }
-            // The scroll-to-latest button's SMOOTH scroll is the one animated
-            // scroll in the app, and while it is in flight the state reads
-            // exactly like a parked reader (pinned, position above the
-            // recorded target). Its recorded target is the bottom — so when
-            // the view is PINNED and `last_scroll_top` already points at the
-            // maximum, a scrollTop write here would cancel that animation
-            // mid-flight for a reader who is headed to the bottom anyway
-            // (#505 re-review). Gated on the pin as well as the offset: with
-            // `pinned == false` no animation can be in flight, so an unpinned
-            // reader whose patch pulled `max_scroll_top` under their recorded
-            // offset still gets compensated.
-            if pinned_to_bottom.get() && last_scroll_top.top() >= max_scroll_top(&container) {
-                return;
-            }
-            let Some(post_top) = history_row_offset_top(&key) else {
-                return;
-            };
-            let shift = post_top - pre_top;
-            if shift != 0 {
-                // From the PRE-patch offset, not the live one: when the patch
-                // shortens the content the browser has already clamped
-                // `scrollTop` down by the time this runs, and shifting from
-                // the clamped value applies the clamp twice (#505 delta
-                // review). Clamping the result is left to the browser.
-                let target = (pre_scroll_top + shift).max(0);
-                // Move the reference BY THE SHIFT, not to the new absolute
-                // offset. `last_scroll_top` is what `reader_moved_up_since`
-                // measures against, and it is only meaningful in the window
-                // between the reader moving and their `scrollend` landing —
-                // writing their freshly-compensated position into it collapses
-                // that signal to "has not moved", and with `pinned_to_bottom`
-                // still stale-true BOTH follow paths then yank them to the
-                // bottom (#505 delta review). A relative update preserves
-                // their gap to the reference in both directions, so the guard
-                // keeps answering truthfully. The pin resolves correctly
-                // either way: in the pre-settle window the reference and the
-                // view differ, so this settle reads as the READER's and the
-                // handler re-measures and clears the stale pin; for a reader
-                // whose settle already landed the two move together, so it
-                // reads as ours and leaves their (already correct) pin
-                // alone.
-                last_scroll_top.shift(shift);
-                container.set_scroll_top(target);
+                pinned_to_bottom.set(true);
             }
         });
     }
@@ -12240,9 +12242,10 @@ mod autoscroll_wiring_pins {
         // mount and then go silent, which no other assertion can see.
         assert_eq!(
             dense.matches("let_=window_items();").count(),
-            2,
-            "the trim re-anchor and the backfill restore must each subscribe \
-             to `window_items`"
+            3,
+            "the trim re-anchor, the backfill restore and the head \
+             reposition (newer pages slide the head) must each subscribe to \
+             `window_items`"
         );
         assert!(
             dense.contains("!trim_would_rearm_backfill(tail,container.client_height())"),

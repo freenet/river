@@ -1042,6 +1042,41 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     await expectSettledAtBottom(page, "an arrival after paging to the newest message was not followed");
   });
 
+  // A newer page slides the range's start past the ceiling. The reader's row
+  // stays put through that page and the next arrival.
+  test("a newer page keeps the reader's row", async ({ page }) => {
+    await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1&deep-history-retention=1");
+    await readerScrollsWithoutGesture(page, 1_000);
+    await callRiverTest(page, "appendMessages", 450);
+    await expect
+      .poll(() => withheld(page), { message: "premise: the burst should hold more than one page" })
+      .toBeGreaterThan(INITIAL_RENDERED_ITEMS);
+    const before = await withheld(page);
+
+    // One task: move into the trigger's reach and note the row in view,
+    // before the page lands.
+    const row = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.scrollTop = c.scrollHeight - c.clientHeight - 400;
+      const cTop = c.getBoundingClientRect().top;
+      for (const r of Array.from(c.querySelectorAll<HTMLElement>("[data-item-key]"))) {
+        const rect = r.getBoundingClientRect();
+        if (rect.height > 0 && rect.top >= cTop && rect.bottom <= cTop + c.clientHeight) {
+          return { key: r.getAttribute("data-item-key")!, top: rect.top - cTop };
+        }
+      }
+      return null;
+    });
+    expect(row, "premise: a row is fully in view").not.toBeNull();
+    await expect.poll(() => withheld(page), { message: "premise: a newer page should land" }).toBeLessThan(before);
+    await expectRowHeld(page, row!.key, row!.top, "a newer page moved the reader's row");
+
+    const paged = await withheld(page);
+    await callRiverTest(page, "appendMessage", "arrival after a newer page");
+    await expect.poll(() => withheld(page), { message: "premise: the arrival should land" }).toBe(paged + 1);
+    await expectRowHeld(page, row!.key, row!.top, "the arrival after a newer page moved the reader's row");
+  });
+
   // While the scroll-to-latest button's smooth scroll is in flight the reader
   // reads as parked, so a burst past the ceiling holds the range's end. The
   // scroll then lands where the app recorded it, so the pin stays armed and
