@@ -601,7 +601,9 @@ impl RoomSynchronizer {
                 &room_secrets,
             );
 
-            // If user is viewing this room with tab visible, mark as read
+            // If user is viewing this room with tab visible, apply the read
+            // rule: only what the reader has had on screen is marked, so the
+            // messages that just arrived stay unread until they are seen.
             let is_visible = *DOCUMENT_VISIBLE.read();
             let is_current_room = CURRENT_ROOM.read().owner_key == Some(owner_vk);
             if is_visible && is_current_room {
@@ -1588,7 +1590,9 @@ impl RoomSynchronizer {
                 &room_secrets,
             );
 
-            // If user is viewing this room with tab visible, mark as read
+            // If user is viewing this room with tab visible, apply the read
+            // rule: only what the reader has had on screen is marked, so the
+            // messages that just arrived stay unread until they are seen.
             let is_visible = *DOCUMENT_VISIBLE.read();
             let is_current_room = CURRENT_ROOM.read().owner_key == Some(room_owner_copy);
             if is_visible && is_current_room {

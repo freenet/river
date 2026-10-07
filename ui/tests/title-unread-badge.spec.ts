@@ -1,5 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
-import { waitForApp, selectRoom } from "./example-room";
+import { test, expect } from "@playwright/test";
+import { waitForApp, selectRoom, setTabVisibility } from "./example-room";
 
 // Regression coverage for the hidden-tab title's unread badge
 // (freenet/river#446 and its predecessor bug).
@@ -22,24 +22,6 @@ import { waitForApp, selectRoom } from "./example-room";
 // "Public Discussion Room" and "Team Chat Room" (the local user is only an
 // observer there, so every message counts as unread until a room is
 // opened) — these tests rely on that, not on a zero-unread starting state.
-
-// Force the tab's visibility state. We override the `document.hidden` and
-// `document.visibilityState` getters and dispatch the `visibilitychange`
-// event the same way Chromium / WebKit / Firefox do when the tab goes to the
-// background or comes back.
-async function setTabVisibility(page: Page, state: "hidden" | "visible") {
-  await page.evaluate((state) => {
-    Object.defineProperty(document, "hidden", {
-      configurable: true,
-      get: () => state === "hidden",
-    });
-    Object.defineProperty(document, "visibilityState", {
-      configurable: true,
-      get: () => state,
-    });
-    document.dispatchEvent(new Event("visibilitychange"));
-  }, state);
-}
 
 test.describe("Document title unread badge", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });

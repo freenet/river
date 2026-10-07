@@ -1438,7 +1438,7 @@ test.describe("The end holds after an explicit request (10c decision 13)", () =>
   const imageRow = (page: Page) => page.locator("[data-item-key]", { hasText: "image fixture" });
 
   /// An image row, still loading, two short messages above the end of the
-  /// open room. All three arrive below the reader.
+  /// open room. All three arrive below the reader, so the room is unread.
   async function addLoadingImageAboveTheEnd(page: Page, image: { requested: () => number }) {
     // The Markdown renders to text plus an <img>, so wait on the plain words.
     await callRiverTest(page, "appendMessage", "image fixture ![fixture](/test-image.svg) above the end");
@@ -1458,10 +1458,17 @@ test.describe("The end holds after an explicit request (10c decision 13)", () =>
       .toBeGreaterThan(before + 50);
   }
 
+  const teamChatBadge = (page: Page) =>
+    page
+      .getByTestId("room-list")
+      .getByRole("button", { name: "Team Chat Room" })
+      .locator('[data-testid="room-unread-badge"]');
+
   /// Leave Team Chat and open it again: an opening request, with the image
   /// still loading in view above the end.
   async function reopenTeamChat(page: Page) {
     await selectListedRoom(page, "Public Discussion Room");
+    await expect(teamChatBadge(page), "premise: the messages below the reader left Team Chat unread").toBeVisible();
     await selectListedRoom(page, "Team Chat Room");
     await page.mouse.move(0, 0);
     await expectSettledAtBottom(page, "premise: the room opens at its newest message");
@@ -1469,7 +1476,7 @@ test.describe("The end holds after an explicit request (10c decision 13)", () =>
     expect(imageTop, "premise: the image row is in view").toBeGreaterThan(0);
   }
 
-  test("a row growing above the end after the room opens keeps the newest message in view", async ({
+  test("a row growing above the end after the room opens keeps the newest message in view, and the room read", async ({
     page,
   }) => {
     const image = await holdTestImage(page);
@@ -1481,6 +1488,8 @@ test.describe("The end holds after an explicit request (10c decision 13)", () =>
 
     await expectSettledAtBottom(page, "a row grew above the end after the room opened and left the newest message off screen");
     await expect(page.getByTestId("scroll-to-bottom"), "Latest offered at the end").toHaveCount(0);
+    await selectListedRoom(page, "Public Discussion Room");
+    await expect(teamChatBadge(page), "the room opened at its newest message and still counts it unread").toHaveCount(0);
   });
 
   test("once the reader scrolls away, the same growth does not move them", async ({ page }) => {

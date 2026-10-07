@@ -14,6 +14,23 @@ export async function waitForApp(page: Page) {
   );
 }
 
+// Force the tab's visibility state: override the `document.hidden` and
+// `document.visibilityState` getters and dispatch `visibilitychange`, the way
+// Chromium, WebKit and Firefox do when the tab goes to the background or back.
+export async function setTabVisibility(page: Page, state: "hidden" | "visible") {
+  await page.evaluate((state) => {
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => state === "hidden",
+    });
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => state,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, state);
+}
+
 // Scoped to the room list: once a room is open the header title has the same name.
 export async function selectListedRoom(page: Page, roomName: string) {
   const roomBtn = page.getByTestId("room-list").getByRole("button", { name: roomName });

@@ -1,5 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp, selectListedRoom } from "./example-room";
+import { callRiverTest } from "./river-test";
+import { waitForApp, selectListedRoom, setTabVisibility } from "./example-room";
 import {
   AT_BOTTOM_EPSILON_PX,
   BOTTOM_THRESHOLD_PX,
@@ -11,7 +12,9 @@ import {
   expectStaysPut,
   fillHistory,
   newestRowFromViewBottom,
+  nextFrames,
   openRoomAtBottom,
+  readerReturnsToEnd,
   readerScrollsWithoutGesture,
   scrollTop,
 } from "./history-geometry";
@@ -144,11 +147,12 @@ test.describe("Muted rooms and the cross-surface totals", { tag: "@chromium-only
 });
 
 // A short arrival related to where the view actually is (A07): is it on screen,
-// is the Latest button offered, and is the room marked read anyway? The 10c
-// policy for Latest: it shows whenever the newest message's bottom is off
-// screen, without the old 100px band (decision 4). CURRENT POLICY for read
-// acknowledgment: deliberate behavior that may be changed on purpose. The
-// viewport witnesses (`onScreen`, `belowView`) are independent of both.
+// is the Latest button offered, and is the room marked read? The 10c policy:
+// Latest shows whenever the newest message's bottom is off screen, without the
+// old 100px band (decision 4), and the open room counts as read only while the
+// tab and chat panel are visible and its newest message is on screen
+// (decision 5). The viewport witnesses (`onScreen`, `belowView`) are
+// independent of both.
 test.describe("Unseen arrivals versus the viewport (A07)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -171,25 +175,66 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
 
   const latest = (page: Page) => page.getByTestId("scroll-to-bottom");
 
-  test("an arrival below a parked reader stays off screen, offers catch-up, and still marks the room read", async ({
-    page,
-  }) => {
+  /// Team Chat's badge in the room list. Hidden while it is the current room,
+  /// so callers open another room first; the room-list click marks only the
+  /// room it opens.
+  const teamChatBadge = (page: Page) =>
+    page
+      .getByTestId("room-list")
+      .getByRole("button", { name: "Team Chat Room" })
+      .locator('[data-testid="room-unread-badge"]');
+
+  /// Open Team Chat with history to scroll back through, read to its end, and
+  /// park at its top.
+  async function parkInTeamChat(page: Page) {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
     await readerScrollsWithoutGesture(page, 0);
     await expectParkedAwayFromEnd(page);
+  }
+
+  test("an arrival below a parked reader stays off screen, offers Latest, and leaves the room unread", async ({
+    page,
+  }) => {
+    await parkInTeamChat(page);
     const before = await scrollTop(page);
 
     await deliverOffscreen(page, "short unseen arrival");
     expect(await onScreen(page, "short unseen arrival"), "the arrival was brought on screen").toBe(false);
     expect(await scrollTop(page), "the arrival moved a parked reader").toBeCloseTo(before, 0);
-    await expect(page.getByTestId("scroll-to-bottom"), "no catch-up offered for an unseen arrival").toBeVisible();
+    await expect(latest(page), "no Latest offered for an unseen arrival").toBeVisible();
 
-    // The open, visible room is marked read up to its newest message although
-    // that message never reached the viewport.
     await selectListedRoom(page, "Public Discussion Room");
-    const teamChat = page.getByTestId("room-list").getByRole("button", { name: "Team Chat Room" });
-    await expect(teamChat.locator('[data-testid="room-unread-badge"]')).toHaveCount(0);
+    await expect(teamChatBadge(page), "an arrival that never reached the viewport was marked read").toBeVisible();
+  });
+
+  test("reaching the newest message marks the room read", async ({ page }) => {
+    await parkInTeamChat(page);
+    await deliverOffscreen(page, "arrival the reader scrolls down to");
+
+    await readerReturnsToEnd(page);
+    await expect
+      .poll(() => onScreen(page, "arrival the reader scrolls down to"), {
+        message: "premise: the reader reached the arrival",
+      })
+      .toBe(true);
+
+    await selectListedRoom(page, "Public Discussion Room");
+    await expect(teamChatBadge(page), "the reader reached the newest message and the room still counts it unread").toHaveCount(0);
+  });
+
+  test("hiding the tab while scrolled up does not mark the room read", async ({ page }) => {
+    await parkInTeamChat(page);
+    await deliverOffscreen(page, "arrival before the tab hides");
+
+    await setTabVisibility(page, "hidden");
+    await setTabVisibility(page, "visible");
+    expect(await onScreen(page, "arrival before the tab hides"), "premise: the reader is still parked above the arrival").toBe(
+      false,
+    );
+
+    await selectListedRoom(page, "Public Discussion Room");
+    await expect(teamChatBadge(page), "hiding the tab marked an unseen arrival read").toBeVisible();
   });
 
   test("a reader parked inside the old 100px band is offered Latest, and an arrival below them leaves the view alone", async ({
@@ -246,8 +291,8 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
 
   /// The history's own padding must not count as part of the newest message:
   /// the slack is a few px past the message's bottom, not past the padding
-  /// below it (10c decision 4).
-  test("the newest message's bottom just below the view offers Latest", async ({ page }) => {
+  /// below it (10c decisions 4 and 5).
+  test("the newest message's bottom just below the view offers Latest and leaves the room unread", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
     await deliverOffscreen(page, "newest near the bottom edge");
@@ -257,9 +302,11 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
     expect(below, "premise: ...by a few px").toBeLessThan(14);
 
     await expect(latest(page), "the newest message's bottom is below the view and Latest is not offered").toBeVisible();
+    await selectListedRoom(page, "Public Discussion Room");
+    await expect(teamChatBadge(page), "a message whose bottom never reached the view was marked read").toBeVisible();
   });
 
-  test("the newest message's bottom just inside the view hides Latest", async ({ page }) => {
+  test("the newest message's bottom just inside the view hides Latest and marks the room read", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
     await deliverOffscreen(page, "newest near the bottom edge");
@@ -269,5 +316,90 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
     expect(below, "premise: ...by a few px, closer than the history's bottom padding").toBeGreaterThan(-11);
 
     await expect(latest(page), "all of the newest message is on screen and Latest is still offered").toHaveCount(0);
+    await selectListedRoom(page, "Public Discussion Room");
+    await expect(teamChatBadge(page), "all of the newest message was on screen and the room still counts it unread").toHaveCount(0);
+  });
+
+  // A history short enough to show an arrival in full, so it lands on screen
+  // with the tab hidden. On screen is not enough: the tab has to be visible too.
+  test.describe("in a hidden tab", () => {
+    test.use({ viewport: { width: 1280, height: 2400 } });
+
+    /// The (N) of a hidden tab's title: unread across every room, this one included.
+    async function hiddenTitleCount(page: Page): Promise<number> {
+      const counted = /^\((\d+)\) /.exec(await page.title());
+      return counted ? Number(counted[1]) : 0;
+    }
+
+    test("an arrival on screen stays unread until the tab is visible again", async ({ page }) => {
+      await openRoomAtBottom(page, "Team Chat Room");
+      await setTabVisibility(page, "hidden");
+      await expect(page, "premise: the hidden title counts the other rooms").toHaveTitle(
+        /^\(\d+\) River - Team Chat Room$/,
+      );
+      const before = await hiddenTitleCount(page);
+
+      await deliverOffscreen(page, "arrival in a hidden tab");
+      expect(await onScreen(page, "arrival in a hidden tab"), "premise: the arrival is on screen").toBe(true);
+      expect(await belowView(page, "arrival in a hidden tab"), "premise: all of the arrival is on screen").toBeLessThanOrEqual(0);
+      await expect(page, "an arrival seen only in a hidden tab was marked read").toHaveTitle(
+        `(${before + 1}) River - Team Chat Room`,
+      );
+      // `toHaveTitle` passes on its first matching poll, which can precede a mark.
+      await nextFrames(page);
+      await page.waitForTimeout(300);
+      expect(await hiddenTitleCount(page), "an arrival seen only in a hidden tab was marked read").toBe(before + 1);
+
+      await setTabVisibility(page, "visible");
+      await nextFrames(page);
+      await selectListedRoom(page, "Public Discussion Room");
+      await expect(
+        teamChatBadge(page),
+        "the tab came back with the arrival on screen and the room still counts it unread",
+      ).toHaveCount(0);
+    });
+  });
+});
+
+// A room whose chat panel is hidden behind the mobile Rooms or Members panel
+// has no layout, so nothing in it is on screen and an arrival there stays
+// unread (10c decision 5). Observed after opening another room, through the
+// hamburger badge, which counts every room but the current one.
+test.describe("Unread behind the mobile panels (A07)", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  const hamburgerBadge = (page: Page) =>
+    page
+      .getByTestId("hamburger-rooms-button")
+      .filter({ visible: true })
+      .getByTestId("hamburger-unread-badge");
+
+  test("an arrival while the chat is behind the room list leaves its room unread", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).click();
+    await expect(page.getByTestId("room-list")).toBeVisible();
+    await expect(page.locator("#chat-scroll-container"), "premise: the chat panel is hidden").toBeHidden();
+
+    await deliverOffscreen(page, "arrived behind the room list");
+    await selectListedRoom(page, "Public Discussion Room");
+
+    await expect(hamburgerBadge(page), "an arrival behind the room list was marked read").toHaveText("1");
+  });
+
+  test("an arrival while the chat is behind the members panel leaves its room unread", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await page.getByTestId("header-members-button").click();
+    const members = page.locator("aside").filter({ hasText: "Active Members" });
+    await expect(members).toBeVisible();
+    await expect(page.locator("#chat-scroll-container"), "premise: the chat panel is hidden").toBeHidden();
+
+    await deliverOffscreen(page, "arrived behind the members panel");
+    // As a notification click does, with the members panel still in front.
+    await callRiverTest(page, "switchRoom", "Public Discussion Room");
+    await members.locator("button").first().click();
+    await expect(page.getByRole("heading", { name: "Public Discussion Room" })).toBeVisible();
+    await nextFrames(page);
+
+    await expect(hamburgerBadge(page), "an arrival behind the members panel was marked read").toHaveText("1");
   });
 });

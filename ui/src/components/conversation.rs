@@ -189,7 +189,8 @@ struct EventSummary {
     names: Vec<String>,
     id: String,
     last_time: DateTime<Utc>,
-    /// The newest event folded in (see [`display_item_last_message_id`]).
+    /// The newest event folded in, for the read rule (see
+    /// [`display_item_last_message_id`]).
     last_message_id: MessageId,
 }
 
@@ -211,7 +212,8 @@ fn display_item_time_ms(item: &DisplayItem) -> i64 {
     }
 }
 
-/// The newest display message `item` renders.
+/// The newest display message `item` renders: what the read rule marks when
+/// the item is the newest one on screen.
 fn display_item_last_message_id(item: &DisplayItem) -> Option<MessageId> {
     match item {
         DisplayItem::Messages(group) => group.messages.last().map(|m| m.message_id.clone()),
@@ -2494,7 +2496,7 @@ fn beautify_freenet_label(url: &str) -> Option<String> {
 /// How far below the visible area (in px) the newest message's bottom may sit
 /// and still count as on screen: fractional layout can leave a row that did
 /// scroll fully into view a pixel short. Past it the Latest button shows
-/// (10c decision 4).
+/// (10c decision 4), and the read rule uses the same edge (decision 5).
 #[cfg(target_arch = "wasm32")]
 const NEWEST_IN_VIEW_SLACK_PX: f64 = 4.0;
 
@@ -2700,6 +2702,14 @@ struct ReaderPosition {
     extend_newer: std::cell::Cell<bool>,
     /// Bumped on every room change, so a deferred trim can detect one.
     room_epoch: std::cell::Cell<u64>,
+    /// The room and newest display message of the last render, set only when
+    /// its range reaches the room's latest message. What `note_newest_seen`
+    /// publishes once its bottom is on screen.
+    newest_rendered: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, MessageId)>>,
+    /// The last value `note_newest_seen` published, so a repeat check (every
+    /// settle, every render) schedules nothing.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    seen_noted: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, MessageId)>>,
     /// The container's last non-zero `clientHeight` the ResizeObserver
     /// handled; 0 while hidden or not yet measured. A settle that measures
     /// another height has beaten the observer to a resize, and must not
@@ -3395,6 +3405,7 @@ fn land_at_end(reader: &ReaderPosition, container: &web_sys::Element) {
     // Now, not at the settle: the row read before the request would bound the
     // next render's range (`keep`) and pull a swapped-out range back in.
     remember_reading_position(reader);
+    note_newest_seen(reader);
 }
 
 /// While the end hold is on, take the view back to the end after a size
@@ -3408,6 +3419,7 @@ fn keep_end_held(reader: &ReaderPosition, container: &web_sys::Element) -> bool 
     scroll_history_to_end(container);
     reader.end_hold.set(Some(container.scroll_top()));
     remember_reading_position(reader);
+    note_newest_seen(reader);
     true
 }
 
@@ -3441,6 +3453,59 @@ fn complete_scroll_request(reader: &ReaderPosition, mut opening_snap_done: Signa
         }
     });
     true
+}
+
+/// Is the newest rendered row's bottom on screen, within
+/// [`NEWEST_IN_VIEW_SLACK_PX`]? Measures `bottom-sentinel`, which sits right
+/// after the history list inside `#chat-content`, above its bottom padding, so
+/// its top edge is that row's bottom: the same edge, and the same slack, as the
+/// Latest button's observer. A live layout read rather than the observer's
+/// last report, which lags a patch that just put an arrival below the fold.
+#[cfg(target_arch = "wasm32")]
+fn newest_bottom_in_view(container: &web_sys::Element) -> bool {
+    let Some(sentinel) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("bottom-sentinel"))
+    else {
+        return false;
+    };
+    let view = container.get_bounding_client_rect();
+    let edge = sentinel.get_bounding_client_rect().top();
+    edge >= view.top() && edge <= view.bottom() + NEWEST_IN_VIEW_SLACK_PX
+}
+
+/// Publish the newest message as seen if the reader can see it now: the tab is
+/// visible, the history has layout and is not awaiting its reveal restore, the
+/// rendered range reaches the room's latest message, and that message's bottom
+/// is on screen (10c decision 5). Marking a room read never goes past what
+/// this publishes; see `document_title::NEWEST_SEEN`.
+///
+/// Called wherever one of those can change: the Latest observer, each settle,
+/// each render, the reveal, a completed request and the tab becoming visible.
+/// Touches no signal itself, so raw JS callbacks may call it; the write is
+/// deferred.
+#[cfg(target_arch = "wasm32")]
+fn note_newest_seen(reader: &ReaderPosition) {
+    let Some(newest) = reader.newest_rendered.borrow().clone() else {
+        return;
+    };
+    if reader.seen_noted.borrow().as_ref() == Some(&newest) {
+        return;
+    }
+    let Some(container) = chat_scroll_container() else {
+        return;
+    };
+    if !crate::components::app::document_title::get_visibility_state()
+        || !history_has_layout(&container)
+        || reader.hidden.get()
+        || !newest_bottom_in_view(&container)
+    {
+        return;
+    }
+    *reader.seen_noted.borrow_mut() = Some(newest.clone());
+    crate::util::defer(move || {
+        *crate::components::app::document_title::NEWEST_SEEN.write() = Some(newest);
+    });
 }
 
 /// May a bottom-settle trim run now? Requires layout, the exact bottom of a
@@ -3557,6 +3622,7 @@ fn install_scroll_settle_listener(
             if observed == 0 || container.client_height() == observed {
                 remember_reading_position(&reader);
             }
+            note_newest_seen(&reader);
         }) as Box<dyn FnMut()>)
     };
     let settle_fn: js_sys::Function = settle.as_ref().unchecked_ref::<js_sys::Function>().clone();
@@ -4093,6 +4159,8 @@ pub fn Conversation() -> Element {
     // `NEWEST_IN_VIEW_SLACK_PX` of rootMargin. The observer fires only on
     // intersection changes, so there is zero work during normal scrolling.
     #[cfg(target_arch = "wasm32")]
+    let observer_reader = reader_position.clone();
+    #[cfg(target_arch = "wasm32")]
     use_effect(move || {
         use wasm_bindgen::prelude::*;
 
@@ -4109,6 +4177,7 @@ pub fn Conversation() -> Element {
             return;
         };
 
+        let reader_position = observer_reader.clone();
         let cb = Closure::wrap(Box::new(move |entries: js_sys::Array| {
             if let Some(entry) = entries
                 .get(0)
@@ -4122,6 +4191,11 @@ pub fn Conversation() -> Element {
                 // .claude/rules/dioxus-signal-safety.md. (#402)
                 let intersecting = entry.is_intersecting();
                 crate::util::defer(move || is_at_bottom.set(intersecting));
+                // The reader scrolled to the newest message, or it came back
+                // into view: the read rule may mark it.
+                if intersecting {
+                    note_newest_seen(&reader_position);
+                }
             }
         }) as Box<dyn FnMut(js_sys::Array)>);
 
@@ -4233,7 +4307,9 @@ pub fn Conversation() -> Element {
     // Finish a pending scroll request after the render it waits for: the new
     // room's rows, the sent message, or the latest range Latest selected. A
     // hidden panel's request is finished by the reveal instead (see the
-    // ResizeObserver below).
+    // ResizeObserver below). Then check the read rule against what the
+    // render left on screen: a deletion can bring the newest message into
+    // view, and a short room shows an arrival in full.
     #[cfg(target_arch = "wasm32")]
     {
         let reader_position = reader_position.clone();
@@ -4241,6 +4317,27 @@ pub fn Conversation() -> Element {
             let _ = message_groups.read().is_some();
             let _ = window_items();
             complete_scroll_request(&reader_position, opening_snap_done);
+            note_newest_seen(&reader_position);
+        });
+    }
+
+    // The tab coming back: whatever is on screen now counts as seen, which
+    // nothing else would notice (no scroll, no resize, no observer change).
+    #[cfg(target_arch = "wasm32")]
+    {
+        let reader_position = reader_position.clone();
+        use_effect(move || {
+            // Anchored before the fallible read, this effect's only
+            // subscription (freenet/river#555).
+            crate::util::signal_guard::anchor();
+            let Ok(visible) = crate::components::app::document_title::DOCUMENT_VISIBLE.try_read()
+            else {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            };
+            if *visible {
+                note_newest_seen(&reader_position);
+            }
         });
     }
 
@@ -4291,6 +4388,7 @@ pub fn Conversation() -> Element {
                         }
                         // The revealed height need not be the one captured.
                         remember_reading_position(&reader_position);
+                        note_newest_seen(&reader_position);
                     }
                     return;
                 }
@@ -5239,6 +5337,9 @@ pub fn Conversation() -> Element {
                     id: "chat-scroll-container",
                     div { class: "max-w-4xl mx-auto px-4 py-4", id: "chat-content",
                     {
+                        // Set again below when this render's range reaches the
+                        // room's latest message.
+                        *reader_position.newest_rendered.borrow_mut() = None;
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
                             match message_groups.read().as_deref() {
@@ -5414,6 +5515,18 @@ pub fn Conversation() -> Element {
                                     let before = reader_position.rendered.replace(rendered.clone());
                                     if !end_hold_survives(before.as_ref(), rendered.as_ref()) {
                                         reader_position.end_hold.set(None);
+                                    }
+                                    // The read rule's candidate: only a range
+                                    // that reaches the latest message has it.
+                                    if !history_window.has_newer {
+                                        *reader_position.newest_rendered.borrow_mut() = CURRENT_ROOM
+                                            .peek()
+                                            .owner_key
+                                            .zip(
+                                                groups[..history_window.end]
+                                                    .last()
+                                                    .and_then(display_item_last_message_id),
+                                            );
                                     }
                                     // Tell the settle handler whether a
                                     // bottom-settle trim would shrink anything.
@@ -5730,7 +5843,8 @@ pub fn Conversation() -> Element {
                     // newer-history strip before it has no height). An
                     // IntersectionObserver watches it instead of using
                     // onscroll, which avoids per-scroll-event DOM queries that
-                    // cause scroll jank on mobile (see issue #151).
+                    // cause scroll jank on mobile (see issue #151), and the
+                    // read rule measures it (`newest_bottom_in_view`).
                     div {
                         id: "bottom-sentinel",
                         class: "h-px pointer-events-none",

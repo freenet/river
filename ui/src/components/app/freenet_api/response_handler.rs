@@ -1699,8 +1699,8 @@ fn hydrate_loaded_rooms_with_authority(
         });
     });
 
-    // Mark current room as read since user is viewing it
-    // (must be after merge so room data exists)
+    // Apply the read rule to the current room, which marks only what the
+    // reader has had on screen (must be after merge so room data exists)
     crate::util::defer(|| {
         mark_current_room_as_read();
         update_document_title();

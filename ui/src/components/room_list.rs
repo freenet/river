@@ -577,6 +577,9 @@ pub fn RoomList() -> Element {
                                     // prevent RefCell re-entrant borrow panics.
                                     crate::util::defer(move || {
                                         *CURRENT_ROOM.write() = CurrentRoom { owner_key: Some(room_key) };
+                                        // The read rule: up to what was seen of
+                                        // this room. Its opening at the latest
+                                        // message is what marks the rest.
                                         mark_current_room_as_read();
                                         // Switch to chat view on mobile
                                         *MOBILE_VIEW.write() = MobileView::Chat;
@@ -600,10 +603,12 @@ pub fn RoomList() -> Element {
                                         }
                                     }
                                     // Unread badge — hidden for the current
-                                    // room (its messages are marked read on
-                                    // open, so a badge there would only
-                                    // flicker) and for Muted rooms (their
-                                    // count is always 0, freenet/river#500).
+                                    // room, by design (it can hold messages
+                                    // the reader has not seen yet, 10c
+                                    // decision 5, but its Latest button
+                                    // offers those), and for Muted rooms
+                                    // (their count is always 0,
+                                    // freenet/river#500).
                                     // Styling mirrors the DM rail badge plus
                                     // `flex-shrink-0` so a long truncated
                                     // room name can't squash it; the accent

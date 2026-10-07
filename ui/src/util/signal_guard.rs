@@ -179,6 +179,10 @@ mod tests {
             "dm_thread_modal.rs DM_DRAFT merge",
             include_str!("../components/direct_messages/dm_thread_modal.rs"),
         ),
+        (
+            "conversation.rs tab visibility",
+            include_str!("../components/conversation.rs"),
+        ),
     ];
 
     /// Body of each `<prefix>(...)` call (e.g. `use_memo(` or `use_effect(`),
@@ -308,12 +312,14 @@ mod tests {
 
     #[test]
     fn every_fallible_effect_anchors_before_its_first_try_read_and_nudges() {
-        // 7 across the 3 files; app.rs has 5, members.rs and dm_thread_modal.rs 1 each.
+        // 8 across the 4 files; app.rs has 5, members.rs, dm_thread_modal.rs and
+        // conversation.rs 1 each (conversation.rs: the 10c read rule's
+        // tab-visibility check).
         assert_fallible_hooks_are_guarded(
             GUARDED_EFFECT_SITES,
             "use_effect(",
             "freenet/river#559",
-            7,
+            8,
         );
     }
 

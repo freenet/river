@@ -5,7 +5,7 @@
 //! - Setting document.title to "River" when no room is selected
 //! - Showing unread message count in title when tab is hidden
 //! - Tracking document visibility state
-//! - Marking messages as read when tab becomes visible
+//! - Marking the open room read up to the newest message the reader has seen
 
 use crate::components::app::chat_delegate::{flush_rooms_to_delegate, save_rooms_to_delegate};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
@@ -29,13 +29,29 @@ static TITLE_MANAGER_INITIALIZED: GlobalSignal<bool> = Global::new(|| false);
 /// Global signal tracking total unread messages across all rooms
 pub static TOTAL_UNREAD_COUNT: GlobalSignal<usize> = Global::new(|| 0);
 
+/// The newest message the reader has had on screen, as `(room owner, message)`.
+///
+/// The read rule (10c decision 5): a room counts as read only while the tab is
+/// visible, the chat panel has layout, the rendered range reaches the room's
+/// latest message and that message's bottom is on screen. `Conversation`
+/// checks those against the live DOM and writes this, through `defer`, when
+/// they all hold. [`mark_current_room_as_read`] never moves a marker past it.
+///
+/// Separate from the marker itself so that no caller can mark from the room
+/// state alone: an arrival renders below the fold before anything reports it
+/// off screen, and every caller that used to read "the latest message" from
+/// `ROOMS` marked exactly that arrival read.
+pub static NEWEST_SEEN: GlobalSignal<Option<(ed25519_dalek::VerifyingKey, MessageId)>> =
+    Global::new(|| None);
+
 thread_local! {
     /// Cache the last title to avoid redundant postMessage calls
     static LAST_TITLE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-/// Get the current document visibility state
-fn get_visibility_state() -> bool {
+/// Get the current document visibility state. Reads the DOM, not a signal, so
+/// raw JS callbacks (which have no Dioxus runtime) can call it.
+pub(crate) fn get_visibility_state() -> bool {
     web_sys::window()
         .and_then(|w| w.document())
         .map(|d| d.visibility_state() == VisibilityState::Visible)
@@ -625,10 +641,11 @@ pub fn count_unread_excluding_room(
 /// DM rail lives in that same panel).
 ///
 /// Drives the badge on the mobile hamburger buttons in the conversation
-/// header. The current room is excluded because its messages are on
-/// screen and marked read on open — counting them would only make the
-/// badge flicker (mirrors the `!is_current` guard on the room-list
-/// badge in `room_list.rs`).
+/// header. The current room is excluded by design (mirroring the
+/// `!is_current` guard on the room-list badge in `room_list.rs`): it can
+/// hold messages the reader has not seen yet (10c decision 5), but its own
+/// Latest button is where those are offered, not a panel the reader has to
+/// open.
 pub fn count_unread_behind_rooms_panel() -> usize {
     // CURRENT_ROOM is read (infallibly) BEFORE the fallible ROOMS read:
     // `try_read() -> Err` registers no subscription (dioxus-signal-safety
@@ -684,46 +701,35 @@ pub fn update_document_title() {
     set_document_title(&title);
 }
 
-/// Mark all messages in the current room as read
+/// Apply the read rule to the open room: advance its `last_read_message_id` to
+/// [`NEWEST_SEEN`], never further, and never backwards.
+///
+/// Every place that marks a room read calls this: the title effect (which
+/// re-runs on every `ROOMS` write and on every `NEWEST_SEEN` change), the tab
+/// becoming visible, the room-list click, the post-load handler and the two
+/// sync paths in `room_synchronizer.rs`. None of them can mark a message the
+/// reader has not had on screen, so an arrival below the fold stays unread
+/// until the reader reaches it. See [`read_marker_update`] for the decision.
 pub fn mark_current_room_as_read() {
-    let current_room = CURRENT_ROOM.read();
-    let Some(owner_key) = current_room.owner_key else {
+    let current_owner_key = CURRENT_ROOM.read().owner_key;
+    // Fallible like `ROOMS` below: in the title effect this read is the
+    // subscription to what the reader has seen, and the anchor there keeps the
+    // effect alive for the nudge (freenet/river#555).
+    let Ok(seen) = NEWEST_SEEN.try_read().map(|seen| seen.clone()) else {
+        crate::util::signal_guard::schedule_nudge();
         return;
     };
 
-    // Get the latest message ID
-    let latest_message_id = {
+    let update = {
         let Ok(rooms) = ROOMS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
             return;
         };
-        let Some(room_data) = rooms.map.get(&owner_key) else {
-            return;
-        };
-
-        // Get the last display message ID
-        room_data
-            .room_state
-            .recent_messages
-            .display_messages()
-            .last()
-            .map(|msg| msg.id())
+        read_marker_update(&rooms.map, current_owner_key, seen.as_ref())
     };
-
-    let Some(new_last_read_id) = latest_message_id else {
-        return; // No messages to mark as read
+    let Some((owner_key, new_last_read_id)) = update else {
+        return;
     };
-
-    // Check if we need to update
-    {
-        let Ok(rooms) = ROOMS.try_read() else {
-            return;
-        };
-        if let Some(room_data) = rooms.map.get(&owner_key) {
-            if room_data.last_read_message_id.as_ref() == Some(&new_last_read_id) {
-                return; // Already marked as read
-            }
-        }
-    }
 
     // Update the last read message ID
     ROOMS.with_mut(|rooms| {
@@ -744,41 +750,51 @@ pub fn mark_current_room_as_read() {
     update_document_title();
 }
 
-/// Decide which room, if any, should be marked read on a visible->hidden
-/// transition, given a snapshot of the rooms map and the owner key of
-/// whichever room is currently on screen (or `None` if no room is selected).
+/// The read rule's one decision: where, if anywhere, the current room's read
+/// marker moves, given a snapshot of the rooms map, the owner key of whichever
+/// room is open (or `None`), and [`NEWEST_SEEN`].
 ///
-/// Pulled out as a pure function so the freenet/river#446 fix boundary is
-/// directly testable without a Dioxus runtime: this is the ONE place that
-/// decides which room(s) get marked read on hide. `mark`'s return type,
-/// `Option<(VerifyingKey, MessageId)>`, structurally forecloses the old
-/// `mark_all_rooms_as_read` bug (returning one entry per room in `rooms`) —
-/// a caller can destructure only a single room, not a sweep. What
-/// `hiding_the_tab_only_marks_the_current_room_as_read` pins is the weaker,
-/// still-real claim the type doesn't cover: that the ONE room this function
-/// names is the CURRENT one, not some other room chosen by accident.
-fn room_to_mark_read_on_hide(
+/// The marker moves to the seen message, and only:
+///
+/// * for the CURRENT room. The return type, `Option<(VerifyingKey,
+///   MessageId)>`, structurally forecloses the old `mark_all_rooms_as_read`
+///   sweep (freenet/river#446), and a seen message from any other room (one
+///   the reader has since left) marks nothing;
+/// * forward. A marker already at or past the seen message stays put; a marker
+///   no longer in the buffer (evicted, so everything counts as unread) moves;
+/// * to a message still in the buffer, so its position is known.
+///
+/// Pure, so the boundary is testable without a Dioxus runtime.
+fn read_marker_update(
     rooms: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
     current_owner_key: Option<ed25519_dalek::VerifyingKey>,
+    seen: Option<&(ed25519_dalek::VerifyingKey, MessageId)>,
 ) -> Option<(ed25519_dalek::VerifyingKey, MessageId)> {
     let owner_key = current_owner_key?;
-    let room_data = rooms.get(&owner_key)?;
-    let latest = room_data
-        .room_state
-        .recent_messages
-        .display_messages()
-        .last()
-        .map(|msg| msg.id())?;
-    if room_data.last_read_message_id.as_ref() == Some(&latest) {
-        return None; // Already marked as read
+    let (seen_room, seen_id) = seen?;
+    if *seen_room != owner_key {
+        return None;
     }
-    Some((owner_key, latest))
+    let room_data = rooms.get(&owner_key)?;
+    let messages = &room_data.room_state.recent_messages.messages;
+    let seen_at = messages.iter().position(|m| &m.id() == seen_id)?;
+    let advances = room_data
+        .last_read_message_id
+        .as_ref()
+        .is_none_or(|marker| {
+            messages
+                .iter()
+                .position(|m| &m.id() == marker)
+                .is_none_or(|marker_at| marker_at < seen_at)
+        });
+    advances.then(|| (owner_key, seen_id.clone()))
 }
 
 /// The two independent outcomes of a visible->hidden `visibilitychange`.
 #[derive(Debug, PartialEq, Eq)]
 struct HideActions {
-    /// Which room (if any) to mark read — see [`room_to_mark_read_on_hide`].
+    /// Which room (if any) to mark read, and up to where — see
+    /// [`read_marker_update`].
     mark: Option<(ed25519_dalek::VerifyingKey, MessageId)>,
     /// Whether to flush pending room saves through the delegate.
     flush: bool,
@@ -792,8 +808,8 @@ struct HideActions {
 /// user read moments ago (its `last_read_message_id` update still sitting
 /// inside `ROOM_SNAPSHOT_MIN_INTERVAL_MS`'s debounce window) can be a
 /// DIFFERENT room than whichever is current when the tab backgrounds. An
-/// earlier draft of this fix flushed only when `room_to_mark_read_on_hide`
-/// returned `Some`, which reintroduced #533 for exactly that case: current
+/// earlier draft of this fix flushed only when the mark was `Some`, which
+/// reintroduced #533 for exactly that case: current
 /// room already read -> no mark -> no flush -> the other room's pending save
 /// is lost if the tab closes before the debounce window closes on its own.
 /// `hiding_the_tab_always_flushes_even_when_nothing_to_mark` pins that this
@@ -801,15 +817,16 @@ struct HideActions {
 fn hide_actions(
     rooms: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
     current_owner_key: Option<ed25519_dalek::VerifyingKey>,
+    seen: Option<&(ed25519_dalek::VerifyingKey, MessageId)>,
 ) -> HideActions {
     HideActions {
-        mark: room_to_mark_read_on_hide(rooms, current_owner_key),
+        mark: read_marker_update(rooms, current_owner_key, seen),
         flush: true,
     }
 }
 
-/// Mark ONLY the currently-visible room as read, up to its latest
-/// currently-known message, and flush pending room saves.
+/// Mark ONLY the currently-visible room as read, up to the newest message the
+/// reader has had on screen ([`NEWEST_SEEN`]), and flush pending room saves.
 ///
 /// Called when the tab transitions from visible to hidden. Marking used to
 /// sweep EVERY room as read (`mark_all_rooms_as_read`, since replaced) on the
@@ -822,6 +839,11 @@ fn hide_actions(
 /// left untouched so its unread count survives the backgrounding. See
 /// [`hide_actions`] for why the flush stays unconditional despite that.
 ///
+/// It doesn't hold for the whole open room either. This then marked up to the
+/// room's latest message, so an arrival below the fold, or behind a mobile
+/// panel, went read the moment the tab hid; now it stays unread (10c
+/// decision 5).
+///
 /// Note this changes the hidden-tab title badge's meaning: it used to show
 /// only messages that arrived *after* the hide (because everything else had
 /// just been swept to read), and now shows the ACCUMULATED unread total
@@ -829,12 +851,15 @@ fn hide_actions(
 /// show. See the freenet/river#446 PR description.
 pub fn mark_current_room_as_read_on_hide() {
     let current_owner_key = CURRENT_ROOM.read().owner_key;
+    // A contended read marks nothing (the title effect marks what was seen
+    // anyway) and still flushes.
+    let seen = NEWEST_SEEN.try_read().ok().and_then(|seen| seen.clone());
 
     let actions = {
         let Ok(rooms) = ROOMS.try_read() else {
             return;
         };
-        hide_actions(&rooms.map, current_owner_key)
+        hide_actions(&rooms.map, current_owner_key, seen.as_ref())
     };
 
     if actions.mark.is_none() && !actions.flush {
@@ -884,8 +909,11 @@ fn on_visibility_change() {
     *DOCUMENT_VISIBLE.write() = is_visible;
 
     if is_visible {
-        // Tab became visible - mark current room as read
-        mark_current_room_as_read();
+        // Tab became visible: catch up to what the reader saw before it hid.
+        // What is on screen now is noted by `Conversation` once it sees the
+        // tab visible, and the title effect marks that. Deferred: this is a
+        // raw JS callback, and marking writes `ROOMS`.
+        crate::util::defer(mark_current_room_as_read);
     } else if was_visible {
         // Tab is going from visible to hidden. Only the room the user was
         // actually looking at gets marked read — see
@@ -946,14 +974,16 @@ pub fn DocumentTitleUpdater() -> Element {
     let rooms_len = ROOMS.try_read().map(|r| r.map.len()).unwrap_or(0);
     let _rooms_version = rooms_len; // Simple trigger for reactivity
 
-    // Update title on changes
+    // Update the title, and apply the read rule, on every change to the room,
+    // the rooms, visibility or what the reader has seen. Marking reads
+    // `NEWEST_SEEN`, so a newly seen message is marked from here; an arrival
+    // nobody has seen is not, however often `ROOMS` changes.
     use_effect(move || {
+        // freenet/river#555: anchored before the fallible `ROOMS` and
+        // `NEWEST_SEEN` reads below.
+        crate::util::signal_guard::anchor();
         update_document_title();
-
-        // If visible and a room is selected, mark as read
-        if *DOCUMENT_VISIBLE.read() && CURRENT_ROOM.read().owner_key.is_some() {
-            mark_current_room_as_read();
-        }
+        mark_current_room_as_read();
     });
 
     // Initialize on first render
@@ -2212,12 +2242,12 @@ mod tests {
     /// `visibilitychange` constantly, silently erasing unread state for
     /// rooms the user never opened.
     ///
-    /// This exercises `room_to_mark_read_on_hide` — the pure function
-    /// `mark_current_room_as_read_on_hide` delegates its decision to — rather
-    /// than going through the `GlobalSignal`-backed wrapper directly, which
-    /// needs a live Dioxus runtime that a native `cargo test` doesn't provide
-    /// (confirmed: calling `mark_current_room_as_read_on_hide()` from a test
-    /// panics with "Must be called from inside a Dioxus runtime").
+    /// This exercises `hide_actions` and `read_marker_update` — the pure
+    /// functions `mark_current_room_as_read_on_hide` delegates its decision to
+    /// — rather than going through the `GlobalSignal`-backed wrapper directly,
+    /// which needs a live Dioxus runtime that a native `cargo test` doesn't
+    /// provide (confirmed: calling `mark_current_room_as_read_on_hide()` from
+    /// a test panics with "Must be called from inside a Dioxus runtime").
     ///
     /// It puts unread messages in THREE non-current rooms plus the current
     /// one, and asserts the decision names only the current room. The
@@ -2229,7 +2259,8 @@ mod tests {
     /// room picked by accident (e.g. "first entry in the map" — three OTHER
     /// rooms, not one, keep that particular mistake from passing by luck of
     /// `HashMap` iteration order: with only 2 rooms total a reviewer measured
-    /// a "return an arbitrary room" mutant passing 2/5 runs).
+    /// a "return an arbitrary room" mutant passing 2/5 runs), nor the room a
+    /// stale seen message came from.
     #[test]
     fn hiding_the_tab_only_marks_the_current_room_as_read() {
         let (self_sk, _self_vk) = keypair();
@@ -2238,7 +2269,8 @@ mod tests {
         let (other_owner_sk_b, other_owner_vk_b) = keypair();
         let (other_owner_sk_c, other_owner_vk_c) = keypair();
 
-        // The room the user is actually looking at: unread messages present.
+        // The room the user is actually looking at: unread messages present,
+        // and the newest one has been on screen.
         let current_messages = vec![
             msg(&current_owner_sk, &current_owner_vk, 1),
             msg(&current_owner_sk, &current_owner_vk, 2),
@@ -2256,22 +2288,25 @@ mod tests {
         // touched.
         let mut rooms = HashMap::new();
         rooms.insert(current_owner_vk, current_room_data);
+        let mut other_latest = Vec::new();
         for (sk, vk) in [
             (&other_owner_sk_a, other_owner_vk_a),
             (&other_owner_sk_b, other_owner_vk_b),
             (&other_owner_sk_c, other_owner_vk_c),
         ] {
             let messages = vec![msg(sk, &vk, 1)];
+            other_latest.push((vk, messages[0].id()));
             rooms.insert(vk, room(self_sk.clone(), vk, messages, None));
         }
 
-        let update = room_to_mark_read_on_hide(&rooms, Some(current_owner_vk));
+        let seen = (current_owner_vk, current_latest.clone());
+        let update = hide_actions(&rooms, Some(current_owner_vk), Some(&seen)).mark;
 
         assert_eq!(
             update,
             Some((current_owner_vk, current_latest)),
-            "hiding the tab must mark the CURRENT room read up to its \
-             latest message, and nothing else"
+            "hiding the tab must mark the CURRENT room read up to the message \
+             the reader saw, and nothing else"
         );
         for other in [other_owner_vk_a, other_owner_vk_b, other_owner_vk_c] {
             assert_ne!(
@@ -2279,6 +2314,16 @@ mod tests {
                 Some(other),
                 "a room the user never opened must NOT be the one marked as \
                  read just because the tab was hidden (freenet/river#446)"
+            );
+        }
+        // A seen message left over from another room marks nothing: the
+        // reader is not looking at that room now.
+        for stale in &other_latest {
+            assert_eq!(
+                hide_actions(&rooms, Some(current_owner_vk), Some(stale)).mark,
+                None,
+                "a seen message from a room that is not open must not mark \
+                 any room read"
             );
         }
     }
@@ -2294,16 +2339,17 @@ mod tests {
         let (self_sk, _self_vk) = keypair();
         let (current_owner_sk, current_owner_vk) = keypair();
 
-        // The current room is ALREADY fully read -> `room_to_mark_read_on_hide`
+        // The current room is ALREADY fully read -> `read_marker_update`
         // returns `None` for it.
         let messages = vec![msg(&current_owner_sk, &current_owner_vk, 1)];
         let latest = messages.last().unwrap().id();
-        let current_room_data = room(self_sk, current_owner_vk, messages, Some(latest));
+        let current_room_data = room(self_sk, current_owner_vk, messages, Some(latest.clone()));
 
         let mut rooms = HashMap::new();
         rooms.insert(current_owner_vk, current_room_data);
 
-        let actions = hide_actions(&rooms, Some(current_owner_vk));
+        let seen = (current_owner_vk, latest);
+        let actions = hide_actions(&rooms, Some(current_owner_vk), Some(&seen));
 
         assert_eq!(
             actions.mark, None,
@@ -2314,6 +2360,124 @@ mod tests {
             "the flush must fire regardless of whether the current room \
              needed marking (freenet/river#533) — a DIFFERENT room may have \
              a pending debounced save that would otherwise be lost"
+        );
+    }
+
+    /// One room, its messages and a marker, with `self` as an observer, for
+    /// the read-rule tests below.
+    fn read_rule_room(
+        last_read: impl FnOnce(&[AuthorizedMessageV1]) -> Option<MessageId>,
+    ) -> (
+        HashMap<VerifyingKey, RoomData>,
+        VerifyingKey,
+        Vec<MessageId>,
+    ) {
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let messages: Vec<_> = (1..=3).map(|n| msg(&owner_sk, &owner_vk, n)).collect();
+        let ids = messages.iter().map(|m| m.id()).collect();
+        let marker = last_read(&messages);
+        let mut rooms = HashMap::new();
+        rooms.insert(owner_vk, room(self_sk, owner_vk, messages, marker));
+        (rooms, owner_vk, ids)
+    }
+
+    /// 10c decision 5: an arrival that renders below the fold is in the room
+    /// state, but the reader has only had the message before it on screen. The
+    /// marker stops there, and the arrival keeps counting as unread.
+    #[test]
+    fn marking_read_stops_at_the_newest_seen_message() {
+        let (mut rooms, owner_vk, ids) = read_rule_room(|_| None);
+        let seen = (owner_vk, ids[1].clone());
+
+        let update = read_marker_update(&rooms, Some(owner_vk), Some(&seen));
+        assert_eq!(
+            update,
+            Some((owner_vk, ids[1].clone())),
+            "the marker must move to the message the reader saw, not to the \
+             room's latest message"
+        );
+
+        let room_data = rooms.get_mut(&owner_vk).unwrap();
+        room_data.last_read_message_id = update.map(|(_, id)| id);
+        assert_eq!(
+            count_unread_in_room_data(room_data),
+            1,
+            "the arrival below the fold must still count as unread"
+        );
+    }
+
+    /// Nothing seen in this room (the tab or panel was hidden the whole time,
+    /// or the reader stayed above the newest message): nothing is marked.
+    #[test]
+    fn nothing_seen_marks_nothing() {
+        let (rooms, owner_vk, _) = read_rule_room(|_| None);
+        assert_eq!(read_marker_update(&rooms, Some(owner_vk), None), None);
+    }
+
+    /// No room open: nothing is marked, whatever was seen before.
+    #[test]
+    fn no_open_room_marks_nothing() {
+        let (rooms, owner_vk, ids) = read_rule_room(|_| None);
+        let seen = (owner_vk, ids[2].clone());
+        assert_eq!(read_marker_update(&rooms, None, Some(&seen)), None);
+    }
+
+    /// A message seen on an earlier visit, older than where the marker has
+    /// since got to, must not move it back.
+    #[test]
+    fn marking_read_never_moves_the_marker_back() {
+        let (rooms, owner_vk, ids) = read_rule_room(|m| Some(m[2].id()));
+        let seen = (owner_vk, ids[0].clone());
+        assert_eq!(
+            read_marker_update(&rooms, Some(owner_vk), Some(&seen)),
+            None
+        );
+        let seen = (owner_vk, ids[2].clone());
+        assert_eq!(
+            read_marker_update(&rooms, Some(owner_vk), Some(&seen)),
+            None,
+            "a marker already on the seen message needs no write"
+        );
+    }
+
+    /// A marker evicted from the buffer counts everything as unread, so the
+    /// seen message is progress and the marker moves to it.
+    #[test]
+    fn an_evicted_marker_moves_to_the_seen_message() {
+        let (sk, vk) = keypair();
+        let evicted = msg(&sk, &vk, 99).id();
+        let (rooms, owner_vk, ids) = read_rule_room(|_| Some(evicted));
+        let seen = (owner_vk, ids[1].clone());
+        assert_eq!(
+            read_marker_update(&rooms, Some(owner_vk), Some(&seen)),
+            Some((owner_vk, ids[1].clone()))
+        );
+    }
+
+    /// A seen message that has since left the buffer can't be positioned
+    /// against the marker, so it marks nothing.
+    #[test]
+    fn a_seen_message_no_longer_in_the_buffer_marks_nothing() {
+        let (rooms, owner_vk, _) = read_rule_room(|_| None);
+        let (sk, vk) = keypair();
+        let seen = (owner_vk, msg(&sk, &vk, 99).id());
+        assert_eq!(
+            read_marker_update(&rooms, Some(owner_vk), Some(&seen)),
+            None
+        );
+    }
+
+    /// Hiding the tab while scrolled up above an arrival: the hide marks only
+    /// what the reader saw, so the arrival survives it as unread.
+    #[test]
+    fn hiding_the_tab_leaves_an_unseen_arrival_unread() {
+        let (rooms, owner_vk, ids) = read_rule_room(|m| Some(m[0].id()));
+        let seen = (owner_vk, ids[1].clone());
+        assert_eq!(
+            hide_actions(&rooms, Some(owner_vk), Some(&seen)).mark,
+            Some((owner_vk, ids[1].clone())),
+            "the hide must stop at the seen message, short of the arrival"
         );
     }
 }
