@@ -81,9 +81,23 @@ async function addOwnReaction(page: Page): Promise<Locator> {
   return chip;
 }
 
+// Playwright's click() is a mouse pointer even on a touch project.
+// The app trusts pointerType, so a finger on mobile has to be tap().
+function mobileProject(): boolean {
+  return test.info().project.name.startsWith("mobile");
+}
+
+async function pressChip(chip: Locator) {
+  if (mobileProject()) {
+    await chip.tap();
+  } else {
+    await chip.click();
+  }
+}
+
 async function removeOwnReaction(page: Page, chip: Locator) {
   await chip.scrollIntoViewIfNeeded();
-  await chip.click();
+  await pressChip(chip);
   const owners = page.getByTestId("reaction-owners");
   if (await coarsePointer(page)) {
     await expect(owners).toBeVisible();
@@ -133,7 +147,7 @@ test.describe("Reaction owner list (#714)", () => {
         .count();
       const chipHeight = (await other.boundingBox())?.height ?? 0;
 
-      await other.click();
+      await pressChip(other);
       await expect(owners).toBeVisible();
       await expect(owners.getByTestId("reaction-remove")).toHaveCount(0);
       await expect(owners.getByTestId("reaction-owner")).toHaveCount(
@@ -158,7 +172,7 @@ test.describe("Reaction owner list (#714)", () => {
       await expect(page.getByTestId("emoji-picker")).toHaveCount(0);
       await expect(page.getByTestId("message-action-menu")).toHaveCount(0);
 
-      await own.click();
+      await pressChip(own);
       await expect(owners).toBeVisible();
       await expect(
         owners.getByTestId("reaction-owner").filter({ hasText: exactName("You") })
@@ -199,6 +213,28 @@ test.describe("Reaction owner list (#714)", () => {
       const added = await addOwnReaction(page);
       await removeOwnReaction(page, added);
     }
+  });
+});
+
+test.describe("Touchscreen with a mouse (#714)", { tag: "@chromium-only" }, () => {
+  test.use({ hasTouch: true, viewport: { width: 1280, height: 800 } });
+
+  test("a mouse click removes and a tap opens the list", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    await waitSettledAtBottom(page);
+    expect(await coarsePointer(page)).toBe(true);
+
+    const clicked = await addOwnReaction(page);
+    await clicked.click();
+    await expect(page.getByTestId("reaction-owners")).toHaveCount(0);
+    await expect(clicked).toHaveCount(0);
+
+    const tapped = await addOwnReaction(page);
+    await tapped.tap();
+    await expect(page.getByTestId("reaction-owners")).toBeVisible();
+    await expect(tapped).toHaveCount(1);
   });
 });
 

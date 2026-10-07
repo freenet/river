@@ -5834,11 +5834,18 @@ fn coarse_pointer() -> bool {
 fn gesture_opens_owner_list(evt: &dioxus_core::Event<MouseData>) -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(pointer) = evt.data().downcast::<web_sys::PointerEvent>() {
-            match pointer.pointer_type().as_str() {
-                "touch" => return true,
-                "mouse" | "pen" => return false,
-                _ => {}
+        // Dioxus 0.7.9 stores the click as a `web_sys::MouseEvent` even when
+        // the browser object is a `PointerEvent`, so a direct downcast to
+        // `PointerEvent` is always `None`. Cast on the JS side instead. A
+        // plain `MouseEvent` (Safari before 17) fails the cast and falls
+        // back to the media query.
+        if let Some(mouse) = evt.data().downcast::<web_sys::MouseEvent>() {
+            if let Some(pointer) = mouse.dyn_ref::<web_sys::PointerEvent>() {
+                match pointer.pointer_type().as_str() {
+                    "touch" => return true,
+                    "mouse" | "pen" => return false,
+                    _ => {}
+                }
             }
         }
     }
