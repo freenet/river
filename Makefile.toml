@@ -276,17 +276,9 @@ cwd = "./ui"
 [tasks.clean-ui-example-output]
 private = true
 description = "Remove cached example UI output before rebuilding"
-# A cached index.html must not survive into an example/no-sync build: if dx
-# decides there is nothing to do, the Playwright job would read the restored
-# index from disk, serve that same index, and pass its disk-vs-HTTP check
-# without this build having produced anything. Removes only the selected
-# public directory; the Rust and Dioxus caches around it stay warm.
-script = '''
-set -e
-: "${BUILD_PROFILE:?BUILD_PROFILE must be set}"
-PUBLIC_DIR="target/dx/river-ui/${BUILD_PROFILE}/web/public"
-rm -rf -- "$PUBLIC_DIR"
-'''
+# Why this must run before every build: see scripts/clean-ui-example-output.sh.
+command = "bash"
+args = ["scripts/clean-ui-example-output.sh"]
 
 [tasks.build-ui-example-no-sync]
 description = "Build the Dioxus UI with example data and no Freenet sync"
@@ -295,10 +287,9 @@ env = { UI_FEATURES = "example-data,no-sync" }
 # build-tailwind is required — see the note on build-ui-example. This is the
 # task AGENTS.md tells you to run before the Playwright suite, so it has to
 # work from a clean checkout.
-# clean-ui-example-output deletes the previous output, so an index on disk
-# afterwards can only have come from this dx run. touch-ui-files is the
-# established trigger (see compress-webapp-test) that makes dx rebuild rather
-# than trust its incremental decision. Pinned by
+# clean-ui-example-output: see scripts/clean-ui-example-output.sh. touch-ui-files
+# is the established trigger (see compress-webapp-test) that makes dx rebuild
+# rather than trust its incremental decision. Pinned by
 # scripts/tests/playwright-bundle-provenance-test.sh.
 dependencies = ["build-chat-delegate", "build-tailwind", "clean-ui-example-output", "touch-ui-files"]
 command = "dx"

@@ -11,17 +11,21 @@
 # directory before every example build; this file checks that deletion, the
 # readiness gate that rejects missing output, and the wiring between them.
 #
-# The cleanup and readiness bodies are extracted from Makefile.toml and
-# build.yml and executed against temporary fixtures, with `python3`, `curl`
-# and `sleep` stubbed. No port, node, Rust build or browser is needed.
+# The production scripts scripts/clean-ui-example-output.sh and
+# scripts/serve-playwright-ui.sh are executed against temporary
+# repository-shaped fixtures, with `python3`, `curl` and `sleep` stubbed. No
+# port, node, Rust build or browser is needed. A few wiring assertions then
+# check that the build and CI actually invoke those scripts.
 #
 # Run: ./scripts/tests/playwright-bundle-provenance-test.sh
-# Point it at other copies (for mutation checks) with PROVENANCE_MAKEFILE and
-# PROVENANCE_WORKFLOW.
+# Point it at other copies (for mutation checks) with PROVENANCE_CLEANUP,
+# PROVENANCE_SERVE, PROVENANCE_MAKEFILE and PROVENANCE_WORKFLOW.
 
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cleanup_script="${PROVENANCE_CLEANUP:-$repo_root/scripts/clean-ui-example-output.sh}"
+serve_script="${PROVENANCE_SERVE:-$repo_root/scripts/serve-playwright-ui.sh}"
 makefile="${PROVENANCE_MAKEFILE:-$repo_root/Makefile.toml}"
 workflow="${PROVENANCE_WORKFLOW:-$repo_root/.github/workflows/build.yml}"
 
@@ -42,9 +46,9 @@ fail() {
 }
 
 # ---------------------------------------------------------------------------
-# Extraction. Each helper exits 3 unless it finds exactly one match, so a
-# renamed or deleted block is reported instead of matching zero sites and
-# passing.
+# Block scoping for the wiring assertions. Each helper exits 3 unless it finds
+# exactly one match, so a renamed or deleted block is reported instead of
+# matching zero sites and passing.
 # ---------------------------------------------------------------------------
 
 # Lines of the single cargo-make task `$2`, up to the next `[section]`.
@@ -55,16 +59,6 @@ toml_task_block() {
         inblk { print }
         END { if (n != 1) exit 3 }
     ' "$1"
-}
-
-# The literal `script = '''...'''` body of a task block on stdin.
-toml_script_body() {
-    awk -v opener="script = '''" -v closer="'''" '
-        !inb && $0 == opener { n++; inb = 1; next }
-        inb && $0 == closer { inb = 0; next }
-        inb { print }
-        END { if (n != 1 || inb) exit 3 }
-    '
 }
 
 # Lines of the single workflow job `$2`, up to the next job or top-level key.
@@ -78,64 +72,22 @@ workflow_job_block() {
     ' "$1"
 }
 
-# The `run: |` body of the single step named `$1` in a job block on stdin,
-# with the block indentation removed.
-workflow_step_run() {
-    awk -v name="- name: $1" '
-        function indent(s) { match(s, /^ */); return RLENGTH }
-        {
-            ind = indent($0)
-            blank = ($0 ~ /^[ \t]*$/)
-            trimmed = substr($0, ind + 1)
-            if (inrun) {
-                if (blank) { pending = pending "\n"; next }
-                if (ind > runind) {
-                    if (bodyind < 0) bodyind = ind
-                    out = out pending substr($0, bodyind + 1) "\n"
-                    pending = ""
-                    next
-                }
-                inrun = 0
-            }
-            if (instep && !blank && ind <= stepind) instep = 0
-            if (trimmed == name) { n++; instep = 1; stepind = ind; next }
-            if (instep && trimmed == "run: |") {
-                runs++; inrun = 1; runind = ind; bodyind = -1; pending = ""
-            }
-        }
-        END {
-            if (n != 1 || runs != 1 || out == "") exit 3
-            printf "%s", out
-        }
-    '
-}
-
-extract_failed=0
-
-cleanup_body=""
-if block="$(toml_task_block "$makefile" clean-ui-example-output)" &&
-    cleanup_body="$(printf '%s\n' "$block" | toml_script_body)" &&
-    [[ -n "$cleanup_body" ]]; then
-    ok "Makefile.toml has exactly one clean-ui-example-output script"
-else
-    cleanup_body=""
-    extract_failed=1
-    fail "Makefile.toml has exactly one clean-ui-example-output script" \
-        "no single [tasks.clean-ui-example-output] with a script = ''' block in $makefile" \
-        "the cases below run with an empty preparation step"
-fi
+for script in "$cleanup_script" "$serve_script"; do
+    if [[ ! -f "$script" ]]; then
+        printf 'FAIL missing script %s\n\nCannot run the cases without it; stopping.\n' "$script"
+        exit 1
+    fi
+done
+# Resolve to absolute paths: the cases run from inside fixtures.
+cleanup_script="$(cd "$(dirname "$cleanup_script")" && pwd)/$(basename "$cleanup_script")"
+serve_script="$(cd "$(dirname "$serve_script")" && pwd)/$(basename "$serve_script")"
 
 job_block=""
-readiness_body=""
-if job_block="$(workflow_job_block "$workflow" ui-playwright-tests)" &&
-    readiness_body="$(printf '%s\n' "$job_block" |
-        workflow_step_run "Serve the built UI and wait for readiness")" &&
-    [[ -n "$readiness_body" ]]; then
-    ok "build.yml has exactly one readiness step in ui-playwright-tests"
+if job_block="$(workflow_job_block "$workflow" ui-playwright-tests)"; then
+    ok "build.yml has exactly one ui-playwright-tests job"
 else
-    printf 'FAIL build.yml has exactly one readiness step in ui-playwright-tests\n'
-    printf '       no single "Serve the built UI and wait for readiness" run: | block in %s\n' "$workflow"
-    printf '\nCannot exercise readiness without its body; stopping.\n'
+    printf 'FAIL build.yml has exactly one ui-playwright-tests job in %s\n' "$workflow"
+    printf '\nCannot check the CI wiring without it; stopping.\n'
     exit 1
 fi
 
@@ -156,9 +108,15 @@ touch "$STUB_SERVER_MARKER"
 exit 0
 STUB
 
-# HTTP: answer with whatever the case put in $STUB_SERVED_HTML.
+# HTTP: answer with whatever the case put in $STUB_SERVED_HTML, after failing
+# the first $STUB_CURL_REFUSALS polls the way curl does before a server listens.
 cat >"$stubs/curl" <<'STUB'
 #!/usr/bin/env bash
+refusals="$(cat "$STUB_CURL_REFUSALS" 2>/dev/null || echo 0)"
+if [[ "$refusals" -gt 0 ]]; then
+    echo $((refusals - 1)) >"$STUB_CURL_REFUSALS"
+    exit 7
+fi
 cat "$STUB_SERVED_HTML" 2>/dev/null
 exit 0
 STUB
@@ -173,6 +131,7 @@ chmod +x "$stubs/python3" "$stubs/curl" "$stubs/sleep"
 
 export STUB_SERVER_MARKER="$sandbox/server-started"
 export STUB_SERVED_HTML="$sandbox/served.html"
+export STUB_CURL_REFUSALS="$sandbox/curl-refusals"
 
 OLD_JS="river-ui-dxh25b5ff1a9ac3ccf1.js"
 NEW_JS="river-ui-dxh0123456789abcdef.js"
@@ -203,9 +162,9 @@ new_fixture() {
     echo 'sibling' >"$fixture/target/dx/river-ui/release/web/sibling-sentinel"
 }
 
-# cargo-make runs script blocks with `sh`, from the repository root.
+# cargo-make runs the script from the repository root.
 run_cleanup() {
-    (cd "$1" && BUILD_PROFILE="${2-release}" sh -c "$cleanup_body") >"$sandbox/cleanup.out" 2>&1
+    (cd "$1" && BUILD_PROFILE="${2-release}" bash "$cleanup_script") >"$sandbox/cleanup.out" 2>&1
 }
 
 # A successful build that writes a fresh index naming bundle $2.
@@ -219,10 +178,9 @@ serve() {
     index_html "$1" >"$STUB_SERVED_HTML"
 }
 
-# GitHub Actions runs `run:` blocks with `bash -e -o pipefail`.
 run_readiness() {
     rm -f "$STUB_SERVER_MARKER"
-    out="$(cd "$1" && PATH="$stubs:$PATH" bash -e -o pipefail -c "$readiness_body" 2>&1)"
+    out="$(cd "$1" && PATH="$stubs:$PATH" bash "$serve_script" 2>&1)"
     status=$?
     # The server is started in the background; give the stub time to land.
     sleep 0.2
@@ -246,59 +204,57 @@ run_cleanup "$fixture"
 # The no-op build: dx exits 0 without writing anything.
 serve "$OLD_JS"
 run_readiness "$fixture"
-if [[ "$status" -ne 0 ]]; then
+if [[ "$status" -ne 0 && "$server_started" -eq 0 ]]; then
     ok "cached output plus a no-op build fails readiness even when names match"
 else
     fail "cached output plus a no-op build fails readiness even when names match" \
-        "readiness exited 0 on the restored index" "$out"
+        "exited $status, server started: $server_started" "$out"
 fi
 
 # ---------------------------------------------------------------------------
 # 2. Cleanup removes the selected public directory and nothing else.
 # ---------------------------------------------------------------------------
 
-if [[ -n "$cleanup_body" ]]; then
-    new_fixture
-    if run_cleanup "$fixture" && [[ ! -e "$fixture/$public_rel" ]] && sentinels_intact "$fixture"; then
-        ok "cleanup removes the selected public directory and keeps the rest of target/"
-    else
-        fail "cleanup removes the selected public directory and keeps the rest of target/" \
-            "$(find "$fixture/target" -type f | sed "s|$fixture/||" | sort | tr '\n' ' ')" \
-            "$(cat "$sandbox/cleanup.out")"
-    fi
+new_fixture
+if run_cleanup "$fixture" && [[ ! -e "$fixture/$public_rel" ]] && sentinels_intact "$fixture"; then
+    ok "cleanup removes the selected public directory and keeps the rest of target/"
+else
+    fail "cleanup removes the selected public directory and keeps the rest of target/" \
+        "$(find "$fixture/target" -type f | sed "s|$fixture/||" | sort | tr '\n' ' ')" \
+        "$(cat "$sandbox/cleanup.out")"
+fi
 
-    new_fixture
-    rm -rf "${fixture:?}/$public_rel"
-    if run_cleanup "$fixture" && sentinels_intact "$fixture"; then
-        ok "cleanup succeeds when public is already absent"
-    else
-        fail "cleanup succeeds when public is already absent" "$(cat "$sandbox/cleanup.out")"
-    fi
+new_fixture
+rm -rf "${fixture:?}/$public_rel"
+if run_cleanup "$fixture" && sentinels_intact "$fixture"; then
+    ok "cleanup succeeds when public is already absent"
+else
+    fail "cleanup succeeds when public is already absent" "$(cat "$sandbox/cleanup.out")"
+fi
 
-    new_fixture
-    if ! run_cleanup "$fixture" "" && [[ -f "$fixture/$public_rel/index.html" ]] && sentinels_intact "$fixture"; then
-        ok "cleanup refuses to run without BUILD_PROFILE"
-    else
-        fail "cleanup refuses to run without BUILD_PROFILE" \
-            "an empty profile would select target/dx/river-ui//web/public" \
-            "$(cat "$sandbox/cleanup.out")"
-    fi
+new_fixture
+if ! run_cleanup "$fixture" "" && [[ -f "$fixture/$public_rel/index.html" ]] && sentinels_intact "$fixture"; then
+    ok "cleanup refuses to run without BUILD_PROFILE"
+else
+    fail "cleanup refuses to run without BUILD_PROFILE" \
+        "an empty profile would select target/dx/river-ui//web/public" \
+        "$(cat "$sandbox/cleanup.out")"
+fi
 
-    # A removal error must fail the task, so cargo-make stops before dx runs.
-    # Root ignores directory permissions, so this case cannot be staged there.
-    if [[ "$(id -u)" -eq 0 ]]; then
-        ok "cleanup fails when removal fails (skipped: running as root)"
+# A removal error must fail the task, so cargo-make stops before dx runs.
+# Root ignores directory permissions, so this case cannot be staged there.
+if [[ "$(id -u)" -eq 0 ]]; then
+    ok "cleanup fails when removal fails (skipped: running as root)"
+else
+    new_fixture
+    chmod a-w "$fixture/$public_rel" "$fixture/target/dx/river-ui/release/web"
+    if ! run_cleanup "$fixture"; then
+        ok "cleanup fails when removal fails"
     else
-        new_fixture
-        chmod a-w "$fixture/$public_rel" "$fixture/target/dx/river-ui/release/web"
-        if ! run_cleanup "$fixture"; then
-            ok "cleanup fails when removal fails"
-        else
-            fail "cleanup fails when removal fails" \
-                "exited 0 with $public_rel still present" "$(cat "$sandbox/cleanup.out")"
-        fi
-        chmod u+w "$fixture/$public_rel" "$fixture/target/dx/river-ui/release/web"
+        fail "cleanup fails when removal fails" \
+            "exited 0 with $public_rel still present" "$(cat "$sandbox/cleanup.out")"
     fi
+    chmod u+w "$fixture/$public_rel" "$fixture/target/dx/river-ui/release/web"
 fi
 
 # ---------------------------------------------------------------------------
@@ -320,6 +276,21 @@ for js in "$NEW_JS" "$OLD_JS"; do
     fi
 done
 
+# The server is started in the background, so the first polls can land
+# before it listens. The loop has to retry them, not exit on them.
+new_fixture
+run_cleanup "$fixture"
+simulate_rebuild "$fixture" "$NEW_JS"
+serve "$NEW_JS"
+echo 2 >"$STUB_CURL_REFUSALS"
+run_readiness "$fixture"
+if [[ "$status" -eq 0 && "$out" == *"built: $NEW_JS served: $NEW_JS"* ]]; then
+    ok "readiness retries polls made before the server listens"
+else
+    fail "readiness retries polls made before the server listens" "exited $status" "$out"
+fi
+rm -f "$STUB_CURL_REFUSALS"
+
 # ---------------------------------------------------------------------------
 # 4. A different served bundle still fails the disk-vs-HTTP comparison.
 # ---------------------------------------------------------------------------
@@ -340,27 +311,22 @@ fi
 #    rejected before the server starts.
 # ---------------------------------------------------------------------------
 
-new_fixture
-rm -f "$fixture/$public_rel/index.html"
-serve "$OLD_JS"
-run_readiness "$fixture"
-if [[ "$status" -ne 0 && "$server_started" -eq 0 ]]; then
-    ok "a missing index fails before the server starts"
-else
-    fail "a missing index fails before the server starts" \
-        "exited $status, server started: $server_started" "$out"
-fi
-
-new_fixture
-: >"$fixture/$public_rel/index.html"
-serve "$OLD_JS"
-run_readiness "$fixture"
-if [[ "$status" -ne 0 && "$server_started" -eq 0 ]]; then
-    ok "an empty index fails before the server starts"
-else
-    fail "an empty index fails before the server starts" \
-        "exited $status, server started: $server_started" "$out"
-fi
+for case in "a missing" "an empty"; do
+    new_fixture
+    if [[ "$case" == "a missing" ]]; then
+        rm -f "$fixture/$public_rel/index.html"
+    else
+        : >"$fixture/$public_rel/index.html"
+    fi
+    serve "$OLD_JS"
+    run_readiness "$fixture"
+    if [[ "$status" -ne 0 && "$server_started" -eq 0 ]]; then
+        ok "$case index fails before the server starts"
+    else
+        fail "$case index fails before the server starts" \
+            "exited $status, server started: $server_started" "$out"
+    fi
+done
 
 new_fixture
 echo '<!DOCTYPE html><html><head></head></html>' >"$fixture/$public_rel/index.html"
@@ -373,28 +339,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Preparation runs on every build, not only on a cache miss.
-# ---------------------------------------------------------------------------
-
-new_fixture
-rm -rf "${fixture:?}/$public_rel"
-run_cleanup "$fixture"
-simulate_rebuild "$fixture" "$NEW_JS"
-serve "$NEW_JS"
-run_readiness "$fixture"
-first_status=$status
-run_cleanup "$fixture"
-run_readiness "$fixture"
-if [[ "$first_status" -eq 0 && "$status" -ne 0 ]]; then
-    ok "a second, warm no-op build fails readiness after a good first run"
-else
-    fail "a second, warm no-op build fails readiness after a good first run" \
-        "first run exited $first_status, second exited $status" "$out"
-fi
-
-# ---------------------------------------------------------------------------
-# 7. Call sites. The bodies above prove nothing if the build no longer runs
-#    them, so pin the wiring. Comment lines are stripped before matching.
+# 6. Call sites. The scripts above prove nothing if the build and CI no longer
+#    run them, so pin the wiring. Comment lines are stripped before matching.
 # ---------------------------------------------------------------------------
 
 strip_comments() { grep -v '^[[:space:]]*#'; }
@@ -425,6 +371,16 @@ else
     fail "Makefile.toml has exactly one build-ui-example-no-sync task"
 fi
 
+if clean_block="$(toml_task_block "$makefile" clean-ui-example-output)" &&
+    clean_code="$(printf '%s\n' "$clean_block" | strip_comments)" &&
+    printf '%s\n' "$clean_code" | grep -qx 'command = "bash"' &&
+    printf '%s\n' "$clean_code" | grep -qx 'args = \["scripts/clean-ui-example-output\.sh"\]'; then
+    ok "clean-ui-example-output runs scripts/clean-ui-example-output.sh"
+else
+    fail "clean-ui-example-output runs scripts/clean-ui-example-output.sh" \
+        "${clean_block:-<task not found>}"
+fi
+
 if touch_block="$(toml_task_block "$makefile" touch-ui-files)" &&
     printf '%s\n' "$touch_block" | strip_comments | grep -qx 'touch ui/src/main.rs'; then
     ok "touch-ui-files still touches ui/src/main.rs"
@@ -451,13 +407,25 @@ else
         "test invocation: ${guard_line:-<none>}" "build: ${build_line:-<none>}"
 fi
 
-if [[ "$readiness_body" == *"--bind 127.0.0.1"* && "$readiness_body" == *"http://127.0.0.1:8082/"* ]] &&
+serve_line="$(printf '%s\n' "$job_code" | grep -n 'run: \./scripts/serve-playwright-ui\.sh$' || true)"
+if [[ "$(printf '%s\n' "$serve_line" | grep -c .)" -eq 1 && -n "$build_line" &&
+    "${serve_line%%:*}" -gt "${build_line%%:*}" ]]; then
+    ok "ui-playwright-tests runs the readiness script once, after the build"
+else
+    fail "ui-playwright-tests runs the readiness script once, after the build" \
+        "readiness: ${serve_line:-<none>}" "build: ${build_line:-<none>}"
+fi
+
+# Playwright reads PLAYWRIGHT_BASE_URL (ui/tests/playwright.config.ts), so the
+# script's bind address and port have to be the one the workflow hands it.
+serve_code="$(strip_comments <"$serve_script")"
+if [[ "$serve_code" == *"--bind 127.0.0.1"* && "$serve_code" == *"http.server 8082 "* &&
+    "$serve_code" == *"http://127.0.0.1:8082/"* ]] &&
     printf '%s\n' "$job_code" | grep -q 'PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082$'; then
     ok "the server binds 127.0.0.1:8082 and Playwright targets it explicitly"
 else
     fail "the server binds 127.0.0.1:8082 and Playwright targets it explicitly"
 fi
 
-[[ "$extract_failed" -eq 0 ]] || printf '\nnote: clean-ui-example-output could not be extracted\n'
 printf '\n%d checks, %d failures\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]
