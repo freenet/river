@@ -903,20 +903,33 @@ async function backfillThenReturn(page: Page): Promise<number[]> {
     await expect.poll(() => page.locator("[data-item-key]").count()).toBeGreaterThan(before);
   }
   await expect(tallest, "premise: backfill should reach the tall rows").toHaveCount(1);
-  await page.evaluate(() => {
+  return observeRowCounts(page, { returnToEnd: true });
+}
+
+/// The rendered row counts the history goes through over two seconds, each
+/// recorded only when it changes. With `returnToEnd`, the jump to the end is
+/// made after the observer is installed, so its first patch is not missed.
+function observeRowCounts(page: Page, { returnToEnd = false } = {}): Promise<number[]> {
+  return page.evaluate(async (returnToEnd) => {
     const hist = document.querySelector('[data-testid="conversation-history"]')!;
     const counts: number[] = [];
-    (window as any).__riverRowCounts = counts;
     let last = hist.querySelectorAll("[data-item-key]").length;
-    new MutationObserver(() => {
+    const observer = new MutationObserver(() => {
       const n = hist.querySelectorAll("[data-item-key]").length;
       if (n !== last) counts.push((last = n));
-    }).observe(hist, { childList: true });
-    const c = document.getElementById("chat-scroll-container")!;
-    c.scrollTop = c.scrollHeight;
-  });
-  await page.waitForTimeout(2_000);
-  return page.evaluate(() => (window as any).__riverRowCounts);
+    });
+    observer.observe(hist, { childList: true });
+    try {
+      if (returnToEnd) {
+        const c = document.getElementById("chat-scroll-container")!;
+        c.scrollTop = c.scrollHeight;
+      }
+      await new Promise((r) => setTimeout(r, 2_000));
+    } finally {
+      observer.disconnect();
+    }
+    return counts;
+  }, returnToEnd);
 }
 
 test.describe("Render ceiling and trimming (A04, A05)", () => {
@@ -998,19 +1011,7 @@ test.describe("Trimming on a very tall viewport (A05)", () => {
       "premise: a trimmed (60-row, short) window must sit within the backfill strip's reach of the viewport",
     ).toBeLessThan((await viewportHeight(page)) + 800);
 
-    const counts = await page.evaluate(async () => {
-      const hist = document.querySelector('[data-testid="conversation-history"]')!;
-      const seen: number[] = [];
-      let last = hist.querySelectorAll("[data-item-key]").length;
-      const observer = new MutationObserver(() => {
-        const n = hist.querySelectorAll("[data-item-key]").length;
-        if (n !== last) seen.push((last = n));
-      });
-      observer.observe(hist, { childList: true });
-      await new Promise((r) => setTimeout(r, 2_000));
-      observer.disconnect();
-      return seen;
-    });
+    const counts = await observeRowCounts(page);
     knownFailure(
       ALL_PROJECTS,
       "trim and backfill oscillate: the trim estimate averages row heights (the #505 loop, via uneven rows)",

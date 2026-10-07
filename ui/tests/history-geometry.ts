@@ -15,10 +15,10 @@ export const BOTTOM_THRESHOLD_PX = 100;
 export const AT_BOTTOM_EPSILON_PX = 4;
 /// How far a row the reader is looking at may move and still count as "kept
 /// in place". Independent of the app's own 2px slack and 100px band (#732).
-export const READING_ROW_BUDGET_PX = 4;
+const READING_ROW_BUDGET_PX = 4;
 
 /// The main SHA the known failures below were reproduced on (10a baseline).
-export const KNOWN_FAILURE_SHA = "739fd683";
+const KNOWN_FAILURE_SHA = "739fd683";
 
 /// Mark the REST of the test as a reproduced, known failure on main.
 ///
@@ -172,13 +172,12 @@ export function nextFrames(page: Page): Promise<void> {
 }
 
 /// The row the reader is looking at: an item row fully inside the visible part
-/// of the history, with its neighbours' keys for deletion cases.
-export type ReadingRow = {
+/// of the history, with the preceding row's key for deletion cases.
+type ReadingRow = {
   key: string;
   top: number;
   text: string;
   prevKey: string | null;
-  nextKey: string | null;
 };
 
 /// The first item row fully inside the container's visible area, optionally
@@ -198,7 +197,6 @@ export async function readingRow(page: Page, containing?: string): Promise<Readi
         top: r.top - cRect.top,
         text,
         prevKey: rows[i - 1]?.getAttribute("data-item-key") ?? null,
-        nextKey: rows[i + 1]?.getAttribute("data-item-key") ?? null,
       };
     }
     return null;
@@ -222,9 +220,9 @@ export function rowTop(page: Page, key: string): Promise<number | null> {
 /// Measure `key` after the patch has settled and again a moment later, so a
 /// late correction (or a late yank) counts against the row too.
 export async function expectRowHeld(page: Page, key: string, expectedTop: number, why: string) {
-  for (const wait of [300, 300]) {
+  for (let i = 0; i < 2; i++) {
     await nextFrames(page);
-    await page.waitForTimeout(wait);
+    await page.waitForTimeout(300);
     const top = await rowTop(page, key);
     expect(top, `${why} (the row left the DOM)`).not.toBeNull();
     expect(Math.abs(top! - expectedTop), `${why} (moved ${top! - expectedTop}px)`).toBeLessThanOrEqual(
@@ -260,7 +258,7 @@ export async function holdSettleEvents(page: Page) {
 }
 
 /// How many settle-path events the gate has withheld so far.
-export function heldSettleEvents(page: Page): Promise<{ scroll: number; scrollend: number; hasScrollend: boolean }> {
+function heldSettleEvents(page: Page): Promise<{ scroll: number; scrollend: number; hasScrollend: boolean }> {
   return page.evaluate(() => {
     const gate = (window as any).__riverSettleGate;
     return { ...gate.held, hasScrollend: gate.hasScrollend };

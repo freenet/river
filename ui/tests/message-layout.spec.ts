@@ -793,15 +793,7 @@ test.describe("Editing the last message keeps its controls reachable (A08)", () 
       "edit me, I am the last message",
     );
 
-    const ownMessage = lastRow.locator('[id^="msg-"]').last();
-    if (await page.evaluate(() => window.matchMedia("(hover: none)").matches)) {
-      await ownMessage.getByTestId("message-kebab").click();
-      await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();
-    } else {
-      await ownMessage.getByTestId("message-bubble").hover();
-      await ownMessage.getByRole("button", { name: /edit/i }).click();
-    }
-    await expect(page.locator('textarea[id^="edit-msg-"]')).toBeVisible({ timeout: 5_000 });
+    await openOwnMessageEdit(page, lastRow.locator('[id^="msg-"]').last());
     // The form reveals itself with a smooth scroll; measure once it has stopped.
     await expect
       .poll(

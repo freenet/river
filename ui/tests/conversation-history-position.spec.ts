@@ -50,17 +50,11 @@ test.describe("Reading position when content above changes (A02)", () => {
   // app compensates only for window-head swaps, so a Markdown image that loads
   // above a parked reader pushes their text down by its height.
   test("an image loading above a parked reader keeps their row in place", async ({ page }) => {
-    let release: (route: Route) => Promise<void> = async () => {};
-    let resolveRequested: (route: Route) => void = () => {};
+    let resolveRequested!: (route: Route) => void;
     const requested = new Promise<Route>((resolve) => {
       resolveRequested = resolve;
     });
     await page.route("**/test-image.svg", (route) => resolveRequested(route));
-    release = (route) =>
-      route.fulfill({
-        contentType: "image/svg+xml",
-        body: '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="#888"/></svg>',
-      });
 
     await openRoomAtBottom(page, "Team Chat Room");
     // The Markdown renders to text plus an <img>, so wait on the plain words.
@@ -88,7 +82,10 @@ test.describe("Reading position when content above changes (A02)", () => {
     const image = page.locator(`[data-item-key="${imageKey}"] img`);
     const heightBefore = await page.locator(`[data-item-key="${imageKey}"]`).evaluate((r) => r.getBoundingClientRect().height);
 
-    await release(route);
+    await route.fulfill({
+      contentType: "image/svg+xml",
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="#888"/></svg>',
+    });
     await expect
       .poll(() => image.evaluate((img: HTMLImageElement) => img.complete && img.naturalHeight > 0), {
         message: "premise: the image should load",
