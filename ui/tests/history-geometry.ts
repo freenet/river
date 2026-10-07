@@ -69,6 +69,15 @@ export function scrollTop(page: Page): Promise<number> {
   });
 }
 
+/// How many newer items the rendered range is holding back, from the
+/// history's `data-newer-withheld`.
+export function withheld(page: Page): Promise<number> {
+  return page
+    .getByTestId("conversation-history")
+    .getAttribute("data-newer-withheld")
+    .then((n) => Number(n));
+}
+
 /// Premise shared by the parked-reader tests: the view is outside the
 /// bottom band, so an arrival must not be followed.
 export async function expectParkedAwayFromEnd(page: Page, why = "premise: parked away from the end") {
