@@ -824,8 +824,8 @@ test.describe("Arrival before the reader's settle (A01)", () => {
 
   // freenet/river#723. The pin re-arms only when the reader's settle lands, so
   // an arrival patched between "back at the bottom" and that settle is not
-  // followed. CURRENT POLICY: main intends to follow here; 10b drops following
-  // and keeps only "no unrequested navigation".
+  // followed. CURRENT POLICY: main intends to follow here. The later
+  // simplification drops following and keeps only "no unrequested navigation".
   test("an arrival patched before the reader's return-to-bottom settles is followed", async ({
     page,
   }) => {
@@ -1027,8 +1027,8 @@ test.describe("Own send while reading history (A06)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
   // CURRENT POLICY: your own message snaps the view to the latest message
-  // (`force_scroll`), wherever you were reading. 10b replaces this with
-  // position preservation; the send and the draft clearing stay.
+  // (`force_scroll`), wherever you were reading. The later simplification
+  // replaces this with position preservation; the send and the draft clearing stay.
   test("sending while scrolled up submits, clears the draft and snaps to the latest message", async ({
     page,
   }) => {

@@ -17,7 +17,7 @@ export const AT_BOTTOM_EPSILON_PX = 4;
 /// in place". Independent of the app's own 2px slack and 100px band (#732).
 const READING_ROW_BUDGET_PX = 4;
 
-/// The main SHA the known failures below were reproduced on (10a baseline).
+/// The main SHA the known failures below were reproduced on, before the scroll simplification.
 const KNOWN_FAILURE_SHA = "739fd683";
 
 /// Mark the REST of the test as a reproduced, known failure on main.

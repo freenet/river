@@ -140,8 +140,8 @@ test.describe("Muted rooms and the cross-surface totals", { tag: "@chromium-only
 
 // A short arrival related to where the view actually is (A07): is it on screen,
 // is the scroll-to-latest button offered, and is the room marked read anyway?
-// CURRENT POLICY throughout: 10b changes catch-up and read acknowledgment on
-// purpose. The viewport witness is what stays.
+// CURRENT POLICY throughout: the later simplification changes catch-up and
+// read acknowledgment on purpose. The viewport witness is what stays.
 test.describe("Unseen arrivals versus the viewport (A07)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 

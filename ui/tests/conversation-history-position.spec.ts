@@ -128,7 +128,7 @@ test.describe("Reading position when content above changes (A02)", () => {
 
   // Deleting the very row the reader is looking at must not be read as "the
   // reader's place is gone, take them to the latest message". An invariant on
-  // main and in 10b.
+  // main and after the scroll simplification.
   test("deleting the row a parked reader is looking at does not navigate to the latest message", async ({
     page,
   }) => {
@@ -210,7 +210,7 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
 
   // CURRENT POLICY: a room opened while the chat is hidden opens at its
   // newest message, and the geometry on reveal belongs to that room, not the
-  // one that was hidden. 10b may restore a saved position instead.
+  // one that was hidden. The later simplification may restore a saved position instead.
   test("a room switched to while the chat is hidden opens at its newest message on reveal", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
