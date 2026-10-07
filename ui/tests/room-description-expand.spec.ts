@@ -59,6 +59,8 @@ test.describe("Room description expand", { tag: "@chromium-only" }, () => {
 
     const description = page.getByTestId("room-header-description");
     await expect(description).toHaveAttribute("data-expanded", "false");
+    // The chevron appears only after the line is measured as overflowing.
+    await expect(page.getByTestId("room-description-toggle")).toBeVisible();
     // "Welcome" is the leading plain text, before the first link.
     await description.click({ position: { x: 8, y: 6 } });
     await expect(description).toHaveAttribute("data-expanded", "true");

@@ -1103,11 +1103,49 @@ fn line_container_depth(line: &str) -> usize {
 /// Classes for the header description. Collapsed is one line (`truncate`);
 /// expanded wraps and scrolls so a long description stays in the header
 /// instead of pushing the messages off the screen (freenet/river#718).
-fn room_description_class(expanded: bool) -> &'static str {
-    if expanded {
-        "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted [&>p]:m-0 break-words cursor-pointer max-h-48 overflow-y-auto"
-    } else {
-        "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline cursor-pointer"
+fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
+    match (expanded, interactive) {
+        (true, _) => {
+            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted [&>p]:m-0 break-words cursor-pointer max-h-48 overflow-y-auto"
+        }
+        (false, true) => {
+            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline cursor-pointer"
+        }
+        (false, false) => {
+            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline"
+        }
+    }
+}
+
+/// The collapsed header line is wider than its box. Measured on the element
+/// itself: a chevron on a line that already fits only makes the header taller
+/// (freenet/river#718 review).
+fn header_description_overflows() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.get_element_by_id("room-header-description"))
+            .is_some_and(|element| element.scroll_width() > element.client_width());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
+/// A drag that selects description text ends in a click. That click must not
+/// expand or collapse the block.
+fn description_selection_is_collapsed() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|window| window.get_selection().ok().flatten())
+            .is_none_or(|selection| selection.is_collapsed())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        true
     }
 }
 
@@ -3675,6 +3713,22 @@ pub fn Conversation() -> Element {
     // so switching rooms collapses it without an effect that would also
     // collapse on unrelated CURRENT_ROOM writes (freenet/river#718).
     let mut expanded_description_room = use_signal(|| None::<ed25519_dalek::VerifyingKey>);
+    // True when the collapsed line does not fit. Stays true while expanded so
+    // the chevron does not vanish for a frame on the way back to one line.
+    let description_overflows = use_signal(|| false);
+    {
+        let mut description_overflows = description_overflows;
+        use_effect(move || {
+            let _html = current_room_description_html.read().clone();
+            let expanded = expanded_description_room.read().is_some();
+            if expanded {
+                return;
+            }
+            crate::util::defer(move || {
+                description_overflows.set(header_description_overflows());
+            });
+        });
+    }
 
     // Memoize expensive message grouping (decryption + markdown parsing)
     // This prevents re-computing on every render/keystroke
@@ -4912,6 +4966,8 @@ pub fn Conversation() -> Element {
                     let description_expanded = expanded_description_room.read().as_ref()
                         == room_key.as_ref()
                         && room_key.is_some();
+                    let description_can_toggle =
+                        description_expanded || *description_overflows.read();
                     let toggle_description = {
                         let room_key = room_key;
                         move || {
@@ -5055,16 +5111,24 @@ pub fn Conversation() -> Element {
                                     if let Some(desc_html) = current_room_description_html.read().as_ref() {
                                         div { class: "flex items-start gap-1 min-w-0",
                                             div {
+                                                id: "room-header-description",
                                                 "data-testid": "room-header-description",
                                                 "data-expanded": if description_expanded { "true" } else { "false" },
-                                                class: room_description_class(description_expanded),
+                                                class: room_description_class(
+                                                    description_expanded,
+                                                    description_can_toggle,
+                                                ),
                                                 onclick: {
                                                     let toggle_description = toggle_description.clone();
                                                     move |evt| {
-                                                        // Links stay links. The rest of the line
-                                                        // is the control the truncated ellipsis
-                                                        // was missing (#718).
-                                                        if description_click_is_link(&evt) {
+                                                        // Links stay links. A drag-select ends in
+                                                        // a click and must not toggle. A line that
+                                                        // already fits has nothing to reveal.
+                                                        if description_click_is_link(&evt)
+                                                            || !description_selection_is_collapsed()
+                                                            || !*description_overflows.peek()
+                                                                && !description_expanded
+                                                        {
                                                             return;
                                                         }
                                                         toggle_description();
@@ -5072,17 +5136,19 @@ pub fn Conversation() -> Element {
                                                 },
                                                 dangerous_inner_html: "{desc_html}"
                                             }
-                                            button {
-                                                "data-testid": "room-description-toggle",
-                                                class: "flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                                                "aria-expanded": if description_expanded { "true" } else { "false" },
-                                                "aria-label": if description_expanded { "Hide room description" } else { "Show room description" },
-                                                title: if description_expanded { "Hide room description" } else { "Show room description" },
-                                                onclick: move |_| toggle_description(),
-                                                if description_expanded {
-                                                    Icon { icon: FaChevronUp, width: 14, height: 14 }
-                                                } else {
-                                                    Icon { icon: FaChevronDown, width: 14, height: 14 }
+                                            if description_can_toggle {
+                                                button {
+                                                    "data-testid": "room-description-toggle",
+                                                    class: "flex-shrink-0 p-0.5 -my-1 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                                    "aria-expanded": if description_expanded { "true" } else { "false" },
+                                                    "aria-label": if description_expanded { "Hide room description" } else { "Show room description" },
+                                                    title: if description_expanded { "Hide room description" } else { "Show room description" },
+                                                    onclick: move |_| toggle_description(),
+                                                    if description_expanded {
+                                                        Icon { icon: FaChevronUp, width: 14, height: 14 }
+                                                    } else {
+                                                        Icon { icon: FaChevronDown, width: 14, height: 14 }
+                                                    }
                                                 }
                                             }
                                         }
