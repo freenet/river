@@ -31,8 +31,11 @@ test.describe("Invite QR code (issue #741)", { tag: "@chromium-only" }, () => {
 
     const qr = page.getByTestId("invite-qr");
     await expect(qr).toBeVisible();
-    await expect(qr.locator("svg")).toBeVisible();
-    await expect(qr.locator("svg")).toHaveAttribute("role", "img");
+    // The heading icon is also an svg. The code itself is the image with
+    // role="img"; matching every svg fails strict mode on the icon.
+    const code = qr.locator('svg[role="img"]');
+    await expect(code).toHaveCount(1);
+    await expect(code).toBeVisible();
     await expect(page.getByTestId("invite-qr-error")).toHaveCount(0);
   });
 
