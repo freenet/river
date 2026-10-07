@@ -951,11 +951,18 @@ function observeRowCounts(page: Page, { returnToEnd = false } = {}): Promise<num
 test.describe("Render ceiling and trimming (A04, A05)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  // The arrival-growth ceiling (WINDOW_ITEMS_CEILING, 240 items) used to slide
-  // the rendered range forward past a parked reader's row although the room
-  // still held that message. Removing it from the DOM is not deleting it: the
-  // row must stay rendered where the reader left it.
-  test("a burst past the render ceiling keeps a parked reader's row rendered", async ({ page }) => {
+  /// How many newer items the rendered range is holding back.
+  function withheld(page: Page): Promise<number> {
+    return page
+      .getByTestId("conversation-history")
+      .getAttribute("data-newer-withheld")
+      .then((n) => Number(n));
+  }
+
+  /// Park in the Deep History Room and take its range past the ceiling with a
+  /// 200-message burst that also prunes the room's oldest messages. Returns
+  /// the reader's row, whose message survives the prune.
+  async function parkPastTheCeiling(page: Page) {
     await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1");
     // Below the backfill strip (top 800px), near the head of the window.
     await readerScrollsWithoutGesture(page, 1_000);
@@ -963,8 +970,6 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     expect(row, "premise: a filler row is fully in view").not.toBeNull();
     const fillerIndex = Number(/history filler (\d+)/.exec(row!.text)![1]);
 
-    // The burst takes the room past its cap, so the oldest messages are
-    // pruned, and grows the rendered range past the ceiling.
     const DEEP_ROOM_SEEDED = 201; // 188 fillers + 13 standard messages
     const DEEP_ROOM_CAP = 300; // DEEP_ROOM_MAX_RECENT_MESSAGES
     const BURST = 200;
@@ -975,45 +980,29 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     ).toBeGreaterThanOrEqual(pruned);
     await callRiverTest(page, "appendMessages", BURST);
     // The burst's newest rows are held back below the parked reader, so its
-    // landing is seen at its oldest arrival and at the catch-up button.
+    // landing is seen at its oldest arrival, the withheld count and the
+    // catch-up button.
     await expect(page.getByText("batched arrival 00", { exact: false })).toHaveCount(1, {
       timeout: 10_000,
     });
+    await expect.poll(() => withheld(page), { message: "premise: the burst should pass the ceiling" }).toBeGreaterThan(0);
     await expect(page.getByTestId("scroll-to-bottom"), "premise: the burst should have landed").toBeVisible();
     await expect(
       page.getByText(`history filler ${String(pruned - 1).padStart(2, "0")}:`, { exact: false }),
       "premise: the prune should have landed",
     ).toHaveCount(0);
-
-    await expectRowHeld(page, row!.key, row!.top, "a burst past the render ceiling took the reader off a message the room still holds");
-  });
-
-  /// How many newer items the rendered range is holding back.
-  function withheld(page: Page): Promise<number> {
-    return page
-      .getByTestId("conversation-history")
-      .getAttribute("data-newer-withheld")
-      .then((n) => Number(n));
-  }
-
-  /// Park in the Deep History Room and take its range past the ceiling with a
-  /// 200-message burst. Returns the reader's row.
-  async function parkPastTheCeiling(page: Page) {
-    await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1");
-    await readerScrollsWithoutGesture(page, 1_000);
-    const row = await readingRow(page, "history filler");
-    expect(row, "premise: a filler row is fully in view").not.toBeNull();
-    await callRiverTest(page, "appendMessages", 200);
-    await expect.poll(() => withheld(page), { message: "premise: the burst should pass the ceiling" }).toBeGreaterThan(0);
     return row!;
   }
 
-  // Once the range is held, further arrivals are withheld rather than
-  // rendered: the reader stays put, the DOM stops growing, and the newest
-  // message is still one click away.
+  // The arrival-growth ceiling (WINDOW_ITEMS_CEILING, 240 items) used to slide
+  // the rendered range forward past a parked reader's row although the room
+  // still held that message. Removing it from the DOM is not deleting it: the
+  // row must stay rendered where the reader left it. Once the range is held,
+  // further arrivals are withheld rather than rendered: the reader stays put,
+  // the DOM stops growing, and the newest message is still one click away.
   test("repeated bursts past the ceiling keep the reader put and the DOM bounded", async ({ page }) => {
     const row = await parkPastTheCeiling(page);
-    await expectRowHeld(page, row.key, row.top, "the first burst moved the reader's row");
+    await expectRowHeld(page, row.key, row.top, "a burst past the render ceiling took the reader off a message the room still holds");
     const rows = await page.locator("[data-item-key]").count();
     const before = await withheld(page);
 
@@ -1096,10 +1085,10 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     expect(await page.locator("[data-item-key]").count(), "the stale trim removed rows").toBe(rows);
   });
 
-  // Tall older rows and a short retained tail: the trim decision estimates
-  // the tail from the AVERAGE rendered row height. At an ordinary height the
-  // real tail still clears the backfill strip, so the window trims once and
-  // stays trimmed, and paging back still works.
+  // Tall older rows and a short retained tail. The trim decision measures the
+  // retained tail's real height (it once estimated it from the AVERAGE row
+  // height). At an ordinary height that tail clears the backfill strip, so the
+  // window trims once and stays trimmed, and paging back still works.
   test("returning to the end after paging into tall rows trims once and stays bounded", async ({
     page,
   }) => {
@@ -1114,10 +1103,11 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
 
 test.describe("Trimming on a very tall viewport (A05)", () => {
   // A zoomed-out window or tall portrait monitor: a trimmed (initial-size,
-  // short) window sits inside the backfill strip's reach, while the trim
-  // decision's average-height estimate, inflated by the tall older rows, says
-  // it clears it. Opening the room is enough: backfill grows the window, the settle at
-  // the end trims it, the trim re-arms the backfill, and so on.
+  // short) window sits inside the backfill strip's reach. The measured tail
+  // sees that and skips the trim. The old average-height estimate, inflated by
+  // the tall older rows, said it cleared the strip, so opening the room was
+  // enough to loop: backfill grew the window, the settle at the end trimmed
+  // it, the trim re-armed the backfill, and so on.
   test.use({ viewport: { width: 1280, height: 5_800 } });
 
   test("an uneven-height room settles instead of trimming and refilling", async ({ page }) => {

@@ -2615,8 +2615,10 @@ struct ReadingAnchor {
 const READING_ANCHOR_ROWS: usize = 7;
 
 /// Reader-position state shared between the render, its effects and the raw
-/// scroll and resize callbacks. Plain cells: the callbacks run with no Dioxus
-/// scope, and nothing renders from these except through `window_items`.
+/// scroll and resize callbacks. Plain cells, so reading one never subscribes
+/// anything: the callbacks run with no Dioxus scope, and a re-render comes
+/// only from `window_items`. The render does read `has_newer` (for the
+/// catch-up button), but only after assigning it earlier in that same render.
 #[derive(Default)]
 struct ReaderPosition {
     /// The last reading position measured while the history had layout.
@@ -3029,9 +3031,11 @@ impl HistoryWindow {
 #[cfg(target_arch = "wasm32")]
 const SCROLL_SETTLE_DEBOUNCE_MS: i32 = 120;
 
-/// Refresh the saved reading position from the live view. Called just before
-/// the chat panel is hidden: once it is, there is no geometry left to read,
-/// and the last settle may predate a scroll still in flight.
+/// Refresh the saved reading position from the live view, keeping the
+/// previous one when there is nothing to measure. Called at every settle,
+/// before a newer page (the position bounds the start's slide), and just
+/// before the chat panel is hidden: once it is, there is no geometry left to
+/// read, and the last settle may predate a scroll still in flight.
 fn remember_reading_position(reader: &ReaderPosition) {
     #[cfg(target_arch = "wasm32")]
     if let Some(anchor) = capture_reading_anchor(reader.range_start.get()) {
@@ -3580,9 +3584,7 @@ fn install_scroll_pin_listeners(
             }
             // Wherever the view came to rest is the reading position a later
             // hide and reveal puts back, whoever moved it there.
-            if let Some(anchor) = capture_reading_anchor(reader.range_start.get()) {
-                *reader.anchor.borrow_mut() = Some(anchor);
-            }
+            remember_reading_position(&reader);
             if ours {
                 return;
             }
@@ -6005,12 +6007,7 @@ pub fn Conversation() -> Element {
                                                             }
                                                             // Refresh the reading position first:
                                                             // it is what bounds the start's slide.
-                                                            #[cfg(target_arch = "wasm32")]
-                                                            if let Some(anchor) = capture_reading_anchor(
-                                                                reader_position.range_start.get(),
-                                                            ) {
-                                                                *reader_position.anchor.borrow_mut() = Some(anchor);
-                                                            }
+                                                            remember_reading_position(&reader_position);
                                                             reader_position.extend_newer.set(true);
                                                             // `window` counts back from the end, so
                                                             // the initial size lets the ceiling slide
