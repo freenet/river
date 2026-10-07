@@ -1045,6 +1045,11 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
       await page.locator("[data-item-key]").count(),
       "paging newer history must stay bounded by the ceiling",
     ).toBeLessThanOrEqual(INITIAL_RENDERED_ITEMS * 4 + INITIAL_RENDERED_ITEMS);
+
+    // Smoke check only: the scroll above re-measured the pin. The page-in
+    // without a later settle is covered by the final-newer-page tests below.
+    await deliver(page, "arrival after paging to the newest");
+    await expectSettledAtBottom(page, "an arrival after paging to the newest message was not followed");
   });
 
   // While the scroll-to-latest button's smooth scroll is in flight the reader
@@ -1151,6 +1156,90 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
         delete (window as any).__riverSmoothGate;
       });
     }
+  });
+
+  /// Fill the opening range to the render ceiling below a parked reader, then
+  /// deliver `text`. Past the ceiling a parked reader's range holds its end
+  /// (`HistoryWindow::resolve_held`), so exactly that message is withheld.
+  async function holdOneNewerItem(page: Page, text: string) {
+    // BACKFILL_LEAD_PX: how far above the end the newer-history trigger reaches.
+    const NEWER_TRIGGER_REACH_PX = 800;
+    const RENDER_CEILING_ITEMS = INITIAL_RENDERED_ITEMS * 4;
+    // The retention variant keeps the burst from pruning under the range.
+    await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1&deep-history-retention=1");
+    // Below the backfill strip (top 800px), as in `parkPastTheCeiling`.
+    await readerScrollsWithoutGesture(page, 1_000);
+    const rendered = await page.locator("[data-item-key]").count();
+    await callRiverTest(page, "appendMessages", RENDER_CEILING_ITEMS - rendered);
+    await expect
+      .poll(() => page.locator("[data-item-key]").count(), { message: "premise: the burst should fill the range to the ceiling" })
+      .toBe(RENDER_CEILING_ITEMS);
+    expect(await withheld(page), "premise: nothing is held at the ceiling").toBe(0);
+    await callRiverTest(page, "appendMessage", text);
+    await expect.poll(() => withheld(page), { message: "premise: one more arrival should hold the end" }).toBe(1);
+    expect(
+      await distanceFromBottom(page),
+      "premise: the reader is out of the newer-history trigger's reach until they jump",
+    ).toBeGreaterThan(NEWER_TRIGGER_REACH_PX);
+  }
+
+  /// Jump to the held range's end and settle there in ONE task, so the settle
+  /// runs while `has_newer` is still true, before the newer-history trigger
+  /// pages the last item in. The natural `scrollend` from the same move lands
+  /// where this settle recorded, reads as the app's own, and leaves the pin.
+  async function settleAtHeldEnd(page: Page) {
+    await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.scrollTop = c.scrollHeight;
+      c.dispatchEvent(new Event("scrollend"));
+    });
+  }
+
+  // The reader settles at the end of a held range, which is not the newest
+  // message, so the pin clears. The final newer page then lands below them
+  // and nothing settles again. Inside the band they are back at the newest
+  // message and must be following again (#747 review, item 1).
+  test("following resumes after the final newer page without another settle", async ({ page }) => {
+    await holdOneNewerItem(page, "short newest");
+    await settleAtHeldEnd(page);
+    await expect.poll(() => withheld(page), { message: "premise: the final newer page should land" }).toBe(0);
+    await expect(
+      page.locator("[data-item-key]").last(),
+      "premise: the last item paged in rather than jumping to latest",
+    ).toContainText("short newest");
+    expect(await distanceFromBottom(page), "premise: the page-in left the reader inside the band").toBeLessThanOrEqual(
+      BOTTOM_THRESHOLD_PX,
+    );
+
+    // Tall: a parked reader's arrival past the ceiling is held, then paged in
+    // under a start slide, and the row that slide removes can leave a short
+    // arrival at the bottom with no following at all.
+    await callRiverTest(page, "appendMessage", `arrival after the final page ${"y".repeat(1_000)}`);
+    await expect(
+      page.locator("[data-item-key]").last(),
+      "the arrival after the final newer page was not rendered",
+    ).toContainText("arrival after the final page", { timeout: 5_000 });
+    await expectSettledAtBottom(page, "an arrival after the final newer page was not followed");
+  });
+
+  // The same page-in, but tall enough to leave the reader outside the band:
+  // they are reading, not at the newest message, so nothing follows.
+  test("a final newer page that lands outside the band does not resume following", async ({ page }) => {
+    await holdOneNewerItem(page, `tall newest ${"y".repeat(1_500)}`);
+    await settleAtHeldEnd(page);
+    await expect.poll(() => withheld(page), { message: "premise: the final newer page should land" }).toBe(0);
+    await nextFrames(page);
+    expect(
+      await distanceFromBottom(page),
+      "a page-in from outside the band took the reader to the bottom",
+    ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    await deliverOffscreen(page, "arrival below the band");
+    await nextFrames(page);
+    expect(
+      await distanceFromBottom(page),
+      "an arrival after a page-in from outside the band was followed",
+    ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
   });
 
   // A settle at the bottom schedules the trim for the next task. A reader who

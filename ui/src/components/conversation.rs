@@ -2617,6 +2617,8 @@ struct ReaderPosition {
     snap_latest: std::cell::Cell<bool>,
     /// The next render extends a held range by one page of newer items.
     extend_newer: std::cell::Cell<bool>,
+    /// A render cleared `has_newer`; the `window_items` effect re-checks the pin.
+    newer_resolved: std::cell::Cell<bool>,
     /// Bumped on every room change, so a deferred trim can detect one.
     room_epoch: std::cell::Cell<u64>,
 }
@@ -3733,6 +3735,7 @@ pub fn Conversation() -> Element {
             reader_position.select_latest.set(false);
             reader_position.snap_latest.set(false);
             reader_position.extend_newer.set(false);
+            reader_position.newer_resolved.set(false);
             reader_position
                 .room_epoch
                 .set(reader_position.room_epoch.get().wrapping_add(1));
@@ -3808,6 +3811,11 @@ pub fn Conversation() -> Element {
     // It also finishes a jump to latest from a held range: only after the
     // render that swapped in the latest range is there a newest row to scroll
     // to. The reader asked for it, so no gate applies.
+    //
+    // And it re-arms the pin when the final newer page lands. The reader's
+    // settle at the end of the held range cleared the pin (that end was not
+    // the newest message), and a page-in does not scroll the view, so no
+    // settle comes to re-measure it. Same test the settle applies.
     #[cfg(target_arch = "wasm32")]
     {
         let trim_landed = trim_landed.clone();
@@ -3817,6 +3825,17 @@ pub fn Conversation() -> Element {
         use_effect(move || {
             // Subscribe, so this runs after the render the trim caused.
             let _ = window_items();
+            if reader_position.newer_resolved.replace(false)
+                && !reader_position.has_newer.get()
+                && !reader_position.hidden.get()
+                && chat_scroll_container().is_some_and(|c| {
+                    history_has_layout(&c)
+                        && ((max_scroll_top(&c) - c.scroll_top()) as f64) <= BOTTOM_THRESHOLD_PX
+                })
+                && !reader_moved_up_since(&last_scroll_top)
+            {
+                pinned_to_bottom.set(true);
+            }
             if reader_position.snap_latest.replace(false) {
                 trim_landed.set(false);
                 scroll_history_to_bottom(
@@ -5644,7 +5663,11 @@ pub fn Conversation() -> Element {
                                         }
                                     });
                                     reader_position.range_start.set(history_window.start);
-                                    reader_position.has_newer.set(history_window.has_newer);
+                                    if reader_position.has_newer.replace(history_window.has_newer)
+                                        && !history_window.has_newer
+                                    {
+                                        reader_position.newer_resolved.set(true);
+                                    }
                                     // Tell the settle handler whether a
                                     // bottom-settle trim would shrink anything.
                                     window_overgrown.set(
@@ -12107,13 +12130,14 @@ mod autoscroll_wiring_pins {
         assert_eq!(
             prod.matches("reader_moved_up_since(&last_scroll_top)")
                 .count(),
-            5,
-            "the guard has exactly five consumers: the content-change effect \
+            6,
+            "the guard has exactly six consumers: the content-change effect \
              and the ResizeObserver (which scroll on the strength of the pin), \
              the backfill restore and the head reposition (which distrust a \
-             stale-true pin mid-fling, #505 review), and the render deciding \
+             stale-true pin mid-fling, #505 review), the render deciding \
              whether a reader is parked (which holds their range at the \
-             ceiling); found a different number of call sites"
+             ceiling), and the re-arm after the final newer page (#747 \
+             review); found a different number of call sites"
         );
         // Whitespace-insensitive: `cargo fmt` decides how this condition wraps,
         // and a pin that a reformat can break is a pin that gets deleted.
