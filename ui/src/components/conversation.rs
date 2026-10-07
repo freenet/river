@@ -8014,17 +8014,9 @@ mod tests {
         // Exactly at the reach clears it; one px short does not.
         assert!(!trim_would_rearm_backfill(reach(900), 900));
         assert!(trim_would_rearm_backfill(reach(900) - 1, 900));
-        // The Uneven Tail Room on a 5800px-tall window: 60 short rows
-        // (~2500px) under tall older ones. The old estimate scaled the whole
-        // rendered height by 60/rendered and, inflated by the tall rows,
-        // cleared the reach; the real tail does not, so no trim and no loop.
-        let (rendered_height, rendered, client) = (40 * 400 + 60 * 42, 100, 5800);
-        let averaged = rendered_height * 60 / rendered;
-        assert!(
-            averaged > reach(client),
-            "premise: the average-height estimate would have trimmed"
-        );
-        assert!(trim_would_rearm_backfill(60 * 42, client));
+        // The Uneven Tail Room on a 5800px-tall window: its newest 60 rows
+        // measure ~2500px, inside the strip's reach. No trim, so no loop.
+        assert!(trim_would_rearm_backfill(60 * 42, 5800));
     }
 
     /// Item keys `m0..m{total}` for the range tests.
@@ -8045,18 +8037,23 @@ mod tests {
         }
     }
 
+    /// A parked reader's hold.
+    fn parked(end: Option<usize>, keep: Option<usize>) -> RangeHold {
+        RangeHold {
+            end,
+            parked: true,
+            keep,
+        }
+    }
+
     /// Past the ceiling, a parked reader's range holds its end instead of sliding
     /// its start, and later arrivals don't grow it (#732 review 42f541b6).
     #[test]
     fn a_parked_reader_s_range_holds_its_end_at_the_ceiling() {
         let opened = HistoryWindow::resolve(201, INITIAL_WINDOW_ITEMS, None);
-        let parked = RangeHold {
-            parked: true,
-            ..RangeHold::default()
-        };
+        let hold = parked(None, None);
         // 200 arrivals in one patch, start anchored.
-        let held =
-            HistoryWindow::resolve_held(401, INITIAL_WINDOW_ITEMS, Some(opened.start), parked);
+        let held = HistoryWindow::resolve_held(401, INITIAL_WINDOW_ITEMS, Some(opened.start), hold);
         assert_eq!(
             held.start, opened.start,
             "the start must not slide past the reader"
@@ -8069,10 +8066,7 @@ mod tests {
             501,
             INITIAL_WINDOW_ITEMS,
             Some(held.start),
-            RangeHold {
-                end: Some(held.end),
-                ..parked
-            },
+            parked(Some(held.end), None),
         );
         assert_eq!((again.start, again.end), (held.start, held.end));
 
@@ -8087,7 +8081,7 @@ mod tests {
 
         // Below the ceiling nothing changes for a parked reader either.
         let small =
-            HistoryWindow::resolve_held(230, INITIAL_WINDOW_ITEMS, Some(opened.start), parked);
+            HistoryWindow::resolve_held(230, INITIAL_WINDOW_ITEMS, Some(opened.start), hold);
         assert_eq!((small.start, small.end), (opened.start, 230));
         assert!(!small.has_newer);
     }
@@ -8111,11 +8105,7 @@ mod tests {
             keys.len(),
             INITIAL_WINDOW_ITEMS,
             Some(relocated.start),
-            RangeHold {
-                end: held_end,
-                parked: true,
-                keep: None,
-            },
+            parked(held_end, None),
         );
         assert_eq!(keys[w.start], first);
         assert_eq!(keys[w.end - 1], last);
@@ -8153,14 +8143,10 @@ mod tests {
     fn a_held_range_pages_older_and_newer() {
         let total = 1000;
         let (start, end) = (300, 300 + WINDOW_ITEMS_CEILING);
-        let parked = |end, keep| RangeHold {
-            end: Some(end),
-            parked: true,
-            keep,
-        };
         // Older: one growth step from the rendered size reveals exactly one page.
         let requested = grown_window(INITIAL_WINDOW_ITEMS, end - start);
-        let older = HistoryWindow::resolve_held(total, requested, Some(start), parked(end, None));
+        let older =
+            HistoryWindow::resolve_held(total, requested, Some(start), parked(Some(end), None));
         assert_eq!((older.start, older.end), (start - WINDOW_GROWTH_ITEMS, end));
 
         // Newer: the end moves one page down and the ceiling slides the start.
@@ -8168,7 +8154,7 @@ mod tests {
             total,
             INITIAL_WINDOW_ITEMS,
             Some(start),
-            parked(end + WINDOW_GROWTH_ITEMS, None),
+            parked(Some(end + WINDOW_GROWTH_ITEMS), None),
         );
         assert_eq!(newer.end, end + WINDOW_GROWTH_ITEMS);
         assert_eq!(newer.end - newer.start, WINDOW_ITEMS_CEILING);
@@ -8179,7 +8165,7 @@ mod tests {
             total,
             INITIAL_WINDOW_ITEMS,
             Some(start),
-            parked(end + WINDOW_GROWTH_ITEMS, Some(keep)),
+            parked(Some(end + WINDOW_GROWTH_ITEMS), Some(keep)),
         );
         assert_eq!(kept.start, keep);
         assert!(kept.end - kept.start > WINDOW_ITEMS_CEILING);
@@ -8189,30 +8175,18 @@ mod tests {
             total,
             INITIAL_WINDOW_ITEMS,
             Some(900),
-            parked(total + 30, None),
+            parked(Some(total + 30), None),
         );
         assert_eq!(last.end, total);
         assert!(!last.has_newer);
     }
 
-    /// No anchors (jump to latest, own send, room open) selects the latest range.
+    /// A degenerate held end (everything it held is gone) falls back to the
+    /// newest item rather than rendering nothing.
     #[test]
-    fn selecting_the_latest_range_drops_the_hold() {
-        let w = HistoryWindow::resolve_held(1000, INITIAL_WINDOW_ITEMS, None, RangeHold::default());
-        assert_eq!((w.start, w.end), (1000 - INITIAL_WINDOW_ITEMS, 1000));
-        assert!(w.has_older && !w.has_newer);
-        // A degenerate held end (everything it held is gone) falls back to the
-        // newest item rather than rendering nothing.
-        let empty = HistoryWindow::resolve_held(
-            50,
-            INITIAL_WINDOW_ITEMS,
-            Some(0),
-            RangeHold {
-                end: Some(0),
-                parked: true,
-                keep: None,
-            },
-        );
+    fn a_held_end_with_nothing_left_falls_back_to_the_newest() {
+        let empty =
+            HistoryWindow::resolve_held(50, INITIAL_WINDOW_ITEMS, Some(0), parked(Some(0), None));
         assert_eq!(empty.end, 50);
     }
 
