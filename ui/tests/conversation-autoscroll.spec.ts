@@ -1,4 +1,4 @@
-import { test, expect, Page, Route } from "@playwright/test";
+import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { selectListedRoom } from "./example-room";
 import {
@@ -20,6 +20,7 @@ import {
   fillHistory,
   historyHeight,
   holdSettleEvents,
+  holdTestImage,
   newestRowFromViewBottom,
   nextFrames,
   openRoomAtBottom,
@@ -1433,28 +1434,6 @@ test.describe("Own send goes to the newest message once (A06)", () => {
 // lets it load, two short messages above the end.
 test.describe("The end holds after an explicit request (10c decision 13)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
-
-  const IMAGE_SVG =
-    '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="#888"/></svg>';
-
-  /// Hold every request for the test image until `release`. Each mount of
-  /// the image may ask again, so all of them are held and all released.
-  async function holdTestImage(page: Page) {
-    const held: Route[] = [];
-    let released = false;
-    const serve = (route: Route) =>
-      route.fulfill({ contentType: "image/svg+xml", body: IMAGE_SVG }).catch(() => {
-        // A request the browser gave up on when its row unmounted.
-      });
-    await page.route("**/test-image.svg", (route) => (released ? serve(route) : void held.push(route)));
-    return {
-      requested: () => held.length,
-      release: async () => {
-        released = true;
-        await Promise.all(held.splice(0).map(serve));
-      },
-    };
-  }
 
   const imageRow = (page: Page) => page.locator("[data-item-key]", { hasText: "image fixture" });
 

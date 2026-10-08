@@ -1,4 +1,4 @@
-import { expect, Page, test } from "@playwright/test";
+import { expect, Page, Route, test } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { waitForApp, selectRoom } from "./example-room";
 
@@ -151,22 +151,37 @@ export async function readerScrollsTo(page: Page, top: number) {
 /// the content on Firefox, and find-in-page, focus-driven scrolling and browser
 /// scroll restoration produce none either.
 export async function readerScrollsWithoutGesture(page: Page, top: number) {
+  await scrollAndSettle(page, top);
+}
+
+/// Move the history to `target` (or its end) with no gesture event, and wait
+/// for the move to settle. A target the container clamps to where it already
+/// is scrolls nothing, so there is no settle to wait for.
+///
+/// The listener goes on before the move, and the move and the wait share one
+/// `evaluate`, so a settle that lands quickly cannot be missed. `"end"` is
+/// resolved in the page, from the history's height at the moment of the move.
+async function scrollAndSettle(page: Page, target: number | "end") {
   await page.evaluate(async (t) => {
     const el = document.getElementById("chat-scroll-container")!;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onSettle: (() => void) | undefined;
     const settled = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
-      el.addEventListener(
-        "scrollend",
-        () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        { once: true },
-      );
+      onSettle = resolve;
+      timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
+      el.addEventListener("scrollend", onSettle);
     });
-    el.scrollTop = t;
-    await settled;
-  }, top);
+    try {
+      const before = el.scrollTop;
+      el.scrollTop = t === "end" ? el.scrollHeight : t;
+      // Unmoved: no settle is coming, and the timer must not reject a
+      // promise nobody awaits.
+      if (el.scrollTop !== before) await settled;
+    } finally {
+      clearTimeout(timer);
+      el.removeEventListener("scrollend", onSettle!);
+    }
+  }, target);
 }
 
 /// Hold for a moment and assert the view did not move.
@@ -197,30 +212,7 @@ export async function fillHistory(page: Page, label = "filler") {
 /// app sees the move settle. Already at the end, nothing scrolls and there is
 /// no settle to wait for.
 export async function readerReturnsToEnd(page: Page) {
-  await page.evaluate(async () => {
-    const el = document.getElementById("chat-scroll-container")!;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const settled = new Promise<void>((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
-      el.addEventListener(
-        "scrollend",
-        () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        { once: true },
-      );
-    });
-    const before = el.scrollTop;
-    el.scrollTop = el.scrollHeight;
-    if (el.scrollTop !== before) {
-      await settled;
-    } else {
-      // Already at the end: no settle is coming, and the timer must not
-      // reject a promise nobody awaits.
-      clearTimeout(timer);
-    }
-  });
+  await scrollAndSettle(page, "end");
 }
 
 /// The reader leaves the end and comes back by themselves. An explicit request
@@ -243,7 +235,7 @@ export function nextFrames(page: Page): Promise<void> {
 
 /// The row the reader is looking at: an item row fully inside the visible part
 /// of the history, with the preceding row's key for deletion cases.
-export type ReadingRow = {
+type ReadingRow = {
   key: string;
   top: number;
   text: string;
@@ -320,11 +312,11 @@ export async function expectRowHeld(page: Page, key: string, expectedTop: number
 }
 
 /// Which edge of a row to measure against the bottom of the view.
-export type RowEdge = "top" | "bottom";
+type RowEdge = "top" | "bottom";
 
 /// How far a row's `edge` sits above the bottom edge of the visible history,
 /// or null when it is not in the DOM.
-export function rowGapFromViewBottom(page: Page, key: string, edge: RowEdge = "bottom"): Promise<number | null> {
+function rowGapFromViewBottom(page: Page, key: string, edge: RowEdge = "bottom"): Promise<number | null> {
   return page.evaluate(
     ([k, e]) => {
       const c = document.getElementById("chat-scroll-container")!;
@@ -418,4 +410,27 @@ export async function releaseSettleEvents(page: Page) {
     if (gate.held.scroll > 0) c.dispatchEvent(new Event("scroll"));
     if (gate.held.scrollend > 0) c.dispatchEvent(new Event("scrollend"));
   });
+}
+
+const TEST_IMAGE_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="#888"/></svg>';
+
+/// Hold every request for `/test-image.svg` (a 400x300 SVG) until `release`.
+/// Each mount of the image may ask again, so all of them are held and all
+/// released, and any request after `release` is served at once.
+export async function holdTestImage(page: Page) {
+  const held: Route[] = [];
+  let released = false;
+  const serve = (route: Route) =>
+    route.fulfill({ contentType: "image/svg+xml", body: TEST_IMAGE_SVG }).catch(() => {
+      // A request the browser gave up on when its row unmounted.
+    });
+  await page.route("**/test-image.svg", (route) => (released ? serve(route) : void held.push(route)));
+  return {
+    requested: () => held.length,
+    release: async () => {
+      released = true;
+      await Promise.all(held.splice(0).map(serve));
+    },
+  };
 }

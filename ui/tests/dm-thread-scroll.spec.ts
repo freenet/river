@@ -38,15 +38,22 @@ async function openThread(page: Page) {
   await expect(page.locator(THREAD)).toBeVisible({ timeout: 5_000 });
 }
 
-/// A thread too short to scroll ("dm history 00" to "02"), open and settled,
-/// so the next inbound DM lands on screen and is the only thing that changes.
-async function openShortThread(page: Page) {
+/// Open Team Chat, seed `count` DMs ("dm history 00" onwards), and open their
+/// thread once the newest of them has rendered.
+async function prepareThread(page: Page, count: number) {
   await page.goto("/");
   await waitForApp(page);
   await selectRoom(page, "Team Chat Room");
-  await callRiverTest(page, "appendDms", 3);
+  await callRiverTest(page, "appendDms", count);
   await openThread(page);
-  await expect(dm(page, "dm history 02")).toHaveCount(1, { timeout: 5_000 });
+  const newest = `dm history ${String(count - 1).padStart(2, "0")}`;
+  await expect(dm(page, newest)).toHaveCount(1, { timeout: 5_000 });
+}
+
+/// A thread too short to scroll ("dm history 00" to "02"), open and settled,
+/// so the next inbound DM lands on screen and is the only thing that changes.
+async function openShortThread(page: Page) {
+  await prepareThread(page, 3);
   expect((await threadGeometry(page)).max, "premise: the thread does not scroll").toBeLessThanOrEqual(0);
   // The opening's own checks (its placement, the observer's first report)
   // must not be the ones that see the next DM.
@@ -63,12 +70,7 @@ async function closeThread(page: Page) {
 
 /// A thread with `HISTORY` DMs, open and settled on its newest DM.
 async function openThreadWithHistory(page: Page) {
-  await page.goto("/");
-  await waitForApp(page);
-  await selectRoom(page, "Team Chat Room");
-  await callRiverTest(page, "appendDms", HISTORY);
-  await openThread(page);
-  await expect(dm(page, NEWEST_HISTORY)).toHaveCount(1, { timeout: 5_000 });
+  await prepareThread(page, HISTORY);
   await expectAtEnd(page, "opening the thread should land on its newest DM");
   const { max } = await threadGeometry(page);
   expect(max, "premise: the thread is long enough to scroll").toBeGreaterThan(300);
@@ -211,12 +213,7 @@ test.describe("DM thread scroll position (10c DM parity)", () => {
   // scrolling thread was never within it; the arrival that first makes a short
   // thread scroll, by less than 50px, was.
   test("an inbound DM that makes a short thread scroll does not move the view", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Team Chat Room");
-    await callRiverTest(page, "appendDms", 3);
-    await openThread(page);
-    await expect(dm(page, "dm history 02")).toHaveCount(1, { timeout: 5_000 });
+    await prepareThread(page, 3);
 
     // Size the window so the modal, which grows with the thread up to 80vh,
     // has room for all but ~25px of one more DM.

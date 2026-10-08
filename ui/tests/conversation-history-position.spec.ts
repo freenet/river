@@ -1,4 +1,4 @@
-import { test, expect, Page, Route } from "@playwright/test";
+import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { selectListedRoom } from "./example-room";
 import {
@@ -12,6 +12,7 @@ import {
   expectSettledAtBottom,
   fillHistory,
   historyHeight,
+  holdTestImage,
   knownFailure,
   nextFrames,
   openRoomAtBottom,
@@ -70,18 +71,13 @@ test.describe("Reading position when content above changes (A02)", () => {
   // app compensates only for window-head swaps, so a Markdown image that loads
   // above a parked reader pushes their text down by its height.
   test("an image loading above a parked reader keeps their row in place", async ({ page }) => {
-    let resolveRequested!: (route: Route) => void;
-    const requested = new Promise<Route>((resolve) => {
-      resolveRequested = resolve;
-    });
-    await page.route("**/test-image.svg", (route) => resolveRequested(route));
-
+    const heldImage = await holdTestImage(page);
     await openRoomAtBottom(page, "Team Chat Room");
     // The Markdown renders to text plus an <img>, so wait on the plain words.
     await callRiverTest(page, "appendMessage", "image fixture ![fixture](/test-image.svg) above the reader");
     await expect(page.getByText("image fixture", { exact: false })).toBeVisible({ timeout: 5_000 });
     await fillHistory(page);
-    const route = await requested;
+    await expect.poll(heldImage.requested, { message: "premise: the image is requested and held" }).toBeGreaterThan(0);
 
     const imageKey = await keyOf(page, "image fixture");
     const afterImage = await page.evaluate((k) => {
@@ -101,10 +97,7 @@ test.describe("Reading position when content above changes (A02)", () => {
     const image = page.locator(`[data-item-key="${imageKey}"] img`);
     const heightBefore = await page.locator(`[data-item-key="${imageKey}"]`).evaluate((r) => r.getBoundingClientRect().height);
 
-    await route.fulfill({
-      contentType: "image/svg+xml",
-      body: '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="#888"/></svg>',
-    });
+    await heldImage.release();
     await expect
       .poll(() => image.evaluate((img: HTMLImageElement) => img.complete && img.naturalHeight > 0), {
         message: "premise: the image should load",
