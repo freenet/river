@@ -64,8 +64,8 @@ fn thread_read_needs_write(current: Option<u64>, up_to_ts: u64) -> bool {
 
 /// Mark every DM from `peer` in `room` as seen up to (and including)
 /// `up_to_ts`. The open thread calls it only with an inbound DM the reader
-/// has had on screen with the tab visible (10c decision 11; see
-/// `ThreadSeenWitness` in `dm_thread_modal.rs`).
+/// has had on screen with the tab visible; see
+/// `ThreadSeenWitness` in `dm_thread_modal.rs`.
 // Its one caller measures the DOM, so it exists only on wasm32.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {

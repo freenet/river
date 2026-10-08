@@ -2593,6 +2593,8 @@ struct RangeHold {
 /// opening the room, the reader's own send, or Latest from a held range. A
 /// room change replaces it, and the render drops one made for another room.
 /// The reading-position corrections stand down while it is pending.
+/// Incoming messages preserve the reader's place; the rationale for replacing
+/// automatic following is in `.claude/rules/history-scrolling.md`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ScrollRequest {
     room: Option<ed25519_dalek::VerifyingKey>,
@@ -2622,7 +2624,7 @@ struct ReadingAnchor {
 const READING_ANCHOR_ROWS: usize = 7;
 
 /// What a render's range holds, enough to tell an arrival from rows changing
-/// height (10c decision 13): its first row, its newest message and how many
+/// height: its first row, its newest message and how many
 /// messages and events it renders.
 #[derive(Clone, PartialEq, Debug)]
 struct RenderedMessages {
@@ -2729,7 +2731,7 @@ struct ReaderPosition {
     /// capture over the position the observer is about to correct from.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     observed_height: std::cell::Cell<i32>,
-    /// The end hold (10c decision 13): `Some(scrollTop)` while the view sits at
+    /// The end hold: `Some(scrollTop)` while the view sits at
     /// the end an explicit request put it at. Rows changing height take it
     /// back there (the ResizeObserver). The reader's first scroll away, an
     /// arrival (the render), a room change and the panel hiding end it.
@@ -3257,8 +3259,8 @@ fn resolve_rendered_range(
     });
     reader.range_start.set(history_window.start);
     reader.has_newer.set(history_window.has_newer);
-    // An arrival ends the end hold; rows that only change height keep it (10c
-    // decision 13). Against the last render, so a request's own render (an own
+    // An arrival ends the end hold; rows that only change height keep it.
+    // Against the last render, so a request's own render (an own
     // send's message) comes before its hold.
     let rendered = rendered_messages(shown);
     let before = reader.rendered.replace(rendered.clone());
@@ -3451,7 +3453,7 @@ fn capture_reading_anchor(range_start: usize) -> Option<ReadingAnchor> {
     let entry = |i: usize| (found[i].0.clone(), (found[i].1 - view_top).round() as i32);
     rows.push(entry(reading));
     // The row above first: if the reading row is deleted, the row above stays
-    // still (10c decision 7), as it does when nothing corrects the removal.
+    // still, as it does when nothing corrects the removal.
     for d in 1..found.len() {
         if rows.len() >= READING_ANCHOR_ROWS {
             break;
@@ -3542,7 +3544,7 @@ fn retained_tail_height(container: &web_sys::Element, retained: usize) -> Option
 #[cfg(target_arch = "wasm32")]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
-/// Take the view to the end and hold it there (10c decision 13).
+/// Take the view to the end and hold it there.
 #[cfg(target_arch = "wasm32")]
 fn hold_end(reader: &ReaderPosition, container: &web_sys::Element) {
     scroll_to_end(container);
@@ -3665,7 +3667,7 @@ fn complete_scroll_request(reader: &ReaderPosition, mut opening_snap_done: Signa
 /// Publish the newest message as seen if the reader can see it now: the tab is
 /// visible, the history has layout and is not awaiting its reveal restore, the
 /// rendered range reaches the room's latest message, and that message's bottom
-/// is on screen (10c decision 5). Marking a room read never goes past what
+/// is on screen. Marking a room read never goes past what
 /// this publishes; see `document_title::NEWEST_SEEN`.
 ///
 /// Called wherever one of those can change: the Latest observer, each settle,
@@ -3845,7 +3847,7 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
         cb.forget();
     }
 
-    // Ends the end hold (10c decision 13) the first time the reader scrolls
+    // Ends the end hold the first time the reader scrolls
     // the newest message off screen. Returns at once unless a hold is on, and
     // a hold lasts only from an explicit request to the reader's first scroll,
     // so the scroll path stays as light as #151 needs.
@@ -3881,7 +3883,7 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
 /// notice that the chat panel was hidden (it measures 0 behind the mobile
 /// Rooms or Members panel) or shown again, and that the chat area changed
 /// height (the composer, the phone keyboard, a toolbar). `#chat-content` is
-/// observed too, for one job only: while the end hold is on (10c decision 13),
+/// observed too, for one job only: while the end hold is on,
 /// a row changing height takes the view back to the end.
 #[cfg(target_arch = "wasm32")]
 fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
@@ -3891,7 +3893,7 @@ fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
     if !history_has_layout(&container) {
         reader.hidden.set(true);
         reader.observed_height.set(0);
-        // The view the hold kept is gone (decision 13).
+        // The view the hold kept is gone.
         reader.end_hold.set(None);
         return;
     }
@@ -3912,13 +3914,13 @@ fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
         return;
     }
     // Held at the end since an explicit request: back to the end, whatever
-    // changed size (decision 13).
+    // changed size.
     if keep_end_held(reader, &container) {
         return;
     }
     // The chat area changed height: keep the view's BOTTOM edge, so the top
     // gets covered or uncovered and a reader at the end keeps seeing the newest
-    // message (10c decision 10). Width alone, or the history alone, leaves the
+    // message. Width alone, or the history alone, leaves the
     // height alone and gets no correction.
     if previous == 0 || height == previous {
         return;
@@ -4097,7 +4099,7 @@ pub fn Conversation() -> Element {
             reader_position
                 .room_epoch
                 .set(reader_position.room_epoch.get().wrapping_add(1));
-            // The old room's hold and range end with it (10c decision 13).
+            // The old room's hold and range end with it.
             reader_position.forget_range();
             reader_position.window_rendered.set(0);
             reader_position.window_overgrown.set(false);
@@ -5673,8 +5675,8 @@ pub fn Conversation() -> Element {
                 }
             }
                 // Scroll-to-latest button (#402): shown whenever the newest
-                // message's bottom is off screen, past a few px of slack (10c
-                // decision 4). Reuses the `is_at_bottom` IntersectionObserver
+                // message's bottom is off screen, past a few px of slack.
+                // Reuses the `is_at_bottom` IntersectionObserver
                 // state, so it appears after scrolling up even a little, or
                 // when an arrival lands below the view, and hides once the
                 // newest message's bottom is in view. Handy on every device but
@@ -7726,7 +7728,7 @@ mod tests {
 
     /// Past the ceiling, the range holds its end instead of sliding its start,
     /// wherever the reader is, and later arrivals don't grow it (#732 review
-    /// 42f541b6, 10c).
+    /// 42f541b6).
     #[test]
     fn the_range_holds_its_end_at_the_ceiling() {
         let opened = HistoryWindow::resolve(201, INITIAL_WINDOW_ITEMS, None);
@@ -11845,7 +11847,7 @@ mod reader_state_tests {
         assert_eq!(last_good_for_room(&None::<(&str, i32)>, &"room a"), None);
     }
 
-    /// 10c decision 13: an arrival ends the hold instead of moving the view.
+    /// An arrival ends the hold instead of moving the view.
     /// Appended (new newest), inserted above the newest (higher count), or
     /// inserted while an at-cap drain removed the first row (new first row,
     /// same count).
@@ -11875,7 +11877,7 @@ mod reader_state_tests {
     /// the hold stays. Rows that only change height (decryption, an image, an
     /// edit) leave the range as it was, and the hold survives them too.
     /// Deleting the newest message changes the newest, and ends it (deleting
-    /// never moves the view, decision 2).
+    /// never moves the view).
     #[test]
     fn a_shrinking_range_keeps_the_hold_unless_the_newest_changed() {
         let before = range("a", b"z", 10);

@@ -169,7 +169,7 @@ test.describe("Deleting the reading row while the chat is hidden (A02)", () => {
   // The visible variant above holds the row above because nothing corrects a
   // mid-window removal. Hidden, the reveal restores the reader from the anchor
   // saved before the panel hid, and that restore has to hold the same row: the
-  // one above the deleted row, not the one below (10c decision 7).
+  // one above the deleted row, not the one below.
   test("deleting the row a reader is looking at while the chat is hidden holds the row above on reveal", async ({
     page,
   }) => {

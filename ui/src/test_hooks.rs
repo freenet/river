@@ -3,7 +3,7 @@
 //! states.
 //!
 //! The composer is not a substitute: an own send is an explicit request to go
-//! to the newest message (10c decision 3), so a message sent through the UI
+//! to the newest message, so a message sent through the UI
 //! proves nothing about how an arriving one behaves. These write straight into
 //! `ROOMS`, as an arriving network update does.
 //!

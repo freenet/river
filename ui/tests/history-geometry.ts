@@ -214,7 +214,7 @@ export async function readerReturnsToEnd(page: Page) {
 
 /// The reader leaves the end and comes back by themselves. An explicit request
 /// (opening, own send, Latest) holds the end while rows change height until
-/// the reader first scrolls away (10c decision 13); after this, a height change
+/// the reader first scrolls away; after this, a height change
 /// meets a reader at the end who is not held there.
 export async function readerLeavesAndReturnsToEnd(page: Page) {
   await readerScrollsWithoutGesture(page, (await scrollTop(page)) - 60);
@@ -327,7 +327,7 @@ export async function newestRowFromViewBottom(
 }
 
 /// `expectRowHeld` for the bottom edge of the view: when the chat area changes
-/// height, the row keeps its distance from the bottom (10c decision 10).
+/// height, the row keeps its distance from the bottom.
 export async function expectHeldFromViewBottom(
   page: Page,
   key: string,

@@ -417,7 +417,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         return rsx! { div { "Room state not available" } };
     };
 
-    // The read rule (10c decision 11): the thread is marked seen only up to an
+    // The read rule: the thread is marked seen only up to an
     // inbound DM the reader has had on screen with the tab visible, never from
     // render. Rendering an arrival is not seeing it: it lands below the fold.
     // `ThreadSeenWitness::check` applies the rule; it runs after the thread's
@@ -458,13 +458,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         });
     }
 
-    // Auto-scroll behaviour (Phase 3 of #243 invite-DM redesign, then 10c):
+    // Explicit navigation policy (see `.claude/rules/history-scrolling.md`):
     //
     //   1. Modal mount       → jump to bottom (always, instant).
     //   2. Outbound send     → jump to bottom once (always, instant).
     //   3. Inbound new msg   → never scroll, even at the bottom: it lands
-    //                          below and the Latest control offers it
-    //                          (10c decision 1).
+    //                          below and the Latest control offers it.
     //
     // For the effect to re-fire when a new bubble lands we need an
     // actual subscribed signal read inside the closure. Dioxus 0.7's
@@ -1036,7 +1035,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             },
                         }
                     }
-                    // Latest (10c): shown whenever the newest DM's bottom is off
+                    // Latest: shown whenever the newest DM's bottom is off
                     // screen by more than the slack, which is how an inbound DM
                     // that landed below is offered.
                     if !newest_in_view() {
@@ -1734,7 +1733,7 @@ fn format_local_time(unix_secs: u64) -> String {
     local.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// What the DM read rule (10c decision 11) needs to mark the open thread seen
+/// What the DM read rule needs to mark the open thread seen
 /// from any of its triggers, raw DOM callbacks included.
 #[derive(Clone)]
 // Only `check` reads the thread, and it needs the DOM.

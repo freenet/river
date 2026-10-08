@@ -1,4 +1,4 @@
-//! The Latest control shared by the room history and the DM thread (10c): the
+//! The Latest control shared by the room history and the DM thread: the
 //! sentinel's observer, the on-screen test for the newest item's bottom, the
 //! jump to the end, and the button itself. Each caller keeps its own sentinel
 //! and handler.
@@ -9,8 +9,8 @@ use dioxus_free_icons::Icon;
 
 /// How far below the visible area (in px) the newest item's bottom may sit and
 /// still count as on screen: fractional layout can leave a row that did scroll
-/// fully into view a pixel short. Past it the Latest button shows (10c decision
-/// 4), and the read rule uses the same edge (decision 5).
+/// fully into view a pixel short. Past it the Latest button shows, and the
+/// read rule uses the same edge.
 #[cfg(target_arch = "wasm32")]
 pub const NEWEST_IN_VIEW_SLACK_PX: f64 = 4.0;
 

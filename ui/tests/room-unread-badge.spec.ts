@@ -143,12 +143,11 @@ test.describe("Muted rooms and the cross-surface totals", { tag: "@chromium-only
 });
 
 // A short arrival related to where the view actually is (A07): is it on screen,
-// is the Latest button offered, and is the room marked read? The 10c policy:
+// is the Latest button offered, and is the room marked read? The rule:
 // Latest shows whenever the newest message's bottom is off screen, without the
-// old 100px band (decision 4), and the open room counts as read only while the
-// tab and chat panel are visible and its newest message is on screen
-// (decision 5). The viewport witnesses (`onScreen`, `belowView`) are
-// independent of both.
+// old 100px band, and the open room counts as read only while the
+// tab and chat panel are visible and its newest message is on screen.
+// The viewport witnesses (`onScreen`, `belowView`) are independent of both.
 test.describe("Unseen arrivals versus the viewport (A07)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -243,7 +242,7 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
 
   /// The history's own padding must not count as part of the newest message:
   /// the slack is a few px past the message's bottom, not past the padding
-  /// below it (10c decisions 4 and 5).
+  /// below it.
   test("the newest message's bottom just below the view offers Latest and leaves the room unread", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
@@ -308,7 +307,7 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
 
 // A room whose chat panel is hidden behind the mobile Rooms or Members panel
 // has no layout, so nothing in it is on screen and an arrival there stays
-// unread (10c decision 5). Observed after opening another room, through the
+// unread. Observed after opening another room, through the
 // hamburger badge, which counts every room but the current one. Only the
 // Members panel is exercised: both panels hide the chat the same way, and the
 // test pins its own viewport, so one engine is enough.

@@ -313,8 +313,8 @@ mod tests {
     #[test]
     fn every_fallible_effect_anchors_before_its_first_try_read_and_nudges() {
         // 9 across the 4 files; app.rs has 5, dm_thread_modal.rs 2 (the DM_DRAFT
-        // merge and the 10c read rule), members.rs 1, conversation.rs 1 (the
-        // 10c read rule's tab-visibility check).
+        // merge and the DM read rule), members.rs 1, conversation.rs 1 (the
+        // room read rule's tab-visibility check).
         assert_fallible_hooks_are_guarded(
             GUARDED_EFFECT_SITES,
             "use_effect(",

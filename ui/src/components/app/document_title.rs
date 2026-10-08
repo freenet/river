@@ -31,7 +31,7 @@ pub static TOTAL_UNREAD_COUNT: GlobalSignal<usize> = Global::new(|| 0);
 
 /// The newest message the reader has had on screen, as `(room owner, message)`.
 ///
-/// The read rule (10c decision 5): a room counts as read only while the tab is
+/// The read rule: a room counts as read only while the tab is
 /// visible, the chat panel has layout, the rendered range reaches the room's
 /// latest message and that message's bottom is on screen. `Conversation`
 /// checks those against the live DOM and writes this, through `defer`, when
@@ -643,7 +643,7 @@ pub fn count_unread_excluding_room(
 /// Drives the badge on the mobile hamburger buttons in the conversation
 /// header. The current room is excluded by design (mirroring the
 /// `!is_current` guard on the room-list badge in `room_list.rs`): it can
-/// hold messages the reader has not seen yet (10c decision 5), but its own
+/// hold messages the reader has not seen yet, but its own
 /// Latest button is where those are offered, not a panel the reader has to
 /// open.
 pub fn count_unread_behind_rooms_panel() -> usize {
@@ -839,7 +839,7 @@ fn hide_actions(
 ///
 /// It doesn't hold for the whole open room either: marking stops at
 /// [`NEWEST_SEEN`], so an arrival below the fold, or behind a mobile panel,
-/// stays unread when the tab hides (10c decision 5).
+/// stays unread when the tab hides.
 ///
 /// Note this changes the hidden-tab title badge's meaning: it used to show
 /// only messages that arrived *after* the hide (because everything else had
@@ -2376,7 +2376,7 @@ mod tests {
         (rooms, owner_vk, ids)
     }
 
-    /// 10c decision 5: an arrival that renders below the fold is in the room
+    /// An arrival that renders below the fold is in the room
     /// state, but the reader has only had the message before it on screen. The
     /// marker stops there, and the arrival keeps counting as unread.
     #[test]

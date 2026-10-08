@@ -40,8 +40,9 @@ import {
 const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
 
 // Arrivals never move the view, wherever the reader is, the very end of the
-// history included (10c decision 1). The Latest button is how a reader reaches
+// history included. The Latest button is how a reader reaches
 // what arrived below them.
+// Rationale: .claude/rules/history-scrolling.md.
 //
 // These began as the freenet/river#486 tests. #486 was the view NOT following
 // new messages: the follow was gated on a 1px sentinel with a 100px
@@ -56,7 +57,7 @@ const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join(
 // (`expectRowHeld`, within READING_ROW_BUDGET_PX), never on the distance from
 // the end, which grows with every arrival whether or not the view moved. When
 // the chat area itself changes height (the composer), the view keeps its
-// BOTTOM edge instead (10c decision 10), so those steps measure the newest
+// BOTTOM edge instead, so those steps measure the newest
 // message against the bottom of the view (`expectHeldFromViewBottom`).
 //
 // Assumes the example-data build, which exposes `window.__riverTest` for
@@ -297,7 +298,7 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     // A reader back at the end by themselves: right after the opening, the
-    // end is held through height changes (10c decision 13; covered below).
+    // end is held through height changes (covered below).
     await readerLeavesAndReturnsToEnd(page);
 
     const before = await historyHeight(page);
@@ -330,8 +331,8 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
     // is the scroll position (the view stays anchored at its top), rather than
     // a jump to the newest message. Width alone gets no correction; where the
     // narrower layout also changes the chat area's height (mobile-safari:
-    // 762px -> 754px), the bottom edge holds through that change (10c
-    // decision 10), moving the scroll position by exactly the difference.
+    // 762px -> 754px), the bottom edge holds through that change, moving the
+    // scroll position by exactly the difference.
     await nextFrames(page);
     await page.waitForTimeout(600);
     const heightChange = viewBefore - (await viewportHeight(page));
@@ -345,12 +346,12 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
-    // Not held at the end by the opening (10c decision 13), which would take
+    // Not held at the end by the opening, which would take
     // the view to the grown row's end and hide what this test measures.
     await readerLeavesAndReturnsToEnd(page);
     const roomyViewport = await viewportHeight(page);
     // Its TOP: the row grows below the bottom edge, and content growth is not
-    // followed (10c decision 1).
+    // followed.
     const newest = await newestRowFromViewBottom(page, "top");
     await page.getByTestId("message-input").fill(LONG_DRAFT);
     await expect
@@ -795,8 +796,8 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
 // deleted reading row (A02) and a hidden panel (A03) in
 // conversation-history-position.spec.ts, unseen arrivals, Latest and read state
 // (A07) in room-unread-badge.spec.ts, and edit-form reachability (A08) in
-// message-layout.spec.ts. The policy they encode is the 10c plan's: the view
-// moves only when the reader asks (opening a room, sending, Latest).
+// message-layout.spec.ts. They encode explicit navigation: the view moves
+// only when the reader asks (opening a room, sending, Latest).
 
 // Fixture assumptions from ui/src/example_data.rs, named where they are consumed.
 /// Rows the history renders when a room opens, and trims back to.
@@ -1142,7 +1143,7 @@ test.describe("Trimming on a very tall viewport (A05)", () => {
 });
 
 // Your own message takes the view to the end of the history once, from
-// wherever you were reading (10c decision 3), after the send applies locally.
+// wherever you were reading, after the send applies locally.
 // It does not start following, and a send that fails to apply goes nowhere.
 test.describe("Own send goes to the newest message once (A06)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
@@ -1304,15 +1305,15 @@ test.describe("Own send goes to the newest message once (A06)", () => {
   });
 });
 
-// 10c decision 13: once an explicit request (opening a room, an own send,
+// Once an explicit request (opening a room, an own send,
 // Latest) has put the reader at the end, the end stays in view while rows
 // change height (a private room's placeholders decrypting, late images, font
 // swaps), until the reader first scrolls away. An arrival ends the hold
-// instead of moving the view, as arrivals never do (decision 1).
+// instead of moving the view, as arrivals never do.
 //
 // The growing row is a Markdown image whose request is held until the test
 // lets it load, two short messages above the end.
-test.describe("The end holds after an explicit request (10c decision 13)", () => {
+test.describe("The end holds after an explicit request", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
   const imageRow = (page: Page) => page.locator("[data-item-key]", { hasText: "image fixture" });

@@ -600,8 +600,8 @@ pub fn RoomList() -> Element {
                                     }
                                     // Unread badge — hidden for the current
                                     // room, by design (it can hold messages
-                                    // the reader has not seen yet, 10c
-                                    // decision 5, but its Latest button
+                                    // the reader has not seen yet, but its
+                                    // Latest button
                                     // offers those), and for Muted rooms
                                     // (their count is always 0,
                                     // freenet/river#500).

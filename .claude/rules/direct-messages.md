@@ -78,8 +78,9 @@ seeds `DM_LAST_SEEN` from the max inbound DM timestamp per
 arriving inbound DM would be instantly marked seen and never surface as
 unread.
 
-**Read rule and scrolling (10c decisions 11, 12).** An open thread
-advances `DM_LAST_SEEN` (`mark_thread_read`) only up to an inbound DM
+**Read rule and scrolling.** The rationale for explicit navigation instead
+of automatic following lives in [history-scrolling.md](history-scrolling.md).
+An open thread advances `DM_LAST_SEEN` (`mark_thread_read`) only up to an inbound DM
 that was on screen with the tab visible — never from render, since an
 arrival renders below the fold. `ThreadSeenWitness::check` in
 `dm_thread_modal.rs` measures `dm-bottom-sentinel` against the thread's

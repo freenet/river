@@ -3,12 +3,12 @@ import { callRiverTest } from "./river-test";
 import { waitForApp, selectRoom, setTabVisibility, hiddenTitleCount } from "./example-room";
 import { AT_BOTTOM_EPSILON_PX, NEWEST_IN_VIEW_SLACK_PX, nextFrames, settle } from "./history-geometry";
 
-// Where a DM thread's view goes (10c, DM parity): opening it lands on the
+// Where a DM thread's view goes: opening it lands on the
 // newest DM, an own send jumps to the end once, and Latest jumps there on
 // request. Nothing else moves the view. An inbound DM never does, even when
 // the reader is at the end; it lands below and Latest offers it.
 //
-// And when the thread counts as seen (10c decision 11, the rooms' rule): only
+// And when the thread counts as seen: only
 // up to an inbound DM that was on screen with the tab visible. One that lands
 // below the fold, or arrives while the tab is hidden, stays unread.
 //
@@ -167,7 +167,7 @@ async function expectStill(page: Page, why: string) {
   expect(furthest, why).toBeLessThanOrEqual(STILL_PX);
 }
 
-test.describe("DM thread scroll position (10c DM parity)", () => {
+test.describe("DM thread scroll position", () => {
   test("an inbound DM does not move a reader parked up the thread", async ({ page }) => {
     await openThreadWithHistory(page);
     const { max } = await threadGeometry(page);
@@ -194,7 +194,7 @@ test.describe("DM thread scroll position (10c DM parity)", () => {
     await composer.press("Enter");
 
     await expect(dm(page, "sent from the top")).toHaveCount(1, { timeout: 5_000 });
-    // Instant, like the room's (decision 12): the first position the thread
+    // Instant, like the room's: the first position the thread
     // reports passing through is already the end, and so is the first read
     // after it.
     await expect
@@ -283,13 +283,13 @@ test.describe("DM thread scroll position (10c DM parity)", () => {
   });
 });
 
-// 10c decision 11: an open thread is marked seen only up to an inbound DM that
-// was on screen with the tab visible. Before 10c the thread marked every
+// An open thread is marked seen only up to an inbound DM that
+// was on screen with the tab visible. Previously the thread marked every
 // inbound DM seen as it rendered, wherever it landed. Witnessed by the rail's
 // unread count for the thread and the hidden-tab title, which counts DMs.
 // Hook-driven, so it runs on one engine; the describe above covers the view on
 // every engine.
-test.describe("DM thread read rule (10c decision 11)", { tag: "@chromium-only" }, () => {
+test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
   test("an inbound DM at the end lands below the view, offers Latest, and stays unread until the reader scrolls to it", async ({
     page,
   }) => {
