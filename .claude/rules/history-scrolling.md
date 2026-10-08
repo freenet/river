@@ -74,6 +74,17 @@ the same 4px message-bottom margin. The thread updates its read cutoff to
 the newest rendered inbound DM timestamp only when the tab is visible and
 the newest DM's bottom is on screen.
 
+A thread's opening and own-send jumps run in a task queued after the render,
+and both they and the read witness find the thread through the global
+`dm-scroll-container` and `dm-bottom-sentinel` ids. Each mounted thread body
+therefore owns a lifetime flag, set false synchronously when it unmounts; a
+queued jump checks it as it runs, before any DOM lookup, and the witness
+checks it before measuring. Work from a closed thread must not scroll, or
+count as seen, whichever thread is open by then, including a reopened
+instance of the same `(room, peer)`, which gets a fresh flag. A read the
+witness already granted may still commit after a close. Pinned by
+`ui/tests/dm-thread-lifecycle.spec.ts`.
+
 This shared policy does not imply identical position correction machinery.
 DM threads do not currently have the room history's end hold or explicit
 composer/keyboard bottom-edge correction. Their timestamp cutoff and its
