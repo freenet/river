@@ -3425,11 +3425,9 @@ fn retained_tail_height(container: &web_sys::Element, retained: usize) -> Option
 #[cfg(target_arch = "wasm32")]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
-/// Land an explicit request (opening, own send, Latest) at the end of the
-/// history, and hold it there while rows change height (10c decision 13).
+/// Take the view to the end and hold it there (10c decision 13).
 #[cfg(target_arch = "wasm32")]
-fn land_at_end(reader: &ReaderPosition, container: &web_sys::Element) {
-    reader.drop_pending_corrections();
+fn hold_end(reader: &ReaderPosition, container: &web_sys::Element) {
     scroll_to_end(container);
     reader.end_hold.set(Some(container.scroll_top()));
     // Now, not at the settle: the row read before the request would bound the
@@ -3438,19 +3436,24 @@ fn land_at_end(reader: &ReaderPosition, container: &web_sys::Element) {
     note_newest_seen(reader);
 }
 
+/// Land an explicit request (opening, own send, Latest) at the end of the
+/// history, and hold it there while rows change height.
+#[cfg(target_arch = "wasm32")]
+fn land_at_end(reader: &ReaderPosition, container: &web_sys::Element) {
+    reader.drop_pending_corrections();
+    hold_end(reader, container);
+}
+
 /// While the end hold is on, take the view back to the end after a size
 /// change: a row above it grew (an image, decryption, a font) or the chat area
 /// changed height. Returns whether it held.
 #[cfg(target_arch = "wasm32")]
 fn keep_end_held(reader: &ReaderPosition, container: &web_sys::Element) -> bool {
-    if reader.end_hold.get().is_none() {
-        return false;
+    let held = reader.end_hold.get().is_some();
+    if held {
+        hold_end(reader, container);
     }
-    scroll_to_end(container);
-    reader.end_hold.set(Some(container.scroll_top()));
-    remember_reading_position(reader);
-    note_newest_seen(reader);
-    true
+    held
 }
 
 /// Finish the pending [`ScrollRequest`] once the history has rows and layout:
