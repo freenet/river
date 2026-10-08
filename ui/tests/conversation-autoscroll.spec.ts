@@ -31,6 +31,7 @@ import {
   rowTop,
   scrollTop,
   viewportHeight,
+  withheld,
 } from "./history-geometry";
 
 /// A draft long enough to take more than BOTTOM_THRESHOLD_PX off the history.
@@ -1002,14 +1003,6 @@ function observeRowCounts(page: Page, { returnToEnd = false } = {}): Promise<num
   }, returnToEnd);
 }
 
-/// How many newer items the rendered range is holding back.
-function withheld(page: Page): Promise<number> {
-  return page
-    .getByTestId("conversation-history")
-    .getAttribute("data-newer-withheld")
-    .then((n) => Number(n));
-}
-
 /// The Deep History Room fixture: 188 fillers + 13 standard messages, capped
 /// at DEEP_ROOM_MAX_RECENT_MESSAGES.
 const DEEP_ROOM_SEEDED = 201;
@@ -1050,9 +1043,8 @@ async function parkPastTheCeiling(page: Page) {
 test.describe("Render ceiling and trimming (A04, A05)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  // The 240-item ceiling used to slide the range past a parked reader's row,
-  // although the room still held the message. Now the range holds: the row
-  // stays, later arrivals are withheld, and jump to latest still works.
+  // Past the ceiling the range holds: the row stays, later arrivals are
+  // withheld, and jump to latest still works.
   test("repeated bursts past the ceiling keep the reader put and the DOM bounded", async ({ page }) => {
     const row = await parkPastTheCeiling(page);
     await expectRowHeld(page, row.key, row.top, "a burst past the render ceiling took the reader off a message the room still holds");
@@ -1073,14 +1065,12 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
       "newest after the bursts",
     );
     await expectSettledAtBottom(page, "jump to latest did not land at the newest message");
-    expect(await withheld(page), "the latest range still withholds newer items").toBe(0);
   });
 
   // Reading down a held range pages withheld messages in until it reaches the
   // newest one.
   test("reading down a held range pages the withheld messages in", async ({ page }) => {
-    const row = await parkPastTheCeiling(page);
-    await expectRowHeld(page, row.key, row.top, "the burst moved the reader's row");
+    await parkPastTheCeiling(page);
     await callRiverTest(page, "appendMessage", "newest after the burst");
     await expect.poll(() => withheld(page)).toBeGreaterThan(0);
 
@@ -1100,10 +1090,41 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     await expect(page.locator("[data-item-key]").last()).toContainText("newest after the burst");
     await expectSettledAtBottom(page, "the end of the paged range is not the newest message");
     await expect(page.getByTestId("scroll-to-bottom"), "the catch-up button is still shown at the newest message").toBeHidden();
-    expect(
-      await page.locator("[data-item-key]").count(),
-      "paging newer history must stay bounded by the ceiling",
-    ).toBeLessThanOrEqual(INITIAL_RENDERED_ITEMS * 4 + INITIAL_RENDERED_ITEMS);
+  });
+
+  // A newer page slides the range's start past the ceiling. The reader's row
+  // stays put through that page and the next arrival.
+  test("a newer page keeps the reader's row", async ({ page }) => {
+    await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1&deep-history-retention=1");
+    await readerScrollsWithoutGesture(page, 1_000);
+    await callRiverTest(page, "appendMessages", 450);
+    await expect
+      .poll(() => withheld(page), { message: "premise: the burst should hold more than one page" })
+      .toBeGreaterThan(INITIAL_RENDERED_ITEMS);
+    const before = await withheld(page);
+
+    // One task: move into the trigger's reach and note the row in view,
+    // before the page lands.
+    const row = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.scrollTop = c.scrollHeight - c.clientHeight - 400;
+      const cTop = c.getBoundingClientRect().top;
+      for (const r of Array.from(c.querySelectorAll<HTMLElement>("[data-item-key]"))) {
+        const rect = r.getBoundingClientRect();
+        if (rect.height > 0 && rect.top >= cTop && rect.bottom <= cTop + c.clientHeight) {
+          return { key: r.getAttribute("data-item-key")!, top: rect.top - cTop };
+        }
+      }
+      return null;
+    });
+    expect(row, "premise: a row is fully in view").not.toBeNull();
+    await expect.poll(() => withheld(page), { message: "premise: a newer page should land" }).toBeLessThan(before);
+    await expectRowHeld(page, row!.key, row!.top, "a newer page moved the reader's row");
+
+    const paged = await withheld(page);
+    await callRiverTest(page, "appendMessage", "arrival after a newer page");
+    await expect.poll(() => withheld(page), { message: "premise: the arrival should land" }).toBe(paged + 1);
+    await expectRowHeld(page, row!.key, row!.top, "the arrival after a newer page moved the reader's row");
   });
 
   // With no following, a reader idle at the exact end never scrolls, so

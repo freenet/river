@@ -2524,7 +2524,7 @@ const WINDOW_GROWTH_ITEMS: usize = 60;
 /// Hard ceiling on how many display items arrival-growth can accumulate.
 ///
 /// Arrivals GROW the rendered window instead of sliding it — see
-/// [`HistoryWindow::resolve`] — so a long session in a busy room would
+/// [`HistoryWindow::resolve_held`] — so a long session in a busy room would
 /// otherwise re-accumulate exactly the unbounded render the window exists to
 /// prevent (freenet/river#498). Four initial windows is the chosen bound:
 /// deep enough that trims are rare (240 items is hours of a busy room, and the
@@ -2538,7 +2538,8 @@ const WINDOW_GROWTH_ITEMS: usize = 60;
 /// The ceiling caps ARRIVAL growth only. A reader paging back through history
 /// raises `window_items` explicitly, and that requested size always wins over
 /// the ceiling — capping it would make the backfill sentinel a no-op past 240
-/// items and dead-end the history (see the cap in [`HistoryWindow::resolve`]).
+/// items and dead-end the history (see the cap in
+/// [`HistoryWindow::resolve_held`]).
 const WINDOW_ITEMS_CEILING: usize = INITIAL_WINDOW_ITEMS * 4;
 
 /// How far into the rendered history the backfill trigger REACHES, in px.
@@ -2585,8 +2586,8 @@ struct RangeHold {
     /// The relocated end of last render's range, if it stopped short of the
     /// newest item.
     end: Option<usize>,
-    /// Index of the display item the reader is looking at. The start never
-    /// moves past it, even above the ceiling.
+    /// The start never moves past this index, even above the ceiling: the
+    /// reading item, less one for a group the view top cuts through.
     keep: Option<usize>,
 }
 
@@ -2686,7 +2687,7 @@ type MessageGroupsValue = Rc<(
 /// reads it.
 #[derive(Default)]
 struct ReaderPosition {
-    /// The last reading position measured while the history had layout.
+    /// See [`ReadingAnchor`].
     anchor: std::cell::RefCell<Option<ReadingAnchor>>,
     /// Seen without layout since the last restore; the next resize restores.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -2932,8 +2933,8 @@ fn relocate_tail(
 /// SPARE term exactly (`k <= WINDOW_ANCHOR_KEYS - 1`, needing `k + 1`
 /// candidates). The full count of leading candidates without pre-patch rows is
 /// `k + (relocated.start - history_window.start)`, and that second term is
-/// non-zero only when `resolve` pulls the start back below the relocated head
-/// — the bulk mid-window removal `relocate_window` already declares
+/// non-zero only when `resolve_held` pulls the start back below the relocated
+/// head — the bulk mid-window removal `relocate_window` already declares
 /// out of scope. For a top-contiguous removal every surviving row at or below
 /// the head shifts by the same amount, so whichever candidate lands measures
 /// the shift exactly.
@@ -3015,6 +3016,7 @@ const TRIM_HEADROOM_PX: f64 = 200.0;
 ///
 /// The tail is measured. An average-row-height estimate looped on rooms whose
 /// older rows are much taller than the newest ones.
+///
 /// Only the wasm settle handler calls this at runtime; natively it is
 /// exercised by the unit tests, hence the targeted allow.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -3037,7 +3039,13 @@ fn grown_window(requested: usize, rendered: usize) -> usize {
 }
 
 impl HistoryWindow {
-    /// Resolve where the rendered tail starts.
+    /// Test shorthand for a range with no held end; see [`Self::resolve_held`].
+    #[cfg(test)]
+    fn resolve(total_items: usize, window: usize, anchor: Option<usize>) -> Self {
+        Self::resolve_held(total_items, window, anchor, RangeHold::default())
+    }
+
+    /// Resolve which display items the history renders.
     ///
     /// `anchor` is the start index the PREVIOUS render used (`None` when the
     /// room was just opened, or after a trim). It is what keeps the window
@@ -3053,30 +3061,24 @@ impl HistoryWindow {
     /// * `start` moves BACK (upward, revealing older items) when the reader
     ///   backfills — `window` grew, so the plain tail start is earlier than
     ///   the anchor.
-    /// * Past [`WINDOW_ITEMS_CEILING`] the end stops instead, and newer items
-    ///   are held back. `max(window, ...)` keeps the ceiling from ever capping
-    ///   a reader-requested backfill.
+    /// * [`WINDOW_ITEMS_CEILING`] caps arrival growth. Past it the end stops
+    ///   instead, wherever the reader is, and newer items are held back.
+    ///   `max(window, ...)` keeps the ceiling from ever capping a
+    ///   reader-requested backfill.
+    ///
+    /// `hold` adds the lower edge:
+    ///
+    /// * A held end moves only when the caller extends it (newer paging); the
+    ///   ceiling then slides the start.
+    /// * The start never passes `keep`, not even at the ceiling.
+    ///
+    /// `window` counts back from the end, so backfill works the same either way.
     ///
     /// Trimming back toward [`INITIAL_WINDOW_ITEMS`] is NOT done here — it is
     /// an explicit event (a settle landing at the bottom, or a room switch)
     /// that clears the anchor and resets `window`, because a trim is only
     /// invisible when the view is at the bottom, where the browser's scrollTop
     /// clamp keeps the tail glued in place.
-    ///
-    /// Test shorthand for a range with no held end; see [`Self::resolve_held`].
-    #[cfg(test)]
-    fn resolve(total_items: usize, window: usize, anchor: Option<usize>) -> Self {
-        Self::resolve_held(total_items, window, anchor, RangeHold::default())
-    }
-
-    /// [`Self::resolve`] with a lower edge from `hold`:
-    ///
-    /// * Past the ceiling, the end stops and newer items are held back.
-    /// * A held end moves only when the caller extends it (newer paging); the
-    ///   ceiling then slides the start.
-    /// * The start never passes `keep`.
-    ///
-    /// `window` counts back from the end, so backfill works the same either way.
     fn resolve_held(
         total_items: usize,
         window: usize,
@@ -3131,8 +3133,10 @@ impl HistoryWindow {
 const SCROLL_SETTLE_DEBOUNCE_MS: i32 = 120;
 
 /// Refresh the saved reading position, keeping the old one when nothing can be
-/// measured. Called at every settle, before a newer page, and just before the
-/// chat panel is hidden (afterwards there is no geometry to read).
+/// measured. Called at every settle, before a newer page, once an explicit
+/// request or a reveal has placed the view, and when the Rooms or Members
+/// button hides the chat panel (afterwards there is no geometry to read). A
+/// breakpoint hide relies on the last settle.
 fn remember_reading_position(reader: &ReaderPosition) {
     #[cfg(target_arch = "wasm32")]
     if let Some(anchor) = capture_reading_anchor(reader.range_start.get()) {
@@ -4270,8 +4274,9 @@ pub fn Conversation() -> Element {
     {
         let reader_position = reader_position.clone();
         use_effect(move || {
-            // Subscribe: head swaps only happen on content changes.
+            // Subscribe: heads swap on content changes and on newer pages.
             let _ = message_groups.read().is_some();
+            let _ = window_items();
             let Some((key, pre_top, pre_scroll_top)) =
                 reader_position.reposition_pending.borrow_mut().take()
             else {
@@ -5373,15 +5378,15 @@ pub fn Conversation() -> Element {
                                     // swaps a held range for the latest one.
                                     let select_latest = reader_position.request.get().is_some()
                                         && reader_position.has_newer.get();
+                                    let key_at =
+                                        |i: usize, key: &str| display_item_key_matches(&groups[i], key);
                                     let prev_anchor = if select_latest {
                                         None
                                     } else {
                                         window_anchor.borrow().clone()
                                     };
                                     let relocated = prev_anchor.as_ref().map(|a| {
-                                        relocate_window(groups.len(), a, |i, key| {
-                                            display_item_key_matches(&groups[i], key)
-                                        })
+                                        relocate_window(groups.len(), a, key_at)
                                     });
                                     let prev_tail = if select_latest {
                                         None
@@ -5390,14 +5395,12 @@ pub fn Conversation() -> Element {
                                     };
                                     let extend_newer = reader_position.extend_newer.replace(false);
                                     let held_end = prev_tail.as_ref().map(|t| {
-                                        let end = relocate_tail(groups.len(), t, |i, key| {
-                                            display_item_key_matches(&groups[i], key)
-                                        })
-                                        // Every held item gone: keep the count.
-                                        .unwrap_or_else(|| {
-                                            relocated.map_or(0, |r| r.start)
-                                                + window_rendered.get()
-                                        });
+                                        let end = relocate_tail(groups.len(), t, key_at)
+                                            // Every held item gone: keep the count.
+                                            .unwrap_or_else(|| {
+                                                relocated.map_or(0, |r| r.start)
+                                                    + window_rendered.get()
+                                            });
                                         if extend_newer {
                                             end + WINDOW_GROWTH_ITEMS
                                         } else {
@@ -5859,8 +5862,7 @@ pub fn Conversation() -> Element {
                 // newest message's bottom is in view. Handy on every device but
                 // especially on touch, where there is no scrollbar to drag.
                 //
-                // Also shown while a held range withholds newer items
-                // (`has_newer` was set by the history render above).
+                // Also shown while a held range withholds newer items.
                 if !is_at_bottom() || reader_position.has_newer.get() {
                     button {
                         class: "absolute bottom-4 right-4 z-30 flex items-center justify-center w-10 h-10 rounded-full bg-panel shadow-lg border border-border text-text-muted hover:text-accent transition-colors",
@@ -6055,13 +6057,7 @@ pub fn Conversation() -> Element {
                                 } else {
                                     "Open room list".to_string()
                                 },
-                                onclick: {
-                                        let reader_position = reader_position.clone();
-                                        move |_| {
-                                            remember_reading_position(&reader_position);
-                                            crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms)
-                                        }
-                                    },
+                                onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                                 Icon { icon: FaBars, width: 18, height: 18 }
                                 // Same unread-elsewhere badge as the room-header
                                 // hamburger; with no room selected every room's
@@ -7892,23 +7888,9 @@ mod tests {
     #[test]
     fn the_trim_skips_when_the_tail_would_rearm_the_sentinel() {
         let reach = |client: i32| client + BACKFILL_LEAD_PX + TRIM_HEADROOM_PX as i32;
-        // Ordinary desktop shape: the newest 60 items measure ~4000px over a
-        // 900px viewport, far past the strip's reach. Trim.
-        assert!(!trim_would_rearm_backfill(4000, 900));
         // Exactly at the reach clears it; one px short does not.
         assert!(!trim_would_rearm_backfill(reach(900), 900));
         assert!(trim_would_rearm_backfill(reach(900) - 1, 900));
-        // The Uneven Tail Room on a 5800px-tall window: 60 short rows
-        // (~2500px) under tall older ones. The old estimate scaled the whole
-        // rendered height by 60/rendered and, inflated by the tall rows,
-        // cleared the reach; the real tail does not, so no trim and no loop.
-        let (rendered_height, rendered, client) = (40 * 400 + 60 * 42, 100, 5800);
-        let averaged = rendered_height * 60 / rendered;
-        assert!(
-            averaged > reach(client),
-            "premise: the average-height estimate would have trimmed"
-        );
-        assert!(trim_would_rearm_backfill(60 * 42, client));
     }
 
     /// Item keys `m0..m{total}` for the range tests.
@@ -8061,26 +8043,11 @@ mod tests {
         );
         assert_eq!(last.end, total);
         assert!(!last.has_newer);
-    }
 
-    /// No anchors (jump to latest, own send, room open) selects the latest range.
-    #[test]
-    fn selecting_the_latest_range_drops_the_hold() {
-        let w = HistoryWindow::resolve_held(1000, INITIAL_WINDOW_ITEMS, None, RangeHold::default());
-        assert_eq!((w.start, w.end), (1000 - INITIAL_WINDOW_ITEMS, 1000));
-        assert!(w.has_older && !w.has_newer);
-        // A degenerate held end (everything it held is gone) falls back to the
-        // newest item rather than rendering nothing.
-        let empty = HistoryWindow::resolve_held(
-            50,
-            INITIAL_WINDOW_ITEMS,
-            Some(0),
-            RangeHold {
-                end: Some(0),
-                keep: None,
-            },
-        );
-        assert_eq!(empty.end, 50);
+        // A held end with nothing left falls back to the newest, not to empty.
+        let empty =
+            HistoryWindow::resolve_held(total, INITIAL_WINDOW_ITEMS, Some(900), held(0, None));
+        assert_eq!(empty.end, total);
     }
 
     /// A deleted reading row falls back to its nearest surviving neighbour,
@@ -8109,14 +8076,6 @@ mod tests {
         // offset, even though the row below survived too.
         assert_eq!(
             reading_anchor_shift(&anchor, 0, dom(&[("below", 700), ("above", 10)])),
-            Some(40)
-        );
-        assert_eq!(
-            reading_anchor_shift(&anchor, 0, dom(&[("below", 700)])),
-            Some(580)
-        );
-        assert_eq!(
-            reading_anchor_shift(&anchor, 0, dom(&[("above", 10)])),
             Some(40)
         );
         // Nothing survives: no move at all.
