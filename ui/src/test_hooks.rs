@@ -148,16 +148,10 @@ pub fn install_test_hooks() {
     // reads as a room still awaiting its initial sync, which has no composer.
     expose(&hooks, "makeRoomPrivateWithoutSecret", move |_: JsValue| {
         crate::util::defer(|| {
-            let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
-                return;
-            };
-            ROOMS.with_mut(|rooms| {
-                let Some(room) = rooms.map.get_mut(&room_key) else {
-                    return;
-                };
+            with_current_room_mut(|room, room_key| {
                 let Some(owner_sk) = room
                     .signing_key()
-                    .filter(|sk| sk.verifying_key() == room_key)
+                    .filter(|sk| sk.verifying_key() == *room_key)
                     .cloned()
                 else {
                     web_sys::console::error_1(
@@ -383,35 +377,37 @@ fn prune_to_cap(room: &mut RoomData) {
     }
 }
 
-/// Drop the current room's messages whose public text contains `needle`.
-fn remove_messages(needle: &str) {
+/// Run `f` on the current room in ONE `ROOMS` mutation. It writes `ROOMS`, so
+/// call it only from inside a `defer` closure.
+fn with_current_room_mut(f: impl FnOnce(&mut RoomData, &VerifyingKey)) {
     let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
         return;
     };
     ROOMS.with_mut(|rooms| {
         if let Some(room) = rooms.map.get_mut(&room_key) {
-            room.room_state.recent_messages.messages.retain(|m| {
-                !m.message
-                    .content
-                    .as_public_string()
-                    .is_some_and(|text| text.contains(needle))
-            });
+            f(room, &room_key);
         }
+    });
+}
+
+/// Drop the current room's messages whose public text contains `needle`.
+fn remove_messages(needle: &str) {
+    with_current_room_mut(|room, _| {
+        room.room_state.recent_messages.messages.retain(|m| {
+            !m.message
+                .content
+                .as_public_string()
+                .is_some_and(|text| text.contains(needle))
+        });
     });
 }
 
 /// Deliver every message to the current room in ONE `ROOMS` mutation, so one
 /// re-render, as a network delta does.
 fn deliver(messages: impl IntoIterator<Item = (String, Delivery)>) {
-    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
-        return;
-    };
-    ROOMS.with_mut(|rooms| {
-        let Some(room) = rooms.map.get_mut(&room_key) else {
-            return;
-        };
+    with_current_room_mut(|room, room_key| {
         for (text, delivery) in messages {
-            push_test_message(room, &room_key, text, delivery);
+            push_test_message(room, room_key, text, delivery);
         }
         prune_to_cap(room);
     });
@@ -437,13 +433,8 @@ enum DmStamp {
 /// `ROOMS` mutation, through the DM field's `apply_delta`: it checks each
 /// signature and both memberships, and keeps the stored order and caps.
 fn deliver_dms(texts: Vec<String>, stamp: DmStamp) {
-    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
-        return;
-    };
-    ROOMS.with_mut(|rooms| {
-        let Some(room) = rooms.map.get_mut(&room_key) else {
-            return;
-        };
+    with_current_room_mut(|room, room_key| {
+        let room_key = *room_key;
         let Some(self_vk) = room.signing_key().map(|sk| sk.verifying_key()) else {
             web_sys::console::error_1(&"__riverTest DM hooks: self holds no key here".into());
             return;
@@ -458,28 +449,27 @@ fn deliver_dms(texts: Vec<String>, stamp: DmStamp) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let count = texts.len() as u64;
-        let first = match stamp {
-            DmStamp::History => now.saturating_sub(count * 60),
-            DmStamp::Newest => room
-                .room_state
-                .direct_messages
-                .messages
-                .iter()
-                .filter(|m| {
-                    let (s, r) = (m.message.sender, m.message.recipient);
-                    (s == self_id && r == peer_id) || (s == peer_id && r == self_id)
-                })
-                .map(|m| m.message.timestamp + 1)
-                .fold(now, u64::max),
+        let (first, step) = match stamp {
+            DmStamp::History => (now.saturating_sub(count * 60), 60),
+            DmStamp::Newest => (
+                room.room_state
+                    .direct_messages
+                    .messages
+                    .iter()
+                    .filter(|m| {
+                        let (s, r) = (m.message.sender, m.message.recipient);
+                        (s == self_id && r == peer_id) || (s == peer_id && r == self_id)
+                    })
+                    .map(|m| m.message.timestamp + 1)
+                    .fold(now, u64::max),
+                1,
+            ),
         };
         let new_messages: Vec<_> = texts
             .into_iter()
             .zip(0..)
             .filter_map(|(text, i)| {
-                let ts = match stamp {
-                    DmStamp::History => first + i * 60,
-                    DmStamp::Newest => first + i,
-                };
+                let ts = first + i * step;
                 compose_direct_message(&peer_sk, &self_vk, &room_key, ts, now, text.as_bytes())
                     .inspect_err(|e| {
                         web_sys::console::error_1(&format!("__riverTest DM compose: {e}").into())

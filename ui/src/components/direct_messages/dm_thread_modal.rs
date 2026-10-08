@@ -461,11 +461,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     //   2. Outbound send     → jump to bottom once (always, instant).
     //   3. Inbound new msg   → never scroll, even at the bottom: it lands
     //                          below and the Latest control offers it
-    //                          (10c decision 1). The old "near the bottom
-    //                          (50px)" follow measured after the arrival
-    //                          had rendered, so in practice it only fired
-    //                          for the DM that first made a short thread
-    //                          scroll.
+    //                          (10c decision 1).
     //
     // For the effect to re-fire when a new bubble lands we need an
     // actual subscribed signal read inside the closure. Dioxus 0.7's
@@ -508,14 +504,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 return;
             }
             let outbound_bump_now = *OUTBOUND_SEND_COUNTER.peek();
-            let prev_bump = prev_outbound_bump.get();
-            let outbound_changed = outbound_bump_now != prev_bump;
-            prev_outbound_bump.set(outbound_bump_now);
-
-            let is_first = !first_scroll_done.get();
-            if is_first {
-                first_scroll_done.set(true);
-            }
+            let outbound_changed =
+                prev_outbound_bump.replace(outbound_bump_now) != outbound_bump_now;
+            let is_first = !first_scroll_done.replace(true);
             // Trigger types:
             //   * is_first         — mount: always jump.
             //   * outbound_changed — user sent: always, once.

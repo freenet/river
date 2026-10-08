@@ -49,17 +49,14 @@ pub static DM_LAST_SEEN: GlobalSignal<HashMap<(VerifyingKey, MemberId), u64>> =
 ///
 /// Split out because the answer gates whether `mark_thread_read`
 /// touches the signal at all: `DmThreadModalBody` calls
-/// `mark_thread_read` again and again while a thread is open (it used
-/// to on every render; since 10c, from every read-rule trigger), and
-/// `with_mut` notifies subscribers even when the mutation changed
+/// `mark_thread_read` from every read-rule trigger while a thread is
+/// open, and `with_mut` notifies subscribers even when the mutation changed
 /// nothing — so an unconditional write turned an open DM thread into a
 /// continuous write pulse on `DM_LAST_SEEN`, widening the contention
 /// window that blanked the DM rail (issue #499).
 /// Pinned by the `thread_read_needs_write_*` tests plus the wiring pin
 /// `mark_thread_read_write_is_gated_pinned`.
-// Native builds have no caller: see `mark_thread_read`.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub(crate) fn thread_read_needs_write(current: Option<u64>, up_to_ts: u64) -> bool {
+fn thread_read_needs_write(current: Option<u64>, up_to_ts: u64) -> bool {
     up_to_ts > current.unwrap_or(0)
 }
 
@@ -69,7 +66,7 @@ pub(crate) fn thread_read_needs_write(current: Option<u64>, up_to_ts: u64) -> bo
 /// `ThreadSeenWitness` in `dm_thread_modal.rs`).
 // Its one caller measures the DOM, so it exists only on wasm32.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
+fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
     crate::util::defer(move || {
         // Skip the write when the stored cutoff would not advance —
         // `with_mut` notifies subscribers even for a no-op mutation and
@@ -969,11 +966,10 @@ mod tests {
         }
     }
 
-    /// Issue #499 write-pulse: `mark_thread_read` is called again and
-    /// again while a thread is open (once on every render; since 10c from
-    /// every read-rule trigger), and `with_mut` notifies subscribers even
-    /// when the mutation is a no-op — so the `with_mut` MUST stay gated on
-    /// `thread_read_needs_write`. Source-scrape (the function needs a
+    /// Issue #499 write-pulse: `mark_thread_read` is called from every
+    /// read-rule trigger while a thread is open, and `with_mut` notifies
+    /// subscribers even when the mutation is a no-op — so the `with_mut`
+    /// MUST stay gated on `thread_read_needs_write`. Source-scrape (the function needs a
     /// Dioxus runtime to exercise): match whitespace-stripped source so
     /// rustfmt reflowing can't fake a failure; cut at `mod tests` (this
     /// file has exactly one) so these needles can't satisfy their own
@@ -986,7 +982,7 @@ mod tests {
         let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
 
         let start = stripped
-            .find("pubfnmark_thread_read")
+            .find("fnmark_thread_read(")
             .expect("mark_thread_read not found");
         let end = stripped[start..]
             .find("pubfnopen_dm_thread")

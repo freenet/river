@@ -3531,7 +3531,16 @@ fn note_newest_seen(reader: &ReaderPosition) {
 
 /// May a bottom-settle trim run now? Requires layout, the exact bottom of a
 /// range that reaches the latest message, an overgrown window, nothing
-/// pending, and a measured tail that clears the backfill strip.
+/// pending, and a measured tail that clears the backfill strip (see
+/// `trim_would_rearm_backfill`).
+///
+/// A settle at the bottom is the one moment a trim is invisible: removing rows
+/// above the viewport shrinks `scrollHeight`, the browser clamps `scrollTop`
+/// with it, and the same tail stays on the bottom edge. Anywhere else, with
+/// scroll anchoring off, a trim shifts content under the reader, so growth
+/// there is bounded by `WINDOW_ITEMS_CEILING` instead. Gated at
+/// `SCROLL_TOP_SLACK_PX`: a trim from even a little above the bottom would
+/// clamp the reader to the exact end, a visible yank.
 #[cfg(target_arch = "wasm32")]
 fn trim_is_due(container: &web_sys::Element, overgrown: bool, reader: &ReaderPosition) -> bool {
     if !overgrown
@@ -3591,23 +3600,9 @@ fn install_scroll_settle_listener(
             if reader.hidden.get() {
                 return;
             }
-            // A settle landing AT the bottom is the ONE moment a window trim
-            // is provably invisible: removing rows above the viewport shrinks
-            // `scrollHeight` and the browser clamps `scrollTop` down with it,
-            // so the same tail stays glued to the bottom edge. Trimming
-            // anywhere else shifts content under the reader now that scroll
-            // anchoring is off, so growth elsewhere is bounded by
-            // `WINDOW_ITEMS_CEILING` instead of trimmed.
-            //
-            // Any settle counts, ours included, so a touch reader who only
-            // returns to the bottom through the scroll-to-latest button still
-            // trims (#505 review). Gated at SCROLL_TOP_SLACK_PX: a trim from
-            // even a little above the bottom would clamp the reader to the
-            // exact end, a visible yank. Skipped when the trimmed tail would
-            // leave the backfill sentinel in range of the bottom viewport —
-            // trim and backfill then oscillate at render speed (#505
-            // re-review; see `trim_would_rearm_backfill`). Never at the bottom
-            // of a held range (`has_newer`): that is not the latest message.
+            // See `trim_is_due`. Any settle counts, ours included, so a touch
+            // reader who only returns to the bottom through the
+            // scroll-to-latest button still trims (#505 review).
             //
             // Deferred: this runs from a raw JS callback with no Dioxus scope,
             // and `window_items` is a signal the render subscribes to. See
@@ -3812,10 +3807,8 @@ pub fn Conversation() -> Element {
     let window_tail = use_hook(|| Rc::new(std::cell::RefCell::new(None::<WindowAnchor>)));
     // See `ReaderPosition`.
     let reader_position = use_hook(|| Rc::new(ReaderPosition::default()));
-    // How many display items the last render actually put on screen. The
-    // backfill growth step reads this instead of the requested size: after
-    // arrivals grow an anchored window, growing from the stale requested size
-    // can reveal zero new rows and dead-end paging (#505 review, blocker 2).
+    // How many display items the last render actually put on screen; the
+    // backfill growth step grows from it (see `grown_window`).
     let window_rendered = use_hook(|| Rc::new(std::cell::Cell::new(0usize)));
     // Whether the rendered window currently holds more than a fresh room-open
     // would render — i.e. whether the bottom-settle trim in
@@ -3902,8 +3895,7 @@ pub fn Conversation() -> Element {
             if prev_windowed_room.get() != room {
                 prev_windowed_room.set(room);
                 window_items.set(INITIAL_WINDOW_ITEMS);
-                // Re-gate the backfill sentinel until the new room's opening
-                // snap has landed (#501 H2).
+                // Re-gate the backfill sentinel; see `opening_snap_done`.
                 opening_snap_done.set(false);
                 // Hide the scroll-to-latest button until the observer reports
                 // on the new room.
@@ -4269,18 +4261,13 @@ pub fn Conversation() -> Element {
     // Keep the reader's view still when the window head is swapped for a
     // later item — the head was pruned out from under the anchor (an at-cap
     // room drains its oldest message on every arrival), or newer paging slid
-    // the start past it (#505 review, blocker 1). Rows above the viewport shrink,
-    // and with `overflow-anchor: none` the browser no longer compensates, so
-    // this effect is the one piece of scroll anchoring reimplemented under
-    // our own control: the render captured a SURVIVING row's `offsetTop`
-    // BEFORE the patch (into `reposition_pending` — the new head row when it
-    // already existed, else the first row after it that did, since a
-    // re-keyed multi-message head group has no pre-patch row under its new
-    // key; see `select_reposition_probe`). Re-measuring it after the patch
-    // gives exactly how far the content above the viewport shifted,
-    // date-separator churn included — top-contiguous removals shift every
-    // surviving row identically. Synchronous — post-patch, pre-paint — for
-    // the same no-flicker reason as the backfill restore above.
+    // the start past it (#505 review, blocker 1). With `overflow-anchor: none`
+    // the browser no longer compensates, so this effect is the one piece of
+    // scroll anchoring reimplemented under our own control. Re-measuring the
+    // row the render captured (see `reposition_pending`) gives exactly how far
+    // the content above the viewport shifted, date-separator churn included.
+    // Synchronous — post-patch, pre-paint — for the same no-flicker reason as
+    // the backfill restore above.
     //
     // Known limitation, deliberately accepted: a mid-window removal (a
     // deletion, a ban purge) or late-loading media above the viewport still
@@ -4318,11 +4305,7 @@ pub fn Conversation() -> Element {
             };
             let shift = post_top - pre_top;
             if shift != 0 {
-                // From the PRE-patch offset, not the live one: when the patch
-                // shortens the content the browser has already clamped
-                // `scrollTop` down by the time this runs, and shifting from
-                // the clamped value applies the clamp twice (#505 delta
-                // review). Clamping the result is left to the browser.
+                // From the PRE-patch offset; see `reposition_pending`.
                 let target = (pre_scroll_top + shift).max(0);
                 container.set_scroll_top(target);
             }
@@ -5466,20 +5449,9 @@ pub fn Conversation() -> Element {
                                         }
                                     };
                                     if head_removed && reader_position.request.get().is_none() {
-                                        // Capture a surviving row's PRE-patch
-                                        // offset, AND the container's
-                                        // pre-patch scrollTop; the DOM still
-                                        // shows the previous render here. The
-                                        // probe row is not necessarily the
-                                        // head itself: a re-keyed head group
-                                        // has no pre-patch row under its new
-                                        // key (#505 re-review blocker; see
-                                        // `select_reposition_probe`). The
-                                        // scroll offset is captured because
-                                        // the browser clamps it down before
-                                        // the effect can read it when the
-                                        // patch shortens the content (#505
-                                        // delta review).
+                                        // The DOM still shows the previous
+                                        // render here. See
+                                        // `reposition_pending`.
                                         #[cfg(target_arch = "wasm32")]
                                         if let (Some((probe_key, probe_top)), Some(container)) = (
                                             select_reposition_probe(
@@ -5513,8 +5485,7 @@ pub fn Conversation() -> Element {
                                             .collect(),
                                         index: history_window.start,
                                     });
-                                    // What the backfill growth step grows FROM
-                                    // (#505 blocker 2; see `grown_window`).
+                                    // See `grown_window`.
                                     window_rendered
                                         .set(history_window.end - history_window.start);
                                     // Only a held range remembers its end.
@@ -5612,76 +5583,32 @@ pub fn Conversation() -> Element {
                                         rows
                                     };
                                     Some(rsx! {
-                                        // Backfill trigger, rendered only while
-                                        // older items are held back. Once the
-                                        // whole room is on screen it leaves the
-                                        // DOM, and with it the observer — so a
-                                        // fully-read room behaves exactly as
-                                        // before.
-                                        //
-                                        // Deliberately OUTSIDE the `space-y-4`
-                                        // list: as a child it would take the
-                                        // first row's place, pushing that row
-                                        // down by the 1rem gap and shifting the
-                                        // history by that much every time the
-                                        // sentinel appeared or (on the last
-                                        // backfill) disappeared.
-                                        // Gated on the opening snap having
-                                        // landed as well: a >window room's
-                                        // first render sits at `scrollTop = 0`
-                                        // until the snap runs, and a sentinel
-                                        // mounted during that beat fires from
-                                        // the top of the history and cascades
-                                        // the backfill (#501 H2). Mounting it
-                                        // after the snap means its first
-                                        // observation sees the view at the
-                                        // bottom, far below the strip. The
-                                        // room-change check covers the one
-                                        // render where `opening_snap_done` is
-                                        // still the PREVIOUS room's true —
-                                        // its reset only lands in the effect
-                                        // pass after this render.
+                                        // Backfill trigger while older items
+                                        // are held back; see `BACKFILL_LEAD_PX`.
+                                        // Outside the `space-y-4` list, where
+                                        // it would add a row gap above the
+                                        // history. Waits for the opening snap
+                                        // (see `opening_snap_done`) and for
+                                        // that signal's room-change reset.
                                         if history_window.has_older
                                             && opening_snap_done()
                                             && !room_changed_this_render
                                         {
-                                            // Zero-height anchor; the sentinel
-                                            // inside it is absolutely
-                                            // positioned, so it contributes no
-                                            // layout at all.
+                                            // Zero-height wrapper: the strip
+                                            // inside adds no layout.
                                             div { style: "position:relative;height:0;",
                                                 div {
                                                     id: "top-backfill-sentinel",
-                                                    // A STRIP spanning the top
-                                                    // BACKFILL_LEAD_PX of the
-                                                    // history, so the backfill
-                                                    // fires as the reader
-                                                    // approaches the end of what
-                                                    // is rendered rather than
-                                                    // when they hit it — and
-                                                    // still fires at scrollTop 0
-                                                    // on a viewport shorter than
-                                                    // the lead. See
-                                                    // `BACKFILL_LEAD_PX` for why
-                                                    // a point marker fails.
-                                                    // Inline style, not a
-                                                    // Tailwind arbitrary value:
-                                                    // the class scanner does not
-                                                    // see class names built
-                                                    // inside rsx.
+                                                    // Inline style: the class
+                                                    // scanner does not see class
+                                                    // names built inside rsx.
                                                     style: "position:absolute;top:0;height:{BACKFILL_LEAD_PX}px;width:1px;",
                                                     onvisible: {
                                                         #[cfg(target_arch = "wasm32")]
                                                         let reader_position = reader_position.clone();
                                                         move |evt: dioxus::prelude::Event<VisibleData>| {
                                                             if evt.data().is_intersecting().unwrap_or(false) {
-                                                                // Capture BEFORE the re-render so the
-                                                                // restore effect can put the reader back
-                                                                // on the row they were looking at: the
-                                                                // current head row's identity + offset
-                                                                // (the measured probe), plus scroll
-                                                                // geometry (offset to restore from, and
-                                                                // the height-delta fallback). See
+                                                                // Capture BEFORE the re-render; see
                                                                 // `BackfillAnchor`.
                                                                 #[cfg(target_arch = "wasm32")]
                                                                 if let (
@@ -5701,13 +5628,7 @@ pub fn Conversation() -> Element {
                                                                                 .scroll_height(),
                                                                         });
                                                                 }
-                                                                // Grow from the RENDERED size, not the
-                                                                // requested one: arrivals grow an anchored
-                                                                // window past the request, and growing from
-                                                                // the stale request can reveal zero new rows
-                                                                // — the sentinel then never re-fires and
-                                                                // paging dead-ends (#505 blocker 2; see
-                                                                // `grown_window`).
+                                                                // See `grown_window`.
                                                                 window_items.with_mut(|n| {
                                                                     *n = grown_window(*n, window_rendered.get())
                                                                 });

@@ -39,8 +39,8 @@ pub static TOTAL_UNREAD_COUNT: GlobalSignal<usize> = Global::new(|| 0);
 ///
 /// Separate from the marker itself so that no caller can mark from the room
 /// state alone: an arrival renders below the fold before anything reports it
-/// off screen, and every caller that used to read "the latest message" from
-/// `ROOMS` marked exactly that arrival read.
+/// off screen, so marking "the latest message" from `ROOMS` would mark that
+/// arrival read.
 pub static NEWEST_SEEN: GlobalSignal<Option<(ed25519_dalek::VerifyingKey, MessageId)>> =
     Global::new(|| None);
 
@@ -837,17 +837,16 @@ fn hide_actions(
 /// left untouched so its unread count survives the backgrounding. See
 /// [`hide_actions`] for why the flush stays unconditional despite that.
 ///
-/// It doesn't hold for the whole open room either. This then marked up to the
-/// room's latest message, so an arrival below the fold, or behind a mobile
-/// panel, went read the moment the tab hid; now it stays unread (10c
-/// decision 5).
+/// It doesn't hold for the whole open room either: marking stops at
+/// [`NEWEST_SEEN`], so an arrival below the fold, or behind a mobile panel,
+/// stays unread when the tab hides (10c decision 5).
 ///
 /// Note this changes the hidden-tab title badge's meaning: it used to show
 /// only messages that arrived *after* the hide (because everything else had
 /// just been swept to read), and now shows the ACCUMULATED unread total
 /// across all rooms, matching what the room-list and hamburger badges already
 /// show. See the freenet/river#446 PR description.
-pub fn mark_current_room_as_read_on_hide() {
+fn mark_current_room_as_read_on_hide() {
     let current_owner_key = CURRENT_ROOM.read().owner_key;
     // A contended read marks nothing (the title effect marks what was seen
     // anyway) and still flushes.
