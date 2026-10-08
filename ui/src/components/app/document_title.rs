@@ -704,13 +704,13 @@ pub fn update_document_title() {
 /// Apply the read rule to the open room: advance its `last_read_message_id` to
 /// [`NEWEST_SEEN`], never further, and never backwards.
 ///
-/// Every place that marks a room read calls this: the title effect (which
-/// re-runs on every `ROOMS` write and on every `NEWEST_SEEN` change), the tab
-/// becoming visible, the room-list click, the post-load handler and the two
-/// sync paths in `room_synchronizer.rs`. None of them can mark a message the
-/// reader has not had on screen, so an arrival below the fold stays unread
-/// until the reader reaches it. See [`read_marker_update`] for the decision.
-pub fn mark_current_room_as_read() {
+/// Called only from the title effect in [`DocumentTitleUpdater`], which re-runs
+/// on every `CURRENT_ROOM`, `ROOMS`, `NEWEST_SEEN` and `DOCUMENT_VISIBLE`
+/// change, so a room switch, an arrival, a load or the tab becoming visible
+/// needs no call of its own. It cannot mark a message the reader has not had
+/// on screen, so an arrival below the fold stays unread until the reader
+/// reaches it. See [`read_marker_update`] for the decision.
+fn mark_current_room_as_read() {
     let current_owner_key = CURRENT_ROOM.read().owner_key;
     // Fallible like `ROOMS` below: in the title effect this read is the
     // subscription to what the reader has seen, and the anchor there keeps the
@@ -905,13 +905,10 @@ fn on_visibility_change() {
 
     *DOCUMENT_VISIBLE.write() = is_visible;
 
-    if is_visible {
-        // Tab became visible: catch up to what the reader saw before it hid.
-        // What is on screen now is noted by `Conversation` once it sees the
-        // tab visible, and the title effect marks that. Deferred: this is a
-        // raw JS callback, and marking writes `ROOMS`.
-        crate::util::defer(mark_current_room_as_read);
-    } else if was_visible {
+    // Tab became visible: nothing to do here. The `DOCUMENT_VISIBLE` write
+    // above re-runs the title effect, which marks what the reader saw; what is
+    // on screen now is noted by `Conversation` once it sees the tab visible.
+    if !is_visible && was_visible {
         // Tab is going from visible to hidden. Only the room the user was
         // actually looking at gets marked read — see
         // `mark_current_room_as_read_on_hide`'s doc for why sweeping every

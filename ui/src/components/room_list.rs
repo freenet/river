@@ -9,9 +9,7 @@ pub(crate) mod room_name_field;
 use crate::components::app::chat_delegate::{
     retry_rooms_load, save_rooms_to_delegate, RoomsLoadState, ROOMS_LOAD_STATE,
 };
-use crate::components::app::document_title::{
-    count_unread_in_room_data_with_mode, mark_current_room_as_read,
-};
+use crate::components::app::document_title::count_unread_in_room_data_with_mode;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
@@ -576,11 +574,9 @@ pub fn RoomList() -> Element {
                                     // Defer signal mutations to a clean execution context to
                                     // prevent RefCell re-entrant borrow panics.
                                     crate::util::defer(move || {
+                                        // The title effect applies the read rule
+                                        // on this write.
                                         *CURRENT_ROOM.write() = CurrentRoom { owner_key: Some(room_key) };
-                                        // The read rule: up to what was seen of
-                                        // this room. Its opening at the latest
-                                        // message is what marks the rest.
-                                        mark_current_room_as_read();
                                         // Switch to chat view on mobile
                                         *MOBILE_VIEW.write() = MobileView::Chat;
                                         spawn(async move {
