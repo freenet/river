@@ -11744,39 +11744,23 @@ mod autoscroll_wiring_pins {
         );
     }
 
-    /// The #501/#505 windowing contract: trims happen at a settle landing AT
-    /// the bottom — ours included, so the scroll-to-latest button trims too —
-    /// gated at the slack, so a reader even slightly above the end is never
-    /// clamped to it; the deferred trim re-checks the room; the backfill
-    /// restore stands down while an explicit request is pending (H3); the
-    /// backfill sentinel waits for the opening (H2) and for the room-switch
-    /// reset to catch up. H2 and H3 are races the browser suite catches only
-    /// when they fire, so these pins are their deterministic guard.
+    /// The #501/#505 windowing races the browser suite catches only when they
+    /// fire, so these pins are their deterministic guard: the deferred trim
+    /// re-checks the room, the backfill restore stands down while an explicit
+    /// request is pending (H3), and the backfill sentinel waits for the
+    /// opening (H2) and for the room-switch reset to catch up. The rest of
+    /// the trim contract (at the bottom only, within the slack, re-measured,
+    /// geometry-gated) is covered on every browser project by the
+    /// conversation-autoscroll "Render ceiling and trimming" and "very tall
+    /// viewport" tests.
     #[test]
     fn the_window_trims_at_the_bottom_and_backfill_waits_for_the_opening() {
         let dense = dense_production_source();
         assert!(
-            dense.contains("iftrim_is_due(&container,reader.window_overgrown.get(),&reader)"),
-            "the settle handler must trim the grown window when a settle — \
-             the reader's or ours — lands at the exact bottom"
-        );
-        assert!(
-            dense.contains("ifdistance>SCROLL_TOP_SLACK_PX{returnfalse;}"),
-            "a trim is due only at the exact bottom (the slack), where the \
-             browser's clamp keeps the newest rows in place"
-        );
-        assert!(
-            dense.contains("ifreader.room_epoch.get()!=epoch{return;}")
-                && dense.contains("trim_is_due(&c,true,&reader)"),
-            "the deferred trim must re-check the room and re-measure \
-             eligibility: the settle that scheduled it is a task old, and the \
-             reader may have moved, hidden the panel or switched rooms since"
-        );
-        assert!(
-            dense.contains("!trim_would_rearm_backfill(tail,container.client_height())"),
-            "the trim must be geometry-gated: on a viewport tall enough that \
-             the trimmed tail leaves the sentinel strip in range, trim and \
-             backfill oscillate at render speed (#505 re-review)"
+            dense.contains("ifreader.room_epoch.get()!=epoch{return;}"),
+            "the deferred trim must re-check the room: the settle that \
+             scheduled it is a task old, and the reader may have switched \
+             rooms since"
         );
         // Both captures are taken, and the guard returns, before either
         // correction is applied.
@@ -11803,47 +11787,22 @@ mod autoscroll_wiring_pins {
         );
     }
 
-    /// The #505 blocker-1 compensation wiring: rows carry their item identity,
-    /// the render captures the new head's pre-patch offset when rendered
-    /// content above it is removed, and the reposition effect shifts the
-    /// reader's offset by the measured difference. Removing any leg silently
-    /// reverts to "readers crawl upward one row per arrival in every at-cap
-    /// room".
+    /// The two #505 compensation details no browser test can force: the head
+    /// reposition shifts from the PRE-patch offset, and the backfill restore
+    /// measures its probe row rather than the `scrollHeight` delta. The rest
+    /// of the wiring (row identity, the capture, the measured shift, the
+    /// probe walk over a re-keyed head group) is covered on every browser
+    /// project by the conversation-autoscroll at-cap drain, newer-page and
+    /// backfill tests.
     #[test]
     fn head_swaps_reposition_the_reader() {
         let dense = dense_production_source();
-        assert!(
-            dense.contains("\"data-item-key\":\"{key}\""),
-            "history rows must carry `data-item-key` — the reposition \
-             machinery locates rows by item identity"
-        );
-        assert!(
-            dense.contains("fnhistory_row_offset_top"),
-            "the reposition machinery needs the row-offset lookup"
-        );
-        assert!(
-            dense.contains("reposition_pending.borrow_mut().take()"),
-            "the head-reposition effect must consume the render's pre-patch \
-             capture and shift the reader's offset"
-        );
-        assert!(
-            dense.contains("Some(post_top)=>Some(post_top-self.probe_top),"),
-            "the reposition must be BY MEASUREMENT (post-patch minus pre-patch \
-             offset of a surviving row), not a guess"
-        );
         assert!(
             dense.contains("container.set_scroll_top((capture.scroll_top+shift).max(0));"),
             "the reposition target must be computed from the PRE-patch scroll \
              offset — the browser clamps `scrollTop` down before the effect \
              runs when a patch shortens the content, and shifting from the \
              clamped value applies the clamp twice (#505 delta review)"
-        );
-        assert!(
-            dense.contains("select_reposition_probe("),
-            "the capture must pick its probe through the forward walk — a \
-             head-only probe dead-fires when an at-cap drain re-keys a \
-             multi-message head group, and the reader crawls one intra-group \
-             line per arrival (#505 re-review blocker)"
         );
         assert!(
             dense.contains("matchhistory_row_offset_top(&self.probe_key)"),
