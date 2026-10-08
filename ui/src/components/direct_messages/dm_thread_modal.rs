@@ -20,7 +20,7 @@ use crate::components::room_list::receive_invitation_modal::present_invitation;
 use crate::components::scroll_to_latest::LatestButton;
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
-    scroll_to_end, sentinel_in_view, NEWEST_IN_VIEW_SLACK_PX,
+    observe_sentinel, scroll_to_end, sentinel_in_view, SentinelObserver,
 };
 use crate::room_data::SendMessageError;
 use dioxus::logger::tracing::{error, info, warn};
@@ -543,7 +543,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     // sentinel remounts, disconnected when the modal closes.
     #[cfg(target_arch = "wasm32")]
     let newest_dm_observer =
-        use_hook(|| Rc::new(std::cell::RefCell::new(None::<NewestDmObserver>)));
+        use_hook(|| Rc::new(std::cell::RefCell::new(None::<SentinelObserver>)));
     #[cfg(target_arch = "wasm32")]
     {
         let newest_dm_observer = newest_dm_observer.clone();
@@ -1749,7 +1749,7 @@ struct ThreadSeenWitness {
 impl ThreadSeenWitness {
     /// Mark the thread seen up to its newest inbound DM if the reader can see
     /// the end of the thread right now: the tab is visible and the newest DM's
-    /// bottom is on screen, within [`NEWEST_IN_VIEW_SLACK_PX`]. The newest
+    /// bottom is on screen, within `NEWEST_IN_VIEW_SLACK_PX`. The newest
     /// inbound DM is at or above the newest DM, so the reader has reached it.
     ///
     /// The same rule as rooms (`conversation.rs`'s `note_newest_seen`). Safe
@@ -1776,35 +1776,17 @@ fn dm_scroll_container() -> Option<web_sys::Element> {
         .and_then(|d| d.get_element_by_id("dm-scroll-container"))
 }
 
-/// The IntersectionObserver behind the thread's Latest control, with the
-/// callback it calls. Dropping it disconnects the observer before the callback
-/// goes, so a closed modal leaves nothing observing.
-#[cfg(target_arch = "wasm32")]
-struct NewestDmObserver {
-    observer: web_sys::IntersectionObserver,
-    _callback: wasm_bindgen::closure::Closure<dyn FnMut(js_sys::Array)>,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl Drop for NewestDmObserver {
-    fn drop(&mut self) {
-        self.observer.disconnect();
-    }
-}
-
 /// Watch `dm-bottom-sentinel`, whose top edge is the newest DM's bottom, and
-/// publish whether it is on screen (within [`NEWEST_IN_VIEW_SLACK_PX`]) to
-/// `newest_in_view`. Each report also re-applies the read rule, since the
+/// publish whether it is on screen to `newest_in_view` (see
+/// [`observe_sentinel`]). Each report also re-applies the read rule, since the
 /// reader scrolling the end into view is what usually changes it. Replaces
 /// any observer already in `slot`.
 #[cfg(target_arch = "wasm32")]
 fn observe_newest_dm(
-    slot: &std::cell::RefCell<Option<NewestDmObserver>>,
+    slot: &std::cell::RefCell<Option<SentinelObserver>>,
     newest_in_view: Signal<bool>,
     seen_witness: ThreadSeenWitness,
 ) {
-    use wasm_bindgen::JsCast;
-
     drop(slot.borrow_mut().take());
     let (Some(root), Some(sentinel)) = (
         dm_scroll_container(),
@@ -1814,47 +1796,20 @@ fn observe_newest_dm(
     ) else {
         return;
     };
-    let callback = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(
-        move |entries: js_sys::Array| {
-            // Several reports can queue between callbacks; the last is current.
-            let Some(entry) = entries
-                .iter()
-                .last()
-                .and_then(|e| e.dyn_into::<web_sys::IntersectionObserverEntry>().ok())
-            else {
-                return;
-            };
-            let in_view = entry.is_intersecting();
-            seen_witness.check();
-            // A raw observer callback runs with no Dioxus scope, and the Latest
-            // control renders from this signal, so the write goes through
-            // `defer` (.claude/rules/dioxus-signal-safety.md). By then the modal
-            // may have closed and taken the signal with it: `try_*` skips that,
-            // and skips a write that would change nothing.
-            crate::util::defer(move || {
-                let mut newest_in_view = newest_in_view;
-                if newest_in_view.try_peek().is_ok_and(|v| *v != in_view) {
-                    if let Ok(mut v) = newest_in_view.try_write() {
-                        *v = in_view;
-                    }
+    *slot.borrow_mut() = observe_sentinel(&root, &sentinel, move |in_view| {
+        seen_witness.check();
+        // The Latest control renders from this signal, so the write goes
+        // through `defer`. By then the modal may have closed and taken the
+        // signal with it: `try_*` skips that, and skips a write that would
+        // change nothing.
+        crate::util::defer(move || {
+            let mut newest_in_view = newest_in_view;
+            if newest_in_view.try_peek().is_ok_and(|v| *v != in_view) {
+                if let Ok(mut v) = newest_in_view.try_write() {
+                    *v = in_view;
                 }
-            });
-        },
-    );
-    let options = web_sys::IntersectionObserverInit::new();
-    options.set_root(Some(&root));
-    options.set_root_margin(&format!("0px 0px {NEWEST_IN_VIEW_SLACK_PX}px 0px"));
-    options.set_threshold(&wasm_bindgen::JsValue::from_f64(0.0));
-    let Ok(observer) = web_sys::IntersectionObserver::new_with_options(
-        callback.as_ref().unchecked_ref(),
-        &options,
-    ) else {
-        return;
-    };
-    observer.observe(&sentinel);
-    *slot.borrow_mut() = Some(NewestDmObserver {
-        observer,
-        _callback: callback,
+            }
+        });
     });
 }
 

@@ -16,7 +16,7 @@ use crate::components::members::{
 use crate::components::scroll_to_latest::LatestButton;
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
-    scroll_to_end, sentinel_in_view, NEWEST_IN_VIEW_SLACK_PX,
+    observe_sentinel, scroll_to_end, sentinel_in_view, NEWEST_IN_VIEW_SLACK_PX,
 };
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
@@ -4345,67 +4345,38 @@ pub fn Conversation() -> Element {
     //
     // A 1px invisible sentinel div sits right under the newest rendered row,
     // inside `#chat-content` and above its bottom padding, so it intersects
-    // exactly while that row's bottom is on screen, give or take
-    // `NEWEST_IN_VIEW_SLACK_PX` of rootMargin. The observer fires only on
-    // intersection changes, so there is zero work during normal scrolling.
+    // exactly while that row's bottom is on screen (see `observe_sentinel`).
     #[cfg(target_arch = "wasm32")]
     let observer_reader = reader_position.clone();
     #[cfg(target_arch = "wasm32")]
     use_effect(move || {
-        use wasm_bindgen::prelude::*;
-
-        let Some(window) = web_sys::window() else {
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
             return;
         };
-        let Some(document) = window.document() else {
-            return;
-        };
-        let Some(sentinel) = document.get_element_by_id("bottom-sentinel") else {
-            return;
-        };
-        let Some(root) = document.get_element_by_id("chat-scroll-container") else {
+        let (Some(sentinel), Some(root)) = (
+            document.get_element_by_id("bottom-sentinel"),
+            document.get_element_by_id("chat-scroll-container"),
+        ) else {
             return;
         };
 
         let reader_position = observer_reader.clone();
-        let cb = Closure::wrap(Box::new(move |entries: js_sys::Array| {
-            if let Some(entry) = entries
-                .get(0)
-                .dyn_ref::<web_sys::IntersectionObserverEntry>()
-            {
-                // Defer the signal write: this raw JS callback runs with no
-                // Dioxus runtime/scope on the stack, and `is_at_bottom` is now
-                // subscribed in render (the scroll-to-latest button), so a
-                // direct `.set()` would fire a subscriber notification from an
-                // empty scope and panic on Firefox mobile. See
-                // .claude/rules/dioxus-signal-safety.md. (#402)
-                let intersecting = entry.is_intersecting();
-                crate::util::defer(move || is_at_bottom.set(intersecting));
-                // The reader scrolled to the newest message, or it came back
-                // into view: the read rule may mark it.
-                if intersecting {
-                    note_newest_seen(&reader_position);
-                }
+        let observer = observe_sentinel(&root, &sentinel, move |intersecting| {
+            // Deferred: `is_at_bottom` is subscribed in render (the
+            // scroll-to-latest button), so a direct `.set()` from this raw
+            // callback would notify from an empty scope and panic on Firefox
+            // mobile. (#402)
+            crate::util::defer(move || is_at_bottom.set(intersecting));
+            // The reader scrolled to the newest message, or it came back
+            // into view: the read rule may mark it.
+            if intersecting {
+                note_newest_seen(&reader_position);
             }
-        }) as Box<dyn FnMut(js_sys::Array)>);
-
-        let options = web_sys::IntersectionObserverInit::new();
-        options.set_root(Some(&root));
-        // Only fractional-layout slack below the viewport edge: a newest
-        // message whose bottom is any further down offers Latest.
-        options.set_root_margin(&format!("0px 0px {NEWEST_IN_VIEW_SLACK_PX}px 0px"));
-        options.set_threshold(&JsValue::from_f64(0.0));
-
-        if let Ok(observer) =
-            web_sys::IntersectionObserver::new_with_options(cb.as_ref().unchecked_ref(), &options)
-        {
-            observer.observe(&sentinel);
-            // Leak the closure so it lives as long as the observer.  The Conversation
-            // component is mounted once and never unmounted (hidden/shown via CSS),
-            // so this leak is bounded.  Dioxus use_effect has no cleanup return, so
-            // explicit disconnect is not possible here.
-            cb.forget();
-        }
+        });
+        // Leaked, so it never disconnects: the Conversation component is
+        // mounted once and never unmounted (hidden/shown via CSS), so this
+        // leak is bounded, and `use_effect` has no cleanup hook.
+        std::mem::forget(observer);
     });
 
     // The settle listener and the resize observer. Installed once each, in

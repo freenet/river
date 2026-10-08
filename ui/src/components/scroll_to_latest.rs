@@ -1,6 +1,7 @@
 //! The Latest control shared by the room history and the DM thread (10c): the
-//! on-screen test for the newest item's bottom, the jump to the end, and the
-//! button itself. Each caller keeps its own sentinel, observer and handler.
+//! sentinel's observer, the on-screen test for the newest item's bottom, the
+//! jump to the end, and the button itself. Each caller keeps its own sentinel
+//! and handler.
 
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaChevronDown;
@@ -29,6 +30,66 @@ pub fn sentinel_in_view(container: &web_sys::Element, sentinel_id: &str) -> bool
     let view = container.get_bounding_client_rect();
     let edge = sentinel.get_bounding_client_rect().top();
     view.height() > 0.0 && edge >= view.top() && edge <= view.bottom() + NEWEST_IN_VIEW_SLACK_PX
+}
+
+/// An IntersectionObserver on one sentinel, with the callback it calls.
+/// Dropping it disconnects the observer before the callback goes.
+#[cfg(target_arch = "wasm32")]
+pub struct SentinelObserver {
+    observer: web_sys::IntersectionObserver,
+    _callback: wasm_bindgen::closure::Closure<dyn FnMut(js_sys::Array)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for SentinelObserver {
+    fn drop(&mut self) {
+        self.observer.disconnect();
+    }
+}
+
+/// Watch `sentinel`, whose top edge is the newest item's bottom, and call
+/// `on_change` with whether it is on screen in `root`, within
+/// [`NEWEST_IN_VIEW_SLACK_PX`]. The observer reports only on a change, so
+/// scrolling does no DOM queries (#151). `on_change` runs from a raw JS
+/// callback with no Dioxus scope, so it must `defer` any signal write
+/// (.claude/rules/dioxus-signal-safety.md). `None` if the browser refused the
+/// observer.
+#[cfg(target_arch = "wasm32")]
+pub fn observe_sentinel(
+    root: &web_sys::Element,
+    sentinel: &web_sys::Element,
+    mut on_change: impl FnMut(bool) + 'static,
+) -> Option<SentinelObserver> {
+    use wasm_bindgen::JsCast;
+
+    let callback = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(
+        move |entries: js_sys::Array| {
+            // Several reports can queue between callbacks; the last is current.
+            if let Some(entry) = entries
+                .iter()
+                .last()
+                .and_then(|e| e.dyn_into::<web_sys::IntersectionObserverEntry>().ok())
+            {
+                on_change(entry.is_intersecting());
+            }
+        },
+    );
+    let options = web_sys::IntersectionObserverInit::new();
+    options.set_root(Some(root));
+    // Only fractional-layout slack below the viewport edge: a newest item
+    // whose bottom is any further down offers Latest.
+    options.set_root_margin(&format!("0px 0px {NEWEST_IN_VIEW_SLACK_PX}px 0px"));
+    options.set_threshold(&wasm_bindgen::JsValue::from_f64(0.0));
+    let observer = web_sys::IntersectionObserver::new_with_options(
+        callback.as_ref().unchecked_ref(),
+        &options,
+    )
+    .ok()?;
+    observer.observe(sentinel);
+    Some(SentinelObserver {
+        observer,
+        _callback: callback,
+    })
 }
 
 /// Take `container` to its end at once. Never animated (decisions 6, 12): an
