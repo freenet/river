@@ -12086,14 +12086,6 @@ mod reader_state_tests {
         assert_eq!(last_good_for_room(&None::<(&str, i32)>, &"room a"), None);
     }
 
-    /// Rows that only change height (decryption, an image, an edit) leave the
-    /// range as it was, and the end hold survives them.
-    #[test]
-    fn the_end_hold_survives_a_render_with_the_same_messages() {
-        let before = range("a", b"z", 10);
-        assert!(end_hold_survives(Some(&before), Some(&before.clone())));
-    }
-
     /// 10c decision 13: an arrival ends the hold instead of moving the view.
     /// Appended (new newest), inserted above the newest (higher count), or
     /// inserted while an at-cap drain removed the first row (new first row,
@@ -12121,11 +12113,17 @@ mod reader_state_tests {
     }
 
     /// A trim or a deletion above only shrinks the range: nothing arrived, so
-    /// the hold stays. Deleting the newest message changes the newest, and
-    /// ends it (deleting never moves the view, decision 2).
+    /// the hold stays. Rows that only change height (decryption, an image, an
+    /// edit) leave the range as it was, and the hold survives them too.
+    /// Deleting the newest message changes the newest, and ends it (deleting
+    /// never moves the view, decision 2).
     #[test]
     fn a_shrinking_range_keeps_the_hold_unless_the_newest_changed() {
         let before = range("a", b"z", 10);
+        assert!(
+            end_hold_survives(Some(&before), Some(&before.clone())),
+            "a render with the same messages ended the hold"
+        );
         assert!(end_hold_survives(Some(&before), Some(&range("c", b"z", 8))));
         assert!(end_hold_survives(Some(&before), Some(&range("a", b"z", 9))));
         assert!(!end_hold_survives(

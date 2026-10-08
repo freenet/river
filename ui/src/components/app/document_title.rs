@@ -2406,19 +2406,22 @@ mod tests {
     }
 
     /// Nothing seen in this room (the tab or panel was hidden the whole time,
-    /// or the reader stayed above the newest message): nothing is marked.
+    /// or the reader stayed above the newest message), or no room open
+    /// whatever was seen before: nothing is marked.
     #[test]
-    fn nothing_seen_marks_nothing() {
-        let (rooms, owner_vk, _) = read_rule_room(|_| None);
-        assert_eq!(read_marker_update(&rooms, Some(owner_vk), None), None);
-    }
-
-    /// No room open: nothing is marked, whatever was seen before.
-    #[test]
-    fn no_open_room_marks_nothing() {
+    fn nothing_seen_or_no_open_room_marks_nothing() {
         let (rooms, owner_vk, ids) = read_rule_room(|_| None);
+        assert_eq!(
+            read_marker_update(&rooms, Some(owner_vk), None),
+            None,
+            "nothing seen marked the room"
+        );
         let seen = (owner_vk, ids[2].clone());
-        assert_eq!(read_marker_update(&rooms, None, Some(&seen)), None);
+        assert_eq!(
+            read_marker_update(&rooms, None, Some(&seen)),
+            None,
+            "no open room marked one"
+        );
     }
 
     /// A message seen on an earlier visit, older than where the marker has
@@ -2463,19 +2466,6 @@ mod tests {
         assert_eq!(
             read_marker_update(&rooms, Some(owner_vk), Some(&seen)),
             None
-        );
-    }
-
-    /// Hiding the tab while scrolled up above an arrival: the hide marks only
-    /// what the reader saw, so the arrival survives it as unread.
-    #[test]
-    fn hiding_the_tab_leaves_an_unseen_arrival_unread() {
-        let (rooms, owner_vk, ids) = read_rule_room(|m| Some(m[0].id()));
-        let seen = (owner_vk, ids[1].clone());
-        assert_eq!(
-            hide_actions(&rooms, Some(owner_vk), Some(&seen)).mark,
-            Some((owner_vk, ids[1].clone())),
-            "the hide must stop at the seen message, short of the arrival"
         );
     }
 }

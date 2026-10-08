@@ -129,27 +129,19 @@ export async function openRoomAtBottom(page: Page, roomName: string, path = "/")
   await expectSettledAtBottom(page, "opening a room should land on its newest message");
 }
 
-/// Simulate the reader dragging the history with a pointing device.
-///
-/// The synthetic `wheel` signals reader intent; the `scrollTop` assignment is
-/// what moves the viewport, on every engine (`page.mouse.wheel` is unsupported
-/// on mobile WebKit). Returns without waiting for the settle, so callers can
-/// act before it lands.
+/// The reader scrolls the history to `top`. Assigning `scrollTop` moves the
+/// viewport on every engine (`page.mouse.wheel` is unsupported on mobile
+/// WebKit); the app has no wheel, pointer or touch handling for a gesture event
+/// to change. Returns without waiting for the settle, so callers can act
+/// before it lands.
 export async function readerScrollsTo(page: Page, top: number) {
   await page.evaluate((t) => {
-    const el = document.getElementById("chat-scroll-container")!;
-    el.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }));
-    el.scrollTop = t;
+    document.getElementById("chat-scroll-container")!.scrollTop = t;
   }, top);
 }
 
-/// The same, with NO gesture event at all, and waiting for the settle, so the
-/// app has seen the move end before the caller acts. Tests that need an
-/// un-settled move assign `scrollTop` themselves.
-///
-/// Not a contrivance: a native scrollbar drag dispatches no pointer event to
-/// the content on Firefox, and find-in-page, focus-driven scrolling and browser
-/// scroll restoration produce none either.
+/// The same, waiting for the settle, so the app has seen the move end before
+/// the caller acts. Tests that need an un-settled move use `readerScrollsTo`.
 export async function readerScrollsWithoutGesture(page: Page, top: number) {
   await scrollAndSettle(page, top);
 }

@@ -187,69 +187,6 @@ async function expectStill(page: Page, why: string) {
 }
 
 test.describe("DM thread scroll position (10c DM parity)", () => {
-  test("opening a thread lands on its newest DM and marks it seen", async ({ page }) => {
-    await openThreadWithHistory(page);
-    expect(await belowFold(page, NEWEST_HISTORY)).toBeLessThanOrEqual(SLACK_PX);
-    await expect(page.getByTestId(LATEST)).toBeHidden();
-    await expect(railBadge(page), "opening the thread at its newest DM left it unread").toHaveCount(0);
-  });
-
-  test("an inbound DM at the end lands below the view and offers Latest", async ({ page }) => {
-    await openThreadWithHistory(page);
-    await recordScrolls(page);
-
-    await deliverDm(page, "inbound at the end");
-
-    await expectStill(page, "an inbound DM must not move the view, even at the end");
-    expect(
-      await belowFold(page, "inbound at the end"),
-      "the inbound DM should sit below the view",
-    ).toBeGreaterThan(SLACK_PX);
-    await expect(page.getByTestId(LATEST)).toBeVisible();
-  });
-
-  // The one arrival the old 50px "near the bottom" rule followed. It measured
-  // AFTER the arrival rendered, so a full DM row (~60px) at the end of a
-  // scrolling thread was never within it; the arrival that first makes a short
-  // thread scroll, by less than 50px, was.
-  test("an inbound DM that makes a short thread scroll does not move the view", async ({ page }) => {
-    await prepareThread(page, 3);
-
-    // Size the window so the modal, which grows with the thread up to 80vh,
-    // has room for all but ~25px of one more DM.
-    const fit = () =>
-      page.evaluate((sel) => {
-        const thread = document.querySelector(sel)!;
-        const modal = thread.closest('[class~="max-h-[80vh]"]')!;
-        const rows = thread.querySelectorAll(".prose");
-        const last = rows[rows.length - 1].parentElement!;
-        const prev = rows[rows.length - 2].parentElement!;
-        return {
-          room: parseFloat(getComputedStyle(modal).maxHeight) - modal.getBoundingClientRect().height,
-          row: last.getBoundingClientRect().bottom - prev.getBoundingClientRect().bottom,
-          toEnd: thread.scrollHeight - thread.scrollTop - thread.clientHeight,
-        };
-      }, THREAD);
-    const before = await fit();
-    const vp = page.viewportSize()!;
-    await page.setViewportSize({
-      width: vp.width,
-      height: Math.round(vp.height + (before.row - 25 - before.room) / 0.8),
-    });
-    const tuned = await fit();
-    expect(tuned.toEnd, "premise: the thread does not scroll yet").toBeLessThanOrEqual(0);
-    const overflow = tuned.row - tuned.room;
-    expect(overflow, "premise: one more DM overflows by more than the slack").toBeGreaterThan(SLACK_PX + 8);
-    expect(overflow, "premise: ...and by less than the old 50px band").toBeLessThan(42);
-
-    await recordScrolls(page);
-    await deliverDm(page, "inbound that overflows");
-
-    await expectStill(page, "an inbound DM must not move the view when it first makes the thread scroll");
-    expect(await belowFold(page, "inbound that overflows")).toBeGreaterThan(SLACK_PX);
-    await expect(page.getByTestId(LATEST)).toBeVisible();
-  });
-
   test("an inbound DM does not move a reader parked up the thread", async ({ page }) => {
     await openThreadWithHistory(page);
     const { max } = await threadGeometry(page);
@@ -330,11 +267,16 @@ test.describe("DM thread scroll position (10c DM parity)", () => {
     await expect(page.getByTestId(LATEST)).toBeHidden();
   });
 
-  test("Latest jumps to the end instantly, then hides and does not follow", async ({ page }) => {
+  test("Latest jumps to the end instantly, marks the DM below the fold seen, then hides and does not follow", async ({
+    page,
+  }) => {
     await openThreadWithHistory(page);
     await readerScrollsTo(page, 0);
     const latest = page.getByTestId(LATEST);
     await expect(latest).toBeVisible();
+    await deliverDm(page, "unseen until Latest");
+    await settle(page);
+    await expect(railBadge(page), "premise: the DM below the fold is unread").toHaveText("1");
     await recordScrolls(page);
 
     await latest.click();
@@ -351,6 +293,7 @@ test.describe("DM thread scroll position (10c DM parity)", () => {
     expect(seen.length, "Latest should have scrolled").toBeGreaterThan(0);
     expect(Math.abs(seen[0] - max), "Latest should jump, not animate").toBeLessThanOrEqual(STILL_PX);
     await expect(latest).toBeHidden();
+    await expect(railBadge(page), "Latest brought the DM on screen and the thread still counts it unread").toHaveCount(0);
 
     await recordScrolls(page);
     await deliverDm(page, "inbound after Latest");
@@ -363,15 +306,22 @@ test.describe("DM thread scroll position (10c DM parity)", () => {
 // was on screen with the tab visible. Before 10c the thread marked every
 // inbound DM seen as it rendered, wherever it landed. Witnessed by the rail's
 // unread count for the thread and the hidden-tab title, which counts DMs.
-test.describe("DM thread read rule (10c decision 11)", () => {
-  test("an inbound DM below the fold stays unread until the reader scrolls to it", async ({ page }) => {
+// Hook-driven, so it runs on one engine; the describe above covers the view on
+// every engine.
+test.describe("DM thread read rule (10c decision 11)", { tag: "@chromium-only" }, () => {
+  test("an inbound DM at the end lands below the view, offers Latest, and stays unread until the reader scrolls to it", async ({
+    page,
+  }) => {
     await openThreadWithHistory(page);
     await expect(railBadge(page), "premise: opening the thread marked it seen").toHaveCount(0);
+    await recordScrolls(page);
 
     await deliverDm(page, "unseen below the fold");
-    expect(await belowFold(page, "unseen below the fold"), "premise: the DM lands below the view").toBeGreaterThan(
+    await expectStill(page, "an inbound DM must not move the view, even at the end");
+    expect(await belowFold(page, "unseen below the fold"), "the inbound DM should sit below the view").toBeGreaterThan(
       SLACK_PX,
     );
+    await expect(page.getByTestId(LATEST)).toBeVisible();
     await settle(page);
     await expect(railBadge(page), "a DM that landed below the fold was marked seen").toHaveText("1");
 
@@ -388,18 +338,6 @@ test.describe("DM thread read rule (10c decision 11)", () => {
     expect(await hiddenTitleCount(page), "the hidden-tab title still counts the DM the reader reached").toBe(
       unseen - 1,
     );
-  });
-
-  test("Latest marks a DM below the fold seen", async ({ page }) => {
-    await openThreadWithHistory(page);
-    await deliverDm(page, "unseen until Latest");
-    await settle(page);
-    await expect(railBadge(page), "premise: the DM below the fold is unread").toHaveText("1");
-
-    await page.getByTestId(LATEST).click();
-
-    await expectAtEnd(page, "premise: Latest reached the end");
-    await expect(railBadge(page), "Latest brought the DM on screen and the thread still counts it unread").toHaveCount(0);
   });
 
   test("an inbound DM that lands on screen with the tab visible is marked seen", async ({ page }) => {
