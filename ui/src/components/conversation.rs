@@ -3847,10 +3847,10 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
         cb.forget();
     }
 
-    // Ends the end hold the first time the reader scrolls
-    // the newest message off screen. Returns at once unless a hold is on, and
-    // a hold lasts only from an explicit request to the reader's first scroll,
-    // so the scroll path stays as light as #151 needs.
+    // Release the hold on an upward scroll more than 4px from the scroller's
+    // absolute end. Accepted for now: the padding below the newest message
+    // lets this release while that message is visible and Latest stays hidden.
+    // Returns at once unless a hold is on, keeping the scroll path light (#151).
     let release_hold = Closure::wrap(Box::new(move |_: web_sys::Event| {
         let Some(held_top) = reader.end_hold.get() else {
             return;

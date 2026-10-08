@@ -42,8 +42,12 @@ content, not an unchanged numeric scroll position.
   next room. It waits for rows and visible layout when necessary.
 - After that request lands, an end hold keeps the end visible while rows
   change height, such as images loading or private messages decrypting. An
-  arrival ends the hold instead of following. Scrolling upward away from the
-  end, hiding the panel, changing rooms or an empty range also releases it.
+  arrival ends the hold instead of following. Scrolling upward more than 4px
+  from the scroller's absolute end, hiding the panel, changing rooms or an
+  empty range also releases it. Accepted for now: padding below the newest
+  message lets a small upward scroll release the hold while the message is
+  still visible and Latest stays hidden. Later row growth no longer holds
+  the view at the end.
 - Outside that hold, a change in chat-area height preserves the bottom edge
   of the view. Width-only reflow gets no correction. Paging and panel reveals
   retain their reading-position corrections; deleting the reading row uses
