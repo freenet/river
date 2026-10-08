@@ -489,11 +489,13 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             }
             let seen_witness = seen_witness.clone();
             crate::util::safe_spawn_local(async move {
-                if let Some(container) = dm_scroll_container() {
-                    scroll_to_end(&container);
-                }
-                // The end is on screen now, so it counts as seen.
-                seen_witness.check();
+                run_placement(Box::new(move || {
+                    if let Some(container) = dm_scroll_container() {
+                        scroll_to_end(&container);
+                    }
+                    // The end is on screen now, so it counts as seen.
+                    seen_witness.check();
+                }));
             });
         });
     }
@@ -891,6 +893,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
     rsx! {
         div {
+            "data-testid": "dm-thread-modal",
             class: "fixed inset-0 z-50 flex items-center justify-center",
             // Escape handler at the outer-modal scope so the confirm
             // dialog can be dismissed via Escape regardless of which
@@ -940,6 +943,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         span { class: "text-accent", "{peer_label}" }
                     }
                     button {
+                        "data-testid": "dm-thread-close-button",
                         class: "p-1 text-text-muted hover:text-text transition-colors text-xl",
                         onclick: close,
                         "✕"
@@ -1793,6 +1797,17 @@ fn observe_newest_dm(
             }
         });
     });
+}
+
+/// Run a queued opening or own-send placement. The example test build lets
+/// `holdNextDmPlacement` hold it here, inside its task, so a spec can unmount
+/// the thread before it runs.
+#[cfg(target_arch = "wasm32")]
+fn run_placement(placement: Box<dyn FnOnce()>) {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    crate::test_hooks::run_or_hold_dm_placement(placement);
+    #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
+    placement();
 }
 
 /// Whether the test hooks forced this `ROOMS` read to fail like a contended

@@ -20,8 +20,16 @@
 //! the room hooks they run the DM field's own `apply_delta`, so every DM is
 //! sealed to self, sender-signed, and kept in the contract's order and caps.
 //!
+//! `appendDmsForPeer` and `deliverDmForPeer` do the same for a second fixed
+//! test identity (peer 1), so a spec can switch between two threads; peer 0 is
+//! the identity `appendDms` and `deliverDm` use.
+//!
 //! `failNextDmRoomRead` makes the open DM thread's next `ROOMS` read fail, as
 //! a contended one does, and `dmRoomReadFailuresTaken` reports when it has.
+//!
+//! `holdNextDmPlacement` holds the next DM thread placement (the opening or
+//! own-send jump) after its task starts and before it runs, so a spec can
+//! unmount the thread underneath it; `releaseHeldDmPlacement` runs it.
 //!
 //! The room hooks skip `apply_delta`'s verification on purpose, and every hook
 //! admits test identities on self's say-so, so none may be reachable anywhere
@@ -108,18 +116,59 @@ pub fn install_test_hooks() {
     // so a DM sent or delivered afterwards sorts below them. Long enough at 30
     // to make the thread scroll on every test viewport.
     expose(&hooks, "appendDms", move |count: u32| {
-        crate::util::defer(move || {
-            deliver_dms(
-                (0..count).map(|i| format!("dm history {i:02}")).collect(),
-                DmStamp::History,
-            )
-        });
+        crate::util::defer(move || append_dm_history(&DM_PEERS[0], count));
     });
 
     // One inbound DM from the test peer, stamped after every DM in the thread
     // so it renders as the newest.
     expose(&hooks, "deliverDm", move |text: String| {
-        crate::util::defer(move || deliver_dms(vec![text], DmStamp::Newest));
+        crate::util::defer(move || deliver_dms(&DM_PEERS[0], vec![text], DmStamp::Newest));
+    });
+
+    // `appendDms` and `deliverDm` for a chosen test peer: 0 is the one those
+    // use, 1 a second identity with its own thread.
+    expose2(&hooks, "appendDmsForPeer", move |peer: u32, count: u32| {
+        let peer = dm_peer(peer);
+        crate::util::defer(move || append_dm_history(peer, count));
+    });
+    expose2(
+        &hooks,
+        "deliverDmForPeer",
+        move |peer: u32, text: String| {
+            let peer = dm_peer(peer);
+            crate::util::defer(move || deliver_dms(peer, vec![text], DmStamp::Newest));
+        },
+    );
+
+    // Hold the NEXT DM thread placement (the opening or own-send jump) once
+    // its task has started, before it touches the DOM, until
+    // `releaseHeldDmPlacement`. One-shot: later placements run as usual.
+    expose(&hooks, "holdNextDmPlacement", move |_: JsValue| {
+        DM_PLACEMENT_HOLD_ARMED.with(|armed| armed.set(true));
+    });
+
+    // How many placements are held right now (0 or 1).
+    expose_getter(&hooks, "heldDmPlacementCount", move || {
+        HELD_DM_PLACEMENT.with(|held| u32::from(held.borrow().is_some()))
+    });
+
+    // Run the held placement, in a fresh task as it would have run. Throws if
+    // nothing is held, so a release that does nothing cannot pass silently.
+    expose(&hooks, "releaseHeldDmPlacement", move |_: JsValue| {
+        // Out of the RefCell before it runs, so it cannot re-enter the borrow.
+        let Some(action) = HELD_DM_PLACEMENT.with(|held| held.borrow_mut().take()) else {
+            wasm_bindgen::throw_str("__riverTest.releaseHeldDmPlacement: no placement is held");
+        };
+        crate::util::safe_spawn_local(async move {
+            RELEASED_DM_PLACEMENTS_RUN.with(|n| n.set(n.get() + 1));
+            action();
+        });
+    });
+
+    // How many released placements have run, so a test can wait for its
+    // release to land rather than guess.
+    expose_getter(&hooks, "releasedDmPlacementsRun", move || {
+        RELEASED_DM_PLACEMENTS_RUN.with(|n| n.get())
     });
 
     expose(&hooks, "insertMessageBeforeLast", move |text: String| {
@@ -247,6 +296,28 @@ thread_local! {
     static DM_ROOM_READ_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Forced DM room-read failures taken so far (`dmRoomReadFailuresTaken`).
     static DM_ROOM_READS_FAILED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The next DM placement is to be held (`holdNextDmPlacement`).
+    static DM_PLACEMENT_HOLD_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The held DM placement, as the thread queued it.
+    static HELD_DM_PLACEMENT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Released DM placements that have run (`releasedDmPlacementsRun`).
+    static RELEASED_DM_PLACEMENTS_RUN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run a DM thread placement now, or hold it if `holdNextDmPlacement` armed a
+/// hold. The thread calls this from inside the placement's task.
+pub(crate) fn run_or_hold_dm_placement(action: Box<dyn FnOnce()>) {
+    if !DM_PLACEMENT_HOLD_ARMED.with(|armed| armed.replace(false)) {
+        action();
+        return;
+    }
+    let displaced = HELD_DM_PLACEMENT.with(|held| held.borrow_mut().replace(action));
+    if displaced.is_some() {
+        web_sys::console::error_1(
+            &"__riverTest.holdNextDmPlacement: a held placement was never released".into(),
+        );
+    }
 }
 
 /// Take a pending forced failure for the DM thread's `ROOMS` read, counting it.
@@ -451,10 +522,52 @@ fn deliver(messages: impl IntoIterator<Item = (String, Delivery)>) {
     });
 }
 
-/// The other member in the test DM thread. Its nickname is what the specs
-/// open the thread by (`dm-thread-scroll.spec.ts`).
-const DM_PEER_SEED: [u8; 32] = [0x9D; 32];
-const DM_PEER_NICKNAME: &str = "DM Test Peer";
+/// A fixed test identity on the other side of a DM thread.
+struct DmPeer {
+    seed: [u8; 32],
+    /// What the specs open the thread by, so no nickname may contain another.
+    nickname: &'static str,
+    /// Prefix of the DMs `append_dm_history` seeds, "<prefix> NN".
+    history_label: &'static str,
+}
+
+/// The DM hooks' test peers, by index. Peer 0 is the one `appendDms` and
+/// `deliverDm` use (`dm-thread-scroll.spec.ts`); peer 1 gives a spec a second
+/// thread in the same room (`dm-thread-lifecycle.spec.ts`).
+const DM_PEERS: [DmPeer; 2] = [
+    DmPeer {
+        seed: [0x9D; 32],
+        nickname: "DM Test Peer",
+        history_label: "dm history",
+    },
+    DmPeer {
+        seed: [0xAE; 32],
+        nickname: "Other DM Peer",
+        history_label: "other dm history",
+    },
+];
+
+/// The test peer at `index`; throws to the caller for any other index.
+fn dm_peer(index: u32) -> &'static DmPeer {
+    DM_PEERS.get(index as usize).unwrap_or_else(|| {
+        wasm_bindgen::throw_str(&format!(
+            "__riverTest DM hooks: no test peer {index} (there are {})",
+            DM_PEERS.len()
+        ))
+    })
+}
+
+/// `count` DMs from `peer` labelled "<history_label> NN", a minute apart and
+/// all in the past, in ONE mutation (see `appendDms`).
+fn append_dm_history(peer: &DmPeer, count: u32) {
+    deliver_dms(
+        peer,
+        (0..count)
+            .map(|i| format!("{} {i:02}", peer.history_label))
+            .collect(),
+        DmStamp::History,
+    )
+}
 
 /// How a DM delivery is timestamped.
 #[derive(Clone, Copy)]
@@ -467,18 +580,18 @@ enum DmStamp {
     Newest,
 }
 
-/// Deliver `texts` from the test peer to self in the current room, in ONE
-/// `ROOMS` mutation, through the DM field's `apply_delta`: it checks each
-/// signature and both memberships, and keeps the stored order and caps.
-fn deliver_dms(texts: Vec<String>, stamp: DmStamp) {
+/// Deliver `texts` from `peer` to self in the current room, in ONE `ROOMS`
+/// mutation, through the DM field's `apply_delta`: it checks each signature
+/// and both memberships, and keeps the stored order and caps.
+fn deliver_dms(peer: &DmPeer, texts: Vec<String>, stamp: DmStamp) {
     with_current_room_mut(|room, room_key| {
         let room_key = *room_key;
         let Some(self_vk) = room.signing_key().map(|sk| sk.verifying_key()) else {
             web_sys::console::error_1(&"__riverTest DM hooks: self holds no key here".into());
             return;
         };
-        let peer_sk = SigningKey::from_bytes(&DM_PEER_SEED);
-        admit_with_nickname(room, &room_key, &peer_sk, DM_PEER_NICKNAME);
+        let peer_sk = SigningKey::from_bytes(&peer.seed);
+        admit_with_nickname(room, &room_key, &peer_sk, peer.nickname);
 
         let self_id = MemberId::from(&self_vk);
         let peer_id = MemberId::from(&peer_sk.verifying_key());

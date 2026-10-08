@@ -16,6 +16,14 @@ type RiverTestHooks = {
   deliverDm(text: string): void;
   failNextDmRoomRead(): void;
   dmRoomReadFailuresTaken(): number;
+  // Peer 0 is the identity appendDms/deliverDm use; peer 1 a second one. Others throw.
+  appendDmsForPeer(peerIndex: 0 | 1, count: number): void;
+  deliverDmForPeer(peerIndex: 0 | 1, text: string): void;
+  holdNextDmPlacement(): void;
+  heldDmPlacementCount(): number;
+  // Throws if no placement is held.
+  releaseHeldDmPlacement(): void;
+  releasedDmPlacementsRun(): number;
 };
 
 // One hook per round trip.
