@@ -120,6 +120,17 @@ pub fn DmThreadModal() -> Element {
 
 #[component]
 fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
+    // This mounted instance's lifetime, for work it queues that can outlive it
+    // (the opening and own-send placements, the read witness). Each mount gets
+    // a fresh cell, so a reopened thread with the same (room, peer) does not
+    // revive an old instance's work. Cleared synchronously on unmount, not
+    // deferred, so anything that runs after the unmount sees it.
+    let mounted = use_hook(|| Rc::new(std::cell::Cell::new(true)));
+    {
+        let mounted = mounted.clone();
+        use_drop(move || mounted.set(false));
+    }
+
     let mut draft = use_signal(String::new);
     let mut send_error: Signal<Option<String>> = use_signal(|| None);
 
@@ -432,6 +443,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         room,
         peer,
         newest_inbound_ts: Rc::new(std::cell::Cell::new(0)),
+        mounted: mounted.clone(),
     });
     #[cfg(target_arch = "wasm32")]
     {
@@ -472,6 +484,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         let first_scroll_done = first_scroll_done.clone();
         let prev_outbound_bump = prev_outbound_bump.clone();
         let seen_witness = seen_witness.clone();
+        let mounted = mounted.clone();
         use_effect(move || {
             // Subscribing read: re-runs whenever a fresh last bubble mounts.
             let trigger = last_dm_bubble();
@@ -488,8 +501,15 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 return;
             }
             let seen_witness = seen_witness.clone();
+            let mounted = mounted.clone();
             crate::util::safe_spawn_local(async move {
                 run_placement(Box::new(move || {
+                    // Checked as it runs, not as it is queued: the thread may
+                    // have closed since, and the ids below would then find
+                    // whichever thread is open now.
+                    if !mounted.get() {
+                        return;
+                    }
                     if let Some(container) = dm_scroll_container() {
                         scroll_to_end(&container);
                     }
@@ -1730,6 +1750,9 @@ struct ThreadSeenWitness {
     peer: MemberId,
     /// The newest inbound DM the thread's last render showed (0: none).
     newest_inbound_ts: Rc<std::cell::Cell<u64>>,
+    /// Whether the thread instance this witness belongs to is still mounted.
+    /// Once it is not, the DOM ids `check` reads belong to another thread.
+    mounted: Rc<std::cell::Cell<bool>>,
 }
 
 impl ThreadSeenWitness {
@@ -1741,8 +1764,15 @@ impl ThreadSeenWitness {
     /// The same rule as rooms (`conversation.rs`'s `note_newest_seen`). Safe
     /// from a raw DOM callback: it reads no signal, and
     /// `mark_thread_read` defers its write and never moves backwards.
+    ///
+    /// Does nothing once its thread instance has unmounted: a queued placement
+    /// or observer report can run after that, and the thread on screen by then
+    /// is not the one this witness would mark.
     #[cfg(target_arch = "wasm32")]
     fn check(&self) {
+        if !self.mounted.get() {
+            return;
+        }
         let ts = self.newest_inbound_ts.get();
         if ts == 0
             || !crate::components::app::document_title::get_visibility_state()
