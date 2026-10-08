@@ -167,6 +167,54 @@ async function expectStill(page: Page, why: string) {
   expect(furthest, why).toBeLessThanOrEqual(STILL_PX);
 }
 
+/// Uncaught page errors and console errors from now on: a WASM panic surfaces
+/// as either.
+function recordPageErrors(page: Page) {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  page.on("console", (msg) => {
+    if (msg.type() === "error") errors.push(msg.text());
+  });
+  return errors;
+}
+
+function roomReadFailuresTaken(page: Page) {
+  return callRiverTest(page, "dmRoomReadFailuresTaken");
+}
+
+/// Make the open thread's next `ROOMS` read fail, as a contended one does, and
+/// wait until it has and the retry it nudged has rendered.
+async function failNextRoomRead(page: Page) {
+  const before = await roomReadFailuresTaken(page);
+  await callRiverTest(page, "failNextDmRoomRead");
+  await expect
+    .poll(() => roomReadFailuresTaken(page), { message: "the forced room-read failure was never taken" })
+    .toBe(before + 1);
+  await settle(page);
+}
+
+/// Remember the thread's scroller and composer elements, to check later that
+/// they are the same nodes rather than replacements.
+async function rememberThreadElements(page: Page) {
+  await page.evaluate((sel) => {
+    const w = window as unknown as Record<string, Element | null>;
+    w.__dmScroller = document.querySelector(sel);
+    w.__dmComposer = document.querySelector('textarea[placeholder="Type a direct message..."]');
+  }, THREAD);
+}
+
+function sameThreadElements(page: Page) {
+  return page.evaluate((sel) => {
+    const w = window as unknown as Record<string, Element | null>;
+    return {
+      scroller: w.__dmScroller !== null && w.__dmScroller === document.querySelector(sel),
+      composer:
+        w.__dmComposer !== null &&
+        w.__dmComposer === document.querySelector('textarea[placeholder="Type a direct message..."]'),
+    };
+  }, THREAD);
+}
+
 test.describe("DM thread scroll position", () => {
   test("an inbound DM does not move a reader parked up the thread", async ({ page }) => {
     await openThreadWithHistory(page);
@@ -350,5 +398,71 @@ test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
       railBadge(page),
       "the tab came back with the DM on screen and the thread still counts it unread",
     ).toHaveCount(0);
+  });
+});
+
+// A failed `ROOMS` read (contention) is transient: the open thread keeps what
+// it last showed until the retry succeeds. A room that is gone is not.
+test.describe("DM thread room read", () => {
+  test("a failed room read keeps the open thread, its draft and the reader's place", async ({ page }) => {
+    const errors = recordPageErrors(page);
+    await openThreadWithHistory(page);
+    await readerScrollsTo(page, Math.round((await threadGeometry(page)).max / 2));
+    const composer = page.getByPlaceholder("Type a direct message...");
+    await composer.fill("unsent draft");
+    await deliverDm(page, "unread below the fold");
+    await settle(page);
+    await expect(railBadge(page), "premise: the DM below the fold is unread").toHaveText("1");
+    await rememberThreadElements(page);
+    await recordScrolls(page);
+
+    await failNextRoomRead(page);
+
+    expect(await sameThreadElements(page), "a failed room read replaced the thread").toEqual({
+      scroller: true,
+      composer: true,
+    });
+    await expectStill(page, "a failed room read moved the reader");
+    await expect(composer).toHaveValue("unsent draft");
+    await expect(railBadge(page), "a failed room read marked the DM below the fold seen").toHaveText("1");
+
+    // The retry re-subscribed the thread to the room.
+    await deliverDm(page, "after the failed read");
+    expect(await sameThreadElements(page)).toEqual({ scroller: true, composer: true });
+    await expect(composer).toHaveValue("unsent draft");
+    expect(errors).toEqual([]);
+  });
+
+  test("a room read that fails as the thread opens recovers and lands on the newest DM", async ({ page }) => {
+    const errors = recordPageErrors(page);
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+    await callRiverTest(page, "appendDms", HISTORY);
+    // Pending until a thread reads the room: none is open yet.
+    await callRiverTest(page, "failNextDmRoomRead");
+    expect(await roomReadFailuresTaken(page), "premise: no thread has read the room yet").toBe(0);
+
+    await openThread(page);
+
+    await expect.poll(() => roomReadFailuresTaken(page), { message: "the opening read never failed" }).toBe(1);
+    await expect(dm(page, NEWEST_HISTORY)).toHaveCount(1, { timeout: 5_000 });
+    await expectAtEnd(page, "a thread whose first read failed should still open on its newest DM");
+    await expect(page.getByTestId("dm-thread-unavailable")).toHaveCount(0);
+    await expect(page.getByTestId(LATEST)).toBeHidden();
+    expect(errors).toEqual([]);
+  });
+
+  test("a room that is gone replaces the open thread with the unavailable notice", async ({ page }) => {
+    const errors = recordPageErrors(page);
+    await openThreadWithHistory(page);
+
+    // Clears every room, so the thread's room is genuinely absent.
+    await callRiverTest(page, "setRoomsLoadState", "loaded");
+
+    await expect(page.getByTestId("dm-thread-unavailable")).toHaveCount(1, { timeout: 5_000 });
+    await expect(page.locator(THREAD)).toHaveCount(0);
+    await expect(page.getByText(NEWEST_HISTORY, { exact: true })).toHaveCount(0);
+    expect(errors).toEqual([]);
   });
 });
