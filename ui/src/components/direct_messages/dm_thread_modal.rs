@@ -180,16 +180,16 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         }
     });
 
-    // Pull the rendered messages + counterparty nickname once per read of
-    // ROOMS. We materialise to plain Strings so the rsx! macro below doesn't
-    // hold a ROOMS borrow across spawn_local.
+    // The thread as plain Strings, so the render holds no ROOMS borrow. The
+    // body is keyed by thread, so `last_view` is this thread's last good view:
+    // a contended read shows it instead of unmounting the thread, and a room
+    // that is gone clears it.
+    let last_view = use_hook(|| Rc::new(std::cell::RefCell::new(None::<ViewData>)));
     let view = use_memo({
+        let last_view = last_view.clone();
         move || {
-            // `room` and `peer` are plain captured props, not signals. This memo
-            // does read OUTBOUND_DMS further down, but ROOMS is read FIRST, so a
-            // contended ROOMS pass returns before reaching it and ends with zero
-            // subscriptions -- and this modal is always mounted, so nothing
-            // remounts it. freenet/river#555.
+            // Before the fallible reads: a contended pass subscribes to nothing
+            // else (freenet/river#555).
             crate::util::signal_guard::anchor();
             let read = if forced_room_read_failure() {
                 None
@@ -198,9 +198,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             };
             let Some(rooms) = read else {
                 crate::util::signal_guard::schedule_nudge();
+                return last_view.borrow().clone();
+            };
+            let Some(room_data) = rooms.map.get(&room) else {
+                *last_view.borrow_mut() = None;
                 return None;
             };
-            let room_data = rooms.map.get(&room)?;
 
             // INBOUND bodies are ECIES-sealed to us, so reading them needs the
             // private key — but its absence must not blank the thread. Outbound
@@ -406,23 +409,18 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             }
             rendered.sort_by_key(|d| d.timestamp);
 
-            Some(ViewData {
+            let view = ViewData {
                 peer_nickname,
                 peer_still_member,
                 messages: rendered,
                 latest_inbound_ts,
                 identity_known: self_id.is_some(),
                 can_send: self_sk.is_some(),
-            })
+            };
+            *last_view.borrow_mut() = Some(view.clone());
+            Some(view)
         }
     });
-
-    let view_value = view.read();
-    let Some(view_data) = view_value.as_ref() else {
-        return rsx! {
-            div { "data-testid": "dm-thread-unavailable", "Room state not available" }
-        };
-    };
 
     // The read rule: the thread is marked seen only up to an
     // inbound DM the reader has had on screen with the tab visible, never from
@@ -435,12 +433,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         peer,
         newest_inbound_ts: Rc::new(std::cell::Cell::new(0)),
     });
-    // Inter-render memory, written here and read by the triggers above, some
-    // of which are raw DOM callbacks with no Dioxus runtime. Nothing renders
-    // from it.
-    seen_witness
-        .newest_inbound_ts
-        .set(view_data.latest_inbound_ts);
     #[cfg(target_arch = "wasm32")]
     {
         let seen_witness = seen_witness.clone();
@@ -449,10 +441,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // only subscriptions (freenet/river#555).
             crate::util::signal_guard::anchor();
             // Re-run after the thread's messages change...
-            if view.try_read().is_err() {
+            let Ok(has_view) = view.try_read().map(|v| v.is_some()) else {
                 crate::util::signal_guard::schedule_nudge();
                 return;
-            }
+            };
             // ...and when the tab becomes visible.
             if crate::components::app::document_title::DOCUMENT_VISIBLE
                 .try_read()
@@ -461,35 +453,17 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 crate::util::signal_guard::schedule_nudge();
                 return;
             }
-            seen_witness.check();
+            if has_view {
+                seen_witness.check();
+            }
         });
     }
 
-    // Explicit navigation policy (see `.claude/rules/history-scrolling.md`):
-    //
-    //   1. Modal mount       → jump to bottom (always, instant).
-    //   2. Outbound send     → jump to bottom once (always, instant).
-    //   3. Inbound new msg   → never scroll, even at the bottom: it lands
-    //                          below and the Latest control offers it.
-    //
-    // For the effect to re-fire when a new bubble lands we need an
-    // actual subscribed signal read inside the closure. Dioxus 0.7's
-    // `use_effect` only re-runs when a signal that was `.read()`
-    // SUCCESSFULLY inside the closure body changes — capturing a
-    // plain `usize` `message_count` does not create a subscription,
-    // and `.peek()` on `OUTBOUND_SEND_COUNTER` is also non-reactive.
-    // PR #278's Codex round-1 fix replaced the previous `.read()` on
-    // `OUTBOUND_SEND_COUNTER` with `.peek()` for re-entrancy safety;
-    // that left the effect with no reactive read at all (issue #283).
-    //
-    // Mirror the conversation.rs pattern: the LAST DM bubble's
-    // `onmounted` updates `last_dm_bubble`, and the effect reads
-    // `last_dm_bubble()` (calls the Signal as a function = subscribing
-    // read). Whenever a new bubble mounts at a different `Rc` identity,
-    // the effect re-fires. `OUTBOUND_SEND_COUNTER.peek()` stays
-    // non-reactive — the bubble mount provides the trigger; the
-    // counter is just consulted to classify the trigger as
-    // outbound-vs-inbound.
+    // Explicit navigation (`.claude/rules/history-scrolling.md`): the opening
+    // and an own send jump to the end; an inbound DM never scrolls, and the
+    // Latest control offers it. The last bubble's mount is the trigger: it
+    // writes `last_dm_bubble`, the effect's subscription (#283), and
+    // `OUTBOUND_SEND_COUNTER` (peeked) tells an own send from an arrival.
     let last_dm_bubble: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
     let first_scroll_done = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
     let prev_outbound_bump = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0u64)));
@@ -499,29 +473,18 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         let prev_outbound_bump = prev_outbound_bump.clone();
         let seen_witness = seen_witness.clone();
         use_effect(move || {
-            // Read the last-bubble signal as a SUBSCRIBING read so the
-            // effect re-runs whenever a fresh bubble mounts (i.e. new
-            // DM lands or the modal opens with messages already in
-            // view). Without this, Dioxus has no signal to watch and
-            // the effect runs exactly once on mount — leaving auto-
-            // scroll silently broken on subsequent messages (#283).
+            // Subscribing read: re-runs whenever a fresh last bubble mounts.
             let trigger = last_dm_bubble();
-            if trigger.is_none() {
-                // No bubble has mounted yet (empty-thread state or
-                // first render before mounts arrive). Stay subscribed
-                // and bail until the first mount lands.
+            // No bubble yet, or no view to place: consume nothing until there is.
+            if trigger.is_none() || view.try_peek().is_ok_and(|v| v.is_none()) {
                 return;
             }
             let outbound_bump_now = *OUTBOUND_SEND_COUNTER.peek();
             let outbound_changed =
                 prev_outbound_bump.replace(outbound_bump_now) != outbound_bump_now;
             let is_first = !first_scroll_done.replace(true);
-            // Trigger types:
-            //   * is_first         — mount: always jump.
-            //   * outbound_changed — user sent: always, once.
-            //   * else             — inbound (or a purge): never.
-            let should_scroll = is_first || outbound_changed;
-            if !should_scroll {
+            // Anything else is an arrival (or a purge): never scroll.
+            if !is_first && !outbound_changed {
                 return;
             }
             let seen_witness = seen_witness.clone();
@@ -556,6 +519,25 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         use_drop(move || drop(newest_dm_observer.borrow_mut().take()));
     }
 
+    // Confirmation modal for the destructive "Delete their messages" action.
+    // Single-click would erase every inbound DM from `peer` with no undo
+    // (#266). The confirmation gate forces a deliberate second click; the
+    // primary Cancel/Esc path closes it without mutating anything.
+    let mut confirm_delete_open: Signal<bool> = use_signal(|| false);
+
+    // Every hook is above this, so each render calls the same hooks.
+    let view_value = view.read();
+    // Inter-render memory for the read rule's triggers, some of them raw DOM
+    // callbacks with no Dioxus runtime. The shown view's cutoff, so a retained
+    // view only marks what it shows; 0 (nothing) with no view.
+    seen_witness
+        .newest_inbound_ts
+        .set(view_value.as_ref().map_or(0, |v| v.latest_inbound_ts));
+    let Some(view_data) = view_value.as_ref() else {
+        return rsx! {
+            div { "data-testid": "dm-thread-unavailable", "Room state not available" }
+        };
+    };
     let peer_label = view_data.peer_nickname.clone();
     let peer_still_member = view_data.peer_still_member;
     let identity_known = view_data.identity_known;
@@ -566,12 +548,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             *OPEN_DM_THREAD.write() = None;
         });
     };
-
-    // Confirmation modal for the destructive "Delete their messages" action.
-    // Single-click would erase every inbound DM from `peer` with no undo
-    // (#266). The confirmation gate forces a deliberate second click; the
-    // primary Cancel/Esc path closes it without mutating anything.
-    let mut confirm_delete_open: Signal<bool> = use_signal(|| false);
 
     // No-arg send callback so both `onclick` and `onkeydown` (Enter)
     // can invoke it. `mut` because Dioxus signal `.set()` borrows the
