@@ -1070,34 +1070,49 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
   });
 
   // A settle at the bottom schedules the trim for the next task. A reader who
-  // moves in between must keep their rows.
-  test("a trim scheduled at the bottom stands down when the reader moves before it runs", async ({ page }) => {
-    await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1");
-    // Backfill grows the window and leaves the reader near the top.
-    await backfillOnce(page, "premise: backfill should grow the window past its initial size");
-    const rows = await page.locator("[data-item-key]").count();
-    expect(rows, "premise: the window is grown").toBeGreaterThan(INITIAL_RENDERED_ITEMS);
+  // moves in between must keep their rows. The 5px case is just outside the
+  // 2px rounding slack and rejects a widened near-bottom trim allowance.
+  for (const distance of [5, 1_500]) {
+    test(`a trim scheduled at the bottom stands down when the reader moves ${distance}px before it runs`, async ({ page }) => {
+      await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1");
+      // Backfill grows the window and leaves the reader near the top.
+      await backfillOnce(page, "premise: backfill should grow the window past its initial size");
+      const rows = await page.locator("[data-item-key]").count();
+      expect(rows, "premise: the window is grown").toBeGreaterThan(INITIAL_RENDERED_ITEMS);
 
-    // One task: land at the end, settle (schedules the trim), move up.
-    const row = await page.evaluate(() => {
-      const c = document.getElementById("chat-scroll-container")!;
-      c.scrollTop = c.scrollHeight;
-      c.dispatchEvent(new Event("scrollend"));
-      c.scrollTop = c.scrollHeight - c.clientHeight - 1_500;
-      const cTop = c.getBoundingClientRect().top;
-      for (const r of Array.from(c.querySelectorAll<HTMLElement>("[data-item-key]"))) {
-        const rect = r.getBoundingClientRect();
-        if (rect.height > 0 && rect.top >= cTop && rect.bottom <= cTop + c.clientHeight) {
-          return { key: r.getAttribute("data-item-key")!, top: rect.top - cTop };
+      // One task: land at the end, settle (schedules the trim), move up.
+      const row = await page.evaluate((distance) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        c.scrollTop = c.scrollHeight;
+        c.dispatchEvent(new Event("scrollend"));
+        c.scrollTop = c.scrollHeight - c.clientHeight - distance;
+        const cTop = c.getBoundingClientRect().top;
+        for (const r of Array.from(c.querySelectorAll<HTMLElement>("[data-item-key]"))) {
+          const rect = r.getBoundingClientRect();
+          if (rect.height > 0 && rect.top >= cTop && rect.bottom <= cTop + c.clientHeight) {
+            return {
+              key: r.getAttribute("data-item-key")!,
+              top: rect.top - cTop,
+              distance: c.scrollHeight - c.scrollTop - c.clientHeight,
+            };
+          }
         }
-      }
-      return null;
-    });
-    expect(row, "premise: a row is fully in view after moving up").not.toBeNull();
+        return null;
+      }, distance);
+      expect(row, "premise: a row is fully in view after moving up").not.toBeNull();
+      expect(row!.distance, "premise: the reader moved the intended distance from the end").toBeCloseTo(distance, 0);
 
-    await expectRowHeld(page, row!.key, row!.top, "a trim scheduled before the reader moved shifted their row");
-    expect(await page.locator("[data-item-key]").count(), "the stale trim removed rows").toBe(rows);
-  });
+      await expectRowHeld(page, row!.key, row!.top, "a trim scheduled before the reader moved shifted their row");
+      expect(await page.locator("[data-item-key]").count(), "the stale trim removed rows").toBe(rows);
+
+      // Prove the grown window is eligible to trim once the reader returns.
+      await readerScrollsWithoutGesture(page, await historyHeight(page));
+      await expect.poll(() => page.locator("[data-item-key]").count(), {
+        message: "returning to the exact bottom should trim the grown window",
+      }).toBe(INITIAL_RENDERED_ITEMS);
+      await expectSettledAtBottom(page, "the trim left the view off the end");
+    });
+  }
 
   // Tall older rows and a short retained tail. At an ordinary height the
   // measured tail clears the backfill strip, so the window trims once and stays
