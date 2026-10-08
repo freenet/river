@@ -1,6 +1,8 @@
 import { expect, Page, Route, test } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { waitForApp, selectRoom } from "./example-room";
+import { waitForApp, selectRoom, nextFrames, settle } from "./example-room";
+
+export { nextFrames, settle };
 
 // Geometry and event-order helpers shared by the conversation scroll specs.
 // Rows are identified by `data-item-key` (a group's first message id), never
@@ -9,10 +11,13 @@ import { waitForApp, selectRoom } from "./example-room";
 /// Rendered history rows: display items plus date separators.
 export const HISTORY_ROWS = '[data-testid="conversation-history"] > *';
 
-/// The old 100px band that counted as "at the bottom" for following and the
-/// Latest button. The app no longer has it (10c decision 4); tests keep it as
-/// a premise distance, "well away from the end".
-export const BOTTOM_THRESHOLD_PX = 100;
+/// A premise distance: a view this far from the end of the history is well
+/// away from it.
+export const WELL_AWAY_FROM_END_PX = 100;
+/// conversation.rs `NEWEST_IN_VIEW_SLACK_PX` and dm_thread_modal.rs
+/// `NEWEST_DM_IN_VIEW_SLACK_PX`: how far below the visible area the newest
+/// message's bottom may sit and still count as on screen.
+export const NEWEST_IN_VIEW_SLACK_PX = 4;
 /// Slack for fractional layout after a scroll that did land at the bottom.
 export const AT_BOTTOM_EPSILON_PX = 4;
 /// How far a row the reader is looking at may move and still count as "kept
@@ -81,9 +86,9 @@ export function withheld(page: Page): Promise<number> {
 }
 
 /// Premise shared by the parked-reader tests: the view is well away from the
-/// end of the history, outside the old 100px bottom band.
+/// end of the history.
 export async function expectParkedAwayFromEnd(page: Page, why = "premise: parked away from the end") {
-  expect(await distanceFromBottom(page), why).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+  expect(await distanceFromBottom(page), why).toBeGreaterThan(WELL_AWAY_FROM_END_PX);
 }
 
 export async function expectSettledAtBottom(page: Page, why: string, timeout = 5_000) {
@@ -218,13 +223,6 @@ export async function readerLeavesAndReturnsToEnd(page: Page) {
   await expectSettledAtBottom(page, "premise: the reader came back to the end");
 }
 
-/// Two animation frames, so a patch's effects and the layout they cause land.
-export function nextFrames(page: Page): Promise<void> {
-  return page.evaluate(
-    () => new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r()))),
-  );
-}
-
 /// The row the reader is looking at: an item row fully inside the visible part
 /// of the history, with the preceding row's key for deletion cases.
 type ReadingRow = {
@@ -293,8 +291,7 @@ export function rowTop(page: Page, key: string): Promise<number | null> {
 /// late correction (or a late yank) counts against the row too.
 export async function expectRowHeld(page: Page, key: string, expectedTop: number, why: string) {
   for (let i = 0; i < 2; i++) {
-    await nextFrames(page);
-    await page.waitForTimeout(300);
+    await settle(page);
     const top = await rowTop(page, key);
     expect(top, `${why} (the row left the DOM)`).not.toBeNull();
     expect(Math.abs(top! - expectedTop), `${why} (moved ${top! - expectedTop}px)`).toBeLessThanOrEqual(
@@ -339,14 +336,20 @@ export async function expectHeldFromViewBottom(
   edge: RowEdge = "bottom",
 ) {
   for (let i = 0; i < 2; i++) {
-    await nextFrames(page);
-    await page.waitForTimeout(300);
+    await settle(page);
     const gap = await rowGapFromViewBottom(page, key, edge);
     expect(gap, `${why} (the row left the DOM)`).not.toBeNull();
     expect(Math.abs(gap! - expectedGap), `${why} (moved ${expectedGap - gap!}px)`).toBeLessThanOrEqual(
       READING_ROW_BUDGET_PX,
     );
   }
+}
+
+/// Below the 768px breakpoint, open the members panel, which replaces the chat.
+export async function hideChatBehindMembers(page: Page) {
+  await page.getByTestId("header-members-button").click();
+  await expect(page.locator("aside").filter({ hasText: "Active Members" })).toBeVisible();
+  await expect(page.locator("#chat-scroll-container"), "premise: the chat panel is hidden").toBeHidden();
 }
 
 /// Withhold the history's settle events (`scrollend`, and `scroll` for the

@@ -1,10 +1,12 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { waitForApp, selectListedRoom, setTabVisibility } from "./example-room";
+import { waitForApp, selectListedRoom, setTabVisibility, hiddenTitleCount, roomUnreadBadge } from "./example-room";
 import {
+  NEWEST_IN_VIEW_SLACK_PX,
   deliverOffscreen,
   expectParkedAwayFromEnd,
   fillHistory,
+  hideChatBehindMembers,
   newestRowFromViewBottom,
   nextFrames,
   openRoomAtBottom,
@@ -169,14 +171,9 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
 
   const latest = (page: Page) => page.getByTestId("scroll-to-bottom");
 
-  /// Team Chat's badge in the room list. Hidden while it is the current room,
-  /// so callers open another room first; the room-list click marks only the
+  /// Team Chat's badge in the room list; the room-list click marks only the
   /// room it opens.
-  const teamChatBadge = (page: Page) =>
-    page
-      .getByTestId("room-list")
-      .getByRole("button", { name: "Team Chat Room" })
-      .locator('[data-testid="room-unread-badge"]');
+  const teamChatBadge = (page: Page) => roomUnreadBadge(page, "Team Chat Room");
 
   /// Open Team Chat with history to scroll back through, read to its end, and
   /// park at its top.
@@ -231,10 +228,6 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
     await expect(teamChatBadge(page), "hiding the tab marked an unseen arrival read").toBeVisible();
   });
 
-  /// conversation.rs `NEWEST_IN_VIEW_SLACK_PX`: how far below the visible
-  /// history the newest message's bottom may sit and still count as on screen.
-  const NEWEST_IN_VIEW_SLACK_PX = 4;
-
   /// Scroll so the newest row's bottom sits `below` px under the visible
   /// history's bottom edge (negative: above it). Returns where it landed.
   async function parkNewestBottom(page: Page, below: number): Promise<number> {
@@ -284,12 +277,6 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
   test.describe("in a hidden tab", () => {
     test.use({ viewport: { width: 1280, height: 2400 } });
 
-    /// The (N) of a hidden tab's title: unread across every room, this one included.
-    async function hiddenTitleCount(page: Page): Promise<number> {
-      const counted = /^\((\d+)\) /.exec(await page.title());
-      return counted ? Number(counted[1]) : 0;
-    }
-
     test("an arrival on screen stays unread until the tab is visible again", async ({ page }) => {
       await openRoomAtBottom(page, "Team Chat Room");
       await setTabVisibility(page, "hidden");
@@ -304,9 +291,8 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
       await expect(page, "an arrival seen only in a hidden tab was marked read").toHaveTitle(
         `(${before + 1}) River - Team Chat Room`,
       );
-      // `toHaveTitle` passes on its first matching poll, which can precede a mark.
-      await nextFrames(page);
-      await page.waitForTimeout(300);
+      // `toHaveTitle` passes on its first matching poll, which can precede a
+      // mark; `hiddenTitleCount` settles first.
       expect(await hiddenTitleCount(page), "an arrival seen only in a hidden tab was marked read").toBe(before + 1);
 
       await setTabVisibility(page, "visible");
@@ -337,15 +323,12 @@ test.describe("Unread behind the mobile panels (A07)", { tag: "@chromium-only" }
 
   test("an arrival while the chat is behind the members panel leaves its room unread", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
-    await page.getByTestId("header-members-button").click();
-    const members = page.locator("aside").filter({ hasText: "Active Members" });
-    await expect(members).toBeVisible();
-    await expect(page.locator("#chat-scroll-container"), "premise: the chat panel is hidden").toBeHidden();
+    await hideChatBehindMembers(page);
 
     await deliverOffscreen(page, "arrived behind the members panel");
     // As a notification click does, with the members panel still in front.
     await callRiverTest(page, "switchRoom", "Public Discussion Room");
-    await members.locator("button").first().click();
+    await page.locator("aside").filter({ hasText: "Active Members" }).locator("button").first().click();
     await expect(page.getByRole("heading", { name: "Public Discussion Room" })).toBeVisible();
     await nextFrames(page);
 

@@ -3,7 +3,7 @@ import { callRiverTest } from "./river-test";
 import { selectListedRoom } from "./example-room";
 import {
   ALL_PROJECTS,
-  BOTTOM_THRESHOLD_PX,
+  WELL_AWAY_FROM_END_PX,
   deliverOffscreen,
   distanceFromBottom,
   expectParkedAwayFromEnd,
@@ -11,6 +11,7 @@ import {
   expectRowHeld,
   expectSettledAtBottom,
   fillHistory,
+  hideChatBehindMembers,
   historyHeight,
   holdTestImage,
   knownFailure,
@@ -49,13 +50,6 @@ async function keyOf(page: Page, text: string): Promise<string> {
   const row = page.locator("[data-item-key]", { hasText: text });
   await expect(row).toHaveCount(1);
   return (await row.getAttribute("data-item-key"))!;
-}
-
-/// Below the 768px breakpoint, open the members panel, which replaces the chat.
-async function hideChatBehindMembers(page: Page) {
-  await page.getByTestId("header-members-button").click();
-  await expect(page.locator("aside").filter({ hasText: "Active Members" })).toBeVisible();
-  await expect(page.locator("#chat-scroll-container"), "premise: the chat panel is hidden").toBeHidden();
 }
 
 async function backToChat(page: Page) {
@@ -162,7 +156,7 @@ test.describe("Reading position when content above changes (A02)", () => {
     expect(
       await distanceFromBottom(page),
       "deleting the reader's row took them to the latest message",
-    ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    ).toBeGreaterThan(WELL_AWAY_FROM_END_PX);
     expect(Math.abs((await scrollTop(page)) - before), "the view moved when the reader's row was deleted").toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
     await expectRowHeld(page, row!.prevKey!, prevTop, "the row above the deleted one moved");
   });
@@ -344,7 +338,7 @@ test.describe("Opening a room that is temporarily empty (A03)", () => {
     expect(
       await historyHeight(page),
       "premise: the first messages should overflow the view",
-    ).toBeGreaterThan((await viewportHeight(page)) + BOTTOM_THRESHOLD_PX);
+    ).toBeGreaterThan((await viewportHeight(page)) + WELL_AWAY_FROM_END_PX);
     await expectSettledAtBottom(page, "the room opened empty did not open at its newest message");
 
     const row = await expectReadingRow(page);

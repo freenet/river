@@ -1,11 +1,11 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { selectListedRoom } from "./example-room";
+import { roomUnreadBadge, selectListedRoom } from "./example-room";
 import {
   AT_BOTTOM_EPSILON_PX,
-  BOTTOM_THRESHOLD_PX,
   HISTORY_ROWS,
   READING_ROW_BUDGET_PX,
+  WELL_AWAY_FROM_END_PX,
   deliver,
   deliverOffscreen,
   distanceFromBottom,
@@ -31,11 +31,12 @@ import {
   releaseSettleEvents,
   rowTop,
   scrollTop,
+  settle,
   viewportHeight,
   withheld,
 } from "./history-geometry";
 
-/// A draft long enough to take more than BOTTOM_THRESHOLD_PX off the history.
+/// A draft long enough to take more than WELL_AWAY_FROM_END_PX off the history.
 const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
 
 // Arrivals never move the view, wherever the reader is, the very end of the
@@ -87,7 +88,7 @@ test.describe("Arrivals never move the view (#486)", () => {
           "premise: the composer did not grow by more than the old 100px " +
           "margin, so this test is not exercising #486's latch",
       })
-      .toBeLessThan(roomyViewport - BOTTOM_THRESHOLD_PX);
+      .toBeLessThan(roomyViewport - WELL_AWAY_FROM_END_PX);
 
     // The window shrinks from the bottom and the view keeps its bottom edge,
     // so the newest message stays where it was above the composer.
@@ -110,7 +111,7 @@ test.describe("Arrivals never move the view (#486)", () => {
     await page.getByTestId("message-input").fill("");
     await expect
       .poll(() => viewportHeight(page), { timeout: 5_000 })
-      .toBeGreaterThan(roomyViewport - BOTTOM_THRESHOLD_PX);
+      .toBeGreaterThan(roomyViewport - WELL_AWAY_FROM_END_PX);
     await expectHeldFromViewBottom(page, newest.key, newest.gap, "the composer collapsed and the view lost its bottom edge");
     await deliverOffscreen(page, "arrived after the draft was cleared");
     await expectHeldFromViewBottom(
@@ -145,7 +146,7 @@ test.describe("Arrivals never move the view (#486)", () => {
         timeout: 5_000,
         message: "premise: the draft should take more than the old margin off the history",
       })
-      .toBeLessThan(roomyViewport - BOTTOM_THRESHOLD_PX);
+      .toBeLessThan(roomyViewport - WELL_AWAY_FROM_END_PX);
     await expectSettleWithheld(page);
     await expectHeldFromViewBottom(page, newest.key, newest.gap, "a draft grown one line at a time moved the newest message");
     await releaseSettleEvents(page);
@@ -178,7 +179,7 @@ test.describe("Arrivals never move the view (#486)", () => {
         },
         { once: true },
       );
-    }, roomyViewport - BOTTOM_THRESHOLD_PX);
+    }, roomyViewport - WELL_AWAY_FROM_END_PX);
     await page.getByTestId("message-input").fill(LONG_DRAFT);
 
     const premise = await page.evaluate(() => (window as any).__riverSameFrameSettle);
@@ -247,7 +248,7 @@ test.describe("Arrivals never move the view (#486)", () => {
     await readerScrollsTo(page, 0);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
-      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      .toBeGreaterThan(WELL_AWAY_FROM_END_PX);
 
     await deliver(page, "arrived while reading history");
     await expectStaysPut(
@@ -323,7 +324,7 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
           "narrowing the window did not make the history taller, so this test " +
           "is not exercising a reflow at all",
       })
-      .toBeGreaterThan(before + BOTTOM_THRESHOLD_PX);
+      .toBeGreaterThan(before + WELL_AWAY_FROM_END_PX);
 
     // A reflow rewraps every row, so no row keeps its offset. What must hold
     // is the scroll position (the view stays anchored at its top), rather than
@@ -359,7 +360,7 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
           "premise: the composer did not grow enough that clearing it would " +
           "clamp the view, so this test is not exercising the same-frame race",
       })
-      .toBeLessThan(roomyViewport - BOTTOM_THRESHOLD_PX);
+      .toBeLessThan(roomyViewport - WELL_AWAY_FROM_END_PX);
     await expectHeldFromViewBottom(page, newest.key, newest.gap, "the composer grew and the newest message moved", "top");
 
     // On `document`, so it runs after the app's own input handler has
@@ -384,7 +385,7 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
         };
         document.addEventListener("input", onInput, { once: true });
       },
-      { grow: GROWTH_PX, collapsedAbove: roomyViewport - BOTTOM_THRESHOLD_PX },
+      { grow: GROWTH_PX, collapsedAbove: roomyViewport - WELL_AWAY_FROM_END_PX },
     );
     await page.getByTestId("message-input").fill("");
 
@@ -555,7 +556,7 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
     await readerScrollsTo(page, mid);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
-      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      .toBeGreaterThan(WELL_AWAY_FROM_END_PX);
 
     const probe = await tagVisibleRow(page, "__riverProbeAtCap");
     expect(
@@ -619,7 +620,7 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
     await readerScrollsTo(page, parkedAt);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
-      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      .toBeGreaterThan(WELL_AWAY_FROM_END_PX);
 
     const probe = await tagVisibleRow(page, "__riverProbeBatch");
     expect(
@@ -735,7 +736,7 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
     await readerScrollsTo(page, mid);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
-      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+      .toBeGreaterThan(WELL_AWAY_FROM_END_PX);
 
     const beforeBatch = await renderedRowCount(page);
     // One batched delivery of more than a whole growth step, in a single
@@ -1337,11 +1338,7 @@ test.describe("The end holds after an explicit request (10c decision 13)", () =>
       .toBeGreaterThan(before + 50);
   }
 
-  const teamChatBadge = (page: Page) =>
-    page
-      .getByTestId("room-list")
-      .getByRole("button", { name: "Team Chat Room" })
-      .locator('[data-testid="room-unread-badge"]');
+  const teamChatBadge = (page: Page) => roomUnreadBadge(page, "Team Chat Room");
 
   /// Leave Team Chat and open it again: an opening request, with the image
   /// still loading in view above the end.
@@ -1401,8 +1398,7 @@ test.describe("The end holds after an explicit request (10c decision 13)", () =>
     const before = await scrollTop(page);
     await loadImage(page, image);
 
-    await nextFrames(page);
-    await page.waitForTimeout(300);
+    await settle(page);
     expect(await scrollTop(page), "a row grew after an arrival and the view went to the end").toBeCloseTo(before, 0);
     await expect(page.getByTestId("scroll-to-bottom"), "the arrival must stay reachable").toBeVisible();
   });
