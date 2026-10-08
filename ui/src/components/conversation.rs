@@ -2685,6 +2685,20 @@ type MessageGroupsValue = Rc<(
 /// reads it.
 #[derive(Default)]
 struct ReaderPosition {
+    /// The IDENTITY of the item the last render's window started at, so
+    /// arrivals GROW the window instead of sliding it (#501), and so index
+    /// shifts from at-cap message pruning cannot move the head in content
+    /// space (#505 review, blocker 1). See [`WindowAnchor`].
+    window_anchor: std::cell::RefCell<Option<WindowAnchor>>,
+    /// Identity of a held range's last items (newest first), set only while
+    /// `HistoryWindow::has_newer`. Relocated like `window_anchor`.
+    window_tail: std::cell::RefCell<Option<WindowAnchor>>,
+    /// How many display items the last render actually put on screen; the
+    /// backfill growth step grows from it (see `grown_window`).
+    window_rendered: std::cell::Cell<usize>,
+    /// Whether the rendered window holds more than a fresh room-open would
+    /// render, i.e. whether the bottom-settle trim has anything to do.
+    window_overgrown: std::cell::Cell<bool>,
     /// See [`ReadingAnchor`].
     anchor: std::cell::RefCell<Option<ReadingAnchor>>,
     /// Seen without layout since the last restore; the next resize restores.
@@ -2756,6 +2770,13 @@ impl ReaderPosition {
     fn drop_pending_corrections(&self) {
         *self.backfill_anchor.borrow_mut() = None;
         *self.reposition_pending.borrow_mut() = None;
+    }
+
+    /// No range on screen, or a new room's: end the hold and forget the last
+    /// range, so the next render's range is never compared against it.
+    fn forget_range(&self) {
+        *self.rendered.borrow_mut() = None;
+        self.end_hold.set(None);
     }
 }
 
@@ -3535,12 +3556,7 @@ fn trim_is_due(container: &web_sys::Element, overgrown: bool, reader: &ReaderPos
 /// not in the DOM yet and the caller should try again.
 #[cfg(target_arch = "wasm32")]
 #[must_use]
-fn install_scroll_settle_listener(
-    window_items: Signal<usize>,
-    window_anchor: Rc<std::cell::RefCell<Option<WindowAnchor>>>,
-    window_overgrown: Rc<std::cell::Cell<bool>>,
-    reader: Rc<ReaderPosition>,
-) -> bool {
+fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<ReaderPosition>) -> bool {
     use wasm_bindgen::prelude::*;
 
     let Some(container) = chat_scroll_container() else {
@@ -3554,8 +3570,6 @@ fn install_scroll_settle_listener(
 
     // One DOM measurement per settle, not per scroll event.
     let settle = {
-        let window_anchor = window_anchor.clone();
-        let window_overgrown = window_overgrown.clone();
         let reader = reader.clone();
         Closure::wrap(Box::new(move || {
             let Some(container) = chat_scroll_container() else {
@@ -3576,10 +3590,8 @@ fn install_scroll_settle_listener(
             // Deferred: this runs from a raw JS callback with no Dioxus scope,
             // and `window_items` is a signal the render subscribes to. See
             // .claude/rules/dioxus-signal-safety.md.
-            if trim_is_due(&container, window_overgrown.get(), &reader) {
-                window_overgrown.set(false);
-                let window_anchor = window_anchor.clone();
-                let window_overgrown = window_overgrown.clone();
+            if trim_is_due(&container, reader.window_overgrown.get(), &reader) {
+                reader.window_overgrown.set(false);
                 let reader = reader.clone();
                 let epoch = reader.room_epoch.get();
                 let mut window_items = window_items;
@@ -3591,10 +3603,10 @@ fn install_scroll_settle_listener(
                     }
                     if !chat_scroll_container().is_some_and(|c| trim_is_due(&c, true, &reader)) {
                         // Still overgrown; a later settle at the bottom may trim.
-                        window_overgrown.set(true);
+                        reader.window_overgrown.set(true);
                         return;
                     }
-                    *window_anchor.borrow_mut() = None;
+                    *reader.window_anchor.borrow_mut() = None;
                     window_items.set(INITIAL_WINDOW_ITEMS);
                 });
             }
@@ -3764,26 +3776,8 @@ pub fn Conversation() -> Element {
     // How many trailing display items the history renders. Grows only when the
     // reader reaches the top of what is rendered — see `INITIAL_WINDOW_ITEMS`.
     let mut window_items = use_signal(|| INITIAL_WINDOW_ITEMS);
-    // The IDENTITY of the item the last render's window started at, so
-    // arrivals GROW the window instead of sliding it (#501), and so index
-    // shifts from at-cap message pruning cannot move the head in content
-    // space (#505 review, blocker 1) — see `WindowAnchor`. Inter-render
-    // memory written back during render; nothing renders FROM it, so there is
-    // no subscriber to notify.
-    let window_anchor = use_hook(|| Rc::new(std::cell::RefCell::new(None::<WindowAnchor>)));
-    // Identity of a held range's last items (newest first), set only while
-    // `HistoryWindow::has_newer`. Relocated like `window_anchor`.
-    let window_tail = use_hook(|| Rc::new(std::cell::RefCell::new(None::<WindowAnchor>)));
     // See `ReaderPosition`.
     let reader_position = use_hook(|| Rc::new(ReaderPosition::default()));
-    // How many display items the last render actually put on screen; the
-    // backfill growth step grows from it (see `grown_window`).
-    let window_rendered = use_hook(|| Rc::new(std::cell::Cell::new(0usize)));
-    // Whether the rendered window currently holds more than a fresh room-open
-    // would render — i.e. whether the bottom-settle trim in
-    // `install_scroll_settle_listener` has anything to do. Maintained by
-    // render, read from the raw settle callback (which cannot touch signals).
-    let window_overgrown = use_hook(|| Rc::new(std::cell::Cell::new(false)));
     // Whether the opening snap for the CURRENT room has landed. The backfill
     // sentinel only mounts once this is true: a freshly-opened >window room
     // renders at `scrollTop = 0` for a beat before the snap runs, and a
@@ -3813,8 +3807,8 @@ pub fn Conversation() -> Element {
         let changed = prev_render_room.get() != Some(room);
         if changed {
             prev_render_room.set(Some(room));
-            *window_anchor.borrow_mut() = None;
-            *window_tail.borrow_mut() = None;
+            *reader_position.window_anchor.borrow_mut() = None;
+            *reader_position.window_tail.borrow_mut() = None;
             // Never restore the old room's position. `hidden` stays so the
             // reveal still opens the new room.
             *reader_position.anchor.borrow_mut() = None;
@@ -3829,10 +3823,9 @@ pub fn Conversation() -> Element {
                 .room_epoch
                 .set(reader_position.room_epoch.get().wrapping_add(1));
             // The old room's hold and range end with it (10c decision 13).
-            reader_position.end_hold.set(None);
-            *reader_position.rendered.borrow_mut() = None;
-            window_rendered.set(0);
-            window_overgrown.set(false);
+            reader_position.forget_range();
+            reader_position.window_rendered.set(0);
+            reader_position.window_overgrown.set(false);
         } else if reader_position
             .request
             .get()
@@ -4207,8 +4200,6 @@ pub fn Conversation() -> Element {
     // rendered) gets another chance; `installed` is set only on success.
     #[cfg(target_arch = "wasm32")]
     {
-        let window_anchor = window_anchor.clone();
-        let window_overgrown = window_overgrown.clone();
         let reader_position = reader_position.clone();
         let installed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
         use_effect(move || {
@@ -4216,12 +4207,7 @@ pub fn Conversation() -> Element {
             if installed.get() {
                 return;
             }
-            if install_scroll_settle_listener(
-                window_items,
-                window_anchor.clone(),
-                window_overgrown.clone(),
-                reader_position.clone(),
-            ) {
+            if install_scroll_settle_listener(window_items, reader_position.clone()) {
                 installed.set(true);
             }
         });
@@ -5355,7 +5341,7 @@ pub fn Conversation() -> Element {
                                     let prev_anchor = if select_latest {
                                         None
                                     } else {
-                                        window_anchor.borrow().clone()
+                                        reader_position.window_anchor.borrow().clone()
                                     };
                                     let relocated = prev_anchor.as_ref().map(|a| {
                                         relocate_window(groups.len(), a, key_at)
@@ -5363,7 +5349,7 @@ pub fn Conversation() -> Element {
                                     let prev_tail = if select_latest {
                                         None
                                     } else {
-                                        window_tail.borrow().clone()
+                                        reader_position.window_tail.borrow().clone()
                                     };
                                     let extend_newer = reader_position.extend_newer.replace(false);
                                     let held_end = prev_tail.as_ref().map(|t| {
@@ -5371,7 +5357,7 @@ pub fn Conversation() -> Element {
                                             // Every held item gone: keep the count.
                                             .unwrap_or_else(|| {
                                                 relocated.map_or(0, |r| r.start)
-                                                    + window_rendered.get()
+                                                    + reader_position.window_rendered.get()
                                             });
                                         if extend_newer {
                                             end + WINDOW_GROWTH_ITEMS
@@ -5446,7 +5432,7 @@ pub fn Conversation() -> Element {
                                     // fine: inter-render memory, nothing
                                     // renders from them, and re-resolving with
                                     // the values just written is a fixed point.
-                                    *window_anchor.borrow_mut() = Some(WindowAnchor {
+                                    *reader_position.window_anchor.borrow_mut() = Some(WindowAnchor {
                                         keys: groups[history_window.start..]
                                             .iter()
                                             .take(WINDOW_ANCHOR_KEYS)
@@ -5455,10 +5441,11 @@ pub fn Conversation() -> Element {
                                         index: history_window.start,
                                     });
                                     // See `grown_window`.
-                                    window_rendered
+                                    reader_position
+                                        .window_rendered
                                         .set(history_window.end - history_window.start);
                                     // Only a held range remembers its end.
-                                    *window_tail.borrow_mut() = history_window.has_newer.then(|| {
+                                    *reader_position.window_tail.borrow_mut() = history_window.has_newer.then(|| {
                                         WindowAnchor {
                                             keys: groups[history_window.start..history_window.end]
                                                 .iter()
@@ -5497,7 +5484,7 @@ pub fn Conversation() -> Element {
                                     }
                                     // Tell the settle handler whether a
                                     // bottom-settle trim would shrink anything.
-                                    window_overgrown.set(
+                                    reader_position.window_overgrown.set(
                                         requested_window > INITIAL_WINDOW_ITEMS
                                             || history_window.end - history_window.start
                                                 > INITIAL_WINDOW_ITEMS,
@@ -5573,7 +5560,6 @@ pub fn Conversation() -> Element {
                                                     // names built inside rsx.
                                                     style: "position:absolute;top:0;height:{BACKFILL_LEAD_PX}px;width:1px;",
                                                     onvisible: {
-                                                        #[cfg(target_arch = "wasm32")]
                                                         let reader_position = reader_position.clone();
                                                         move |evt: dioxus::prelude::Event<VisibleData>| {
                                                             if evt.data().is_intersecting().unwrap_or(false) {
@@ -5599,7 +5585,7 @@ pub fn Conversation() -> Element {
                                                                 }
                                                                 // See `grown_window`.
                                                                 window_items.with_mut(|n| {
-                                                                    *n = grown_window(*n, window_rendered.get())
+                                                                    *n = grown_window(*n, reader_position.window_rendered.get())
                                                                 });
                                                             }
                                                         }
@@ -5739,8 +5725,7 @@ pub fn Conversation() -> Element {
                                 }
                                 None => {
                                     // No rows: nothing to hold at the end.
-                                    *reader_position.rendered.borrow_mut() = None;
-                                    reader_position.end_hold.set(None);
+                                    reader_position.forget_range();
                                     Some(rsx! {
                                         div { class: "flex flex-col items-center justify-center h-64 text-text-muted",
                                             p { "No messages yet. Start the conversation!" }
@@ -5749,8 +5734,7 @@ pub fn Conversation() -> Element {
                                 }
                             }
                         } else {
-                            *reader_position.rendered.borrow_mut() = None;
-                            reader_position.end_hold.set(None);
+                            reader_position.forget_range();
                             None
                         }
                     }
@@ -8098,18 +8082,20 @@ mod tests {
              blocker 1)"
         );
         assert!(
-            squashed.contains("*window_anchor.borrow_mut()=Some(WindowAnchor{"),
+            squashed.contains("*reader_position.window_anchor.borrow_mut()=Some(WindowAnchor{"),
             "the render must write the resolved head's identity back so the \
              NEXT render grows instead of sliding (#501)"
         );
         assert!(
-            squashed.contains("window_rendered.set(history_window.end-history_window.start);"),
+            squashed.contains(
+                "reader_position.window_rendered.set(history_window.end-history_window.start);"
+            ),
             "the render must record the RENDERED size — the backfill growth \
              step grows from it, or paging dead-ends after arrivals (#505 \
              blocker 2)"
         );
         assert!(
-            squashed.contains("*n=grown_window(*n,window_rendered.get())"),
+            squashed.contains("*n=grown_window(*n,reader_position.window_rendered.get())"),
             "the backfill sentinel must grow through `grown_window`, from the \
              rendered size (#505 blocker 2)"
         );
@@ -8128,7 +8114,9 @@ mod tests {
         // the bottom-settle trim, so deleting the room reset would have
         // false-passed against it (#505 review).
         assert!(
-            squashed.contains("prev_render_room.set(Some(room));*window_anchor.borrow_mut()=None;"),
+            squashed.contains(
+                "prev_render_room.set(Some(room));*reader_position.window_anchor.borrow_mut()=None;"
+            ),
             "the windowing Cells must reset inline in the render on a room \
              switch — the effect-based reset runs one render too late, so \
              the new room's first frame would render at the old room's depth"
@@ -11848,7 +11836,7 @@ mod autoscroll_wiring_pins {
     fn the_window_trims_at_the_bottom_and_backfill_waits_for_the_opening() {
         let dense = dense_production_source();
         assert!(
-            dense.contains("iftrim_is_due(&container,window_overgrown.get(),&reader)"),
+            dense.contains("iftrim_is_due(&container,reader.window_overgrown.get(),&reader)"),
             "the settle handler must trim the grown window when a settle — \
              the reader's or ours — lands at the exact bottom"
         );
