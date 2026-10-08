@@ -778,16 +778,14 @@ fn read_marker_update(
     let room_data = rooms.get(&owner_key)?;
     let messages = &room_data.room_state.recent_messages.messages;
     let seen_at = messages.iter().position(|m| &m.id() == seen_id)?;
-    let advances = room_data
+    let marker_at = room_data
         .last_read_message_id
         .as_ref()
-        .is_none_or(|marker| {
-            messages
-                .iter()
-                .position(|m| &m.id() == marker)
-                .is_none_or(|marker_at| marker_at < seen_at)
-        });
-    advances.then(|| (owner_key, seen_id.clone()))
+        .and_then(|marker| messages.iter().position(|m| &m.id() == marker));
+    if marker_at.is_some_and(|marker_at| marker_at >= seen_at) {
+        return None;
+    }
+    Some((owner_key, seen_id.clone()))
 }
 
 /// The two independent outcomes of a visible->hidden `visibilitychange`.

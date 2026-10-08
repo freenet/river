@@ -2732,8 +2732,7 @@ struct ReaderPosition {
     /// swaps the window head for a LATER item (the head was pruned out from
     /// under the anchor, or newer paging slid past it), the rows above the
     /// viewport shrink, and with scroll anchoring disabled nothing
-    /// compensates. The render captures `(probe key, its pre-patch offsetTop,
-    /// the container's pre-patch scrollTop)` here (see
+    /// compensates. The render captures a [`RepositionAnchor`] here (see
     /// `select_reposition_probe`); the `head_reposition` effect re-measures
     /// the row after the patch and shifts `scrollTop` by the difference.
     ///
@@ -2743,7 +2742,7 @@ struct ReaderPosition {
     /// apply the shift on top of the clamp (#505 delta review). A trade: a
     /// live read is immune to the reader scrolling between render and effect,
     /// a captured one to the clamp, and the clamp is far more frequent.
-    reposition_pending: std::cell::RefCell<Option<(String, i32, i32)>>,
+    reposition_pending: std::cell::RefCell<Option<RepositionAnchor>>,
 }
 
 impl ReaderPosition {
@@ -2995,6 +2994,24 @@ struct BackfillAnchor {
     /// `scrollHeight` at capture time — the fallback delta if the probe row
     /// vanishes in the same patch (an at-cap drain re-keying it; rare).
     scroll_height: i32,
+}
+
+/// What the render captures before a patch that swaps the window head for a
+/// later item, so the `head_reposition` effect can keep the reader's view
+/// still. See `ReaderPosition::reposition_pending`.
+///
+/// Only ever constructed on wasm (the capture reads the DOM); see
+/// `BackfillAnchor` for why the native allow.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Clone, PartialEq, Debug)]
+struct RepositionAnchor {
+    /// `data-item-key` of a row that survives the patch (see
+    /// `select_reposition_probe`).
+    probe_key: String,
+    /// The probe row's `offsetTop` before the patch.
+    probe_top: i32,
+    /// `scrollTop` before the patch.
+    scroll_top: i32,
 }
 
 /// Margin over the backfill strip's reach before a trim is allowed. Covers
@@ -4277,8 +4294,11 @@ pub fn Conversation() -> Element {
             // Subscribe: heads swap on content changes and on newer pages.
             let _ = message_groups.read().is_some();
             let _ = window_items();
-            let Some((key, pre_top, pre_scroll_top)) =
-                reader_position.reposition_pending.borrow_mut().take()
+            let Some(RepositionAnchor {
+                probe_key,
+                probe_top: pre_top,
+                scroll_top: pre_scroll_top,
+            }) = reader_position.reposition_pending.borrow_mut().take()
             else {
                 return;
             };
@@ -4293,7 +4313,7 @@ pub fn Conversation() -> Element {
             if !history_has_layout(&container) {
                 return;
             }
-            let Some(post_top) = history_row_offset_top(&key) else {
+            let Some(post_top) = history_row_offset_top(&probe_key) else {
                 return;
             };
             let shift = post_top - pre_top;
@@ -5461,7 +5481,7 @@ pub fn Conversation() -> Element {
                                         // patch shortens the content (#505
                                         // delta review).
                                         #[cfg(target_arch = "wasm32")]
-                                        if let (Some((key, pre_top)), Some(container)) = (
+                                        if let (Some((probe_key, probe_top)), Some(container)) = (
                                             select_reposition_probe(
                                                 groups[history_window.start..history_window.end]
                                                     .iter()
@@ -5472,7 +5492,11 @@ pub fn Conversation() -> Element {
                                             chat_scroll_container().filter(history_has_layout),
                                         ) {
                                             *reader_position.reposition_pending.borrow_mut() =
-                                                Some((key, pre_top, container.scroll_top()));
+                                                Some(RepositionAnchor {
+                                                    probe_key,
+                                                    probe_top,
+                                                    scroll_top: container.scroll_top(),
+                                                });
                                         }
                                     }
                                     // Remember where this render started so the
@@ -12122,7 +12146,11 @@ mod reader_state_tests {
             scroll_top: 20,
             scroll_height: 30,
         });
-        *reader.reposition_pending.borrow_mut() = Some(("a".to_string(), 10, 20));
+        *reader.reposition_pending.borrow_mut() = Some(RepositionAnchor {
+            probe_key: "a".to_string(),
+            probe_top: 10,
+            scroll_top: 20,
+        });
 
         reader.request_end(None);
 
