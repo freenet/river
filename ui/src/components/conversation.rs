@@ -3817,6 +3817,104 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
     true
 }
 
+/// A size change of the history. The container's size is the history's only
+/// notice that the chat panel was hidden (it measures 0 behind the mobile
+/// Rooms or Members panel) or shown again, and that the chat area changed
+/// height (the composer, the phone keyboard, a toolbar). `#chat-content` is
+/// observed too, for one job only: while the end hold is on (10c decision 13),
+/// a row changing height takes the view back to the end.
+#[cfg(target_arch = "wasm32")]
+fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
+    let Some(container) = chat_scroll_container() else {
+        return;
+    };
+    if !history_has_layout(&container) {
+        reader.hidden.set(true);
+        reader.observed_height.set(0);
+        // The view the hold kept is gone (decision 13).
+        reader.end_hold.set(None);
+        return;
+    }
+    let height = container.client_height();
+    let previous = reader.observed_height.replace(height);
+    // Revealed: finish a request made while hidden (a room opened behind the
+    // panel), else put the reader back on their row.
+    if reader.hidden.replace(false) {
+        if !complete_scroll_request(reader, opening_snap_done) {
+            let anchor = reader.anchor.borrow().clone();
+            if let Some(anchor) = anchor {
+                restore_reading_anchor(&anchor, 0);
+            }
+            // The revealed height need not be the one captured.
+            remember_reading_position(reader);
+            note_newest_seen(reader);
+        }
+        return;
+    }
+    // Held at the end since an explicit request: back to the end, whatever
+    // changed size (decision 13).
+    if keep_end_held(reader, &container) {
+        return;
+    }
+    // The chat area changed height: keep the view's BOTTOM edge, so the top
+    // gets covered or uncovered and a reader at the end keeps seeing the newest
+    // message (10c decision 10). Width alone, or the history alone, leaves the
+    // height alone and gets no correction.
+    if previous == 0 || height == previous {
+        return;
+    }
+    // Exact: the reading rows go back to where they were, relative to the
+    // bottom edge, as of the last capture. Computed from that state, not from
+    // `scrollTop`, so a clamp or a growth in between (or several resizes before
+    // the next settle) cannot be counted twice. Not across a width change: the
+    // rewrap moved the rows, and width reflow gets no correction.
+    let anchor = reader.anchor.borrow().clone();
+    if anchor.is_some_and(|anchor| {
+        anchor.view_width == container.client_width()
+            && restore_reading_anchor(&anchor, height - anchor.view_height)
+    }) {
+        return;
+    }
+    // No usable remembered row: keep the edge arithmetically.
+    let top = container.scroll_top();
+    if height < previous {
+        container.set_scroll_top(top + (previous - height));
+    } else if top + SCROLL_TOP_SLACK_PX < max_scroll_top(&container) {
+        // At the new maximum the browser's clamp already holds the end; a
+        // reader who was within the growth of the end lands on it.
+        container.set_scroll_top(top - (height - previous));
+    }
+}
+
+/// Observe the history container and `#chat-content` with
+/// [`on_history_resize`]. Returns whether the observer was installed; `false`
+/// means the container was not in the DOM yet and the caller should try again.
+#[cfg(target_arch = "wasm32")]
+#[must_use]
+fn observe_history_resize(reader: Rc<ReaderPosition>, opening_snap_done: Signal<bool>) -> bool {
+    use wasm_bindgen::prelude::*;
+
+    let Some(container) = chat_scroll_container() else {
+        return false;
+    };
+    let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
+        on_history_resize(&reader, opening_snap_done);
+    }) as Box<dyn FnMut(js_sys::Array)>);
+    let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) else {
+        return false;
+    };
+    observer.observe(&container);
+    if let Some(content) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("chat-content"))
+    {
+        observer.observe(&content);
+    }
+    // Leaked for the same reason as the settle listener's closures.
+    cb.forget();
+    true
+}
+
 /// The two affordances the no-room screen must offer in EVERY load state
 /// (freenet/river#509).
 ///
@@ -4310,22 +4408,23 @@ pub fn Conversation() -> Element {
         }
     });
 
-    // The settle listener: reading-position capture and the bottom trim.
-    // Installed once, in its own effect, because it must outlive every
-    // re-render of the history. Reading `message_groups` only makes the effect
-    // re-runnable, so a first attempt that found no container yet (nothing
-    // rendered) gets another chance; `installed` is set only on success.
+    // The settle listener and the resize observer. Installed once each, in
+    // one effect, because they must outlive every re-render of the history.
+    // Reading `message_groups` only makes the effect re-runnable, so an
+    // attempt that found no container yet (nothing rendered) gets another
+    // chance; each flag is set only on success.
     #[cfg(target_arch = "wasm32")]
     {
-        let reader_position = reader_position.clone();
-        let installed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+        let reader = reader_position.clone();
+        let listening = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+        let observing = use_hook(|| Rc::new(std::cell::Cell::new(false)));
         use_effect(move || {
             let _retry_on_content_change = message_groups.read().is_some();
-            if installed.get() {
-                return;
+            if !listening.get() {
+                listening.set(install_scroll_settle_listener(window_items, reader.clone()));
             }
-            if install_scroll_settle_listener(window_items, reader_position.clone()) {
-                installed.set(true);
+            if !observing.get() {
+                observing.set(observe_history_resize(reader.clone(), opening_snap_done));
             }
         });
     }
@@ -4386,8 +4485,8 @@ pub fn Conversation() -> Element {
 
     // Finish a pending scroll request after the render it waits for: the new
     // room's rows, the sent message, or the latest range Latest selected. A
-    // hidden panel's request is finished by the reveal instead (see the
-    // ResizeObserver below). Then check the read rule against what the
+    // hidden panel's request is finished by the reveal instead (see
+    // `on_history_resize`). Then check the read rule against what the
     // render left on screen: a deletion can bring the newest message into
     // view, and a short room shows an arrival in full.
     #[cfg(target_arch = "wasm32")]
@@ -4417,110 +4516,6 @@ pub fn Conversation() -> Element {
             };
             if *visible {
                 note_newest_seen(&reader_position);
-            }
-        });
-    }
-
-    // The container's size is the history's only notice that the chat panel
-    // was hidden (it measures 0 behind the mobile Rooms or Members panel) or
-    // shown again, and that the chat area changed height (the composer, the
-    // phone keyboard, a toolbar). `#chat-content` is observed too, for one job
-    // only: while the end hold is on (10c decision 13), a row changing height
-    // takes the view back to the end. Observed once, from its own effect;
-    // `message_groups` only makes the effect re-runnable until the container
-    // exists.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let reader_position = reader_position.clone();
-        let observed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
-        use_effect(move || {
-            use wasm_bindgen::prelude::*;
-
-            let _retry_on_content_change = message_groups.read().is_some();
-            if observed.get() {
-                return;
-            }
-            let Some(container) = chat_scroll_container() else {
-                return;
-            };
-
-            let reader_position = reader_position.clone();
-            let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
-                let Some(container) = chat_scroll_container() else {
-                    return;
-                };
-                if !history_has_layout(&container) {
-                    reader_position.hidden.set(true);
-                    reader_position.observed_height.set(0);
-                    // The view the hold kept is gone (decision 13).
-                    reader_position.end_hold.set(None);
-                    return;
-                }
-                let height = container.client_height();
-                let previous = reader_position.observed_height.replace(height);
-                // Revealed: finish a request made while hidden (a room opened
-                // behind the panel), else put the reader back on their row.
-                if reader_position.hidden.replace(false) {
-                    if !complete_scroll_request(&reader_position, opening_snap_done) {
-                        let anchor = reader_position.anchor.borrow().clone();
-                        if let Some(anchor) = anchor {
-                            restore_reading_anchor(&anchor, 0);
-                        }
-                        // The revealed height need not be the one captured.
-                        remember_reading_position(&reader_position);
-                        note_newest_seen(&reader_position);
-                    }
-                    return;
-                }
-                // Held at the end since an explicit request: back to the end,
-                // whatever changed size (decision 13).
-                if keep_end_held(&reader_position, &container) {
-                    return;
-                }
-                // The chat area changed height: keep the view's BOTTOM edge,
-                // so the top gets covered or uncovered and a reader at the end
-                // keeps seeing the newest message (10c decision 10). Width
-                // alone, or the history alone, leaves the height alone and
-                // gets no correction.
-                if previous == 0 || height == previous {
-                    return;
-                }
-                // Exact: the reading rows go back to where they were, relative
-                // to the bottom edge, as of the last capture. Computed from
-                // that state, not from `scrollTop`, so a clamp or a growth in
-                // between (or several resizes before the next settle) cannot
-                // be counted twice. Not across a width change: the rewrap
-                // moved the rows, and width reflow gets no correction.
-                let anchor = reader_position.anchor.borrow().clone();
-                if anchor.is_some_and(|anchor| {
-                    anchor.view_width == container.client_width()
-                        && restore_reading_anchor(&anchor, height - anchor.view_height)
-                }) {
-                    return;
-                }
-                // No usable remembered row: keep the edge arithmetically.
-                let top = container.scroll_top();
-                if height < previous {
-                    container.set_scroll_top(top + (previous - height));
-                } else if top + SCROLL_TOP_SLACK_PX < max_scroll_top(&container) {
-                    // At the new maximum the browser's clamp already holds
-                    // the end; a reader who was within the growth of the end
-                    // lands on it.
-                    container.set_scroll_top(top - (height - previous));
-                }
-            }) as Box<dyn FnMut(js_sys::Array)>);
-
-            if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
-                observer.observe(&container);
-                if let Some(content) = web_sys::window()
-                    .and_then(|w| w.document())
-                    .and_then(|d| d.get_element_by_id("chat-content"))
-                {
-                    observer.observe(&content);
-                }
-                // Leaked for the same reason as the observers above.
-                cb.forget();
-                observed.set(true);
             }
         });
     }
@@ -11777,7 +11772,7 @@ mod autoscroll_wiring_pins {
     fn the_settle_listener_has_a_debounced_fallback() {
         let prod = production_source();
         assert!(
-            prod.contains("if install_scroll_settle_listener("),
+            prod.contains("listening.set(install_scroll_settle_listener("),
             "`install_scroll_settle_listener` must actually be called from `Conversation`"
         );
         assert!(
