@@ -3163,6 +3163,120 @@ impl HistoryWindow {
     }
 }
 
+/// Resolve the range this render puts on screen, and record it in `reader` for
+/// the next render, the settle handler and the read rule. Writes only
+/// `reader`'s cells, which nothing renders from: re-resolving with the values
+/// just written is a fixed point. `room` is the open room.
+///
+/// Also returns whether rendered content at or above the new head was removed
+/// in this very patch: the old head is gone (pruned, deleted, or re-keyed by a
+/// drained first message) or now sits BEFORE the range (newer paging). The
+/// reader's offset then needs the `head_reposition` effect's compensation.
+fn resolve_rendered_range(
+    groups: &[DisplayItem],
+    requested_window: usize,
+    room: Option<ed25519_dalek::VerifyingKey>,
+    reader: &ReaderPosition,
+) -> (HistoryWindow, bool) {
+    // Re-locate the anchored window by IDENTITY: at-cap pruning shifts every
+    // index, so the stored index is only a hint, and the head key alone can
+    // vanish while its neighbors survive (#505 blockers; see `WindowAnchor`
+    // and `relocate_window`). A pending request (Latest, an own send) swaps a
+    // held range for the latest one, so it forgets all three.
+    let select_latest = reader.request.get().is_some() && reader.has_newer.get();
+    let (prev_anchor, prev_tail, keep) = if select_latest {
+        (None, None, None)
+    } else {
+        (
+            reader.window_anchor.borrow().clone(),
+            reader.window_tail.borrow().clone(),
+            // Keep the reading row, plus one item for a group the view top
+            // cuts through.
+            reader
+                .anchor
+                .borrow()
+                .as_ref()
+                .and_then(|a| locate_reading_item(groups, a))
+                .map(|i| i.saturating_sub(1)),
+        )
+    };
+    let key_at = |i: usize, key: &str| display_item_key_matches(&groups[i], key);
+    let relocated = prev_anchor
+        .as_ref()
+        .map(|a| relocate_window(groups.len(), a, key_at));
+    let extend_newer = reader.extend_newer.replace(false);
+    let held_end = prev_tail.as_ref().map(|t| {
+        let end = relocate_tail(groups.len(), t, key_at)
+            // Every held item gone: keep the count.
+            .unwrap_or_else(|| relocated.map_or(0, |r| r.start) + reader.window_rendered.get());
+        if extend_newer {
+            end + WINDOW_GROWTH_ITEMS
+        } else {
+            end
+        }
+    });
+    let history_window = HistoryWindow::resolve_held(
+        groups.len(),
+        requested_window,
+        relocated.as_ref().map(|r| r.start),
+        RangeHold {
+            end: held_end,
+            keep,
+        },
+    );
+    let head_removed =
+        relocated.is_some_and(|r| !r.head_survived || history_window.start > r.start);
+    let shown = &groups[history_window.start..history_window.end];
+
+    // Where this render started, so the NEXT one grows instead of sliding
+    // (#501).
+    *reader.window_anchor.borrow_mut() = Some(WindowAnchor {
+        keys: groups[history_window.start..]
+            .iter()
+            .take(WINDOW_ANCHOR_KEYS)
+            .map(display_item_key)
+            .collect(),
+        index: history_window.start,
+    });
+    // See `grown_window`.
+    reader
+        .window_rendered
+        .set(history_window.end - history_window.start);
+    // Only a held range remembers its end.
+    *reader.window_tail.borrow_mut() = history_window.has_newer.then(|| WindowAnchor {
+        keys: shown
+            .iter()
+            .rev()
+            .take(WINDOW_ANCHOR_KEYS)
+            .map(display_item_key)
+            .collect(),
+        index: history_window.end - 1,
+    });
+    reader.range_start.set(history_window.start);
+    reader.has_newer.set(history_window.has_newer);
+    // An arrival ends the end hold; rows that only change height keep it (10c
+    // decision 13). Against the last render, so a request's own render (an own
+    // send's message) comes before its hold.
+    let rendered = rendered_messages(shown);
+    let before = reader.rendered.replace(rendered.clone());
+    if !end_hold_survives(before.as_ref(), rendered.as_ref()) {
+        reader.end_hold.set(None);
+    }
+    // The read rule's candidate: only a range that reaches the latest message
+    // has it.
+    if !history_window.has_newer {
+        *reader.newest_rendered.borrow_mut() =
+            room.zip(shown.last().and_then(display_item_last_message_id));
+    }
+    // Tell the settle handler whether a bottom-settle trim would shrink
+    // anything.
+    reader.window_overgrown.set(
+        requested_window > INITIAL_WINDOW_ITEMS
+            || history_window.end - history_window.start > INITIAL_WINDOW_ITEMS,
+    );
+    (history_window, head_removed)
+}
+
 /// Trailing delay used to spot a scroll settling on browsers with no
 /// `scrollend` event (Safari before 17.4).
 #[cfg(target_arch = "wasm32")]
@@ -5327,85 +5441,14 @@ pub fn Conversation() -> Element {
                                     } else {
                                         subscribed_window
                                     };
-                                    // Re-locate the anchored window by
-                                    // IDENTITY: at-cap pruning shifts every
-                                    // index, so the stored index is only a
-                                    // hint, and the head key alone can vanish
-                                    // while its neighbors survive (#505
-                                    // blockers; see `WindowAnchor` and
-                                    // `relocate_window`).
-                                    //
-                                    // A pending request (Latest, an own send)
-                                    // swaps a held range for the latest one.
-                                    let select_latest = reader_position.request.get().is_some()
-                                        && reader_position.has_newer.get();
-                                    let key_at =
-                                        |i: usize, key: &str| display_item_key_matches(&groups[i], key);
-                                    let prev_anchor = if select_latest {
-                                        None
-                                    } else {
-                                        reader_position.window_anchor.borrow().clone()
-                                    };
-                                    let relocated = prev_anchor.as_ref().map(|a| {
-                                        relocate_window(groups.len(), a, key_at)
-                                    });
-                                    let prev_tail = if select_latest {
-                                        None
-                                    } else {
-                                        reader_position.window_tail.borrow().clone()
-                                    };
-                                    let extend_newer = reader_position.extend_newer.replace(false);
-                                    let held_end = prev_tail.as_ref().map(|t| {
-                                        let end = relocate_tail(groups.len(), t, key_at)
-                                            // Every held item gone: keep the count.
-                                            .unwrap_or_else(|| {
-                                                relocated.map_or(0, |r| r.start)
-                                                    + reader_position.window_rendered.get()
-                                            });
-                                        if extend_newer {
-                                            end + WINDOW_GROWTH_ITEMS
-                                        } else {
-                                            end
-                                        }
-                                    });
-                                    // Keep the reading row, plus one item
-                                    // for a group the view top cuts through.
-                                    let keep = if !select_latest {
-                                        reader_position
-                                            .anchor
-                                            .borrow()
-                                            .as_ref()
-                                            .and_then(|a| locate_reading_item(groups, a))
-                                            .map(|i| i.saturating_sub(1))
-                                    } else {
-                                        None
-                                    };
-                                    let history_window = HistoryWindow::resolve_held(
-                                        groups.len(),
+                                    let (history_window, head_removed) = resolve_rendered_range(
+                                        groups,
                                         requested_window,
-                                        relocated.as_ref().map(|r| r.start),
-                                        RangeHold {
-                                            end: held_end,
-                                            keep,
-                                        },
+                                        CURRENT_ROOM.peek().owner_key,
+                                        &reader_position,
                                     );
-                                    // Was rendered content at or above the new
-                                    // head removed in this very patch? True
-                                    // when the old head is gone (pruned,
-                                    // deleted, or re-keyed by a drained first
-                                    // message) or now sits BEFORE the window
-                                    // (newer paging). The reader needs their
-                                    // offset compensated for it — the
-                                    // `head_reposition` effect's job — unless
-                                    // a pending request is about to move the
-                                    // view anyway.
-                                    let head_removed = match &relocated {
-                                        None => false,
-                                        Some(r) => {
-                                            !r.head_survived
-                                                || history_window.start > r.start
-                                        }
-                                    };
+                                    // A request about to move the view anyway
+                                    // needs no compensation.
                                     if head_removed && reader_position.request.get().is_none() {
                                         // The DOM still shows the previous
                                         // render here. See
@@ -5429,69 +5472,6 @@ pub fn Conversation() -> Element {
                                                 });
                                         }
                                     }
-                                    // Remember where this render started so the
-                                    // NEXT one grows instead of sliding (#501).
-                                    // Cell/RefCell writes during render are
-                                    // fine: inter-render memory, nothing
-                                    // renders from them, and re-resolving with
-                                    // the values just written is a fixed point.
-                                    *reader_position.window_anchor.borrow_mut() = Some(WindowAnchor {
-                                        keys: groups[history_window.start..]
-                                            .iter()
-                                            .take(WINDOW_ANCHOR_KEYS)
-                                            .map(display_item_key)
-                                            .collect(),
-                                        index: history_window.start,
-                                    });
-                                    // See `grown_window`.
-                                    reader_position
-                                        .window_rendered
-                                        .set(history_window.end - history_window.start);
-                                    // Only a held range remembers its end.
-                                    *reader_position.window_tail.borrow_mut() = history_window.has_newer.then(|| {
-                                        WindowAnchor {
-                                            keys: groups[history_window.start..history_window.end]
-                                                .iter()
-                                                .rev()
-                                                .take(WINDOW_ANCHOR_KEYS)
-                                                .map(display_item_key)
-                                                .collect(),
-                                            index: history_window.end - 1,
-                                        }
-                                    });
-                                    reader_position.range_start.set(history_window.start);
-                                    reader_position.has_newer.set(history_window.has_newer);
-                                    // An arrival ends the end hold; rows that
-                                    // only change height keep it (10c
-                                    // decision 13). Against the last render,
-                                    // so a request's own render (an own send's
-                                    // message) comes before its hold.
-                                    let rendered = rendered_messages(
-                                        &groups[history_window.start..history_window.end],
-                                    );
-                                    let before = reader_position.rendered.replace(rendered.clone());
-                                    if !end_hold_survives(before.as_ref(), rendered.as_ref()) {
-                                        reader_position.end_hold.set(None);
-                                    }
-                                    // The read rule's candidate: only a range
-                                    // that reaches the latest message has it.
-                                    if !history_window.has_newer {
-                                        *reader_position.newest_rendered.borrow_mut() = CURRENT_ROOM
-                                            .peek()
-                                            .owner_key
-                                            .zip(
-                                                groups[..history_window.end]
-                                                    .last()
-                                                    .and_then(display_item_last_message_id),
-                                            );
-                                    }
-                                    // Tell the settle handler whether a
-                                    // bottom-settle trim would shrink anything.
-                                    reader_position.window_overgrown.set(
-                                        requested_window > INITIAL_WINDOW_ITEMS
-                                            || history_window.end - history_window.start
-                                                > INITIAL_WINDOW_ITEMS,
-                                    );
                                     let withheld_newer = groups.len() - history_window.end;
                                     let groups =
                                         groups[history_window.start..history_window.end].to_vec();
@@ -8074,7 +8054,8 @@ mod tests {
         let squashed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
 
         assert!(
-            squashed.contains("HistoryWindow::resolve_held(groups.len(),requested_window,"),
+            squashed.contains("resolve_rendered_range(groups,requested_window,")
+                && squashed.contains("HistoryWindow::resolve_held(groups.len(),requested_window,"),
             "the history must slice its display items through `HistoryWindow`"
         );
         assert!(
@@ -8085,14 +8066,13 @@ mod tests {
              blocker 1)"
         );
         assert!(
-            squashed.contains("*reader_position.window_anchor.borrow_mut()=Some(WindowAnchor{"),
+            squashed.contains("*reader.window_anchor.borrow_mut()=Some(WindowAnchor{"),
             "the render must write the resolved head's identity back so the \
              NEXT render grows instead of sliding (#501)"
         );
         assert!(
-            squashed.contains(
-                "reader_position.window_rendered.set(history_window.end-history_window.start);"
-            ),
+            squashed
+                .contains("reader.window_rendered.set(history_window.end-history_window.start);"),
             "the render must record the RENDERED size — the backfill growth \
              step grows from it, or paging dead-ends after arrivals (#505 \
              blocker 2)"
