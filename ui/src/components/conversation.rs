@@ -2737,15 +2737,16 @@ struct ReaderPosition {
     /// The last render's range, so the next render can tell an arrival from
     /// rows changing height.
     rendered: std::cell::RefCell<Option<RenderedMessages>>,
-    /// The backfill sentinel's capture, consumed by the restore effect. See
-    /// `BackfillAnchor`.
-    backfill_anchor: std::cell::RefCell<Option<BackfillAnchor>>,
+    /// The backfill sentinel's capture just before it grows the window, so
+    /// the restore can put the reader back on the row they were looking at.
+    /// See [`ProbeCapture`] and `correct_view_after_patch`.
+    backfill_anchor: std::cell::RefCell<Option<ProbeCapture>>,
     /// A pending "keep the reader's view still" adjustment: when a render
     /// swaps the window head for a LATER item (the head was pruned out from
     /// under the anchor, or newer paging slid past it), the rows above the
     /// viewport shrink, and with scroll anchoring disabled nothing
-    /// compensates. The render captures a [`RepositionAnchor`] here (see
-    /// `select_reposition_probe`); the `head_reposition` effect re-measures
+    /// compensates. The render captures a [`ProbeCapture`] here (see
+    /// `select_reposition_probe`); `correct_view_after_patch` re-measures
     /// the row after the patch and shifts `scrollTop` by the difference.
     ///
     /// The scroll offset is captured too because the browser clamps
@@ -2754,7 +2755,7 @@ struct ReaderPosition {
     /// apply the shift on top of the clamp (#505 delta review). A trade: a
     /// live read is immune to the reader scrolling between render and effect,
     /// a captured one to the clamp, and the clamp is far more frequent.
-    reposition_pending: std::cell::RefCell<Option<RepositionAnchor>>,
+    reposition_pending: std::cell::RefCell<Option<ProbeCapture>>,
 }
 
 impl ReaderPosition {
@@ -2890,7 +2891,7 @@ fn relocate_anchor(total: usize, hint: usize, is_anchor: impl Fn(usize) -> bool)
 /// probe finds nothing to measure against. Rare, and it fails toward
 /// rendering MORE history rather than losing the reader's place entirely.
 ///
-/// The `head_reposition` effect measures and compensates the reader for
+/// The head reposition (`correct_view_after_patch`) compensates the reader for
 /// the TOP-CONTIGUOUS removals this relocation deals in (at-cap drains,
 /// batched or not, including a re-keyed multi-message head group, and small
 /// leading deletes the spares still cover). It does NOT make every removal
@@ -2990,47 +2991,49 @@ fn display_item_key_matches(item: &DisplayItem, key: &str) -> bool {
     }
 }
 
-/// What the backfill sentinel captures just before growing the window, so the
-/// restore can put the reader back on the row they were looking at.
+/// A row's position captured before a patch, so `correct_view_after_patch`
+/// can keep the reader's view still after it: the backfill sentinel's capture
+/// before it grows the window (`ReaderPosition::backfill_anchor`), and the
+/// render's before it swaps the window head for a later item
+/// (`ReaderPosition::reposition_pending`).
 ///
 /// Only ever constructed on wasm (the capture reads the DOM), hence the
 /// native allow rather than a cfg that would also hide the type from the
 /// component's non-wasm compile.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, PartialEq, Debug)]
-struct BackfillAnchor {
-    /// `data-item-key` of the head row at capture time. It survives the
-    /// backfill (revealed rows land ABOVE it), and its `offsetTop` shift
-    /// measures EXACTLY the height prepended above the viewport — unlike the
-    /// raw `scrollHeight` delta, which also counts content appended BELOW the
-    /// viewport when an arrival batches into the same patch, over-shifting
-    /// the reader by that content's height (#505 re-review).
+struct ProbeCapture {
+    /// `data-item-key` of a row that survives the patch: the head row for a
+    /// backfill (revealed rows land ABOVE it), the one
+    /// `select_reposition_probe` picks for a head swap. Its `offsetTop` shift
+    /// measures EXACTLY the height added or removed above the viewport —
+    /// unlike the raw `scrollHeight` delta, which also counts content
+    /// appended BELOW the viewport when an arrival batches into the same
+    /// patch, over-shifting the reader by that content's height (#505
+    /// re-review).
     probe_key: String,
     /// The probe row's `offsetTop` at capture time.
     probe_top: i32,
     /// `scrollTop` at capture time.
     scroll_top: i32,
-    /// `scrollHeight` at capture time — the fallback delta if the probe row
-    /// vanishes in the same patch (an at-cap drain re-keying it; rare).
-    scroll_height: i32,
+    /// Backfill only: `scrollHeight` at capture time, the fallback delta if
+    /// the probe row vanishes in the same patch (an at-cap drain re-keying
+    /// it; rare). A head swap whose probe row vanished is left alone.
+    scroll_height: Option<i32>,
 }
 
-/// What the render captures before a patch that swaps the window head for a
-/// later item, so the `head_reposition` effect can keep the reader's view
-/// still. See `ReaderPosition::reposition_pending`.
-///
-/// Only ever constructed on wasm (the capture reads the DOM); see
-/// `BackfillAnchor` for why the native allow.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-#[derive(Clone, PartialEq, Debug)]
-struct RepositionAnchor {
-    /// `data-item-key` of a row that survives the patch (see
-    /// `select_reposition_probe`).
-    probe_key: String,
-    /// The probe row's `offsetTop` before the patch.
-    probe_top: i32,
-    /// `scrollTop` before the patch.
-    scroll_top: i32,
+impl ProbeCapture {
+    /// How far the content above the viewport moved since the capture: the
+    /// probe row's `offsetTop` shift, else the `scrollHeight` fallback.
+    #[cfg(target_arch = "wasm32")]
+    fn shift(&self, container: &web_sys::Element) -> Option<i32> {
+        match history_row_offset_top(&self.probe_key) {
+            Some(post_top) => Some(post_top - self.probe_top),
+            None => self
+                .scroll_height
+                .map(|scroll_height| container.scroll_height() - scroll_height),
+        }
+    }
 }
 
 /// Margin over the backfill strip's reach before a trim is allowed. Covers
@@ -3171,7 +3174,7 @@ impl HistoryWindow {
 /// Also returns whether rendered content at or above the new head was removed
 /// in this very patch: the old head is gone (pruned, deleted, or re-keyed by a
 /// drained first message) or now sits BEFORE the range (newer paging). The
-/// reader's offset then needs the `head_reposition` effect's compensation.
+/// reader's offset then needs the head reposition's compensation.
 fn resolve_rendered_range(
     groups: &[DisplayItem],
     requested_window: usize,
@@ -3568,6 +3571,63 @@ fn keep_end_held(reader: &ReaderPosition, container: &web_sys::Element) -> bool 
         hold_end(reader, container);
     }
     held
+}
+
+/// Keep the reader's view still across the patch that just landed, from the
+/// captures taken before it (see [`ProbeCapture`]). Both are consumed here,
+/// applied or not.
+///
+/// - The backfill restore: the revealed items land ABOVE the current offset,
+///   so without it the history jumps by their full height. Restoring the
+///   offset is also what stops the backfill cascading: the sentinel ends up
+///   above the viewport again, so it stops intersecting until the reader
+///   scrolls back up to it.
+/// - The head reposition, when the render swapped the window head for a
+///   later item: the head was pruned out from under the anchor (an at-cap
+///   room drains its oldest message on every arrival), or newer paging slid
+///   the start past it (#505 review, blocker 1). With `overflow-anchor: none`
+///   the browser no longer compensates, so this is the one piece of scroll
+///   anchoring reimplemented under our own control. Re-measuring the probe
+///   row gives exactly how far the content above the viewport shifted,
+///   date-separator churn included.
+///
+/// Known limitation, deliberately accepted: a mid-window removal (a deletion,
+/// a ban purge) or late-loading media above the viewport still shifts the
+/// reader — rare events, versus the every-arrival churn this compensates
+/// (#507). Full generality is what browser scroll anchoring does; it stays
+/// off because Safari before 27 has none.
+///
+/// Synchronous, not deferred: Dioxus has already patched the DOM when effects
+/// run, and reading layout here forces the reflow the correction needs. A
+/// macrotask hop let the browser paint one frame of the moved rows at the
+/// wrong offset before the correction landed — a flicker native scroll
+/// anchoring used to mask (#505 review).
+#[cfg(target_arch = "wasm32")]
+fn correct_view_after_patch(reader: &ReaderPosition) {
+    let backfill = reader.backfill_anchor.borrow_mut().take();
+    let head_swap = reader.reposition_pending.borrow_mut().take();
+    if backfill.is_none() && head_swap.is_none() {
+        return;
+    }
+    // An explicit request owns the view until it lands (#501 H3).
+    if reader.request.get().is_some() {
+        return;
+    }
+    let Some(container) = chat_scroll_container() else {
+        return;
+    };
+    if let Some(capture) = backfill {
+        if let Some(shift) = capture.shift(&container).filter(|shift| *shift > 0) {
+            container.set_scroll_top(capture.scroll_top + shift);
+        }
+    }
+    // Hidden rows measure 0; the reveal restores the reader instead.
+    if let Some(capture) = head_swap.filter(|_| history_has_layout(&container)) {
+        if let Some(shift) = capture.shift(&container).filter(|shift| *shift != 0) {
+            // From the PRE-patch offset; see `reposition_pending`.
+            container.set_scroll_top((capture.scroll_top + shift).max(0));
+        }
+    }
 }
 
 /// Finish the pending [`ScrollRequest`] once the history has rows and layout:
@@ -4081,49 +4141,6 @@ pub fn Conversation() -> Element {
         });
     }
 
-    // Put the view back where the reader was after a backfill. The revealed
-    // items land ABOVE the current offset, so without this the history jumps by
-    // their full height. Restoring the offset is also what stops the backfill
-    // cascading: the sentinel ends up above the viewport again, so it stops
-    // intersecting until the reader scrolls back up to it.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let reader_position = reader_position.clone();
-        use_effect(move || {
-            // Subscribe, so this runs after the render that added the items.
-            let _ = window_items();
-            let Some(anchor) = reader_position.backfill_anchor.borrow_mut().take() else {
-                return;
-            };
-            // An explicit request owns the view until it lands (#501 H3).
-            if reader_position.request.get().is_some() {
-                return;
-            }
-            let Some(container) = chat_scroll_container() else {
-                return;
-            };
-            // Synchronous, not deferred: Dioxus has already patched the DOM
-            // when effects run, and reading layout here forces the reflow the
-            // restore needs. A macrotask hop let the browser paint one frame
-            // of the prepended rows at the wrong offset before the
-            // reposition landed — a flicker native scroll anchoring used to
-            // mask (#505 review).
-            //
-            // MEASURED, not height-delta'd: the probed head row's `offsetTop`
-            // shift is exactly the height prepended ABOVE the viewport. The
-            // raw `scrollHeight` delta also counts an arrival batched into
-            // the same patch BELOW the viewport, and over-shifts the reader
-            // by its height (#505 re-review). The delta method survives only
-            // as the fallback for a probe row pruned in the same patch.
-            let shift = match history_row_offset_top(&anchor.probe_key) {
-                Some(post_top) => post_top - anchor.probe_top,
-                None => container.scroll_height() - anchor.scroll_height,
-            };
-            if shift > 0 {
-                container.set_scroll_top(anchor.scroll_top + shift);
-            }
-        });
-    }
     // Which message's touch action menu (kebab) is open, by message ID string.
     // Owned by Conversation (not per message group) so only ONE menu is open at
     // a time across the whole history — opening one closes any other (#402).
@@ -4400,72 +4417,24 @@ pub fn Conversation() -> Element {
         });
     }
 
-    // Keep the reader's view still when the window head is swapped for a
-    // later item — the head was pruned out from under the anchor (an at-cap
-    // room drains its oldest message on every arrival), or newer paging slid
-    // the start past it (#505 review, blocker 1). With `overflow-anchor: none`
-    // the browser no longer compensates, so this effect is the one piece of
-    // scroll anchoring reimplemented under our own control. Re-measuring the
-    // row the render captured (see `reposition_pending`) gives exactly how far
-    // the content above the viewport shifted, date-separator churn included.
-    // Synchronous — post-patch, pre-paint — for the same no-flicker reason as
-    // the backfill restore above.
-    //
-    // Known limitation, deliberately accepted: a mid-window removal (a
-    // deletion, a ban purge) or late-loading media above the viewport still
-    // shifts the reader — rare events, versus the every-arrival churn this
-    // compensates (#507). Full generality is what browser scroll anchoring
-    // does; it stays off because Safari before 27 has none.
+    // After each render that can move rows, in this order: the backfill
+    // restore and the head reposition (`correct_view_after_patch`), which
+    // stand down while an explicit request is pending, then finishing that
+    // request (`complete_scroll_request`), which waits for the render it asked
+    // for: the new room's rows, the sent message, or the latest range Latest
+    // selected. A hidden panel's request is finished by the reveal instead
+    // (see `on_history_resize`). Last, the read rule against what the render
+    // left on screen: a deletion can bring the newest message into view, and
+    // a short room shows an arrival in full.
     #[cfg(target_arch = "wasm32")]
     {
         let reader_position = reader_position.clone();
         use_effect(move || {
-            // Subscribe: heads swap on content changes and on newer pages.
+            // Subscribe: a backfill and a newer page change `window_items`,
+            // and heads swap on content changes too.
             let _ = message_groups.read().is_some();
             let _ = window_items();
-            let Some(RepositionAnchor {
-                probe_key,
-                probe_top: pre_top,
-                scroll_top: pre_scroll_top,
-            }) = reader_position.reposition_pending.borrow_mut().take()
-            else {
-                return;
-            };
-            // An explicit request owns the view until it lands.
-            if reader_position.request.get().is_some() {
-                return;
-            }
-            let Some(container) = chat_scroll_container() else {
-                return;
-            };
-            // Hidden rows measure 0; the reveal restores the reader instead.
-            if !history_has_layout(&container) {
-                return;
-            }
-            let Some(post_top) = history_row_offset_top(&probe_key) else {
-                return;
-            };
-            let shift = post_top - pre_top;
-            if shift != 0 {
-                // From the PRE-patch offset; see `reposition_pending`.
-                let target = (pre_scroll_top + shift).max(0);
-                container.set_scroll_top(target);
-            }
-        });
-    }
-
-    // Finish a pending scroll request after the render it waits for: the new
-    // room's rows, the sent message, or the latest range Latest selected. A
-    // hidden panel's request is finished by the reveal instead (see
-    // `on_history_resize`). Then check the read rule against what the
-    // render left on screen: a deletion can bring the newest message into
-    // view, and a short room shows an arrival in full.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let reader_position = reader_position.clone();
-        use_effect(move || {
-            let _ = message_groups.read().is_some();
-            let _ = window_items();
+            correct_view_after_patch(&reader_position);
             complete_scroll_request(&reader_position, opening_snap_done);
             note_newest_seen(&reader_position);
         });
@@ -5431,10 +5400,11 @@ pub fn Conversation() -> Element {
                                             chat_scroll_container().filter(history_has_layout),
                                         ) {
                                             *reader_position.reposition_pending.borrow_mut() =
-                                                Some(RepositionAnchor {
+                                                Some(ProbeCapture {
                                                     probe_key,
                                                     probe_top,
                                                     scroll_top: container.scroll_top(),
+                                                    scroll_height: None,
                                                 });
                                         }
                                     }
@@ -5513,7 +5483,7 @@ pub fn Conversation() -> Element {
                                                         move |evt: dioxus::prelude::Event<VisibleData>| {
                                                             if evt.data().is_intersecting().unwrap_or(false) {
                                                                 // Capture BEFORE the re-render; see
-                                                                // `BackfillAnchor`.
+                                                                // `ProbeCapture`.
                                                                 #[cfg(target_arch = "wasm32")]
                                                                 if let (
                                                                     Some(container),
@@ -5523,13 +5493,14 @@ pub fn Conversation() -> Element {
                                                                     first_history_row_identity(),
                                                                 ) {
                                                                     *reader_position.backfill_anchor.borrow_mut() =
-                                                                        Some(BackfillAnchor {
+                                                                        Some(ProbeCapture {
                                                                             probe_key,
                                                                             probe_top,
                                                                             scroll_top: container
                                                                                 .scroll_top(),
-                                                                            scroll_height: container
-                                                                                .scroll_height(),
+                                                                            scroll_height: Some(
+                                                                                container.scroll_height(),
+                                                                            ),
                                                                         });
                                                                 }
                                                                 // See `grown_window`.
@@ -11807,11 +11778,18 @@ mod autoscroll_wiring_pins {
              the trimmed tail leaves the sentinel strip in range, trim and \
              backfill oscillate at render speed (#505 re-review)"
         );
-        assert_eq!(
-            dense
-                .matches("ifreader_position.request.get().is_some(){return;}")
-                .count(),
-            2,
+        // Both captures are taken, and the guard returns, before either
+        // correction is applied.
+        let corrections = dense
+            .split("fncorrect_view_after_patch(")
+            .nth(1)
+            .and_then(|body| body.split("ifletSome(capture)=backfill").next())
+            .expect("correct_view_after_patch is missing");
+        assert!(
+            corrections.contains("letbackfill=reader.backfill_anchor.borrow_mut().take();")
+                && corrections
+                    .contains("lethead_swap=reader.reposition_pending.borrow_mut().take();")
+                && corrections.contains("ifreader.request.get().is_some(){return;}"),
             "the backfill restore (#501 H3) and the head reposition must each \
              stand down while an explicit request is pending"
         );
@@ -11849,12 +11827,12 @@ mod autoscroll_wiring_pins {
              capture and shift the reader's offset"
         );
         assert!(
-            dense.contains("letshift=post_top-pre_top;"),
+            dense.contains("Some(post_top)=>Some(post_top-self.probe_top),"),
             "the reposition must be BY MEASUREMENT (post-patch minus pre-patch \
              offset of a surviving row), not a guess"
         );
         assert!(
-            dense.contains("lettarget=(pre_scroll_top+shift).max(0);"),
+            dense.contains("container.set_scroll_top((capture.scroll_top+shift).max(0));"),
             "the reposition target must be computed from the PRE-patch scroll \
              offset — the browser clamps `scrollTop` down before the effect \
              runs when a patch shortens the content, and shifting from the \
@@ -11868,7 +11846,7 @@ mod autoscroll_wiring_pins {
              line per arrival (#505 re-review blocker)"
         );
         assert!(
-            dense.contains("matchhistory_row_offset_top(&anchor.probe_key)"),
+            dense.contains("matchhistory_row_offset_top(&self.probe_key)"),
             "the backfill restore must reposition by the measured probe row, \
              not the raw scrollHeight delta — the delta counts arrivals \
              appended BELOW the viewport in the same patch and over-shifts \
@@ -11960,16 +11938,17 @@ mod reader_state_tests {
     #[test]
     fn requesting_the_end_drops_pending_corrections() {
         let reader = ReaderPosition::default();
-        *reader.backfill_anchor.borrow_mut() = Some(BackfillAnchor {
+        *reader.backfill_anchor.borrow_mut() = Some(ProbeCapture {
             probe_key: "a".to_string(),
             probe_top: 10,
             scroll_top: 20,
-            scroll_height: 30,
+            scroll_height: Some(30),
         });
-        *reader.reposition_pending.borrow_mut() = Some(RepositionAnchor {
+        *reader.reposition_pending.borrow_mut() = Some(ProbeCapture {
             probe_key: "a".to_string(),
             probe_top: 10,
             scroll_top: 20,
+            scroll_height: None,
         });
 
         reader.request_end(None);
