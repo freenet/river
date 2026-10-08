@@ -20,6 +20,9 @@
 //! the room hooks they run the DM field's own `apply_delta`, so every DM is
 //! sealed to self, sender-signed, and kept in the contract's order and caps.
 //!
+//! `failNextDmRoomRead` makes the open DM thread's next `ROOMS` read fail, as
+//! a contended one does, and `dmRoomReadFailuresTaken` reports when it has.
+//!
 //! The room hooks skip `apply_delta`'s verification on purpose, and every hook
 //! admits test identities on self's say-so, so none may be reachable anywhere
 //! the result could be pushed to the network. The module compiles only for
@@ -75,6 +78,11 @@ pub fn install_test_hooks() {
         hook: impl FnMut(A, B) + 'static,
     ) {
         let hook = Closure::<dyn FnMut(A, B)>::new(hook).into_js_value();
+        let _ = js_sys::Reflect::set(hooks, &JsValue::from_str(name), &hook);
+    }
+
+    fn expose_getter(hooks: &js_sys::Object, name: &str, hook: impl FnMut() -> u32 + 'static) {
+        let hook = Closure::<dyn FnMut() -> u32>::new(hook).into_js_value();
         let _ = js_sys::Reflect::set(hooks, &JsValue::from_str(name), &hook);
     }
 
@@ -190,6 +198,20 @@ pub fn install_test_hooks() {
         });
     });
 
+    // Make the open DM thread's next `ROOMS` read take its failed-read branch,
+    // as a contended read does, and nudge so that read happens. If no thread
+    // is open, the next one to open takes it.
+    expose(&hooks, "failNextDmRoomRead", move |_: JsValue| {
+        DM_ROOM_READ_FAILURE.with(|f| f.set(true));
+        crate::util::signal_guard::schedule_nudge();
+    });
+
+    // How many forced DM room-read failures have been taken, so a test can wait
+    // for its failure to land rather than guess.
+    expose_getter(&hooks, "dmRoomReadFailuresTaken", move || {
+        DM_ROOM_READS_FAILED.with(|n| n.get())
+    });
+
     // Switch rooms the way a notification click does: CURRENT_ROOM changes
     // while whatever modal is open stays open. The room list is behind the
     // modal's backdrop, so the UI itself cannot do this from a test.
@@ -218,6 +240,22 @@ pub fn install_test_hooks() {
     });
 
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
+}
+
+thread_local! {
+    /// A forced DM room-read failure is pending (`failNextDmRoomRead`).
+    static DM_ROOM_READ_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Forced DM room-read failures taken so far (`dmRoomReadFailuresTaken`).
+    static DM_ROOM_READS_FAILED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Take a pending forced failure for the DM thread's `ROOMS` read, counting it.
+pub(crate) fn take_dm_room_read_failure() -> bool {
+    let forced = DM_ROOM_READ_FAILURE.with(|f| f.replace(false));
+    if forced {
+        DM_ROOM_READS_FAILED.with(|n| n.set(n.get() + 1));
+    }
+    forced
 }
 
 /// Where a delivered message lands in the room's message list.

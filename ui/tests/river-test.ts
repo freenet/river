@@ -14,6 +14,8 @@ type RiverTestHooks = {
   switchRoom(name: string): void;
   appendDms(count: number): void;
   deliverDm(text: string): void;
+  failNextDmRoomRead(): void;
+  dmRoomReadFailuresTaken(): number;
 };
 
 // One hook per round trip.

@@ -191,7 +191,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // subscriptions -- and this modal is always mounted, so nothing
             // remounts it. freenet/river#555.
             crate::util::signal_guard::anchor();
-            let Ok(rooms) = ROOMS.try_read() else {
+            let read = if forced_room_read_failure() {
+                None
+            } else {
+                ROOMS.try_read().ok()
+            };
+            let Some(rooms) = read else {
                 crate::util::signal_guard::schedule_nudge();
                 return None;
             };
@@ -414,7 +419,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
     let view_value = view.read();
     let Some(view_data) = view_value.as_ref() else {
-        return rsx! { div { "Room state not available" } };
+        return rsx! {
+            div { "data-testid": "dm-thread-unavailable", "Room state not available" }
+        };
     };
 
     // The read rule: the thread is marked seen only up to an
@@ -1810,6 +1817,15 @@ fn observe_newest_dm(
             }
         });
     });
+}
+
+/// Whether the test hooks forced this `ROOMS` read to fail like a contended
+/// one (`failNextDmRoomRead`). Always `false` outside the example test build.
+fn forced_room_read_failure() -> bool {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    return crate::test_hooks::take_dm_room_read_failure();
+    #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
+    false
 }
 
 /// Pure helper: merge an incoming DM_DRAFT body into whatever the user
