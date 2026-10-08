@@ -13,6 +13,11 @@ use crate::components::members::{
     deputy_badges_for_viewer, impersonation_checker_for_viewer, impersonation_warning_for_display,
     privilege_in_view, DeputyBadge,
 };
+use crate::components::scroll_to_latest::LatestButton;
+#[cfg(target_arch = "wasm32")]
+use crate::components::scroll_to_latest::{
+    scroll_to_end, sentinel_in_view, NEWEST_IN_VIEW_SLACK_PX,
+};
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
 use crate::util::display_name::{display_nickname, sanitize_display_name};
@@ -33,8 +38,8 @@ use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile,
-    FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
+    FaBars, FaBell, FaBellSlash, FaCircleInfo, FaEllipsisVertical, FaFaceSmile, FaPenToSquare,
+    FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -2493,13 +2498,6 @@ fn beautify_freenet_label(url: &str) -> Option<String> {
     Some(format!("freenet:{id_prefix}{suffix}"))
 }
 
-/// How far below the visible area (in px) the newest message's bottom may sit
-/// and still count as on screen: fractional layout can leave a row that did
-/// scroll fully into view a pixel short. Past it the Latest button shows
-/// (10c decision 4), and the read rule uses the same edge (decision 5).
-#[cfg(target_arch = "wasm32")]
-const NEWEST_IN_VIEW_SLACK_PX: f64 = 4.0;
-
 /// How many display items (message groups and event summaries) the conversation
 /// renders when a room is opened.
 ///
@@ -3406,22 +3404,12 @@ fn retained_tail_height(container: &web_sys::Element, retained: usize) -> Option
 #[cfg(target_arch = "wasm32")]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
-/// Take the history to its end at once. Never animated: an explicit request
-/// lands in the same task, so nothing can arrive or settle mid-flight.
-#[cfg(target_arch = "wasm32")]
-fn scroll_history_to_end(container: &web_sys::Element) {
-    let opts = web_sys::ScrollToOptions::new();
-    opts.set_top(container.scroll_height() as f64);
-    opts.set_behavior(web_sys::ScrollBehavior::Instant);
-    container.scroll_to_with_scroll_to_options(&opts);
-}
-
 /// Land an explicit request (opening, own send, Latest) at the end of the
 /// history, and hold it there while rows change height (10c decision 13).
 #[cfg(target_arch = "wasm32")]
 fn land_at_end(reader: &ReaderPosition, container: &web_sys::Element) {
     reader.drop_pending_corrections();
-    scroll_history_to_end(container);
+    scroll_to_end(container);
     reader.end_hold.set(Some(container.scroll_top()));
     // Now, not at the settle: the row read before the request would bound the
     // next render's range (`keep`) and pull a swapped-out range back in.
@@ -3437,7 +3425,7 @@ fn keep_end_held(reader: &ReaderPosition, container: &web_sys::Element) -> bool 
     if reader.end_hold.get().is_none() {
         return false;
     }
-    scroll_history_to_end(container);
+    scroll_to_end(container);
     reader.end_hold.set(Some(container.scroll_top()));
     remember_reading_position(reader);
     note_newest_seen(reader);
@@ -3476,25 +3464,6 @@ fn complete_scroll_request(reader: &ReaderPosition, mut opening_snap_done: Signa
     true
 }
 
-/// Is the newest rendered row's bottom on screen, within
-/// [`NEWEST_IN_VIEW_SLACK_PX`]? Measures `bottom-sentinel`, which sits right
-/// after the history list inside `#chat-content`, above its bottom padding, so
-/// its top edge is that row's bottom: the same edge, and the same slack, as the
-/// Latest button's observer. A live layout read rather than the observer's
-/// last report, which lags a patch that just put an arrival below the fold.
-#[cfg(target_arch = "wasm32")]
-fn newest_bottom_in_view(container: &web_sys::Element) -> bool {
-    let Some(sentinel) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("bottom-sentinel"))
-    else {
-        return false;
-    };
-    let view = container.get_bounding_client_rect();
-    let edge = sentinel.get_bounding_client_rect().top();
-    edge >= view.top() && edge <= view.bottom() + NEWEST_IN_VIEW_SLACK_PX
-}
-
 /// Publish the newest message as seen if the reader can see it now: the tab is
 /// visible, the history has layout and is not awaiting its reveal restore, the
 /// rendered range reaches the room's latest message, and that message's bottom
@@ -3519,7 +3488,7 @@ fn note_newest_seen(reader: &ReaderPosition) {
     if !crate::components::app::document_title::get_visibility_state()
         || !history_has_layout(&container)
         || reader.hidden.get()
-        || !newest_bottom_in_view(&container)
+        || !sentinel_in_view(&container, "bottom-sentinel")
     {
         return;
     }
@@ -5792,7 +5761,7 @@ pub fn Conversation() -> Element {
                     // IntersectionObserver watches it instead of using
                     // onscroll, which avoids per-scroll-event DOM queries that
                     // cause scroll jank on mobile (see issue #151), and the
-                    // read rule measures it (`newest_bottom_in_view`).
+                    // read rule measures it (`sentinel_in_view`).
                     div {
                         id: "bottom-sentinel",
                         class: "h-px pointer-events-none",
@@ -5809,16 +5778,12 @@ pub fn Conversation() -> Element {
                 //
                 // Also shown while a held range withholds newer items.
                 if !is_at_bottom() || reader_position.has_newer.get() {
-                    button {
-                        class: "absolute bottom-4 right-4 z-30 flex items-center justify-center w-10 h-10 rounded-full bg-panel shadow-lg border border-border text-text-muted hover:text-accent transition-colors",
-                        "aria-label": "Scroll to latest messages",
-                        "data-testid": "scroll-to-bottom",
+                    LatestButton {
+                        aria_label: "Scroll to latest messages",
+                        test_id: "scroll-to-bottom",
                         // Do NOT optimistically set `is_at_bottom` here: the
                         // IntersectionObserver flips it (hiding the button) once
                         // the sentinel actually reaches view. #402.
-                        //
-                        // Instant both ways (10c decision 6), and one-shot: a
-                        // later arrival does not extend it.
                         onclick: {
                             let reader_position = reader_position.clone();
                             move |_| {
@@ -5839,7 +5804,6 @@ pub fn Conversation() -> Element {
                                 }
                             }
                         }},
-                        Icon { icon: FaChevronDown, width: 18, height: 18 }
                     }
                 }
             }

@@ -17,11 +17,14 @@ use crate::components::direct_messages::{
 };
 use crate::components::members::Invitation;
 use crate::components::room_list::receive_invitation_modal::present_invitation;
+use crate::components::scroll_to_latest::LatestButton;
+#[cfg(target_arch = "wasm32")]
+use crate::components::scroll_to_latest::{
+    scroll_to_end, sentinel_in_view, NEWEST_IN_VIEW_SLACK_PX,
+};
 use crate::room_data::SendMessageError;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::FaChevronDown;
-use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::direct_messages::{
@@ -511,14 +514,15 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             //   * is_first         — mount: always jump.
             //   * outbound_changed — user sent: always, once.
             //   * else             — inbound (or a purge): never.
-            // Both jumps are instant, like the room's (10c decisions 6, 12).
             let should_scroll = is_first || outbound_changed;
             if !should_scroll {
                 return;
             }
             let seen_witness = seen_witness.clone();
             crate::util::safe_spawn_local(async move {
-                scroll_dm_container_to_bottom();
+                if let Some(container) = dm_scroll_container() {
+                    scroll_to_end(&container);
+                }
                 // The end is on screen now, so it counts as seen.
                 seen_witness.check();
             });
@@ -531,7 +535,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     }
 
     // Drives the Latest control: is the newest DM's bottom on screen, give or
-    // take `NEWEST_DM_IN_VIEW_SLACK_PX`? Written only by the observer on
+    // take `NEWEST_IN_VIEW_SLACK_PX`? Written only by the observer on
     // `dm-bottom-sentinel` (see `observe_newest_dm`), so nothing reads layout
     // on scroll. Starts `true` so the control stays hidden until it reports.
     let newest_in_view = use_signal(|| true);
@@ -1034,15 +1038,11 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                     // Latest (10c): shown whenever the newest DM's bottom is off
                     // screen by more than the slack, which is how an inbound DM
-                    // that landed below is offered. Same look as the room's
-                    // scroll-to-latest button. Instant (decision 6) and one-shot:
-                    // a later arrival does not extend it. The observer hides it
-                    // once the end is in view; nothing hides it optimistically.
+                    // that landed below is offered.
                     if !newest_in_view() {
-                        button {
-                            class: "absolute bottom-4 right-4 z-30 flex items-center justify-center w-10 h-10 rounded-full bg-panel shadow-lg border border-border text-text-muted hover:text-accent transition-colors",
-                            "aria-label": "Scroll to latest direct messages",
-                            "data-testid": "dm-scroll-to-latest",
+                        LatestButton {
+                            aria_label: "Scroll to latest direct messages",
+                            test_id: "dm-scroll-to-latest",
                             // A DOM scroll only, no signal write, so no `defer`
                             // (`check` defers its own).
                             onclick: {
@@ -1050,14 +1050,15 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                 move |_| {
                                     #[cfg(target_arch = "wasm32")]
                                     {
-                                        scroll_dm_container_to_bottom();
+                                        if let Some(container) = dm_scroll_container() {
+                                            scroll_to_end(&container);
+                                        }
                                         seen_witness.check();
                                     }
                                     #[cfg(not(target_arch = "wasm32"))]
                                     let _ = &seen_witness;
                                 }
                             },
-                            Icon { icon: FaChevronDown, width: 18, height: 18 }
                         }
                     }
                 }
@@ -1733,13 +1734,6 @@ fn format_local_time(unix_secs: u64) -> String {
     local.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// How far below the thread's visible area the newest DM's bottom may sit and
-/// still count as on screen; past it the Latest control shows. The room's
-/// `NEWEST_IN_VIEW_SLACK_PX`, for the same reason: fractional layout can leave
-/// a DM that did scroll fully into view a pixel short.
-#[cfg(target_arch = "wasm32")]
-const NEWEST_DM_IN_VIEW_SLACK_PX: f64 = 4.0;
-
 /// What the DM read rule (10c decision 11) needs to mark the open thread seen
 /// from any of its triggers, raw DOM callbacks included.
 #[derive(Clone)]
@@ -1755,20 +1749,18 @@ struct ThreadSeenWitness {
 impl ThreadSeenWitness {
     /// Mark the thread seen up to its newest inbound DM if the reader can see
     /// the end of the thread right now: the tab is visible and the newest DM's
-    /// bottom is on screen, within [`NEWEST_DM_IN_VIEW_SLACK_PX`]. The newest
+    /// bottom is on screen, within [`NEWEST_IN_VIEW_SLACK_PX`]. The newest
     /// inbound DM is at or above the newest DM, so the reader has reached it.
     ///
-    /// The same rule as rooms (`conversation.rs`'s `note_newest_seen`), and for
-    /// the same reason it reads live layout rather than the observer's last
-    /// report, which lags the patch that just put an arrival below the fold.
-    /// Safe from a raw DOM callback: it reads no signal, and
+    /// The same rule as rooms (`conversation.rs`'s `note_newest_seen`). Safe
+    /// from a raw DOM callback: it reads no signal, and
     /// `mark_thread_read` defers its write and never moves backwards.
     #[cfg(target_arch = "wasm32")]
     fn check(&self) {
         let ts = self.newest_inbound_ts.get();
         if ts == 0
             || !crate::components::app::document_title::get_visibility_state()
-            || !newest_dm_bottom_in_view()
+            || !dm_scroll_container().is_some_and(|c| sentinel_in_view(&c, "dm-bottom-sentinel"))
         {
             return;
         }
@@ -1776,23 +1768,12 @@ impl ThreadSeenWitness {
     }
 }
 
-/// Is the newest DM's bottom on screen, within [`NEWEST_DM_IN_VIEW_SLACK_PX`]?
-/// Measures `dm-bottom-sentinel`: the same edge, and the same slack, as the
-/// Latest control's observer.
+/// The DM thread's scroll container, if it is currently in the DOM.
 #[cfg(target_arch = "wasm32")]
-fn newest_dm_bottom_in_view() -> bool {
-    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
-        return false;
-    };
-    let (Some(container), Some(sentinel)) = (
-        document.get_element_by_id("dm-scroll-container"),
-        document.get_element_by_id("dm-bottom-sentinel"),
-    ) else {
-        return false;
-    };
-    let view = container.get_bounding_client_rect();
-    let edge = sentinel.get_bounding_client_rect().top();
-    view.height() > 0.0 && edge >= view.top() && edge <= view.bottom() + NEWEST_DM_IN_VIEW_SLACK_PX
+fn dm_scroll_container() -> Option<web_sys::Element> {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("dm-scroll-container"))
 }
 
 /// The IntersectionObserver behind the thread's Latest control, with the
@@ -1812,7 +1793,7 @@ impl Drop for NewestDmObserver {
 }
 
 /// Watch `dm-bottom-sentinel`, whose top edge is the newest DM's bottom, and
-/// publish whether it is on screen (within [`NEWEST_DM_IN_VIEW_SLACK_PX`]) to
+/// publish whether it is on screen (within [`NEWEST_IN_VIEW_SLACK_PX`]) to
 /// `newest_in_view`. Each report also re-applies the read rule, since the
 /// reader scrolling the end into view is what usually changes it. Replaces
 /// any observer already in `slot`.
@@ -1825,12 +1806,11 @@ fn observe_newest_dm(
     use wasm_bindgen::JsCast;
 
     drop(slot.borrow_mut().take());
-    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
-        return;
-    };
     let (Some(root), Some(sentinel)) = (
-        document.get_element_by_id("dm-scroll-container"),
-        document.get_element_by_id("dm-bottom-sentinel"),
+        dm_scroll_container(),
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("dm-bottom-sentinel")),
     ) else {
         return;
     };
@@ -1863,7 +1843,7 @@ fn observe_newest_dm(
     );
     let options = web_sys::IntersectionObserverInit::new();
     options.set_root(Some(&root));
-    options.set_root_margin(&format!("0px 0px {NEWEST_DM_IN_VIEW_SLACK_PX}px 0px"));
+    options.set_root_margin(&format!("0px 0px {NEWEST_IN_VIEW_SLACK_PX}px 0px"));
     options.set_threshold(&wasm_bindgen::JsValue::from_f64(0.0));
     let Ok(observer) = web_sys::IntersectionObserver::new_with_options(
         callback.as_ref().unchecked_ref(),
@@ -1876,27 +1856,6 @@ fn observe_newest_dm(
         observer,
         _callback: callback,
     });
-}
-
-/// Jump the DM thread container to its bottom edge. Instant for opening, an
-/// own send and Latest alike (10c decisions 6, 12): a smooth scroll would
-/// leave the end off screen while it animates. No-op when the container isn't
-/// in the DOM yet — safe to call from effect bodies.
-#[cfg(target_arch = "wasm32")]
-fn scroll_dm_container_to_bottom() {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let Some(document) = window.document() else {
-        return;
-    };
-    let Some(container) = document.get_element_by_id("dm-scroll-container") else {
-        return;
-    };
-    let opts = web_sys::ScrollToOptions::new();
-    opts.set_top(container.scroll_height() as f64);
-    opts.set_behavior(web_sys::ScrollBehavior::Instant);
-    container.scroll_to_with_scroll_to_options(&opts);
 }
 
 /// Pure helper: merge an incoming DM_DRAFT body into whatever the user
