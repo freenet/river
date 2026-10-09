@@ -1010,11 +1010,12 @@ pub(crate) fn note_register_error_for_register_ack(key: &DelegateKey) {
 /// a `missing delegate` error. Every chat-delegate request handler answers with
 /// exactly one message (and core does not forward a delegate's empty output for
 /// a contract notification to clients, `route_notification_outbound`), so an
-/// empty reply for the current delegate that is not our own
-/// register's ack, before this attempt has registered, means the list-first
-/// load (freenet/river#757) reached a delegate the node does not have. Once
-/// this attempt has registered, an unclaimed empty reply is more likely a late
-/// register ack than a missing delegate, and is left alone as before.
+/// empty reply for the current delegate that is not our own register's ack,
+/// while this attempt has not registered and its room list is still
+/// unanswered, means the list-first load (freenet/river#757) reached a
+/// delegate the node does not have. Outside that window an unclaimed empty
+/// reply is more likely a late register ack (this attempt's, or a superseded
+/// one's) than a missing delegate, and is left alone.
 pub(crate) fn note_delegate_response_for_register_ack(key: &DelegateKey, values_len: usize) {
     if REGISTER_ACK
         .lock()
