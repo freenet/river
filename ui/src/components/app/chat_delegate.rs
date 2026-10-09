@@ -604,23 +604,99 @@ fn persist_cipher_material(cipher: &[u8; 32], nonce: &[u8; 24]) {
     }
 }
 
+/// Set up the chat delegate and load rooms from it: on the initial connect and
+/// on every reconnect/wake.
+///
+/// Lists rooms FIRST, without registering the delegate (freenet/river#757).
+/// The node keeps a registered delegate across restarts, so re-sending the
+/// ~740 KB WASM on every load bought nothing but a slower start: the room list
+/// waited for its ack (#709). If the node does not have the delegate (the
+/// first load after a delegate re-key, or a fresh node), it says so, as a
+/// typed `missing delegate` error or, before freenet-core#5729 (0.2.136 and
+/// earlier), as an empty reply; [`on_current_delegate_missing`] then registers
+/// it and lists again. A user-initiated Retry registers up front
+/// ([`set_up_chat_delegate_registering`]).
 pub async fn set_up_chat_delegate() -> Result<(), String> {
+    set_up_chat_delegate_with(false).await
+}
+
+/// [`set_up_chat_delegate`], but registering the delegate before listing, as
+/// every load did before freenet/river#757. Used by Retry, whose job includes
+/// repairing a registration that failed.
+pub async fn set_up_chat_delegate_registering() -> Result<(), String> {
+    set_up_chat_delegate_with(true).await
+}
+
+async fn set_up_chat_delegate_with(register_first: bool) -> Result<(), String> {
     // freenet/river#397 Codex review 8 (P2#2): treat EVERY setup-triggered load
     // as a fresh attempt — the initial load AND every reconnect/wake, since this
     // fn re-runs on each. `begin_load_attempt` advances LOAD_ATTEMPT_GEN, so every
     // worker spawned by the PREVIOUS pass is now stale and its Drop/mark/
     // set_load_state all no-op (attempt-scoped guard) — overlap is harmless. It
     // also resets SAW_FETCH_FAILURE, returns the rail to `Loading`, and arms a
-    // fresh gen-guarded hard-max BEFORE RegisterDelegate, so even a registration
+    // fresh gen-guarded hard-max BEFORE anything is sent, so even a registration
     // failure eventually resolves.
     begin_load_attempt();
-    // Capture the attempt this continuation belongs to (review 11): the
-    // RegisterDelegate + fire_list_rooms_request below run across awaits, so a
-    // reconnect can advance the attempt mid-flight — gate the failure resolve on
-    // still-current.
+    // Capture the attempt this continuation belongs to (review 11): the sends
+    // below run across awaits, so a reconnect can advance the attempt
+    // mid-flight — gate the failure resolve on still-current.
     let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
     reset_outbound_dms_hydration_request();
 
+    if register_first {
+        claim_registration(attempt);
+        return register_then_load(attempt, Reload::All).await;
+    }
+
+    // Legacy migration is NOT fired here. It is gated on the current
+    // delegate's response: if the current delegate has data, migration is
+    // skipped (current is authoritative); if it is empty, migration is fired
+    // then. This prevents legacy responses from racing with the current
+    // delegate and clobbering newer state (freenet/river#253).
+    fire_list_rooms_request().await;
+    if load_attempt_is_current(attempt) {
+        fire_load_outbound_dms_request(attempt).await;
+    }
+    Ok(())
+}
+
+/// What [`register_then_load`] sends once the delegate is registered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reload {
+    /// The room list and the outbound-DM load, unconditionally: nothing has
+    /// been sent for this attempt yet.
+    All,
+    /// Only what has not been answered: the list if this attempt has no
+    /// `ListResponse`, the outbound DMs if they are not hydrated. The first
+    /// sends reached a delegate the node did not have (freenet/river#757).
+    Unanswered,
+}
+
+/// `attempt + 1` of the load attempt that has registered the chat delegate;
+/// 0 when none has (freenet/river#757). At most one registration per attempt,
+/// however many requests report the delegate missing.
+static REGISTERED_FOR_ATTEMPT: AtomicU32 = AtomicU32::new(0);
+
+/// Claim this attempt's one registration. Returns false if it already
+/// registered.
+fn claim_registration(attempt: u32) -> bool {
+    claim_once_per_attempt(&REGISTERED_FOR_ATTEMPT, attempt)
+}
+
+/// Mark `slot` taken for `attempt`; true only for the first claim in that
+/// attempt. `slot` holds `attempt + 1`, 0 meaning never claimed.
+fn claim_once_per_attempt(slot: &AtomicU32, attempt: u32) -> bool {
+    let marker = attempt.wrapping_add(1);
+    slot.swap(marker, Ordering::Relaxed) != marker
+}
+
+fn registered_this_attempt() -> bool {
+    REGISTERED_FOR_ATTEMPT.load(Ordering::Relaxed)
+        == LOAD_ATTEMPT_GEN.load(Ordering::Relaxed).wrapping_add(1)
+}
+
+/// Register the chat delegate, wait for the node's reply, then load.
+async fn register_then_load(attempt: u32, reload: Reload) -> Result<(), String> {
     let delegate = create_chat_delegate_container();
 
     // freenet/river#709: arm the ack slot BEFORE sending, so the node's reply
@@ -650,24 +726,13 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
         Ok(_) => {
             info!("RegisterDelegate sent; waiting for the node's reply before loading rooms");
             // freenet/river#709: `WebApi::send` resolves once the bytes are on
-            // the socket, not when the node has registered the delegate. On the
-            // first load after a delegate re-key the node has never seen this
-            // delegate, and it can run the ListRequest / outbound-DM GetRequest
-            // BEFORE the RegisterDelegate queued ahead of them: both get an
-            // empty reply (or, since freenet-core#5729, `missing delegate`),
-            // the load never starts, and the user sees no rooms until a reload.
-            // So the two requests wait for the node's reply to the register.
+            // the socket, not when the node has registered the delegate. The
+            // node can run a request queued behind the RegisterDelegate before
+            // the registration completes, and that request then finds no
+            // delegate. So the loads wait for the node's reply to the register.
             //
             // The wait runs in its own task: the reply arrives through the same
             // message loop that called us, so awaiting it here would deadlock.
-            //
-            // Legacy migration is NOT fired here. It is gated on the current
-            // delegate's response: if the current delegate has data, migration is
-            // skipped (current is authoritative); if it is empty, migration is
-            // fired then. This prevents legacy responses from racing with the
-            // current delegate and clobbering newer state (freenet/river#253).
-            // The fresh-attempt bookkeeping (SAW_FETCH_FAILURE reset, Loading
-            // state, hard-max arming) already ran in `begin_load_attempt()` above.
             crate::util::safe_spawn_local(async move {
                 let timeout =
                     crate::util::sleep(std::time::Duration::from_millis(REGISTER_ACK_TIMEOUT_MS));
@@ -698,11 +763,15 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
                 if !load_attempt_is_current(attempt) {
                     return;
                 }
-                fire_list_rooms_request().await;
+                if reload == Reload::All || !list_answered_this_attempt(attempt) {
+                    fire_list_rooms_request().await;
+                }
                 if !load_attempt_is_current(attempt) {
                     return;
                 }
-                fire_load_outbound_dms_request(attempt).await;
+                if reload == Reload::All || !OUTBOUND_DMS_HYDRATED.load(Ordering::Acquire) {
+                    fire_load_outbound_dms_request(attempt).await;
+                }
             });
 
             Ok(())
@@ -849,6 +918,15 @@ pub(crate) fn note_register_error_for_register_ack(key: &DelegateKey) {
 
 /// Called by the response handler for every `DelegateResponse`, so a pending
 /// register wait can complete (freenet/river#709).
+///
+/// It is also how a node older than freenet-core#5729 (0.2.136 and earlier)
+/// reports that the chat delegate is not registered: an empty reply instead of
+/// a `missing delegate` error. Every chat-delegate handler answers with exactly
+/// one message, so an empty reply for the current delegate that is not our own
+/// register's ack, before this attempt has registered, means the list-first
+/// load (freenet/river#757) reached a delegate the node does not have. Once
+/// this attempt has registered, an unclaimed empty reply is more likely a late
+/// register ack than a missing delegate, and is left alone as before.
 pub(crate) fn note_delegate_response_for_register_ack(key: &DelegateKey, values_len: usize) {
     if REGISTER_ACK
         .lock()
@@ -856,6 +934,11 @@ pub(crate) fn note_delegate_response_for_register_ack(key: &DelegateKey, values_
         .on_delegate_response(key, values_len)
     {
         debug!("RegisterDelegate reply received");
+        return;
+    }
+    if values_len == 0 && is_current_delegate_key(key) && !registered_this_attempt() {
+        warn!("Empty reply from the chat delegate: the node does not have it (pre-#5729 node)");
+        on_current_delegate_missing();
     }
 }
 
@@ -870,6 +953,29 @@ static LIST_OUTSTANDING: AtomicU32 = AtomicU32::new(0);
 /// exists to shorten.
 pub(crate) fn note_current_list_response() {
     let _ = claim_outstanding_list(&LIST_OUTSTANDING, LOAD_ATTEMPT_GEN.load(Ordering::Relaxed));
+}
+
+/// `attempt + 1` of the load attempt whose current-delegate `ListResponse` has
+/// started the room load; 0 when none has (freenet/river#757).
+static LIST_ANSWERED_FOR_ATTEMPT: AtomicU32 = AtomicU32::new(0);
+
+/// Claim the current attempt's one room load for a `ListResponse`. Returns
+/// false for a second `ListResponse` in the same attempt, which must not
+/// start a second load: two per-room loads in one attempt register their
+/// per-room GETs under the same single-waiter correlation keys and orphan
+/// each other's waiters, reading as fetch failures. A second one arrives when
+/// the list-first load re-lists after registering a missing delegate and the
+/// first list was answered after all, or when a previous attempt's list is
+/// answered late on the same socket. Both lists carry the same keys.
+pub(crate) fn claim_list_load() -> bool {
+    claim_once_per_attempt(
+        &LIST_ANSWERED_FOR_ATTEMPT,
+        LOAD_ATTEMPT_GEN.load(Ordering::Relaxed),
+    )
+}
+
+fn list_answered_this_attempt(attempt: u32) -> bool {
+    LIST_ANSWERED_FOR_ATTEMPT.load(Ordering::Relaxed) == attempt.wrapping_add(1)
 }
 
 /// Take the outstanding-list marker if it belongs to `attempt`.
@@ -887,8 +993,11 @@ fn claim_outstanding_list(outstanding: &AtomicU32, attempt: u32) -> bool {
 /// The node reported the CURRENT chat delegate missing (freenet/river#707).
 /// This is not a legacy probe result, so it must not seal the migration.
 ///
-/// The error carries no request id. If this attempt's room list is still
-/// unanswered, the list is what failed (a failed or lost register), no
+/// The first time in an attempt, this is the list-first load meeting a node
+/// that lacks the delegate (freenet/river#757): register it and reload.
+///
+/// After that, the error carries no request id. If this attempt's room list is
+/// still unanswered, the list is what failed (a failed or lost register), no
 /// `ListResponse` will come to start the load, and the user would otherwise
 /// wait for the hard-max and then see "No rooms yet". So record the failure
 /// and show Retry, which re-registers. Once the list has been answered, a
@@ -899,6 +1008,20 @@ fn claim_outstanding_list(outstanding: &AtomicU32, attempt: u32) -> bool {
 /// refusing the delegate's requests.
 pub(crate) fn on_current_delegate_missing() {
     let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    // freenet/river#757: the load lists before registering, so on a node that
+    // lacks the delegate (the first load after a delegate re-key, a fresh node)
+    // this is the expected answer. Register once, then send again whatever has
+    // not been answered. Only a delegate still missing AFTER this attempt
+    // registered it falls through to the failure below.
+    if claim_registration(attempt) {
+        warn!("The node does not have the chat delegate; registering it and reloading");
+        crate::util::safe_spawn_local(async move {
+            if let Err(e) = register_then_load(attempt, Reload::Unanswered).await {
+                error!("{}", e);
+            }
+        });
+        return;
+    }
     if !claim_outstanding_list(&LIST_OUTSTANDING, attempt) {
         return;
     }
@@ -1218,30 +1341,139 @@ mod tests {
             .find("load_rooms_per_room(keys).await;")
             .expect("current-delegate ListResponse branch must exist");
         assert!(
-            rh.get(current_list.saturating_sub(300)..current_list)
+            rh.get(current_list.saturating_sub(800)..current_list)
                 .unwrap()
                 .contains("note_current_list_response();"),
             "the current delegate's ListResponse must clear the outstanding marker"
         );
         let production = chat_delegate_production();
         let body = fn_body(&production, "pub(crate) fn on_current_delegate_missing() {");
+        // freenet/river#757: the first Missing in an attempt registers and
+        // reloads; only a Missing after that registration fails the load.
+        let register = body
+            .find("if claim_registration(attempt) {")
+            .expect("the first Missing must claim this attempt's registration");
+        let register_arm = body.get(register..).unwrap();
+        let register_arm = register_arm
+            .get(
+                ..register_arm
+                    .find("return;")
+                    .expect("the register arm returns"),
+            )
+            .unwrap();
+        assert!(
+            register_arm.contains("register_then_load(attempt, Reload::Unanswered)"),
+            "the first Missing must register and re-send only what went unanswered"
+        );
         let claim = body
             .find("claim_outstanding_list(&LIST_OUTSTANDING, attempt)")
             .expect("the handler must be gated on the outstanding list");
         let mark = body
             .find("mark_fetch_failure_if_current(attempt)")
             .expect("the handler must mark the failure");
-        assert!(claim < mark);
+        assert!(register < claim && claim < mark);
     }
 
-    /// freenet/river#709 wiring: in `set_up_chat_delegate` the list and
-    /// outbound-DM requests are sent only after `wait_for_register_ack`, the
-    /// slot is armed before the register is sent, and the response handler
-    /// feeds every `DelegateResponse` to the slot.
+    /// freenet/river#757: one registration per attempt, however many requests
+    /// come back Missing, and a new attempt may register again.
     #[test]
-    fn set_up_chat_delegate_lists_rooms_only_after_register_reply() {
+    fn registration_is_claimed_once_per_attempt() {
+        let slot = AtomicU32::new(0);
+        assert!(claim_once_per_attempt(&slot, 7));
+        assert!(
+            !claim_once_per_attempt(&slot, 7),
+            "the list and the DM load both report Missing: one registration"
+        );
+        assert!(
+            claim_once_per_attempt(&slot, 8),
+            "a later attempt registers again"
+        );
         let production = chat_delegate_production();
-        let body = fn_body(&production, "pub async fn set_up_chat_delegate()");
+        assert!(fn_body(&production, "fn claim_registration(")
+            .contains("claim_once_per_attempt(&REGISTERED_FOR_ATTEMPT, attempt)"));
+    }
+
+    /// freenet/river#757: a normal setup lists rooms (and loads outbound DMs)
+    /// WITHOUT registering the delegate first; only Retry registers up front.
+    #[test]
+    fn set_up_chat_delegate_lists_before_registering() {
+        let production = chat_delegate_production();
+        let body = fn_body(&production, "async fn set_up_chat_delegate_with(");
+        let register_first = body
+            .find("if register_first {")
+            .expect("the register-first path must be explicit");
+        let register_arm = body.get(register_first..).unwrap();
+        let register_arm = register_arm
+            .get(..register_arm.find("}").expect("arm closes"))
+            .unwrap();
+        assert!(register_arm.contains("register_then_load(attempt, Reload::All)"));
+        let after = body.get(register_first + register_arm.len()..).unwrap();
+        assert!(
+            !after.contains("RegisterDelegate") && !after.contains("register_then_load("),
+            "the normal path must not register before listing"
+        );
+        assert!(after.contains("fire_list_rooms_request().await"));
+        assert!(after.contains("fire_load_outbound_dms_request(attempt).await"));
+        assert!(
+            fn_body(&production, "pub async fn set_up_chat_delegate()")
+                .contains("set_up_chat_delegate_with(false)"),
+            "a connect or wake must take the list-first path"
+        );
+        assert!(
+            fn_body(
+                &production,
+                "pub async fn set_up_chat_delegate_registering()"
+            )
+            .contains("set_up_chat_delegate_with(true)"),
+            "Retry must take the register-first path"
+        );
+
+        // A pre-#5729 node's empty reply is routed to the same handler, but
+        // only while this attempt has not registered.
+        let note = fn_body(
+            &production,
+            "pub(crate) fn note_delegate_response_for_register_ack(",
+        );
+        assert!(note.contains(
+            "values_len == 0 && is_current_delegate_key(key) && !registered_this_attempt()"
+        ));
+        assert!(note.contains("on_current_delegate_missing();"));
+    }
+
+    /// freenet/river#757: a second current-delegate ListResponse in one attempt
+    /// must not start a second room load.
+    #[test]
+    fn a_second_list_response_in_an_attempt_is_ignored() {
+        let slot = AtomicU32::new(0);
+        assert!(claim_once_per_attempt(&slot, 3));
+        assert!(
+            !claim_once_per_attempt(&slot, 3),
+            "same attempt: no second load"
+        );
+        let production = chat_delegate_production();
+        assert!(fn_body(&production, "pub(crate) fn claim_list_load()")
+            .contains("&LIST_ANSWERED_FOR_ATTEMPT,"));
+        let rh = response_handler_production();
+        let spawn = rh
+            .find("load_rooms_per_room(keys).await;")
+            .expect("current-delegate ListResponse branch must exist");
+        assert!(
+            rh.get(spawn.saturating_sub(400)..spawn)
+                .unwrap()
+                .contains("if claim_list_load() {"),
+            "the room load must be gated on claim_list_load"
+        );
+    }
+
+    /// freenet/river#709 wiring: whenever the delegate is registered
+    /// (`register_then_load`), the list and outbound-DM requests are sent only
+    /// after `wait_for_register_ack`, the slot is armed before the register is
+    /// sent, and the response handler feeds every `DelegateResponse` to the
+    /// slot.
+    #[test]
+    fn register_then_load_lists_rooms_only_after_register_reply() {
+        let production = chat_delegate_production();
+        let body = fn_body(&production, "async fn register_then_load(");
 
         let arm = body
             .find("arm_register_ack(")
@@ -3781,8 +4013,9 @@ mod tests {
             "retry must re-enable the legacy probe so a failed legacy source is retried (P1b)"
         );
         assert!(
-            body.contains("set_up_chat_delegate().await"),
-            "retry must re-run full setup (re-register) via set_up_chat_delegate, not a bare list request"
+            body.contains("set_up_chat_delegate_registering().await"),
+            "retry must re-run full setup and re-register up front \
+             (set_up_chat_delegate_registering), not a bare list request"
         );
         assert!(
             !body.contains("begin_load_attempt()"),
@@ -4967,12 +5200,13 @@ mod tests {
                 .contains("&OUTBOUND_DMS_HYDRATION_REQUEST,"),
             "the save's hydration wait must count its bound from the request"
         );
-        let setup = fn_body(&production, "pub async fn set_up_chat_delegate()");
+        let setup = fn_body(&production, "async fn set_up_chat_delegate_with(");
+        let reset = setup
+            .find("reset_outbound_dms_hydration_request();")
+            .expect("each setup pass must reset the DM request timing");
         assert!(
-            setup
-                .find("reset_outbound_dms_hydration_request();")
-                .unwrap()
-                < setup.find("DelegateRequest::RegisterDelegate").unwrap(),
+            reset < setup.find("register_then_load(").unwrap()
+                && reset < setup.find("fire_load_outbound_dms_request(").unwrap(),
             "each setup pass must stop timing an earlier pass's DM request"
         );
     }
@@ -10248,10 +10482,12 @@ pub(crate) fn retry_rooms_load() {
     // BEFORE the re-setup so `fire_legacy_migration_request` sees it cleared.
     LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     crate::util::safe_spawn_local(async {
-        // set_up_chat_delegate begins the fresh attempt AND re-registers; its Err
+        // set_up_chat_delegate_registering begins the fresh attempt AND
+        // re-registers up front (freenet/river#757: a normal setup lists first
+        // and registers only when the node reports the delegate missing); its Err
         // path resolves LoadFailed, so a persistent registration failure re-shows
         // Retry rather than getting stuck.
-        if let Err(e) = set_up_chat_delegate().await {
+        if let Err(e) = set_up_chat_delegate_registering().await {
             error!("Retry: chat delegate setup failed: {}", e);
         }
     });

@@ -65,6 +65,20 @@ fn should_request_legacy_seal(error: &SynchronizerError, current: &DelegateKey) 
     }
 }
 
+/// Whether an API error reports the CURRENT chat delegate missing: typed
+/// `DelegateError::Missing(current)`, or the untyped core wording naming it
+/// ("delegate <key> not found in store"). Either way the list-first load
+/// (freenet/river#757) must register the delegate.
+fn names_current_missing(error: &SynchronizerError, current: &DelegateKey) -> bool {
+    match error.missing_delegate_key() {
+        Some(key) => key.bytes() == current.bytes(),
+        None => {
+            let message = error.to_string();
+            is_missing_delegate_error(&message) && message.contains(&current.to_string())
+        }
+    }
+}
+
 /// Whether an untyped error is freenet-core's flattened
 /// `DelegateError::RegisterError` for `current` (freenet/river#709). Core wraps
 /// a refused register in `ExecutorError::other`, so the client gets only its
@@ -839,10 +853,7 @@ impl FreenetSynchronizer {
                                     // legacy delegate must not speak for the other
                                     // twenty-five.
                                     request_legacy_seal_on_quiescence();
-                                } else if e
-                                    .missing_delegate_key()
-                                    .is_some_and(|key| key.bytes() == current.bytes())
-                                {
+                                } else if names_current_missing(&e, &current) {
                                     warn!("The CURRENT chat delegate was reported missing; not a legacy probe, so not sealing (freenet/river#707)");
                                     on_current_delegate_missing();
                                 }
@@ -1079,6 +1090,17 @@ mod tests {
         assert!(!should_request_legacy_seal(&untyped(&current), &current));
         assert!(should_request_legacy_seal(&untyped(&legacy), &current));
 
+        // freenet/river#757: both forms naming the CURRENT delegate make the
+        // list-first load register it; neither form naming another key does.
+        assert!(names_current_missing(&current_missing, &current));
+        assert!(names_current_missing(&untyped(&current), &current));
+        assert!(!names_current_missing(&missing(&legacy), &current));
+        assert!(!names_current_missing(&untyped(&stranger), &current));
+        assert!(!names_current_missing(
+            &SynchronizerError::WebSocketError("contract abc123 not found".into()),
+            &current
+        ));
+
         // The error arm must route a current-key Missing to the load's failure
         // path, so the user gets Retry instead of a stuck rail.
         let production = crate::util::strip_comments(
@@ -1088,7 +1110,7 @@ mod tests {
                 .unwrap(),
         );
         let branch = production
-            .find(".is_some_and(|key| key.bytes() == current.bytes())")
+            .find("else if names_current_missing(&e, &current) {")
             .expect("the current-key Missing branch must exist");
         assert!(
             production

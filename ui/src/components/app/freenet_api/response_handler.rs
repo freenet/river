@@ -11,14 +11,14 @@ mod update_response;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
-    arm_legacy_migration_recovery, await_delegate_response, clear_legacy_migration_in_progress,
-    complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
-    complete_pending_signing_key_request, current_delegate_source_rank,
-    decide_legacy_migration_action, decide_per_room_load_action, enqueue_delegate_request,
-    fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
-    is_legacy_delegate_key, is_legacy_migration_in_progress, legacy_scoped_correlation,
-    load_state_after_probe_legacy, mark_legacy_migration_done, mark_legacy_migration_in_progress,
-    mark_outbound_dms_hydrated, note_current_list_response,
+    arm_legacy_migration_recovery, await_delegate_response, claim_list_load,
+    clear_legacy_migration_in_progress, complete_pending_public_key_request,
+    complete_pending_request, complete_pending_sign_request, complete_pending_signing_key_request,
+    current_delegate_source_rank, decide_legacy_migration_action, decide_per_room_load_action,
+    enqueue_delegate_request, fire_legacy_migration_request, hydrate_hidden_dm_threads,
+    hydrate_outbound_dms_cache, is_legacy_delegate_key, is_legacy_migration_in_progress,
+    legacy_scoped_correlation, load_state_after_probe_legacy, mark_legacy_migration_done,
+    mark_legacy_migration_in_progress, mark_outbound_dms_hydrated, note_current_list_response,
     note_delegate_response_for_register_ack, parse_room_storage_key, per_room_terminal,
     prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, response_correlation_base,
     room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate,
@@ -542,9 +542,17 @@ impl ResponseHandler {
                                             }
                                         } else {
                                             note_current_list_response();
-                                            crate::util::safe_spawn_local(async move {
-                                                load_rooms_per_room(keys).await;
-                                            });
+                                            // One room load per attempt: a second
+                                            // ListResponse (a re-list after
+                                            // registering, freenet/river#757, or
+                                            // a late one) carries the same keys.
+                                            if claim_list_load() {
+                                                crate::util::safe_spawn_local(async move {
+                                                    load_rooms_per_room(keys).await;
+                                                });
+                                            } else {
+                                                info!("Ignoring a second room list for this load attempt");
+                                            }
                                         }
                                     }
                                     // CAS storage responses (freenet/river#345). The
