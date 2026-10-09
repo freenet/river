@@ -5,7 +5,9 @@ use crate::components::app::freenet_api::error::SynchronizerError;
 use crate::components::app::freenet_api::response_handler::update_notification::{
     clear_upgrade_target, follow_upgrade_pointer_if_needed, upgrade_target_owner,
 };
-use crate::components::app::freenet_api::room_synchronizer::RoomSynchronizer;
+use crate::components::app::freenet_api::room_synchronizer::{
+    compute_update_data, RoomSynchronizer,
+};
 use crate::components::app::notifications::mark_initial_sync_complete;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
@@ -1265,11 +1267,15 @@ fn complete_subscribe_get(owner_vk: ed25519_dalek::VerifyingKey, network_state: 
         sync_info.update_last_synced_state(&owner_vk, &network_state);
         sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
     });
+    // Asked the way `process_rooms` will ask it, rather than `!=`: state
+    // equality also compares `actions_state`, which is rebuilt locally and
+    // never on a decoded network state, so it would flag every room with an
+    // edit or reaction.
+    let params = ChatRoomParametersV1 { owner: owner_vk };
     let local_ahead = match ROOMS.try_read() {
-        Ok(rooms) => rooms
-            .map
-            .get(&owner_vk)
-            .is_some_and(|rd| rd.room_state != network_state),
+        Ok(rooms) => rooms.map.get(&owner_vk).is_some_and(|rd| {
+            compute_update_data(&rd.room_state, Some(&network_state), &params).is_some()
+        }),
         // Unreadable: assume it differs. A spurious sync computes an empty
         // delta and sends nothing.
         Err(_) => true,

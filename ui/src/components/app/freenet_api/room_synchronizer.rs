@@ -70,7 +70,7 @@ fn merge_incoming_state(
     Ok(delta)
 }
 
-fn compute_update_data(
+pub(crate) fn compute_update_data(
     state: &ChatRoomStateV1,
     baseline: Option<&ChatRoomStateV1>,
     params: &ChatRoomParametersV1,
