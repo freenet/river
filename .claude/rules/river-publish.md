@@ -245,8 +245,10 @@ where stale legacy data overwrites newer state on the current delegate
    `__river_legacy_migration_in_progress__` (`LEGACY_MIGRATION_IN_PROGRESS_KEY`):
    written and acknowledged BEFORE any migration re-save (`hydrate_loaded_rooms`'s
    legacy branch and the current-blob explosion alike; the save is skipped if
-   the write is not acknowledged) and deleted ONLY after a FULL successful
-   re-save. A partial/aborted re-save therefore leaves it in the delegate, the
+   the write is not acknowledged) and deleted ONLY by the legacy fan-out's
+   quiescence seal, once every re-save it started has succeeded (several
+   generations re-save concurrently and share it; a recovery that finds
+   nothing to add also converges there). A partial/aborted re-save therefore leaves it in the delegate, the
    next load sees it in the `ListResponse`, and that drives the recovery above.
    It was a localStorage flag until freenet/river#757, which never worked in
    production: the gateway's iframe sandbox omits `allow-same-origin`, so

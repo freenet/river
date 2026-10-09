@@ -3647,6 +3647,7 @@ mod tests {
         let mut current = empty_rooms_for_merge();
         let mut kept_live = test_minimal_room_data(kept);
         kept_live.self_sk = Some(live_sk.clone());
+        let kept_live_state = kept_live.room_state.clone();
         current.map.insert(kept, kept_live);
         current
             .map
@@ -3695,6 +3696,10 @@ mod tests {
             live.map[&kept].self_sk.as_ref().map(|k| k.verifying_key()),
             Some(live_sk.verifying_key()),
             "the live identity is not replaced by the legacy one"
+        );
+        assert_eq!(
+            live.map[&kept].room_state, kept_live_state,
+            "the kept room's state is the live copy's"
         );
     }
 

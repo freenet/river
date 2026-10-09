@@ -3923,16 +3923,131 @@ mod tests {
         );
     }
 
-    /// The seed from a listing must both SET and CLEAR the session flag: a
-    /// listing without the marker (e.g. after another tab finished the
-    /// migration) must not leave a stale `true` from earlier in the session.
+    /// A listing without the marker clears a stale `present`, but never hides
+    /// a re-save running in this session whose marker write is not yet acked.
     #[test]
-    fn migration_marker_seed_tracks_the_listing() {
-        let marker = ChatDelegateKey::new(LEGACY_MIGRATION_IN_PROGRESS_KEY.to_vec());
-        note_migration_marker_from_listing(&[marker]);
-        assert!(is_legacy_migration_in_progress());
-        note_migration_marker_from_listing(&[]);
-        assert!(!is_legacy_migration_in_progress());
+    fn a_listing_seeds_the_marker_without_hiding_a_running_resave() {
+        let mut m = MigrationMarkerState::default();
+        m.seen_in_listing(true);
+        assert!(m.in_progress());
+        m.seen_in_listing(false);
+        assert!(!m.in_progress());
+
+        m.begin();
+        m.seen_in_listing(false); // a reconnect listing raced the marker write
+        assert!(m.in_progress());
+    }
+
+    /// Several legacy generations re-save concurrently and share one marker.
+    /// It may only go once ALL of them are done (the fan-out's quiescence),
+    /// never when the first one finishes (#757 review).
+    #[test]
+    fn overlapping_resaves_keep_the_marker_until_all_finish() {
+        let mut m = MigrationMarkerState::default();
+        m.begin(); // generation A
+        m.begin(); // generation B
+        m.end(true); // A finishes first
+        assert!(!m.may_seal(), "B is still writing");
+        assert!(m.in_progress());
+        m.end(true);
+        assert!(m.may_seal());
+        assert!(m.take_marker_for_deletion());
+        assert!(!m.in_progress());
+        assert!(!m.take_marker_for_deletion(), "deleted once");
+    }
+
+    /// A failed re-save keeps the marker for the rest of the session, so the
+    /// next load re-runs the fill.
+    #[test]
+    fn a_failed_resave_blocks_the_seal() {
+        let mut m = MigrationMarkerState::default();
+        m.begin();
+        m.begin();
+        m.end(false);
+        m.end(true);
+        assert!(!m.may_seal());
+        assert!(m.in_progress());
+    }
+
+    /// A recovery whose legacy fan-out finds nothing to add starts no re-save.
+    /// The marker must still go at quiescence, or every later load re-probes
+    /// legacy forever and the import gate stays shut (#757 review).
+    #[test]
+    fn a_recovery_with_nothing_to_add_converges() {
+        let mut m = MigrationMarkerState::default();
+        m.seen_in_listing(true);
+        assert!(m.in_progress());
+        assert!(
+            m.may_seal(),
+            "a merely-present marker must not block the seal"
+        );
+        assert!(m.take_marker_for_deletion());
+        assert!(!m.in_progress());
+    }
+
+    /// Only an explicit `StoreResponse { Ok }` counts as the marker written.
+    #[test]
+    fn marker_store_outcome_accepts_only_an_acknowledged_store() {
+        let key = ChatDelegateKey::new(LEGACY_MIGRATION_IN_PROGRESS_KEY.to_vec());
+        assert!(
+            marker_store_outcome(Ok(ChatDelegateResponseMsg::StoreResponse {
+                key: key.clone(),
+                value_size: 1,
+                result: Ok(()),
+            }))
+            .is_ok()
+        );
+        assert!(
+            marker_store_outcome(Ok(ChatDelegateResponseMsg::StoreResponse {
+                key: key.clone(),
+                value_size: 1,
+                result: Err("full".into()),
+            }))
+            .is_err()
+        );
+        assert!(
+            marker_store_outcome(Ok(ChatDelegateResponseMsg::DeleteResponse {
+                key,
+                result: Ok(()),
+            }))
+            .is_err()
+        );
+        assert!(marker_store_outcome(Err("timed out".into())).is_err());
+    }
+
+    /// The seal's gate must consult `may_seal`, which a merely-present marker
+    /// does not block — not `is_legacy_migration_in_progress`, which it does
+    /// (that combination never converged). And the marker is deleted only
+    /// there, after the seal. Source pin: the seal runs inside a timer +
+    /// `defer` closure that native tests cannot drive.
+    #[test]
+    fn the_marker_is_deleted_only_by_the_quiescence_seal() {
+        let src = include_str!("chat_delegate.rs");
+        // `rfind`: the definition sits after every test that names it.
+        let sched = src
+            .rfind("fn schedule_legacy_seal(")
+            .expect("schedule_legacy_seal must exist");
+        let body = &src[sched..];
+        let body = &body[..body.find("\n}\n").expect("function must terminate")];
+        let gate = body
+            .find("m.may_seal()")
+            .expect("seal must gate on may_seal");
+        let seal = body
+            .find("mark_legacy_migration_done()")
+            .expect("seal write");
+        // Built from parts so this test's own text does not match it.
+        let needle = ["delete_migration", "_marker()"].concat();
+        let delete = body
+            .find(needle.as_str())
+            .expect("the seal must delete the marker");
+        assert!(gate < seal && seal < delete);
+        assert!(!body.contains("is_legacy_migration_in_progress()"));
+        // The definition plus the single call in the seal.
+        assert_eq!(
+            src.matches(needle.as_str()).count(),
+            2,
+            "the seal is the only place the marker is deleted"
+        );
     }
 
     // ===== resolve_hidden_thread_hydration tests (#261 Codex P3) =====
@@ -9342,6 +9457,12 @@ fn is_legacy_migration_done() -> bool {
 }
 
 /// Mark legacy migration as done for the current set in localStorage.
+///
+/// Inert in production, like every localStorage flag here: the gateway's
+/// iframe sandbox omits `allow-same-origin`, so `local_storage()` fails and
+/// nothing is written. What stops repeat probing there is the load plan (a
+/// current delegate with per-room keys never probes legacy) and the walk's
+/// delegate-stored markers.
 pub fn mark_legacy_migration_done() {
     #[cfg(target_arch = "wasm32")]
     {
@@ -9359,8 +9480,8 @@ pub fn mark_legacy_migration_done() {
 }
 
 /// Current-delegate storage key of the "legacy migration in progress" marker —
-/// persisted BEFORE a migration's per-room re-save and deleted only on full
-/// success. If a migration is interrupted (a per-room CAS write fails, or the
+/// persisted BEFORE a migration's per-room re-save and deleted only at the
+/// legacy fan-out's quiescence seal, once every re-save it started succeeded. If a migration is interrupted (a per-room CAS write fails, or the
 /// tab is closed mid-migration), the marker survives, so the next load's
 /// per-room path knows the per-room key set may be INCOMPLETE and re-runs the
 /// legacy fill to recover any stranded room (freenet/river#345 follow-up —
@@ -9379,12 +9500,83 @@ pub fn mark_legacy_migration_done() {
 pub(crate) const LEGACY_MIGRATION_IN_PROGRESS_KEY: &[u8] =
     b"__river_legacy_migration_in_progress__";
 
-/// Session mirror of [`LEGACY_MIGRATION_IN_PROGRESS_KEY`]: seeded from the
-/// current delegate's `ListResponse` ([`note_migration_marker_from_listing`]),
-/// set by [`mark_legacy_migration_in_progress`], cleared by
-/// [`clear_legacy_migration_in_progress`]. Read synchronously by the load and
-/// identity-import gates.
-static LEGACY_MIGRATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// Session view of the in-progress marker and of the migrations running now.
+///
+/// Pure (no I/O, no globals) so the decisions below are unit-testable; the
+/// production instance is [`MIGRATION_MARKER`].
+///
+/// The marker is deleted ONLY at the legacy fan-out's quiescence seal
+/// ([`schedule_legacy_seal`]), never when one re-save finishes: every legacy
+/// generation is probed at once and each that holds rooms re-saves on its own
+/// schedule, so deleting on the first success would leave a slower
+/// generation's rooms unprotected until its own re-save started. Quiescence is
+/// also what makes a recovery that finds nothing to add converge.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationMarkerState {
+    /// The marker is (or is about to be) in the current delegate: seen in its
+    /// listing, or written by a migration this session.
+    pub(crate) present: bool,
+    /// Re-saves started this session that have not finished.
+    pub(crate) in_flight: u32,
+    /// A re-save failed this session; the marker must survive it.
+    pub(crate) failed: bool,
+}
+
+impl MigrationMarkerState {
+    /// A re-save is starting (call before writing the marker).
+    pub(crate) fn begin(&mut self) {
+        self.present = true;
+        self.in_flight += 1;
+    }
+
+    /// A re-save ended. `wrote_anything` is false when it aborted before its
+    /// first write (the marker store was not acknowledged).
+    pub(crate) fn end(&mut self, succeeded: bool) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if !succeeded {
+            self.failed = true;
+        }
+    }
+
+    /// The current delegate's listing was read (start of a load).
+    pub(crate) fn seen_in_listing(&mut self, has_marker: bool) {
+        // A listing can race a re-save of this session whose marker write is
+        // not yet acknowledged; never let it hide a running migration.
+        self.present = has_marker || self.in_flight > 0;
+    }
+
+    /// Whether the load and identity-import gates must treat the room set as
+    /// incomplete.
+    pub(crate) fn in_progress(&self) -> bool {
+        self.present || self.in_flight > 0
+    }
+
+    /// At the fan-out's quiescence: may the migration be sealed (and the
+    /// marker deleted)? Never with a re-save running or after one failed.
+    pub(crate) fn may_seal(&self) -> bool {
+        self.in_flight == 0 && !self.failed
+    }
+
+    /// At a seal: whether there is a marker to delete. Clears it.
+    pub(crate) fn take_marker_for_deletion(&mut self) -> bool {
+        std::mem::take(&mut self.present)
+    }
+}
+
+/// The production [`MigrationMarkerState`].
+static MIGRATION_MARKER: std::sync::Mutex<MigrationMarkerState> =
+    std::sync::Mutex::new(MigrationMarkerState {
+        present: false,
+        in_flight: 0,
+        failed: false,
+    });
+
+fn with_marker<T>(f: impl FnOnce(&mut MigrationMarkerState) -> T) -> T {
+    let mut guard = MIGRATION_MARKER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut guard)
+}
 
 /// Whether the room set is still being RECOVERED and is therefore NOT yet
 /// fully authoritative (freenet/river#414, Codex round-9 P1).
@@ -9399,8 +9591,9 @@ static LEGACY_MIGRATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// identity-import gate ANDs `!rooms_recovery_in_progress()` on top of
 /// `Loaded && !saw_fetch_failure`, so imports wait for recovery to finish.
 ///
-/// True while EITHER the interrupted-migration flag is set (recovery pending /
-/// running — cleared only on a full successful re-save) OR any awaited load
+/// True while EITHER the interrupted-migration marker is present or a re-save is
+/// running ([`MigrationMarkerState::in_progress`]; cleared at the legacy
+/// fan-out's quiescence seal once every re-save succeeded) OR any awaited load
 /// worker is still in flight (`PENDING_LOADS != 0`). This does NOT weaken the
 /// recovery; it only makes imports wait for it.
 pub(crate) fn rooms_recovery_in_progress() -> bool {
@@ -9410,7 +9603,7 @@ pub(crate) fn rooms_recovery_in_progress() -> bool {
 /// True if a legacy migration was started but not confirmed complete (see
 /// [`LEGACY_MIGRATION_IN_PROGRESS_KEY`]).
 pub fn is_legacy_migration_in_progress() -> bool {
-    LEGACY_MIGRATION_IN_PROGRESS.load(Ordering::Relaxed)
+    with_marker(|m| m.in_progress())
 }
 
 /// Whether the current delegate's key listing carries the in-progress marker.
@@ -9419,37 +9612,22 @@ pub(crate) fn listing_has_migration_marker(keys: &[ChatDelegateKey]) -> bool {
         .any(|k| k.as_bytes() == LEGACY_MIGRATION_IN_PROGRESS_KEY)
 }
 
-/// Seed the session flag from the CURRENT delegate's `ListResponse`, before the
-/// load decides between per-room, blob and legacy paths.
+/// Seed the session state from the CURRENT delegate's `ListResponse`, before
+/// the load decides between per-room, blob and legacy paths.
 pub(crate) fn note_migration_marker_from_listing(keys: &[ChatDelegateKey]) {
     let interrupted = listing_has_migration_marker(keys);
     if interrupted {
         info!("Current delegate carries the migration-in-progress marker — a prior migration was interrupted");
     }
-    LEGACY_MIGRATION_IN_PROGRESS.store(interrupted, Ordering::Relaxed);
+    with_marker(|m| m.seen_in_listing(interrupted));
 }
 
-/// Raise the session flag at the moment a migration starts (synchronously, so
-/// the identity-import gate sees it before any spawned save runs). The durable
-/// half is [`mark_legacy_migration_in_progress`].
-pub(crate) fn begin_legacy_migration() {
-    LEGACY_MIGRATION_IN_PROGRESS.store(true, Ordering::Relaxed);
-}
-
-/// Mark a legacy migration as in progress (call BEFORE the re-save), and
-/// persist the marker in the current delegate. Returns `Err` if the delegate
-/// did not acknowledge the marker: the caller must then NOT start the re-save,
-/// because a partial per-room set without a durable marker is exactly the state
-/// that strands rooms. Skipping is safe — nothing has been written yet, so the
-/// next load still sees an empty successor and migrates from scratch.
-pub(crate) async fn mark_legacy_migration_in_progress() -> Result<(), String> {
-    LEGACY_MIGRATION_IN_PROGRESS.store(true, Ordering::Relaxed);
-    match send_delegate_request(ChatDelegateRequestMsg::StoreRequest {
-        key: ChatDelegateKey::new(LEGACY_MIGRATION_IN_PROGRESS_KEY.to_vec()),
-        value: b"1".to_vec(),
-    })
-    .await
-    {
+/// Interpret the delegate's reply to the marker store. Only an explicit
+/// `StoreResponse { result: Ok }` counts as written.
+pub(crate) fn marker_store_outcome(
+    reply: Result<ChatDelegateResponseMsg, String>,
+) -> Result<(), String> {
+    match reply {
         Ok(ChatDelegateResponseMsg::StoreResponse { result: Ok(()), .. }) => Ok(()),
         Ok(ChatDelegateResponseMsg::StoreResponse { result: Err(e), .. }) => {
             Err(format!("delegate refused the migration marker: {e}"))
@@ -9461,19 +9639,52 @@ pub(crate) async fn mark_legacy_migration_in_progress() -> Result<(), String> {
     }
 }
 
-/// Clear the "legacy migration in progress" marker (call only after a FULL,
-/// successful re-save — alongside [`mark_legacy_migration_done`]). A failed
-/// delete leaves the marker in the delegate, which costs one harmless recovery
-/// re-probe on the next load; the session flag is cleared regardless because
-/// this session's migration did complete.
-pub(crate) async fn clear_legacy_migration_in_progress() {
-    LEGACY_MIGRATION_IN_PROGRESS.store(false, Ordering::Relaxed);
+/// Register a migration re-save the moment it is decided on, synchronously, so
+/// the load and identity-import gates see it before the spawned save runs.
+/// Must be followed by [`mark_legacy_migration_in_progress`] in that save.
+pub(crate) fn begin_legacy_migration() {
+    with_marker(|m| m.begin());
+}
+
+/// Persist the marker in the current delegate, BEFORE the re-save's first
+/// write. Returns `Err` if the delegate did not acknowledge it; the caller must
+/// then NOT start the re-save (and must not call [`end_legacy_migration`]),
+/// because a partial per-room set without a durable marker is exactly the
+/// state that strands rooms. Skipping is safe: nothing has been written yet,
+/// so the next load still finds no per-room keys and migrates from scratch.
+pub(crate) async fn mark_legacy_migration_in_progress() -> Result<(), String> {
+    let reply = send_delegate_request(ChatDelegateRequestMsg::StoreRequest {
+        key: ChatDelegateKey::new(LEGACY_MIGRATION_IN_PROGRESS_KEY.to_vec()),
+        value: b"1".to_vec(),
+    })
+    .await;
+    let outcome = marker_store_outcome(reply);
+    if outcome.is_err() {
+        // Nothing was written: this re-save neither ran nor failed.
+        with_marker(|m| m.in_flight = m.in_flight.saturating_sub(1));
+    }
+    outcome
+}
+
+/// A re-save started by [`mark_legacy_migration_in_progress`] ended. Does NOT
+/// delete the marker: that happens at the fan-out's quiescence seal, see
+/// [`MigrationMarkerState`].
+pub(crate) fn end_legacy_migration(succeeded: bool) {
+    with_marker(|m| m.end(succeeded));
+}
+
+/// Delete the marker from the current delegate. Called only from the
+/// quiescence seal. A failed delete leaves it in place, which costs one
+/// harmless recovery re-probe on the next load.
+async fn delete_migration_marker() {
     match send_delegate_request(ChatDelegateRequestMsg::DeleteRequest {
         key: ChatDelegateKey::new(LEGACY_MIGRATION_IN_PROGRESS_KEY.to_vec()),
     })
     .await
     {
-        Ok(ChatDelegateResponseMsg::DeleteResponse { result: Ok(()), .. }) => {}
+        Ok(ChatDelegateResponseMsg::DeleteResponse { result: Ok(()), .. }) => {
+            info!("Migration complete — deleted the migration-in-progress marker");
+        }
         other => warn!("Could not delete the migration-in-progress marker: {other:?}"),
     }
 }
@@ -9948,11 +10159,20 @@ fn schedule_legacy_seal(armed_gen: u32, armed_attempt: u32) {
             // across sessions, since `fire_legacy_migration_request` checks the
             // seal BEFORE the in-progress flag. Leaving it unsealed just means a
             // harmless re-probe next session — the safe direction.
-            if is_legacy_migration_in_progress() {
+            //
+            // A marker that is merely PRESENT (seen in the listing: this load
+            // is a recovery) must not block the seal, or a recovery that finds
+            // nothing to add would never converge (#757 review).
+            if !with_marker(|m| m.may_seal()) {
                 return;
             }
             if LEGACY_SEAL_PENDING.swap(false, Ordering::Relaxed) {
                 mark_legacy_migration_done();
+                // The fan-out is over and every re-save it started succeeded:
+                // the per-room set is complete, so the marker goes.
+                if with_marker(|m| m.take_marker_for_deletion()) {
+                    crate::util::safe_spawn_local(delete_migration_marker());
+                }
             }
         });
     });
