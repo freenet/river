@@ -21,8 +21,8 @@ use dioxus::prelude::ReadableExt;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use freenet_stdlib::prelude::{
-    ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, Parameters, UpdateData,
-    WrappedContract, WrappedState,
+    ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
+    Parameters, UpdateData, WrappedContract, WrappedState,
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
@@ -865,6 +865,20 @@ pub async fn handle_get_response(
                 .verify_signature(&owner_vk)
                 .is_ok();
 
+            // Does this answer the code-free subscribe GET `process_rooms`
+            // sent instead of a PUT (freenet/river#757)? If it came back
+            // without real state, the room has to be re-seeded with a PUT:
+            // recorded here so every later attempt PUTs, whatever the backward
+            // probe below then does.
+            let completes_subscribe_get = is_current_key
+                && SYNC_INFO.with_mut(|sync_info| {
+                    if retrieved_has_real_state {
+                        sync_info.take_subscribe_get(&owner_vk)
+                    } else {
+                        sync_info.subscribe_get_found_nothing(&owner_vk)
+                    }
+                });
+
             if is_current_key && !retrieved_has_real_state {
                 info!(
                     "Current contract key for room {:?} returned empty/default state — \
@@ -899,6 +913,14 @@ pub async fn handle_get_response(
                     "No legacy generations for room {:?} — falling through to seed current key",
                     MemberId::from(owner_vk)
                 );
+                if completes_subscribe_get {
+                    // The subscribe GET reached the contract but found no real
+                    // state, and there is nothing older to recover. Seed it
+                    // with the local snapshot, as the PUT the GET replaced
+                    // would have (freenet/river#757).
+                    request_seed_put(owner_vk);
+                    return Ok(());
+                }
             }
 
             // Imported rooms use GET-first because their default state has an
@@ -939,6 +961,10 @@ pub async fn handle_get_response(
             // ("missing contract parameters"). An already-subscribed room
             // has no PUT, so its heal goes out as a standalone UPDATE
             // further down.
+            // The network's state, kept as the sync baseline when this GET
+            // completes a subscribe (freenet/river#757). Cloned only then.
+            let subscribe_get_baseline = completes_subscribe_get.then(|| retrieved_state.clone());
+
             let mut retrieved_state_for_put = retrieved_state.clone();
             if needs_put_subscribe {
                 if let Some(heal) = &member_info_heal {
@@ -1202,6 +1228,14 @@ pub async fn handle_get_response(
                         mark_initial_sync_complete(&owner_vk);
                     });
                 }
+            } else if let Some(network_state) = subscribe_get_baseline {
+                // This GET was the room's subscribe (freenet/river#757): the
+                // node registered the subscription and cached the contract
+                // code, and the network's state is merged above. Run AFTER that
+                // merge (`defer` is FIFO) so the comparison sees merged state.
+                crate::util::defer(move || {
+                    complete_subscribe_get(owner_vk, network_state);
+                });
             } else {
                 // Normal refresh — already subscribed, just update sync info
                 crate::util::defer(move || {
@@ -1214,6 +1248,89 @@ pub async fn handle_get_response(
     }
 
     Ok(())
+}
+
+/// Finish a code-free subscribe GET (freenet/river#757) once its state has
+/// been merged into `ROOMS`.
+///
+/// The baseline becomes the network's state, not the merged one, the same rule
+/// `update_room_state` follows: whatever this device holds that the network
+/// did not (messages sent while offline, a member-info edit that never landed)
+/// then shows up in `needs_to_send_update` as a delta and goes out as an
+/// `Update`. That is what the full-state PUT used to deliver as a side effect,
+/// for a fraction of the bytes. `mark_needs_sync` drives that `ProcessRooms`;
+/// when local and network state already agree, nothing is sent.
+fn complete_subscribe_get(owner_vk: ed25519_dalek::VerifyingKey, network_state: ChatRoomStateV1) {
+    SYNC_INFO.with_mut(|sync_info| {
+        sync_info.update_last_synced_state(&owner_vk, &network_state);
+        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+    });
+    let local_ahead = match ROOMS.try_read() {
+        Ok(rooms) => rooms
+            .map
+            .get(&owner_vk)
+            .is_some_and(|rd| rd.room_state != network_state),
+        // Unreadable: assume it differs. A spurious sync computes an empty
+        // delta and sends nothing.
+        Err(_) => true,
+    };
+    if local_ahead {
+        info!(
+            "Room {:?} holds state the network lacks — pushing it as a delta",
+            MemberId::from(owner_vk)
+        );
+        crate::components::app::mark_needs_sync(owner_vk);
+    }
+}
+
+/// Re-seed `owner_vk`'s room with a full PUT after its code-free subscribe GET
+/// found nothing (freenet/river#757). The caller has already flagged the room
+/// `needs_seed_put`; resetting it to `Disconnected` and running `ProcessRooms`
+/// now sends that PUT through the one path that owns it, instead of waiting
+/// for the subscription timeout.
+fn request_seed_put(owner_vk: ed25519_dalek::VerifyingKey) {
+    info!(
+        "Room {:?} not found on the network — re-seeding it with a PUT",
+        MemberId::from(owner_vk)
+    );
+    SYNC_INFO.with_mut(|sync_info| {
+        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Disconnected);
+    });
+    let tx = crate::components::app::SYNCHRONIZER
+        .read()
+        .get_message_sender();
+    if let Err(e) = tx.unbounded_send(
+        crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage::ProcessRooms,
+    ) {
+        // The subscription-timeout backstop still retries it, with a PUT.
+        error!("Failed to request a re-seed PUT: {}", e);
+    }
+}
+
+/// A GET came back `NotFound`: no peer holds the contract
+/// (freenet/river#757).
+///
+/// Only a room whose code-free subscribe GET is outstanding acts on it, by
+/// re-seeding with a PUT. Every other GET (a pending invitation, an imported
+/// room, a refresh, a backward-probe hop) keeps its existing behaviour, which
+/// was to ignore a `NotFound` and let its own timeout handle it.
+pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
+    if crate::components::app::freenet_api::backward_probe::is_probe_instance(&instance_id) {
+        info!("NotFound for backward-probe contract {}", instance_id);
+        return;
+    }
+    let Some(owner_vk) = SYNC_INFO.read().get_owner_vk_for_instance_id(&instance_id) else {
+        info!("NotFound for unrecognised contract {}", instance_id);
+        return;
+    };
+    if SYNC_INFO.with_mut(|sync_info| sync_info.subscribe_get_found_nothing(&owner_vk)) {
+        request_seed_put(owner_vk);
+    } else {
+        info!(
+            "NotFound for room {:?} with no subscribe GET outstanding — ignoring",
+            MemberId::from(owner_vk)
+        );
+    }
 }
 
 /// Adopt a backward-probe-recovered state (freenet/river#292, Task 3): the
@@ -2381,6 +2498,57 @@ mod tests {
             "the re-accept short-circuit must judge membership against the canonical \
              `retrieved_state`, not the local ROOMS snapshot, so a stale local \
              membership can't suppress a legitimate rejoin (freenet/river#367)."
+        );
+    }
+
+    /// freenet/river#757 safety net, source pin: a `NotFound` for a room whose
+    /// code-free subscribe GET is outstanding must re-seed it with a PUT. The
+    /// state machine is unit-tested in `sync_info.rs`; this pins the wiring
+    /// from the response to that PUT, which no native test can drive.
+    #[test]
+    fn not_found_on_a_subscribe_get_requests_the_seed_put() {
+        let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        let full = include_str!("get_response.rs");
+        let src = strip(full.split("mod tests {").next().unwrap());
+        // Production fns in file order: complete_subscribe_get,
+        // request_seed_put, handle_get_not_found, adopt_recovered_probe_state.
+        let between = |head: &str, next: &str| -> String {
+            let start = src
+                .find(head)
+                .unwrap_or_else(|| panic!("{head} must exist"));
+            let rest = &src[start..];
+            rest[..rest
+                .find(next)
+                .unwrap_or_else(|| panic!("{next} must follow {head}"))]
+                .to_string()
+        };
+
+        let not_found = between(
+            "pubasyncfnhandle_get_not_found(",
+            "pub(crate)asyncfnadopt_recovered_probe_state(",
+        );
+        let consumed = not_found
+            .find("subscribe_get_found_nothing(&owner_vk)")
+            .expect("handle_get_not_found must consume the outstanding subscribe GET");
+        let seeded = not_found
+            .find("request_seed_put(owner_vk)")
+            .expect("handle_get_not_found must request the seed PUT");
+        assert!(consumed < seeded);
+
+        let reseed = between("fnrequest_seed_put(", "pubasyncfnhandle_get_not_found(");
+        assert!(
+            reseed.contains("RoomSyncStatus::Disconnected"),
+            "the re-seed must hand the room back to process_rooms as Disconnected"
+        );
+        assert!(
+            reseed.contains("SynchronizerMessage::ProcessRooms"),
+            "the re-seed must run ProcessRooms now, not wait for the timeout"
+        );
+
+        let handler = strip(include_str!("../response_handler.rs"));
+        assert!(
+            handler.contains("ContractResponse::NotFound{instance_id}=>{handle_get_not_found(instance_id).await;"),
+            "handle_api_response must route NotFound to handle_get_not_found"
         );
     }
 }

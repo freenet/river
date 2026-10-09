@@ -28,6 +28,7 @@ use crate::components::app::chat_delegate::{
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
+use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::room_data::{RoomSlot, Rooms, RoomsMeta};
@@ -38,7 +39,7 @@ use dioxus::prelude::ReadableExt;
 
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 use freenet_stdlib::prelude::{DelegateKey, OutboundDelegateMsg};
-pub use get_response::handle_get_response;
+pub use get_response::{handle_get_not_found, handle_get_response};
 pub use put_response::handle_put_response;
 use river_core::chat_delegate::{
     CasStoreResult, ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg,
@@ -104,6 +105,9 @@ impl ResponseHandler {
                         state.to_vec(),
                     )
                     .await?;
+                }
+                ContractResponse::NotFound { instance_id } => {
+                    handle_get_not_found(instance_id).await;
                 }
                 ContractResponse::PutResponse { key } => {
                     handle_put_response(&mut self.room_synchronizer, key).await?;
@@ -1574,6 +1578,19 @@ fn hydrate_loaded_rooms_with_authority(
         .copied()
         .filter(|k| !tombstoned.contains(k))
         .collect();
+    // These rooms have been on the network before, so their first subscribe
+    // can try a code-free GET rather than re-uploading the contract
+    // (freenet/river#757). Deferred AHEAD of the merge below (`defer` is FIFO),
+    // so no `process_rooms` can see a room before it is marked.
+    let known_keys = room_keys.clone();
+    crate::util::defer(move || {
+        SYNC_INFO.with_mut(|sync_info| {
+            for key in known_keys {
+                sync_info.mark_known_on_network(key);
+            }
+        });
+    });
+
     // Merge the loaded rooms with the current rooms
     let loaded_keys = room_keys.clone();
     crate::util::defer(move || {
@@ -1938,9 +1955,12 @@ fn hydrate_loaded_rooms_with_authority(
     // right thing per room: imported rooms
     // (default placeholder state) GET with
     // return_contract_code=true; full-state
-    // rooms PUT with subscribe=true. Both cache
-    // the contract WASM on the node BEFORE any
-    // subscribe, so the subscription succeeds.
+    // rooms GET with subscribe=true and no
+    // code (freenet/river#757), re-seeding
+    // with a PUT if the network lacks them.
+    // Each makes the node cache the contract
+    // WASM itself, so the subscription
+    // succeeds.
     let had_loaded_rooms = !room_keys.is_empty();
     info!(
         "Scheduling initial sync for {} rooms loaded from delegate",
