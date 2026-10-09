@@ -42,7 +42,7 @@ rand = { version = "0.8.5", features = ["getrandom"], default-features = true }
 # room-contract WASM with unresolvable wasm-bindgen imports
 # (issue freenet/river#241).
 getrandom = { version = "0.2.16" }
-base64 = "0.22.1"
+base64 = "0.23.1"
 once_cell = "1.18.0"
 data-encoding = "2.3.3"
 tracing = "0.1.40"
