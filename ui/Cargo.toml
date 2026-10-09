@@ -43,10 +43,18 @@ web-sys = { workspace = true, features = [
     "Event",
     "EventTarget",
     "CssStyleDeclaration",
+    "Blob",
+    "File",
     "HtmlAnchorElement",
     "HtmlElement",
+    "HtmlInputElement",
     "HtmlTextAreaElement",
+    "HtmlVideoElement",
     "MessageEvent",
+    "MediaDevices",
+    "MediaStream",
+    "MediaStreamConstraints",
+    "MediaStreamTrack",
     "MouseEvent",
     "IntersectionObserver",
     "IntersectionObserverEntry",
@@ -99,6 +107,7 @@ freenet-migrate = "0.5"
 
 futures = "0.3.30"
 futures-timer = "3.0.3"
+qrcode = { version = "0.14", default-features = false }
 
 # Add this section for the build script
 [build-dependencies]
@@ -108,5 +117,10 @@ chrono = "0.4"
 freenet-migrate-build = "0.2"
 
 [dev-dependencies]
+# GrayImage only. Default image features pull AV1 and are unused by the QR test.
+image = { version = "0.25.10", default-features = false }
+# `img` is the feature that implements rqrr's buffer trait for `image::GrayImage`.
+# It does not enable image's codec defaults.
+rqrr = { version = "0.11.0", default-features = false, features = ["img"] }
 # Reads the shared share-link test vectors (util/share-link-vectors.json).
 serde_json = "1"

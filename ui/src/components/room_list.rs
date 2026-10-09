@@ -1,6 +1,7 @@
 pub(crate) mod create_room_modal;
 pub(crate) mod dm_rail_section;
 pub(crate) mod edit_room_modal;
+pub(crate) mod invite_qr_scan;
 pub(crate) mod join_with_code_modal;
 pub(crate) mod notification_modal;
 pub(crate) mod receive_invitation_modal;

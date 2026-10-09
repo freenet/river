@@ -8,7 +8,7 @@ use freenet_stdlib::prelude::tracing::info;
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::room_state::member::MemberId;
 use river_core::ChatRoomStateV1;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Get current time in milliseconds (works in WASM)
 pub(crate) fn now_ms() -> f64 {
@@ -53,6 +53,29 @@ pub const CONTRACT_NOT_FOUND_ERROR: &str =
 pub struct SyncInfo {
     map: HashMap<VerifyingKey, RoomSyncInfo>,
     instances: HashMap<ContractInstanceId, VerifyingKey>,
+    /// Rooms whose contract we have reason to believe the network already
+    /// holds: loaded from delegate storage, or subscribed earlier this session.
+    /// Only these subscribe with a code-free GET; everything else (a room
+    /// created this session, say) seeds with a full PUT as before
+    /// (freenet/river#757). Kept outside `map` so it can be set before the room
+    /// is registered, which must not happen early: registration in
+    /// `rooms_awaiting_subscription` is what seeds `last_synced_state`.
+    known_on_network: HashSet<VerifyingKey>,
+}
+
+/// How [`crate::components::app::freenet_api::room_synchronizer::RoomSynchronizer::process_rooms`]
+/// subscribes a room that already holds valid state (freenet/river#757).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SubscribeRoute {
+    /// `GET { return_contract_code: false, subscribe: true }`: no upload. The
+    /// node fetches and caches the contract code itself, registers this
+    /// client's subscription, and returns the network's state, which is merged
+    /// locally and pushes back any local-only changes as a delta UPDATE.
+    Get,
+    /// `PUT { contract, state, subscribe: true }`: uploads the contract WASM and
+    /// the full local state. This is the re-seed that recovers a room the
+    /// network lost (a77bfe76), and the only way to create a new room.
+    Put,
 }
 
 pub struct RoomSyncInfo {
@@ -69,6 +92,13 @@ pub struct RoomSyncInfo {
     /// room that already holds valid synced state the counter is tracked but
     /// never trips the bound (see `record_failed_sync_attempt`).
     pub failed_sync_attempts: u32,
+    /// A code-free subscribe GET ([`SubscribeRoute::Get`]) is outstanding for
+    /// this room (freenet/river#757).
+    pub subscribe_get_in_flight: bool,
+    /// The last subscribe GET did not come back with state — the node answered
+    /// `NotFound`, an error, or nothing in time — so the next attempt must
+    /// re-seed with a full PUT. Cleared once the room reaches `Subscribed`.
+    pub needs_seed_put: bool,
 }
 
 impl SyncInfo {
@@ -76,6 +106,7 @@ impl SyncInfo {
         SyncInfo {
             map: HashMap::new(),
             instances: HashMap::new(),
+            known_on_network: HashSet::new(),
         }
     }
 
@@ -95,6 +126,8 @@ impl SyncInfo {
                 last_synced_state: None,
                 subscribing_since: None,
                 failed_sync_attempts: 0,
+                subscribe_get_in_flight: false,
+                needs_seed_put: false,
             });
 
             self.instances.insert(*contract_id, owner_key);
@@ -124,8 +157,85 @@ impl SyncInfo {
             // and give up prematurely (freenet/river#290).
             if status == RoomSyncStatus::Subscribed {
                 sync_info.failed_sync_attempts = 0;
+                // Subscribed means the network holds the contract now, however
+                // we got here, so a later re-subscribe (a reconnect) can skip
+                // the upload (freenet/river#757).
+                sync_info.subscribe_get_in_flight = false;
+                sync_info.needs_seed_put = false;
+                self.known_on_network.insert(*owner_key);
             }
             sync_info.sync_status = status;
+        }
+    }
+
+    /// Record that `owner_key`'s room came out of delegate storage, so its
+    /// contract has (very likely) been on the network before and the first
+    /// subscribe can try a code-free GET (freenet/river#757). If the network
+    /// has since lost it, the GET's failure falls back to the re-seeding PUT.
+    pub fn mark_known_on_network(&mut self, owner_key: VerifyingKey) {
+        self.known_on_network.insert(owner_key);
+    }
+
+    /// Which way to subscribe `owner_key`'s room next (freenet/river#757). The
+    /// GET is tried only for a room believed to be on the network whose last
+    /// subscribe GET did not fail; anything else seeds with a PUT, which is
+    /// what every subscribe did before this route existed.
+    pub fn subscribe_route(&self, owner_key: &VerifyingKey) -> SubscribeRoute {
+        let failed_get = self
+            .map
+            .get(owner_key)
+            .is_some_and(|info| info.needs_seed_put);
+        if self.known_on_network.contains(owner_key) && !failed_get {
+            SubscribeRoute::Get
+        } else {
+            SubscribeRoute::Put
+        }
+    }
+
+    /// The node refused a subscription for `owner_key` with local state on
+    /// hand: re-seed it with the PUT next, whichever route the refused
+    /// subscription came from (freenet/river#757). Before the GET route every
+    /// subscription followed a PUT, so this was already the behaviour.
+    pub fn require_seed_put(&mut self, owner_key: &VerifyingKey) {
+        if let Some(sync_info) = self.map.get_mut(owner_key) {
+            sync_info.subscribe_get_in_flight = false;
+            sync_info.needs_seed_put = true;
+        }
+    }
+
+    /// A subscribe GET was sent for `owner_key` (freenet/river#757).
+    pub fn note_subscribe_get_sent(&mut self, owner_key: &VerifyingKey) {
+        if let Some(sync_info) = self.map.get_mut(owner_key) {
+            sync_info.subscribe_get_in_flight = true;
+        }
+    }
+
+    /// A `GetResponse` with state arrived for `owner_key`. Returns `true` if it
+    /// answers an outstanding subscribe GET, in which case the caller completes
+    /// the subscription from it (freenet/river#757).
+    pub fn take_subscribe_get(&mut self, owner_key: &VerifyingKey) -> bool {
+        match self.map.get_mut(owner_key) {
+            Some(sync_info) if sync_info.subscribe_get_in_flight => {
+                sync_info.subscribe_get_in_flight = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The node reported `owner_key`'s contract missing (or returned no usable
+    /// state for it). Returns `true` if that answers an outstanding subscribe
+    /// GET: the room must now be re-seeded with a PUT, and the caller does so
+    /// at once (freenet/river#757). Any later attempt also PUTs until the room
+    /// reaches `Subscribed`.
+    pub fn subscribe_get_found_nothing(&mut self, owner_key: &VerifyingKey) -> bool {
+        match self.map.get_mut(owner_key) {
+            Some(sync_info) if sync_info.subscribe_get_in_flight => {
+                sync_info.subscribe_get_in_flight = false;
+                sync_info.needs_seed_put = true;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -200,6 +310,13 @@ impl SyncInfo {
         };
         sync_info.failed_sync_attempts = sync_info.failed_sync_attempts.saturating_add(1);
         sync_info.subscribing_since = None;
+        // A subscribe GET that timed out or errored proves nothing about
+        // whether the network has the room, so retry the way that cannot miss:
+        // the re-seeding PUT (freenet/river#757).
+        if sync_info.subscribe_get_in_flight {
+            sync_info.subscribe_get_in_flight = false;
+            sync_info.needs_seed_put = true;
+        }
         if awaiting_initial_sync && sync_info.failed_sync_attempts >= MAX_SYNC_ATTEMPTS_BEFORE_ERROR
         {
             warn!(
@@ -300,7 +417,7 @@ impl SyncInfo {
                     let elapsed_ms = current_time - started_at;
                     if elapsed_ms >= REPUT_DELAY_MS as f64 {
                         warn!(
-                            "Subscription timeout for room {:?} after {:.1}s - will re-PUT contract",
+                            "Subscription timeout for room {:?} after {:.1}s - will retry with a seeding PUT",
                             MemberId::from(*key),
                             elapsed_ms / 1000.0
                         );
@@ -689,6 +806,125 @@ mod tests {
             si.map.get(&owner).unwrap().sync_status,
             RoomSyncStatus::Disconnected
         );
+    }
+
+    /// freenet/river#757: a room loaded from delegate storage subscribes with a
+    /// code-free GET; a room this session created (never marked known) still
+    /// seeds with the PUT, because the network cannot have it yet.
+    #[test]
+    fn only_rooms_known_on_the_network_subscribe_by_get() {
+        let mut si = SyncInfo::new();
+        let (loaded, created) = (test_owner(20), test_owner(21));
+        si.mark_known_on_network(loaded);
+        si.register_new_room(loaded);
+        si.register_new_room(created);
+        assert_eq!(si.subscribe_route(&loaded), SubscribeRoute::Get);
+        assert_eq!(si.subscribe_route(&created), SubscribeRoute::Put);
+    }
+
+    /// freenet/river#757, the safety net: when the subscribe GET finds the
+    /// contract missing, the room must be re-seeded with the full PUT, and keep
+    /// PUTting until a subscription succeeds. Then a later re-subscribe (a
+    /// reconnect) goes back to the cheap GET.
+    #[test]
+    fn not_found_on_a_subscribe_get_falls_back_to_the_seeding_put() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(22);
+        si.mark_known_on_network(owner);
+        si.register_new_room(owner);
+
+        si.note_subscribe_get_sent(&owner);
+        si.update_sync_status(&owner, RoomSyncStatus::Subscribing);
+        assert!(
+            si.subscribe_get_found_nothing(&owner),
+            "a NotFound answering our subscribe GET must ask for a re-seed"
+        );
+        assert_eq!(
+            si.subscribe_route(&owner),
+            SubscribeRoute::Put,
+            "a room the network lost must be re-seeded with the PUT"
+        );
+
+        // The PUT itself can fail and be retried: still a PUT, never the GET.
+        assert!(si.record_failed_sync_attempt(&owner, false));
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Put);
+
+        // The PUT lands and the room subscribes: the network has it again.
+        si.update_sync_status(&owner, RoomSyncStatus::Subscribed);
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Get);
+    }
+
+    /// A subscribe GET that times out (or errors with no request id) says
+    /// nothing about whether the network has the room, so the retry must be the
+    /// PUT that works either way — exactly the pre-#757 behaviour.
+    #[test]
+    fn a_timed_out_subscribe_get_retries_with_the_seeding_put() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(23);
+        si.mark_known_on_network(owner);
+        si.register_new_room(owner);
+        si.note_subscribe_get_sent(&owner);
+        si.update_sync_status(&owner, RoomSyncStatus::Subscribing);
+
+        assert!(si.record_failed_sync_attempt(&owner, false));
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Put);
+        assert!(
+            !si.take_subscribe_get(&owner),
+            "the timed-out GET is no longer outstanding"
+        );
+    }
+
+    /// Only an OUTSTANDING subscribe GET reacts. A `NotFound` or `GetResponse`
+    /// for any other GET (an invitation, an imported room, a refresh) must not
+    /// flip a room to the PUT route or be mistaken for a subscription, and an
+    /// answer is consumed once.
+    #[test]
+    fn subscribe_get_answers_are_matched_once_and_only_when_outstanding() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(24);
+        si.mark_known_on_network(owner);
+        si.register_new_room(owner);
+
+        assert!(!si.subscribe_get_found_nothing(&owner));
+        assert!(!si.take_subscribe_get(&owner));
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Get);
+
+        si.note_subscribe_get_sent(&owner);
+        assert!(si.take_subscribe_get(&owner));
+        assert!(
+            !si.take_subscribe_get(&owner),
+            "consumed by the first answer"
+        );
+        assert!(
+            !si.subscribe_get_found_nothing(&owner),
+            "a late NotFound after the GET already answered must not force a PUT"
+        );
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Get);
+    }
+
+    /// A refused subscription (`SubscribeResponse { subscribed: false }`) puts
+    /// a known room back on the seeding PUT, as before the GET route existed.
+    #[test]
+    fn a_refused_subscription_requires_the_seeding_put() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(26);
+        si.mark_known_on_network(owner);
+        si.register_new_room(owner);
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Get);
+        si.require_seed_put(&owner);
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Put);
+    }
+
+    /// A room created this session joins the GET route once it has subscribed,
+    /// so a reconnect does not re-upload the contract for it either.
+    #[test]
+    fn a_subscribed_room_is_known_on_the_network() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(25);
+        si.register_new_room(owner);
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Put);
+        si.update_sync_status(&owner, RoomSyncStatus::Subscribed);
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Get);
     }
 
     /// `record_failed_sync_attempt` on an unknown room is a no-op that reports

@@ -185,9 +185,10 @@ plaintext in the chat delegate.
   bounded (`await_flag_with_bound`, 300 polls of 50 ms = 15 s), but the count
   runs only from the moment the current delegate's DM `GetRequest` is sent,
   and restarts for each new request (`OUTBOUND_DMS_HYDRATION_REQUEST`; each
-  setup pass resets it before its register, freenet/river#709). Before a
+  setup pass resets it before it sends anything, freenet/river#709). Before a
   request is out there is no bound: the save waits until a setup pass sends
-  one. If a save does give up and the `GetResponse` arrives later,
+  one, which since freenet/river#757 is once the room list is answered or the
+  delegate has been registered. If a save does give up and the `GetResponse` arrives later,
   `mark_outbound_dms_hydrated()` runs one catch-up save of the merged store. The latch is set
   by `mark_outbound_dms_hydrated()`, called only from the CURRENT (non-legacy)
   delegate's `OUTBOUND_DMS_STORAGE_KEY` `GetResponse` handler in
