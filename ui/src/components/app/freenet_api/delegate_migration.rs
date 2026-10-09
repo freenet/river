@@ -143,7 +143,8 @@ pub(crate) fn pred_wip_marker_key(predecessor: &DelegateKey) -> Vec<u8> {
     marker_key(MIGRATE_PRED_WIP_PREFIX, predecessor)
 }
 
-/// Whether `key` is one of THIS module's migration markers. Used to exclude
+/// Whether `key` is one of River's migration markers: this module's, or the
+/// sweep's in-progress marker (`LEGACY_MIGRATION_IN_PROGRESS_KEY`). Used to exclude
 /// markers from a predecessor's fetched pairs: when the current delegate later
 /// becomes a predecessor itself, its store contains these keys, and offering
 /// them to the writer (or re-copying them forward) would forge migration state.
@@ -151,7 +152,9 @@ pub(crate) fn pred_wip_marker_key(predecessor: &DelegateKey) -> Vec<u8> {
 /// deliberately a different, app-chosen format — see the module docs — so the
 /// crate cannot know to filter them.)
 pub(crate) fn is_migration_marker_key(key: &[u8]) -> bool {
-    key.starts_with(MIGRATE_PRED_DONE_PREFIX) || key.starts_with(MIGRATE_PRED_WIP_PREFIX)
+    key.starts_with(MIGRATE_PRED_DONE_PREFIX)
+        || key.starts_with(MIGRATE_PRED_WIP_PREFIX)
+        || key == crate::components::app::chat_delegate::LEGACY_MIGRATION_IN_PROGRESS_KEY
 }
 
 // ---------------------------------------------------------------------------

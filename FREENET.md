@@ -35,6 +35,7 @@ This file enumerates the Freenet contracts and delegates published from this rep
 ## Notes for integrators
 
 - Depend on `river-core` for the wire types; you almost never need to compile or execute the contract/delegate WASM yourself to read or construct River-compatible data.
+- Chat-delegate message byte fields (stored values, signing payloads) are CBOR **byte strings** from the delegate generation after `V32` (freenet/river#757); earlier generations used CBOR arrays of integers. River encodes with ciborium, which decodes either form into a `Vec<u8>`; a decoder built on another CBOR library must accept both.
 - Every contract/delegate here can re-key on any release (see the Migration notes above) — **a build-time-constant reference to a key will silently go stale.** Resolve a pointer instead; see below.
 
 ## Stable identity: resolve a pointer, do not pin a key

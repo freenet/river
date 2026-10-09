@@ -11,15 +11,16 @@ mod update_response;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
-    arm_legacy_migration_recovery, await_delegate_response, claim_list_load,
-    clear_legacy_migration_in_progress, complete_pending_public_key_request,
-    complete_pending_request, complete_pending_sign_request, complete_pending_signing_key_request,
+    arm_legacy_migration_recovery, await_delegate_response, begin_legacy_migration,
+    claim_list_load, complete_pending_public_key_request, complete_pending_request,
+    complete_pending_sign_request, complete_pending_signing_key_request,
     current_delegate_source_rank, decide_legacy_migration_action, decide_per_room_load_action,
-    enqueue_delegate_request, fire_legacy_migration_request, hydrate_hidden_dm_threads,
-    hydrate_outbound_dms_cache, is_legacy_delegate_key, is_legacy_migration_in_progress,
-    legacy_scoped_correlation, load_state_after_probe_legacy, mark_legacy_migration_done,
-    mark_legacy_migration_in_progress, mark_outbound_dms_hydrated, note_current_list_response,
-    note_delegate_response_for_register_ack, parse_room_storage_key, per_room_terminal,
+    end_legacy_migration, enqueue_delegate_request, fire_legacy_migration_request,
+    hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
+    is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
+    mark_legacy_migration_done, mark_legacy_migration_in_progress, mark_outbound_dms_hydrated,
+    note_current_list_response, note_delegate_response_for_register_ack,
+    note_migration_marker_from_listing, parse_room_storage_key, per_room_terminal,
     prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, request_outbound_dms_once,
     response_correlation_base, room_storage_key, save_outbound_dms_to_delegate,
     save_rooms_to_delegate, seed_saved_slots_from_load, send_delegate_request,
@@ -774,6 +775,10 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
     // (superseded by a Retry) can neither pollute the new attempt's
     // `SAW_FETCH_FAILURE` nor write its display state.
     let worker = LoadWorkerGuard::new();
+    // The interrupted-migration marker lives in the current delegate, so this
+    // listing is where a new session learns of it (see
+    // `LEGACY_MIGRATION_IN_PROGRESS_KEY`).
+    note_migration_marker_from_listing(&keys);
     match plan_load_from_keys(&keys) {
         LoadPlan::ProbeLegacy => {
             info!("Current delegate has no room data — firing legacy migration probe");
@@ -1020,13 +1025,14 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             //   case — same room key under a different signing key — keeps the
             //   local copy per `reconcile_room_present`; recovery does not widen
             //   that pre-existing behavior.)
-            // - On a successful full re-save the in-progress flag is cleared and
-            //   migration is marked done, so recovery converges. If the legacy
-            //   delegate is genuinely empty or no longer installed, nothing is
-            //   recovered and the flag persists; the next session re-probes once
-            //   — the SAME bounded, harmless cost the existing empty-legacy path
-            //   already pays (see the `is_legacy_delegate` no-`rooms_data` branch
-            //   above). No data loss, no spam loop.
+            // - Once the fan-out goes quiet with every re-save successful, the
+            //   quiescence seal deletes the in-progress marker and
+            //   migration is marked done, so recovery converges — including
+            //   when the legacy fan-out finds nothing to add. If no legacy
+            //   generation gives a definitive answer (all silent), nothing
+            //   requests the seal and the marker persists; the next session
+            //   re-probes once — a bounded, harmless cost. No data loss, no
+            //   spam loop.
             if action.recover && arm_legacy_migration_recovery() {
                 info!("Prior migration was interrupted — re-running to recover any stranded rooms");
                 // Background re-fill: the initial per-room load already resolved
@@ -1137,11 +1143,13 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
             value: Some(bytes), ..
         }) => match from_reader::<Rooms, _>(&bytes[..]) {
             Ok(loaded) => {
-                // Mark in progress BEFORE the explosion save; only mark done once
-                // it fully succeeds — otherwise a partial explosion would strand
-                // rooms on the next per-room load (freenet/river#345 follow-up,
-                // same hazard as the legacy-delegate path).
-                mark_legacy_migration_in_progress();
+                // Mark in progress BEFORE the explosion save (persisted inside
+                // the spawned save below, before its first write); only mark
+                // done once it fully succeeds — otherwise a partial explosion
+                // would strand rooms on the next per-room load
+                // (freenet/river#345 follow-up, same hazard as the
+                // legacy-delegate path).
+                begin_legacy_migration();
                 // freenet/river#397: a current-delegate blob explosion is a
                 // migration. Set `Migrating` BEFORE hydrate merges the rooms so a
                 // re-render lands on the "Migrating…" state before the list fills.
@@ -1186,9 +1194,15 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                 // gate the Loaded writes on still-current explicitly.
                 let attempt = worker.attempt();
                 crate::util::safe_spawn_local(async move {
-                    match save_rooms_to_delegate().await {
+                    if let Err(e) = mark_legacy_migration_in_progress().await {
+                        // Explode anyway: see `mark_legacy_migration_in_progress`.
+                        error!("Exploding rooms_data without a durable migration marker: {e}");
+                    }
+                    let saved = save_rooms_to_delegate().await;
+                    end_legacy_migration(saved.is_ok());
+                    match saved {
                         Ok(_) => {
-                            clear_legacy_migration_in_progress();
+                            // The marker is deleted by the quiescence seal.
                             request_legacy_seal_on_quiescence();
                             // Resolve to `Loaded` only if we merged live rooms;
                             // otherwise let the backstop own the terminal.
@@ -1198,8 +1212,8 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                         }
                         Err(e) => {
                             error!("Failed to explode single blob into per-room keys: {}", e);
-                            // Leave the in-progress flag set so the next load
-                            // re-runs the fill. Same had_rooms gate as the Ok arm.
+                            // The marker stays (a failed re-save blocks the
+                            // seal), so the next load re-runs the fill. Same had_rooms gate as the Ok arm.
                             if had_rooms {
                                 set_load_state_if_current(attempt, RoomsLoadState::Loaded);
                             }
@@ -1209,7 +1223,7 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
             }
             // A corrupt current-delegate blob is unparseable. We intentionally do
             // NOT mark migration done (a corrupt blob is not proof there's nothing
-            // to migrate) and do NOT touch the in-progress flag — if a prior
+            // to migrate) and do NOT touch the in-progress marker — if a prior
             // migration left it set, the next session re-runs recovery, and the
             // already-loaded per-room keys remain intact.
             Err(e) => {
@@ -2005,9 +2019,11 @@ fn hydrate_loaded_rooms_with_authority(
         // failure, or the tab closing mid-save) can leave a PARTIAL per-room set.
         // If we don't record that, the next load takes the per-room path and
         // never re-probes legacy, stranding any room whose key wasn't written
-        // until the user rejoins (freenet/river#345 follow-up). The flag stays
+        // until the user rejoins (freenet/river#345 follow-up). The marker stays
         // set until a FULL re-save succeeds, so the next load knows to re-fill.
-        mark_legacy_migration_in_progress();
+        // The session flag is raised now; the durable marker is written (and
+        // acknowledged) inside the spawned save, before its first per-room write.
+        begin_legacy_migration();
         // freenet/river#397 Codex review 4: only resolve to `Loaded` when this
         // legacy re-save actually merged live rooms. A zero-live-room / empty
         // legacy result writes NOTHING to the global state — so a concurrent
@@ -2015,10 +2031,17 @@ fn hydrate_loaded_rooms_with_authority(
         // into a false Empty by this one. The universal backstop owns the
         // all-nothing terminal (→ `LoadFailed` if a fetch failed, else Empty).
         crate::util::safe_spawn_local(async move {
-            match save_rooms_to_delegate().await {
+            if let Err(e) = mark_legacy_migration_in_progress().await {
+                // Re-save anyway: see `mark_legacy_migration_in_progress`.
+                error!("Migrating legacy rooms without a durable migration marker: {e}");
+            }
+            let saved = save_rooms_to_delegate().await;
+            end_legacy_migration(saved.is_ok());
+            match saved {
                 Ok(_) => {
                     info!("Successfully migrated room data to new delegate");
-                    clear_legacy_migration_in_progress();
+                    // The marker is deleted by the quiescence seal, not here:
+                    // a slower generation may still be about to re-save.
                     // Seal only once the whole legacy fan-out has gone quiet —
                     // NOT here (freenet/river#527). Every generation is probed
                     // at once; sealing on the FIRST one to finish its re-save
@@ -2037,7 +2060,8 @@ fn hydrate_loaded_rooms_with_authority(
                 }
                 Err(e) => {
                     error!("Failed to migrate room data to new delegate: {}", e);
-                    // Leave the in-progress flag set so the next load re-fills.
+                    // The marker stays (a failed re-save blocks the seal), so
+                    // the next load re-fills.
                     if had_loaded_rooms {
                         set_load_state_if_current(attempt, RoomsLoadState::Loaded);
                     }
@@ -2822,14 +2846,54 @@ mod tests {
         let resave_start = production
             .find("Migrating room data from legacy delegate to new delegate")
             .expect("legacy re-save block marker must exist");
-        let resave = &production[resave_start..(resave_start + 1800).min(production.len())];
+        let resave = &production[resave_start..(resave_start + 3000).min(production.len())];
+        // The durable marker must be ACKNOWLEDGED before the first per-room
+        // write, and its failure must abort the save (a partial per-room set
+        // without a marker is the stranding state).
+        let mark = resave
+            .find("if let Err(e) = mark_legacy_migration_in_progress().await")
+            .expect("legacy re-save must persist the in-progress marker first");
+        let save = resave
+            .find("save_rooms_to_delegate().await")
+            .expect("legacy re-save block must save");
         assert!(
-            resave.contains("mark_legacy_migration_in_progress()"),
-            "legacy re-save must mark migration in progress BEFORE saving"
+            mark < save,
+            "the marker must be persisted BEFORE the re-save"
         );
         assert!(
-            resave.contains("clear_legacy_migration_in_progress()"),
-            "legacy re-save must clear the in-progress flag on success"
+            !resave[mark..save].contains("return;"),
+            "an unacknowledged marker must NOT abort the re-save: the merged rooms are \
+             written by other save paths anyway, so aborting only loses completeness"
+        );
+        assert!(
+            resave[save..].contains("end_legacy_migration(saved.is_ok());"),
+            "the re-save must report how it ended (the seal deletes the marker)"
+        );
+
+        // (1b) The same ordering for the current-blob explosion.
+        let blob_start = production
+            .find("Exploding rooms_data without a durable migration marker")
+            .expect("blob explosion must persist the marker first");
+        let blob_window =
+            &production[blob_start.saturating_sub(400)..(blob_start + 900).min(production.len())];
+        let blob_mark = blob_window
+            .find("if let Err(e) = mark_legacy_migration_in_progress().await")
+            .expect("blob explosion must persist the marker");
+        let blob_save = blob_window
+            .find("save_rooms_to_delegate().await")
+            .expect("blob explosion must save");
+        assert!(blob_mark < blob_save);
+        assert!(!blob_window[blob_mark..blob_save].contains("return;"));
+        assert!(blob_window[blob_save..].contains("end_legacy_migration(saved.is_ok());"));
+
+        // (1c) A new session learns of the marker from the current delegate's
+        //      listing, BEFORE the load plan is chosen (the marker is in the
+        //      delegate, not localStorage, which the gateway iframe lacks).
+        assert!(
+            production.contains(
+                "note_migration_marker_from_listing(&keys);\n    match plan_load_from_keys(&keys)"
+            ),
+            "the per-room load must seed the in-progress flag from the listing first"
         );
 
         // (2) Per-room load routes its gating through the pure, unit-tested
@@ -3130,7 +3194,7 @@ mod tests {
         // (c) the save-completion closure resolves `Loaded` WITHOUT a `!recovery`
         // guard — a completion must resolve even under recovery (Codex review 3).
         let save_pos = body
-            .find("match save_rooms_to_delegate().await {")
+            .find("let saved = save_rooms_to_delegate().await;")
             .expect("the blob-explosion save closure must exist");
         // Bound to the closure body (up to the corrupt-blob `Err(e) =>` arm that
         // follows the spawn).
@@ -3614,6 +3678,20 @@ mod tests {
             LoadPlan::ProbeLegacy
         );
         assert_eq!(plan_load_from_keys(&[]), LoadPlan::ProbeLegacy);
+        // The migration marker is not room data: alone it still probes legacy,
+        // and next to a room key the per-room path (which reads the marker
+        // separately) is taken.
+        let marker =
+            dk(crate::components::app::chat_delegate::LEGACY_MIGRATION_IN_PROGRESS_KEY.to_vec());
+        assert_eq!(
+            plan_load_from_keys(&[marker.clone()]),
+            LoadPlan::ProbeLegacy
+        );
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        assert!(matches!(
+            plan_load_from_keys(&[marker, dk(room_storage_key(&owner))]),
+            LoadPlan::PerRoom { .. }
+        ));
     }
 
     /// Reconstruct routes `Present` → `map`, `Tombstone` → `removed_rooms`, and

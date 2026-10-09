@@ -3623,6 +3623,86 @@ mod tests {
         );
     }
 
+    /// freenet/river#757 — an interrupted-migration RECOVERY re-runs the legacy
+    /// fill on top of a live set the user has kept using. Possible because the
+    /// in-progress marker is now durable: a crash mid-save, or a lost delete of
+    /// the marker after a complete save, both re-run the merge of the legacy
+    /// generation into rooms loaded from the current delegate.
+    ///
+    /// The re-run must be additive only: restore a stranded room, keep a room
+    /// joined since, keep a room left since left, and never replace the live
+    /// identity with the legacy one.
+    #[test]
+    fn a_recovery_rerun_only_adds_rooms_the_live_set_lacks() {
+        let kept = SigningKey::from_bytes(&[41u8; 32]).verifying_key();
+        let left = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        let joined_since = SigningKey::from_bytes(&[43u8; 32]).verifying_key();
+        let stranded = SigningKey::from_bytes(&[44u8; 32]).verifying_key();
+        let live_sk = SigningKey::from_bytes(&[51u8; 32]);
+        let legacy_sk = SigningKey::from_bytes(&[52u8; 32]);
+        const LEGACY_RANK: u32 = 28;
+        const CURRENT_RANK: u32 = 29;
+
+        // What the per-room load hydrated from the CURRENT delegate.
+        let mut current = empty_rooms_for_merge();
+        let mut kept_live = test_minimal_room_data(kept);
+        kept_live.self_sk = Some(live_sk.clone());
+        let kept_live_state = kept_live.room_state.clone();
+        current.map.insert(kept, kept_live);
+        current
+            .map
+            .insert(joined_since, test_minimal_room_data(joined_since));
+        current.removed_rooms.insert(left);
+        let mut live = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+        live.merge_from_source(
+            current,
+            CURRENT_RANK,
+            MergeAuthority::Authoritative,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+
+        // The legacy generation's older snapshot, re-read by the recovery.
+        let mut legacy = empty_rooms_for_merge();
+        let mut kept_old = test_minimal_room_data(kept);
+        kept_old.self_sk = Some(legacy_sk);
+        legacy.map.insert(kept, kept_old);
+        legacy.map.insert(left, test_minimal_room_data(left));
+        legacy
+            .map
+            .insert(stranded, test_minimal_room_data(stranded));
+        live.merge_from_source(
+            legacy,
+            LEGACY_RANK,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+
+        assert!(
+            live.map.contains_key(&stranded),
+            "the stranded room is restored"
+        );
+        assert!(
+            live.map.contains_key(&joined_since),
+            "a room joined since is kept"
+        );
+        assert!(
+            !live.map.contains_key(&left) && live.removed_rooms.contains(&left),
+            "a room left since stays left"
+        );
+        assert_eq!(
+            live.map[&kept].self_sk.as_ref().map(|k| k.verifying_key()),
+            Some(live_sk.verifying_key()),
+            "the live identity is not replaced by the legacy one"
+        );
+        assert_eq!(
+            live.map[&kept].room_state, kept_live_state,
+            "the kept room's state is the live copy's"
+        );
+    }
+
     /// An AUTHORITATIVE source — the current delegate, or an explicit in-session
     /// action — keeps its removal power. The fix is one-directional.
     #[test]
