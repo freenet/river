@@ -241,12 +241,18 @@ where stale legacy data overwrites newer state on the current delegate
      (non-destructive — the blob is left as a rollback fallback).
    - **Nothing** → `fire_legacy_migration_request()`.
 
-   The **interrupted-migration flag** is a per-legacy-set localStorage marker
-   (`river_legacy_migration_in_progress:<fingerprint>`, parallel to the
-   `…_done:` flag): set BEFORE any migration re-save (`hydrate_loaded_rooms`'s
-   legacy branch and the current-blob explosion alike) and cleared ONLY on a
-   FULL successful re-save. A partial/aborted re-save therefore leaves it set,
-   which is what drives the recovery above.
+   The **interrupted-migration marker** is a key in the CURRENT delegate,
+   `__river_legacy_migration_in_progress__` (`LEGACY_MIGRATION_IN_PROGRESS_KEY`):
+   written and acknowledged BEFORE any migration re-save (`hydrate_loaded_rooms`'s
+   legacy branch and the current-blob explosion alike; the save is skipped if
+   the write is not acknowledged) and deleted ONLY after a FULL successful
+   re-save. A partial/aborted re-save therefore leaves it in the delegate, the
+   next load sees it in the `ListResponse`, and that drives the recovery above.
+   It was a localStorage flag until freenet/river#757, which never worked in
+   production: the gateway's iframe sandbox omits `allow-same-origin`, so
+   localStorage is unavailable (the `…_done:` flag is likewise inert there; the
+   crate walk's delegate-stored markers are what actually stop repeats).
+   `is_migration_marker_key` keeps the marker from being copied forward.
 4. `fire_legacy_migration_request` probes each legacy delegate TWO ways:
    (a) fixed `GetRequest` for `[ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY]`
    (the pre-#345 single-blob format + DM cache), and (b) a `ListRequest` to
