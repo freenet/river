@@ -148,6 +148,12 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                     Capture::Code(raw) if still => {
                         let extracted = crate::invite_qr::invitation_text_from_scan(&raw);
                         crate::util::defer(move || {
+                            // Checked again here: a Stop or Cancel handled
+                            // between the await and this deferred tick must
+                            // still win.
+                            if !session_after.generation_is(generation) {
+                                return;
+                            }
                             scanning.set(false);
                             match accept_invite_code(&extracted) {
                                 Ok(()) => {
@@ -166,6 +172,9 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                     Capture::Code(_) | Capture::Cancelled => {}
                     Capture::Failed(msg) if still => {
                         crate::util::defer(move || {
+                            if !session_after.generation_is(generation) {
+                                return;
+                            }
                             scanning.set(false);
                             scan_error.set(Some(msg));
                         });
@@ -188,6 +197,8 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
         session_for_stop.stop();
         crate::util::defer(move || scanning.set(false));
     };
+    // Read once so the intro copy and the Scan button always agree.
+    let can_scan = invite_qr_scan::detector_available();
 
     rsx! {
         div {
@@ -204,7 +215,12 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                     "Enter Invite Code"
                 }
                 p { class: "text-sm text-text-muted mb-3",
-                    "Paste a portable invite code someone shared with you, or scan their QR code. It works on any host or peer, so you don't need to open a special link."
+                    // Only mention scanning where the Scan button is shown.
+                    if can_scan {
+                        "Paste a portable invite code someone shared with you, or scan their QR code. It works on any host or peer, so you don't need to open a special link."
+                    } else {
+                        "Paste a portable invite code someone shared with you. It works on any host or peer, so you don't need to open a special link."
+                    }
                 }
                 if *scanning.read() {
                     video {
@@ -224,14 +240,14 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                         onclick: stop_scan,
                         "Stop scanning"
                     }
-                } else if invite_qr_scan::detector_available() {
+                } else if can_scan {
                     // Browsers without BarcodeDetector (iOS Safari, Firefox,
                     // desktop Chrome on Linux and Windows) keep the paste box
                     // only. A Scan button there can only report that scanning
                     // is unavailable (freenet/river#741 review).
                     if invite_qr_scan::camera_prompt_unavailable() {
                         p { class: "text-xs text-text-muted mb-3",
-                            "Opens your camera to take a photo of the QR code."
+                            "Take or choose a photo of the QR code."
                         }
                     }
                     button {
@@ -270,6 +286,9 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                                         return;
                                     }
                                     crate::util::defer(move || match decoded {
+                                        // A Cancel handled before this
+                                        // deferred tick still wins.
+                                        _ if !session.generation_is(generation) => {}
                                         Ok(raw) => {
                                             let extracted =
                                                 crate::invite_qr::invitation_text_from_scan(&raw);

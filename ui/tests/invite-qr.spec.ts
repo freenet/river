@@ -2,9 +2,10 @@ import { test, expect, Page } from "@playwright/test";
 import { waitForApp, selectRoom } from "./example-room";
 
 // freenet/river#741. The invite modal shows a QR of the portable code, and
-// Enter Invite Code offers a camera scan. The scan itself needs a camera and
-// BarcodeDetector, so CI only checks that the control is there; the matrix
-// round-trip is a Rust test in ui/src/invite_qr.rs.
+// Enter Invite Code offers a scan only where BarcodeDetector exists. A real
+// scan needs a camera, so CI checks which controls and copy are shown, with
+// and without a (stubbed) detector; the matrix round-trip is a Rust test in
+// ui/src/invite_qr.rs.
 
 const ROOM_NAME = "Public Discussion Room";
 
@@ -39,16 +40,46 @@ test.describe("Invite QR code (issue #741)", { tag: "@chromium-only" }, () => {
     await expect(page.getByTestId("invite-qr-error")).toHaveCount(0);
   });
 
-  test("Enter Invite Code offers a QR scan", async ({ page }) => {
+  async function openJoinModal(page: Page) {
     await page.goto("/");
     await waitForApp(page);
-
     await page.getByTestId("join-with-code-button").click();
-    await expect(page.getByTestId("join-with-code-modal")).toBeVisible({
-      timeout: 5_000,
+    const modal = page.getByTestId("join-with-code-modal");
+    await expect(modal).toBeVisible({ timeout: 5_000 });
+    return modal;
+  }
+
+  test("without BarcodeDetector there is no scan button or scan copy", async ({ page }) => {
+    // Like iOS Safari and Firefox. Removed explicitly so the test does not
+    // depend on the platform's Chromium build lacking it.
+    await page.addInitScript(() => {
+      delete (window as any).BarcodeDetector;
     });
-    // Headless Chromium has no BarcodeDetector, so the button is omitted.
-    // Android Chrome, which has the detector, is the scan path.
+    const modal = await openJoinModal(page);
+    expect(await page.evaluate(() => "BarcodeDetector" in window)).toBe(false);
     await expect(page.getByTestId("join-with-code-scan-button")).toHaveCount(0);
+    await expect(modal).toContainText("Paste a portable invite code someone shared with you.");
+    await expect(modal).not.toContainText(/scan/i);
+  });
+
+  test("with BarcodeDetector the scan button is a secondary action", async ({ page }) => {
+    await page.addInitScript(() => {
+      (window as any).BarcodeDetector = class {
+        static async getSupportedFormats() {
+          return ["qr_code"];
+        }
+        async detect() {
+          return [];
+        }
+      };
+    });
+    const modal = await openJoinModal(page);
+    const scan = page.getByTestId("join-with-code-scan-button");
+    await expect(scan).toBeVisible();
+    await expect(scan).toHaveText(/Scan QR code/);
+    await expect(modal).toContainText("or scan their QR code");
+    // One primary action per modal: Scan uses the surface style, not the accent.
+    await expect(scan).not.toHaveClass(/bg-accent/);
+    await expect(scan).toHaveClass(/(^|\s)bg-surface(\s|$)/);
   });
 });

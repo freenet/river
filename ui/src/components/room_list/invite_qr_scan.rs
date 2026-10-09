@@ -12,8 +12,8 @@
 //! `allow-same-origin` would make the contract same-origin with the node, so
 //! the scan takes one photo through a file input instead and reads that still
 //! with the same detector. Browsers without `BarcodeDetector` (and native
-//! test builds) report that scanning is unavailable. The paste box stays
-//! either way.
+//! test builds) get no Scan button and no mention of scanning. The paste box
+//! stays either way.
 
 use std::cell::Cell;
 #[cfg(target_arch = "wasm32")]
@@ -65,6 +65,7 @@ impl ScanSession {
     /// False once [`Self::stop`] or a newer [`Self::begin`] has run. A task
     /// that no longer owns the generation must not stop tracks or accept a
     /// code: those belong to the scan that replaced it.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub(crate) fn generation_is(&self, generation: u32) -> bool {
         self.generation.get() == generation
     }
@@ -422,4 +423,41 @@ extern "C" {
 
     #[wasm_bindgen(method, catch)]
     fn detect(this: &BarcodeDetector, source: &JsValue) -> Result<js_sys::Promise, JsValue>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScanSession;
+
+    // The modal's cancel guards all rest on these: a scan owns its generation
+    // until a Stop or a newer scan, and never gets it back.
+    #[test]
+    fn a_scan_owns_its_generation_until_stopped() {
+        let session = ScanSession::new();
+        let first = session.begin();
+        assert!(session.generation_is(first));
+        session.stop();
+        assert!(!session.generation_is(first));
+    }
+
+    #[test]
+    fn a_newer_scan_invalidates_the_older_one() {
+        let session = ScanSession::new();
+        let first = session.begin();
+        let second = session.begin();
+        assert!(!session.generation_is(first));
+        assert!(session.generation_is(second));
+    }
+
+    #[test]
+    fn the_generation_wraps_without_reviving_an_old_scan() {
+        let session = ScanSession::new();
+        session.generation.set(u32::MAX - 1);
+        let near_end = session.begin();
+        assert_eq!(near_end, u32::MAX);
+        let wrapped = session.begin();
+        assert_eq!(wrapped, 0);
+        assert!(!session.generation_is(near_end));
+        assert!(session.generation_is(wrapped));
+    }
 }
