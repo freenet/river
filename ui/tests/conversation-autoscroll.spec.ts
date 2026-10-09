@@ -342,6 +342,25 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
     ).toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
   });
 
+  test("does not drag a parked reader down when a resize reflows the history", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+
+    await readerScrollsTo(page, 0);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(WELL_AWAY_FROM_END_PX);
+
+    // Exercise the same reflow with the reader parked: layout corrections
+    // must not take a reader who scrolled up back to the end.
+    await page.setViewportSize({ width: 380, height: 900 });
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(WELL_AWAY_FROM_END_PX);
+  });
+
   test("history that grows in the same frame the composer collapses does not move a reader at the end", async ({
     page,
   }) => {
@@ -538,6 +557,45 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
     expect(await items.count(), "the window should grow by exactly the arrivals").toBe(
       itemsBefore + 6,
     );
+  });
+
+  test("arrivals do not move a reader parked in a windowed room's history", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    // Park mid-history: away from the end and far enough from the top not
+    // to trigger a backfill.
+    const mid = Math.floor((await historyHeight(page)) / 2);
+    await readerScrollsTo(page, mid);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(WELL_AWAY_FROM_END_PX);
+
+    const probe = await tagVisibleRow(page, "__riverProbe501");
+    expect(
+      probe,
+      "premise: a rendered row should be visible mid-history"
+    ).not.toBeNull();
+
+    for (let i = 1; i <= 3; i++) {
+      await deliver(page, `parked windowed arrival ${i}`);
+    }
+    await expectStaysPut(
+      page,
+      "arrivals in a windowed room moved a parked reader's scroll offset"
+    );
+
+    const after = await taggedRowTop(page, "__riverProbe501");
+    expect(
+      after,
+      "the probed row left the DOM — the window slid out from under a parked reader"
+    ).not.toBeNull();
+    expect(
+      Math.abs(after! - probe!),
+      "content shifted under a parked reader when arrivals landed"
+    ).toBeLessThanOrEqual(2);
   });
 
   test("arrivals do not crawl a parked reader in an at-cap room", async ({
@@ -805,6 +863,8 @@ const INITIAL_RENDERED_ITEMS = 60;
 /// How far arrivals alone may grow the rendered range from an opening window
 /// (WINDOW_ITEMS_CEILING in conversation.rs).
 const ARRIVAL_CEILING_ITEMS = INITIAL_RENDERED_ITEMS * 4;
+/// How far above the end the newer-history trigger reaches (BACKFILL_LEAD_PX).
+const NEWER_TRIGGER_REACH_PX = 800;
 /// Tall rows at the head of "Tall Head Room" (at its message cap).
 const TALL_HEAD_TALL_ROWS = 8;
 /// Tall rows at the head of "Uneven Tail Room", numbered 00 up.
@@ -990,6 +1050,12 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     await expect(page.locator("[data-item-key]").last()).toContainText("newest after the burst");
     await expectSettledAtBottom(page, "the end of the paged range is not the newest message");
     await expect(page.getByTestId("scroll-to-bottom"), "the catch-up button is still shown at the newest message").toBeHidden();
+
+    // Reaching the newest page must not leave later arrivals withheld. The
+    // arrival renders, but reaching the end does not start following it.
+    const row = await expectReadingRow(page);
+    await deliver(page, "arrival after paging to the newest");
+    await expectRowHeld(page, row.key, row.top, "an arrival after paging to the newest moved the reader");
   });
 
   // A newer page slides the range's start past the ceiling. The reader's row
@@ -1025,6 +1091,85 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     await callRiverTest(page, "appendMessage", "arrival after a newer page");
     await expect.poll(() => withheld(page), { message: "premise: the arrival should land" }).toBe(paged + 1);
     await expectRowHeld(page, row!.key, row!.top, "the arrival after a newer page moved the reader's row");
+  });
+
+  /// Fill the opening range to the render ceiling below a parked reader, then
+  /// deliver `text`. Past the ceiling a parked reader's range holds its end
+  /// (`HistoryWindow::resolve_held`), so exactly that message is withheld.
+  async function holdOneNewerItem(page: Page, text: string) {
+    // The retention variant keeps the burst from pruning under the range.
+    await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1&deep-history-retention=1");
+    // Below the backfill strip (top 800px), as in `parkPastTheCeiling`.
+    await readerScrollsWithoutGesture(page, 1_000);
+    const rendered = await page.locator("[data-item-key]").count();
+    await callRiverTest(page, "appendMessages", ARRIVAL_CEILING_ITEMS - rendered);
+    await expect
+      .poll(() => page.locator("[data-item-key]").count(), { message: "premise: the burst should fill the range to the ceiling" })
+      .toBe(ARRIVAL_CEILING_ITEMS);
+    expect(await withheld(page), "premise: nothing is held at the ceiling").toBe(0);
+    await callRiverTest(page, "appendMessage", text);
+    await expect.poll(() => withheld(page), { message: "premise: one more arrival should hold the end" }).toBe(1);
+    expect(
+      await distanceFromBottom(page),
+      "premise: the reader is out of the newer-history trigger's reach until they jump",
+    ).toBeGreaterThan(NEWER_TRIGGER_REACH_PX);
+  }
+
+  /// Jump to the held range's end and settle there in ONE task, so the settle
+  /// runs while newer items are still withheld, before the newer-history
+  /// trigger pages the last item in.
+  async function settleAtHeldEnd(page: Page) {
+    await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.scrollTop = c.scrollHeight;
+      c.dispatchEvent(new Event("scrollend"));
+    });
+  }
+
+  // The reader settles while the final item is still withheld, then it pages
+  // in without another reader scroll. The next arrival must render and keep
+  // their row in place, even when that page left them near the end (#747).
+  test("an arrival after the final newer page renders without moving the reader", async ({ page }) => {
+    await holdOneNewerItem(page, "short newest");
+    await settleAtHeldEnd(page);
+    await expect.poll(() => withheld(page), { message: "premise: the final newer page should land" }).toBe(0);
+    await expect(
+      page.locator("[data-item-key]").last(),
+      "premise: the last item paged in rather than jumping to latest",
+    ).toContainText("short newest");
+    expect(await distanceFromBottom(page), "premise: the page-in left the reader near the end").toBeLessThanOrEqual(
+      WELL_AWAY_FROM_END_PX,
+    );
+
+    const row = await expectReadingRow(page);
+    // A short arrival can appear to have been followed when paging removes
+    // a row above the reader. A tall one keeps that false positive visible.
+    await callRiverTest(page, "appendMessage", `arrival after the final page ${"y".repeat(1_000)}`);
+    await expect(
+      page.locator("[data-item-key]").last(),
+      "the arrival after the final newer page was not rendered",
+    ).toContainText("arrival after the final page", { timeout: 5_000 });
+    await expectRowHeld(page, row.key, row.top, "an arrival after the final newer page moved the reader");
+  });
+
+  // A tall final page leaves the reader away from the end. A subsequent
+  // arrival must render without taking them to the newest message.
+  test("a final newer page that lands outside the band does not resume following", async ({ page }) => {
+    await holdOneNewerItem(page, `tall newest ${"y".repeat(1_500)}`);
+    await settleAtHeldEnd(page);
+    await expect.poll(() => withheld(page), { message: "premise: the final newer page should land" }).toBe(0);
+    await nextFrames(page);
+    expect(
+      await distanceFromBottom(page),
+      "a page-in from outside the band took the reader to the bottom",
+    ).toBeGreaterThan(WELL_AWAY_FROM_END_PX);
+
+    await deliverOffscreen(page, "arrival below the band");
+    await nextFrames(page);
+    expect(
+      await distanceFromBottom(page),
+      "an arrival after a page-in from outside the band was followed",
+    ).toBeGreaterThan(WELL_AWAY_FROM_END_PX);
   });
 
   // With no following, a reader idle at the exact end never scrolls, so
