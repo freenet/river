@@ -44,9 +44,11 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) -> bool {
                     MemberId::from(owner_vk)
                 );
                 crate::util::defer(move || {
-                    SYNC_INFO
-                        .write()
-                        .update_sync_status(&owner_vk, RoomSyncStatus::Disconnected);
+                    let mut sync_info = SYNC_INFO.write();
+                    // Retry with the PUT even if this room would otherwise
+                    // subscribe with a code-free GET (freenet/river#757).
+                    sync_info.require_seed_put(&owner_vk);
+                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Disconnected);
                 });
                 true // Signal that a re-PUT should be scheduled
             } else {
@@ -69,5 +71,31 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) -> bool {
     } else {
         warn!("Could not find owner VK for contract ID: {}", key.id());
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// freenet/river#757: a refused subscription with local state must put the
+    /// room back on the seeding PUT before handing it to `process_rooms`, or a
+    /// room on the code-free GET route would just GET again.
+    #[test]
+    fn refused_subscription_requires_the_seed_put_before_retrying() {
+        let src: String = crate::util::strip_comments(
+            include_str!("subscribe_response.rs")
+                .split("mod tests {")
+                .next()
+                .unwrap(),
+        )
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+        let seed = src
+            .find("sync_info.require_seed_put(&owner_vk);")
+            .expect("a refused subscription must require the seed PUT");
+        let retry = src
+            .find("sync_info.update_sync_status(&owner_vk,RoomSyncStatus::Disconnected);")
+            .expect("and hand the room back as Disconnected");
+        assert!(seed < retry);
     }
 }

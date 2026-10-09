@@ -10,7 +10,7 @@ use crate::components::app::notifications::{
     mark_initial_sync_complete, notify_new_messages, INITIAL_SYNC_COMPLETE,
 };
 use crate::components::app::receive_times::record_receive_times;
-use crate::components::app::sync_info::{now_ms, RoomSyncStatus, SYNC_INFO};
+use crate::components::app::sync_info::{now_ms, RoomSyncStatus, SubscribeRoute, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
@@ -70,7 +70,7 @@ fn merge_incoming_state(
     Ok(delta)
 }
 
-fn compute_update_data(
+pub(crate) fn compute_update_data(
     state: &ChatRoomStateV1,
     baseline: Option<&ChatRoomStateV1>,
     params: &ChatRoomParametersV1,
@@ -611,6 +611,55 @@ impl RoomSynchronizer {
     }
 }
 
+/// The request that seeds a room's contract on the network: the room-contract
+/// WASM, its parameters and the full local state, with `subscribe: true`.
+///
+/// This is the re-seed that recovers a room whose state the network has lost
+/// (a77bfe76), and how a room created on this device first reaches the network.
+/// It is expensive (the WASM alone is ~800 KB), so a room the network should
+/// already hold subscribes with [`subscribe_get_request`] instead and only
+/// falls back to this when that finds nothing (freenet/river#757).
+pub(crate) fn seed_put_request(
+    owner_vk: &VerifyingKey,
+    state: &ChatRoomStateV1,
+) -> ContractRequest<'static> {
+    let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+    let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+    let parameters = Parameters::from(to_cbor_vec(&parameters));
+    let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
+        WrappedContract::new(Arc::new(contract_code), parameters),
+    ));
+    // Strip any absorbed upgrade pointer before this FORWARD seed PUT onto the
+    // current contract, so an imported room that carried a backward pointer
+    // does not poison the current generation (freenet/river#427 P2-2).
+    let wrapped_state = WrappedState::new(to_cbor_vec(&strip_upgrade_pointer(state)));
+    ContractRequest::Put {
+        contract: contract_container,
+        state: wrapped_state,
+        related_contracts: Default::default(),
+        subscribe: true,
+        blocking_subscribe: false,
+    }
+}
+
+/// The code-free subscribe for a room the network should already hold
+/// (freenet/river#757).
+///
+/// `return_contract_code: false` keeps the WASM off the client socket; the node
+/// still fetches and caches the code itself when it does not have it, which a
+/// later `Update` needs. `subscribe: true` registers this client's subscription
+/// on the node and the node's own upstream one. The reply is a `GetResponse`
+/// (completed in `handle_get_response`) or, when no peer has the contract, a
+/// `NotFound` (which re-seeds with [`seed_put_request`]).
+pub(crate) fn subscribe_get_request(owner_vk: &VerifyingKey) -> ContractRequest<'static> {
+    ContractRequest::Get {
+        key: *owner_vk_to_contract_key(owner_vk).id(),
+        return_contract_code: false,
+        subscribe: true,
+        blocking_subscribe: false,
+    }
+}
+
 impl RoomSynchronizer {
     pub fn new() -> Self {
         Self {
@@ -839,38 +888,55 @@ impl RoomSynchronizer {
                     continue;
                 }
 
+                // A room the network should already hold subscribes with a
+                // code-free GET instead of re-uploading the contract WASM and
+                // its full state on every load (freenet/river#757). The
+                // re-seeding PUT below stays the fallback: a GET that finds
+                // nothing flips the room to `needs_seed_put`.
+                let route = SYNC_INFO.read().subscribe_route(owner_vk);
+                if route == SubscribeRoute::Get {
+                    info!(
+                        "Subscribing to room {:?} via GET (no contract upload)",
+                        MemberId::from(*owner_vk)
+                    );
+                    if let Some(web_api) = WEB_API.write().as_mut() {
+                        // Marked outstanding BEFORE the send, so no reply can
+                        // ever arrive for a GET not yet recorded as ours.
+                        SYNC_INFO.with_mut(|sync_info| sync_info.note_subscribe_get_sent(owner_vk));
+                        match web_api
+                            .send(ClientRequest::ContractOp(subscribe_get_request(owner_vk)))
+                            .await
+                        {
+                            Ok(_) => {
+                                SYNC_INFO.with_mut(|sync_info| {
+                                    sync_info
+                                        .update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
+                                });
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Error sending subscribe GET for room {:?}: {}",
+                                    MemberId::from(*owner_vk),
+                                    e
+                                );
+                                SYNC_INFO.with_mut(|sync_info| {
+                                    sync_info.take_subscribe_get(owner_vk);
+                                    sync_info.update_sync_status(
+                                        owner_vk,
+                                        RoomSyncStatus::Error(e.to_string()),
+                                    );
+                                });
+                            }
+                        }
+                    } else {
+                        warn!("WebAPI became unavailable during processing");
+                    }
+                    continue;
+                }
+
                 info!("Subscribing to room: {:?}", MemberId::from(*owner_vk));
 
-                let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-                let parameters = ChatRoomParametersV1 { owner: *owner_vk };
-                let params_bytes = to_cbor_vec(&parameters);
-                let parameters = Parameters::from(params_bytes);
-
-                let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
-                    WrappedContract::new(Arc::new(contract_code), parameters),
-                ));
-
-                // Strip any absorbed upgrade pointer before this FORWARD seed PUT
-                // onto the current contract, so an imported room that carried a
-                // backward pointer does not poison the current generation
-                // (freenet/river#427 P2-2).
-                let wrapped_state = WrappedState::new(to_cbor_vec(&strip_upgrade_pointer(state)));
-
-                info!(
-                    "Preparing PutRequest for room {:?} with contract ID: {}",
-                    MemberId::from(*owner_vk),
-                    contract_id
-                );
-
-                let put_request = ContractRequest::Put {
-                    contract: contract_container,
-                    state: wrapped_state,
-                    related_contracts: Default::default(),
-                    subscribe: true,
-                    blocking_subscribe: false,
-                };
-
-                let client_request = ClientRequest::ContractOp(put_request);
+                let client_request = ClientRequest::ContractOp(seed_put_request(owner_vk, state));
 
                 info!(
                     "Sending PutRequest for room {:?} with contract ID: {}",
@@ -2065,6 +2131,134 @@ mod tests {
     /// because the gated name has `_if_dm_is_newer` between `thread` and `(`.
     fn unconditional_unhide_needle() -> String {
         format!("{}{}", "unhide_dm_thread", "(")
+    }
+
+    /// freenet/river#757: the re-seed PUT must still upload the contract code
+    /// and the full state and subscribe — it is what recovers a room the
+    /// network lost — while the code-free subscribe GET must not ask for the
+    /// code back and must subscribe.
+    #[test]
+    fn seed_put_and_subscribe_get_requests_have_the_right_shape() {
+        let (state, params, _sk) = create_test_room();
+        let owner = params.owner;
+        let expected_id = *owner_vk_to_contract_key(&owner).id();
+
+        match seed_put_request(&owner, &state) {
+            ContractRequest::Put {
+                contract,
+                state: put_state,
+                subscribe,
+                ..
+            } => {
+                assert!(subscribe, "the seed PUT must subscribe");
+                assert_eq!(*contract.key().id(), expected_id);
+                assert_eq!(
+                    contract.data(),
+                    ROOM_CONTRACT_WASM,
+                    "the seed PUT must carry the room-contract WASM"
+                );
+                let sent: ChatRoomStateV1 =
+                    ciborium::de::from_reader(put_state.as_ref()).expect("state decodes");
+                assert_eq!(sent, strip_upgrade_pointer(&state));
+            }
+            other => panic!("expected a Put, got {other:?}"),
+        }
+
+        match subscribe_get_request(&owner) {
+            ContractRequest::Get {
+                key,
+                return_contract_code,
+                subscribe,
+                ..
+            } => {
+                assert_eq!(key, expected_id);
+                assert!(
+                    !return_contract_code,
+                    "the subscribe GET must not pull the ~800 KB WASM to the client"
+                );
+                assert!(subscribe, "the subscribe GET must register a subscription");
+            }
+            other => panic!("expected a Get, got {other:?}"),
+        }
+    }
+
+    /// freenet/river#757: after a subscribe GET, local state that the network
+    /// lacks must be detected (and so pushed as a delta), identical state must
+    /// not, and a difference only in the locally rebuilt `actions_state` must
+    /// not either: a decoded network state never has one.
+    #[test]
+    fn local_state_ahead_detects_only_what_an_update_would_carry() {
+        use crate::components::app::freenet_api::response_handler::get_response::local_state_ahead;
+        let (network, params, owner_sk) = create_test_room();
+        let owner = params.owner;
+
+        assert!(!local_state_ahead(&network, &network, &owner));
+
+        let mut offline = network.clone();
+        add_message(&mut offline, &owner_sk, "sent while offline");
+        assert!(local_state_ahead(&offline, &network, &owner));
+
+        let mut rebuilt = network.clone();
+        rebuilt
+            .recent_messages
+            .actions_state
+            .deleted
+            .insert(river_core::room_state::message::MessageId(FastHash(7)));
+        assert_ne!(rebuilt, network, "fixture: only actions_state differs");
+        assert!(!local_state_ahead(&rebuilt, &network, &owner));
+    }
+
+    /// `process_rooms`' body, comments and whitespace stripped, test module cut.
+    fn process_rooms_source() -> String {
+        let src = include_str!("room_synchronizer.rs");
+        let production = src.split("mod tests {").next().unwrap();
+        let stripped: String = crate::util::strip_comments(production)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let start = stripped
+            .find("pubasyncfnprocess_rooms(")
+            .expect("process_rooms must exist");
+        let body = &stripped[start..];
+        body[..body
+            .find("pub(crate)fnupdate_room_state(")
+            .expect("update_room_state follows process_rooms")]
+            .to_string()
+    }
+
+    /// freenet/river#757 wiring. The GET route must record the GET as this
+    /// room's outstanding subscribe BEFORE sending it (the fallback PUT keys
+    /// off that flag: without it a NotFound is ignored and a timeout retries
+    /// the GET forever), send the code-free GET, and `continue` so it never
+    /// also sends the PUT. The PUT route must still build the seed PUT.
+    #[test]
+    fn process_rooms_routes_get_then_falls_through_to_the_seed_put() {
+        let body = process_rooms_source();
+        let route = body
+            .find("ifroute==SubscribeRoute::Get{")
+            .expect("process_rooms must branch on the subscribe route");
+        let get_arm = &body[route..];
+        let get_arm = &get_arm[..get_arm
+            .find("continue;")
+            .expect("the GET arm must end in `continue;`")];
+        let noted = get_arm
+            .find("note_subscribe_get_sent(owner_vk)")
+            .expect("the GET arm must mark the subscribe GET outstanding");
+        let sent = get_arm
+            .find("subscribe_get_request(owner_vk)")
+            .expect("the GET arm must send the code-free subscribe GET");
+        assert!(noted < sent, "mark it outstanding before the send");
+        assert!(
+            !get_arm.contains("seed_put_request"),
+            "the GET arm must not also PUT"
+        );
+        let put = body
+            .find("seed_put_request(owner_vk,state)")
+            .expect("process_rooms must send seed_put_request on the PUT route");
+        assert!(
+            put > route + get_arm.len(),
+            "the seed PUT must be the fallthrough after the GET arm"
+        );
     }
 
     /// This file's source with the test module and all whitespace removed.
