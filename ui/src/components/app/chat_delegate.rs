@@ -653,22 +653,42 @@ async fn set_up_chat_delegate_with(register_first: bool) -> Result<(), String> {
     // skipped (current is authoritative); if it is empty, migration is fired
     // then. This prevents legacy responses from racing with the current
     // delegate and clobbering newer state (freenet/river#253).
+    //
+    // Only the list goes out now. The outbound-DM load follows once the
+    // delegate is known to be there (`request_outbound_dms_once`, from the
+    // `ListResponse` or after a registration). Sent alongside the list, on a
+    // node without the delegate it would be a second "missing" answer, and on
+    // a pre-#5729 node its empty reply could land after the register is armed
+    // and pass for the register's ack, letting the re-list overtake the
+    // register (#709) and leave the user on "No rooms yet".
     fire_list_rooms_request().await;
-    if load_attempt_is_current(attempt) {
-        fire_load_outbound_dms_request(attempt).await;
-    }
     Ok(())
 }
 
-/// What [`register_then_load`] sends once the delegate is registered.
+/// `attempt + 1` of the load attempt that has sent its outbound-DM load; 0
+/// when none has (freenet/river#757).
+static DMS_REQUESTED_FOR_ATTEMPT: AtomicU32 = AtomicU32::new(0);
+
+/// Send this attempt's outbound-DM load, once, now that the chat delegate is
+/// known to be on the node: its room list was answered. See
+/// `set_up_chat_delegate_with` for why it no longer goes out with the list.
+pub(crate) fn request_outbound_dms_once() {
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    if claim_once_per_attempt(&DMS_REQUESTED_FOR_ATTEMPT, attempt) {
+        crate::util::safe_spawn_local(async move {
+            fire_load_outbound_dms_request(attempt).await;
+        });
+    }
+}
+
+/// Whether [`register_then_load`] re-sends the room list once the delegate is
+/// registered. The outbound-DM load goes out once per attempt either way.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Reload {
-    /// The room list and the outbound-DM load, unconditionally: nothing has
-    /// been sent for this attempt yet.
+    /// Unconditionally: nothing has been sent for this attempt yet (Retry).
     All,
-    /// Only what has not been answered: the list if this attempt has no
-    /// `ListResponse`, the outbound DMs if they are not hydrated. The first
-    /// sends reached a delegate the node did not have (freenet/river#757).
+    /// Only if this attempt has no `ListResponse`: the first list reached a
+    /// delegate the node did not have (freenet/river#757).
     Unanswered,
 }
 
@@ -769,7 +789,7 @@ async fn register_then_load(attempt: u32, reload: Reload) -> Result<(), String> 
                 if !load_attempt_is_current(attempt) {
                     return;
                 }
-                if reload == Reload::All || !OUTBOUND_DMS_HYDRATED.load(Ordering::Acquire) {
+                if claim_once_per_attempt(&DMS_REQUESTED_FOR_ATTEMPT, attempt) {
                     fire_load_outbound_dms_request(attempt).await;
                 }
             });
@@ -1013,20 +1033,58 @@ pub(crate) fn on_current_delegate_missing() {
     // this is the expected answer. Register once, then send again whatever has
     // not been answered. Only a delegate still missing AFTER this attempt
     // registered it falls through to the failure below.
-    if claim_registration(attempt) {
-        warn!("The node does not have the chat delegate; registering it and reloading");
-        crate::util::safe_spawn_local(async move {
-            if let Err(e) = register_then_load(attempt, Reload::Unanswered).await {
-                error!("{}", e);
-            }
-        });
-        return;
+    match missing_action(&REGISTERED_FOR_ATTEMPT, &LIST_OUTSTANDING, attempt) {
+        MissingAction::Register => {
+            warn!("The node does not have the chat delegate; registering it and reloading");
+            crate::util::safe_spawn_local(async move {
+                if let Err(e) = register_then_load(attempt, Reload::Unanswered).await {
+                    error!("{}", e);
+                }
+            });
+        }
+        MissingAction::FailLoad => {
+            mark_fetch_failure_if_current(attempt);
+            resolve_load_failed_if_empty(attempt);
+        }
+        MissingAction::Ignore => {}
     }
-    if !claim_outstanding_list(&LIST_OUTSTANDING, attempt) {
-        return;
+}
+
+/// What a current-delegate "missing" answer does to load attempt `attempt`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MissingAction {
+    /// First in the attempt: register the delegate and reload.
+    Register,
+    /// The delegate is still missing after this attempt registered it, and
+    /// the (re-)list it answers will never be answered: fail to Retry.
+    FailLoad,
+    /// Belongs to some other request; the list was answered or already failed.
+    Ignore,
+}
+
+/// Decide [`MissingAction`], claiming the attempt's registration and/or its
+/// outstanding list as it does. Pure over the two markers so the sequence can
+/// be tested.
+///
+/// The `Register` arm also drops the outstanding-list marker: the list this
+/// answers will never get a `ListResponse`, and the re-list after the ack
+/// re-arms it. Otherwise any further "missing" before that re-list (a request
+/// that was already in flight) would find the marker and fail a load that is
+/// in the middle of recovering.
+fn missing_action(
+    registered: &AtomicU32,
+    list_outstanding: &AtomicU32,
+    attempt: u32,
+) -> MissingAction {
+    if claim_once_per_attempt(registered, attempt) {
+        let _ = claim_outstanding_list(list_outstanding, attempt);
+        return MissingAction::Register;
     }
-    mark_fetch_failure_if_current(attempt);
-    resolve_load_failed_if_empty(attempt);
+    if claim_outstanding_list(list_outstanding, attempt) {
+        MissingAction::FailLoad
+    } else {
+        MissingAction::Ignore
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1346,32 +1404,56 @@ mod tests {
                 .contains("note_current_list_response();"),
             "the current delegate's ListResponse must clear the outstanding marker"
         );
+        // freenet/river#757: the first Missing in an attempt registers and
+        // reloads; only a Missing after the re-list fails the load.
         let production = chat_delegate_production();
         let body = fn_body(&production, "pub(crate) fn on_current_delegate_missing() {");
-        // freenet/river#757: the first Missing in an attempt registers and
-        // reloads; only a Missing after that registration fails the load.
-        let register = body
-            .find("if claim_registration(attempt) {")
-            .expect("the first Missing must claim this attempt's registration");
-        let register_arm = body.get(register..).unwrap();
-        let register_arm = register_arm
-            .get(
-                ..register_arm
-                    .find("return;")
-                    .expect("the register arm returns"),
-            )
-            .unwrap();
         assert!(
-            register_arm.contains("register_then_load(attempt, Reload::Unanswered)"),
-            "the first Missing must register and re-send only what went unanswered"
+            body.contains("missing_action(&REGISTERED_FOR_ATTEMPT, &LIST_OUTSTANDING, attempt)")
         );
-        let claim = body
-            .find("claim_outstanding_list(&LIST_OUTSTANDING, attempt)")
-            .expect("the handler must be gated on the outstanding list");
-        let mark = body
-            .find("mark_fetch_failure_if_current(attempt)")
-            .expect("the handler must mark the failure");
-        assert!(register < claim && claim < mark);
+        let register = body.find("MissingAction::Register => {").unwrap();
+        let fail = body.find("MissingAction::FailLoad => {").unwrap();
+        assert!(body[register..fail].contains("register_then_load(attempt, Reload::Unanswered)"));
+        assert!(body[fail..].contains("mark_fetch_failure_if_current(attempt)"));
+    }
+
+    /// freenet/river#757: the list-first load meets a node without the
+    /// delegate. Every "missing" answer that arrives before the re-list (the
+    /// list's own, and any request already in flight) must lead to exactly one
+    /// registration and NO load failure; only a missing answer to the re-list
+    /// sent after registering fails the load to Retry.
+    #[test]
+    fn missing_answers_register_once_and_fail_only_after_the_relist() {
+        let (registered, list) = (AtomicU32::new(0), AtomicU32::new(0));
+        let attempt = 4;
+        list.store(attempt + 1, Ordering::Relaxed); // the first list is out
+
+        assert_eq!(
+            missing_action(&registered, &list, attempt),
+            MissingAction::Register
+        );
+        assert_eq!(
+            missing_action(&registered, &list, attempt),
+            MissingAction::Ignore,
+            "a second missing answer before the re-list must not fail a recovering load"
+        );
+
+        list.store(attempt + 1, Ordering::Relaxed); // the re-list after the ack
+        assert_eq!(
+            missing_action(&registered, &list, attempt),
+            MissingAction::FailLoad,
+            "still missing after registering: Retry"
+        );
+        assert_eq!(
+            missing_action(&registered, &list, attempt),
+            MissingAction::Ignore
+        );
+
+        // A new attempt registers again.
+        assert_eq!(
+            missing_action(&registered, &list, attempt + 1),
+            MissingAction::Register
+        );
     }
 
     /// freenet/river#757: one registration per attempt, however many requests
@@ -1413,7 +1495,16 @@ mod tests {
             "the normal path must not register before listing"
         );
         assert!(after.contains("fire_list_rooms_request().await"));
-        assert!(after.contains("fire_load_outbound_dms_request(attempt).await"));
+        assert!(
+            !after.contains("fire_load_outbound_dms_request("),
+            "the DM load must wait until the delegate is known present"
+        );
+        assert!(
+            response_handler_production().contains("request_outbound_dms_once();"),
+            "an answered room list must start the outbound-DM load"
+        );
+        assert!(fn_body(&production, "async fn register_then_load(")
+            .contains("if claim_once_per_attempt(&DMS_REQUESTED_FOR_ATTEMPT, attempt) {"));
         assert!(
             fn_body(&production, "pub async fn set_up_chat_delegate()")
                 .contains("set_up_chat_delegate_with(false)"),
@@ -2363,6 +2454,14 @@ mod tests {
         crate::room_data::test_minimal_room_data(SigningKey::from_bytes(&[9u8; 32]).verifying_key())
     }
 
+    /// A room as a current build stores it: `self_vk` already backfilled, so
+    /// the load seeds it.
+    fn seedable_room() -> RoomData {
+        let mut room = room_fixture();
+        room.backfill_self_vk();
+        room
+    }
+
     /// The save's view of a room: its content and critical hashes, computed
     /// exactly as `do_save_rooms_to_delegate` computes them.
     fn save_hashes(room: &RoomData) -> (u64, Option<u64>) {
@@ -2377,7 +2476,7 @@ mod tests {
     /// the same content, and does nothing.
     #[test]
     fn load_seed_makes_the_post_load_save_skip_an_unchanged_room() {
-        let room = room_fixture();
+        let room = seedable_room();
         let vk = room.owner_vk;
         let loaded: RoomSlot =
             ciborium::from_reader(&present_slot_bytes(&room)[..]).expect("slot decodes");
@@ -2385,6 +2484,7 @@ mod tests {
 
         let prev = ROOM_SLOT_STATE.with(|c| c.borrow().get(&vk).copied());
         let (h, crit) = save_hashes(&room);
+        assert_eq!(prev, Some(SavedSlot::Loaded { content: h }));
         assert_eq!(
             present_save_decision(prev, h, crit, false, now_ms()),
             PresentSaveDecision::Unchanged
@@ -2402,7 +2502,7 @@ mod tests {
     /// A critical change is written either way.
     #[test]
     fn load_seed_never_skips_or_defers_a_changed_room() {
-        let room = room_fixture();
+        let room = seedable_room();
         let vk = room.owner_vk;
         let loaded: RoomSlot =
             ciborium::from_reader(&present_slot_bytes(&room)[..]).expect("slot decodes");
@@ -2427,6 +2527,31 @@ mod tests {
             "the first change after a load must be written immediately (#629)"
         );
 
+        // ...and that write is still the session's first for the room, so it
+        // records no write time and cannot arm the debounce for the network
+        // state that lands next (#629), exactly as with no seed at all.
+        assert!(is_first_write_of_session(prev));
+        assert!(is_first_write_of_session(None));
+        assert_eq!(
+            slot_after_write(
+                CasWriteOutcome::Stored,
+                is_first_write_of_session(prev),
+                h,
+                crit,
+                5.0
+            ),
+            SavedSlot::Present {
+                content: h,
+                critical: crit,
+                written_at_ms: None
+            }
+        );
+        assert!(!is_first_write_of_session(Some(SavedSlot::Present {
+            content: h,
+            critical: crit,
+            written_at_ms: None
+        })));
+
         let mut critical_changed = room.clone();
         critical_changed.self_nickname = Some("renamed".to_string());
         let (h, crit) = save_hashes(&critical_changed);
@@ -2446,7 +2571,7 @@ mod tests {
     /// the #534 debounce runs on. Tombstones and `rooms_meta` are seeded too.
     #[test]
     fn load_seed_keeps_existing_slots_and_covers_tombstones_and_meta() {
-        let room = room_fixture();
+        let room = seedable_room();
         let vk = room.owner_vk;
         let left = SigningKey::from_bytes(&[10u8; 32]).verifying_key();
         let written = SavedSlot::Present {
@@ -2480,6 +2605,22 @@ mod tests {
             META_SLOT_HASH.with(|c| *c.borrow()),
             Some(content_hash(&buf))
         );
+    }
+
+    /// A room whose stored blob predates `self_vk` is left unseeded, so the
+    /// save still writes it once and its `self_vk` backfill
+    /// (`reconcile_room_present`) is not starved by the skip.
+    #[test]
+    fn load_seed_leaves_a_room_needing_the_self_vk_backfill_to_the_save() {
+        let mut room = room_fixture();
+        room.self_vk = None;
+        assert!(
+            room.signing_key().is_some(),
+            "fixture holds the private key"
+        );
+        let vk = room.owner_vk;
+        seed_saved_slots_from_load(&[(vk, RoomSlot::Present(Box::new(room)))], None);
+        assert_eq!(ROOM_SLOT_STATE.with(|c| c.borrow().get(&vk).copied()), None);
     }
 
     /// Extracting the decision must not change the #533 debounce: a cache-only
@@ -5206,7 +5347,7 @@ mod tests {
             .expect("each setup pass must reset the DM request timing");
         assert!(
             reset < setup.find("register_then_load(").unwrap()
-                && reset < setup.find("fire_load_outbound_dms_request(").unwrap(),
+                && reset < setup.find("fire_list_rooms_request(").unwrap(),
             "each setup pass must stop timing an earlier pass's DM request"
         );
     }
@@ -7130,6 +7271,15 @@ enum SavedSlot {
     },
     /// We've persisted this room as a tombstone (the user left it).
     Tombstone,
+    /// The per-room load read this content from the delegate and this tab has
+    /// written nothing for the room yet (freenet/river#757). Distinct from
+    /// `Present` so the first write after it still counts as the session's
+    /// first ([`slot_after_write`]), which must not arm the debounce
+    /// (freenet/river#629).
+    Loaded {
+        /// Hash of the loaded `RoomData`, serialized as the save serializes it.
+        content: u64,
+    },
 }
 
 thread_local! {
@@ -7197,9 +7347,11 @@ thread_local! {
 /// warns about, and why only the hydrated result is compared, never the raw
 /// stored bytes.
 ///
-/// `written_at_ms: None` keeps freenet/river#629 intact: nothing was written,
-/// so the first genuine change (state arriving from the network) is persisted
-/// immediately rather than deferred. Existing entries are left alone: on a
+/// The seed is [`SavedSlot::Loaded`], which keeps freenet/river#629 intact:
+/// the first write after it is persisted immediately and, being the session's
+/// first write for the room, does not arm the debounce, exactly as when there
+/// was no entry. A room whose blob still lacks `self_vk` is not seeded, so the
+/// save's `self_vk` backfill still reaches it. Existing entries are left alone: on a
 /// reconnect's re-load they describe what this tab itself last wrote, and
 /// their write time is what the #534 debounce runs on.
 pub(crate) fn seed_saved_slots_from_load(
@@ -7211,15 +7363,20 @@ pub(crate) fn seed_saved_slots_from_load(
         for (vk, slot) in slots {
             let entry = match slot {
                 RoomSlot::Present(room_data) => {
+                    // The save chokepoint backfills `self_vk` into a blob that
+                    // predates it (`reconcile_room_present`). Leave such a room
+                    // unseeded so the save still writes it once and the
+                    // backfill progresses as before.
+                    if room_data.self_vk.is_none() && room_data.signing_key().is_some() {
+                        continue;
+                    }
                     let mut buf = Vec::new();
                     if ciborium::ser::into_writer(room_data.as_ref(), &mut buf).is_err() {
                         // No baseline: the save then writes it, as before.
                         continue;
                     }
-                    SavedSlot::Present {
+                    SavedSlot::Loaded {
                         content: content_hash(&buf),
-                        critical: critical_hash(room_data),
-                        written_at_ms: None,
                     }
                 }
                 RoomSlot::Tombstone => SavedSlot::Tombstone,
@@ -7324,7 +7481,8 @@ enum CasWriteOutcome {
 /// regressed. Keep it testable.
 ///
 /// `first_write_of_session` is `true` when this room had no
-/// [`ROOM_SLOT_STATE`] entry before this save. Because that map is a
+/// [`ROOM_SLOT_STATE`] entry before this save, or only the load's
+/// [`SavedSlot::Loaded`] seed (freenet/river#757). Because that map is a
 /// `thread_local` starting empty on every page load, the case that matters is
 /// the load-time echo of the snapshot we just HYDRATED: a write carrying no
 /// room state we did not already have. Arming the window on it is
@@ -7399,6 +7557,13 @@ enum PresentSaveDecision {
     Write,
 }
 
+/// Whether a write for a room whose last-persisted slot was `prev` is this
+/// session's first for it: nothing recorded, or only the load's seed
+/// (freenet/river#757). See [`slot_after_write`] for why that matters (#629).
+fn is_first_write_of_session(prev: Option<SavedSlot>) -> bool {
+    matches!(prev, None | Some(SavedSlot::Loaded { .. }))
+}
+
 /// Pure form of the per-room save decision, so the dedupe, the #533 debounce
 /// and the #757 load seed can be tested without a websocket.
 fn present_save_decision(
@@ -7410,7 +7575,9 @@ fn present_save_decision(
 ) -> PresentSaveDecision {
     // Unchanged since the last write (or since the load read it) — nothing to
     // do.
-    if let Some(SavedSlot::Present { content: saved, .. }) = prev {
+    if let Some(SavedSlot::Present { content: saved, .. } | SavedSlot::Loaded { content: saved }) =
+        prev
+    {
         if saved == content {
             return PresentSaveDecision::Unchanged;
         }
@@ -7836,7 +8003,13 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
                 ROOM_SLOT_STATE.with(|c| {
                     c.borrow_mut().insert(
                         *vk,
-                        slot_after_write(outcome, prev.is_none(), h, crit, now_ms()),
+                        slot_after_write(
+                            outcome,
+                            is_first_write_of_session(prev),
+                            h,
+                            crit,
+                            now_ms(),
+                        ),
                     );
                 });
                 // Once a rejoin is persisted as Present, consume the rejoin

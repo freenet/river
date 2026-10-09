@@ -192,6 +192,17 @@ impl SyncInfo {
         }
     }
 
+    /// The node refused a subscription for `owner_key` with local state on
+    /// hand: re-seed it with the PUT next, whichever route the refused
+    /// subscription came from (freenet/river#757). Before the GET route every
+    /// subscription followed a PUT, so this was already the behaviour.
+    pub fn require_seed_put(&mut self, owner_key: &VerifyingKey) {
+        if let Some(sync_info) = self.map.get_mut(owner_key) {
+            sync_info.subscribe_get_in_flight = false;
+            sync_info.needs_seed_put = true;
+        }
+    }
+
     /// A subscribe GET was sent for `owner_key` (freenet/river#757).
     pub fn note_subscribe_get_sent(&mut self, owner_key: &VerifyingKey) {
         if let Some(sync_info) = self.map.get_mut(owner_key) {
@@ -889,6 +900,18 @@ mod tests {
             "a late NotFound after the GET already answered must not force a PUT"
         );
         assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Get);
+    }
+
+    /// A refused subscription (`SubscribeResponse { subscribed: false }`) puts
+    /// a known room back on the seeding PUT, as before the GET route existed.
+    #[test]
+    fn a_refused_subscription_requires_the_seeding_put() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(26);
+        si.mark_known_on_network(owner);
+        si.register_new_room(owner);
+        si.require_seed_put(&owner);
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Put);
     }
 
     /// A room created this session joins the GET route once it has subscribed,

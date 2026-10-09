@@ -20,12 +20,12 @@ use crate::components::app::chat_delegate::{
     legacy_scoped_correlation, load_state_after_probe_legacy, mark_legacy_migration_done,
     mark_legacy_migration_in_progress, mark_outbound_dms_hydrated, note_current_list_response,
     note_delegate_response_for_register_ack, parse_room_storage_key, per_room_terminal,
-    prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, response_correlation_base,
-    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate,
-    seed_saved_slots_from_load, send_delegate_request, send_delegate_request_to,
-    set_load_state_if_current, source_rank_for_delegate_key, LegacyMigrationAction,
-    LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY,
-    ROOMS_META_KEY, ROOMS_STORAGE_KEY,
+    prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, request_outbound_dms_once,
+    response_correlation_base, room_storage_key, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, seed_saved_slots_from_load, send_delegate_request,
+    send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
+    LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
+    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -547,6 +547,9 @@ impl ResponseHandler {
                                             // registering, freenet/river#757, or
                                             // a late one) carries the same keys.
                                             if claim_list_load() {
+                                                // The delegate answered, so the
+                                                // outbound-DM load can follow.
+                                                request_outbound_dms_once();
                                                 crate::util::safe_spawn_local(async move {
                                                     load_rooms_per_room(keys).await;
                                                 });
@@ -3366,27 +3369,20 @@ mod tests {
         );
     }
 
-    /// freenet/river#417: the startup room load must fan the per-room delegate
-    /// GETs out CONCURRENTLY — enqueue every request in a wave first (synchronous
-    /// WS send), then await that wave's responses together via `join_all` —
-    /// rather than awaiting each in a serial `for … .await`. That collapses
-    /// wall-clock from N round-trips to ~ceil(N / ROOM_LOAD_CONCURRENCY). Pin the
-    /// wiring by source-grep (this repo's convention), scoped to the per-room load
-    /// region so the trailing single meta GET (which legitimately still uses
-    /// `send_delegate_request`) is excluded.
     /// freenet/river#757: the per-room load must seed the save baseline from
     /// the slots it read from the current delegate, before they are consumed,
     /// or the save that follows re-reads every room's full value.
     #[test]
     fn per_room_load_seeds_the_save_baseline() {
         let src = include_str!("response_handler.rs");
-        let production: String = src
-            .split("mod tests {")
-            .next()
-            .expect("production code before `mod tests`")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
+        let production: String = crate::util::strip_comments(
+            src.split("mod tests {")
+                .next()
+                .expect("production code before `mod tests`"),
+        )
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
         let start = production
             .find("asyncfnload_rooms_per_room(")
             .expect("load_rooms_per_room must exist");
@@ -3400,6 +3396,14 @@ mod tests {
         assert!(seed < reconstruct, "seed before the slots are consumed");
     }
 
+    /// freenet/river#417: the startup room load must fan the per-room delegate
+    /// GETs out CONCURRENTLY — enqueue every request in a wave first (synchronous
+    /// WS send), then await that wave's responses together via `join_all` —
+    /// rather than awaiting each in a serial `for … .await`. That collapses
+    /// wall-clock from N round-trips to ~ceil(N / ROOM_LOAD_CONCURRENCY). Pin the
+    /// wiring by source-grep (this repo's convention), scoped to the per-room load
+    /// region so the trailing single meta GET (which legitimately still uses
+    /// `send_delegate_request`) is excluded.
     #[test]
     fn per_room_load_fans_out_concurrently() {
         let src = include_str!("response_handler.rs");

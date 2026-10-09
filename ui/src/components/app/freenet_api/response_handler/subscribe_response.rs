@@ -44,9 +44,11 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) -> bool {
                     MemberId::from(owner_vk)
                 );
                 crate::util::defer(move || {
-                    SYNC_INFO
-                        .write()
-                        .update_sync_status(&owner_vk, RoomSyncStatus::Disconnected);
+                    let mut sync_info = SYNC_INFO.write();
+                    // Retry with the PUT even if this room would otherwise
+                    // subscribe with a code-free GET (freenet/river#757).
+                    sync_info.require_seed_put(&owner_vk);
+                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Disconnected);
                 });
                 true // Signal that a re-PUT should be scheduled
             } else {

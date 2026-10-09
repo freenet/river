@@ -244,8 +244,10 @@ pub async fn handle_get_response(
                 // reload/reconnect, or an imported room). `Disconnected` is the
                 // status `rooms_awaiting_subscription` keys on, so
                 // `process_rooms`'s existing-room path will establish a real
-                // PUT+subscribe if needed; that re-PUT is idempotent and
-                // self-healing if the room was in fact already subscribed.
+                // subscription (a subscribe GET, or a seeding PUT if the
+                // network lacks the room, freenet/river#757); either is
+                // idempotent and self-healing if the room was in fact already
+                // subscribed.
                 // Marking `Subscribed` here would instead suppress that path
                 // and could leave an unsubscribed room silently not receiving
                 // updates. (Codex review of this PR.)
@@ -871,7 +873,10 @@ pub async fn handle_get_response(
             // sent instead of a PUT (freenet/river#757)? If it came back
             // without real state, the room has to be re-seeded with a PUT:
             // recorded here so every later attempt PUTs, whatever the backward
-            // probe below then does.
+            // probe below then does. A synchronous write, not `defer`red: the
+            // answer is needed now, and this runs in the synchronizer's message
+            // loop, which already writes SYNC_INFO synchronously in
+            // `process_rooms` and the error arm.
             let completes_subscribe_get = is_current_key
                 && SYNC_INFO.with_mut(|sync_info| {
                     if retrieved_has_real_state {
@@ -1267,15 +1272,11 @@ fn complete_subscribe_get(owner_vk: ed25519_dalek::VerifyingKey, network_state: 
         sync_info.update_last_synced_state(&owner_vk, &network_state);
         sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
     });
-    // Asked the way `process_rooms` will ask it, rather than `!=`: state
-    // equality also compares `actions_state`, which is rebuilt locally and
-    // never on a decoded network state, so it would flag every room with an
-    // edit or reaction.
-    let params = ChatRoomParametersV1 { owner: owner_vk };
     let local_ahead = match ROOMS.try_read() {
-        Ok(rooms) => rooms.map.get(&owner_vk).is_some_and(|rd| {
-            compute_update_data(&rd.room_state, Some(&network_state), &params).is_some()
-        }),
+        Ok(rooms) => rooms
+            .map
+            .get(&owner_vk)
+            .is_some_and(|rd| local_state_ahead(&rd.room_state, &network_state, &owner_vk)),
         // Unreadable: assume it differs. A spurious sync computes an empty
         // delta and sends nothing.
         Err(_) => true,
@@ -1287,6 +1288,21 @@ fn complete_subscribe_get(owner_vk: ed25519_dalek::VerifyingKey, network_state: 
         );
         crate::components::app::mark_needs_sync(owner_vk);
     }
+}
+
+/// Whether `local` holds anything `network` lacks, i.e. whether
+/// `process_rooms` would send an update against a `network` baseline.
+///
+/// Asked exactly that way rather than with `!=`: state equality also compares
+/// `actions_state`, which is rebuilt locally and never on a decoded network
+/// state, so `!=` would flag every room with an edit or reaction.
+pub(crate) fn local_state_ahead(
+    local: &ChatRoomStateV1,
+    network: &ChatRoomStateV1,
+    owner_vk: &ed25519_dalek::VerifyingKey,
+) -> bool {
+    let params = ChatRoomParametersV1 { owner: *owner_vk };
+    compute_update_data(local, Some(network), &params).is_some()
 }
 
 /// Re-seed `owner_vk`'s room with a full PUT after its code-free subscribe GET
@@ -2513,7 +2529,12 @@ mod tests {
     /// from the response to that PUT, which no native test can drive.
     #[test]
     fn not_found_on_a_subscribe_get_requests_the_seed_put() {
-        let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        let strip = |s: &str| -> String {
+            crate::util::strip_comments(s)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
         let full = include_str!("get_response.rs");
         let src = strip(full.split("mod tests {").next().unwrap());
         // Production fns in file order: complete_subscribe_get,
@@ -2533,23 +2554,56 @@ mod tests {
             "pubasyncfnhandle_get_not_found(",
             "pub(crate)asyncfnadopt_recovered_probe_state(",
         );
-        let consumed = not_found
-            .find("subscribe_get_found_nothing(&owner_vk)")
-            .expect("handle_get_not_found must consume the outstanding subscribe GET");
-        let seeded = not_found
-            .find("request_seed_put(owner_vk)")
-            .expect("handle_get_not_found must request the seed PUT");
-        assert!(consumed < seeded);
+        assert!(
+            not_found.contains(
+                "ifSYNC_INFO.with_mut(|sync_info|sync_info.subscribe_get_found_nothing(&owner_vk)){request_seed_put(owner_vk);"
+            ),
+            "handle_get_not_found must request the seed PUT exactly when the \
+             NotFound answers an outstanding subscribe GET"
+        );
 
         let reseed = between("fnrequest_seed_put(", "pubasyncfnhandle_get_not_found(");
+        let disconnected = reseed
+            .find("RoomSyncStatus::Disconnected")
+            .expect("the re-seed must hand the room back to process_rooms as Disconnected");
+        let process = reseed
+            .find("SynchronizerMessage::ProcessRooms")
+            .expect("the re-seed must run ProcessRooms now, not wait for the timeout");
         assert!(
-            reseed.contains("RoomSyncStatus::Disconnected"),
-            "the re-seed must hand the room back to process_rooms as Disconnected"
+            disconnected < process,
+            "Disconnected before ProcessRooms runs"
+        );
+
+        // The other consumers in handle_get_response: a subscribe GET that
+        // reached the contract but found no real state (and nothing older to
+        // recover) also re-seeds, and one with state completes the
+        // subscription with the network state as the baseline.
+        let get = between(
+            "pubasyncfnhandle_get_response(",
+            "fncomplete_subscribe_get(",
         );
         assert!(
-            reseed.contains("SynchronizerMessage::ProcessRooms"),
-            "the re-seed must run ProcessRooms now, not wait for the timeout"
+            get.contains("ifcompletes_subscribe_get{request_seed_put(owner_vk);returnOk(());}"),
+            "an empty-state subscribe GET with no legacy generation must re-seed"
         );
+        assert!(
+            get.contains("}elseifletSome(network_state)=subscribe_get_baseline{crate::util::defer(move||{complete_subscribe_get(owner_vk,network_state);});"),
+            "a subscribe GET with state must complete via complete_subscribe_get"
+        );
+        let complete = between(
+            "fncomplete_subscribe_get(",
+            "pub(crate)fnlocal_state_ahead(",
+        );
+        let baseline = complete
+            .find("update_last_synced_state(&owner_vk,&network_state)")
+            .expect("the network state must become the sync baseline");
+        let subscribed = complete
+            .find("RoomSyncStatus::Subscribed")
+            .expect("the room must become Subscribed");
+        let push = complete
+            .find("mark_needs_sync(owner_vk)")
+            .expect("local-only state must be pushed");
+        assert!(baseline < push && subscribed < push);
 
         let handler = strip(include_str!("../response_handler.rs"));
         assert!(

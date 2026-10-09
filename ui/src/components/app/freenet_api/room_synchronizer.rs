@@ -900,13 +900,15 @@ impl RoomSynchronizer {
                         MemberId::from(*owner_vk)
                     );
                     if let Some(web_api) = WEB_API.write().as_mut() {
+                        // Marked outstanding BEFORE the send, so no reply can
+                        // ever arrive for a GET not yet recorded as ours.
+                        SYNC_INFO.with_mut(|sync_info| sync_info.note_subscribe_get_sent(owner_vk));
                         match web_api
                             .send(ClientRequest::ContractOp(subscribe_get_request(owner_vk)))
                             .await
                         {
                             Ok(_) => {
                                 SYNC_INFO.with_mut(|sync_info| {
-                                    sync_info.note_subscribe_get_sent(owner_vk);
                                     sync_info
                                         .update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
                                 });
@@ -918,6 +920,7 @@ impl RoomSynchronizer {
                                     e
                                 );
                                 SYNC_INFO.with_mut(|sync_info| {
+                                    sync_info.take_subscribe_get(owner_vk);
                                     sync_info.update_sync_status(
                                         owner_vk,
                                         RoomSyncStatus::Error(e.to_string()),
@@ -2130,12 +2133,6 @@ mod tests {
         format!("{}{}", "unhide_dm_thread", "(")
     }
 
-    /// This file's source with the test module and all whitespace removed.
-    ///
-    /// Cutting at `mod tests` (not `#[cfg(test)]`) is what keeps these pins
-    /// from matching their own assertion literals. Stripping whitespace keeps
-    /// them alive across a rustfmt pass that splits a growing call's arguments
-    /// over several lines.
     /// freenet/river#757: the re-seed PUT must still upload the contract code
     /// and the full state and subscribe — it is what recovers a room the
     /// network lost — while the code-free subscribe GET must not ask for the
@@ -2185,30 +2182,91 @@ mod tests {
         }
     }
 
-    /// The PUT route in `process_rooms` must still build the seed PUT. Scoped
-    /// to `process_rooms` so a builder used elsewhere cannot satisfy it.
+    /// freenet/river#757: after a subscribe GET, local state that the network
+    /// lacks must be detected (and so pushed as a delta), identical state must
+    /// not, and a difference only in the locally rebuilt `actions_state` must
+    /// not either: a decoded network state never has one.
     #[test]
-    fn process_rooms_seeds_with_a_put_on_the_put_route() {
-        let whole = production_source_whitespace_stripped();
-        let start = whole
+    fn local_state_ahead_detects_only_what_an_update_would_carry() {
+        use crate::components::app::freenet_api::response_handler::get_response::local_state_ahead;
+        let (network, params, owner_sk) = create_test_room();
+        let owner = params.owner;
+
+        assert!(!local_state_ahead(&network, &network, &owner));
+
+        let mut offline = network.clone();
+        add_message(&mut offline, &owner_sk, "sent while offline");
+        assert!(local_state_ahead(&offline, &network, &owner));
+
+        let mut rebuilt = network.clone();
+        rebuilt
+            .recent_messages
+            .actions_state
+            .deleted
+            .insert(river_core::room_state::message::MessageId(FastHash(7)));
+        assert_ne!(rebuilt, network, "fixture: only actions_state differs");
+        assert!(!local_state_ahead(&rebuilt, &network, &owner));
+    }
+
+    /// `process_rooms`' body, comments and whitespace stripped, test module cut.
+    fn process_rooms_source() -> String {
+        let src = include_str!("room_synchronizer.rs");
+        let production = src.split("mod tests {").next().unwrap();
+        let stripped: String = crate::util::strip_comments(production)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let start = stripped
             .find("pubasyncfnprocess_rooms(")
             .expect("process_rooms must exist");
-        let body = &whole[start..];
-        let body = &body[..body
+        let body = &stripped[start..];
+        body[..body
             .find("pub(crate)fnupdate_room_state(")
-            .expect("update_room_state follows process_rooms")];
+            .expect("update_room_state follows process_rooms")]
+            .to_string()
+    }
+
+    /// freenet/river#757 wiring. The GET route must record the GET as this
+    /// room's outstanding subscribe BEFORE sending it (the fallback PUT keys
+    /// off that flag: without it a NotFound is ignored and a timeout retries
+    /// the GET forever), send the code-free GET, and `continue` so it never
+    /// also sends the PUT. The PUT route must still build the seed PUT.
+    #[test]
+    fn process_rooms_routes_get_then_falls_through_to_the_seed_put() {
+        let body = process_rooms_source();
         let route = body
             .find("ifroute==SubscribeRoute::Get{")
             .expect("process_rooms must branch on the subscribe route");
+        let get_arm = &body[route..];
+        let get_arm = &get_arm[..get_arm
+            .find("continue;")
+            .expect("the GET arm must end in `continue;`")];
+        let noted = get_arm
+            .find("note_subscribe_get_sent(owner_vk)")
+            .expect("the GET arm must mark the subscribe GET outstanding");
+        let sent = get_arm
+            .find("subscribe_get_request(owner_vk)")
+            .expect("the GET arm must send the code-free subscribe GET");
+        assert!(noted < sent, "mark it outstanding before the send");
+        assert!(
+            !get_arm.contains("seed_put_request"),
+            "the GET arm must not also PUT"
+        );
         let put = body
             .find("seed_put_request(owner_vk,state)")
             .expect("process_rooms must send seed_put_request on the PUT route");
         assert!(
-            put > route,
-            "the seed PUT must be the fallthrough after the GET route, not skipped"
+            put > route + get_arm.len(),
+            "the seed PUT must be the fallthrough after the GET arm"
         );
     }
 
+    /// This file's source with the test module and all whitespace removed.
+    ///
+    /// Cutting at `mod tests` (not `#[cfg(test)]`) is what keeps these pins
+    /// from matching their own assertion literals. Stripping whitespace keeps
+    /// them alive across a rustfmt pass that splits a growing call's arguments
+    /// over several lines.
     fn production_source_whitespace_stripped() -> String {
         let src = include_str!("room_synchronizer.rs");
         let cut = src
