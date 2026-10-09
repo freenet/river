@@ -242,18 +242,23 @@ where stale legacy data overwrites newer state on the current delegate
    - **Nothing** → `fire_legacy_migration_request()`.
 
    The **interrupted-migration marker** is a key in the CURRENT delegate,
-   `__river_legacy_migration_in_progress__` (`LEGACY_MIGRATION_IN_PROGRESS_KEY`):
-   written and acknowledged BEFORE any migration re-save (`hydrate_loaded_rooms`'s
-   legacy branch and the current-blob explosion alike; the save is skipped if
-   the write is not acknowledged) and deleted ONLY by the legacy fan-out's
-   quiescence seal, once every re-save it started has succeeded (several
-   generations re-save concurrently and share it; a recovery that finds
-   nothing to add also converges there). A partial/aborted re-save therefore leaves it in the delegate, the
-   next load sees it in the `ListResponse`, and that drives the recovery above.
+   `__river_legacy_migration_in_progress__` (`LEGACY_MIGRATION_IN_PROGRESS_KEY`),
+   stored (once per session, acknowledged, retried once) BEFORE the first
+   migration re-save (`hydrate_loaded_rooms`'s legacy branch and the
+   current-blob explosion alike) and deleted ONLY by the legacy fan-out's
+   quiescence seal, once no re-save is running and none failed. Several
+   generations re-save concurrently and share it, and a recovery that finds
+   nothing to add also converges at that seal. A partial re-save therefore
+   leaves it in the delegate; the next load sees it in the `ListResponse` and
+   that drives the recovery above. A freenet-migrate walk wip marker
+   (`__migrate_pred_wip__:<hex>`) without its done marker counts the same way,
+   because the walk's flush also writes per-room keys. Session state is the
+   pure `MigrationMarkerState`; marker Store/Delete are serialised (they share
+   one correlation slot).
    It was a localStorage flag until freenet/river#757, which never worked in
    production: the gateway's iframe sandbox omits `allow-same-origin`, so
-   localStorage is unavailable (the `…_done:` flag is likewise inert there; the
-   crate walk's delegate-stored markers are what actually stop repeats).
+   localStorage is unavailable. The `…_done:` seal is likewise inert there, so
+   an account with no rooms at all re-probes legacy on every load.
    `is_migration_marker_key` keeps the marker from being copied forward.
 4. `fire_legacy_migration_request` probes each legacy delegate TWO ways:
    (a) fixed `GetRequest` for `[ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY]`
