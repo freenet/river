@@ -3891,9 +3891,15 @@ mod tests {
     /// from the registry). Either way the entry is required: the committed
     /// bytes are what users' delegate key is derived from, whatever moved
     /// them.
+    ///
+    /// Updated for V32 (freenet/river#757): the delegate's request/response
+    /// byte fields now encode as CBOR byte strings instead of integer arrays,
+    /// which changes the delegate WASM directly. No river-core version bump:
+    /// that would re-key the room contract too, and riverctl does not use
+    /// these message types.
     #[test]
     fn legacy_set_fingerprint_is_stable_across_codegen_changes() {
-        assert_eq!(legacy_set_fingerprint(), "c32c326c1328de9a");
+        assert_eq!(legacy_set_fingerprint(), "10f72d68c4c4ad91");
     }
 
     /// The "migration in progress" and "migration done" localStorage keys MUST
@@ -5588,7 +5594,7 @@ mod tests {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "c2e6063899624b65715d683fbbba04637ba89b72dc17f5b1610343922356fc46",
+            "ea5005e96f5b098893aabf83e3ff8bc765e07c8c5eba1374da039a33060b006b",
             "chat_delegate.wasm changed — this branch must not alter the delegate WASM; \
              if the change is intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"

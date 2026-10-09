@@ -98,11 +98,34 @@ pub struct OutboundDmEntry {
 pub type RequestId = u64;
 
 /// Messages sent from the App to the Chat Delegate
+///
+/// # Byte fields are CBOR byte strings
+///
+/// Every `Vec<u8>` payload field in this enum and in
+/// [`ChatDelegateResponseMsg`] carries `#[serde(with = "cbor_bytes")]`. A bare
+/// `Vec<u8>` goes through `serialize_seq`, and ciborium writes it as a CBOR
+/// array of integers: every byte >= 0x18 costs 2 bytes, so a 1.18 MB stored
+/// room arrived as a 2.32 MB `GetResponse` (freenet/river#757). As a byte
+/// string it costs the payload plus a few header bytes.
+///
+/// Decoding accepts both encodings in both directions, which is what keeps a
+/// delegate re-key safe while old and new generations coexist on one node:
+/// ciborium's `deserialize_byte_buf` (the [`cbor_bytes`] entry point) also
+/// takes a CBOR array, so this UI decodes a legacy delegate's integer-array
+/// replies; and ciborium's `deserialize_seq` (the plain `Vec<u8>` entry point)
+/// also takes a byte string, so a legacy delegate decodes these requests.
+/// Both are pinned in `tests::byte_fields_*`.
+///
+/// `ChatDelegateKey` is deliberately left as an integer array: keys are sent
+/// to legacy delegates during migration (`GetRequest`, `ListRequest`), are a
+/// few dozen bytes, and are the one field whose encoding a frozen predecessor
+/// has to keep accepting forever.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatDelegateRequestMsg {
     // Key-value storage operations
     StoreRequest {
         key: ChatDelegateKey,
+        #[serde(with = "cbor_bytes")]
         value: Vec<u8>,
     },
     GetRequest {
@@ -143,6 +166,7 @@ pub enum ChatDelegateRequestMsg {
     /// round-trip.
     CasStoreRequest {
         key: ChatDelegateKey,
+        #[serde(with = "cbor_bytes")]
         value: Vec<u8>,
         expected_generation: u64,
     },
@@ -164,48 +188,56 @@ pub enum ChatDelegateRequestMsg {
     SignMessage {
         room_key: RoomKey,
         request_id: RequestId,
+        #[serde(with = "cbor_bytes")]
         message_bytes: Vec<u8>,
     },
     /// Sign a member invitation (Member serialized)
     SignMember {
         room_key: RoomKey,
         request_id: RequestId,
+        #[serde(with = "cbor_bytes")]
         member_bytes: Vec<u8>,
     },
     /// Sign a ban (BanV1 serialized)
     SignBan {
         room_key: RoomKey,
         request_id: RequestId,
+        #[serde(with = "cbor_bytes")]
         ban_bytes: Vec<u8>,
     },
     /// Sign a room configuration (Configuration serialized)
     SignConfig {
         room_key: RoomKey,
         request_id: RequestId,
+        #[serde(with = "cbor_bytes")]
         config_bytes: Vec<u8>,
     },
     /// Sign member info (MemberInfo serialized)
     SignMemberInfo {
         room_key: RoomKey,
         request_id: RequestId,
+        #[serde(with = "cbor_bytes")]
         member_info_bytes: Vec<u8>,
     },
     /// Sign a secret version record (SecretVersionRecordV1 serialized)
     SignSecretVersion {
         room_key: RoomKey,
         request_id: RequestId,
+        #[serde(with = "cbor_bytes")]
         record_bytes: Vec<u8>,
     },
     /// Sign an encrypted secret for member (EncryptedSecretForMemberV1 serialized)
     SignEncryptedSecret {
         room_key: RoomKey,
         request_id: RequestId,
+        #[serde(with = "cbor_bytes")]
         secret_bytes: Vec<u8>,
     },
     /// Sign a room upgrade (RoomUpgrade serialized)
     SignUpgrade {
         room_key: RoomKey,
         request_id: RequestId,
+        #[serde(with = "cbor_bytes")]
         upgrade_bytes: Vec<u8>,
     },
 
@@ -252,6 +284,7 @@ pub enum ChatDelegateResponseMsg {
     // Key-value storage responses
     GetResponse {
         key: ChatDelegateKey,
+        #[serde(with = "cbor_bytes::option")]
         value: Option<Vec<u8>>,
     },
     ListResponse {
@@ -271,6 +304,7 @@ pub enum ChatDelegateResponseMsg {
     /// Response to [`ChatDelegateRequestMsg::GetVersionedRequest`].
     GetVersionedResponse {
         key: ChatDelegateKey,
+        #[serde(with = "cbor_bytes::option")]
         value: Option<Vec<u8>>,
         /// Current generation of the stored value (`0` if absent).
         generation: u64,
@@ -333,6 +367,7 @@ pub enum CasStoreResult {
     /// `expected_generation = current_generation`.
     Conflict {
         current_generation: u64,
+        #[serde(with = "cbor_bytes::option")]
         current_value: Option<Vec<u8>>,
     },
     /// The host-function store failed (e.g. secret storage error).
@@ -364,6 +399,99 @@ pub fn is_thread_hidden(
         .iter()
         .find(|h| &h.room_owner_vk == room_owner_vk && h.peer == peer)
         .is_some_and(|h| max_message_ts <= h.hidden_at_ts)
+}
+
+/// Serde helper for the byte fields of [`ChatDelegateRequestMsg`] /
+/// [`ChatDelegateResponseMsg`]: encode as a CBOR **byte string**, decode
+/// either a byte string or the legacy array-of-integers form.
+///
+/// Hand-rolled rather than the `serde_bytes` crate on purpose: adding that
+/// dependency to river-core re-keyed the ROOM CONTRACT even though the room
+/// contract never touches these types (measured for #757: `room_contract.wasm`
+/// went from `a3e63c8c…` to `48d91e7b…`, same size, functions reordered —
+/// most likely via river-core's crate metadata hash feeding symbol order).
+/// This module leaves the room contract byte-identical.
+/// The `check-room-contract-migration` CI gate catches that, but a
+/// delegate-only change has no reason to pay for a room-contract re-key.
+///
+/// `deserialize_byte_buf` is ciborium's entry point that accepts both a CBOR
+/// byte string and a CBOR array, so this is the decode-both path without
+/// `deserialize_any`. These messages are only ever encoded with ciborium.
+mod cbor_bytes {
+    use serde::de::{SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_byte_buf(BytesOrLegacySeq)
+    }
+
+    struct BytesOrLegacySeq;
+
+    impl<'de> Visitor<'de> for BytesOrLegacySeq {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a CBOR byte string, or a legacy array of byte values")
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+            Ok(v)
+        }
+
+        /// Legacy form: a CBOR array of integers, one per byte.
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            // `size_hint` is the array header's DECLARED length, unchecked
+            // against the input, so cap the preallocation (the same bound
+            // serde's own `Vec<u8>` impl applies). See `payload_bytes` in
+            // `room_state/content.rs` for the lying-header case.
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+            while let Some(byte) = seq.next_element::<u8>()? {
+                out.push(byte);
+            }
+            Ok(out)
+        }
+    }
+
+    /// The same encoding for `Option<Vec<u8>>`: `None` stays CBOR `null`.
+    pub mod option {
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+        struct BytesRef<'a>(&'a [u8]);
+
+        impl Serialize for BytesRef<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+
+        #[derive(Deserialize)]
+        struct Bytes(#[serde(with = "super")] Vec<u8>);
+
+        pub fn serialize<S: Serializer>(
+            value: &Option<Vec<u8>>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match value {
+                Some(bytes) => serializer.serialize_some(&BytesRef(bytes)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Vec<u8>>, D::Error> {
+            Ok(Option::<Bytes>::deserialize(deserializer)?.map(|b| b.0))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -724,5 +852,459 @@ mod tests {
             cbor_round_trip_response(&get),
             ChatDelegateResponseMsg::GetResponse { .. }
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // Byte-field encoding (freenet/river#757)
+    //
+    // `legacy` mirrors the pre-#757 shape of every variant whose byte fields
+    // gained `serde(with = "cbor_bytes")`: the same variant names and field
+    // names with a plain `Vec<u8>`, which is exactly what every predecessor
+    // delegate generation (and the UI that talked to it) was compiled with.
+    // ciborium tags enums externally by variant NAME, so a subset enum is
+    // wire-identical for the variants it names.
+    // ---------------------------------------------------------------------
+    // Variant names must match the live enums exactly (ciborium tags by name).
+    #[allow(clippy::enum_variant_names)]
+    mod legacy {
+        use super::super::{RequestId, RoomKey};
+        use serde::{Deserialize, Serialize};
+
+        /// Its own key type, NOT the live `ChatDelegateKey`: sharing the live
+        /// type would make any encoding change to it invisible here.
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        pub struct ChatDelegateKey(pub Vec<u8>);
+
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        pub enum Request {
+            StoreRequest {
+                key: ChatDelegateKey,
+                value: Vec<u8>,
+            },
+            CasStoreRequest {
+                key: ChatDelegateKey,
+                value: Vec<u8>,
+                expected_generation: u64,
+            },
+            SignMessage {
+                room_key: RoomKey,
+                request_id: RequestId,
+                message_bytes: Vec<u8>,
+            },
+            SignMember {
+                room_key: RoomKey,
+                request_id: RequestId,
+                member_bytes: Vec<u8>,
+            },
+            SignBan {
+                room_key: RoomKey,
+                request_id: RequestId,
+                ban_bytes: Vec<u8>,
+            },
+            SignConfig {
+                room_key: RoomKey,
+                request_id: RequestId,
+                config_bytes: Vec<u8>,
+            },
+            SignMemberInfo {
+                room_key: RoomKey,
+                request_id: RequestId,
+                member_info_bytes: Vec<u8>,
+            },
+            SignSecretVersion {
+                room_key: RoomKey,
+                request_id: RequestId,
+                record_bytes: Vec<u8>,
+            },
+            SignEncryptedSecret {
+                room_key: RoomKey,
+                request_id: RequestId,
+                secret_bytes: Vec<u8>,
+            },
+            SignUpgrade {
+                room_key: RoomKey,
+                request_id: RequestId,
+                upgrade_bytes: Vec<u8>,
+            },
+            GetRequest {
+                key: ChatDelegateKey,
+            },
+            ListRequest,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        pub enum Response {
+            GetResponse {
+                key: ChatDelegateKey,
+                value: Option<Vec<u8>>,
+            },
+            GetVersionedResponse {
+                key: ChatDelegateKey,
+                value: Option<Vec<u8>>,
+                generation: u64,
+            },
+            CasStoreResponse {
+                key: ChatDelegateKey,
+                result: CasStoreResult,
+            },
+            ListResponse {
+                keys: Vec<ChatDelegateKey>,
+            },
+        }
+
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        pub enum CasStoreResult {
+            Stored {
+                generation: u64,
+            },
+            Conflict {
+                current_generation: u64,
+                current_value: Option<Vec<u8>>,
+            },
+            Failed(String),
+        }
+    }
+
+    fn lk(key: &ChatDelegateKey) -> legacy::ChatDelegateKey {
+        legacy::ChatDelegateKey(key.0.clone())
+    }
+
+    fn to_cbor<T: Serialize>(v: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(v, &mut buf).expect("serialize CBOR");
+        buf
+    }
+
+    fn from_cbor<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+        ciborium::de::from_reader(bytes).expect("parse CBOR")
+    }
+
+    /// Every byte value, so the high (2-byte-as-integer) range is covered.
+    fn all_bytes() -> Vec<u8> {
+        (0..=255u8).cycle().take(1000).collect()
+    }
+
+    /// Re-encode a new-format value through its legacy mirror and back, so a
+    /// test can compare the two without needing `PartialEq` on the new enums.
+    fn new_request_as_legacy(msg: &ChatDelegateRequestMsg) -> legacy::Request {
+        from_cbor(&to_cbor(msg))
+    }
+
+    fn new_response_as_legacy(msg: &ChatDelegateResponseMsg) -> legacy::Response {
+        from_cbor(&to_cbor(msg))
+    }
+
+    /// The point of #757: a large value costs ~its own size on the wire, not
+    /// ~2x. 1000 bytes covering every byte value is 1002 bytes of CBOR string
+    /// plus the envelope; as an integer array it was ~1.9 KB.
+    #[test]
+    fn byte_fields_encode_as_cbor_byte_strings() {
+        let value = all_bytes();
+        let new = to_cbor(&ChatDelegateResponseMsg::GetResponse {
+            key: ChatDelegateKey(b"k".to_vec()),
+            value: Some(value.clone()),
+        });
+        let old = to_cbor(&legacy::Response::GetResponse {
+            key: legacy::ChatDelegateKey(b"k".to_vec()),
+            value: Some(value.clone()),
+        });
+        // 0x59 0x03 0xE8 = CBOR major type 2 (byte string), 2-byte length 1000.
+        assert!(
+            new.windows(3).any(|w| w == [0x59, 0x03, 0xE8]),
+            "value must be a CBOR byte string"
+        );
+        assert!(
+            new.len() < value.len() + 64,
+            "new encoding is {} bytes",
+            new.len()
+        );
+        assert!(
+            old.len() > value.len() * 18 / 10,
+            "legacy encoding is {} bytes",
+            old.len()
+        );
+    }
+
+    /// A predecessor delegate replies with integer arrays; the new UI must
+    /// decode them, or every migration read of a legacy delegate fails.
+    /// Covers every response field that changed, including `None`.
+    #[test]
+    fn byte_fields_decode_legacy_integer_array_responses() {
+        let value = all_bytes();
+        let key = ChatDelegateKey(b"room:abc".to_vec());
+        for v in [Some(value.clone()), Some(vec![]), None] {
+            let legacy_get = legacy::Response::GetResponse {
+                key: lk(&key),
+                value: v.clone(),
+            };
+            match from_cbor::<ChatDelegateResponseMsg>(&to_cbor(&legacy_get)) {
+                ChatDelegateResponseMsg::GetResponse { key: k, value: got } => {
+                    assert_eq!(k, key);
+                    assert_eq!(got, v);
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+
+            let legacy_versioned = legacy::Response::GetVersionedResponse {
+                key: lk(&key),
+                value: v.clone(),
+                generation: 7,
+            };
+            match from_cbor::<ChatDelegateResponseMsg>(&to_cbor(&legacy_versioned)) {
+                ChatDelegateResponseMsg::GetVersionedResponse {
+                    value: got,
+                    generation,
+                    ..
+                } => {
+                    assert_eq!(got, v);
+                    assert_eq!(generation, 7);
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+
+            let legacy_conflict = legacy::Response::CasStoreResponse {
+                key: lk(&key),
+                result: legacy::CasStoreResult::Conflict {
+                    current_generation: 3,
+                    current_value: v.clone(),
+                },
+            };
+            match from_cbor::<ChatDelegateResponseMsg>(&to_cbor(&legacy_conflict)) {
+                ChatDelegateResponseMsg::CasStoreResponse { result, .. } => assert_eq!(
+                    result,
+                    CasStoreResult::Conflict {
+                        current_generation: 3,
+                        current_value: v.clone(),
+                    }
+                ),
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+    }
+
+    /// The reverse direction: a frozen predecessor delegate (plain `Vec<u8>`)
+    /// must still decode what the new UI sends and what the new delegate
+    /// replies. The migration path sends predecessors only key-only requests
+    /// today, so this is defence in depth, not a load-bearing path — but it
+    /// means nothing in the protocol depends on that staying true.
+    #[test]
+    fn byte_fields_legacy_decoder_accepts_byte_strings() {
+        let value = all_bytes();
+        let key = ChatDelegateKey(b"room:abc".to_vec());
+        let room_key = [5u8; 32];
+
+        let cases: Vec<(ChatDelegateRequestMsg, legacy::Request)> = vec![
+            (
+                ChatDelegateRequestMsg::StoreRequest {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+                legacy::Request::StoreRequest {
+                    key: lk(&key),
+                    value: value.clone(),
+                },
+            ),
+            (
+                ChatDelegateRequestMsg::CasStoreRequest {
+                    key: key.clone(),
+                    value: value.clone(),
+                    expected_generation: 4,
+                },
+                legacy::Request::CasStoreRequest {
+                    key: lk(&key),
+                    value: value.clone(),
+                    expected_generation: 4,
+                },
+            ),
+            (
+                ChatDelegateRequestMsg::SignMessage {
+                    room_key,
+                    request_id: 1,
+                    message_bytes: value.clone(),
+                },
+                legacy::Request::SignMessage {
+                    room_key,
+                    request_id: 1,
+                    message_bytes: value.clone(),
+                },
+            ),
+            (
+                ChatDelegateRequestMsg::SignMember {
+                    room_key,
+                    request_id: 2,
+                    member_bytes: value.clone(),
+                },
+                legacy::Request::SignMember {
+                    room_key,
+                    request_id: 2,
+                    member_bytes: value.clone(),
+                },
+            ),
+            (
+                ChatDelegateRequestMsg::SignBan {
+                    room_key,
+                    request_id: 3,
+                    ban_bytes: value.clone(),
+                },
+                legacy::Request::SignBan {
+                    room_key,
+                    request_id: 3,
+                    ban_bytes: value.clone(),
+                },
+            ),
+            (
+                ChatDelegateRequestMsg::SignConfig {
+                    room_key,
+                    request_id: 4,
+                    config_bytes: value.clone(),
+                },
+                legacy::Request::SignConfig {
+                    room_key,
+                    request_id: 4,
+                    config_bytes: value.clone(),
+                },
+            ),
+            (
+                ChatDelegateRequestMsg::SignMemberInfo {
+                    room_key,
+                    request_id: 5,
+                    member_info_bytes: value.clone(),
+                },
+                legacy::Request::SignMemberInfo {
+                    room_key,
+                    request_id: 5,
+                    member_info_bytes: value.clone(),
+                },
+            ),
+            (
+                ChatDelegateRequestMsg::SignSecretVersion {
+                    room_key,
+                    request_id: 6,
+                    record_bytes: value.clone(),
+                },
+                legacy::Request::SignSecretVersion {
+                    room_key,
+                    request_id: 6,
+                    record_bytes: value.clone(),
+                },
+            ),
+            (
+                ChatDelegateRequestMsg::SignEncryptedSecret {
+                    room_key,
+                    request_id: 7,
+                    secret_bytes: value.clone(),
+                },
+                legacy::Request::SignEncryptedSecret {
+                    room_key,
+                    request_id: 7,
+                    secret_bytes: value.clone(),
+                },
+            ),
+            (
+                ChatDelegateRequestMsg::SignUpgrade {
+                    room_key,
+                    request_id: 8,
+                    upgrade_bytes: value.clone(),
+                },
+                legacy::Request::SignUpgrade {
+                    room_key,
+                    request_id: 8,
+                    upgrade_bytes: value.clone(),
+                },
+            ),
+        ];
+        for (new, expected) in cases {
+            assert_eq!(new_request_as_legacy(&new), expected);
+            // And the legacy form still decodes into the new type with the
+            // same bytes (re-encoded through legacy for comparison).
+            let back: ChatDelegateRequestMsg = from_cbor(&to_cbor(&expected));
+            assert_eq!(new_request_as_legacy(&back), expected);
+        }
+
+        for v in [Some(value.clone()), Some(vec![]), None] {
+            assert_eq!(
+                new_response_as_legacy(&ChatDelegateResponseMsg::GetResponse {
+                    key: key.clone(),
+                    value: v.clone(),
+                }),
+                legacy::Response::GetResponse {
+                    key: lk(&key),
+                    value: v.clone()
+                }
+            );
+            assert_eq!(
+                new_response_as_legacy(&ChatDelegateResponseMsg::GetVersionedResponse {
+                    key: key.clone(),
+                    value: v.clone(),
+                    generation: 9,
+                }),
+                legacy::Response::GetVersionedResponse {
+                    key: lk(&key),
+                    value: v.clone(),
+                    generation: 9,
+                }
+            );
+            assert_eq!(
+                new_response_as_legacy(&ChatDelegateResponseMsg::CasStoreResponse {
+                    key: key.clone(),
+                    result: CasStoreResult::Conflict {
+                        current_generation: 2,
+                        current_value: v.clone(),
+                    },
+                }),
+                legacy::Response::CasStoreResponse {
+                    key: lk(&key),
+                    result: legacy::CasStoreResult::Conflict {
+                        current_generation: 2,
+                        current_value: v.clone(),
+                    },
+                }
+            );
+        }
+    }
+
+    /// The requests the migration walk sends to a PREDECESSOR delegate must be
+    /// byte-identical to what that predecessor's own UI sent, because a frozen
+    /// WASM is the one decoder we can never update. Today that is the key-only
+    /// `GetRequest` and `ListRequest`; `ChatDelegateKey` stays an integer
+    /// array for exactly this reason.
+    #[test]
+    fn predecessor_bound_requests_are_wire_identical_to_legacy() {
+        let key = ChatDelegateKey(b"room:3xYz".to_vec());
+        assert_eq!(
+            to_cbor(&ChatDelegateRequestMsg::GetRequest { key: key.clone() }),
+            to_cbor(&legacy::Request::GetRequest { key: lk(&key) })
+        );
+        assert_eq!(
+            to_cbor(&ChatDelegateRequestMsg::ListRequest),
+            to_cbor(&legacy::Request::ListRequest)
+        );
+        assert_eq!(
+            to_cbor(&ChatDelegateResponseMsg::ListResponse {
+                keys: vec![key.clone()]
+            }),
+            to_cbor(&legacy::Response::ListResponse {
+                keys: vec![lk(&key)]
+            })
+        );
+    }
+
+    /// A legacy array header declares its length, and ciborium hands that
+    /// declared length to `size_hint` unchecked. A tiny message claiming
+    /// 2^64-1 elements must fail to decode, not allocate or panic.
+    #[test]
+    fn legacy_array_with_lying_length_header_errors_not_panics() {
+        // {"GetResponse": {"key": [], "value": <array, 2^64-1 elements>}}
+        let mut bytes = to_cbor(&legacy::Response::GetResponse {
+            key: legacy::ChatDelegateKey(vec![]),
+            value: Some(vec![]),
+        });
+        // The empty legacy `value` array is the final byte (0x80); replace it
+        // with an 8-byte-length array header and a single element.
+        assert_eq!(bytes.pop(), Some(0x80));
+        bytes.extend_from_slice(&[0x9B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        let decoded: Result<ChatDelegateResponseMsg, _> =
+            ciborium::de::from_reader(bytes.as_slice());
+        assert!(decoded.is_err());
     }
 }
