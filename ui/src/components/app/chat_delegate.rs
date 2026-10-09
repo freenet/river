@@ -673,9 +673,12 @@ async fn set_up_chat_delegate_with(register_first: bool) -> Result<(), String> {
     // Backstop: if the list is neither answered nor reported missing (a lost
     // reply), still send the DM load, so the outbound-DM saves waiting on its
     // hydration get their bound instead of parking until the next pass.
+    // Not once this attempt is registering: the register path sends the DM
+    // load itself after its ack, and a DM request sent while the register
+    // wait is armed could, on a pre-#5729 node, answer it as the ack.
     crate::util::safe_spawn_local(async move {
         crate::util::sleep(std::time::Duration::from_millis(DM_LOAD_FALLBACK_MS)).await;
-        if load_attempt_is_current(attempt) {
+        if load_attempt_is_current(attempt) && !registered_this_attempt() {
             request_outbound_dms_once();
         }
     });
@@ -684,9 +687,10 @@ async fn set_up_chat_delegate_with(register_first: bool) -> Result<(), String> {
 
 /// How long the list-first load waits for its room list to be answered (or
 /// the delegate registered) before sending the outbound-DM load anyway
-/// (freenet/river#757). Past the register wait, so it never races a
-/// registration still in progress.
+/// (freenet/river#757).
 const DM_LOAD_FALLBACK_MS: u64 = 2 * REGISTER_ACK_TIMEOUT_MS;
+const _: () = assert!(DM_LOAD_FALLBACK_MS > REGISTER_ACK_TIMEOUT_MS);
+const _: () = assert!(DM_LOAD_FALLBACK_MS < LOAD_HARD_MAX_MS);
 
 /// `attempt + 1` of the load attempt that has sent its outbound-DM load; 0
 /// when none has (freenet/river#757).
@@ -704,9 +708,13 @@ pub(crate) fn request_outbound_dms_once() {
     }
 }
 
-/// Longer than core's first per-connection delegate backoff (100 ms + 20%
-/// jitter, `client_events/websocket.rs` `DelegateRateLimiter`).
+/// Longer than core's per-connection delegate backoff after one failure
+/// (100 ms +-20%) or two (200 ms +-20%), `client_events/websocket.rs`
+/// `DelegateRateLimiter`. A third consecutive failure on one socket (480 ms
+/// at most) is not covered; the register then waits out its timeout and the
+/// load fails to Retry.
 const MISSING_BACKOFF_LAPSE_MS: u64 = 250;
+const _: () = assert!(MISSING_BACKOFF_LAPSE_MS > 240);
 
 /// Whether [`register_then_load`] sends the room list after the register wait.
 fn should_relist(reload: Reload, list_answered: bool) -> bool {
@@ -925,6 +933,12 @@ impl RegisterAckSlot {
         }
     }
 
+    /// Drop whatever wait is armed, from any pass (freenet/river#757). Its
+    /// waiter sees `Superseded`.
+    pub(crate) fn cancel(&mut self) {
+        self.pending = None;
+    }
+
     /// Drop the wait armed as `generation`. A later pass's wait is left alone.
     pub(crate) fn disarm(&mut self, generation: u64) {
         if matches!(&self.pending, Some((armed, _, _)) if *armed == generation) {
@@ -976,7 +990,7 @@ fn disarm_register_ack(generation: u64) {
 
 /// Drop whatever register wait is armed; its waiter sees `Superseded`.
 fn cancel_register_ack() {
-    REGISTER_ACK.lock().unwrap().pending = None;
+    REGISTER_ACK.lock().unwrap().cancel();
 }
 
 /// Called from the synchronizer's error arm for a typed
@@ -1010,7 +1024,11 @@ pub(crate) fn note_delegate_response_for_register_ack(key: &DelegateKey, values_
         debug!("RegisterDelegate reply received");
         return;
     }
-    if values_len == 0 && is_current_delegate_key(key) && !registered_this_attempt() {
+    if values_len == 0
+        && is_current_delegate_key(key)
+        && !registered_this_attempt()
+        && list_outstanding_this_attempt()
+    {
         warn!("Empty reply from the chat delegate: the node does not have it (pre-#5729 node)");
         on_current_delegate_missing();
     }
@@ -1046,6 +1064,14 @@ pub(crate) fn claim_list_load() -> bool {
         &LIST_ANSWERED_FOR_ATTEMPT,
         LOAD_ATTEMPT_GEN.load(Ordering::Relaxed),
     )
+}
+
+/// Whether this attempt's room list has been sent and is still unanswered.
+/// An empty reply means "missing" only then: once the list is answered, an
+/// unclaimed empty reply is a superseded attempt's late register ack.
+fn list_outstanding_this_attempt() -> bool {
+    LIST_OUTSTANDING.load(Ordering::Relaxed)
+        == LOAD_ATTEMPT_GEN.load(Ordering::Relaxed).wrapping_add(1)
 }
 
 fn list_answered_this_attempt(attempt: u32) -> bool {
@@ -1510,6 +1536,25 @@ mod tests {
         );
     }
 
+    /// freenet/river#757: cancelling drops a wait armed by any pass, so a later
+    /// empty reply is not mistaken for its ack, and the waiter is superseded.
+    #[test]
+    fn a_cancelled_register_wait_takes_no_ack() {
+        let mut slot = RegisterAckSlot::default();
+        let key = register_test_key(3);
+        let armed = slot.arm(key.clone());
+        slot.cancel();
+        assert!(
+            !slot.on_delegate_response(&key, 0),
+            "no wait left to complete"
+        );
+        let outcome = futures::executor::block_on(wait_for_register_ack(
+            armed.receiver,
+            futures::future::pending::<()>(),
+        ));
+        assert_eq!(outcome, RegisterAckWait::Superseded);
+    }
+
     /// freenet/river#757: after the register wait, Retry always lists; the
     /// recovery from a missing delegate re-lists unless the list was answered
     /// after all.
@@ -1531,22 +1576,42 @@ mod tests {
     #[test]
     fn list_first_load_edges_are_wired() {
         let production = chat_delegate_production();
-        let with_body = fn_body(&production, "async fn set_up_chat_delegate_with(");
+        let with_body: String = fn_body(&production, "async fn set_up_chat_delegate_with(")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let register_first_end = with_body
+            .find("returnregister_then_load(attempt,Reload::All).await;}")
+            .expect("the register-first branch must return");
         let cancel = with_body
             .find("cancel_register_ack();")
             .expect("a stale register wait must be cancelled");
         let list = with_body.find("fire_list_rooms_request().await").unwrap();
-        assert!(cancel < list);
-        assert!(with_body[list..].contains("request_outbound_dms_once();"));
+        assert!(
+            register_first_end < cancel && cancel < list,
+            "the list-first path itself must cancel a stale wait before listing"
+        );
+        assert!(
+            with_body[list..].contains(
+                "crate::util::safe_spawn_local(asyncmove{crate::util::sleep(std::time::Duration::from_millis(DM_LOAD_FALLBACK_MS)).await;ifload_attempt_is_current(attempt)&&!registered_this_attempt(){request_outbound_dms_once();}});"
+            ),
+            "the DM backstop must wait, and skip a superseded or registering attempt"
+        );
 
-        let register = fn_body(&production, "async fn register_then_load(");
-        let lapse = register
-            .find("MISSING_BACKOFF_LAPSE_MS")
-            .expect("the recovery must let the node's backoff lapse");
-        assert!(lapse < register.find("DelegateRequest::RegisterDelegate").unwrap());
-        let timed_out = register.find("RegisterAckWait::TimedOut => {").unwrap();
-        assert!(register[timed_out..].contains("disarm_register_ack(generation);"));
-        assert!(register.contains("should_relist(reload, list_answered_this_attempt(attempt))"));
+        let register: String = fn_body(&production, "async fn register_then_load(")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            register.starts_with("asyncfnregister_then_load(attempt:u32,reload:Reload)->Result<(),String>{ifreload==Reload::Unanswered{crate::util::sleep(std::time::Duration::from_millis(MISSING_BACKOFF_LAPSE_MS)).await;if!load_attempt_is_current(attempt){returnOk(());}}"),
+            "only the recovery waits out the backoff, and re-checks the attempt after"
+        );
+        let timed_out = register.find("RegisterAckWait::TimedOut=>{").unwrap();
+        let timed_out_arm = &register[timed_out..];
+        let timed_out_arm =
+            &timed_out_arm[..timed_out_arm.find("RegisterAckWait::Superseded").unwrap()];
+        assert!(timed_out_arm.contains("disarm_register_ack(generation);"));
+        assert!(register.contains("should_relist(reload,list_answered_this_attempt(attempt))"));
 
         let fire_list = fn_body(&production, "async fn fire_list_rooms_request()");
         let marker = fire_list
@@ -1646,8 +1711,9 @@ mod tests {
             &production,
             "pub(crate) fn note_delegate_response_for_register_ack(",
         );
-        assert!(note.contains(
-            "values_len == 0 && is_current_delegate_key(key) && !registered_this_attempt()"
+        let squashed: String = note.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(squashed.contains(
+            "values_len==0&&is_current_delegate_key(key)&&!registered_this_attempt()&&list_outstanding_this_attempt()"
         ));
         assert!(note.contains("on_current_delegate_missing();"));
     }
