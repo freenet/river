@@ -12,23 +12,25 @@ use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
     arm_legacy_migration_recovery, await_delegate_response, begin_legacy_migration,
-    complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
-    complete_pending_signing_key_request, current_delegate_source_rank,
-    decide_legacy_migration_action, decide_per_room_load_action, end_legacy_migration,
-    enqueue_delegate_request, fire_legacy_migration_request, hydrate_hidden_dm_threads,
-    hydrate_outbound_dms_cache, is_legacy_delegate_key, is_legacy_migration_in_progress,
-    legacy_scoped_correlation, load_state_after_probe_legacy, mark_legacy_migration_done,
-    mark_legacy_migration_in_progress, mark_outbound_dms_hydrated, note_current_list_response,
-    note_delegate_response_for_register_ack, note_migration_marker_from_listing,
-    parse_room_storage_key, per_room_terminal, prune_outbound_dms_for_purges,
-    request_legacy_seal_on_quiescence, response_correlation_base, room_storage_key,
-    save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
+    claim_list_load, complete_pending_public_key_request, complete_pending_request,
+    complete_pending_sign_request, complete_pending_signing_key_request,
+    current_delegate_source_rank, decide_legacy_migration_action, decide_per_room_load_action,
+    end_legacy_migration, enqueue_delegate_request, fire_legacy_migration_request,
+    hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
+    is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
+    mark_legacy_migration_done, mark_legacy_migration_in_progress, mark_outbound_dms_hydrated,
+    note_current_list_response, note_delegate_response_for_register_ack,
+    note_migration_marker_from_listing, parse_room_storage_key, per_room_terminal,
+    prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, request_outbound_dms_once,
+    response_correlation_base, room_storage_key, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, seed_saved_slots_from_load, send_delegate_request,
     send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
     LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
     OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
+use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::room_data::{RoomSlot, Rooms, RoomsMeta};
@@ -39,7 +41,7 @@ use dioxus::prelude::ReadableExt;
 
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 use freenet_stdlib::prelude::{DelegateKey, OutboundDelegateMsg};
-pub use get_response::handle_get_response;
+pub use get_response::{handle_get_not_found, handle_get_response};
 pub use put_response::handle_put_response;
 use river_core::chat_delegate::{
     CasStoreResult, ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg,
@@ -105,6 +107,9 @@ impl ResponseHandler {
                         state.to_vec(),
                     )
                     .await?;
+                }
+                ContractResponse::NotFound { instance_id } => {
+                    handle_get_not_found(instance_id).await;
                 }
                 ContractResponse::PutResponse { key } => {
                     handle_put_response(&mut self.room_synchronizer, key).await?;
@@ -538,9 +543,20 @@ impl ResponseHandler {
                                             }
                                         } else {
                                             note_current_list_response();
-                                            crate::util::safe_spawn_local(async move {
-                                                load_rooms_per_room(keys).await;
-                                            });
+                                            // One room load per attempt: a second
+                                            // ListResponse (a re-list after
+                                            // registering, freenet/river#757, or
+                                            // a late one) carries the same keys.
+                                            if claim_list_load() {
+                                                // The delegate answered, so the
+                                                // outbound-DM load can follow.
+                                                request_outbound_dms_once();
+                                                crate::util::safe_spawn_local(async move {
+                                                    load_rooms_per_room(keys).await;
+                                                });
+                                            } else {
+                                                info!("Ignoring a second room list for this load attempt");
+                                            }
                                         }
                                     }
                                     // CAS storage responses (freenet/river#345). The
@@ -957,6 +973,10 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                 None
             };
 
+            // The current delegate holds exactly these bytes: let the save that
+            // follows hydration skip any room hydration left unchanged instead
+            // of re-reading every room's full value (freenet/river#757).
+            seed_saved_slots_from_load(&slots, meta.as_ref());
             let loaded = reconstruct_rooms(slots, meta);
             // Capture emptiness BEFORE `loaded` is moved into hydrate, for the
             // authoritative terminal decision below.
@@ -1588,6 +1608,19 @@ fn hydrate_loaded_rooms_with_authority(
         .copied()
         .filter(|k| !tombstoned.contains(k))
         .collect();
+    // These rooms have been on the network before, so their first subscribe
+    // can try a code-free GET rather than re-uploading the contract
+    // (freenet/river#757). Deferred AHEAD of the merge below (`defer` is FIFO),
+    // so no `process_rooms` can see a room before it is marked.
+    let known_keys = room_keys.clone();
+    crate::util::defer(move || {
+        SYNC_INFO.with_mut(|sync_info| {
+            for key in known_keys {
+                sync_info.mark_known_on_network(key);
+            }
+        });
+    });
+
     // Merge the loaded rooms with the current rooms
     let loaded_keys = room_keys.clone();
     crate::util::defer(move || {
@@ -1952,9 +1985,12 @@ fn hydrate_loaded_rooms_with_authority(
     // right thing per room: imported rooms
     // (default placeholder state) GET with
     // return_contract_code=true; full-state
-    // rooms PUT with subscribe=true. Both cache
-    // the contract WASM on the node BEFORE any
-    // subscribe, so the subscription succeeds.
+    // rooms GET with subscribe=true and no
+    // code (freenet/river#757), re-seeding
+    // with a PUT if the network lacks them.
+    // Each makes the node cache the contract
+    // WASM itself, so the subscription
+    // succeeds.
     let had_loaded_rooms = !room_keys.is_empty();
     info!(
         "Scheduling initial sync for {} rooms loaded from delegate",
@@ -3395,6 +3431,33 @@ mod tests {
                 && !after_none.contains("mark_fetch_failure()"),
             "a definitive `value: None` is a legitimate skip, not a fetch failure"
         );
+    }
+
+    /// freenet/river#757: the per-room load must seed the save baseline from
+    /// the slots it read from the current delegate, before they are consumed,
+    /// or the save that follows re-reads every room's full value.
+    #[test]
+    fn per_room_load_seeds_the_save_baseline() {
+        let src = include_str!("response_handler.rs");
+        let production: String = crate::util::strip_comments(
+            src.split("mod tests {")
+                .next()
+                .expect("production code before `mod tests`"),
+        )
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+        let start = production
+            .find("asyncfnload_rooms_per_room(")
+            .expect("load_rooms_per_room must exist");
+        let region = &production[start..];
+        let seed = region
+            .find("seed_saved_slots_from_load(&slots,meta.as_ref());")
+            .expect("the per-room load must seed the save baseline");
+        let reconstruct = region
+            .find("reconstruct_rooms(slots,meta)")
+            .expect("the per-room load reconstructs the rooms");
+        assert!(seed < reconstruct, "seed before the slots are consumed");
     }
 
     /// freenet/river#417: the startup room load must fan the per-room delegate
