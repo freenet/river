@@ -3864,7 +3864,7 @@ mod tests {
     /// (freenet/river#398 moved codegen to `freenet-migrate-build`) must
     /// reproduce it byte-identically, or every user silently re-runs legacy
     /// migration once. Pinned to the value computed from the current
-    /// `legacy_delegates.toml` (27 entries spanning V1..V30 — V4–V6 removed —
+    /// `legacy_delegates.toml` (29 entries spanning V1..V32 — V4–V6 removed —
     /// in file order). This value
     /// SHOULD change when a genuinely new legacy entry is added — update the
     /// constant then — but must NEVER change from a codegen/tooling swap.
@@ -3895,7 +3895,8 @@ mod tests {
     /// Updated for V32 (freenet/river#757): the delegate's request/response
     /// byte fields now encode as CBOR byte strings instead of integer arrays,
     /// which changes the delegate WASM directly. No river-core version bump:
-    /// that would re-key the room contract too, and riverctl does not use
+    /// that re-keys the room contract too (measured: 0.1.21 -> 0.1.22 moves
+    /// room_contract.wasm a3e63c8c… -> c29522a5…), and riverctl does not use
     /// these message types.
     #[test]
     fn legacy_set_fingerprint_is_stable_across_codegen_changes() {

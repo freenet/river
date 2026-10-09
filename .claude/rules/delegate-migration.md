@@ -25,7 +25,9 @@ migration entry, **users lose all room data**.
 - Run `add-migration` BEFORE your changes alter the WASM (stash changes first if needed)
 - **Single source of truth**: `legacy_delegates.toml` — never manually edit byte arrays
 - **Both steps use BLAKE3**: `code_hash = BLAKE3(wasm)`, `delegate_key = BLAKE3(code_hash)` — NOT SHA256
-- **Publish both UI and riverctl** when WASM changes: `cargo make publish-all`
+- **Publish both UI and riverctl** when the ROOM-CONTRACT WASM changes:
+  `cargo make publish-all`. riverctl embeds only `room_contract.wasm`, so a
+  delegate-only re-key (e.g. freenet/river#757) publishes the UI alone.
 
 ## Single Source of Truth: `legacy_delegates.toml`
 
@@ -172,6 +174,31 @@ Two related things worth keeping straight:
   byte-identical because the generated table sits behind
   `#[cfg(feature = "migration")]` (`common/src/lib.rs`), which the contract build
   does not enable — not because non-code changes are free. Do not generalise it.
+
+## river-core dependency and version changes re-key the room contract
+
+**Measured, 2026-10-09 (freenet/river#757).** Same canonical co-build
+(`scripts/sync-wasm.sh`), river-core's own source unchanged except as noted:
+
+```
+baseline                                      room_contract.wasm = a3e63c8c…
++ `serde_bytes` dependency on river-core       room_contract.wasm = 48d91e7b…
++ river-core version 0.1.21 -> 0.1.22          room_contract.wasm = c29522a5…
+```
+
+Same size, functions reordered: river-core's crate metadata hash feeds the
+contract's symbol order even though the contract never calls the new code.
+So a change meant for the delegate alone (a new wire helper, a dependency
+only the delegate uses) can still re-key the room contract, which then needs
+`add-room-contract-migration` and a riverctl release. When the change does not
+need either, keep river-core's dependency list and version untouched (#757
+hand-rolled a 40-line serde helper instead of adding `serde_bytes`), and check
+`room_contract.wasm` against `main` after `sync-wasm`. Changes to
+`common/src/chat_delegate.rs` itself have left it byte-identical (#345, #757).
+
+Note the measurement must use the co-build: building `-p room-contract` alone
+resolves river-core with different features and gives a different hash even
+on an unmodified tree.
 
 ## Technical Details
 

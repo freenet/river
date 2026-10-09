@@ -101,8 +101,9 @@ pub type RequestId = u64;
 ///
 /// # Byte fields are CBOR byte strings
 ///
-/// Every `Vec<u8>` payload field in this enum and in
-/// [`ChatDelegateResponseMsg`] carries `#[serde(with = "cbor_bytes")]`. A bare
+/// Every `Vec<u8>` / `Option<Vec<u8>>` payload field in this enum, in
+/// [`ChatDelegateResponseMsg`] and in [`CasStoreResult`] is encoded through
+/// the private `cbor_bytes` helper below. A bare
 /// `Vec<u8>` goes through `serialize_seq`, and ciborium writes it as a CBOR
 /// array of integers: every byte >= 0x18 costs 2 bytes, so a 1.18 MB stored
 /// room arrived as a 2.32 MB `GetResponse` (freenet/river#757). As a byte
@@ -110,16 +111,21 @@ pub type RequestId = u64;
 ///
 /// Decoding accepts both encodings in both directions, which is what keeps a
 /// delegate re-key safe while old and new generations coexist on one node:
-/// ciborium's `deserialize_byte_buf` (the [`cbor_bytes`] entry point) also
+/// ciborium's `deserialize_byte_buf` (the `cbor_bytes` entry point) also
 /// takes a CBOR array, so this UI decodes a legacy delegate's integer-array
 /// replies; and ciborium's `deserialize_seq` (the plain `Vec<u8>` entry point)
 /// also takes a byte string, so a legacy delegate decodes these requests.
 /// Both are pinned in `tests::byte_fields_*`.
 ///
-/// `ChatDelegateKey` is deliberately left as an integer array: keys are sent
-/// to legacy delegates during migration (`GetRequest`, `ListRequest`), are a
-/// few dozen bytes, and are the one field whose encoding a frozen predecessor
-/// has to keep accepting forever.
+/// Deliberately left as integer arrays:
+/// - `ChatDelegateKey`: keys are sent to legacy delegates during migration
+///   (`GetRequest`) and come back in their `ListResponse`, are a few dozen
+///   bytes, and are the one byte field a frozen predecessor has to keep
+///   exchanging byte-identically forever.
+/// - `SignResponse::signature` (64 bytes, inside a `Result`).
+///
+/// A new byte field added to either enum should use `cbor_bytes` too, and be
+/// added to `tests::every_byte_field_encodes_as_a_cbor_byte_string`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatDelegateRequestMsg {
     // Key-value storage operations
@@ -284,7 +290,7 @@ pub enum ChatDelegateResponseMsg {
     // Key-value storage responses
     GetResponse {
         key: ChatDelegateKey,
-        #[serde(with = "cbor_bytes::option")]
+        #[serde(default, with = "cbor_bytes::option")]
         value: Option<Vec<u8>>,
     },
     ListResponse {
@@ -304,7 +310,7 @@ pub enum ChatDelegateResponseMsg {
     /// Response to [`ChatDelegateRequestMsg::GetVersionedRequest`].
     GetVersionedResponse {
         key: ChatDelegateKey,
-        #[serde(with = "cbor_bytes::option")]
+        #[serde(default, with = "cbor_bytes::option")]
         value: Option<Vec<u8>>,
         /// Current generation of the stored value (`0` if absent).
         generation: u64,
@@ -367,7 +373,7 @@ pub enum CasStoreResult {
     /// `expected_generation = current_generation`.
     Conflict {
         current_generation: u64,
-        #[serde(with = "cbor_bytes::option")]
+        #[serde(default, with = "cbor_bytes::option")]
         current_value: Option<Vec<u8>>,
     },
     /// The host-function store failed (e.g. secret storage error).
@@ -450,9 +456,9 @@ mod cbor_bytes {
         /// Legacy form: a CBOR array of integers, one per byte.
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
             // `size_hint` is the array header's DECLARED length, unchecked
-            // against the input, so cap the preallocation (the same bound
-            // serde's own `Vec<u8>` impl applies). See `payload_bytes` in
-            // `room_state/content.rs` for the lying-header case.
+            // against the input, so cap the preallocation (4096, as in
+            // `payload_bytes` in `room_state/content.rs`, which describes the
+            // lying-header case). The Vec still grows as needed.
             let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
             while let Some(byte) = seq.next_element::<u8>()? {
                 out.push(byte);
@@ -462,6 +468,10 @@ mod cbor_bytes {
     }
 
     /// The same encoding for `Option<Vec<u8>>`: `None` stays CBOR `null`.
+    ///
+    /// Fields using this also carry `#[serde(default)]`: `with` drops serde's
+    /// implicit "missing `Option` field is `None`", which the plain
+    /// `Option<Vec<u8>>` these replaced had.
     pub mod option {
         use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -1306,5 +1316,240 @@ mod tests {
         let decoded: Result<ChatDelegateResponseMsg, _> =
             ciborium::de::from_reader(bytes.as_slice());
         assert!(decoded.is_err());
+    }
+
+    /// Every byte field the change covers, asserted on the decoded CBOR value
+    /// rather than on size: the decode tests above pass whichever encoding is
+    /// used, so without this a dropped `serde(with)` on any one field would
+    /// silently bring the ~2x cost back for that path.
+    #[test]
+    fn every_byte_field_encodes_as_a_cbor_byte_string() {
+        use ciborium::value::Value;
+
+        fn field(v: &Value, variant: &str, name: &str) -> Value {
+            let outer = v.as_map().expect("externally tagged enum");
+            let (_, inner) = outer
+                .iter()
+                .find(|(k, _)| k.as_text() == Some(variant))
+                .expect("variant");
+            inner
+                .as_map()
+                .expect("struct variant")
+                .iter()
+                .find(|(k, _)| k.as_text() == Some(name))
+                .map(|(_, v)| v.clone())
+                .expect("field")
+        }
+        fn value_of<T: Serialize>(msg: &T) -> Value {
+            from_cbor(&to_cbor(msg))
+        }
+
+        let bytes = vec![0xAB; 30];
+        let key = ChatDelegateKey(b"k".to_vec());
+        let room_key = [1u8; 32];
+        let requests: Vec<(ChatDelegateRequestMsg, &str, &str)> = vec![
+            (
+                ChatDelegateRequestMsg::StoreRequest {
+                    key: key.clone(),
+                    value: bytes.clone(),
+                },
+                "StoreRequest",
+                "value",
+            ),
+            (
+                ChatDelegateRequestMsg::CasStoreRequest {
+                    key: key.clone(),
+                    value: bytes.clone(),
+                    expected_generation: 1,
+                },
+                "CasStoreRequest",
+                "value",
+            ),
+            (
+                ChatDelegateRequestMsg::SignMessage {
+                    room_key,
+                    request_id: 1,
+                    message_bytes: bytes.clone(),
+                },
+                "SignMessage",
+                "message_bytes",
+            ),
+            (
+                ChatDelegateRequestMsg::SignMember {
+                    room_key,
+                    request_id: 1,
+                    member_bytes: bytes.clone(),
+                },
+                "SignMember",
+                "member_bytes",
+            ),
+            (
+                ChatDelegateRequestMsg::SignBan {
+                    room_key,
+                    request_id: 1,
+                    ban_bytes: bytes.clone(),
+                },
+                "SignBan",
+                "ban_bytes",
+            ),
+            (
+                ChatDelegateRequestMsg::SignConfig {
+                    room_key,
+                    request_id: 1,
+                    config_bytes: bytes.clone(),
+                },
+                "SignConfig",
+                "config_bytes",
+            ),
+            (
+                ChatDelegateRequestMsg::SignMemberInfo {
+                    room_key,
+                    request_id: 1,
+                    member_info_bytes: bytes.clone(),
+                },
+                "SignMemberInfo",
+                "member_info_bytes",
+            ),
+            (
+                ChatDelegateRequestMsg::SignSecretVersion {
+                    room_key,
+                    request_id: 1,
+                    record_bytes: bytes.clone(),
+                },
+                "SignSecretVersion",
+                "record_bytes",
+            ),
+            (
+                ChatDelegateRequestMsg::SignEncryptedSecret {
+                    room_key,
+                    request_id: 1,
+                    secret_bytes: bytes.clone(),
+                },
+                "SignEncryptedSecret",
+                "secret_bytes",
+            ),
+            (
+                ChatDelegateRequestMsg::SignUpgrade {
+                    room_key,
+                    request_id: 1,
+                    upgrade_bytes: bytes.clone(),
+                },
+                "SignUpgrade",
+                "upgrade_bytes",
+            ),
+        ];
+        for (msg, variant, name) in &requests {
+            assert_eq!(
+                field(&value_of(msg), variant, name),
+                Value::Bytes(bytes.clone()),
+                "{variant}.{name}"
+            );
+        }
+
+        for (v, expected) in [
+            (Some(bytes.clone()), Value::Bytes(bytes.clone())),
+            (None, Value::Null),
+        ] {
+            let get = value_of(&ChatDelegateResponseMsg::GetResponse {
+                key: key.clone(),
+                value: v.clone(),
+            });
+            assert_eq!(field(&get, "GetResponse", "value"), expected);
+            let versioned = value_of(&ChatDelegateResponseMsg::GetVersionedResponse {
+                key: key.clone(),
+                value: v.clone(),
+                generation: 1,
+            });
+            assert_eq!(field(&versioned, "GetVersionedResponse", "value"), expected);
+            let conflict = value_of(&CasStoreResult::Conflict {
+                current_generation: 1,
+                current_value: v.clone(),
+            });
+            assert_eq!(field(&conflict, "Conflict", "current_value"), expected);
+        }
+    }
+
+    /// Literal wire bytes, independent of the `legacy` mirror (which shares
+    /// this ciborium and so would move with it).
+    #[test]
+    fn get_response_golden_vectors() {
+        // {"GetResponse": {"key": [0x6B], "value": <V>}}
+        let prefix: Vec<u8> = [
+            &[0xA1, 0x6B][..],
+            b"GetResponse",
+            &[0xA2, 0x63],
+            b"key",
+            &[0x81, 0x18, 0x6B, 0x65],
+            b"value",
+        ]
+        .concat();
+        let new_wire = [prefix.clone(), vec![0x42, 0x01, 0xFF]].concat();
+        let legacy_wire = [prefix, vec![0x82, 0x01, 0x18, 0xFF]].concat();
+
+        let msg = ChatDelegateResponseMsg::GetResponse {
+            key: ChatDelegateKey(b"k".to_vec()),
+            value: Some(vec![0x01, 0xFF]),
+        };
+        assert_eq!(to_cbor(&msg), new_wire);
+        for wire in [&new_wire, &legacy_wire] {
+            match from_cbor::<ChatDelegateResponseMsg>(wire) {
+                ChatDelegateResponseMsg::GetResponse { value, .. } => {
+                    assert_eq!(value, Some(vec![0x01, 0xFF]))
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+    }
+
+    /// The byte-string arm with a lying length must also fail cleanly.
+    #[test]
+    fn byte_string_with_lying_length_header_errors_not_panics() {
+        let mut bytes = to_cbor(&ChatDelegateResponseMsg::GetResponse {
+            key: ChatDelegateKey(vec![]),
+            value: Some(vec![]),
+        });
+        // The empty byte string is the final byte (0x40).
+        assert_eq!(bytes.pop(), Some(0x40));
+        bytes.extend_from_slice(&[0x5B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        let decoded: Result<ChatDelegateResponseMsg, _> =
+            ciborium::de::from_reader(bytes.as_slice());
+        assert!(decoded.is_err());
+    }
+
+    /// `serde(with)` drops serde's implicit "absent `Option` is `None`"; the
+    /// `default` attribute restores what the plain `Option<Vec<u8>>` did.
+    #[test]
+    fn absent_optional_byte_field_decodes_as_none() {
+        let mut wire: Vec<u8> = [
+            &[0xA1, 0x6B][..],
+            b"GetResponse",
+            &[0xA1, 0x63],
+            b"key",
+            &[0x80],
+        ]
+        .concat();
+        match from_cbor::<ChatDelegateResponseMsg>(&wire) {
+            ChatDelegateResponseMsg::GetResponse { value, .. } => assert_eq!(value, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        wire = [
+            &[0xA1, 0x74][..],
+            b"GetVersionedResponse",
+            &[0xA2, 0x63],
+            b"key",
+            &[0x80, 0x6A],
+            b"generation",
+            &[0x03],
+        ]
+        .concat();
+        match from_cbor::<ChatDelegateResponseMsg>(&wire) {
+            ChatDelegateResponseMsg::GetVersionedResponse {
+                value, generation, ..
+            } => {
+                assert_eq!(value, None);
+                assert_eq!(generation, 3);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }

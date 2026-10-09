@@ -79,7 +79,7 @@ cargo fmt
 ### Step 5: Commit, Build, and Publish
 
 ```bash
-git add legacy_delegates.toml ui/public/contracts/ cli/contracts/
+git add legacy_delegates.toml pointer-records.toml ui/public/contracts/ cli/contracts/
 git commit -m "fix: <description> with delegate migration"
 cargo make build
 cargo make compress-webapp
@@ -340,7 +340,7 @@ call-site swap, the dual-running period and the parity test.
 - **Wrong hash algorithm**: BLAKE3 not SHA256 for CodeHash
 - **Forgetting migration**: Users lose all room data
 - **Computing key AFTER changes**: Must run `add-migration` BEFORE changes alter the WASM
-- **Not republishing riverctl**: Use `cargo make publish-all` when WASM changes
+- **Not republishing riverctl**: Use `cargo make publish-all` when the room-contract WASM changes (riverctl does not embed the chat delegate)
 - **Parameters file**: Always use `published-contract/webapp.parameters` (committed) — determines contract ID
 
 ## Contract ID
