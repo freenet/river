@@ -648,6 +648,13 @@ async fn set_up_chat_delegate_with(register_first: bool) -> Result<(), String> {
         return register_then_load(attempt, Reload::All).await;
     }
 
+    // An earlier attempt's register wait must not outlive it: on a node
+    // without typed `Missing` (0.2.136 and earlier) this attempt's list is
+    // answered by an EMPTY reply, which a still-armed earlier wait would take
+    // as its ack, so this attempt would never register (freenet/river#757).
+    // The earlier waiter is told it was superseded.
+    cancel_register_ack();
+
     // Legacy migration is NOT fired here. It is gated on the current
     // delegate's response: if the current delegate has data, migration is
     // skipped (current is authoritative); if it is empty, migration is fired
@@ -662,8 +669,24 @@ async fn set_up_chat_delegate_with(register_first: bool) -> Result<(), String> {
     // and pass for the register's ack, letting the re-list overtake the
     // register (#709) and leave the user on "No rooms yet".
     fire_list_rooms_request().await;
+
+    // Backstop: if the list is neither answered nor reported missing (a lost
+    // reply), still send the DM load, so the outbound-DM saves waiting on its
+    // hydration get their bound instead of parking until the next pass.
+    crate::util::safe_spawn_local(async move {
+        crate::util::sleep(std::time::Duration::from_millis(DM_LOAD_FALLBACK_MS)).await;
+        if load_attempt_is_current(attempt) {
+            request_outbound_dms_once();
+        }
+    });
     Ok(())
 }
+
+/// How long the list-first load waits for its room list to be answered (or
+/// the delegate registered) before sending the outbound-DM load anyway
+/// (freenet/river#757). Past the register wait, so it never races a
+/// registration still in progress.
+const DM_LOAD_FALLBACK_MS: u64 = 2 * REGISTER_ACK_TIMEOUT_MS;
 
 /// `attempt + 1` of the load attempt that has sent its outbound-DM load; 0
 /// when none has (freenet/river#757).
@@ -679,6 +702,15 @@ pub(crate) fn request_outbound_dms_once() {
             fire_load_outbound_dms_request(attempt).await;
         });
     }
+}
+
+/// Longer than core's first per-connection delegate backoff (100 ms + 20%
+/// jitter, `client_events/websocket.rs` `DelegateRateLimiter`).
+const MISSING_BACKOFF_LAPSE_MS: u64 = 250;
+
+/// Whether [`register_then_load`] sends the room list after the register wait.
+fn should_relist(reload: Reload, list_answered: bool) -> bool {
+    reload == Reload::All || !list_answered
 }
 
 /// Whether [`register_then_load`] re-sends the room list once the delegate is
@@ -717,6 +749,17 @@ fn registered_this_attempt() -> bool {
 
 /// Register the chat delegate, wait for the node's reply, then load.
 async fn register_then_load(attempt: u32, reload: Reload) -> Result<(), String> {
+    if reload == Reload::Unanswered {
+        // The "missing" answer that brought us here armed the node's
+        // per-connection backoff for this delegate key (100 ms, +-20%). Before
+        // core 0.2.137 registrations share that lane, so a register sent at
+        // once is refused as rate limited and the load stalls for the whole
+        // register wait. Let the backoff lapse first.
+        crate::util::sleep(std::time::Duration::from_millis(MISSING_BACKOFF_LAPSE_MS)).await;
+        if !load_attempt_is_current(attempt) {
+            return Ok(());
+        }
+    }
     let delegate = create_chat_delegate_container();
 
     // freenet/river#709: arm the ack slot BEFORE sending, so the node's reply
@@ -756,6 +799,7 @@ async fn register_then_load(attempt: u32, reload: Reload) -> Result<(), String> 
             crate::util::safe_spawn_local(async move {
                 let timeout =
                     crate::util::sleep(std::time::Duration::from_millis(REGISTER_ACK_TIMEOUT_MS));
+                let generation = register_ack.generation;
                 match wait_for_register_ack(register_ack.receiver, timeout).await {
                     RegisterAckWait::Acked => {
                         info!("Chat delegate registered successfully");
@@ -770,6 +814,9 @@ async fn register_then_load(attempt: u32, reload: Reload) -> Result<(), String> 
                     RegisterAckWait::TimedOut => {
                         // No reply in time. Load anyway: this is what every
                         // load did before #709, and a stuck rail is worse.
+                        // Drop the wait, so a late empty reply is not taken
+                        // as an ack by it (freenet/river#757).
+                        disarm_register_ack(generation);
                         warn!(
                             "No reply to RegisterDelegate after {}ms; loading rooms anyway",
                             REGISTER_ACK_TIMEOUT_MS
@@ -783,7 +830,7 @@ async fn register_then_load(attempt: u32, reload: Reload) -> Result<(), String> 
                 if !load_attempt_is_current(attempt) {
                     return;
                 }
-                if reload == Reload::All || !list_answered_this_attempt(attempt) {
+                if should_relist(reload, list_answered_this_attempt(attempt)) {
                     fire_list_rooms_request().await;
                 }
                 if !load_attempt_is_current(attempt) {
@@ -927,6 +974,11 @@ fn disarm_register_ack(generation: u64) {
     REGISTER_ACK.lock().unwrap().disarm(generation);
 }
 
+/// Drop whatever register wait is armed; its waiter sees `Superseded`.
+fn cancel_register_ack() {
+    REGISTER_ACK.lock().unwrap().pending = None;
+}
+
 /// Called from the synchronizer's error arm for a typed
 /// `DelegateError::RegisterError`, so the room load stops waiting at once
 /// instead of sitting out [`REGISTER_ACK_TIMEOUT_MS`].
@@ -941,8 +993,10 @@ pub(crate) fn note_register_error_for_register_ack(key: &DelegateKey) {
 ///
 /// It is also how a node older than freenet-core#5729 (0.2.136 and earlier)
 /// reports that the chat delegate is not registered: an empty reply instead of
-/// a `missing delegate` error. Every chat-delegate handler answers with exactly
-/// one message, so an empty reply for the current delegate that is not our own
+/// a `missing delegate` error. Every chat-delegate request handler answers with
+/// exactly one message (and core does not forward a delegate's empty output for
+/// a contract notification to clients, `route_notification_outbound`), so an
+/// empty reply for the current delegate that is not our own
 /// register's ack, before this attempt has registered, means the list-first
 /// load (freenet/river#757) reached a delegate the node does not have. Once
 /// this attempt has registered, an unclaimed empty reply is more likely a late
@@ -1456,6 +1510,73 @@ mod tests {
         );
     }
 
+    /// freenet/river#757: after the register wait, Retry always lists; the
+    /// recovery from a missing delegate re-lists unless the list was answered
+    /// after all.
+    #[test]
+    fn relist_after_registering_unless_the_list_was_answered() {
+        assert!(should_relist(Reload::All, false));
+        assert!(should_relist(Reload::All, true));
+        assert!(should_relist(Reload::Unanswered, false));
+        assert!(!should_relist(Reload::Unanswered, true));
+    }
+
+    /// freenet/river#757 wiring for the list-first load's edges: a stale
+    /// register wait is cancelled before listing; a timed-out wait is
+    /// disarmed; the recovery waits out the node's backoff before registering;
+    /// the DM load has a backstop; the list marker is armed before the send
+    /// (the recovery drops it and relies on the re-list re-arming it); and the
+    /// DM load is claimed once per attempt, from the current delegate's
+    /// first ListResponse.
+    #[test]
+    fn list_first_load_edges_are_wired() {
+        let production = chat_delegate_production();
+        let with_body = fn_body(&production, "async fn set_up_chat_delegate_with(");
+        let cancel = with_body
+            .find("cancel_register_ack();")
+            .expect("a stale register wait must be cancelled");
+        let list = with_body.find("fire_list_rooms_request().await").unwrap();
+        assert!(cancel < list);
+        assert!(with_body[list..].contains("request_outbound_dms_once();"));
+
+        let register = fn_body(&production, "async fn register_then_load(");
+        let lapse = register
+            .find("MISSING_BACKOFF_LAPSE_MS")
+            .expect("the recovery must let the node's backoff lapse");
+        assert!(lapse < register.find("DelegateRequest::RegisterDelegate").unwrap());
+        let timed_out = register.find("RegisterAckWait::TimedOut => {").unwrap();
+        assert!(register[timed_out..].contains("disarm_register_ack(generation);"));
+        assert!(register.contains("should_relist(reload, list_answered_this_attempt(attempt))"));
+
+        let fire_list = fn_body(&production, "async fn fire_list_rooms_request()");
+        let marker = fire_list
+            .find("LIST_OUTSTANDING.store(attempt.wrapping_add(1)")
+            .expect("the list send must arm the outstanding marker");
+        assert!(marker < fire_list.find("api.send(delegate_request)").unwrap());
+
+        assert!(
+            fn_body(&production, "pub(crate) fn request_outbound_dms_once()")
+                .contains("claim_once_per_attempt(&DMS_REQUESTED_FOR_ATTEMPT, attempt)")
+        );
+        let rh = response_handler_production();
+        let gate = rh.find("if claim_list_load() {").unwrap();
+        let load = rh.find("load_rooms_per_room(keys).await;").unwrap();
+        assert!(
+            rh[gate..load].contains("request_outbound_dms_once();"),
+            "the DM load must start from the current delegate's first ListResponse"
+        );
+    }
+
+    /// freenet/river#757 / #629: the save must classify a write after the
+    /// load's seed as the session's first.
+    #[test]
+    fn save_passes_the_seed_aware_first_write_flag() {
+        let production = chat_delegate_production();
+        let save = fn_body(&production, "async fn do_save_rooms_to_delegate(");
+        let squashed: String = save.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(squashed.contains("slot_after_write(outcome,is_first_write_of_session(prev),"));
+    }
+
     /// freenet/river#757: one registration per attempt, however many requests
     /// come back Missing, and a new attempt may register again.
     #[test]
@@ -1548,12 +1669,11 @@ mod tests {
         let spawn = rh
             .find("load_rooms_per_room(keys).await;")
             .expect("current-delegate ListResponse branch must exist");
-        assert!(
-            rh.get(spawn.saturating_sub(400)..spawn)
-                .unwrap()
-                .contains("if claim_list_load() {"),
-            "the room load must be gated on claim_list_load"
-        );
+        let gate = rh
+            .find("if claim_list_load() {")
+            .expect("the room load must be gated on claim_list_load");
+        let note = rh.find("note_current_list_response();").unwrap();
+        assert!(note < gate && gate < spawn);
     }
 
     /// freenet/river#709 wiring: whenever the delegate is registered
@@ -2478,6 +2598,7 @@ mod tests {
     fn load_seed_makes_the_post_load_save_skip_an_unchanged_room() {
         let room = seedable_room();
         let vk = room.owner_vk;
+        ROOM_SLOT_STATE.with(|c| c.borrow_mut().remove(&vk));
         let loaded: RoomSlot =
             ciborium::from_reader(&present_slot_bytes(&room)[..]).expect("slot decodes");
         seed_saved_slots_from_load(&[(vk, loaded)], None);
@@ -2504,6 +2625,7 @@ mod tests {
     fn load_seed_never_skips_or_defers_a_changed_room() {
         let room = seedable_room();
         let vk = room.owner_vk;
+        ROOM_SLOT_STATE.with(|c| c.borrow_mut().remove(&vk));
         let loaded: RoomSlot =
             ciborium::from_reader(&present_slot_bytes(&room)[..]).expect("slot decodes");
         seed_saved_slots_from_load(&[(vk, loaded)], None);
@@ -2619,6 +2741,7 @@ mod tests {
             "fixture holds the private key"
         );
         let vk = room.owner_vk;
+        ROOM_SLOT_STATE.with(|c| c.borrow_mut().remove(&vk));
         seed_saved_slots_from_load(&[(vk, RoomSlot::Present(Box::new(room)))], None);
         assert_eq!(ROOM_SLOT_STATE.with(|c| c.borrow().get(&vk).copied()), None);
     }
@@ -4059,17 +4182,27 @@ mod tests {
             .unwrap_or(self_production.len());
         let setup_body = &self_production[setup_idx..setup_end];
 
-        let begin = setup_body
+        // freenet/river#757: the begin must precede BOTH ways a setup pass
+        // first talks to the delegate, the list-first send and the
+        // register-first path, so either failing has an armed hard-max.
+        let with_body = fn_body(
+            &chat_delegate_production(),
+            "async fn set_up_chat_delegate_with(",
+        )
+        .to_string();
+        let begin = with_body
             .find("begin_load_attempt();")
             .expect("set_up_chat_delegate must begin a fresh load attempt");
-        // Anchor on the actual code token, not the word in the rationale comment.
-        let register = setup_body
-            .find("DelegateRequest::RegisterDelegate")
-            .expect("set_up_chat_delegate must register the delegate");
+        let register = with_body
+            .find("register_then_load(attempt, Reload::All)")
+            .expect("the register-first path must exist");
+        let list = with_body
+            .find("fire_list_rooms_request().await")
+            .expect("the list-first path must exist");
         assert!(
-            begin < register,
-            "begin_load_attempt() must run BEFORE RegisterDelegate so even a \
-             registration failure has an armed hard-max"
+            begin < register && begin < list,
+            "begin_load_attempt() must run BEFORE the delegate is first contacted \
+             so even a registration or list failure has an armed hard-max"
         );
 
         // The RegisterDelegate Err path resolves the load (P2#1).
@@ -7297,9 +7430,11 @@ thread_local! {
     /// Neither the seed nor the first write of a session may arm the snapshot
     /// debounce: between freenet/river#534 and #629 the redundant load-time
     /// write stamped `written_at_ms`, so the state arriving from the network
-    /// moments later was deferred and usually never written. The seed carries
-    /// `written_at_ms: None` and [`slot_after_write`] refuses to arm the window
-    /// on a session's first write. Do not weaken either without re-reading #629.
+    /// moments later was deferred and usually never written. The seed is a
+    /// [`SavedSlot::Loaded`], which carries no write time and keeps the next
+    /// write the session's first ([`is_first_write_of_session`]), and
+    /// [`slot_after_write`] refuses to arm the window on a session's first
+    /// write. Do not weaken either without re-reading #629.
     static ROOM_SLOT_STATE: std::cell::RefCell<HashMap<VerifyingKey, SavedSlot>> =
         std::cell::RefCell::new(HashMap::new());
     /// Last-persisted content hash of the `rooms_meta` value.
@@ -8896,8 +9031,9 @@ static OUTBOUND_DMS_HYDRATED: AtomicBool = AtomicBool::new(false);
 /// while this is non-zero, and restarts whenever it changes (see
 /// [`await_flag_with_bound`]).
 ///
-/// Since freenet/river#709 the request waits for the register reply (up to
-/// [`REGISTER_ACK_TIMEOUT_MS`]), so a bound that started at save time could
+/// The request is not sent at setup time (since freenet/river#709 it waited
+/// for the register reply; since #757 it waits for the room list's answer or a
+/// registration), so a bound that started at save time could
 /// expire before the request was even sent, and the save would then overwrite
 /// the stored blob with a truncated one. For the same reason a setup pass that
 /// starts before hydration resets this to 0: a request sent on an earlier,
@@ -9005,9 +9141,10 @@ const OUTBOUND_DMS_HYDRATION_MAX_POLLS: u32 = 300;
 /// (freenet/river#709 moved that send behind the register reply). Waiting
 /// longer only delays the save; giving up early would overwrite the stored blob
 /// with a truncated one. The wait before a request has no bound of its own: a
-/// setup pass sends the request once its register wait ends, unless the send
-/// fails or the pass is superseded, in which case the next pass (reconnect,
-/// wake or Retry) sends it. Until then every waiting save is parked, including
+/// setup pass sends the request once the delegate is known present (its room
+/// list answered, or its registration acked, freenet/river#757) or, failing
+/// both, after [`DM_LOAD_FALLBACK_MS`]; if the send fails or the pass is
+/// superseded, the next pass (reconnect, wake or Retry) sends it. Until then every waiting save is parked, including
 /// `LiveImportSeam::flush` in the crate-migration walk, which therefore stalls
 /// (without sealing anything) until a pass sends the request.
 ///

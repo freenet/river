@@ -73,3 +73,29 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) -> bool {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// freenet/river#757: a refused subscription with local state must put the
+    /// room back on the seeding PUT before handing it to `process_rooms`, or a
+    /// room on the code-free GET route would just GET again.
+    #[test]
+    fn refused_subscription_requires_the_seed_put_before_retrying() {
+        let src: String = crate::util::strip_comments(
+            include_str!("subscribe_response.rs")
+                .split("mod tests {")
+                .next()
+                .unwrap(),
+        )
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+        let seed = src
+            .find("sync_info.require_seed_put(&owner_vk);")
+            .expect("a refused subscription must require the seed PUT");
+        let retry = src
+            .find("sync_info.update_sync_status(&owner_vk,RoomSyncStatus::Disconnected);")
+            .expect("and hand the room back as Disconnected");
+        assert!(seed < retry);
+    }
+}

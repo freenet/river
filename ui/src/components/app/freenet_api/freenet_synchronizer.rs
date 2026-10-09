@@ -50,8 +50,10 @@ fn is_missing_delegate_error(message: &str) -> bool {
 ///
 /// freenet/river#707: the error channel carries no request id, so an error
 /// alone does not say which request failed. The current delegate can also be
-/// reported missing (the first load after a re-key, when the node runs a request
-/// before the `RegisterDelegate` ahead of it, freenet/river#709), and treating
+/// reported missing (routinely since freenet/river#757: the load lists before
+/// registering, so the first load after a re-key gets `Missing` and registers
+/// then; also a request the node runs before a `RegisterDelegate` ahead of it,
+/// freenet/river#709), and treating
 /// that as a legacy probe result would seal the migration for good. So a typed
 /// `Missing` seals only when it names a known LEGACY generation, and an untyped
 /// message that names `current` never seals.

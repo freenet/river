@@ -910,6 +910,7 @@ mod tests {
         let owner = test_owner(26);
         si.mark_known_on_network(owner);
         si.register_new_room(owner);
+        assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Get);
         si.require_seed_put(&owner);
         assert_eq!(si.subscribe_route(&owner), SubscribeRoute::Put);
     }
