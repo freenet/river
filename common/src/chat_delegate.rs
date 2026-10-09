@@ -414,8 +414,9 @@ pub fn is_thread_hidden(
 /// Hand-rolled rather than the `serde_bytes` crate on purpose: adding that
 /// dependency to river-core re-keyed the ROOM CONTRACT even though the room
 /// contract never touches these types (measured for #757: `room_contract.wasm`
-/// went from `a3e63c8c…` to `48d91e7b…`, same size, functions reordered —
-/// most likely via river-core's crate metadata hash feeding symbol order).
+/// went from `a3e63c8c…` to `48d91e7b…`, same size, functions reordered; the
+/// mechanism is not established, a crate-metadata effect on symbol order is a
+/// guess).
 /// This module leaves the room contract byte-identical.
 /// The `check-room-contract-migration` CI gate catches that, but a
 /// delegate-only change has no reason to pay for a room-contract re-key.
@@ -1467,6 +1468,20 @@ mod tests {
             });
             assert_eq!(field(&conflict, "Conflict", "current_value"), expected);
         }
+
+        // The documented exception stays an integer array (inside `Ok`).
+        let sig = value_of(&ChatDelegateResponseMsg::SignResponse {
+            room_key,
+            request_id: 1,
+            signature: Ok(vec![7; 64]),
+        });
+        assert!(
+            matches!(
+                field(&sig, "SignResponse", "signature"),
+                Value::Map(ref m) if matches!(m[0].1, Value::Array(_))
+            ),
+            "SignResponse.signature is documented as an integer array"
+        );
     }
 
     /// Literal wire bytes, independent of the `legacy` mirror (which shares
@@ -1551,5 +1566,62 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+        // {"Conflict": {"current_generation": 2}}
+        wire = [
+            &[0xA1, 0x68][..],
+            b"Conflict",
+            &[0xA1, 0x72],
+            b"current_generation",
+            &[0x02],
+        ]
+        .concat();
+        assert_eq!(
+            from_cbor::<CasStoreResult>(&wire),
+            CasStoreResult::Conflict {
+                current_generation: 2,
+                current_value: None,
+            }
+        );
+    }
+
+    /// Request-direction golden vector, plus `None` as CBOR `null` (0xF6).
+    #[test]
+    fn request_and_null_golden_vectors() {
+        // {"StoreRequest": {"key": [0x6B], "value": h'01FF'}}
+        let store: Vec<u8> = [
+            &[0xA1, 0x6C][..],
+            b"StoreRequest",
+            &[0xA2, 0x63],
+            b"key",
+            &[0x81, 0x18, 0x6B, 0x65],
+            b"value",
+            &[0x42, 0x01, 0xFF],
+        ]
+        .concat();
+        assert_eq!(
+            to_cbor(&ChatDelegateRequestMsg::StoreRequest {
+                key: ChatDelegateKey(b"k".to_vec()),
+                value: vec![0x01, 0xFF],
+            }),
+            store
+        );
+        // {"GetResponse": {"key": [0x6B], "value": null}}
+        let none: Vec<u8> = [
+            &[0xA1, 0x6B][..],
+            b"GetResponse",
+            &[0xA2, 0x63],
+            b"key",
+            &[0x81, 0x18, 0x6B, 0x65],
+            b"value",
+            &[0xF6],
+        ]
+        .concat();
+        assert_eq!(
+            to_cbor(&ChatDelegateResponseMsg::GetResponse {
+                key: ChatDelegateKey(b"k".to_vec()),
+                value: None,
+            }),
+            none
+        );
     }
 }

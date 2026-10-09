@@ -3903,21 +3903,36 @@ mod tests {
         assert_eq!(legacy_set_fingerprint(), "10f72d68c4c4ad91");
     }
 
-    /// The "migration in progress" and "migration done" localStorage keys MUST
-    /// be distinct — they're set/cleared independently, and a shared key would
-    /// make clearing one corrupt the other (freenet/river#345 follow-up: the
-    /// in-progress flag drives interrupted-migration recovery).
+    /// The in-progress marker must be recognised in a listing, must not be
+    /// mistaken for room data by the load planner, and must never be copied
+    /// forward by the migration walk into the next delegate generation (a
+    /// copied marker would claim an interrupted migration that never happened).
     #[test]
-    fn migration_in_progress_key_distinct_from_done_key() {
-        let fp = legacy_set_fingerprint();
-        let in_progress = legacy_migration_in_progress_key();
-        let done = legacy_migration_flag_key();
-        assert_ne!(in_progress, done);
-        assert!(in_progress.starts_with(LEGACY_MIGRATION_IN_PROGRESS_PREFIX));
+    fn migration_in_progress_marker_is_a_delegate_key_that_never_travels() {
+        let marker = ChatDelegateKey::new(LEGACY_MIGRATION_IN_PROGRESS_KEY.to_vec());
+        let room = ChatDelegateKey::new(b"room:abc".to_vec());
+        assert!(listing_has_migration_marker(&[
+            room.clone(),
+            marker.clone()
+        ]));
+        assert!(!listing_has_migration_marker(&[room]));
         assert!(
-            in_progress.ends_with(&fp),
-            "in-progress flag must be per-set too"
+            super::super::freenet_api::delegate_migration::is_migration_marker_key(
+                LEGACY_MIGRATION_IN_PROGRESS_KEY
+            )
         );
+    }
+
+    /// The seed from a listing must both SET and CLEAR the session flag: a
+    /// listing without the marker (e.g. after another tab finished the
+    /// migration) must not leave a stale `true` from earlier in the session.
+    #[test]
+    fn migration_marker_seed_tracks_the_listing() {
+        let marker = ChatDelegateKey::new(LEGACY_MIGRATION_IN_PROGRESS_KEY.to_vec());
+        note_migration_marker_from_listing(&[marker]);
+        assert!(is_legacy_migration_in_progress());
+        note_migration_marker_from_listing(&[]);
+        assert!(!is_legacy_migration_in_progress());
     }
 
     // ===== resolve_hidden_thread_hydration tests (#261 Codex P3) =====
@@ -9343,25 +9358,33 @@ pub fn mark_legacy_migration_done() {
     }
 }
 
-/// localStorage key prefix for the "legacy migration in progress" flag — set
-/// BEFORE a migration's per-room re-save and cleared only on full success. If a
-/// migration is interrupted (a per-room CAS write fails, or the tab is closed
-/// mid-migration), this flag stays set, so the next load's per-room path knows
-/// the per-room key set may be INCOMPLETE and re-runs the legacy fill to recover
-/// any stranded room (freenet/river#345 follow-up — Nacho's "Freenet Devs"
-/// disappeared-after-update report). New users never set it (no legacy data → no
-/// migration), so they incur no extra probing.
-#[allow(dead_code)]
-const LEGACY_MIGRATION_IN_PROGRESS_PREFIX: &str = "river_legacy_migration_in_progress:";
+/// Current-delegate storage key of the "legacy migration in progress" marker —
+/// persisted BEFORE a migration's per-room re-save and deleted only on full
+/// success. If a migration is interrupted (a per-room CAS write fails, or the
+/// tab is closed mid-migration), the marker survives, so the next load's
+/// per-room path knows the per-room key set may be INCOMPLETE and re-runs the
+/// legacy fill to recover any stranded room (freenet/river#345 follow-up —
+/// Nacho's "Freenet Devs" disappeared-after-update report). New users never set
+/// it (no legacy data → no migration), so they incur no extra probing.
+///
+/// It lives in the delegate, NOT localStorage: the gateway serves the app in an
+/// iframe whose sandbox omits `allow-same-origin`, so `window.localStorage` is
+/// unavailable there and a localStorage marker was never written in production.
+/// Measured on freenet/river#757's rehearsal: a tab closed after the first
+/// `room:` write left 1 of 4 rooms on every later load, the other 3 stranded in
+/// the predecessor. The current delegate is the right scope: it is new on every
+/// re-key, so a marker can only describe a migration INTO this generation, and
+/// [`is_migration_marker_key`](super::freenet_api::delegate_migration::is_migration_marker_key)
+/// keeps it from being copied forward into the next one.
+pub(crate) const LEGACY_MIGRATION_IN_PROGRESS_KEY: &[u8] =
+    b"__river_legacy_migration_in_progress__";
 
-#[allow(dead_code)]
-fn legacy_migration_in_progress_key() -> String {
-    format!(
-        "{}{}",
-        LEGACY_MIGRATION_IN_PROGRESS_PREFIX,
-        legacy_set_fingerprint()
-    )
-}
+/// Session mirror of [`LEGACY_MIGRATION_IN_PROGRESS_KEY`]: seeded from the
+/// current delegate's `ListResponse` ([`note_migration_marker_from_listing`]),
+/// set by [`mark_legacy_migration_in_progress`], cleared by
+/// [`clear_legacy_migration_in_progress`]. Read synchronously by the load and
+/// identity-import gates.
+static LEGACY_MIGRATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Whether the room set is still being RECOVERED and is therefore NOT yet
 /// fully authoritative (freenet/river#414, Codex round-9 P1).
@@ -9385,51 +9408,73 @@ pub(crate) fn rooms_recovery_in_progress() -> bool {
 }
 
 /// True if a legacy migration was started but not confirmed complete (see
-/// [`LEGACY_MIGRATION_IN_PROGRESS_PREFIX`]).
+/// [`LEGACY_MIGRATION_IN_PROGRESS_KEY`]).
 pub fn is_legacy_migration_in_progress() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.local_storage() {
-                let key = legacy_migration_in_progress_key();
-                return storage.get_item(&key).ok().flatten().is_some();
-            }
-        }
-        false
+    LEGACY_MIGRATION_IN_PROGRESS.load(Ordering::Relaxed)
+}
+
+/// Whether the current delegate's key listing carries the in-progress marker.
+pub(crate) fn listing_has_migration_marker(keys: &[ChatDelegateKey]) -> bool {
+    keys.iter()
+        .any(|k| k.as_bytes() == LEGACY_MIGRATION_IN_PROGRESS_KEY)
+}
+
+/// Seed the session flag from the CURRENT delegate's `ListResponse`, before the
+/// load decides between per-room, blob and legacy paths.
+pub(crate) fn note_migration_marker_from_listing(keys: &[ChatDelegateKey]) {
+    let interrupted = listing_has_migration_marker(keys);
+    if interrupted {
+        info!("Current delegate carries the migration-in-progress marker — a prior migration was interrupted");
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    LEGACY_MIGRATION_IN_PROGRESS.store(interrupted, Ordering::Relaxed);
+}
+
+/// Raise the session flag at the moment a migration starts (synchronously, so
+/// the identity-import gate sees it before any spawned save runs). The durable
+/// half is [`mark_legacy_migration_in_progress`].
+pub(crate) fn begin_legacy_migration() {
+    LEGACY_MIGRATION_IN_PROGRESS.store(true, Ordering::Relaxed);
+}
+
+/// Mark a legacy migration as in progress (call BEFORE the re-save), and
+/// persist the marker in the current delegate. Returns `Err` if the delegate
+/// did not acknowledge the marker: the caller must then NOT start the re-save,
+/// because a partial per-room set without a durable marker is exactly the state
+/// that strands rooms. Skipping is safe — nothing has been written yet, so the
+/// next load still sees an empty successor and migrates from scratch.
+pub(crate) async fn mark_legacy_migration_in_progress() -> Result<(), String> {
+    LEGACY_MIGRATION_IN_PROGRESS.store(true, Ordering::Relaxed);
+    match send_delegate_request(ChatDelegateRequestMsg::StoreRequest {
+        key: ChatDelegateKey::new(LEGACY_MIGRATION_IN_PROGRESS_KEY.to_vec()),
+        value: b"1".to_vec(),
+    })
+    .await
     {
-        // Non-WASM (tests): no migration is ever in progress.
-        false
+        Ok(ChatDelegateResponseMsg::StoreResponse { result: Ok(()), .. }) => Ok(()),
+        Ok(ChatDelegateResponseMsg::StoreResponse { result: Err(e), .. }) => {
+            Err(format!("delegate refused the migration marker: {e}"))
+        }
+        Ok(other) => Err(format!(
+            "unexpected reply to migration marker store: {other:?}"
+        )),
+        Err(e) => Err(format!("migration marker store failed: {e}")),
     }
 }
 
-/// Mark a legacy migration as in progress (call BEFORE the re-save).
-pub fn mark_legacy_migration_in_progress() {
-    #[cfg(target_arch = "wasm32")]
+/// Clear the "legacy migration in progress" marker (call only after a FULL,
+/// successful re-save — alongside [`mark_legacy_migration_done`]). A failed
+/// delete leaves the marker in the delegate, which costs one harmless recovery
+/// re-probe on the next load; the session flag is cleared regardless because
+/// this session's migration did complete.
+pub(crate) async fn clear_legacy_migration_in_progress() {
+    LEGACY_MIGRATION_IN_PROGRESS.store(false, Ordering::Relaxed);
+    match send_delegate_request(ChatDelegateRequestMsg::DeleteRequest {
+        key: ChatDelegateKey::new(LEGACY_MIGRATION_IN_PROGRESS_KEY.to_vec()),
+    })
+    .await
     {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.local_storage() {
-                let key = legacy_migration_in_progress_key();
-                if let Err(e) = storage.set_item(&key, "true") {
-                    warn!("Failed to set legacy-migration-in-progress flag: {:?}", e);
-                }
-            }
-        }
-    }
-}
-
-/// Clear the "legacy migration in progress" flag (call only after a FULL,
-/// successful re-save — alongside [`mark_legacy_migration_done`]).
-pub fn clear_legacy_migration_in_progress() {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.local_storage() {
-                let key = legacy_migration_in_progress_key();
-                let _ = storage.remove_item(&key);
-            }
-        }
+        Ok(ChatDelegateResponseMsg::DeleteResponse { result: Ok(()), .. }) => {}
+        other => warn!("Could not delete the migration-in-progress marker: {other:?}"),
     }
 }
 

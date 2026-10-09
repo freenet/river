@@ -186,15 +186,21 @@ baseline                                      room_contract.wasm = a3e63c8c…
 + river-core version 0.1.21 -> 0.1.22          room_contract.wasm = c29522a5…
 ```
 
-Same size, functions reordered: river-core's crate metadata hash feeds the
-contract's symbol order even though the contract never calls the new code.
-So a change meant for the delegate alone (a new wire helper, a dependency
-only the delegate uses) can still re-key the room contract, which then needs
-`add-room-contract-migration` and a riverctl release. When the change does not
-need either, keep river-core's dependency list and version untouched (#757
-hand-rolled a 40-line serde helper instead of adding `serde_bytes`), and check
-`room_contract.wasm` against `main` after `sync-wasm`. Changes to
-`common/src/chat_delegate.rs` itself have left it byte-identical (#345, #757).
+Same size, functions reordered, even though the contract never calls the new
+code. (The mechanism is not established; river-core's crate metadata feeding
+symbol order is a guess.) So a change meant for the delegate alone (a new wire
+helper, a dependency only the delegate uses) can still re-key the room
+contract, which then needs `add-room-contract-migration` and a riverctl
+release. When the change does not need either, keep river-core's dependency
+list and version untouched (#757 hand-rolled a ~55-line serde helper instead of
+adding `serde_bytes`), and ALWAYS compare `room_contract.wasm` against `main`
+after `sync-wasm`. The two `common/src/chat_delegate.rs` changes checked so far
+(#345, #757) left it byte-identical, which is an observation, not a rule.
+
+The exception is a release that must ship riverctl anyway: river-core is
+published, riverctl pins it with `=`, and `release-riverctl.yml` skips a
+river-core version crates.io already has, so a river-core source change that
+riverctl needs requires the bump, and with it the room-contract re-key.
 
 Note the measurement must use the co-build: building `-p room-contract` alone
 resolves river-core with different features and gives a different hash even
