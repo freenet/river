@@ -2131,6 +2131,156 @@ mod tests {
         crate::room_data::test_minimal_room_data(SigningKey::from_bytes(&[9u8; 32]).verifying_key())
     }
 
+    /// The save's view of a room: its content and critical hashes, computed
+    /// exactly as `do_save_rooms_to_delegate` computes them.
+    fn save_hashes(room: &RoomData) -> (u64, Option<u64>) {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(room, &mut buf).unwrap();
+        (content_hash(&buf), critical_hash(room))
+    }
+
+    /// freenet/river#757: the save right after a load must not re-read (or
+    /// rewrite) a room the load just read and hydration left unchanged. The
+    /// load seeds the slot from the bytes the delegate returned, the save finds
+    /// the same content, and does nothing.
+    #[test]
+    fn load_seed_makes_the_post_load_save_skip_an_unchanged_room() {
+        let room = room_fixture();
+        let vk = room.owner_vk;
+        let loaded: RoomSlot =
+            ciborium::from_reader(&present_slot_bytes(&room)[..]).expect("slot decodes");
+        seed_saved_slots_from_load(&[(vk, loaded)], None);
+
+        let prev = ROOM_SLOT_STATE.with(|c| c.borrow().get(&vk).copied());
+        let (h, crit) = save_hashes(&room);
+        assert_eq!(
+            present_save_decision(prev, h, crit, false, now_ms()),
+            PresentSaveDecision::Unchanged
+        );
+        // Without the seed, the same save had to read the room back.
+        assert_eq!(
+            present_save_decision(None, h, crit, false, now_ms()),
+            PresentSaveDecision::Write
+        );
+    }
+
+    /// A room that hydration (or the network, moments later) changed must
+    /// still be written, and written NOW: the seed records no write time, so
+    /// the #533 debounce cannot defer it (that would be freenet/river#629).
+    /// A critical change is written either way.
+    #[test]
+    fn load_seed_never_skips_or_defers_a_changed_room() {
+        let room = room_fixture();
+        let vk = room.owner_vk;
+        let loaded: RoomSlot =
+            ciborium::from_reader(&present_slot_bytes(&room)[..]).expect("slot decodes");
+        seed_saved_slots_from_load(&[(vk, loaded)], None);
+        let prev = ROOM_SLOT_STATE.with(|c| c.borrow().get(&vk).copied());
+
+        let mut cache_changed = room.clone();
+        cache_changed
+            .room_state
+            .configuration
+            .configuration
+            .configuration_version += 1;
+        let (h, crit) = save_hashes(&cache_changed);
+        assert_eq!(
+            crit,
+            save_hashes(&room).1,
+            "fixture: only the cache changed"
+        );
+        assert_eq!(
+            present_save_decision(prev, h, crit, false, now_ms()),
+            PresentSaveDecision::Write,
+            "the first change after a load must be written immediately (#629)"
+        );
+
+        let mut critical_changed = room.clone();
+        critical_changed.self_nickname = Some("renamed".to_string());
+        let (h, crit) = save_hashes(&critical_changed);
+        assert_ne!(
+            crit,
+            save_hashes(&room).1,
+            "fixture: a critical field changed"
+        );
+        assert_eq!(
+            present_save_decision(prev, h, crit, false, now_ms()),
+            PresentSaveDecision::Write
+        );
+    }
+
+    /// The seed fills only empty slots: on a reconnect's re-load the existing
+    /// entry describes what this tab itself wrote, and its write time is what
+    /// the #534 debounce runs on. Tombstones and `rooms_meta` are seeded too.
+    #[test]
+    fn load_seed_keeps_existing_slots_and_covers_tombstones_and_meta() {
+        let room = room_fixture();
+        let vk = room.owner_vk;
+        let left = SigningKey::from_bytes(&[10u8; 32]).verifying_key();
+        let written = SavedSlot::Present {
+            content: 1,
+            critical: Some(2),
+            written_at_ms: Some(3.0),
+        };
+        ROOM_SLOT_STATE.with(|c| c.borrow_mut().insert(vk, written));
+        META_SLOT_HASH.with(|c| *c.borrow_mut() = None);
+
+        let meta = RoomsMeta::default();
+        seed_saved_slots_from_load(
+            &[
+                (vk, RoomSlot::Present(Box::new(room))),
+                (left, RoomSlot::Tombstone),
+            ],
+            Some(&meta),
+        );
+
+        assert_eq!(
+            ROOM_SLOT_STATE.with(|c| c.borrow().get(&vk).copied()),
+            Some(written)
+        );
+        assert_eq!(
+            ROOM_SLOT_STATE.with(|c| c.borrow().get(&left).copied()),
+            Some(SavedSlot::Tombstone)
+        );
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&meta, &mut buf).unwrap();
+        assert_eq!(
+            META_SLOT_HASH.with(|c| *c.borrow()),
+            Some(content_hash(&buf))
+        );
+    }
+
+    /// Extracting the decision must not change the #533 debounce: a cache-only
+    /// change shortly after a real write still defers, a flush never does.
+    #[test]
+    fn present_save_decision_keeps_the_snapshot_debounce() {
+        let room = room_fixture();
+        let (h, crit) = save_hashes(&room);
+        let written = Some(SavedSlot::Present {
+            content: h.wrapping_add(1),
+            critical: crit,
+            written_at_ms: Some(1_000.0),
+        });
+        assert_eq!(
+            present_save_decision(written, h, crit, false, 2_000.0),
+            PresentSaveDecision::Defer
+        );
+        assert_eq!(
+            present_save_decision(written, h, crit, true, 2_000.0),
+            PresentSaveDecision::Write
+        );
+        assert_eq!(
+            present_save_decision(
+                written,
+                h,
+                crit,
+                false,
+                1_000.0 + ROOM_SNAPSHOT_MIN_INTERVAL_MS
+            ),
+            PresentSaveDecision::Write
+        );
+    }
+
     /// Boundary + clock-skew behaviour of the debounce decision.
     ///
     /// The negative case is the important one. `now_ms()` is a WALL clock and
@@ -6750,21 +6900,22 @@ enum SavedSlot {
 
 thread_local! {
     /// Last-persisted state per per-room key, keyed by owner VK. Diffed each
-    /// save so only changed rooms are written. Per-session; starts EMPTY on a
-    /// fresh load (the load path deliberately does NOT pre-seed it). The first
-    /// save after a load therefore re-serializes each room's CURRENT
-    /// (post-hydrate) state and CAS-writes any that differ from the delegate —
-    /// correct because hydration can legitimately change a room's serialized
-    /// form (e.g. `regenerate_contract_key`, `remove_unverifiable_messages`), so
-    /// seeding the baseline from the loaded bytes could wrongly skip a needed
-    /// write. CAS reconcile makes the redundant same-content writes harmless.
+    /// save so only changed rooms are written. Per-session; starts empty and
+    /// is seeded by the per-room load from what it read
+    /// ([`seed_saved_slots_from_load`], freenet/river#757). The seed is the
+    /// hash of each loaded `RoomData` as the save would serialize it, NOT of the
+    /// raw stored bytes, so a room whose serialized form hydration changed
+    /// (e.g. `regenerate_contract_key`, `remove_unverifiable_messages`) still
+    /// differs from its baseline and is written. Before the seed, the first
+    /// save after a load re-read every room's full value just to find it
+    /// unchanged.
     ///
-    /// "Harmless" was FALSE between freenet/river#534 and #629: that redundant
-    /// first write stamped `written_at_ms`, arming the snapshot debounce with
-    /// data that was never new, so the state arriving from the network moments
-    /// later was deferred and usually never written. It is true again only
-    /// because [`slot_after_write`] now refuses to arm the window on the first
-    /// write of a session. Do not weaken that without re-reading #629.
+    /// Neither the seed nor the first write of a session may arm the snapshot
+    /// debounce: between freenet/river#534 and #629 the redundant load-time
+    /// write stamped `written_at_ms`, so the state arriving from the network
+    /// moments later was deferred and usually never written. The seed carries
+    /// `written_at_ms: None` and [`slot_after_write`] refuses to arm the window
+    /// on a session's first write. Do not weaken either without re-reading #629.
     static ROOM_SLOT_STATE: std::cell::RefCell<HashMap<VerifyingKey, SavedSlot>> =
         std::cell::RefCell::new(HashMap::new());
     /// Last-persisted content hash of the `rooms_meta` value.
@@ -6791,6 +6942,65 @@ thread_local! {
     /// widens the marking further should re-argue it here.
     static REJOINED_THIS_SESSION: std::cell::RefCell<HashSet<VerifyingKey>> =
         std::cell::RefCell::new(HashSet::new());
+}
+
+/// Record what the per-room load just read from the CURRENT delegate as this
+/// session's saved baseline, so the save that follows the load skips every
+/// room hydration left unchanged (freenet/river#757).
+///
+/// Without this the first save re-read every room's full value with a
+/// `GetVersionedRequest` (up to 2.3 MB per room, ~3.3 MB for a 4-room
+/// account) only to find the bytes it was about to store already there. A
+/// plain `GetRequest` returns no generation, so the load cannot hand the save
+/// a CAS generation to reuse; recording "the delegate holds exactly this"
+/// removes the read instead.
+///
+/// The baseline is the content hash of each loaded `RoomData` serialized
+/// exactly as the save serializes it, so a room that hydration DID change
+/// (`regenerate_contract_key`, `remove_unverifiable_messages`, a merge with a
+/// copy already in memory) hashes differently and is still written, through
+/// the usual read-merge-write CAS. That is the case `ROOM_SLOT_STATE`'s doc
+/// warns about, and why only the hydrated result is compared, never the raw
+/// stored bytes.
+///
+/// `written_at_ms: None` keeps freenet/river#629 intact: nothing was written,
+/// so the first genuine change (state arriving from the network) is persisted
+/// immediately rather than deferred. Existing entries are left alone: on a
+/// reconnect's re-load they describe what this tab itself last wrote, and
+/// their write time is what the #534 debounce runs on.
+pub(crate) fn seed_saved_slots_from_load(
+    slots: &[(VerifyingKey, RoomSlot)],
+    meta: Option<&RoomsMeta>,
+) {
+    ROOM_SLOT_STATE.with(|c| {
+        let mut saved = c.borrow_mut();
+        for (vk, slot) in slots {
+            let entry = match slot {
+                RoomSlot::Present(room_data) => {
+                    let mut buf = Vec::new();
+                    if ciborium::ser::into_writer(room_data.as_ref(), &mut buf).is_err() {
+                        // No baseline: the save then writes it, as before.
+                        continue;
+                    }
+                    SavedSlot::Present {
+                        content: content_hash(&buf),
+                        critical: critical_hash(room_data),
+                        written_at_ms: None,
+                    }
+                }
+                RoomSlot::Tombstone => SavedSlot::Tombstone,
+            };
+            saved.entry(*vk).or_insert(entry);
+        }
+    });
+    if let Some(meta) = meta {
+        let mut buf = Vec::new();
+        if ciborium::ser::into_writer(meta, &mut buf).is_ok() {
+            META_SLOT_HASH.with(|c| {
+                c.borrow_mut().get_or_insert(content_hash(&buf));
+            });
+        }
+    }
 }
 
 /// Record that the user explicitly rejoined `owner_vk` this session. Called
@@ -6940,6 +7150,66 @@ fn slot_after_write(
         // Present that could later content-hash-skip a genuine rejoin.
         CasWriteOutcome::Aborted => SavedSlot::Tombstone,
     }
+}
+
+/// What a save does with one present room, given what was last persisted for
+/// it (`prev`) and the room's current content and critical hashes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PresentSaveDecision {
+    /// The delegate already holds this content — no read, no write. Also what
+    /// a room the load seeded and hydration left alone gets (freenet/river#757).
+    Unchanged,
+    /// A cache-only change inside the snapshot interval (freenet/river#533).
+    Defer,
+    /// Read-merge-write it now.
+    Write,
+}
+
+/// Pure form of the per-room save decision, so the dedupe, the #533 debounce
+/// and the #757 load seed can be tested without a websocket.
+fn present_save_decision(
+    prev: Option<SavedSlot>,
+    content: u64,
+    critical: Option<u64>,
+    force_flush: bool,
+    now_ms: f64,
+) -> PresentSaveDecision {
+    // Unchanged since the last write (or since the load read it) — nothing to
+    // do.
+    if let Some(SavedSlot::Present { content: saved, .. }) = prev {
+        if saved == content {
+            return PresentSaveDecision::Unchanged;
+        }
+    }
+
+    // Something changed. Decide whether it must be written NOW or can ride
+    // the snapshot cadence (freenet/river#533).
+    //
+    // Write immediately when the UNRECOVERABLE fields changed, when this is
+    // a room we haven't written this session, when the previous slot was a
+    // tombstone (a rejoin), when the caller asked for a flush, or when the
+    // critical projection failed to serialize. Only a pure `room_state` /
+    // `last_read_message_id` change on an already-persisted room is
+    // deferred, and only until the interval elapses.
+    //
+    // Deferring is safe ONLY for the cache: `room_state` is replicated in
+    // the room contract, so a stale snapshot costs a colder start and never
+    // loses data. `self_sk` cannot be re-derived from the network, which is
+    // why it must never fall into this branch.
+    if !force_flush {
+        if let Some(SavedSlot::Present {
+            critical: saved_critical,
+            written_at_ms: Some(written_at_ms),
+            ..
+        }) = prev
+        {
+            let cache_only_change = critical.is_some() && saved_critical == critical;
+            if cache_only_change && should_defer_cache_only_save(now_ms - written_at_ms) {
+                return PresentSaveDecision::Defer;
+            }
+        }
+    }
+    PresentSaveDecision::Write
 }
 
 /// Generic read-merge-write CAS for a single delegate key (freenet/river#345).
@@ -7301,43 +7571,13 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
         let crit = critical_hash(room_data);
         let prev = ROOM_SLOT_STATE.with(|c| c.borrow().get(vk).copied());
 
-        // Unchanged since the last write — nothing to do (pre-existing dedupe).
-        if let Some(SavedSlot::Present { content, .. }) = prev {
-            if content == h {
+        match present_save_decision(prev, h, crit, force_flush, now_ms()) {
+            PresentSaveDecision::Unchanged => continue,
+            PresentSaveDecision::Defer => {
+                debug!("room {vk:?}: deferring cache-only save");
                 continue;
             }
-        }
-
-        // Something changed. Decide whether it must be written NOW or can ride
-        // the snapshot cadence (freenet/river#533).
-        //
-        // Write immediately when the UNRECOVERABLE fields changed, when this is
-        // a room we haven't written this session, when the previous slot was a
-        // tombstone (a rejoin), when the caller asked for a flush, or when the
-        // critical projection failed to serialize. Only a pure `room_state` /
-        // `last_read_message_id` change on an already-persisted room is
-        // deferred, and only until the interval elapses.
-        //
-        // Deferring is safe ONLY for the cache: `room_state` is replicated in
-        // the room contract, so a stale snapshot costs a colder start and never
-        // loses data. `self_sk` cannot be re-derived from the network, which is
-        // why it must never fall into this branch.
-        if !force_flush {
-            if let Some(SavedSlot::Present {
-                critical,
-                written_at_ms: Some(written_at_ms),
-                ..
-            }) = prev
-            {
-                let cache_only_change = crit.is_some() && critical == crit;
-                let elapsed_ms = now_ms() - written_at_ms;
-                if cache_only_change && should_defer_cache_only_save(elapsed_ms) {
-                    debug!(
-                        "room {vk:?}: deferring cache-only save ({elapsed_ms}ms since last write)"
-                    );
-                    continue;
-                }
-            }
+            PresentSaveDecision::Write => {}
         }
 
         let rejoined = REJOINED_THIS_SESSION.with(|s| s.borrow().contains(vk));

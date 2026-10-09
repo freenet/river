@@ -21,10 +21,11 @@ use crate::components::app::chat_delegate::{
     mark_outbound_dms_hydrated, note_current_list_response,
     note_delegate_response_for_register_ack, parse_room_storage_key, per_room_terminal,
     prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, response_correlation_base,
-    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
-    send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
-    LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
-    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
+    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate,
+    seed_saved_slots_from_load, send_delegate_request, send_delegate_request_to,
+    set_load_state_if_current, source_rank_for_delegate_key, LegacyMigrationAction,
+    LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY,
+    ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -956,6 +957,10 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                 None
             };
 
+            // The current delegate holds exactly these bytes: let the save that
+            // follows hydration skip any room hydration left unchanged instead
+            // of re-reading every room's full value (freenet/river#757).
+            seed_saved_slots_from_load(&slots, meta.as_ref());
             let loaded = reconstruct_rooms(slots, meta);
             // Capture emptiness BEFORE `loaded` is moved into hydrate, for the
             // authoritative terminal decision below.
@@ -3361,6 +3366,32 @@ mod tests {
     /// wiring by source-grep (this repo's convention), scoped to the per-room load
     /// region so the trailing single meta GET (which legitimately still uses
     /// `send_delegate_request`) is excluded.
+    /// freenet/river#757: the per-room load must seed the save baseline from
+    /// the slots it read from the current delegate, before they are consumed,
+    /// or the save that follows re-reads every room's full value.
+    #[test]
+    fn per_room_load_seeds_the_save_baseline() {
+        let src = include_str!("response_handler.rs");
+        let production: String = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let start = production
+            .find("asyncfnload_rooms_per_room(")
+            .expect("load_rooms_per_room must exist");
+        let region = &production[start..];
+        let seed = region
+            .find("seed_saved_slots_from_load(&slots,meta.as_ref());")
+            .expect("the per-room load must seed the save baseline");
+        let reconstruct = region
+            .find("reconstruct_rooms(slots,meta)")
+            .expect("the per-room load reconstructs the rooms");
+        assert!(seed < reconstruct, "seed before the slots are consumed");
+    }
+
     #[test]
     fn per_room_load_fans_out_concurrently() {
         let src = include_str!("response_handler.rs");
