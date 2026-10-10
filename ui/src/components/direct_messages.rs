@@ -78,16 +78,16 @@ fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
         // on that same synchronous stack `with_mut` (which is
         // `f(&mut *self.write())`, a panicking borrow) would be a
         // GUARANTEED panic. So a contended peek must SKIP, never fall
-        // through to the write. Skipping is harmless: the open thread
-        // calls this again on its next read-rule trigger (the next
-        // message, the reader reaching the end, the tab becoming
-        // visible, a reopen), so a skipped advance self-heals then. The
-        // `false` fallback below is load-bearing — a `true` fallback is
-        // the panic path. Pinned by `mark_thread_read_write_is_gated_pinned`.
-        let needs_write = DM_LAST_SEEN
+        // through to the write, and nudge: the nudge re-runs the thread's
+        // witness effect, which calls this again. Pinned by
+        // `mark_thread_read_write_is_gated_pinned`.
+        let Ok(needs_write) = DM_LAST_SEEN
             .try_peek()
             .map(|seen| thread_read_needs_write(seen.get(&(room, peer)).copied(), up_to_ts))
-            .unwrap_or(false);
+        else {
+            crate::util::signal_guard::schedule_nudge();
+            return;
+        };
         if !needs_write {
             return;
         }
@@ -1009,29 +1009,40 @@ mod tests {
              re-applies its read rule (issue #499 write-pulse)"
         );
 
-        // The contended-peek fallback must be FALSE (skip the write).
-        // `try_peek` fails only while a live WRITE borrow exists on
-        // DM_LAST_SEEN, and on that same synchronous stack `with_mut`
-        // is a panicking borrow — so a `true` fallback converts every
-        // contended peek into a guaranteed RefCell panic. `false` is
-        // safe: the open thread calls mark_thread_read again on its next
-        // read-rule trigger, so a skipped advance self-heals then.
+        // A contended peek must SKIP the write and nudge. `try_peek` fails
+        // only while a live WRITE borrow exists on DM_LAST_SEEN, and on
+        // that same synchronous stack `with_mut` is a panicking borrow —
+        // so falling through (an `unwrap_or(true)`) is a guaranteed RefCell
+        // panic. The nudge re-runs the thread's witness effect, which calls
+        // mark_thread_read again, so the skipped advance is retried.
         // (Needles built with concat! so this comment and the
         // assertion literals cannot drift into matching themselves —
         // they sit inside the cut anyway, belt and braces.)
-        let fallback_false = concat!(".unwrap_or(", "false)");
-        let fallback_true = concat!(".unwrap_or(", "true)");
+        let skip_on_contention = concat!(
+            "else{crate::util::signal_guard::",
+            "schedule_nudge();return;};"
+        );
+        let skip = seg.find(skip_on_contention).unwrap_or_else(|| {
+            panic!(
+                "mark_thread_read must read with `let Ok(..) = ..try_peek().. \
+                 else {{ schedule_nudge(); return; }}` — a contended peek means a \
+                 live write borrow, falling through to with_mut on that stack \
+                 panics, and without the nudge the skipped advance is never retried"
+            )
+        });
         assert!(
-            seg.contains(fallback_false),
-            "mark_thread_read's try_peek fallback must be `false` (skip on \
-             contention) — a contended peek means a live write borrow, and \
-             falling through to with_mut on that stack panics"
+            seg.contains(concat!("letOk(needs_write)=DM_LAST_SEEN", ".try_peek()")),
+            "mark_thread_read must bind the peeked decision with `let Ok(needs_write)`"
         );
         assert!(
-            !seg.contains(fallback_true),
+            !seg.contains(concat!(".unwrap_or(", "true)")),
             "mark_thread_read must NOT fall back to `true` on a contended \
              try_peek — that is the guaranteed-panic path (with_mut on a \
              signal whose write borrow is live)"
+        );
+        assert!(
+            skip < gate,
+            "mark_thread_read's contended-peek skip must come before the gated write"
         );
     }
 
