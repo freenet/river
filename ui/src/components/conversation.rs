@@ -16,7 +16,8 @@ use crate::components::members::{
 use crate::components::scroll_to_latest::LatestButton;
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
-    observe_sentinel, scroll_to_end, sentinel_in_view, NEWEST_IN_VIEW_SLACK_PX,
+    follows_arrival, newest_bottom_below_view, observe_sentinel, scroll_to_end, sentinel_in_view,
+    NEWEST_IN_VIEW_SLACK_PX, ROOM_FOLLOW_BAND_PX,
 };
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
@@ -2753,6 +2754,10 @@ struct ReaderPosition {
     /// its range reaches the room's latest message. What `note_newest_seen`
     /// publishes once its bottom is on screen.
     newest_rendered: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, MessageId)>>,
+    /// The room and [`NewestKey`] of the last render whose range reached the
+    /// room's latest message: what `follow_arrival_at_end` compares an
+    /// arrival against.
+    newest_key: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, NewestKey)>>,
     /// The last value `note_newest_seen` published, so a repeat check (every
     /// settle, every render) schedules nothing.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -2811,6 +2816,7 @@ impl ReaderPosition {
     /// range, so the next render's range is never compared against it.
     fn forget_range(&self) {
         *self.rendered.borrow_mut() = None;
+        *self.newest_key.borrow_mut() = None;
         self.end_hold.set(None);
     }
 }
@@ -3304,6 +3310,7 @@ fn resolve_rendered_range(
     if !history_window.has_newer {
         *reader.newest_rendered.borrow_mut() =
             room.zip(shown.last().and_then(display_item_last_message_id));
+        *reader.newest_key.borrow_mut() = room.zip(newest_key(groups));
     }
     // Tell the settle handler whether a bottom-settle trim would shrink
     // anything.
@@ -3661,6 +3668,48 @@ fn correct_view_after_patch(reader: &ReaderPosition) {
             // From the PRE-patch offset; see `reposition_pending`.
             container.set_scroll_top((capture.scroll_top + shift).max(0));
         }
+    }
+}
+
+/// Follow an arrival for a reader at the end: ask for one move to the end when
+/// this render brings a newer newest message (`is_arrival`) and, before the
+/// patch, the room was in the foreground (`foreground::in_foreground`) with its
+/// newest message's bottom within `ROOM_FOLLOW_BAND_PX` of the view's bottom
+/// edge. Runs in render, so the DOM still shows the previous render; measuring
+/// after the patch would count the arrival's own height against the band.
+/// Stateless: nothing is remembered between arrivals, so nothing can latch
+/// (#486, #508, #723). See `.claude/rules/history-scrolling.md`.
+#[cfg(target_arch = "wasm32")]
+fn follow_arrival_at_end(
+    groups: &[DisplayItem],
+    room: Option<ed25519_dalek::VerifyingKey>,
+    reader: &ReaderPosition,
+) {
+    // A pending request already owns the view; a held range is not at the end.
+    if reader.request.get().is_some() || reader.has_newer.get() || reader.hidden.get() {
+        return;
+    }
+    let Some(room) = room else {
+        return;
+    };
+    let previous = reader
+        .newest_key
+        .borrow()
+        .as_ref()
+        .filter(|(rendered_room, _)| *rendered_room == room)
+        .map(|(_, key)| key.clone());
+    if !is_arrival(previous.as_ref(), newest_key(groups).as_ref()) {
+        return;
+    }
+    let Some(container) = chat_scroll_container() else {
+        return;
+    };
+    if follows_arrival(
+        crate::components::foreground::in_foreground(None, &container),
+        newest_bottom_below_view(&container, "bottom-sentinel"),
+        ROOM_FOLLOW_BAND_PX,
+    ) {
+        reader.request_end(Some(room));
     }
 }
 
@@ -5412,6 +5461,14 @@ pub fn Conversation() -> Element {
                                     } else {
                                         subscribed_window
                                     };
+                                    // Before the range resolves, so a follow
+                                    // selects the latest range in this render.
+                                    #[cfg(target_arch = "wasm32")]
+                                    follow_arrival_at_end(
+                                        groups,
+                                        CURRENT_ROOM.peek().owner_key,
+                                        &reader_position,
+                                    );
                                     let (history_window, head_removed) = resolve_rendered_range(
                                         groups,
                                         requested_window,

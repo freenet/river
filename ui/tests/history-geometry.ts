@@ -20,6 +20,11 @@ export const WELL_AWAY_FROM_END_PX = 100;
 export const NEWEST_IN_VIEW_SLACK_PX = 4;
 /// Slack for fractional layout after a scroll that did land at the bottom.
 export const AT_BOTTOM_EPSILON_PX = 4;
+/// scroll_to_latest.rs `ROOM_FOLLOW_BAND_PX` / `DM_FOLLOW_BAND_PX`: how far
+/// below the view the newest message's bottom may sit when an arrival lands and
+/// still be followed.
+export const ROOM_FOLLOW_BAND_PX = 100;
+export const DM_FOLLOW_BAND_PX = 50;
 /// How far a row the reader is looking at may move and still count as "kept
 /// in place". Independent of the app's own slack (#732).
 export const READING_ROW_BUDGET_PX = 4;
@@ -275,6 +280,32 @@ export async function expectMessageInView(page: Page, text: string, why: string)
   });
   expect(overflow.above, `${why} (its top is ${overflow.above}px above the view)`).toBeLessThanOrEqual(1);
   expect(overflow.below, `${why} (its bottom is ${overflow.below}px below the view)`).toBeLessThanOrEqual(1);
+}
+
+/// An arrival was followed: the history settled at its end with the message
+/// entirely in view.
+export async function expectFollowed(page: Page, text: string, why: string) {
+  await expectSettledAtBottom(page, why);
+  await expectMessageInView(page, text, why);
+}
+
+/// How far the newest message's bottom (`#bottom-sentinel`'s top, the edge
+/// the follow rule measures) sits below the visible history. Negative: above
+/// its bottom edge.
+export function newestBelowView(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const c = document.getElementById("chat-scroll-container")!;
+    const s = document.getElementById("bottom-sentinel")!;
+    return s.getBoundingClientRect().top - c.getBoundingClientRect().bottom;
+  });
+}
+
+/// The reader scrolls so the newest message's bottom sits `below` px under the
+/// view's bottom edge, and the move settles.
+export async function readerParksNewestBelow(page: Page, below: number) {
+  const target = (await scrollTop(page)) + (await newestBelowView(page)) - below;
+  await readerScrollsWithoutGesture(page, target);
+  expect(Math.abs((await newestBelowView(page)) - below), "premise: parked where asked").toBeLessThanOrEqual(2);
 }
 
 /// A row's top relative to the container's top, or null when it is not in the

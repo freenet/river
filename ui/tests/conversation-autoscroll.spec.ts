@@ -1,14 +1,16 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { roomUnreadBadge, selectListedRoom } from "./example-room";
+import { roomUnreadBadge, selectListedRoom, setTabVisibility } from "./example-room";
 import {
   AT_BOTTOM_EPSILON_PX,
   HISTORY_ROWS,
   READING_ROW_BUDGET_PX,
+  ROOM_FOLLOW_BAND_PX,
   WELL_AWAY_FROM_END_PX,
   deliver,
   deliverOffscreen,
   distanceFromBottom,
+  expectFollowed,
   expectMessageInView,
   expectParkedAwayFromEnd,
   expectReadingRow,
@@ -25,6 +27,7 @@ import {
   nextFrames,
   openRoomAtBottom,
   readerLeavesAndReturnsToEnd,
+  readerParksNewestBelow,
   readerScrollsTo,
   readerScrollsWithoutGesture,
   readingRow,
@@ -1592,5 +1595,148 @@ test.describe("The end holds after an explicit request", () => {
     await loadImage(page, image);
 
     await expectSettledAtBottom(page, "a row grew above the end after a send and left the newest message off screen");
+  });
+});
+
+// An arrival follows a reader at the end, measured before the patch: the
+// newest message's bottom within ROOM_FOLLOW_BAND_PX of the view's bottom
+// edge, in a visible tab, with no modal over the history. Nothing else
+// follows, and nothing scrolls when the tab or a modal comes back.
+// Rationale: .claude/rules/history-scrolling.md.
+test.describe("An arrival follows a reader at the end", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("an arrival follows a reader at the end and Latest stays hidden", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+
+    await deliver(page, "followed from the end");
+    await expectFollowed(page, "followed from the end", "an arrival did not follow a reader at the end");
+    await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);
+  });
+
+  for (const [offset, follows] of [
+    [-20, true],
+    [20, false],
+  ] as const) {
+    const below = ROOM_FOLLOW_BAND_PX + offset;
+    test(`an arrival ${follows ? "follows" : "does not follow"} a reader whose newest message sits ${below}px below the view`, async ({
+      page,
+    }) => {
+      await openRoomAtBottom(page, "Team Chat Room");
+      await fillHistory(page);
+      await readerParksNewestBelow(page, below);
+      const row = await expectReadingRow(page);
+
+      await deliverOffscreen(page, `arrival ${below}px from the end`);
+      if (follows) {
+        await expectFollowed(page, `arrival ${below}px from the end`, "an arrival inside the band did not follow");
+      } else {
+        await expectRowHeld(page, row.key, row.top, "an arrival outside the band moved the view");
+        await expect(page.getByTestId("scroll-to-bottom")).toBeVisible();
+      }
+    });
+  }
+
+  test("an arrival taller than the band follows a reader at the end", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    const tall = `tall arrival ${"word ".repeat(400)}`;
+
+    await deliverOffscreen(page, "tall arrival");
+    await expectSettledAtBottom(page, "premise: the first arrival followed");
+    await callRiverTest(page, "appendMessage", tall);
+    await expect(page.locator("[data-anchor-key]", { hasText: "tall arrival word" })).toHaveCount(1);
+    const height = await page
+      .locator("[data-anchor-key]", { hasText: "tall arrival word" })
+      .evaluate((el) => el.getBoundingClientRect().height);
+    expect(height, "premise: the arrival is taller than the band").toBeGreaterThan(ROOM_FOLLOW_BAND_PX);
+    await expectSettledAtBottom(page, "a tall arrival did not follow a reader at the end");
+  });
+
+  test("a message inserted above the newest one does not follow", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await readerParksNewestBelow(page, ROOM_FOLLOW_BAND_PX / 2);
+    const row = await expectReadingRow(page);
+
+    await callRiverTest(page, "insertMessageBeforeLast", "inserted above the newest");
+    await expect(page.getByText("inserted above the newest")).toHaveCount(1);
+    await expectRowHeld(page, row.key, row.top, "a message inserted above the newest one moved the view");
+  });
+
+  test("an arrival in a hidden tab does not follow, nor does the tab coming back", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    const row = await expectReadingRow(page);
+
+    await setTabVisibility(page, "hidden");
+    await deliverOffscreen(page, "arrival in a hidden tab");
+    await expectRowHeld(page, row.key, row.top, "an arrival in a hidden tab moved the view");
+    await setTabVisibility(page, "visible");
+    await expectRowHeld(page, row.key, row.top, "the tab coming back moved the view");
+    await expect(page.getByTestId("scroll-to-bottom")).toBeVisible();
+  });
+});
+
+// Desktop-only surfaces (the member list, hover actions), engine-agnostic.
+test.describe("An arrival under a modal or popover", { tag: "@chromium-only" }, () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  const teamChatBadge = (page: Page) => roomUnreadBadge(page, "Team Chat Room");
+
+  test("an arrival under a modal does not follow, nor does closing it", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    const row = await expectReadingRow(page);
+    await page.locator('[data-testid^="member-item-"]').first().click();
+    await expect(page.getByTestId("member-info-modal")).toBeVisible({ timeout: 5_000 });
+
+    await deliverOffscreen(page, "arrival under a modal");
+    await expectRowHeld(page, row.key, row.top, "an arrival under a modal moved the history");
+    await page.getByTestId("member-info-close-button").click();
+    await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
+    await expectRowHeld(page, row.key, row.top, "closing the modal moved the history");
+    await expect(page.getByTestId("scroll-to-bottom")).toBeVisible();
+    await selectListedRoom(page, "Public Discussion Room");
+    await expect(teamChatBadge(page), "an arrival behind a modal was marked read").toBeVisible();
+  });
+
+  test("an arrival under the DM thread modal does not follow the room", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    const row = await expectReadingRow(page);
+    await callRiverTest(page, "appendDms", 1);
+    await page.locator(".dm-rail-row-btn").first().click();
+    await expect(page.locator("#dm-scroll-container")).toBeVisible({ timeout: 5_000 });
+
+    await deliverOffscreen(page, "room arrival under a DM thread");
+    await expectRowHeld(page, row.key, row.top, "a room arrival under the DM thread moved the history");
+  });
+
+  test("an arrival under a message's reaction picker does not follow, nor does closing it", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    const newest = page.locator('[id^="msg-"]').last();
+    await newest.getByTestId("message-bubble").hover();
+    await newest.getByTestId("add-reaction-button").click();
+    await expect(page.getByTestId("emoji-picker")).toBeVisible();
+    const row = await expectReadingRow(page);
+
+    await deliverOffscreen(page, "arrival under a popover");
+    await expectRowHeld(page, row.key, row.top, "an arrival under a row popover moved the history");
+    await page.mouse.click(5, 5);
+    await expect(page.getByTestId("emoji-picker")).toHaveCount(0);
+    await expectRowHeld(page, row.key, row.top, "closing the popover moved the history");
+  });
+
+  test("an arrival under the composer's emoji picker follows", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await page.getByTitle("Insert emoji").click();
+    await expect(page.locator("div.fixed.inset-0.z-40")).toHaveCount(1);
+
+    await deliver(page, "arrival under the composer picker");
+    await expectFollowed(page, "arrival under the composer picker", "a composer popover stopped an arrival following");
   });
 });
