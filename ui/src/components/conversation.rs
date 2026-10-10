@@ -2531,8 +2531,9 @@ const WINDOW_GROWTH_ITEMS: usize = 60;
 /// worst-case DOM stays ~4x the room-open cost rather than unbounded.
 ///
 /// At the ceiling the range stops at its end and holds newer items back
-/// (`HistoryWindow::has_newer`), even for a reader idle at the bottom: nothing
-/// follows arrivals, so they land below the view either way.
+/// (`HistoryWindow::has_newer`) below a parked reader. A reader at the end
+/// follows the arrivals instead: the follow's request takes the latest range
+/// (`resolve_rendered_range`).
 ///
 /// The ceiling caps ARRIVAL growth only. A reader paging back through history
 /// raises `window_items` explicitly, and that requested size always wins over
@@ -2591,11 +2592,11 @@ struct RangeHold {
 }
 
 /// A one-shot request to take the view to the end of `room`'s history:
-/// opening the room, the reader's own send, or Latest from a held range. A
-/// room change replaces it, and the render drops one made for another room.
-/// The reading-position corrections stand down while it is pending.
-/// Incoming messages preserve the reader's place; the rationale for replacing
-/// automatic following is in `.claude/rules/history-scrolling.md`.
+/// opening the room, the reader's own send, Latest, or an arrival followed for
+/// a reader at the end (`follow_arrival_at_end`). A room change replaces it,
+/// and the render drops one made for another room. The reading-position
+/// corrections stand down while it is pending. Any other arrival preserves the
+/// reader's place; see `.claude/rules/history-scrolling.md`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ScrollRequest {
     room: Option<ed25519_dalek::VerifyingKey>,
@@ -2771,7 +2772,8 @@ struct ReaderPosition {
     /// The end hold: `Some(scrollTop)` while the view sits at
     /// the end an explicit request put it at. Rows changing height take it
     /// back there (the ResizeObserver). The reader's first scroll away, an
-    /// arrival (the render), a room change and the panel hiding end it.
+    /// arrival (the render), a room change and the panel hiding end it; an
+    /// arrival that is followed lands a new request, which holds again.
     end_hold: std::cell::Cell<Option<i32>>,
     /// The last render's range, so the next render can tell an arrival from
     /// rows changing height.
@@ -12049,7 +12051,8 @@ mod reader_state_tests {
         assert_eq!(last_good_for_room(&None::<(&str, i32)>, &"room a"), None);
     }
 
-    /// An arrival ends the hold instead of moving the view.
+    /// An arrival ends the hold (a followed one lands a new request, which
+    /// holds again).
     /// Appended (new newest), inserted above the newest (higher count), or
     /// inserted while an at-cap drain removed the first row (new first row,
     /// same count).

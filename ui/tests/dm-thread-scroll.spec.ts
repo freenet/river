@@ -5,12 +5,14 @@ import { AT_BOTTOM_EPSILON_PX, DM_FOLLOW_BAND_PX, NEWEST_IN_VIEW_SLACK_PX, nextF
 
 // Where a DM thread's view goes: opening it lands on the
 // newest DM, an own send jumps to the end once, and Latest jumps there on
-// request. Nothing else moves the view. An inbound DM never does, even when
-// the reader is at the end; it lands below and Latest offers it.
+// request. An inbound DM follows a reader at the end of a thread in the
+// foreground (DM_FOLLOW_BAND_PX); anywhere else it lands below and Latest
+// offers it. Nothing else moves the view.
 //
-// And when the thread counts as seen: only
-// up to an inbound DM that was on screen with the tab visible. One that lands
-// below the fold, or arrives while the tab is hidden, stays unread.
+// And when the thread counts as seen: only up to an inbound DM that was on
+// screen while the thread was in the foreground. One that lands below the
+// fold, or arrives while the tab is hidden or a modal covers the thread,
+// stays unread.
 //
 // The thread is populated through the `appendDms` / `deliverDm` test hooks,
 // which add sender-signed DMs from one test member ("DM Test Peer") to self

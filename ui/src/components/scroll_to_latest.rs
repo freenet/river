@@ -141,7 +141,8 @@ pub fn scroll_to_end(container: &web_sys::Element) {
 }
 
 /// The round Latest button in the corner of a scroll area. Instant and
-/// one-shot: a later arrival does not extend it. The caller's observer hides
+/// one-shot: it leaves nothing behind, and a later arrival follows only by the
+/// ordinary rule (`follows_arrival`). The caller's observer hides
 /// it once the end is in view; nothing hides it optimistically (#402).
 #[component]
 pub fn LatestButton(

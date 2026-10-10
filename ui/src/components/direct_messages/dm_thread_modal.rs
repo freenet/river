@@ -49,8 +49,9 @@ const DM_THREAD_MODAL: &str = "dm-thread";
 /// Monotonic counter bumped every time the local user sends a DM from
 /// any open thread modal. The auto-scroll effect reads this via
 /// `.peek()` (non-reactive) to distinguish "user sent a message"
-/// (scroll to it once) from "peer sent a message" (never scroll; the
-/// Latest control offers it). Wrap-around is fine — the effect compares
+/// (scroll to it once) from "peer sent a message" (followed only for a
+/// reader at the end, see `dm_arrival_follows`; otherwise the Latest
+/// control offers it). Wrap-around is fine — the effect compares
 /// for inequality with a stored previous value.
 ///
 /// Lives at module scope rather than inside the modal so a re-render
