@@ -129,9 +129,10 @@ pub fn observe_sentinel(
     })
 }
 
-/// Take `container` to its end at once. Never animated (decisions 6, 12): an
-/// explicit request lands in the same task, so nothing can arrive or settle
-/// mid-flight, and a smooth scroll would leave the end off screen while it ran.
+/// Take `container` to its end at once. Never animated
+/// (`.claude/rules/history-scrolling.md`): an explicit request lands in the
+/// same task, so nothing can arrive or settle mid-flight, and a smooth scroll
+/// would leave the end off screen while it ran.
 #[cfg(target_arch = "wasm32")]
 pub fn scroll_to_end(container: &web_sys::Element) {
     let opts = web_sys::ScrollToOptions::new();

@@ -1418,8 +1418,8 @@ test.describe("Own send goes to the newest message once (A06)", () => {
 // Once an explicit request (opening a room, an own send,
 // Latest) has put the reader at the end, the end stays in view while rows
 // change height (a private room's placeholders decrypting, late images, font
-// swaps), until the reader first scrolls away. An arrival ends the hold
-// instead of moving the view, as arrivals never do.
+// swaps), until the reader first scrolls away. An arrival ends the hold; a
+// followed one lands a new request, which holds again.
 //
 // The growing row is a Markdown image whose request is held until the test
 // lets it load, two short messages above the end.

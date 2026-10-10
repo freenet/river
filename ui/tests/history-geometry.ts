@@ -14,9 +14,9 @@ export const HISTORY_ROWS = '[data-testid="conversation-history"] > *';
 /// A premise distance: a view this far from the end of the history is well
 /// away from it.
 export const WELL_AWAY_FROM_END_PX = 100;
-/// conversation.rs `NEWEST_IN_VIEW_SLACK_PX` and dm_thread_modal.rs
-/// `NEWEST_DM_IN_VIEW_SLACK_PX`: how far below the visible area the newest
-/// message's bottom may sit and still count as on screen.
+/// scroll_to_latest.rs `NEWEST_IN_VIEW_SLACK_PX`, shared by the room and the
+/// DM thread: how far below the visible area the newest message's bottom may
+/// sit and still count as on screen.
 export const NEWEST_IN_VIEW_SLACK_PX = 4;
 /// Slack for fractional layout after a scroll that did land at the bottom.
 export const AT_BOTTOM_EPSILON_PX = 4;
@@ -30,7 +30,7 @@ export const DM_FOLLOW_BAND_PX = 50;
 export const READING_ROW_BUDGET_PX = 4;
 
 /// The main SHA the known failures below were reproduced on, before the scroll simplification.
-const KNOWN_FAILURE_SHA = "739fd683";
+const KNOWN_FAILURE_SHA = "1ce80050";
 
 /// Mark the REST of the test as a reproduced, known failure on main.
 ///
