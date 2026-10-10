@@ -1442,43 +1442,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_open_room_count_is_that_room_alone_under_its_mode() {
-        // The mobile back-to-chat badge counts only the open room.
-        let (self_sk, _) = keypair();
-        let (owner_a_sk, owner_a_vk) = keypair();
-        let (owner_b_sk, owner_b_vk) = keypair();
-        let room_a = room(
-            self_sk.clone(),
-            owner_a_vk,
-            vec![
-                msg(&owner_a_sk, &owner_a_vk, 1),
-                msg(&owner_a_sk, &owner_a_vk, 2),
-            ],
-            None,
-        );
-        let room_b = room(
-            self_sk,
-            owner_b_vk,
-            vec![msg(&owner_b_sk, &owner_b_vk, 1)],
-            None,
-        );
-        let mut map = HashMap::new();
-        map.insert(owner_a_vk, room_a);
-        map.insert(owner_b_vk, room_b);
-        let mut modes = HashMap::new();
-
-        assert_eq!(count_unread_in_room(&map, &modes, Some(&owner_a_vk)), 2);
-        assert_eq!(count_unread_in_room(&map, &modes, Some(&owner_b_vk)), 1);
-        // No open room, or one not in the map: nothing to count.
-        assert_eq!(count_unread_in_room(&map, &modes, None), 0);
-        let (_, other_vk) = keypair();
-        assert_eq!(count_unread_in_room(&map, &modes, Some(&other_vk)), 0);
-        // The room's own mode applies: muted counts zero.
-        modes.insert(owner_a_vk, NotificationMode::Muted);
-        assert_eq!(count_unread_in_room(&map, &modes, Some(&owner_a_vk)), 0);
-    }
-
     /// Build a message from `author_sk` that @mentions `mention_of`.
     fn mention_msg(
         author_sk: &SigningKey,
@@ -2101,6 +2064,15 @@ mod tests {
             count_unread_excluding_room(&map, &modes, Some(&owner_c_vk)),
             3
         );
+
+        // The mobile back-to-chat badge counts the open room alone, under its mode.
+        assert_eq!(count_unread_in_room(&map, &modes, Some(&owner_a_vk)), 2);
+        assert_eq!(count_unread_in_room(&map, &modes, Some(&owner_b_vk)), 1);
+        assert_eq!(count_unread_in_room(&map, &modes, Some(&owner_c_vk)), 0);
+        // No open room, or one not in the map: nothing to count.
+        assert_eq!(count_unread_in_room(&map, &modes, None), 0);
+        let (_, other_vk) = keypair();
+        assert_eq!(count_unread_in_room(&map, &modes, Some(&other_vk)), 0);
     }
 
     /// Build a direct message. The counters never verify signatures, so

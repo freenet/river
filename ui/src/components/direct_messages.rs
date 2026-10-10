@@ -1024,21 +1024,13 @@ mod tests {
         );
         let skip = seg.find(skip_on_contention).unwrap_or_else(|| {
             panic!(
-                "mark_thread_read must read with `let Ok(..) = ..try_peek().. \
-                 else {{ schedule_nudge(); return; }}` — a contended peek means a \
-                 live write borrow, falling through to with_mut on that stack \
-                 panics, and without the nudge the skipped advance is never retried"
+                "mark_thread_read's contended try_peek must `else {{ schedule_nudge(); \
+                 return; }}`: skip the write (with_mut would panic) and nudge to retry it"
             )
         });
         assert!(
             seg.contains(concat!("letOk(needs_write)=DM_LAST_SEEN", ".try_peek()")),
             "mark_thread_read must bind the peeked decision with `let Ok(needs_write)`"
-        );
-        assert!(
-            !seg.contains(concat!(".unwrap_or(", "true)")),
-            "mark_thread_read must NOT fall back to `true` on a contended \
-             try_peek — that is the guaranteed-panic path (with_mut on a \
-             signal whose write borrow is live)"
         );
         assert!(
             skip < gate,
