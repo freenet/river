@@ -20,7 +20,8 @@ use crate::components::room_list::receive_invitation_modal::present_invitation;
 use crate::components::scroll_to_latest::LatestButton;
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
-    observe_sentinel, scroll_to_end, sentinel_in_view, SentinelObserver,
+    follows_arrival, newest_bottom_below_view, observe_sentinel, scroll_to_end, sentinel_in_view,
+    SentinelObserver, DM_FOLLOW_BAND_PX,
 };
 use crate::room_data::SendMessageError;
 use dioxus::logger::tracing::{error, info, warn};
@@ -476,18 +477,25 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         });
     }
 
-    // Explicit navigation (`.claude/rules/history-scrolling.md`): the opening
-    // and an own send jump to the end; an inbound DM never scrolls, and the
-    // Latest control offers it. The last bubble's mount is the trigger: it
+    // Placement (`.claude/rules/history-scrolling.md`): the opening and an own
+    // send jump to the end, and an inbound DM follows a reader at the end
+    // (`follow_pending`); any other arrival leaves the thread where it is, and
+    // the Latest control offers it. The last bubble's mount is the trigger: it
     // writes `last_dm_bubble`, the effect's subscription (#283), and
     // `OUTBOUND_SEND_COUNTER` (peeked) tells an own send from an arrival.
     let last_dm_bubble: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
     let first_scroll_done = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
     let prev_outbound_bump = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0u64)));
+    // The newest DM the render has seen, and whether the render that first
+    // showed it found the reader at the end (`dm_arrival_follows`), read
+    // before the patch. Set in render; the effect consumes the flag.
+    let newest_recorded = use_hook(|| Rc::new(std::cell::Cell::new(None::<DmKey>)));
+    let follow_pending = use_hook(|| Rc::new(std::cell::Cell::new(false)));
     #[cfg(target_arch = "wasm32")]
     {
         let first_scroll_done = first_scroll_done.clone();
         let prev_outbound_bump = prev_outbound_bump.clone();
+        let follow_pending = follow_pending.clone();
         let seen_witness = seen_witness.clone();
         let mounted = mounted.clone();
         use_effect(move || {
@@ -501,8 +509,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             let outbound_changed =
                 prev_outbound_bump.replace(outbound_bump_now) != outbound_bump_now;
             let is_first = !first_scroll_done.replace(true);
-            // Anything else is an arrival (or a purge): never scroll.
-            if !is_first && !outbound_changed {
+            let follow = follow_pending.replace(false);
+            // Any other arrival, or a purge: leave the thread where it is.
+            if !is_first && !outbound_changed && !follow {
                 return;
             }
             let seen_witness = seen_witness.clone();
@@ -527,7 +536,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     {
         // Touch the values so they're not flagged as unused on native.
-        let _ = (&last_dm_bubble, &first_scroll_done, &prev_outbound_bump);
+        let _ = (
+            &last_dm_bubble,
+            &first_scroll_done,
+            &prev_outbound_bump,
+            &follow_pending,
+        );
     }
 
     // Drives the Latest control: is the newest DM's bottom on screen, give or
@@ -565,6 +579,19 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             div { "data-testid": "dm-thread-unavailable", "Room state not available" }
         };
     };
+    // A thread opened empty has no opening to place: its first DM is an
+    // arrival like any other (review item 6 on #753).
+    if view_data.identity_known && view_data.messages.is_empty() {
+        first_scroll_done.set(true);
+    }
+    // In render, so the DOM still shows the previous render: measured after
+    // the patch, a tall arrival's own height would count against the band.
+    let newest = newest_dm_key(&view_data.messages);
+    if is_newer_dm(newest_recorded.get().as_ref(), newest.as_ref()) {
+        newest_recorded.set(newest);
+        #[cfg(target_arch = "wasm32")]
+        follow_pending.set(dm_arrival_follows());
+    }
     let peer_label = view_data.peer_nickname.clone();
     let peer_still_member = view_data.peer_still_member;
     let identity_known = view_data.identity_known;
@@ -1822,6 +1849,22 @@ impl ThreadSeenWitness {
         }
         crate::components::direct_messages::mark_thread_read(self.room, self.peer, ts);
     }
+}
+
+/// Does an arrival rendering now follow? Only into a thread in the foreground
+/// (no modal over it, see `foreground::in_foreground`) whose newest DM's bottom
+/// sits within `DM_FOLLOW_BAND_PX` of its view's bottom edge. Called from
+/// render, before the patch; a thread not yet in the DOM (the opening) does
+/// not follow, which the opening placement covers.
+#[cfg(target_arch = "wasm32")]
+fn dm_arrival_follows() -> bool {
+    dm_scroll_container().is_some_and(|container| {
+        follows_arrival(
+            crate::components::foreground::in_foreground(Some(DM_THREAD_MODAL), &container),
+            newest_bottom_below_view(&container, "dm-bottom-sentinel"),
+            DM_FOLLOW_BAND_PX,
+        )
+    })
 }
 
 /// The DM thread's scroll container, if it is currently in the DOM.

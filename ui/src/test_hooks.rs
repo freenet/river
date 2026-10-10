@@ -140,6 +140,19 @@ pub fn install_test_hooks() {
         },
     );
 
+    // Admit a test peer to the current room with no DMs, so a spec can open
+    // an empty thread with them from Member Info.
+    expose(&hooks, "admitDmPeer", move |peer: u32| {
+        let peer = dm_peer(peer);
+        crate::util::defer(move || {
+            with_current_room_mut(|room, room_key| {
+                let room_key = *room_key;
+                let peer_sk = SigningKey::from_bytes(&peer.seed);
+                admit_with_nickname(room, &room_key, &peer_sk, peer.nickname);
+            })
+        });
+    });
+
     // Hold the NEXT DM thread placement (the opening or own-send jump) once
     // its task has started, before it touches the DOM, until
     // `releaseHeldDmPlacement`. One-shot: later placements run as usual.

@@ -1,7 +1,7 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { waitForApp, selectRoom, setTabVisibility, hiddenTitleCount } from "./example-room";
-import { AT_BOTTOM_EPSILON_PX, NEWEST_IN_VIEW_SLACK_PX, nextFrames, settle } from "./history-geometry";
+import { waitForApp, selectRoom, setTabVisibility, hiddenTitleCount, memberRows } from "./example-room";
+import { AT_BOTTOM_EPSILON_PX, DM_FOLLOW_BAND_PX, NEWEST_IN_VIEW_SLACK_PX, nextFrames, settle } from "./history-geometry";
 
 // Where a DM thread's view goes: opening it lands on the
 // newest DM, an own send jumps to the end once, and Latest jumps there on
@@ -213,6 +213,40 @@ function sameThreadElements(page: Page) {
         w.__dmComposer === document.querySelector('textarea[placeholder="Type a direct message..."]'),
     };
   }, THREAD);
+}
+
+/// How far the newest DM's bottom (`dm-bottom-sentinel`'s top, the edge the
+/// follow rule measures) sits below the thread's view. Negative: above it.
+function newestDmBelowView(page: Page) {
+  return page.evaluate((sel) => {
+    const thread = document.querySelector(sel)!;
+    const sentinel = document.getElementById("dm-bottom-sentinel")!;
+    return sentinel.getBoundingClientRect().top - thread.getBoundingClientRect().bottom;
+  }, THREAD);
+}
+
+/// The reader scrolls so the newest DM's bottom sits `below` px under the
+/// thread's bottom edge.
+async function parkNewestDmBelow(page: Page, below: number) {
+  const { top } = await threadGeometry(page);
+  await readerScrollsTo(page, top + (await newestDmBelowView(page)) - below);
+  expect(Math.abs((await newestDmBelowView(page)) - below), "premise: parked where asked").toBeLessThanOrEqual(2);
+}
+
+const OTHER_PEER = "Other DM Peer";
+
+/// Open an empty thread with the second test peer, from Member Info.
+async function openEmptyThread(page: Page) {
+  await page.goto("/");
+  await waitForApp(page);
+  await selectRoom(page, "Team Chat Room");
+  await callRiverTest(page, "admitDmPeer", 1);
+  await memberRows(page).filter({ hasText: OTHER_PEER }).first().click();
+  await expect(page.getByTestId("member-info-modal")).toBeVisible({ timeout: 5_000 });
+  await page.locator('button[aria-label="Send direct message"]').first().click();
+  await expect(page.locator(THREAD)).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByText(/no messages yet/i), "premise: the thread opened empty").toBeVisible();
+  await settle(page);
 }
 
 test.describe("DM thread scroll position", () => {
@@ -484,5 +518,107 @@ test.describe("DM thread room read", () => {
     await expect(page.locator(THREAD)).toHaveCount(0);
     await expect(page.getByText(NEWEST_HISTORY, { exact: true })).toHaveCount(0);
     expect(errors).toEqual([]);
+  });
+});
+
+// An inbound DM follows a reader at the end of the thread: the newest DM's
+// bottom within DM_FOLLOW_BAND_PX of the view's bottom edge before the patch,
+// in a visible tab, with no modal over the thread. Nothing else follows, and
+// nothing scrolls when the tab or a modal comes back.
+// Rationale: .claude/rules/history-scrolling.md.
+test.describe("DM thread follows a reader at the end", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("an inbound DM follows a reader at the end and is marked seen", async ({ page }) => {
+    await openThreadWithHistory(page);
+
+    await deliverDm(page, "followed DM");
+    await expectAtEnd(page, "an inbound DM did not follow a reader at the end");
+    expect(await belowFold(page, "followed DM"), "the followed DM is off screen").toBeLessThanOrEqual(NEWEST_IN_VIEW_SLACK_PX);
+    await expect(railBadge(page), "a followed DM stayed unread").toHaveCount(0);
+    await expect(page.getByTestId(LATEST)).toHaveCount(0);
+  });
+
+  for (const [offset, follows] of [
+    [-20, true],
+    [20, false],
+  ] as const) {
+    const below = DM_FOLLOW_BAND_PX + offset;
+    test(`an inbound DM ${follows ? "follows" : "does not follow"} a reader whose newest DM sits ${below}px below the view`, async ({
+      page,
+    }) => {
+      await openThreadWithHistory(page);
+      await parkNewestDmBelow(page, below);
+      await recordScrolls(page);
+
+      await deliverDm(page, `DM ${below}px from the end`);
+      if (follows) {
+        await expectAtEnd(page, "an inbound DM inside the band did not follow");
+      } else {
+        await expectStill(page, "an inbound DM outside the band moved the thread");
+        await expect(page.getByTestId(LATEST)).toBeVisible();
+      }
+    });
+  }
+
+  test("an inbound DM taller than the band follows a reader at the end", async ({ page }) => {
+    await openThreadWithHistory(page);
+    const tall = `tall DM ${"word ".repeat(300)}`.trim();
+
+    await deliverDm(page, tall);
+    const height = await dm(page, tall).evaluate((el) => el.parentElement!.getBoundingClientRect().height);
+    expect(height, "premise: the DM is taller than the band").toBeGreaterThan(DM_FOLLOW_BAND_PX);
+    await expectAtEnd(page, "a tall inbound DM did not follow a reader at the end");
+  });
+
+  test("an inbound DM in a hidden tab does not follow, nor does the tab coming back", async ({ page }) => {
+    await openThreadWithHistory(page);
+    await recordScrolls(page);
+
+    await setTabVisibility(page, "hidden");
+    await deliverDm(page, "DM in a hidden tab");
+    await expectStill(page, "an inbound DM in a hidden tab moved the thread");
+    await setTabVisibility(page, "visible");
+    await expectStill(page, "the tab coming back moved the thread");
+    await expect(page.getByTestId(LATEST)).toBeVisible();
+    await expect(railBadge(page), "a DM below the fold was marked seen").toHaveText("1");
+  });
+
+  test("the first inbound DM of a thread opened empty is on screen and seen", async ({ page }) => {
+    await openEmptyThread(page);
+
+    await callRiverTest(page, "deliverDmForPeer", 1, "first DM of an empty thread");
+    await expect(dm(page, "first DM of an empty thread")).toHaveCount(1, { timeout: 5_000 });
+    expect(await belowFold(page, "first DM of an empty thread"), "the first DM is off screen").toBeLessThanOrEqual(0);
+    await expectAtEnd(page, "the thread is not at its end");
+  });
+
+  test("DMs arriving in a hidden tab into a thread opened empty leave it at the top", async ({ page }) => {
+    await openEmptyThread(page);
+    await setTabVisibility(page, "hidden");
+
+    // One mutation, so the burst's last DM is the thread's first bubble.
+    await callRiverTest(page, "appendDmsForPeer", 1, HISTORY);
+    await expect(dm(page, `other dm history ${HISTORY - 1}`)).toHaveCount(1, { timeout: 5_000 });
+    await settle(page);
+    expect((await threadGeometry(page)).max, "premise: the burst overflows the thread").toBeGreaterThan(0);
+    expect((await threadGeometry(page)).top, "the thread jumped past DMs that arrived in a hidden tab").toBeLessThanOrEqual(1);
+    await recordScrolls(page);
+    await setTabVisibility(page, "visible");
+    await expectStill(page, "the tab coming back moved the thread");
+    await expect(page.getByTestId(LATEST)).toBeVisible();
+  });
+
+  test("an inbound DM under the thread's confirmation does not follow, nor does closing it", async ({ page }) => {
+    await openThreadWithHistory(page);
+    await page.getByRole("button", { name: "Delete their messages" }).click();
+    await expect(page.getByRole("dialog", { name: "Confirm delete their messages" })).toBeVisible();
+    await recordScrolls(page);
+
+    await deliverDm(page, "DM under a confirmation");
+    await expectStill(page, "an inbound DM under a modal moved the thread");
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expectStill(page, "closing the confirmation moved the thread");
+    await expect(page.getByTestId(LATEST)).toBeVisible();
   });
 });

@@ -19,6 +19,8 @@ type RiverTestHooks = {
   // Peer 0 is the identity appendDms/deliverDm use; peer 1 a second one. Others throw.
   appendDmsForPeer(peerIndex: 0 | 1, count: number): void;
   deliverDmForPeer(peerIndex: 0 | 1, text: string): void;
+  // Admits the peer as a member with no DMs, for an empty thread.
+  admitDmPeer(peerIndex: 0 | 1): void;
   holdNextDmPlacement(): void;
   heldDmPlacementCount(): number;
   // Throws if no placement is held.
