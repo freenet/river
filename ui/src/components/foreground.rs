@@ -25,10 +25,9 @@ thread_local! {
 /// subscribe to it; nothing scrolls on it.
 pub static FOREGROUND_CHANGED: GlobalSignal<u64> = Global::new(|| 0);
 
-/// Record that a conversation may have come back to the foreground. Callers
-/// are in a clean context (a `defer` closure or a raw DOM event handler that
-/// defers), so this writes directly; the next value is computed before the
-/// write guard.
+/// Record that a conversation may have come back to the foreground. Every
+/// caller runs it from a `crate::util::defer` closure, so this writes
+/// directly; the next value is computed before the write guard.
 pub fn note_foreground_changed() {
     let next = FOREGROUND_CHANGED.peek().wrapping_add(1);
     *FOREGROUND_CHANGED.write() = next;

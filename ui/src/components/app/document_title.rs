@@ -940,7 +940,7 @@ fn on_visibility_change() {
     // effect, which marks what the reader saw, and the foreground bump re-runs
     // the read rule's checks against what is on screen now.
     if is_visible && !was_visible {
-        crate::components::foreground::note_foreground_changed();
+        crate::util::defer(crate::components::foreground::note_foreground_changed);
     }
     if !is_visible && was_visible {
         // Tab is going from visible to hidden. Only the room the user was
