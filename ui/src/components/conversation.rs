@@ -2663,6 +2663,38 @@ fn end_hold_survives(before: Option<&RenderedMessages>, now: Option<&RenderedMes
         && (now.first == before.first || now.count < before.count)
 }
 
+/// The room's newest display message, as the follow rule compares it. Ordered
+/// by time, then id, so a later message, a message folding into the last
+/// author's group and a join folding into the trailing event summary all
+/// compare greater; a deletion of the newest compares less, and an edit equal.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct NewestKey {
+    time_ms: i64,
+    id: MessageId,
+}
+
+/// The [`NewestKey`] of the last display item, if any.
+fn newest_key(groups: &[DisplayItem]) -> Option<NewestKey> {
+    let (time, id) = match groups.last()? {
+        DisplayItem::Messages(group) => {
+            let message = group.messages.last()?;
+            (message.time, message.message_id.clone())
+        }
+        DisplayItem::Event(summary) => (summary.last_time, summary.last_message_id.clone()),
+    };
+    Some(NewestKey {
+        time_ms: time.timestamp_millis(),
+        id,
+    })
+}
+
+/// Did a message arrive after the newest one the last render showed? Only a
+/// strictly greater newest message counts: an edit, a deletion of the newest,
+/// a message inserted above it, and a first render do not.
+fn is_arrival(previous: Option<&NewestKey>, now: Option<&NewestKey>) -> bool {
+    matches!((previous, now), (Some(previous), Some(now)) if now > previous)
+}
+
 /// The value a contended read stands in with: the last good one, but only if
 /// it was taken for `room`. Another room's rows never render in this one.
 fn last_good_for_room<K: PartialEq, T: Clone>(cache: &Option<(K, T)>, room: &K) -> Option<T> {
@@ -7353,6 +7385,63 @@ mod tests {
     /// The newest item is on screen for ANY window size — including the
     /// degenerate zero, which would otherwise render a history the reader
     /// cannot scroll into (the window only ever grows upward from the bottom).
+    fn newest(time_ms: i64, seed: &[u8]) -> NewestKey {
+        NewestKey {
+            time_ms,
+            id: MessageId(freenet_scaffold::util::fast_hash(seed)),
+        }
+    }
+
+    #[test]
+    fn only_a_newer_newest_message_is_an_arrival() {
+        let before = newest(1_000, b"a");
+        assert!(
+            is_arrival(Some(&before), Some(&newest(2_000, b"b"))),
+            "a later message"
+        );
+        assert!(
+            !is_arrival(Some(&before), Some(&before)),
+            "an edit or a re-render"
+        );
+        assert!(
+            !is_arrival(Some(&before), Some(&newest(500, b"z"))),
+            "the newest deleted"
+        );
+        assert!(
+            !is_arrival(None, Some(&before)),
+            "a first render or a held range"
+        );
+        assert!(!is_arrival(Some(&before), None), "an emptied room");
+        // Same millisecond: the id decides, so the order is total.
+        let (low, high) = {
+            let (x, y) = (newest(1_000, b"x"), newest(1_000, b"y"));
+            if x < y {
+                (x, y)
+            } else {
+                (y, x)
+            }
+        };
+        assert!(is_arrival(Some(&low), Some(&high)));
+        assert!(!is_arrival(Some(&high), Some(&low)));
+    }
+
+    #[test]
+    fn a_join_folding_into_the_trailing_summary_raises_the_newest_key() {
+        let summary = |last_time_ms: i64, seed: &[u8]| {
+            DisplayItem::Event(EventSummary {
+                names: vec!["Ann".into()],
+                id: "summary".into(),
+                last_time: DateTime::from_timestamp_millis(last_time_ms).unwrap(),
+                last_message_id: MessageId(freenet_scaffold::util::fast_hash(seed)),
+            })
+        };
+        let before = newest_key(&[summary(1_000, b"join-1")]);
+        // The same summary item, now holding a second join.
+        let after = newest_key(&[summary(2_000, b"join-2")]);
+        assert!(is_arrival(before.as_ref(), after.as_ref()));
+        assert_eq!(newest_key(&[]), None);
+    }
+
     #[test]
     fn the_window_always_renders_the_newest_item() {
         for total in 1..200usize {
