@@ -41,6 +41,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// envelope overhead is accounted for. 32 KiB - 256 byte safety margin.
 const DM_BODY_BYTE_CAP: usize = MAX_DM_CIPHERTEXT_BYTES - 256;
 
+/// The thread's own `ModalPresence` name. Only a modal OTHER than the thread
+/// takes it out of the foreground.
+const DM_THREAD_MODAL: &str = "dm-thread";
+
 /// Monotonic counter bumped every time the local user sends a DM from
 /// any open thread modal. The auto-scroll effect reads this via
 /// `.peek()` (non-reactive) to distinguish "user sent a message"
@@ -457,8 +461,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 crate::util::signal_guard::schedule_nudge();
                 return;
             };
-            // ...and when the tab becomes visible.
-            if crate::components::app::document_title::DOCUMENT_VISIBLE
+            // ...and when the thread may be back in the foreground (the tab
+            // became visible, a modal over it closed).
+            if crate::components::foreground::FOREGROUND_CHANGED
                 .try_read()
                 .is_err()
             {
@@ -944,7 +949,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     confirm_delete_open.set(false);
                 }
             },
-            crate::components::foreground::ModalPresence { name: "dm-thread" }
+            crate::components::foreground::ModalPresence { name: DM_THREAD_MODAL }
             // Backdrop
             div {
                 class: "absolute inset-0 bg-black/50",
@@ -1759,8 +1764,10 @@ struct ThreadSeenWitness {
 
 impl ThreadSeenWitness {
     /// Mark the thread seen up to its newest inbound DM if the reader can see
-    /// the end of the thread right now: the tab is visible and the newest DM's
-    /// bottom is on screen, within `NEWEST_IN_VIEW_SLACK_PX`. The newest
+    /// the end of the thread right now: the thread is in the foreground (the
+    /// tab is visible and no modal covers it, see `foreground::in_foreground`)
+    /// and the newest DM's bottom is on screen, within
+    /// `NEWEST_IN_VIEW_SLACK_PX`. The newest
     /// inbound DM is at or above the newest DM, so the reader has reached it.
     ///
     /// The same rule as rooms (`conversation.rs`'s `note_newest_seen`). Safe
@@ -1777,8 +1784,10 @@ impl ThreadSeenWitness {
         }
         let ts = self.newest_inbound_ts.get();
         if ts == 0
-            || !crate::components::app::document_title::get_visibility_state()
-            || !dm_scroll_container().is_some_and(|c| sentinel_in_view(&c, "dm-bottom-sentinel"))
+            || !dm_scroll_container().is_some_and(|c| {
+                crate::components::foreground::in_foreground(Some(DM_THREAD_MODAL), &c)
+                    && sentinel_in_view(&c, "dm-bottom-sentinel")
+            })
         {
             return;
         }

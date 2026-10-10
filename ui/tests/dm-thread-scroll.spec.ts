@@ -399,6 +399,26 @@ test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
       "the tab came back with the DM on screen and the thread still counts it unread",
     ).toHaveCount(0);
   });
+
+  test("an inbound DM on screen under the thread's confirmation stays unread until it closes, which does not scroll", async ({
+    page,
+  }) => {
+    await openShortThread(page);
+    await page.getByRole("button", { name: "Delete their messages" }).click();
+    await expect(page.getByRole("dialog", { name: "Confirm delete their messages" })).toBeVisible();
+    await recordScrolls(page);
+
+    await deliverDm(page, "on screen under a confirmation");
+    expect(await belowFold(page, "on screen under a confirmation"), "premise: all of the DM is on screen").toBeLessThanOrEqual(
+      0,
+    );
+    await settle(page);
+    await expect(railBadge(page), "a DM seen only under a modal was marked seen").toHaveText("1");
+
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(railBadge(page), "closing the confirmation left the DM on screen unread").toHaveCount(0);
+    await expectStill(page, "closing the confirmation moved the thread");
+  });
 });
 
 // A failed `ROOMS` read (contention) is transient: the open thread keeps what

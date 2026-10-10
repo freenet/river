@@ -303,6 +303,62 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
       ).toHaveCount(0);
     });
   });
+
+  // The same short history, read under a modal: an arrival on screen behind
+  // one is not seen until it closes, and closing it reads without scrolling.
+  test.describe("under a modal", { tag: "@chromium-only" }, () => {
+    test.use({ viewport: { width: 1280, height: 2400 } });
+
+    async function openMemberInfo(page: Page) {
+      await page.locator('[data-testid^="member-item-"]').first().click();
+      await expect(page.getByTestId("member-info-modal")).toBeVisible({ timeout: 5_000 });
+    }
+
+    async function closeMemberInfo(page: Page) {
+      await page.getByTestId("member-info-close-button").click();
+      await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
+    }
+
+    test("an arrival on screen under a modal stays unread", async ({ page }) => {
+      await openRoomAtBottom(page, "Team Chat Room");
+      await openMemberInfo(page);
+
+      await deliverOffscreen(page, "arrival under a modal");
+      expect(await belowView(page, "arrival under a modal"), "premise: all of the arrival is on screen").toBeLessThanOrEqual(0);
+      await nextFrames(page);
+      // Away with the modal still open, so its closing cannot read the room.
+      await callRiverTest(page, "switchRoom", "Public Discussion Room");
+      await expect(teamChatBadge(page), "an arrival seen only under a modal was marked read").toBeVisible();
+    });
+
+    test("closing the modal reads an arrival on screen without moving the view", async ({ page }) => {
+      await openRoomAtBottom(page, "Team Chat Room");
+      await openMemberInfo(page);
+      await deliverOffscreen(page, "arrival read on close");
+      expect(await belowView(page, "arrival read on close"), "premise: all of the arrival is on screen").toBeLessThanOrEqual(0);
+      const before = await scrollTop(page);
+
+      await closeMemberInfo(page);
+      await nextFrames(page);
+      expect(await scrollTop(page), "closing the modal moved the view").toBeCloseTo(before, 0);
+      await selectListedRoom(page, "Public Discussion Room");
+      await expect(teamChatBadge(page), "closing the modal left an arrival on screen unread").toHaveCount(0);
+    });
+
+    test("an arrival on screen under a message's reaction picker stays unread", async ({ page }) => {
+      await openRoomAtBottom(page, "Team Chat Room");
+      const row = page.locator('[id^="msg-"]').last();
+      await row.getByTestId("message-bubble").hover();
+      await row.getByTestId("add-reaction-button").click();
+      await expect(page.getByTestId("emoji-picker")).toBeVisible();
+
+      await deliverOffscreen(page, "arrival under a popover");
+      expect(await onScreen(page, "arrival under a popover"), "premise: the arrival is on screen").toBe(true);
+      await nextFrames(page);
+      await callRiverTest(page, "switchRoom", "Public Discussion Room");
+      await expect(teamChatBadge(page), "an arrival seen only under a row popover was marked read").toBeVisible();
+    });
+  });
 });
 
 // A room whose chat panel is hidden behind the mobile Rooms or Members panel

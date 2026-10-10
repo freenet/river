@@ -3664,14 +3664,16 @@ fn complete_scroll_request(reader: &ReaderPosition, mut opening_snap_done: Signa
     true
 }
 
-/// Publish the newest message as seen if the reader can see it now: the tab is
-/// visible, the history has layout and is not awaiting its reveal restore, the
+/// Publish the newest message as seen if the reader can see it now: the history
+/// is in the foreground (`foreground::in_foreground`: the tab is visible, it
+/// has layout, and no modal covers it) and not awaiting its reveal restore, the
 /// rendered range reaches the room's latest message, and that message's bottom
 /// is on screen. Marking a room read never goes past what
 /// this publishes; see `document_title::NEWEST_SEEN`.
 ///
 /// Called wherever one of those can change: the Latest observer, each settle,
-/// each render, the reveal, a completed request and the tab becoming visible.
+/// each render, the reveal, a completed request, and `FOREGROUND_CHANGED` (the
+/// tab becoming visible, a modal closing).
 /// Touches no signal itself, so raw JS callbacks may call it; the write is
 /// deferred.
 #[cfg(target_arch = "wasm32")]
@@ -3685,8 +3687,7 @@ fn note_newest_seen(reader: &ReaderPosition) {
     let Some(container) = chat_scroll_container() else {
         return;
     };
-    if !crate::components::app::document_title::get_visibility_state()
-        || !history_has_layout(&container)
+    if !crate::components::foreground::in_foreground(None, &container)
         || reader.hidden.get()
         || !sentinel_in_view(&container, "bottom-sentinel")
     {
@@ -4442,8 +4443,9 @@ pub fn Conversation() -> Element {
         });
     }
 
-    // The tab coming back: whatever is on screen now counts as seen, which
-    // nothing else would notice (no scroll, no resize, no observer change).
+    // Back in the foreground (the tab became visible, a modal closed): whatever
+    // is on screen now counts as seen, which nothing else would notice (no
+    // scroll, no resize, no observer change). Never scrolls.
     #[cfg(target_arch = "wasm32")]
     {
         let reader_position = reader_position.clone();
@@ -4451,14 +4453,14 @@ pub fn Conversation() -> Element {
             // Anchored before the fallible read, this effect's only
             // subscription (freenet/river#555).
             crate::util::signal_guard::anchor();
-            let Ok(visible) = crate::components::app::document_title::DOCUMENT_VISIBLE.try_read()
-            else {
+            if crate::components::foreground::FOREGROUND_CHANGED
+                .try_read()
+                .is_err()
+            {
                 crate::util::signal_guard::schedule_nudge();
                 return;
-            };
-            if *visible {
-                note_newest_seen(&reader_position);
             }
+            note_newest_seen(&reader_position);
         });
     }
 
