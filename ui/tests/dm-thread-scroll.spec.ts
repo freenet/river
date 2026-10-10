@@ -242,6 +242,11 @@ async function openEmptyThread(page: Page) {
   await page.goto("/");
   await waitForApp(page);
   await selectRoom(page, "Team Chat Room");
+  await openEmptyThreadHere(page);
+}
+
+/// `openEmptyThread` without the reload, so this session's earlier sends stand.
+async function openEmptyThreadHere(page: Page) {
   await callRiverTest(page, "admitDmPeer", 1);
   await memberRows(page).filter({ hasText: OTHER_PEER }).first().click();
   await expect(page.getByTestId("member-info-modal")).toBeVisible({ timeout: 5_000 });
@@ -611,6 +616,27 @@ test.describe("DM thread follows a reader at the end", () => {
     await setTabVisibility(page, "visible");
     await expectStill(page, "the tab coming back moved the thread");
     await expect(page.getByTestId(LATEST)).toBeVisible();
+  });
+
+  test("a send in another thread earlier in the session does not move a thread opened empty", async ({ page }) => {
+    await prepareThread(page, 3);
+    const composer = page.getByPlaceholder("Type a direct message...");
+    await composer.fill("own DM elsewhere");
+    await composer.press("Enter");
+    await expect(dm(page, "own DM elsewhere")).toHaveCount(1, { timeout: 5_000 });
+    await closeThread(page);
+    // No reload: the send above stays this session's.
+    await openEmptyThreadHere(page);
+    await setTabVisibility(page, "hidden");
+
+    await callRiverTest(page, "appendDmsForPeer", 1, HISTORY);
+    await expect(dm(page, `other dm history ${HISTORY - 1}`)).toHaveCount(1, { timeout: 5_000 });
+    await settle(page);
+    expect((await threadGeometry(page)).max, "premise: the burst overflows the thread").toBeGreaterThan(0);
+    expect((await threadGeometry(page)).top, "another thread's send moved a thread opened empty").toBeLessThanOrEqual(1);
+    await recordScrolls(page);
+    await setTabVisibility(page, "visible");
+    await expectStill(page, "the tab coming back moved the thread");
   });
 
   test("an inbound DM under the thread's confirmation does not follow, nor does closing it", async ({ page }) => {

@@ -486,7 +486,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     // `OUTBOUND_SEND_COUNTER` (peeked) tells an own send from an arrival.
     let last_dm_bubble: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
     let first_scroll_done = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
-    let prev_outbound_bump = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0u64)));
+    // The counter as this thread mounts: a send before it was another thread's.
+    let prev_outbound_bump =
+        use_hook(|| std::rc::Rc::new(std::cell::Cell::new(*OUTBOUND_SEND_COUNTER.peek())));
     // The newest DM the render has seen, and whether the render that first
     // showed it found the reader at the end (`dm_arrival_follows`), read
     // before the patch. Set in render; the effect consumes the flag.
