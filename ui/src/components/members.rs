@@ -1588,7 +1588,7 @@ pub fn MemberList() -> Element {
                 div { class: "flex items-center gap-2",
                     // Mobile back button
                     BackToChatButton {
-                        class: "md:hidden p-1 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                        class: "md:hidden p-1",
                         icon_size: 14,
                         testid: "members-back-to-chat-button",
                     }

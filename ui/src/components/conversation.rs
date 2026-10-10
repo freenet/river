@@ -9,6 +9,7 @@ use crate::components::app::{
     MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NOTIFICATION_MODAL,
     ROOMS,
 };
+use crate::components::back_to_chat::CountBadge;
 use crate::components::members::{
     deputy_badges_for_viewer, impersonation_checker_for_viewer, impersonation_warning_for_display,
     privilege_in_view, DeputyBadge,
@@ -5269,14 +5270,7 @@ pub fn Conversation() -> Element {
                                     // Unread-elsewhere badge: new messages in OTHER rooms
                                     // (and DMs) are invisible on mobile while a room fills
                                     // the screen — surface them on the room-list button.
-                                    if panel_unread() > 0 {
-                                        span {
-                                            class: "absolute top-0 right-0 flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-accent text-white text-[10px] font-semibold leading-none pointer-events-none",
-                                            "data-testid": "hamburger-unread-badge",
-                                            "aria-hidden": "true",
-                                            "{panel_unread}"
-                                        }
-                                    }
+                                    CountBadge { count: panel_unread(), position: "top-0 right-0", testid: "hamburger-unread-badge" }
                                 }
                                 // Description is a sibling of the title button, not a child:
                                 // `<a>` is interactive content and cannot be nested inside
@@ -5956,14 +5950,7 @@ pub fn Conversation() -> Element {
                                 // Same unread-elsewhere badge as the room-header
                                 // hamburger; with no room selected every room's
                                 // unread (plus DMs) counts.
-                                if panel_unread() > 0 {
-                                    span {
-                                        class: "absolute top-0 right-0 flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-accent text-white text-[10px] font-semibold leading-none pointer-events-none",
-                                        "data-testid": "hamburger-unread-badge",
-                                        "aria-hidden": "true",
-                                        "{panel_unread}"
-                                    }
-                                }
+                                CountBadge { count: panel_unread(), position: "top-0 right-0", testid: "hamburger-unread-badge" }
                             }
                         }
                         // freenet/river#509: this panel is the ONLY thing a

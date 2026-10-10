@@ -335,7 +335,7 @@ pub fn RoomList() -> Element {
             // Mobile back button (hidden on desktop)
             div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
                 BackToChatButton {
-                    class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                    class: "p-2",
                     icon_size: 16,
                     testid: "rooms-back-to-chat-button",
                 }

@@ -639,7 +639,7 @@ pub fn count_unread_excluding_room(
 /// Mode-aware unread messages in `room` alone: 0 for `None` or a room not in
 /// `map`. The pure core of [`count_unread_in_current_room`]; use a fresh room
 /// key per test, as for [`count_unread_excluding_room`].
-pub fn count_unread_in_room(
+fn count_unread_in_room(
     map: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
     modes: &std::collections::HashMap<
         ed25519_dalek::VerifyingKey,
