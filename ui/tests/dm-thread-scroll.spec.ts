@@ -263,7 +263,7 @@ test.describe("DM thread scroll position", () => {
     await expect(page.getByTestId(LATEST)).toBeVisible();
   });
 
-  test("an own send goes to the end once, and a later inbound DM does not follow it", async ({
+  test("an own send goes to the end once, and a later inbound DM follows from there", async ({
     page,
   }) => {
     await openThreadWithHistory(page);
@@ -289,10 +289,11 @@ test.describe("DM thread scroll position", () => {
     expect(await belowFold(page, "sent from the top")).toBeLessThanOrEqual(NEWEST_IN_VIEW_SLACK_PX);
     await expect(page.getByTestId(LATEST)).toBeHidden();
 
-    await recordScrolls(page);
+    // The send left the reader at the end, so the next inbound DM follows by
+    // the ordinary rule.
     await deliverDm(page, "inbound after the send");
-    await expectStill(page, "the send's scroll must not turn into following");
-    await expect(page.getByTestId(LATEST)).toBeVisible();
+    await expectAtEnd(page, "an inbound DM after a send did not follow a reader at the end");
+    await expect(page.getByTestId(LATEST)).toBeHidden();
   });
 
   test("reopening a thread lands on its newest DM", async ({ page }) => {
@@ -330,7 +331,7 @@ test.describe("DM thread scroll position", () => {
     await expect(page.getByTestId(LATEST)).toBeHidden();
   });
 
-  test("Latest jumps to the end instantly, marks the DM below the fold seen, then hides and does not follow", async ({
+  test("Latest jumps to the end instantly, marks the DM below the fold seen, then hides, and the next DM follows", async ({
     page,
   }) => {
     await openThreadWithHistory(page);
@@ -358,10 +359,9 @@ test.describe("DM thread scroll position", () => {
     await expect(latest).toBeHidden();
     await expect(railBadge(page), "Latest brought the DM on screen and the thread still counts it unread").toHaveCount(0);
 
-    await recordScrolls(page);
     await deliverDm(page, "inbound after Latest");
-    await expectStill(page, "Latest must not turn into following");
-    await expect(latest).toBeVisible();
+    await expectAtEnd(page, "an inbound DM after Latest did not follow a reader at the end");
+    await expect(latest).toBeHidden();
   });
 });
 
@@ -372,15 +372,17 @@ test.describe("DM thread scroll position", () => {
 // Hook-driven, so it runs on one engine; the describe above covers the view on
 // every engine.
 test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
-  test("an inbound DM at the end lands below the view, offers Latest, and stays unread until the reader scrolls to it", async ({
+  test("an inbound DM at the end in a hidden tab lands below the view, offers Latest, and stays unread until the reader scrolls to it", async ({
     page,
   }) => {
     await openThreadWithHistory(page);
     await expect(railBadge(page), "premise: opening the thread marked it seen").toHaveCount(0);
     await recordScrolls(page);
 
+    // A hidden tab is not in the foreground, so the DM is not followed.
+    await setTabVisibility(page, "hidden");
     await deliverDm(page, "unseen below the fold");
-    await expectStill(page, "an inbound DM must not move the view, even at the end");
+    await expectStill(page, "an inbound DM in a hidden tab moved the view");
     expect(await belowFold(page, "unseen below the fold"), "the inbound DM should sit below the view").toBeGreaterThan(
       NEWEST_IN_VIEW_SLACK_PX,
     );
