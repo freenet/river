@@ -246,6 +246,8 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
   test("the newest message's bottom just below the view offers Latest and leaves the room unread", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
+    // Parked away, so the arrival is not followed (and read) on arrival.
+    await readerScrollsWithoutGesture(page, 0);
     await deliverOffscreen(page, "newest near the bottom edge");
 
     const below = await parkNewestBottom(page, 10);
@@ -260,6 +262,8 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
   test("the newest message's bottom just inside the view hides Latest and marks the room read", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
+    // Parked away, so the arrival is not followed (and read) on arrival.
+    await readerScrollsWithoutGesture(page, 0);
     await deliverOffscreen(page, "newest near the bottom edge");
 
     const below = await parkNewestBottom(page, -6);

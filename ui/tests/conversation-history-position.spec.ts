@@ -323,7 +323,7 @@ test.describe("Opening a room that is temporarily empty (A03)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
   // The opening waits for rows. A room opened with no messages lands at its
-  // newest message when the first ones arrive, once, and then stays put.
+  // newest message when the first ones arrive, once.
   test("a room opened empty lands at its newest message when its first messages arrive", async ({ page }) => {
     const empty = page.getByText("No messages yet", { exact: false });
     await openRoomAtBottom(page, "Public Discussion Room");
@@ -341,8 +341,11 @@ test.describe("Opening a room that is temporarily empty (A03)", () => {
     ).toBeGreaterThan((await viewportHeight(page)) + WELL_AWAY_FROM_END_PX);
     await expectSettledAtBottom(page, "the room opened empty did not open at its newest message");
 
+    // The opening landed once: a reader who then leaves the end is not taken
+    // back by the next arrival.
+    await readerScrollsWithoutGesture(page, 0);
     const row = await expectReadingRow(page);
     await deliverOffscreen(page, "arrival after the opening");
-    await expectRowHeld(page, row.key, row.top, "an arrival after the opening moved the view");
+    await expectRowHeld(page, row.key, row.top, "an arrival after the opening moved a reader who left the end");
   });
 });
