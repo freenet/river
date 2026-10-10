@@ -2632,44 +2632,30 @@ struct ReadingAnchor {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const READING_ANCHOR_ROWS: usize = 7;
 
-/// What a render's range holds, enough to tell an arrival from rows changing
-/// height: its first row, its newest message and how many
-/// messages and events it renders.
+/// What a render's range holds, enough to tell an arrival at the end from
+/// anything else: its newest message.
 #[derive(Clone, PartialEq, Debug)]
 struct RenderedMessages {
-    first: String,
     newest: Option<MessageId>,
-    count: usize,
 }
 
-/// [`RenderedMessages`] for the display items a render puts on screen.
+/// [`RenderedMessages`] for the display items a render puts on screen, or
+/// `None` for an empty range.
 fn rendered_messages(items: &[DisplayItem]) -> Option<RenderedMessages> {
     Some(RenderedMessages {
-        first: display_item_key(items.first()?),
-        newest: items.last().and_then(display_item_last_message_id),
-        count: items
-            .iter()
-            .map(|item| match item {
-                DisplayItem::Messages(group) => group.messages.len(),
-                DisplayItem::Event(summary) => summary.names.len(),
-            })
-            .sum(),
+        newest: display_item_last_message_id(items.last()?),
     })
 }
 
 /// Does the end hold survive the step from the last render's range to this
-/// one? Only when both have rows and nothing arrived in between: no new newest
-/// message, no higher count, and no new first row without a lower count (a
-/// drain and an out-of-order insert in one patch). A trim or a deletion above
-/// only shrinks the range and keeps it; content changes (decryption, an edit)
-/// change none of the three.
+/// one? Only when both have rows and the newest message is unchanged. A
+/// backfill, a message inserted above the newest, a trim and rows changing
+/// height (decryption, an edit, an image) all keep it.
 fn end_hold_survives(before: Option<&RenderedMessages>, now: Option<&RenderedMessages>) -> bool {
     let (Some(before), Some(now)) = (before, now) else {
         return false;
     };
     now.newest == before.newest
-        && now.count <= before.count
-        && (now.first == before.first || now.count < before.count)
 }
 
 /// The room's newest display message, as the follow rule compares it. Ordered
@@ -3312,7 +3298,7 @@ fn resolve_rendered_range(
     });
     reader.range_start.set(history_window.start);
     reader.has_newer.set(history_window.has_newer);
-    // An arrival ends the end hold; rows that only change height keep it.
+    // A new newest message ends the end hold; anything else keeps it.
     // Against the last render, so a request's own render (an own
     // send's message) comes before its hold.
     let rendered = rendered_messages(shown);
@@ -12119,16 +12105,15 @@ mod reader_state_tests {
         }
     }
 
-    fn id(seed: &[u8]) -> MessageId {
-        MessageId(freenet_scaffold::util::fast_hash(seed))
+    /// What a render of `items` holds.
+    fn range(items: &[DisplayItem]) -> RenderedMessages {
+        rendered_messages(items).expect("a non-empty range")
     }
 
-    fn range(first: &str, newest: &[u8], count: usize) -> RenderedMessages {
-        RenderedMessages {
-            first: first.to_string(),
-            newest: Some(id(newest)),
-            count,
-        }
+    /// `items` with `extra` inserted above the last one.
+    fn above_last(items: &[DisplayItem], extra: &DisplayItem) -> Vec<DisplayItem> {
+        let (last, rest) = items.split_last().expect("a non-empty range");
+        rest.iter().chain([extra, last]).cloned().collect()
     }
 
     /// A contended read stands in with the last good value for the SAME room,
@@ -12146,29 +12131,47 @@ mod reader_state_tests {
         assert_eq!(last_good_for_room(&None::<(&str, i32)>, &"room a"), None);
     }
 
-    /// An arrival ends the hold (a followed one lands a new request, which
-    /// holds again).
-    /// Appended (new newest), inserted above the newest (higher count), or
-    /// inserted while an at-cap drain removed the first row (new first row,
-    /// same count).
+    /// A new newest message ends the hold (a followed one lands a new request,
+    /// which holds again).
     #[test]
-    fn an_arrival_ends_the_end_hold() {
-        let before = range("a", b"z", 10);
+    fn a_new_newest_message_ends_the_end_hold() {
+        let all = events(20);
+        let before = range(&all[5..15]);
         for (now, what) in [
-            (range("a", b"new", 11), "an appended message"),
+            (range(&all[5..16]), "an appended message"),
             (
-                range("b", b"new", 10),
+                range(&all[6..16]),
                 "an at-cap arrival that drained the first row",
-            ),
-            (range("a", b"z", 11), "a message inserted above the newest"),
-            (
-                range("b", b"z", 10),
-                "an insert in the same patch as a drain",
             ),
         ] {
             assert!(
                 !end_hold_survives(Some(&before), Some(&now)),
                 "{what} kept the hold"
+            );
+        }
+    }
+
+    /// The newest message is unchanged, so nothing arrived at the end: the
+    /// hold stays.
+    #[test]
+    fn a_backfill_or_an_insert_above_keeps_the_end_hold() {
+        let all = events(20);
+        let extra = &events(21)[20];
+        let before = range(&all[5..15]);
+        for (now, what) in [
+            (range(&all[0..15]), "a backfill"),
+            (
+                range(&above_last(&all[5..15], extra)),
+                "a message inserted above the newest",
+            ),
+            (
+                range(&above_last(&all[6..15], extra)),
+                "an insert in the same patch as a drain",
+            ),
+        ] {
+            assert!(
+                end_hold_survives(Some(&before), Some(&now)),
+                "{what} ended the hold"
             );
         }
     }
@@ -12180,17 +12183,24 @@ mod reader_state_tests {
     /// never moves the view).
     #[test]
     fn a_shrinking_range_keeps_the_hold_unless_the_newest_changed() {
-        let before = range("a", b"z", 10);
+        let all = events(20);
+        let before = range(&all[5..15]);
         assert!(
             end_hold_survives(Some(&before), Some(&before.clone())),
             "a render with the same messages ended the hold"
         );
-        assert!(end_hold_survives(Some(&before), Some(&range("c", b"z", 8))));
-        assert!(end_hold_survives(Some(&before), Some(&range("a", b"z", 9))));
-        assert!(!end_hold_survives(
+        assert!(end_hold_survives(Some(&before), Some(&range(&all[8..15]))));
+        let deleted_above: Vec<_> = all[5..15]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 3)
+            .map(|(_, item)| item.clone())
+            .collect();
+        assert!(end_hold_survives(
             Some(&before),
-            Some(&range("a", b"y", 9))
+            Some(&range(&deleted_above))
         ));
+        assert!(!end_hold_survives(Some(&before), Some(&range(&all[5..14]))));
     }
 
     /// A backfill restore or head reposition measured before a request must
@@ -12228,7 +12238,7 @@ mod reader_state_tests {
     /// No rows on either side: nothing to hold.
     #[test]
     fn an_empty_range_ends_the_end_hold() {
-        let before = range("a", b"z", 10);
+        let before = range(&events(10));
         assert!(!end_hold_survives(None, Some(&before)));
         assert!(!end_hold_survives(Some(&before), None));
         assert!(rendered_messages(&[]).is_none());

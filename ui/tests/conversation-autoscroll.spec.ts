@@ -189,6 +189,8 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
+    // Out of the opening's end hold, which an insert above the newest keeps.
+    await readerLeavesAndReturnsToEnd(page);
     const row = await expectReadingRow(page);
     const heightBefore = await historyHeight(page);
 
@@ -1540,6 +1542,33 @@ test.describe("The end holds after an explicit request", () => {
     await loadImage(page, image);
 
     await expectSettledAtBottom(page, "a row grew above the end after a send and left the newest message off screen");
+  });
+
+  // Tall enough that the opening's tail sits inside the backfill lead, so the
+  // opening backfills: same newest message, more rows.
+  test.describe("with an opening backfill", () => {
+    test.use({ viewport: { width: 1280, height: 5_600 } });
+
+    test("a backfill on opening keeps the end hold for a row that grows later", async ({ page }) => {
+      const image = await holdTestImage(page);
+      await openRoomAtBottom(page, "Team Chat Room");
+      await callRiverTest(page, "appendMessages", 80);
+      await expect(page.getByText("batched arrival 79")).toHaveCount(1, { timeout: 5_000 });
+      await addLoadingImageAboveTheEnd(page, image);
+      await reopenTeamChat(page);
+      await expect
+        .poll(() => page.locator("[data-item-key]").count(), { message: "premise: the opening backfilled" })
+        .toBeGreaterThan(INITIAL_RENDERED_ITEMS);
+      await expectSettledAtBottom(page, "premise: the backfill kept the reader at the end");
+      expect(await historyHeight(page), "premise: the history overflows").toBeGreaterThan(
+        await viewportHeight(page),
+      );
+
+      await loadImage(page, image);
+
+      await expectSettledAtBottom(page, "a row grew after the opening backfilled and left the newest message off screen");
+      await expect(page.getByTestId("scroll-to-bottom"), "Latest offered at the end").toHaveCount(0);
+    });
   });
 });
 
