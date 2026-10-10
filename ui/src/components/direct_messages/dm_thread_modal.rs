@@ -1460,6 +1460,35 @@ struct RenderedDm {
     token: PurgeToken,
 }
 
+/// A thread's newest DM, as the follow rule compares it: by timestamp, then
+/// purge token, so the order is total.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct DmKey {
+    timestamp: u64,
+    token: PurgeToken,
+}
+
+/// The greatest [`DmKey`] among `messages`.
+fn newest_dm_key(messages: &[RenderedDm]) -> Option<DmKey> {
+    messages
+        .iter()
+        .map(|m| DmKey {
+            timestamp: m.timestamp,
+            token: m.token,
+        })
+        .max()
+}
+
+/// Did a DM arrive after the newest one recorded? Only a strictly greater key
+/// counts: a purge of the newest DM lowers it, and a re-render keeps it.
+fn is_newer_dm(previous: Option<&DmKey>, newest: Option<&DmKey>) -> bool {
+    match (previous, newest) {
+        (None, Some(_)) => true,
+        (Some(previous), Some(newest)) => newest > previous,
+        _ => false,
+    }
+}
+
 #[component]
 fn DmBubble(
     message: RenderedDm,
@@ -2450,5 +2479,33 @@ mod tests {
              write the auto-scroll effect's signal stays at None and #283 \
              silently re-regresses."
         );
+    }
+
+    fn dm_key(timestamp: u64, token: u8) -> DmKey {
+        DmKey {
+            timestamp,
+            token: PurgeToken([token; 16]),
+        }
+    }
+
+    #[test]
+    fn only_a_newer_newest_dm_is_an_arrival() {
+        let before = dm_key(100, 1);
+        assert!(
+            is_newer_dm(Some(&before), Some(&dm_key(101, 0))),
+            "a later DM"
+        );
+        assert!(
+            is_newer_dm(Some(&before), Some(&dm_key(100, 2))),
+            "same second, higher token"
+        );
+        assert!(!is_newer_dm(Some(&before), Some(&before)), "a re-render");
+        assert!(
+            !is_newer_dm(Some(&before), Some(&dm_key(99, 9))),
+            "the newest purged"
+        );
+        assert!(is_newer_dm(None, Some(&before)), "the first DM of a thread");
+        assert!(!is_newer_dm(Some(&before), None), "an emptied thread");
+        assert!(!is_newer_dm(None, None));
     }
 }
