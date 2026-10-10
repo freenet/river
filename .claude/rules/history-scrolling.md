@@ -92,13 +92,13 @@ Accepted trade-offs:
   the ceiling takes the latest range instead.
 - After that request lands, an end hold keeps the end visible while rows
   change height, such as images loading or private messages decrypting. A
-  new newest message ends the hold; a followed one lands a new request, which
-  holds again. A backfill, a message inserted above the newest, a trim and
-  rows changing height keep it. Scrolling upward more than 4px from the
-  scroller's absolute end, hiding the panel, changing rooms or an empty range
-  also releases it. Accepted for now: padding below the newest message lets a
-  small upward scroll release the hold while the message is still visible
-  and Latest stays hidden.
+  change of newest message ends the hold, including deleting the newest; a
+  followed arrival lands a new request, which holds again. A backfill, a
+  message inserted above the newest, a trim and rows changing height keep
+  it. Scrolling upward more than 4px from the scroller's absolute end, hiding
+  the panel, changing rooms or an empty range also releases it. Accepted for
+  now: padding below the newest message lets a small upward scroll release
+  the hold while the message is still visible and Latest stays hidden.
 - Outside that hold, a change in chat-area height preserves the bottom edge
   of the view. Width-only reflow gets no correction. Paging and panel reveals
   retain their reading-position corrections; deleting the reading row uses
