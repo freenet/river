@@ -1856,6 +1856,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
         div {
             class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
             onclick: move |_| is_active.set(false),
+            crate::components::foreground::ModalPresence { name: "member-token-export" }
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-xl w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
@@ -2566,6 +2567,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
         div {
             class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
             onclick: move |_| reset_and_close(),
+            crate::components::foreground::ModalPresence { name: "member-token-import" }
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
                 onclick: move |e| e.stop_propagation(),

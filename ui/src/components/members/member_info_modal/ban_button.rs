@@ -214,6 +214,7 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
                     // Confirmation modal
                     div {
                         class: "fixed inset-0 z-50 flex items-center justify-center",
+                        crate::components::foreground::ModalPresence { name: "ban-confirm" }
                         // Overlay
                         div {
                             class: "absolute inset-0 bg-black/50",

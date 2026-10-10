@@ -385,6 +385,7 @@ pub fn InviteViaDmPickerModal() -> Element {
     rsx! {
         div {
             class: "fixed inset-0 z-50 flex items-center justify-center",
+            crate::components::foreground::ModalPresence { name: "invite-via-dm-picker" }
             div {
                 class: "absolute inset-0 bg-black/50",
                 onclick: close,

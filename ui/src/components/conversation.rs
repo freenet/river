@@ -5985,6 +5985,7 @@ pub fn Conversation() -> Element {
                 div {
                     class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
                     onclick: move |_| pending_delete.set(None),
+                    crate::components::foreground::ModalPresence { name: "delete-message-confirm" }
                     div {
                         class: "bg-panel rounded-lg shadow-xl p-6 max-w-sm mx-4",
                         onclick: move |e| e.stop_propagation(),
@@ -6827,6 +6828,7 @@ fn MessageGroupComponent(
                                                         ),
                                                         style: format!("max-height: {}px", *menu_max_h.read()),
                                                         "data-testid": "message-action-menu",
+                                                        crate::components::foreground::ModalPresence { name: "message-popover" }
                                                         button {
                                                             class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
                                                             onclick: move |_| {
@@ -7037,6 +7039,7 @@ fn MessageGroupComponent(
                                                         ),
                                                         style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
                                                         onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                        crate::components::foreground::ModalPresence { name: "message-popover" }
                                                         {FREQUENT_EMOJIS.iter().map(|emoji| {
                                                             let emoji_str = emoji.to_string();
                                                             let msg_id = msg_id_react.clone();

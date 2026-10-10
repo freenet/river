@@ -944,6 +944,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     confirm_delete_open.set(false);
                 }
             },
+            crate::components::foreground::ModalPresence { name: "dm-thread" }
             // Backdrop
             div {
                 class: "absolute inset-0 bg-black/50",
@@ -1261,6 +1262,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             confirm_delete_open.set(false);
                         }
                     },
+                    crate::components::foreground::ModalPresence { name: "dm-confirm-delete" }
                     // Inner backdrop — clicking it cancels.
                     div {
                         class: "absolute inset-0 bg-black/60",

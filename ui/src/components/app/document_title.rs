@@ -905,9 +905,12 @@ fn on_visibility_change() {
 
     *DOCUMENT_VISIBLE.write() = is_visible;
 
-    // Tab became visible: nothing to do here. The `DOCUMENT_VISIBLE` write
-    // above re-runs the title effect, which marks what the reader saw; what is
-    // on screen now is noted by `Conversation` once it sees the tab visible.
+    // Tab became visible: the `DOCUMENT_VISIBLE` write above re-runs the title
+    // effect, which marks what the reader saw, and the foreground bump re-runs
+    // the read rule's checks against what is on screen now.
+    if is_visible && !was_visible {
+        crate::components::foreground::note_foreground_changed();
+    }
     if !is_visible && was_visible {
         // Tab is going from visible to hidden. Only the room the user was
         // actually looking at gets marked read — see

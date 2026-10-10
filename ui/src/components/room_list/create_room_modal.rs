@@ -146,6 +146,7 @@ pub fn CreateRoomModal() -> Element {
                     });
                 });
             },
+            crate::components::foreground::ModalPresence { name: "create-room" }
             div {
                 "data-testid": "create-room-modal",
                 class: "bg-panel rounded-xl shadow-xl max-w-md w-full",

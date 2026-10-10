@@ -207,6 +207,7 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                 let reset_and_close = reset_and_close.clone();
                 move |_| reset_and_close()
             },
+            crate::components::foreground::ModalPresence { name: "join-with-code" }
             div {
                 "data-testid": "join-with-code-modal",
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto",
