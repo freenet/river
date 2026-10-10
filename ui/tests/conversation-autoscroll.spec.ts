@@ -1610,6 +1610,38 @@ test.describe("An arrival follows a reader at the end", () => {
     await expectRowHeld(page, row.key, row.top, "a message inserted above the newest one moved the view");
   });
 
+  // Arrival identity is stored order. A message stamped more than 60s ahead
+  // displays clamped (test deliveries record no receive time, so to the
+  // grouping pass's "now"), which can sit below the tail it follows.
+  test("an arrival clamped earlier than the tail it follows still follows a reader at the end", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await callRiverTest(page, "appendMessageAhead", "skewed within tolerance", 50);
+    await expect(page.getByText("skewed within tolerance")).toHaveCount(1, { timeout: 5_000 });
+    await expectSettledAtBottom(page, "premise: the first skewed arrival followed");
+
+    await callRiverTest(page, "appendMessageAhead", `clamped tail ${"word ".repeat(300)}`, 120);
+    await expect(page.locator("[data-anchor-key]", { hasText: "clamped tail word" })).toHaveCount(1, {
+      timeout: 5_000,
+    });
+    await expectSettledAtBottom(page, "an arrival clamped below the previous tail did not follow");
+  });
+
+  test("a grouping pass with nothing new does not move a reader near the end", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    // Clamped to each pass's "now", so its display time moves on every pass.
+    await callRiverTest(page, "appendMessageAhead", "far ahead", 600);
+    await expect(page.getByText("far ahead")).toHaveCount(1, { timeout: 5_000 });
+    await expectSettledAtBottom(page, "premise: the far-ahead arrival followed");
+    await readerParksNewestBelow(page, ROOM_FOLLOW_BAND_PX / 2);
+    const row = await expectReadingRow(page);
+
+    await callRiverTest(page, "insertMessageBeforeLast", "above the tail");
+    await expect(page.getByText("above the tail")).toHaveCount(1, { timeout: 5_000 });
+    await expectRowHeld(page, row.key, row.top, "a grouping pass with no new message moved the view");
+  });
+
   test("an arrival in a hidden tab does not follow, nor does the tab coming back", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);

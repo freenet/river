@@ -164,6 +164,8 @@ struct GroupedMessage {
     content_html: String,
     #[allow(dead_code)]
     time: DateTime<Utc>,
+    /// The stored (sender's) time, unclamped: arrival order. See [`NewestKey`].
+    sent_ms: i64,
     /// True if the sender's timestamp ran ahead of when we received this
     /// message and was clamped back to that arrival time. (It is clamped to
     /// ARRIVAL, not to "now": see [`MessageClock`] for why the render's wall
@@ -195,6 +197,8 @@ struct EventSummary {
     names: Vec<String>,
     id: String,
     last_time: DateTime<Utc>,
+    /// The stored (sender's) time, unclamped: arrival order. See [`NewestKey`].
+    last_sent_ms: i64,
     /// The newest event folded in, for the read rule (see
     /// [`display_item_last_message_id`]).
     last_message_id: MessageId,
@@ -609,6 +613,7 @@ fn group_messages(
                 if let Some(DisplayItem::Event(ref mut summary)) = items.last_mut() {
                     summary.names.push(author_name);
                     summary.last_time = message_time;
+                    summary.last_sent_ms = raw_time.timestamp_millis();
                     summary.last_message_id = message_id;
                 }
             } else {
@@ -616,6 +621,7 @@ fn group_messages(
                     names: vec![author_name],
                     id: msg_id_str,
                     last_time: message_time,
+                    last_sent_ms: raw_time.timestamp_millis(),
                     last_message_id: message_id,
                 }));
             }
@@ -665,6 +671,7 @@ fn group_messages(
             content_text: content_text.clone(),
             content_html,
             time: message_time,
+            sent_ms: send_time_ms,
             time_clamped,
             id: format!("{:?}", message_id.0),
             message_id,
@@ -2666,7 +2673,8 @@ fn end_hold_survives(before: Option<&RenderedMessages>, now: Option<&RenderedMes
 }
 
 /// The room's newest display message, as the follow rule compares it. Ordered
-/// by time, then id, so a later message, a message folding into the last
+/// by the stored time, then id, which is display order (the clamped time is
+/// for presentation only), so a later message, a message folding into the last
 /// author's group and a join folding into the trailing event summary all
 /// compare greater; a deletion of the newest compares less, and an edit equal.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -2677,17 +2685,14 @@ struct NewestKey {
 
 /// The [`NewestKey`] of the last display item, if any.
 fn newest_key(groups: &[DisplayItem]) -> Option<NewestKey> {
-    let (time, id) = match groups.last()? {
+    let (time_ms, id) = match groups.last()? {
         DisplayItem::Messages(group) => {
             let message = group.messages.last()?;
-            (message.time, message.message_id.clone())
+            (message.sent_ms, message.message_id.clone())
         }
-        DisplayItem::Event(summary) => (summary.last_time, summary.last_message_id.clone()),
+        DisplayItem::Event(summary) => (summary.last_sent_ms, summary.last_message_id.clone()),
     };
-    Some(NewestKey {
-        time_ms: time.timestamp_millis(),
-        id,
-    })
+    Some(NewestKey { time_ms, id })
 }
 
 /// Did a message arrive after the newest one the last render showed? Only a
@@ -7499,6 +7504,7 @@ mod tests {
                 names: vec!["Ann".into()],
                 id: "summary".into(),
                 last_time: DateTime::from_timestamp_millis(last_time_ms).unwrap(),
+                last_sent_ms: last_time_ms,
                 last_message_id: MessageId(freenet_scaffold::util::fast_hash(seed)),
             })
         };
@@ -11835,6 +11841,93 @@ mod group_messages_clock_tests {
         assert!(!g.time_clamped);
         assert_eq!(g.messages[0].time, sent);
     }
+
+    /// A tail stamped far ahead with no arrival time is clamped to the pass's
+    /// "now", which moves on every pass; its arrival identity must not.
+    #[test]
+    fn the_newest_key_ignores_the_fallback_clock() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+
+        let now = at(1_700_000_000_000);
+        let messages = state(vec![message_at(
+            owner_id,
+            &alice,
+            now + chrono::Duration::minutes(10),
+        )]);
+        let member_info = info(&alice, "Alice");
+        let receive_times = ReceiveTimes::new();
+
+        let first = group(&messages, &member_info, owner_id, &receive_times, now);
+        let later = group(
+            &messages,
+            &member_info,
+            owner_id,
+            &receive_times,
+            now + chrono::Duration::seconds(30),
+        );
+        assert_ne!(
+            only_group(&first).messages[0].time,
+            only_group(&later).messages[0].time,
+            "premise: the display time follows the fallback clock"
+        );
+
+        assert_eq!(newest_key(&first), newest_key(&later));
+        assert!(!is_arrival(
+            newest_key(&first).as_ref(),
+            newest_key(&later).as_ref()
+        ));
+    }
+
+    /// A new tail clamped to an arrival earlier than the previous tail's
+    /// unclamped time is still later in stored order: an arrival.
+    #[test]
+    fn a_new_tail_clamped_below_the_previous_one_is_an_arrival() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+
+        let received = at(1_700_000_000_000);
+        let a = message_at(owner_id, &alice, received + chrono::Duration::seconds(50));
+        let b = message_at(owner_id, &alice, received + chrono::Duration::seconds(130));
+        let mut receive_times = ReceiveTimes::new();
+        receive_times.insert(a.id().0 .0, received.timestamp_millis() as f64);
+        receive_times.insert(
+            b.id().0 .0,
+            (received + chrono::Duration::seconds(10)).timestamp_millis() as f64,
+        );
+        let member_info = info(&alice, "Alice");
+        let now = received + chrono::Duration::seconds(20);
+
+        let before = group(
+            &state(vec![a.clone()]),
+            &member_info,
+            owner_id,
+            &receive_times,
+            now,
+        );
+        let after = group(
+            &state(vec![a, b]),
+            &member_info,
+            owner_id,
+            &receive_times,
+            now,
+        );
+        let tail = |items: &[DisplayItem]| match items.last() {
+            Some(DisplayItem::Messages(g)) => g.messages.last().expect("a message").time,
+            _ => panic!("expected a message group last"),
+        };
+        assert!(
+            tail(&after) < tail(&before),
+            "premise: the new tail displays earlier than the previous one"
+        );
+
+        assert!(is_arrival(
+            newest_key(&before).as_ref(),
+            newest_key(&after).as_ref()
+        ));
+    }
 }
 
 /// Source-grep pins for the scroll wiring in [`Conversation`].
@@ -11988,6 +12081,7 @@ mod reader_state_tests {
                     names: vec![format!("member {i}")],
                     id: format!("e{i}"),
                     last_time: DateTime::from_timestamp(i as i64, 0).unwrap(),
+                    last_sent_ms: i as i64 * 1_000,
                     last_message_id: MessageId(freenet_scaffold::util::fast_hash(
                         format!("e{i}").as_bytes(),
                     )),
