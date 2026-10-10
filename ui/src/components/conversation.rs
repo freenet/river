@@ -3258,7 +3258,7 @@ fn resolve_rendered_range(
             end
         }
     });
-    let history_window = HistoryWindow::resolve_held(
+    let mut history_window = HistoryWindow::resolve_held(
         groups.len(),
         requested_window,
         relocated.as_ref().map(|r| r.start),
@@ -3267,6 +3267,13 @@ fn resolve_rendered_range(
             keep,
         },
     );
+    // A pending request lands at the latest message. If this render's own
+    // arrivals hold the range's end (the ceiling), as a followed burst or a
+    // send at the ceiling does, it takes the latest range instead.
+    if reader.request.get().is_some() && history_window.has_newer && !select_latest {
+        history_window =
+            HistoryWindow::resolve_held(groups.len(), requested_window, None, RangeHold::default());
+    }
     let head_removed =
         relocated.is_some_and(|r| !r.head_survived || history_window.start > r.start);
     let shown = &groups[history_window.start..history_window.end];
@@ -11970,6 +11977,50 @@ mod autoscroll_wiring_pins {
 #[cfg(test)]
 mod reader_state_tests {
     use super::*;
+
+    fn events(count: usize) -> Vec<DisplayItem> {
+        (0..count)
+            .map(|i| {
+                DisplayItem::Event(EventSummary {
+                    names: vec![format!("member {i}")],
+                    id: format!("e{i}"),
+                    last_time: DateTime::from_timestamp(i as i64, 0).unwrap(),
+                    last_message_id: MessageId(freenet_scaffold::util::fast_hash(
+                        format!("e{i}").as_bytes(),
+                    )),
+                })
+            })
+            .collect()
+    }
+
+    /// A burst past the ceiling holds the range's end, unless a request is
+    /// pending (a followed arrival, an own send): that lands on the latest
+    /// range.
+    #[test]
+    fn a_pending_request_takes_the_latest_range_past_the_ceiling() {
+        let all = events(INITIAL_WINDOW_ITEMS + WINDOW_ITEMS_CEILING);
+        for (pending, expect_held) in [(false, true), (true, false)] {
+            let reader = ReaderPosition::default();
+            resolve_rendered_range(
+                &all[..INITIAL_WINDOW_ITEMS],
+                INITIAL_WINDOW_ITEMS,
+                None,
+                &reader,
+            );
+            if pending {
+                reader.request_end(None);
+            }
+            let (window, _) = resolve_rendered_range(&all, INITIAL_WINDOW_ITEMS, None, &reader);
+            assert_eq!(window.has_newer, expect_held, "pending request: {pending}");
+            if pending {
+                assert_eq!(
+                    window.end,
+                    all.len(),
+                    "the latest range ends at the newest item"
+                );
+            }
+        }
+    }
 
     fn id(seed: &[u8]) -> MessageId {
         MessageId(freenet_scaffold::util::fast_hash(seed))
