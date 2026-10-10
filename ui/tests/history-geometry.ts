@@ -117,9 +117,13 @@ export async function deliver(page: Page, text: string) {
 
 /// Like `deliver`, but only waits for the patch: the arrival may land below a
 /// parked reader's viewport, where `toBeVisible` would still pass but says
-/// nothing about where the view is.
-export async function deliverOffscreen(page: Page, text: string) {
-  await callRiverTest(page, "appendMessage", text);
+/// nothing about where the view is. `aheadSeconds` stamps it ahead of our clock.
+export async function deliverOffscreen(page: Page, text: string, aheadSeconds?: number) {
+  if (aheadSeconds !== undefined) {
+    await callRiverTest(page, "appendMessageAhead", text, aheadSeconds);
+  } else {
+    await callRiverTest(page, "appendMessage", text);
+  }
   await expect(page.getByText(text, { exact: false })).toHaveCount(1, { timeout: 5_000 });
 }
 
@@ -381,6 +385,13 @@ export async function hideChatBehindMembers(page: Page) {
   await page.getByTestId("header-members-button").click();
   await expect(page.locator("aside").filter({ hasText: "Active Members" })).toBeVisible();
   await expect(page.locator("#chat-scroll-container"), "premise: the chat panel is hidden").toBeHidden();
+}
+
+/// Back from the members panel to the chat, once the revealed history has laid out.
+export async function backToChatFromMembers(page: Page) {
+  await page.getByTestId("members-back-to-chat-button").click();
+  await expect(page.locator("#chat-scroll-container")).toBeVisible();
+  await nextFrames(page);
 }
 
 /// Withhold the history's settle events (`scrollend`, and `scroll` for the

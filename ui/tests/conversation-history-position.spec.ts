@@ -1,9 +1,10 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { selectListedRoom } from "./example-room";
+import { hamburgerBadge, membersBackToChatBadge, selectListedRoom } from "./example-room";
 import {
   ALL_PROJECTS,
   WELL_AWAY_FROM_END_PX,
+  backToChatFromMembers,
   deliverOffscreen,
   distanceFromBottom,
   expectParkedAwayFromEnd,
@@ -50,12 +51,6 @@ async function keyOf(page: Page, text: string): Promise<string> {
   const row = page.locator("[data-item-key]", { hasText: text });
   await expect(row).toHaveCount(1);
   return (await row.getAttribute("data-item-key"))!;
-}
-
-async function backToChat(page: Page) {
-  await page.locator("aside").filter({ hasText: "Active Members" }).locator("button").first().click();
-  await expect(page.locator("#chat-scroll-container")).toBeVisible();
-  await nextFrames(page);
 }
 
 test.describe("Reading position when content above changes (A02)", () => {
@@ -189,7 +184,7 @@ test.describe("Deleting the reading row while the chat is hidden (A02)", () => {
     await hideChatBehindMembers(page);
     await callRiverTest(page, "removeMessages", "keep 2:");
     await expect(page.getByText("keep 2:", { exact: false })).toHaveCount(0, { timeout: 5_000 });
-    await backToChat(page);
+    await backToChatFromMembers(page);
 
     await expectParkedAwayFromEnd(page, "the reveal took the reader to the latest message");
     await expectRowHeld(page, row!.prevKey!, prevTop, "the row above the deleted one moved across the hidden deletion");
@@ -244,7 +239,7 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     const rowsAfterFirst = await page.locator("[data-item-key]").count();
     await callRiverTest(page, "appendMessages", HIDDEN_DRAIN_BATCH - 30);
     await expectRowCountAbove(page, rowsAfterFirst, "premise: the second burst should patch the hidden history");
-    await backToChat(page);
+    await backToChatFromMembers(page);
 
     await expectRowHeld(page, row.key, row.top, "an at-cap drain while the chat was hidden moved the reader's row");
   });
@@ -293,7 +288,7 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await expect
       .poll(() => withheld(page), { message: "premise: the burst should take the hidden range past the ceiling" })
       .toBeGreaterThan(0);
-    await backToChat(page);
+    await backToChatFromMembers(page);
 
     await expectRowHeld(page, row!.key, row!.top, "a burst past the ceiling while hidden moved the reader's row");
   });
@@ -309,7 +304,7 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await hideChatBehindMembers(page);
 
     await callRiverTest(page, "switchRoom", "Your Private Room");
-    await backToChat(page);
+    await backToChatFromMembers(page);
 
     await expect(page.getByRole("heading", { name: "Your Private Room" })).toBeVisible();
     await expect(page.getByText("filler 0:", { exact: false }), "the previous room's rows are still rendered").toHaveCount(0);
@@ -322,25 +317,20 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
   // reader at the end; it is counted on the back button and stays unread.
   test("a reader at the end keeps their row when an arrival lands behind the members panel", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
-    const row = await readingRow(page);
-    expect(row, "premise: a row is fully in view").not.toBeNull();
+    const row = await expectReadingRow(page);
 
     await hideChatBehindMembers(page);
+    await expect(membersBackToChatBadge(page), "premise: nothing unread yet").toHaveCount(0);
     await deliverOffscreen(page, `tall hidden arrival ${"word ".repeat(300)}`);
-    await expect(
-      page.getByTestId("members-back-to-chat-button").getByTestId("back-to-chat-unread-badge"),
-      "premise: the arrival is counted on the back button",
-    ).toHaveText("1");
-    await backToChat(page);
+    await expect(membersBackToChatBadge(page), "premise: the arrival is counted on the back button").toHaveText("1");
+    await expect(page.getByTestId("members-back-to-chat-button")).toHaveAttribute("aria-label", "Back to chat, 1 unread");
+    await backToChatFromMembers(page);
 
-    await expectRowHeld(page, row!.key, row!.top, "an arrival behind the members panel moved a reader at the end");
+    await expectRowHeld(page, row.key, row.top, "an arrival behind the members panel moved a reader at the end");
     await expect(page.getByTestId("scroll-to-bottom"), "Latest should offer the hidden arrival").toBeVisible();
     // The room list is hidden on a phone; the hamburger counts every room but the open one.
     await callRiverTest(page, "switchRoom", "Public Discussion Room");
-    await expect(
-      page.getByTestId("hamburger-rooms-button").filter({ visible: true }).getByTestId("hamburger-unread-badge"),
-      "the hidden arrival was marked read",
-    ).toHaveText("1");
+    await expect(hamburgerBadge(page), "the hidden arrival was marked read").toHaveText("1");
   });
 });
 

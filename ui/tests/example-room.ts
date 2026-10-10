@@ -91,6 +91,16 @@ export function roomUnreadBadge(page: Page, roomName: string): Locator {
   return page.getByTestId("room-list").getByRole("button", { name: roomName }).getByTestId("room-unread-badge");
 }
 
+/// The unread badge on whichever hamburger is showing (room header or no-room panel).
+export function hamburgerBadge(page: Page): Locator {
+  return page.getByTestId("hamburger-rooms-button").filter({ visible: true }).getByTestId("hamburger-unread-badge");
+}
+
+/// The members panel back arrow's badge; the rooms panel's arrow shares its test id.
+export function membersBackToChatBadge(page: Page): Locator {
+  return page.getByTestId("members-back-to-chat-button").getByTestId("back-to-chat-unread-badge");
+}
+
 export function memberRows(page: Page): Locator {
   return page.getByTestId("member-list").locator('[data-testid^="member-item-"] button');
 }

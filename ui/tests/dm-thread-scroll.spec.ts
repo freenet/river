@@ -256,6 +256,23 @@ async function openEmptyThreadHere(page: Page) {
   await settle(page);
 }
 
+/// In a hidden tab, a burst that overflows the open empty thread leaves it at
+/// the top (`why` if not); the tab coming back does not move it and Latest shows.
+async function expectHiddenBurstStaysAtTop(page: Page, why: string) {
+  await setTabVisibility(page, "hidden");
+  // One mutation, so the burst's last DM is the thread's first bubble.
+  await callRiverTest(page, "appendDmsForPeer", 1, HISTORY);
+  await expect(dm(page, `other dm history ${HISTORY - 1}`)).toHaveCount(1, { timeout: 5_000 });
+  await settle(page);
+  const { max, top } = await threadGeometry(page);
+  expect(max, "premise: the burst overflows the thread").toBeGreaterThan(0);
+  expect(top, why).toBeLessThanOrEqual(1);
+  await recordScrolls(page);
+  await setTabVisibility(page, "visible");
+  await expectStill(page, "the tab coming back moved the thread");
+  await expect(page.getByTestId(LATEST)).toBeVisible();
+}
+
 test.describe("DM thread scroll position", () => {
   test("an inbound DM does not move a reader parked up the thread", async ({ page }) => {
     await openThreadWithHistory(page);
@@ -604,18 +621,7 @@ test.describe("DM thread follows a reader at the end", () => {
 
   test("DMs arriving in a hidden tab into a thread opened empty leave it at the top", async ({ page }) => {
     await openEmptyThread(page);
-    await setTabVisibility(page, "hidden");
-
-    // One mutation, so the burst's last DM is the thread's first bubble.
-    await callRiverTest(page, "appendDmsForPeer", 1, HISTORY);
-    await expect(dm(page, `other dm history ${HISTORY - 1}`)).toHaveCount(1, { timeout: 5_000 });
-    await settle(page);
-    expect((await threadGeometry(page)).max, "premise: the burst overflows the thread").toBeGreaterThan(0);
-    expect((await threadGeometry(page)).top, "the thread jumped past DMs that arrived in a hidden tab").toBeLessThanOrEqual(1);
-    await recordScrolls(page);
-    await setTabVisibility(page, "visible");
-    await expectStill(page, "the tab coming back moved the thread");
-    await expect(page.getByTestId(LATEST)).toBeVisible();
+    await expectHiddenBurstStaysAtTop(page, "the thread jumped past DMs that arrived in a hidden tab");
   });
 
   test("a send in another thread earlier in the session does not move a thread opened empty", async ({ page }) => {
@@ -627,16 +633,7 @@ test.describe("DM thread follows a reader at the end", () => {
     await closeThread(page);
     // No reload: the send above stays this session's.
     await openEmptyThreadHere(page);
-    await setTabVisibility(page, "hidden");
-
-    await callRiverTest(page, "appendDmsForPeer", 1, HISTORY);
-    await expect(dm(page, `other dm history ${HISTORY - 1}`)).toHaveCount(1, { timeout: 5_000 });
-    await settle(page);
-    expect((await threadGeometry(page)).max, "premise: the burst overflows the thread").toBeGreaterThan(0);
-    expect((await threadGeometry(page)).top, "another thread's send moved a thread opened empty").toBeLessThanOrEqual(1);
-    await recordScrolls(page);
-    await setTabVisibility(page, "visible");
-    await expectStill(page, "the tab coming back moved the thread");
+    await expectHiddenBurstStaysAtTop(page, "another thread's send moved a thread opened empty");
   });
 
   test("after a purge, an inbound DM stamped below the purged one still follows", async ({ page }) => {

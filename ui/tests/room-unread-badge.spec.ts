@@ -1,8 +1,16 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { waitForApp, selectListedRoom, setTabVisibility, hiddenTitleCount, roomUnreadBadge } from "./example-room";
+import {
+  waitForApp,
+  selectListedRoom,
+  setTabVisibility,
+  hiddenTitleCount,
+  roomUnreadBadge,
+  hamburgerBadge,
+} from "./example-room";
 import {
   NEWEST_IN_VIEW_SLACK_PX,
+  backToChatFromMembers,
   deliverOffscreen,
   expectParkedAwayFromEnd,
   fillHistory,
@@ -374,12 +382,6 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
 test.describe("Unread behind the mobile panels (A07)", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 390, height: 844 } });
 
-  const hamburgerBadge = (page: Page) =>
-    page
-      .getByTestId("hamburger-rooms-button")
-      .filter({ visible: true })
-      .getByTestId("hamburger-unread-badge");
-
   test("an arrival while the chat is behind the members panel leaves its room unread", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await hideChatBehindMembers(page);
@@ -387,24 +389,10 @@ test.describe("Unread behind the mobile panels (A07)", { tag: "@chromium-only" }
     await deliverOffscreen(page, "arrived behind the members panel");
     // As a notification click does, with the members panel still in front.
     await callRiverTest(page, "switchRoom", "Public Discussion Room");
-    await page.locator("aside").filter({ hasText: "Active Members" }).locator("button").first().click();
+    await backToChatFromMembers(page);
     await expect(page.getByRole("heading", { name: "Public Discussion Room" })).toBeVisible();
     await nextFrames(page);
 
     await expect(hamburgerBadge(page), "an arrival behind the members panel was marked read").toHaveText("1");
-  });
-
-  test("an arrival in the open room while the members panel is in front is counted on the back button", async ({
-    page,
-  }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await hideChatBehindMembers(page);
-    const backButton = page.getByTestId("members-back-to-chat-button");
-    await expect(backButton.getByTestId("back-to-chat-unread-badge"), "premise: nothing unread yet").toHaveCount(0);
-
-    await deliverOffscreen(page, "arrived while members showed");
-
-    await expect(backButton.getByTestId("back-to-chat-unread-badge")).toHaveText("1");
-    await expect(backButton).toHaveAttribute("aria-label", "Back to chat, 1 unread");
   });
 });

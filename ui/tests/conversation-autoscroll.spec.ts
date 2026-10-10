@@ -1393,11 +1393,7 @@ test.describe("Own send goes to the newest message once (A06)", () => {
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
-    await callRiverTest(page, "appendMessageAhead", "stamped ahead of our clock", 50);
-    await expect(
-      page.getByText("stamped ahead of our clock", { exact: false }),
-      "premise: the skewed message should land",
-    ).toHaveCount(1, { timeout: 5_000 });
+    await deliverOffscreen(page, "stamped ahead of our clock", 50);
     await readerScrollsWithoutGesture(page, 0);
     await expectParkedAwayFromEnd(page, "premise: reading older messages");
 
@@ -1645,14 +1641,10 @@ test.describe("An arrival follows a reader at the end", () => {
   test("an arrival clamped earlier than the tail it follows still follows a reader at the end", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
-    await callRiverTest(page, "appendMessageAhead", "skewed within tolerance", 50);
-    await expect(page.getByText("skewed within tolerance")).toHaveCount(1, { timeout: 5_000 });
+    await deliverOffscreen(page, "skewed within tolerance", 50);
     await expectSettledAtBottom(page, "premise: the first skewed arrival followed");
 
-    await callRiverTest(page, "appendMessageAhead", `clamped tail ${"word ".repeat(300)}`, 120);
-    await expect(page.locator("[data-anchor-key]", { hasText: "clamped tail word" })).toHaveCount(1, {
-      timeout: 5_000,
-    });
+    await deliverOffscreen(page, `clamped tail ${"word ".repeat(300)}`, 120);
     await expectSettledAtBottom(page, "an arrival clamped below the previous tail did not follow");
   });
 
@@ -1660,8 +1652,7 @@ test.describe("An arrival follows a reader at the end", () => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
     // Clamped to each pass's "now", so its display time moves on every pass.
-    await callRiverTest(page, "appendMessageAhead", "far ahead", 600);
-    await expect(page.getByText("far ahead")).toHaveCount(1, { timeout: 5_000 });
+    await deliverOffscreen(page, "far ahead", 600);
     await expectSettledAtBottom(page, "premise: the far-ahead arrival followed");
     await readerParksNewestBelow(page, ROOM_FOLLOW_BAND_PX / 2);
     const row = await expectReadingRow(page);
