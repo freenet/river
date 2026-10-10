@@ -639,6 +639,41 @@ test.describe("DM thread follows a reader at the end", () => {
     await expectStill(page, "the tab coming back moved the thread");
   });
 
+  test("after a purge, an inbound DM stamped below the purged one still follows", async ({ page }) => {
+    await prepareThread(page, 3);
+    // Own DMs tall enough that the thread still scrolls once the peer's are gone.
+    const composer = page.getByPlaceholder("Type a direct message...");
+    for (const i of [1, 2, 3]) {
+      const text = `own tall DM ${i} ${"word ".repeat(120)}`.trim();
+      await composer.fill(text);
+      await composer.press("Enter");
+      await expect(dm(page, text)).toHaveCount(1, { timeout: 5_000 });
+    }
+    await settle(page);
+    await expectAtEnd(page, "premise: the sends left the thread at its end");
+
+    await callRiverTest(page, "deliverDmAhead", "future DM", 120);
+    await expect(dm(page, "future DM")).toHaveCount(1, { timeout: 5_000 });
+    await expectAtEnd(page, "premise: the future-stamped DM followed");
+
+    await page.getByRole("button", { name: "Delete their messages" }).click();
+    await page
+      .getByRole("dialog", { name: "Confirm delete their messages" })
+      .getByRole("button", { name: "Delete", exact: true })
+      .click();
+    await expect(dm(page, "future DM"), "premise: the purge removed the peer's DMs").toHaveCount(0, {
+      timeout: 5_000,
+    });
+    await settle(page);
+    expect((await threadGeometry(page)).max, "premise: the thread still scrolls").toBeGreaterThan(0);
+    await expectAtEnd(page, "premise: the reader is at the end after the purge");
+
+    // Stamped about now, below the purged DM.
+    const tall = `inbound after the purge ${"word ".repeat(300)}`.trim();
+    await deliverDm(page, tall);
+    await expectAtEnd(page, "a DM stamped below a purged one did not follow a reader at the end");
+  });
+
   test("an inbound DM under the thread's confirmation does not follow, nor does closing it", async ({ page }) => {
     await openThreadWithHistory(page);
     await page.getByRole("button", { name: "Delete their messages" }).click();

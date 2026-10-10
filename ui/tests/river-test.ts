@@ -14,6 +14,7 @@ type RiverTestHooks = {
   switchRoom(name: string): void;
   appendDms(count: number): void;
   deliverDm(text: string): void;
+  deliverDmAhead(text: string, seconds: number): void;
   failNextDmRoomRead(): void;
   dmRoomReadFailuresTaken(): number;
   // Peer 0 is the identity appendDms/deliverDm use; peer 1 a second one. Others throw.

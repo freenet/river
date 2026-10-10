@@ -125,6 +125,18 @@ pub fn install_test_hooks() {
         crate::util::defer(move || deliver_dms(&DM_PEERS[0], vec![text], DmStamp::Newest));
     });
 
+    // One inbound DM from the test peer stamped `seconds` ahead of now, within
+    // the DM field's future-skew limit.
+    expose2(
+        &hooks,
+        "deliverDmAhead",
+        move |text: String, seconds: u32| {
+            crate::util::defer(move || {
+                deliver_dms(&DM_PEERS[0], vec![text], DmStamp::Ahead(seconds.into()))
+            });
+        },
+    );
+
     // `appendDms` and `deliverDm` for a chosen test peer: 0 is the one those
     // use, 1 a second identity with its own thread.
     expose2(&hooks, "appendDmsForPeer", move |peer: u32, count: u32| {
@@ -591,6 +603,8 @@ enum DmStamp {
     /// the delivery sorts last even within one second of the previous one
     /// (the thread orders same-second DMs by signature).
     Newest,
+    /// `now` plus this many seconds: a sender whose clock runs ahead.
+    Ahead(u64),
 }
 
 /// Deliver `texts` from `peer` to self in the current room, in ONE `ROOMS`
@@ -628,6 +642,7 @@ fn deliver_dms(peer: &DmPeer, texts: Vec<String>, stamp: DmStamp) {
                     .fold(now, u64::max),
                 1,
             ),
+            DmStamp::Ahead(seconds) => (now + seconds, 1),
         };
         let new_messages: Vec<_> = texts
             .into_iter()

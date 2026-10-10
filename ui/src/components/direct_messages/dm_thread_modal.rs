@@ -489,9 +489,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     // The counter as this thread mounts: a send before it was another thread's.
     let prev_outbound_bump =
         use_hook(|| std::rc::Rc::new(std::cell::Cell::new(*OUTBOUND_SEND_COUNTER.peek())));
-    // The newest DM the render has seen, and whether the render that first
-    // showed it found the reader at the end (`dm_arrival_follows`), read
-    // before the patch. Set in render; the effect consumes the flag.
+    // The newest DM the last render showed (a purge lowers it), and whether
+    // the render that first showed it found the reader at the end
+    // (`dm_arrival_follows`), read before the patch. Set in render; the effect
+    // consumes the flag.
     let newest_recorded = use_hook(|| Rc::new(std::cell::Cell::new(None::<DmKey>)));
     let follow_pending = use_hook(|| Rc::new(std::cell::Cell::new(false)));
     #[cfg(target_arch = "wasm32")]
@@ -589,9 +590,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     }
     // In render, so the DOM still shows the previous render: measured after
     // the patch, a tall arrival's own height would count against the band.
-    let newest = newest_dm_key(&view_data.messages);
-    if is_newer_dm(newest_recorded.get().as_ref(), newest.as_ref()) {
-        newest_recorded.set(newest);
+    if note_newest_dm(&newest_recorded, newest_dm_key(&view_data.messages)) {
         #[cfg(target_arch = "wasm32")]
         follow_pending.set(dm_arrival_follows());
     }
@@ -1517,6 +1516,12 @@ fn is_newer_dm(previous: Option<&DmKey>, newest: Option<&DmKey>) -> bool {
         (Some(previous), Some(newest)) => newest > previous,
         _ => false,
     }
+}
+
+/// Record `now` as the newest rendered DM; true when it is an arrival (newer than the last one recorded).
+fn note_newest_dm(recorded: &std::cell::Cell<Option<DmKey>>, now: Option<DmKey>) -> bool {
+    let previous = recorded.replace(now);
+    is_newer_dm(previous.as_ref(), now.as_ref())
 }
 
 #[component]
@@ -2553,5 +2558,34 @@ mod tests {
         assert!(is_newer_dm(None, Some(&before)), "the first DM of a thread");
         assert!(!is_newer_dm(Some(&before), None), "an emptied thread");
         assert!(!is_newer_dm(None, None));
+    }
+
+    #[test]
+    fn a_purge_lowers_the_dm_baseline() {
+        let recorded = std::cell::Cell::new(None);
+        assert!(
+            note_newest_dm(&recorded, Some(dm_key(500, 0))),
+            "the first DM"
+        );
+        assert!(
+            !note_newest_dm(&recorded, Some(dm_key(100, 0))),
+            "a purge of the newest is not an arrival"
+        );
+        assert!(
+            note_newest_dm(&recorded, Some(dm_key(200, 0))),
+            "a DM below the purged one, above what is left"
+        );
+        assert!(
+            !note_newest_dm(&recorded, None),
+            "a purge that empties the thread"
+        );
+        assert!(
+            note_newest_dm(&recorded, Some(dm_key(50, 0))),
+            "the first DM after the thread was emptied"
+        );
+        assert!(
+            !note_newest_dm(&recorded, Some(dm_key(50, 0))),
+            "a re-render"
+        );
     }
 }
