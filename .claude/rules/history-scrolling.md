@@ -59,12 +59,12 @@ between arrivals, so no flag can latch:
 Measuring after the patch would count the arrival's own height against the
 band, which is why the pre-#753 DM check missed tall inbound DMs.
 
-An arrival is a strictly newer newest message: `NewestKey` (the stored time,
-the sender's and unclamped, then id, i.e. display order) in the room, `DmKey`
-(timestamp, then purge token) in a thread. An edit, a deletion of the newest,
-a message inserted above it, and a join folding into the trailing event
-summary (which raises the key) are told apart by it. The 60s clock-skew clamp
-only affects grouping and the timestamp shown.
+An arrival is a strictly newer newest message: `NewestKey` (the sender's
+unclamped time, then id: display order) in the room, `DmKey` (timestamp, then
+purge token) in a thread. An edit, a deletion of the newest, a message
+inserted above it, and a join folding into the trailing event summary (which
+raises the key) are told apart by it. The 60s clock-skew clamp only affects
+grouping and the timestamp shown.
 
 **`ModalPresence` rule.** Every modal root, and any popover attached to a
 history row, must mount a `foreground::ModalPresence`. It registers the modal

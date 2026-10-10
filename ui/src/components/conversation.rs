@@ -162,9 +162,10 @@ struct MessageGroup {
 struct GroupedMessage {
     content_text: String,
     content_html: String,
-    #[allow(dead_code)]
     time: DateTime<Utc>,
-    /// The stored (sender's) time, unclamped: arrival order. See [`NewestKey`].
+    /// The sender's unclamped time, used for display ordering (see
+    /// [`NewestKey`]). The clamped `time` still controls presentation and
+    /// grouping.
     sent_ms: i64,
     /// True if the sender's timestamp ran ahead of when we received this
     /// message and was clamped back to that arrival time. (It is clamped to
@@ -197,7 +198,9 @@ struct EventSummary {
     names: Vec<String>,
     id: String,
     last_time: DateTime<Utc>,
-    /// The stored (sender's) time, unclamped: arrival order. See [`NewestKey`].
+    /// The sender's unclamped time, used for display ordering (see
+    /// [`NewestKey`]). The clamped `last_time` still controls presentation and
+    /// grouping.
     last_sent_ms: i64,
     /// The newest event folded in, for the read rule (see
     /// [`display_item_last_message_id`]).
@@ -592,6 +595,7 @@ fn group_messages(
         let author_id = message.message.author;
         let message_id = message.id();
         let raw_time = DateTime::<Utc>::from(message.message.time);
+        let sent_ms = raw_time.timestamp_millis();
         // Clamp target: when we first saw it, else the pass-wide "now".
         let clamp_to = clock.clamp_target(&message_id);
         // `checked_add_signed` rather than `+`: `clamp_to` can come from
@@ -613,7 +617,7 @@ fn group_messages(
                 if let Some(DisplayItem::Event(ref mut summary)) = items.last_mut() {
                     summary.names.push(author_name);
                     summary.last_time = message_time;
-                    summary.last_sent_ms = raw_time.timestamp_millis();
+                    summary.last_sent_ms = sent_ms;
                     summary.last_message_id = message_id;
                 }
             } else {
@@ -621,7 +625,7 @@ fn group_messages(
                     names: vec![author_name],
                     id: msg_id_str,
                     last_time: message_time,
-                    last_sent_ms: raw_time.timestamp_millis(),
+                    last_sent_ms: sent_ms,
                     last_message_id: message_id,
                 }));
             }
@@ -663,15 +667,13 @@ fn group_messages(
         );
 
         // Look up propagation delay (send time → receive time)
-        let send_time_ms = raw_time.timestamp_millis();
-        let receive_delay_secs =
-            get_delay_secs_from(clock.receive_times, &message_id, send_time_ms);
+        let receive_delay_secs = get_delay_secs_from(clock.receive_times, &message_id, sent_ms);
 
         let grouped_message = GroupedMessage {
             content_text: content_text.clone(),
             content_html,
             time: message_time,
-            sent_ms: send_time_ms,
+            sent_ms,
             time_clamped,
             id: format!("{:?}", message_id.0),
             message_id,
@@ -2643,10 +2645,10 @@ fn end_hold_survives(before: Option<&MessageId>, now: Option<&MessageId>) -> boo
 }
 
 /// The room's newest display message, as the follow rule compares it. Ordered
-/// by the stored time, then id, which is display order (the clamped time is
-/// for presentation only), so a later message, a message folding into the last
-/// author's group and a join folding into the trailing event summary all
-/// compare greater; a deletion of the newest compares less, and an edit equal.
+/// by the sender's unclamped time, then id: display order (the clamped time is
+/// for presentation and grouping only), so a later message, a message folding
+/// into the last author's group and a join folding into the trailing event
+/// summary all compare greater; a deletion of the newest compares less, and an edit equal.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct NewestKey {
     time_ms: i64,
@@ -11845,14 +11847,10 @@ mod group_messages_clock_tests {
         );
 
         assert_eq!(newest_key(&first), newest_key(&later));
-        assert!(!is_arrival(
-            newest_key(&first).as_ref(),
-            newest_key(&later).as_ref()
-        ));
     }
 
     /// A new tail clamped to an arrival earlier than the previous tail's
-    /// unclamped time is still later in stored order: an arrival.
+    /// unclamped time is still later in display order: an arrival.
     #[test]
     fn a_new_tail_clamped_below_the_previous_one_is_an_arrival() {
         let owner = signing_key(1);
