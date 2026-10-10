@@ -62,6 +62,7 @@ fn close_modal(name: &'static str) {
 
 /// Is a modal open other than `except`? A DM thread passes its own name, so
 /// only a modal over the thread counts; the room passes `None`.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn modal_open_except(except: Option<&str>) -> bool {
     OPEN_MODALS.with(|open| open.borrow().iter().any(|n| Some(*n) != except))
 }

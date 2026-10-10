@@ -2693,6 +2693,7 @@ fn newest_key(groups: &[DisplayItem]) -> Option<NewestKey> {
 /// Did a message arrive after the newest one the last render showed? Only a
 /// strictly greater newest message counts: an edit, a deletion of the newest,
 /// a message inserted above it, and a first render do not.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn is_arrival(previous: Option<&NewestKey>, now: Option<&NewestKey>) -> bool {
     matches!((previous, now), (Some(previous), Some(now)) if now > previous)
 }
