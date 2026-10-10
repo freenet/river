@@ -4094,10 +4094,11 @@ pub fn Conversation() -> Element {
                     // The ⚠ impersonation checker, from the SAME badge map, so
                     // "who is a deputy" has one answer across the conversation
                     // and the member list. Built once here, like the badges.
+                    let owner_id = MemberId::from(&key);
                     let impersonation = impersonation_checker_for_viewer(
                         &room_state.member_info,
                         &room_data.secrets,
-                        MemberId::from(&key),
+                        owner_id,
                         &deputy_badges,
                     );
                     // Borrowed once per pass, not once per message. The old
@@ -4116,7 +4117,7 @@ pub fn Conversation() -> Element {
                         &member_names,
                         &deputy_badges,
                         &impersonation,
-                        MemberId::from(&key),
+                        owner_id,
                         MessageClock {
                             receive_times: &receive_times,
                             // One "now" for the whole pass. Only reached by
@@ -4124,7 +4125,14 @@ pub fn Conversation() -> Element {
                             fallback_now: Utc::now(),
                         },
                     );
-                    return Some((groups, self_member_id, member_names));
+                    return Some((
+                        groups,
+                        self_member_id,
+                        member_names,
+                        impersonation,
+                        deputy_badges,
+                        owner_id,
+                    ));
                 }
             }
         }
@@ -5486,7 +5494,14 @@ pub fn Conversation() -> Element {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
                             match message_groups.read().as_ref() {
-                                Some((groups, self_member_id, member_names)) => {
+                                Some((
+                                    groups,
+                                    self_member_id,
+                                    member_names,
+                                    impersonation,
+                                    deputy_badges,
+                                    owner_id,
+                                )) => {
                                     // Render only the tail the reader has asked
                                     // for. Slicing BEFORE the clone is the
                                     // point: `GroupedMessage` carries the
@@ -5675,6 +5690,7 @@ pub fn Conversation() -> Element {
                                     let groups =
                                         groups[history_window.start..history_window.end].to_vec();
                                     let self_member_id = *self_member_id;
+                                    let owner_id = *owner_id;
                                     let member_names = member_names.clone();
                                     // Room limits for the in-place edit form's
                                     // encoded-size gate (same measure the
@@ -5834,10 +5850,14 @@ pub fn Conversation() -> Element {
                                             {rows.into_iter().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
+                                                let impersonation = impersonation.clone();
+                                                let deputy_badges = deputy_badges.clone();
                                                 move |row| {
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let handle_edit_message = handle_edit_message.clone();
                                                 let member_names = member_names.clone();
+                                                let impersonation = impersonation.clone();
+                                                let deputy_badges = deputy_badges.clone();
                                                 match row {
                                                     DisplayRow::DateSeparator { key, label } => rsx! {
                                                         div {
@@ -5888,6 +5908,9 @@ pub fn Conversation() -> Element {
                                                                 group: group,
                                                                 self_member_id: self_member_id,
                                                                 member_names: member_names,
+                                                                impersonation: impersonation,
+                                                                deputy_badges: deputy_badges,
+                                                                owner_id: owner_id,
                                                                 max_message_size: edit_max_size,
                                                                 is_private: edit_is_private,
                                                                 edit_trigger: edit_trigger,
@@ -6035,7 +6058,7 @@ pub fn Conversation() -> Element {
             {
                 // Find user's most recent message for up-arrow-to-edit
                 let request_edit_last = move |_| {
-                    if let Some((groups, _, _)) = message_groups.read().as_ref() {
+                    if let Some((groups, _, _, _, _, _)) = message_groups.read().as_ref() {
                         for item in groups.iter().rev() {
                             if let DisplayItem::Messages(group) = item {
                                 if group.is_self {
@@ -6336,6 +6359,105 @@ pub fn Conversation() -> Element {
     }
 }
 
+/// Preferred height of the reactor-name list, including an optional Remove
+/// row. Used only to pick a side of the chip; the popover then caps itself
+/// to the space actually available there and scrolls.
+const REACTION_OWNERS_POPOVER_HEIGHT_PX: f64 = 160.0;
+
+/// Position of an open reactor list. Stored as one signal so the flip, the
+/// anchor, and the height cap update together.
+#[derive(Clone, PartialEq)]
+struct ReactionOwnersPopover {
+    key: String,
+    above: bool,
+    align_right: bool,
+    max_h: f64,
+}
+
+/// True when a finger can be the pointer.
+///
+/// Same query as the touch rules in `ui/assets/main.css`: `(hover: none)` is a
+/// phone or tablet, and `(any-pointer: coarse)` also matches a touchscreen
+/// laptop whose primary pointer still reports `hover: hover`. A tap on those
+/// devices never shows a native `title` tooltip.
+fn coarse_pointer() -> bool {
+    web_sys::window()
+        .and_then(|w| {
+            w.match_media("(hover: none), (any-pointer: coarse)")
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|mq| mq.matches())
+}
+
+/// Whether this tap should open the reactor list instead of removing.
+///
+/// A touchscreen laptop matches `(any-pointer: coarse)` even while a mouse
+/// is the pointer that clicked, and the hover tooltip still says the click
+/// removes. The pointer type of this gesture decides: a finger opens the
+/// list, a mouse removes. When the event is not a pointer event, fall back
+/// to [`coarse_pointer`] (freenet/river#714 review).
+fn gesture_opens_owner_list(evt: &dioxus_core::Event<MouseData>) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Dioxus 0.7.9 stores the click as a `web_sys::MouseEvent` even when
+        // the browser object is a `PointerEvent`, so a direct downcast to
+        // `PointerEvent` is always `None`. Cast on the JS side instead. A
+        // plain `MouseEvent` (Safari before 17) fails the cast and falls
+        // back to the media query.
+        if let Some(mouse) = evt.data().downcast::<web_sys::MouseEvent>() {
+            if let Some(pointer) = mouse.dyn_ref::<web_sys::PointerEvent>() {
+                match pointer.pointer_type().as_str() {
+                    "touch" => return true,
+                    "mouse" | "pen" => return false,
+                    _ => {}
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = evt;
+    }
+    coarse_pointer()
+}
+
+/// ⚠ and 🛡 for one reactor name, from the same helpers as the author line
+/// and the member list. `reactor_id` is the member whose name is shown;
+/// passing the viewer id would flag the real owner (pinned in
+/// `impersonation_warning_is_wired_into_every_render_surface`).
+fn reaction_owner_marks(
+    reactor_id: MemberId,
+    display_name: &str,
+    impersonation: &ImpersonationChecker,
+    owner_id: MemberId,
+    deputy_badges: &HashMap<MemberId, DeputyBadge>,
+) -> (Option<ImpersonationWarning>, Option<DeputyBadge>) {
+    (
+        impersonation_warning_for_display(
+            impersonation,
+            reactor_id,
+            display_name,
+            privilege_in_view(reactor_id, owner_id, deputy_badges),
+        ),
+        deputy_badges.get(&reactor_id).cloned(),
+    )
+}
+
+/// Top and bottom of the chat scrollport, in viewport coordinates. The list
+/// has to open inside this box: an ancestor with `overflow-y-auto` clips a
+/// popover that sticks out of it. Fallback matches the kebab menu.
+fn chat_scrollport_bounds() -> (f64, f64) {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("chat-scroll-container"))
+        .map(|el| {
+            let rect = el.get_bounding_client_rect();
+            (rect.top(), rect.bottom())
+        })
+        .unwrap_or((60.0, 600.0))
+}
+
 /// Corner radii for a bubble at this position in its group: every corner is
 /// round except the ones on the sender's side that face a neighbouring bubble.
 /// Takes position only, so nothing else (reactions, edits) can reshape it.
@@ -6360,6 +6482,9 @@ fn MessageGroupComponent(
     /// answer.
     self_member_id: Option<MemberId>,
     member_names: HashMap<MemberId, String>,
+    impersonation: ImpersonationChecker,
+    deputy_badges: HashMap<MemberId, DeputyBadge>,
+    owner_id: MemberId,
     /// Room max message size in ENCODED content bytes — bounds the edit
     /// action body (`RoomMessageBody::measure_edit`), not the raw text.
     max_message_size: usize,
@@ -6422,6 +6547,46 @@ fn MessageGroupComponent(
 
     // Track if emoji picker should appear above (true) or below (false) the button
     let mut picker_show_above: Signal<bool> = use_signal(|| false);
+
+    // Reactor list for one chip in this group. Touch has no hover, and the
+    // chip's `title` tooltip — the only place those names were rendered — does
+    // not appear on tap (freenet/river#714). One open list per group; its
+    // backdrop covers every other chip, kebab, and "+" so a second popover
+    // cannot stack on top of it.
+    let mut open_reaction_owners: Signal<Option<ReactionOwnersPopover>> = use_signal(|| None);
+    // The list's chip can unmount while the signal still names it (the
+    // reactor removed the emoji, or the message left the window). A later
+    // re-add of that same emoji would reopen the list and its backdrop with
+    // nobody having tapped. Drop the key once no rendered chip owns it.
+    {
+        let live_owner_keys: std::collections::HashSet<String> = group
+            .messages
+            .iter()
+            .flat_map(|msg| {
+                let id = msg.id.clone();
+                msg.reactions
+                    .keys()
+                    .map(move |emoji| format!("{id}:{emoji}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let owners_stale = open_reaction_owners
+            .read()
+            .as_ref()
+            .is_some_and(|popup| !live_owner_keys.contains(&popup.key));
+        if owners_stale {
+            let mut open_reaction_owners = open_reaction_owners;
+            crate::util::defer(move || {
+                let still = open_reaction_owners
+                    .peek()
+                    .as_ref()
+                    .is_some_and(|popup| !live_owner_keys.contains(&popup.key));
+                if still {
+                    open_reaction_owners.set(None);
+                }
+            });
+        }
+    }
 
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
@@ -7106,9 +7271,10 @@ fn MessageGroupComponent(
                                                                 menu_show_above.set(above);
                                                                 menu_align_left.set(align_left);
                                                                 menu_max_h.set(max_h);
-                                                                // Dismiss any open reaction picker so the two
-                                                                // popovers can't stack (#402 review).
+                                                                // Dismiss any open reaction picker or reactor
+                                                                // list so the popovers can't stack (#402, #714).
                                                                 open_emoji_picker.set(None);
+                                                                open_reaction_owners.set(None);
                                                                 open_action_menu.set(Some(id));
                                                             });
                                                         }
@@ -7163,6 +7329,7 @@ fn MessageGroupComponent(
                                                                 let above = *menu_show_above.peek();
                                                                 crate::util::defer(move || {
                                                                     picker_show_above.set(above);
+                                                                    open_reaction_owners.set(None);
                                                                     open_emoji_picker.set(Some(picker_id));
                                                                     open_action_menu.set(None);
                                                                 });
@@ -7240,49 +7407,215 @@ fn MessageGroupComponent(
                                                     let emoji_for_click = emoji.clone();
                                                     let msg_id_for_click = msg_id_react.clone();
 
-                                                    // Build list of reactor names for tooltip
-                                                    let reactor_names: Vec<String> = reactors.iter().map(|reactor_id| {
-                                                        // Unknown identity ⇒ nobody is
-                                                        // labelled "You"; every reactor
-                                                        // falls through to their nickname.
-                                                        if Some(*reactor_id) == self_member_id {
+                                                    // Build list of reactor names for tooltip.
+                                                    // "You" is not a nickname, so it is not
+                                                    // checked for impersonation. Everyone
+                                                    // else gets the same ⚠ / 🛡 as the
+                                                    // author line (freenet/river#714 review).
+                                                    let shown_reactors: Vec<_> = reactors.iter().map(|reactor_id| {
+                                                        let is_you = Some(*reactor_id) == self_member_id;
+                                                        let name = if is_you {
                                                             "You".to_string()
                                                         } else {
                                                             member_names.get(reactor_id)
                                                                 .cloned()
                                                                 .unwrap_or_else(|| "Unknown".to_string())
-                                                        }
+                                                        };
+                                                        let (warning, badge) = if is_you {
+                                                            (None, deputy_badges.get(reactor_id).cloned())
+                                                        } else {
+                                                            reaction_owner_marks(
+                                                                *reactor_id,
+                                                                &name,
+                                                                &impersonation,
+                                                                owner_id,
+                                                                &deputy_badges,
+                                                            )
+                                                        };
+                                                        (name, warning, badge)
                                                     }).collect();
-                                                    let names_str = reactor_names.join(", ");
+                                                    let names_str = shown_reactors
+                                                        .iter()
+                                                        .map(|(name, _, _)| name.as_str())
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ");
 
                                                     let tooltip = if is_user_reaction {
-                                                        format!("{} (click to remove)", names_str)
+                                                        format!("{names_str} (click to remove)")
                                                     } else {
                                                         names_str
                                                     };
+                                                    // Stable per chip inside this group. The list signal
+                                                    // holds at most one of these.
+                                                    let owners_key = format!("{msg_id_for_inline}:{emoji}");
+                                                    let (owners_open, owners_above, owners_align_right, owners_max_h) = {
+                                                        let open = open_reaction_owners.read();
+                                                        let mine = open.as_ref().filter(|popup| popup.key == owners_key);
+                                                        (
+                                                            mine.is_some(),
+                                                            mine.is_some_and(|popup| popup.above),
+                                                            mine.is_some_and(|popup| popup.align_right),
+                                                            mine.map(|popup| popup.max_h)
+                                                                .unwrap_or(REACTION_OWNERS_POPOVER_HEIGHT_PX),
+                                                        )
+                                                    };
+                                                    let msg_id_for_remove = msg_id_for_click.clone();
+                                                    let emoji_for_remove = emoji_for_click.clone();
+                                                    let owners_key_for_click = owners_key.clone();
 
                                                     rsx! {
-                                                        span {
+                                                        // `relative` only — no transform/filter on this wrapper.
+                                                        // A transform would become the containing block for the
+                                                        // `fixed` backdrop and shrink it to the chip (#402).
+                                                        // The scale animation stays on the emoji span, below.
+                                                        div {
                                                             key: "{emoji}",
-                                                            "data-testid": "reaction-chip",
                                                             class: format!(
-                                                                "inline-flex items-center gap-0.5 text-base transition-transform {}",
-                                                                if is_user_reaction {
-                                                                    // Subtle indicator: underline for user's reaction
-                                                                    "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
-                                                                } else {
-                                                                    "cursor-default hover:scale-110"
-                                                                }
+                                                                "relative inline-flex items-center {}",
+                                                                if owners_open { "z-[60]" } else { "" }
                                                             ),
-                                                            title: "{tooltip}",
-                                                            onclick: move |_| {
-                                                                if is_user_reaction {
-                                                                    on_react.call((msg_id_for_click.clone(), emoji_for_click.clone()));
+                                                            if owners_open {
+                                                                div {
+                                                                    class: "fixed inset-0 z-40",
+                                                                    onclick: move |_| {
+                                                                        crate::util::defer(move || {
+                                                                            open_reaction_owners.set(None);
+                                                                        });
+                                                                    },
                                                                 }
-                                                            },
-                                                            "{emoji}"
-                                                            if count > 1 {
-                                                                span { class: "text-xs text-text-muted", "{count}" }
+                                                                div {
+                                                                    "data-testid": "reaction-owners",
+                                                                    role: "dialog",
+                                                                    "aria-label": "Who reacted",
+                                                                    class: format!(
+                                                                        "absolute z-50 w-max min-w-[8rem] max-w-[calc(100vw-1rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
+                                                                        if owners_above { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                                        if owners_align_right { "right-0" } else { "left-0" }
+                                                                    ),
+                                                                    style: format!("max-height: {owners_max_h}px"),
+                                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                                    {shown_reactors.iter().enumerate().map(|(index, (name, warning, badge))| {
+                                                                        rsx! {
+                                                                            div {
+                                                                                key: "{index}",
+                                                                                class: "flex items-baseline gap-1 px-3 py-1.5 text-sm text-text text-left",
+                                                                                span {
+                                                                                    "data-testid": "reaction-owner",
+                                                                                    class: "[overflow-wrap:anywhere]",
+                                                                                    "{name}"
+                                                                                }
+                                                                                if let Some(warning) = warning {
+                                                                                    {
+                                                                                        let tooltip = warning.tooltip();
+                                                                                        rsx! {
+                                                                                            span {
+                                                                                                "data-testid": "reaction-owner-impersonation-warning",
+                                                                                                class: "cursor-default",
+                                                                                                title: "{tooltip}",
+                                                                                                "aria-label": "{tooltip}",
+                                                                                                {crate::util::confusable::WARNING_GLYPH}
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                if let Some(badge) = badge {
+                                                                                    {
+                                                                                        let tooltip = badge.tooltip();
+                                                                                        rsx! {
+                                                                                            span {
+                                                                                                "data-testid": "reaction-owner-deputy-badge",
+                                                                                                class: "cursor-default",
+                                                                                                title: "{tooltip}",
+                                                                                                "aria-label": "{tooltip}",
+                                                                                                "🛡"
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    })}
+                                                                    if is_user_reaction {
+                                                                        button {
+                                                                            "data-testid": "reaction-remove",
+                                                                            class: "px-3 py-2 text-sm text-left text-red-500 hover:bg-error-bg",
+                                                                            onclick: move |_| {
+                                                                                let id = msg_id_for_remove.clone();
+                                                                                let emoji = emoji_for_remove.clone();
+                                                                                crate::util::defer(move || {
+                                                                                    on_react.call((id, emoji));
+                                                                                    open_reaction_owners.set(None);
+                                                                                });
+                                                                            },
+                                                                            "Remove"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            span {
+                                                                "data-testid": "reaction-chip",
+                                                                "aria-expanded": "{owners_open}",
+                                                                class: format!(
+                                                                    "inline-flex items-center gap-0.5 text-base transition-transform {}",
+                                                                    if is_user_reaction {
+                                                                        // Subtle indicator: underline for user's reaction
+                                                                        "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
+                                                                    } else {
+                                                                        "cursor-default hover:scale-110"
+                                                                    }
+                                                                ),
+                                                                title: "{tooltip}",
+                                                                onclick: move |e: MouseEvent| {
+                                                                    // Geometry is read here, outside `defer`: the
+                                                                    // event is gone by the time the timeout fires.
+                                                                    let click_y = e.client_coordinates().y;
+                                                                    let click_x = e.client_coordinates().x;
+                                                                    if gesture_opens_owner_list(&e) {
+                                                                        let key = owners_key_for_click.clone();
+                                                                        let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
+                                                                        let space_below = scroll_bottom - click_y;
+                                                                        let space_above = click_y - scroll_top;
+                                                                        let above = space_below < REACTION_OWNERS_POPOVER_HEIGHT_PX
+                                                                            && space_above > space_below;
+                                                                        let max_h = ((if above { space_above } else { space_below }) - 16.0).max(1.0);
+                                                                        let win_w = web_sys::window()
+                                                                            .and_then(|w| w.inner_width().ok())
+                                                                            .and_then(|v| v.as_f64())
+                                                                            .unwrap_or(400.0);
+                                                                        // Open toward the viewport centre so a chip
+                                                                        // against either edge cannot run the list
+                                                                        // off-screen (#402 review, applied here).
+                                                                        let align_right = click_x > win_w * 0.5;
+                                                                        crate::util::defer(move || {
+                                                                            let already_open = open_reaction_owners
+                                                                                .peek()
+                                                                                .as_ref()
+                                                                                .is_some_and(|popup| popup.key == key);
+                                                                            if already_open {
+                                                                                open_reaction_owners.set(None);
+                                                                            } else {
+                                                                                open_emoji_picker.set(None);
+                                                                                open_action_menu.set(None);
+                                                                                open_reaction_owners.set(Some(ReactionOwnersPopover {
+                                                                                    key,
+                                                                                    above,
+                                                                                    align_right,
+                                                                                    max_h,
+                                                                                }));
+                                                                            }
+                                                                        });
+                                                                    } else if is_user_reaction {
+                                                                        let id = msg_id_for_click.clone();
+                                                                        let emoji = emoji_for_click.clone();
+                                                                        crate::util::defer(move || {
+                                                                            on_react.call((id, emoji));
+                                                                        });
+                                                                    }
+                                                                },
+                                                                "{emoji}"
+                                                                if count > 1 {
+                                                                    span { class: "text-xs text-text-muted", "{count}" }
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -7316,6 +7649,10 @@ fn MessageGroupComponent(
                                                         let picker_id = format!("inline-{}", msg_id_for_inline);
                                                         move |e: MouseEvent| {
                                                             e.stop_propagation();
+                                                            // The chip list and the picker must not both stay
+                                                            // open. Deferred, same as every other signal write
+                                                            // from a handler (.claude/rules/dioxus-signal-safety.md).
+                                                            crate::util::defer(move || open_reaction_owners.set(None));
                                                             let current = open_emoji_picker.read().clone();
                                                             if current.as_ref() == Some(&picker_id) {
                                                                 open_emoji_picker.set(None);
