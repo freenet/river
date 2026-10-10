@@ -393,4 +393,18 @@ test.describe("Unread behind the mobile panels (A07)", { tag: "@chromium-only" }
 
     await expect(hamburgerBadge(page), "an arrival behind the members panel was marked read").toHaveText("1");
   });
+
+  test("an arrival in the open room while the members panel is in front is counted on the back button", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await hideChatBehindMembers(page);
+    const backButton = page.getByTestId("members-back-to-chat-button");
+    await expect(backButton.getByTestId("back-to-chat-unread-badge"), "premise: nothing unread yet").toHaveCount(0);
+
+    await deliverOffscreen(page, "arrived while members showed");
+
+    await expect(backButton.getByTestId("back-to-chat-unread-badge")).toHaveText("1");
+    await expect(backButton).toHaveAttribute("aria-label", "Back to chat, 1 unread");
+  });
 });

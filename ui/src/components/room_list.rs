@@ -13,6 +13,7 @@ use crate::components::app::chat_delegate::{
 use crate::components::app::document_title::count_unread_in_room_data_with_mode;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
+use crate::components::back_to_chat::BackToChatButton;
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
 use crate::components::room_list::join_with_code_modal::JoinWithCodeModal;
@@ -21,8 +22,8 @@ use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
     icons::fa_solid_icons::{
-        FaArrowLeft, FaArrowsUpDown, FaChevronDown, FaChevronUp, FaComments, FaFileImport, FaLock,
-        FaPlus, FaRightToBracket, FaTriangleExclamation,
+        FaArrowsUpDown, FaChevronDown, FaChevronUp, FaComments, FaFileImport, FaLock, FaPlus,
+        FaRightToBracket, FaTriangleExclamation,
     },
     Icon,
 };
@@ -333,10 +334,10 @@ pub fn RoomList() -> Element {
             class: "w-full md:w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
             // Mobile back button (hidden on desktop)
             div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
-                button {
+                BackToChatButton {
                     class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Chat),
-                    Icon { icon: FaArrowLeft, width: 16, height: 16 }
+                    icon_size: 16,
+                    testid: "rooms-back-to-chat-button",
                 }
                 span { class: "ml-2 text-sm font-semibold text-text", "Rooms" }
             }

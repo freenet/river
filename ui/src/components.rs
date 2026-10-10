@@ -1,4 +1,5 @@
 pub mod app;
+pub mod back_to_chat;
 pub mod conversation;
 pub mod direct_messages;
 pub mod foreground;

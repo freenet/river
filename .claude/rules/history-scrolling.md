@@ -38,6 +38,12 @@ mobile panel revealing the chat never scrolls: messages that arrived in the
 meantime stay below, Latest appears, and they stay unread until the reader
 reaches them.
 
+While another mobile panel (Rooms or Members) replaces the chat, Latest is
+hidden with it, so the open room's unread count, under its notification mode,
+shows on that panel's back-to-chat button (`back_to_chat.rs`). No other badge
+changes: the hamburger and the open room's row in the room list still leave
+that room out.
+
 The check is **stateless and measured before the patch.** It reads the DOM in
 the render that brings the arrival, while the DOM still shows the previous
 render (`follow_arrival_at_end`, `dm_arrival_follows`). Nothing is remembered

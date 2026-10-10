@@ -317,6 +317,31 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await page.waitForTimeout(600);
     await expectSettledAtBottom(page, "the newly opened room did not stay at its newest message");
   });
+
+  // A hidden chat has no layout, so an arrival is not followed even for a
+  // reader at the end; it is counted on the back button and stays unread.
+  test("a reader at the end keeps their row when an arrival lands behind the members panel", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    const row = await readingRow(page);
+    expect(row, "premise: a row is fully in view").not.toBeNull();
+
+    await hideChatBehindMembers(page);
+    await deliverOffscreen(page, `tall hidden arrival ${"word ".repeat(300)}`);
+    await expect(
+      page.getByTestId("members-back-to-chat-button").getByTestId("back-to-chat-unread-badge"),
+      "premise: the arrival is counted on the back button",
+    ).toHaveText("1");
+    await backToChat(page);
+
+    await expectRowHeld(page, row!.key, row!.top, "an arrival behind the members panel moved a reader at the end");
+    await expect(page.getByTestId("scroll-to-bottom"), "Latest should offer the hidden arrival").toBeVisible();
+    // The room list is hidden on a phone; the hamburger counts every room but the open one.
+    await callRiverTest(page, "switchRoom", "Public Discussion Room");
+    await expect(
+      page.getByTestId("hamburger-rooms-button").filter({ visible: true }).getByTestId("hamburger-unread-badge"),
+      "the hidden arrival was marked read",
+    ).toHaveText("1");
+  });
 });
 
 test.describe("Opening a room that is temporarily empty (A03)", () => {
