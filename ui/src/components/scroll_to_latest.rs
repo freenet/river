@@ -14,6 +14,43 @@ use dioxus_free_icons::Icon;
 #[cfg(target_arch = "wasm32")]
 pub const NEWEST_IN_VIEW_SLACK_PX: f64 = 4.0;
 
+/// How far below the visible area (in px) the room's newest message may sit
+/// when an arrival lands and still be followed to the end. The pre-#753
+/// `BOTTOM_THRESHOLD_PX`, now measured from the newest message's bottom rather
+/// than the scroller's absolute end (`.claude/rules/history-scrolling.md`).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub const ROOM_FOLLOW_BAND_PX: f64 = 100.0;
+
+/// The DM thread's [`ROOM_FOLLOW_BAND_PX`]: the pre-#753 `is_near_bottom`
+/// tolerance.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub const DM_FOLLOW_BAND_PX: f64 = 50.0;
+
+/// Does an arrival follow? Only into a conversation in the foreground whose
+/// newest item's bottom sat at most `band` px below the view before the patch.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn follows_arrival(in_foreground: bool, newest_below_view: f64, band: f64) -> bool {
+    in_foreground && newest_below_view <= band
+}
+
+/// How far (px) the newest item's bottom, the top edge of the sentinel
+/// `sentinel_id`, sits below `container`'s visible bottom: 0 while it is on
+/// screen, infinite when there is no sentinel or no layout.
+#[cfg(target_arch = "wasm32")]
+pub fn newest_bottom_below_view(container: &web_sys::Element, sentinel_id: &str) -> f64 {
+    let Some(sentinel) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(sentinel_id))
+    else {
+        return f64::INFINITY;
+    };
+    let view = container.get_bounding_client_rect();
+    if view.height() <= 0.0 {
+        return f64::INFINITY;
+    }
+    (sentinel.get_bounding_client_rect().top() - view.bottom()).max(0.0)
+}
+
 /// Is the sentinel `sentinel_id`, whose top edge is the newest item's bottom,
 /// on screen in `container`, within [`NEWEST_IN_VIEW_SLACK_PX`]? The same edge,
 /// and the same slack, as the Latest button's observer. A live layout read
@@ -120,5 +157,25 @@ pub fn LatestButton(
             onclick: move |evt| onclick.call(evt),
             Icon { icon: FaChevronDown, width: 18, height: 18 }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_follow_bands_are_the_pre_753_values() {
+        assert_eq!(ROOM_FOLLOW_BAND_PX, 100.0);
+        assert_eq!(DM_FOLLOW_BAND_PX, 50.0);
+    }
+
+    #[test]
+    fn an_arrival_follows_only_in_the_foreground_within_the_band() {
+        assert!(follows_arrival(true, 0.0, ROOM_FOLLOW_BAND_PX));
+        assert!(follows_arrival(true, 100.0, ROOM_FOLLOW_BAND_PX));
+        assert!(!follows_arrival(true, 100.5, ROOM_FOLLOW_BAND_PX));
+        assert!(!follows_arrival(false, 0.0, ROOM_FOLLOW_BAND_PX));
+        assert!(!follows_arrival(true, f64::INFINITY, DM_FOLLOW_BAND_PX));
     }
 }
