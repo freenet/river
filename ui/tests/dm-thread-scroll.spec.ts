@@ -178,6 +178,26 @@ test.describe("DM thread scroll position", () => {
     await expect(page.getByTestId(LATEST)).toBeHidden();
   });
 
+  test("a send to another thread completing while this one is open does not move it", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+    await callRiverTest(page, "appendDmsForPeer", DM_PEER.index, 3);
+    await callRiverTest(page, "appendDmsForPeer", OTHER_DM_PEER.index, HISTORY);
+    await openThread(page, OTHER_DM_PEER, newestHistoryDm(OTHER_DM_PEER));
+    const { max } = await scrollMetrics(page, DM_VIEW);
+    await scrollThreadTo(page, Math.round(max / 2));
+    await expect(page.getByTestId(LATEST)).toBeVisible();
+    await recordScrolls(page);
+
+    expect(await callRiverTest(page, "sendDmToPeer", DM_PEER.index, "sent to another thread")).toBe("Sent");
+    // Any re-render of this thread would act on a send it took for its own.
+    await page.getByPlaceholder("Type a direct message...").press("a");
+
+    await expectStill(page, "another thread's send moved this parked thread");
+    await expect(dm(page, "sent to another thread")).toHaveCount(0);
+  });
+
   test("reopening a thread lands on its newest DM", async ({ page }) => {
     await openThreadWithHistory(page);
     await scrollThreadTo(page, 0);

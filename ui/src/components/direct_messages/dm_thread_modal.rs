@@ -34,6 +34,7 @@ use river_core::room_state::direct_messages::{
 use river_core::room_state::dm_body::{decode_body, DirectMessageBody, InvitePayload};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,39 +50,42 @@ const DM_HISTORY: HistoryDom = HistoryDom {
     under_dm_thread: false,
 };
 
-/// Monotonic counter bumped every time the local user sends a DM from
-/// any open thread modal. The thread's render reads this via `.peek()`
-/// (non-reactive) to tell "user sent a message" (go to the end once) from
-/// "peer sent a message" (followed only for a reader at the end, see
-/// `HistoryDom::arrival_follows`; otherwise the Latest control offers it).
-/// Wrap-around is fine: the render compares for inequality with the value it
-/// last saw.
+/// Own DMs sent this session, counted per thread `(room, peer)`. A thread's
+/// render reads its own count via `.peek()` (non-reactive) to tell "user sent
+/// a message here" (go to the end once) from "peer sent a message" (followed
+/// only for a reader at the end, see `HistoryDom::arrival_follows`; otherwise
+/// the Latest control offers it). Per thread, so a send completing in another
+/// thread never moves the open one; a map rather than the last send's thread,
+/// so two sends in one render window cannot hide each other. Wrap-around is
+/// fine: the render compares for inequality with the value it last saw.
 ///
-/// Lives at module scope so the invite picker's send can bump it too.
+/// Lives at module scope so the invite picker's send can count too.
 ///
-/// No `.read()` (reactive) subscription: the bump always happens in the same
-/// defer block as the `ROOMS` write that adds the sent DM, so the thread's
-/// memo of `ROOMS` re-renders it. A future writer that bumps this counter
-/// WITHOUT also adding a DM to the thread must add its own re-render trigger,
-/// or the jump waits for the thread's next change.
-static OUTBOUND_SEND_COUNTER: GlobalSignal<u64> = Global::new(|| 0);
+/// No `.read()` (reactive) subscription: the count always moves in the same
+/// defer block as the `ROOMS` write that adds the sent DM to that thread, so
+/// the thread's memo of `ROOMS` re-renders it. A future writer that counts a
+/// send WITHOUT also adding a DM to the thread must add its own re-render
+/// trigger, or the jump waits for the thread's next change.
+static OUTBOUND_SENDS: GlobalSignal<HashMap<(VerifyingKey, MemberId), u64>> =
+    Global::new(HashMap::new);
 
-/// Record that an outbound DM just landed, so an open thread scrolls to it.
-///
-/// Exists so `send_structured_dm` — the path the invite picker uses — gets
-/// the same auto-scroll as the thread's own composer.
-///
-/// The counter itself is read with `peek()`, so it supplies NO subscription:
-/// the sent DM landing in `ROOMS` is what re-renders the thread, and both
-/// callers add one in the same defer block (see `OUTBOUND_SEND_COUNTER`).
-///
-/// Callers are already inside a `defer` block, so this takes the write
-/// directly — and computes the next value BEFORE the write guard, since a
-/// read and write in one statement can overlap their guards and panic (the
-/// same shape as the composer's own bump).
-pub(super) fn note_outbound_send() {
-    let next = OUTBOUND_SEND_COUNTER.peek().wrapping_add(1);
-    *OUTBOUND_SEND_COUNTER.write() = next;
+/// Record that an own DM to `peer` in `room` just landed, so that thread, if
+/// open, scrolls to it. Called by the composer and by `send_structured_dm`
+/// (the invite picker's path), each inside the `defer` block that adds the DM,
+/// so the write is taken directly, under one guard with no read beside it.
+pub(super) fn note_outbound_send(room: VerifyingKey, peer: MemberId) {
+    let mut sends = OUTBOUND_SENDS.write();
+    let count = sends.entry((room, peer)).or_insert(0);
+    *count = count.wrapping_add(1);
+}
+
+/// Own DMs sent to `peer` in `room` this session (see `OUTBOUND_SENDS`).
+fn outbound_sends(room: VerifyingKey, peer: MemberId) -> u64 {
+    OUTBOUND_SENDS
+        .peek()
+        .get(&(room, peer))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Result of applying an outbound DM to the local `ROOMS` state. The
@@ -447,10 +451,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     // a pending request to go to the end, and queues an effect that completes
     // it once that render is in the DOM. Pending from the start: the opening.
     let to_end = use_hook(|| Rc::new(std::cell::Cell::new(true)));
-    // `OUTBOUND_SEND_COUNTER` as last seen, so a bump tells an own send from an
-    // arrival. Starts at the counter as this thread mounts: a send before it
-    // was another thread's.
-    let outbound_seen = use_hook(|| Rc::new(std::cell::Cell::new(*OUTBOUND_SEND_COUNTER.peek())));
+    // This thread's own-send count as last seen, so a change tells an own send
+    // from an arrival. Starts at the count as this thread mounts: a send
+    // before it was already in place when the thread opened.
+    let outbound_seen = use_hook(|| Rc::new(std::cell::Cell::new(outbound_sends(room, peer))));
     // The newest DM the last render showed (a purge lowers it).
     let newest_recorded = use_hook(|| Rc::new(std::cell::Cell::new(None::<DmKey>)));
 
@@ -494,8 +498,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     if view_data.identity_known && view_data.messages.is_empty() {
         to_end.set(false);
     }
-    // An own send, from the composer or the invite picker, goes to the end.
-    let outbound_now = *OUTBOUND_SEND_COUNTER.peek();
+    // An own send to this thread, from the composer or the invite picker, goes
+    // to the end.
+    let outbound_now = outbound_sends(room, peer);
     if outbound_seen.replace(outbound_now) != outbound_now {
         to_end.set(true);
     }
@@ -711,20 +716,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     ApplyOutcome::Applied => {
                         info!("DM appended locally; marking room for sync");
                         mark_needs_sync(room);
-                        // Bump the outbound-send counter so the
-                        // auto-scroll effect notices the user just sent
-                        // a message and snaps to the bottom (regardless
-                        // of prior scroll position). See the effect in
-                        // `DmThreadModalBody`.
-                        //
-                        // Compute `next` BEFORE taking the write guard
-                        // — read/write in the same statement would let
-                        // the read and write guard temporaries overlap
-                        // until the end of the statement, risking a
-                        // RefCell/Dioxus borrow panic on the send
-                        // success path (Codex P1 finding on PR #278).
-                        let next_outbound_counter = OUTBOUND_SEND_COUNTER.peek().wrapping_add(1);
-                        *OUTBOUND_SEND_COUNTER.write() = next_outbound_counter;
+                        // Count the send for this thread, so its render
+                        // goes to the end once, from any scroll position.
+                        note_outbound_send(room, peer);
                         // Persist plaintext for the sender's own view
                         // (#256): the cache write here, in this defer
                         // block, and the delegate save via
@@ -1809,9 +1803,9 @@ mod tests {
     /// NOT. Commenting a call out therefore leaves the needle intact and the
     /// pin green while the behaviour is dead — the realistic path being
     /// "commented it out while debugging and forgot". Verified against
-    /// `note_outbound_send()`. This is the shape of every source pin in this
-    /// file, not a property of any one of them; treat a green pin as evidence
-    /// the text is present, not that the code runs.
+    /// `note_outbound_send(room, peer)`. This is the shape of every source pin
+    /// in this file, not a property of any one of them; treat a green pin as
+    /// evidence the text is present, not that the code runs.
     fn dm_thread_production_source() -> String {
         let raw = include_str!("dm_thread_modal.rs");
         let cut = raw
@@ -1977,7 +1971,7 @@ mod tests {
             .expect("direct_messages.rs must have a `mod tests {`");
         let src: String = raw[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            src.contains("dm_thread_modal::note_outbound_send()"),
+            src.contains("dm_thread_modal::note_outbound_send(room,peer)"),
             "send_structured_dm stopped bumping the outbound scroll counter, \
              so an invite sent from the DM thread gives no visible feedback"
         );

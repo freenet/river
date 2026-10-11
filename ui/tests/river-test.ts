@@ -16,6 +16,8 @@ type RiverTestHooks = {
   deliverDmForPeer(peerIndex: 0 | 1, text: string): void;
   // Admits the peer as a member with no DMs, for an empty thread.
   admitDmPeer(peerIndex: 0 | 1): void;
+  // An own DM to the peer through the real send path; resolves to the outcome, "Sent" on success.
+  sendDmToPeer(peerIndex: 0 | 1, text: string): Promise<string>;
 };
 
 // One hook per round trip.

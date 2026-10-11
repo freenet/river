@@ -1,6 +1,6 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
-//! INBOUND messages, remove messages, and drive the no-room screen's load
-//! states.
+//! INBOUND messages, remove messages, drive the no-room screen's load states,
+//! and complete an own DM while another thread is open.
 //!
 //! The composer is not a substitute: an own send is an explicit request to go
 //! to the newest message, so a message sent through the UI
@@ -97,6 +97,36 @@ pub fn install_test_hooks() {
                 })
             });
         })
+        .into_js_value(),
+    );
+
+    // An own DM to test peer `peer` in the current room, through the invite
+    // picker's send path, so it can complete while another thread is open.
+    // Resolves to the outcome's name, "Sent" on success.
+    set_hook(
+        "sendDmToPeer",
+        Closure::<dyn FnMut(u32, String) -> js_sys::Promise>::new(
+            move |peer: u32, text: String| {
+                let peer_id =
+                    MemberId::from(&SigningKey::from_bytes(&dm_peer(peer).seed).verifying_key());
+                let (tx, rx) = futures::channel::oneshot::channel();
+                crate::util::defer(move || {
+                    let _ = tx.send(CURRENT_ROOM.peek().owner_key);
+                });
+                wasm_bindgen_futures::future_to_promise(async move {
+                    let room = rx
+                        .await
+                        .ok()
+                        .flatten()
+                        .ok_or_else(|| JsValue::from_str("sendDmToPeer: no current room"))?;
+                    let body = river_core::room_state::dm_body::DirectMessageBody::Text { text };
+                    let outcome =
+                        crate::components::direct_messages::send_structured_dm(room, peer_id, body)
+                            .await;
+                    Ok(JsValue::from_str(&format!("{outcome:?}")))
+                })
+            },
+        )
         .into_js_value(),
     );
 
