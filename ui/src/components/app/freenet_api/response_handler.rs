@@ -27,7 +27,6 @@ use crate::components::app::chat_delegate::{
     LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
     OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
-use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{CURRENT_ROOM, ROOMS};
@@ -1730,13 +1729,6 @@ fn hydrate_loaded_rooms_with_authority(
                 }
             }
         });
-    });
-
-    // Mark current room as read since user is viewing it
-    // (must be after merge so room data exists)
-    crate::util::defer(|| {
-        mark_current_room_as_read();
-        update_document_title();
     });
 
     // Migrate signing keys to delegate for each loaded room.

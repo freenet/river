@@ -82,6 +82,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             "data-testid": "invite-member-backdrop",
             class: "fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4",
             onclick: move |_| is_active.set(false),
+            crate::components::foreground::ModalPresence { name: "invite-member" }
             div {
                 "data-testid": "invite-member-modal",
                 class: "bg-panel rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto",

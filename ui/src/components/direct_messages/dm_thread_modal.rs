@@ -12,11 +12,17 @@
 use crate::components::app::chat_delegate::{save_outbound_dm, unhide_dm_thread};
 use crate::components::app::{mark_needs_sync, ROOMS};
 use crate::components::direct_messages::{
-    lookup_outbound_plaintext, mark_thread_read, open_invite_via_dm_picker,
-    parse_outbound_invite_summary, DM_DRAFT, OPEN_DM_THREAD, OUTBOUND_DMS,
+    lookup_outbound_plaintext, open_invite_via_dm_picker, parse_outbound_invite_summary, DM_DRAFT,
+    OPEN_DM_THREAD, OUTBOUND_DMS,
 };
 use crate::components::members::Invitation;
 use crate::components::room_list::receive_invitation_modal::present_invitation;
+use crate::components::scroll_to_latest::LatestButton;
+#[cfg(target_arch = "wasm32")]
+use crate::components::scroll_to_latest::{
+    follows_arrival, newest_bottom_below_view, observe_sentinel, scroll_to_end, sentinel_in_view,
+    SentinelObserver, DM_FOLLOW_BAND_PX,
+};
 use crate::room_data::SendMessageError;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
@@ -36,12 +42,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// envelope overhead is accounted for. 32 KiB - 256 byte safety margin.
 const DM_BODY_BYTE_CAP: usize = MAX_DM_CIPHERTEXT_BYTES - 256;
 
+/// The thread's own `ModalPresence` name. Only a modal OTHER than the thread
+/// takes it out of the foreground.
+const DM_THREAD_MODAL: &str = "dm-thread";
+
 /// Monotonic counter bumped every time the local user sends a DM from
 /// any open thread modal. The auto-scroll effect reads this via
 /// `.peek()` (non-reactive) to distinguish "user sent a message"
-/// (always scroll) from "peer sent a message" (only scroll if reader
-/// is near the bottom). Wrap-around is fine — the effect compares for
-/// inequality with a stored previous value.
+/// (scroll to it once) from "peer sent a message" (followed only for a
+/// reader at the end, see `dm_arrival_follows`; otherwise the Latest
+/// control offers it). Wrap-around is fine — the effect compares
+/// for inequality with a stored previous value.
 ///
 /// Lives at module scope rather than inside the modal so a re-render
 /// caused by `OPEN_DM_THREAD` flipping doesn't reset it; the effect
@@ -105,13 +116,27 @@ pub fn DmThreadModal() -> Element {
         return rsx! {};
     };
 
+    // Keyed on the thread, so opening another one while this is open mounts a
+    // fresh body: its hooks (the read rule's witness, the draft, the opening
+    // jump) are each for one thread.
     rsx! {
-        DmThreadModalBody { room, peer }
+        DmThreadModalBody { key: "{room:?}-{peer:?}", room, peer }
     }
 }
 
 #[component]
 fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
+    // This mounted instance's lifetime, for work it queues that can outlive it
+    // (the opening and own-send placements, the read witness). Each mount gets
+    // a fresh cell, so a reopened thread with the same (room, peer) does not
+    // revive an old instance's work. Cleared synchronously on unmount, not
+    // deferred, so anything that runs after the unmount sees it.
+    let mounted = use_hook(|| Rc::new(std::cell::Cell::new(true)));
+    {
+        let mounted = mounted.clone();
+        use_drop(move || mounted.set(false));
+    }
+
     let mut draft = use_signal(String::new);
     let mut send_error: Signal<Option<String>> = use_signal(|| None);
 
@@ -172,22 +197,30 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         }
     });
 
-    // Pull the rendered messages + counterparty nickname once per read of
-    // ROOMS. We materialise to plain Strings so the rsx! macro below doesn't
-    // hold a ROOMS borrow across spawn_local.
+    // The thread as plain Strings, so the render holds no ROOMS borrow. The
+    // body is keyed by thread, so `last_view` is this thread's last good view:
+    // a contended read shows it instead of unmounting the thread, and a room
+    // that is gone clears it.
+    let last_view = use_hook(|| Rc::new(std::cell::RefCell::new(None::<ViewData>)));
     let view = use_memo({
+        let last_view = last_view.clone();
         move || {
-            // `room` and `peer` are plain captured props, not signals. This memo
-            // does read OUTBOUND_DMS further down, but ROOMS is read FIRST, so a
-            // contended ROOMS pass returns before reaching it and ends with zero
-            // subscriptions -- and this modal is always mounted, so nothing
-            // remounts it. freenet/river#555.
+            // Before the fallible reads: a contended pass subscribes to nothing
+            // else (freenet/river#555).
             crate::util::signal_guard::anchor();
-            let Ok(rooms) = ROOMS.try_read() else {
+            let read = if forced_room_read_failure() {
+                None
+            } else {
+                ROOMS.try_read().ok()
+            };
+            let Some(rooms) = read else {
                 crate::util::signal_guard::schedule_nudge();
+                return last_view.borrow().clone();
+            };
+            let Some(room_data) = rooms.map.get(&room) else {
+                *last_view.borrow_mut() = None;
                 return None;
             };
-            let room_data = rooms.map.get(&room)?;
 
             // INBOUND bodies are ECIES-sealed to us, so reading them needs the
             // private key — but its absence must not blank the thread. Outbound
@@ -393,114 +426,174 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             }
             rendered.sort_by_key(|d| d.timestamp);
 
-            Some(ViewData {
+            let view = ViewData {
                 peer_nickname,
                 peer_still_member,
                 messages: rendered,
                 latest_inbound_ts,
                 identity_known: self_id.is_some(),
                 can_send: self_sk.is_some(),
-            })
+            };
+            *last_view.borrow_mut() = Some(view.clone());
+            Some(view)
         }
     });
 
-    let view_value = view.read();
-    let Some(view_data) = view_value.as_ref() else {
-        return rsx! { div { "Room state not available" } };
-    };
-
-    // Mark thread read once we have actually rendered the latest inbound
-    // timestamp. `defer` keeps the write off the current render frame.
-    if view_data.latest_inbound_ts > 0 {
-        let ts = view_data.latest_inbound_ts;
-        mark_thread_read(room, peer, ts);
+    // The read rule: the thread is marked seen only up to an
+    // inbound DM the reader has had on screen with the tab visible, never from
+    // render. Rendering an arrival is not seeing it: it lands below the fold.
+    // `ThreadSeenWitness::check` applies the rule; it runs after the thread's
+    // messages change, when the tab becomes visible, from the newest-DM
+    // observer, and after the opening, own-send and Latest placements.
+    let seen_witness = use_hook(|| ThreadSeenWitness {
+        room,
+        peer,
+        newest_inbound_ts: Rc::new(std::cell::Cell::new(0)),
+        mounted: mounted.clone(),
+    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        let seen_witness = seen_witness.clone();
+        use_effect(move || {
+            // Anchored before the fallible reads below, which are this effect's
+            // only subscriptions (freenet/river#555).
+            crate::util::signal_guard::anchor();
+            // Re-run after the thread's messages change...
+            let Ok(has_view) = view.try_read().map(|v| v.is_some()) else {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            };
+            // ...and when the thread may be back in the foreground (the tab
+            // became visible, a modal over it closed).
+            if crate::components::foreground::FOREGROUND_CHANGED
+                .try_read()
+                .is_err()
+            {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            }
+            if has_view {
+                seen_witness.check();
+            }
+        });
     }
 
-    // Auto-scroll behaviour (Phase 3 of #243 invite-DM redesign):
-    //
-    //   1. Modal mount       → jump to bottom (always, instant).
-    //   2. Outbound send     → scroll to bottom (always, smooth).
-    //   3. Inbound new msg   → scroll only if the user was already
-    //                          near the bottom (within ~50px). Don't
-    //                          yank a reader who's scrolled up.
-    //
-    // For the effect to re-fire when a new bubble lands we need an
-    // actual subscribed signal read inside the closure. Dioxus 0.7's
-    // `use_effect` only re-runs when a signal that was `.read()`
-    // SUCCESSFULLY inside the closure body changes — capturing a
-    // plain `usize` `message_count` does not create a subscription,
-    // and `.peek()` on `OUTBOUND_SEND_COUNTER` is also non-reactive.
-    // PR #278's Codex round-1 fix replaced the previous `.read()` on
-    // `OUTBOUND_SEND_COUNTER` with `.peek()` for re-entrancy safety;
-    // that left the effect with no reactive read at all (issue #283).
-    //
-    // Mirror the conversation.rs pattern: the LAST DM bubble's
-    // `onmounted` updates `last_dm_bubble`, and the effect reads
-    // `last_dm_bubble()` (calls the Signal as a function = subscribing
-    // read). Whenever a new bubble mounts at a different `Rc` identity,
-    // the effect re-fires. `OUTBOUND_SEND_COUNTER.peek()` stays
-    // non-reactive — the bubble mount provides the trigger; the
-    // counter is just consulted to classify the trigger as
-    // outbound-vs-inbound.
+    // Placement (`.claude/rules/history-scrolling.md`): the opening and an own
+    // send jump to the end, and an inbound DM follows a reader at the end
+    // (`follow_pending`); any other arrival leaves the thread where it is, and
+    // the Latest control offers it. The last bubble's mount is the trigger: it
+    // writes `last_dm_bubble`, the effect's subscription (#283), and
+    // `OUTBOUND_SEND_COUNTER` (peeked) tells an own send from an arrival.
     let last_dm_bubble: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
     let first_scroll_done = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
-    let prev_outbound_bump = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0u64)));
+    // The counter as this thread mounts: a send before it was another thread's.
+    let prev_outbound_bump =
+        use_hook(|| std::rc::Rc::new(std::cell::Cell::new(*OUTBOUND_SEND_COUNTER.peek())));
+    // The newest DM the last render showed (a purge lowers it), and whether
+    // the render that first showed it found the reader at the end
+    // (`dm_arrival_follows`), read before the patch. Set in render; the effect
+    // consumes the flag.
+    let newest_recorded = use_hook(|| Rc::new(std::cell::Cell::new(None::<DmKey>)));
+    let follow_pending = use_hook(|| Rc::new(std::cell::Cell::new(false)));
     #[cfg(target_arch = "wasm32")]
     {
         let first_scroll_done = first_scroll_done.clone();
         let prev_outbound_bump = prev_outbound_bump.clone();
+        let follow_pending = follow_pending.clone();
+        let seen_witness = seen_witness.clone();
+        let mounted = mounted.clone();
         use_effect(move || {
-            // Read the last-bubble signal as a SUBSCRIBING read so the
-            // effect re-runs whenever a fresh bubble mounts (i.e. new
-            // DM lands or the modal opens with messages already in
-            // view). Without this, Dioxus has no signal to watch and
-            // the effect runs exactly once on mount — leaving auto-
-            // scroll silently broken on subsequent messages (#283).
+            // Subscribing read: re-runs whenever a fresh last bubble mounts.
             let trigger = last_dm_bubble();
-            if trigger.is_none() {
-                // No bubble has mounted yet (empty-thread state or
-                // first render before mounts arrive). Stay subscribed
-                // and bail until the first mount lands.
+            // No bubble yet, or no view to place: consume nothing until there is.
+            if trigger.is_none() || view.try_peek().is_ok_and(|v| v.is_none()) {
                 return;
             }
             let outbound_bump_now = *OUTBOUND_SEND_COUNTER.peek();
-            let prev_bump = prev_outbound_bump.get();
-            let outbound_changed = outbound_bump_now != prev_bump;
-            prev_outbound_bump.set(outbound_bump_now);
-
-            let is_first = !first_scroll_done.get();
-            if is_first {
-                first_scroll_done.set(true);
-            }
-            // For inbound-only triggers we want to scroll only if the
-            // user is near the bottom right now. Read the DOM
-            // synchronously before any further layout shifts hit the
-            // viewport — we're inside the effect, post-render.
-            let near_bottom = is_near_bottom("dm-scroll-container", 50.0);
-            // Trigger types:
-            //   * is_first         — mount: always jump (instant).
-            //   * outbound_changed — user sent: always (smooth).
-            //   * else             — inbound: only when near bottom.
-            let should_scroll = is_first || outbound_changed || near_bottom;
-            if !should_scroll {
+            let outbound_changed =
+                prev_outbound_bump.replace(outbound_bump_now) != outbound_bump_now;
+            let is_first = !first_scroll_done.replace(true);
+            let follow = follow_pending.replace(false);
+            // Any other arrival, or a purge: leave the thread where it is.
+            if !is_first && !outbound_changed && !follow {
                 return;
             }
-            let behavior = if is_first {
-                web_sys::ScrollBehavior::Instant
-            } else {
-                web_sys::ScrollBehavior::Smooth
-            };
+            let seen_witness = seen_witness.clone();
+            let mounted = mounted.clone();
             crate::util::safe_spawn_local(async move {
-                scroll_dm_container_to_bottom(behavior);
+                run_placement(Box::new(move || {
+                    // Checked as it runs, not as it is queued: the thread may
+                    // have closed since, and the ids below would then find
+                    // whichever thread is open now.
+                    if !mounted.get() {
+                        return;
+                    }
+                    if let Some(container) = dm_scroll_container() {
+                        scroll_to_end(&container);
+                    }
+                    // The end is on screen now, so it counts as seen.
+                    seen_witness.check();
+                }));
             });
         });
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
         // Touch the values so they're not flagged as unused on native.
-        let _ = (&last_dm_bubble, &first_scroll_done, &prev_outbound_bump);
+        let _ = (
+            &last_dm_bubble,
+            &first_scroll_done,
+            &prev_outbound_bump,
+            &follow_pending,
+        );
     }
 
+    // Drives the Latest control: is the newest DM's bottom on screen, give or
+    // take `NEWEST_IN_VIEW_SLACK_PX`? Written only by the observer on
+    // `dm-bottom-sentinel` (see `observe_newest_dm`), so nothing reads layout
+    // on scroll. Starts `true` so the control stays hidden until it reports.
+    let newest_in_view = use_signal(|| true);
+    // That observer, held for as long as the modal is open: replaced when the
+    // sentinel remounts, disconnected when the modal closes.
+    #[cfg(target_arch = "wasm32")]
+    let newest_dm_observer =
+        use_hook(|| Rc::new(std::cell::RefCell::new(None::<SentinelObserver>)));
+    #[cfg(target_arch = "wasm32")]
+    {
+        let newest_dm_observer = newest_dm_observer.clone();
+        use_drop(move || drop(newest_dm_observer.borrow_mut().take()));
+    }
+
+    // Confirmation modal for the destructive "Delete their messages" action.
+    // Single-click would erase every inbound DM from `peer` with no undo
+    // (#266). The confirmation gate forces a deliberate second click; the
+    // primary Cancel/Esc path closes it without mutating anything.
+    let mut confirm_delete_open: Signal<bool> = use_signal(|| false);
+
+    // Every hook is above this, so each render calls the same hooks.
+    let view_value = view.read();
+    // Inter-render memory for the read rule's triggers, some of them raw DOM
+    // callbacks with no Dioxus runtime. The shown view's cutoff, so a retained
+    // view only marks what it shows; 0 (nothing) with no view.
+    seen_witness
+        .newest_inbound_ts
+        .set(view_value.as_ref().map_or(0, |v| v.latest_inbound_ts));
+    let Some(view_data) = view_value.as_ref() else {
+        return rsx! {
+            div { "data-testid": "dm-thread-unavailable", "Room state not available" }
+        };
+    };
+    // A thread opened empty has no opening to place: its first DM is an
+    // arrival like any other (review item 6 on #753).
+    if view_data.identity_known && view_data.messages.is_empty() {
+        first_scroll_done.set(true);
+    }
+    // In render, so the DOM still shows the previous render: measured after
+    // the patch, a tall arrival's own height would count against the band.
+    if note_newest_dm(&newest_recorded, newest_dm_key(&view_data.messages)) {
+        #[cfg(target_arch = "wasm32")]
+        follow_pending.set(dm_arrival_follows());
+    }
     let peer_label = view_data.peer_nickname.clone();
     let peer_still_member = view_data.peer_still_member;
     let identity_known = view_data.identity_known;
@@ -511,12 +604,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             *OPEN_DM_THREAD.write() = None;
         });
     };
-
-    // Confirmation modal for the destructive "Delete their messages" action.
-    // Single-click would erase every inbound DM from `peer` with no undo
-    // (#266). The confirmation gate forces a deliberate second click; the
-    // primary Cancel/Esc path closes it without mutating anything.
-    let mut confirm_delete_open: Signal<bool> = use_signal(|| false);
 
     // No-arg send callback so both `onclick` and `onkeydown` (Enter)
     // can invoke it. `mut` because Dioxus signal `.set()` borrows the
@@ -860,6 +947,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
     rsx! {
         div {
+            "data-testid": "dm-thread-modal",
             class: "fixed inset-0 z-50 flex items-center justify-center",
             // Escape handler at the outer-modal scope so the confirm
             // dialog can be dismissed via Escape regardless of which
@@ -890,6 +978,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     confirm_delete_open.set(false);
                 }
             },
+            crate::components::foreground::ModalPresence { name: DM_THREAD_MODAL }
             // Backdrop
             div {
                 class: "absolute inset-0 bg-black/50",
@@ -909,52 +998,108 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         span { class: "text-accent", "{peer_label}" }
                     }
                     button {
+                        "data-testid": "dm-thread-close-button",
                         class: "p-1 text-text-muted hover:text-text transition-colors text-xl",
                         onclick: close,
                         "✕"
                     }
                 }
 
-                // Thread body. Stable id so the auto-scroll effect can
-                // reach the same DOM node across re-renders without
-                // having to walk the tree.
-                div {
-                    id: "dm-scroll-container",
-                    class: "flex-1 overflow-y-auto px-5 py-4 space-y-2",
-                    if view_data.messages.is_empty() && !identity_known {
-                        // NOT "No messages yet". With no local identity every
-                        // DM in this thread was skipped rather than shown (see
-                        // the memo), so the history may be substantial — and
-                        // telling the reader it is empty is a claim about their
-                        // data that happens to be false. Same register as the
-                        // send path's refusal below.
-                        p {
-                            "data-testid": "dm-thread-identity-unavailable",
-                            class: "text-sm text-text-muted italic",
-                            "This device doesn't hold your key for this room, so this conversation can't be shown here."
-                        }
-                    } else if view_data.messages.is_empty() {
-                        p { class: "text-sm text-text-muted italic",
-                            "No messages yet. Say hello!"
-                        }
-                    } else {
-                        {
-                            let messages_len = view_data.messages.len();
-                            view_data.messages.iter().enumerate().map(move |(idx, m)| {
-                                let is_last = idx + 1 == messages_len;
-                                let on_mount = if is_last {
-                                    Some(last_dm_bubble)
-                                } else {
-                                    None
-                                };
-                                rsx! {
-                                    DmBubble {
-                                        key: "{idx}_{m.timestamp}",
-                                        message: m.clone(),
-                                        last_bubble_sink: on_mount,
-                                    }
+                // Thread body, wrapped so the Latest control can sit over its
+                // bottom-right corner.
+                div { class: "relative flex-1 min-h-0 flex flex-col",
+                    // Stable id so the auto-scroll effect can reach the same
+                    // DOM node across re-renders without having to walk the
+                    // tree.
+                    div {
+                        id: "dm-scroll-container",
+                        class: "flex-1 min-h-0 overflow-y-auto px-5 py-4",
+                        // The spacing lives on this inner list, not on the
+                        // container, so the sentinel below gets no gap: its top
+                        // edge is the newest DM's bottom.
+                        div { class: "space-y-2",
+                            if view_data.messages.is_empty() && !identity_known {
+                                // NOT "No messages yet". With no local identity every
+                                // DM in this thread was skipped rather than shown (see
+                                // the memo), so the history may be substantial — and
+                                // telling the reader it is empty is a claim about their
+                                // data that happens to be false. Same register as the
+                                // send path's refusal below.
+                                p {
+                                    "data-testid": "dm-thread-identity-unavailable",
+                                    class: "text-sm text-text-muted italic",
+                                    "This device doesn't hold your key for this room, so this conversation can't be shown here."
                                 }
-                            })
+                            } else if view_data.messages.is_empty() {
+                                p { class: "text-sm text-text-muted italic",
+                                    "No messages yet. Say hello!"
+                                }
+                            } else {
+                                {
+                                    let messages_len = view_data.messages.len();
+                                    view_data.messages.iter().enumerate().map(move |(idx, m)| {
+                                        let is_last = idx + 1 == messages_len;
+                                        let on_mount = if is_last {
+                                            Some(last_dm_bubble)
+                                        } else {
+                                            None
+                                        };
+                                        rsx! {
+                                            DmBubble {
+                                                key: "{idx}_{m.timestamp}",
+                                                message: m.clone(),
+                                                last_bubble_sink: on_mount,
+                                            }
+                                        }
+                                    })
+                                }
+                            }
+                        }
+                        // Right under the newest DM: an IntersectionObserver
+                        // watches it for the Latest control, so scrolling does
+                        // no DOM queries (#151). Remounts with the thread body,
+                        // and each mount replaces the observer.
+                        div {
+                            id: "dm-bottom-sentinel",
+                            class: "h-px pointer-events-none",
+                            onmounted: {
+                                let seen_witness = seen_witness.clone();
+                                move |_| {
+                                    #[cfg(target_arch = "wasm32")]
+                                    observe_newest_dm(
+                                        &newest_dm_observer,
+                                        newest_in_view,
+                                        seen_witness.clone(),
+                                    );
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    let _ = &seen_witness;
+                                }
+                            },
+                        }
+                    }
+                    // Latest: shown whenever the newest DM's bottom is off
+                    // screen by more than the slack, which is how an inbound DM
+                    // that landed below is offered.
+                    if !newest_in_view() {
+                        LatestButton {
+                            aria_label: "Scroll to latest direct messages",
+                            test_id: "dm-scroll-to-latest",
+                            // A DOM scroll only, no signal write, so no `defer`
+                            // (`check` defers its own).
+                            onclick: {
+                                let seen_witness = seen_witness.clone();
+                                move |_| {
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        if let Some(container) = dm_scroll_container() {
+                                            scroll_to_end(&container);
+                                        }
+                                        seen_witness.check();
+                                    }
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    let _ = &seen_witness;
+                                }
+                            },
                         }
                     }
                 }
@@ -1151,6 +1296,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             confirm_delete_open.set(false);
                         }
                     },
+                    crate::components::foreground::ModalPresence { name: "dm-confirm-delete" }
                     // Inner backdrop — clicking it cancels.
                     div {
                         class: "absolute inset-0 bg-black/60",
@@ -1341,6 +1487,41 @@ struct RenderedDm {
     body: String,
     kind: BodyKind,
     token: PurgeToken,
+}
+
+/// A thread's newest DM, as the follow rule compares it: by timestamp, then
+/// purge token, so the order is total.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct DmKey {
+    timestamp: u64,
+    token: PurgeToken,
+}
+
+/// The greatest [`DmKey`] among `messages`.
+fn newest_dm_key(messages: &[RenderedDm]) -> Option<DmKey> {
+    messages
+        .iter()
+        .map(|m| DmKey {
+            timestamp: m.timestamp,
+            token: m.token,
+        })
+        .max()
+}
+
+/// Did a DM arrive after the newest one recorded? Only a strictly greater key
+/// counts: a purge of the newest DM lowers it, and a re-render keeps it.
+fn is_newer_dm(previous: Option<&DmKey>, newest: Option<&DmKey>) -> bool {
+    match (previous, newest) {
+        (None, Some(_)) => true,
+        (Some(previous), Some(newest)) => newest > previous,
+        _ => false,
+    }
+}
+
+/// Record `now` as the newest rendered DM; true when it is an arrival (newer than the last one recorded).
+fn note_newest_dm(recorded: &std::cell::Cell<Option<DmKey>>, now: Option<DmKey>) -> bool {
+    let previous = recorded.replace(now);
+    is_newer_dm(previous.as_ref(), now.as_ref())
 }
 
 #[component]
@@ -1630,55 +1811,133 @@ fn format_local_time(unix_secs: u64) -> String {
     local.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// Returns `true` if the DM scroll container is currently scrolled to
-/// within `tolerance_px` of its bottom edge. Returns `false` if the
-/// container is missing (e.g. modal not mounted) so callers default to
-/// "don't yank the viewport" — safer than the opposite.
-#[cfg(target_arch = "wasm32")]
-fn is_near_bottom(container_id: &str, tolerance_px: f64) -> bool {
-    let Some(window) = web_sys::window() else {
-        return false;
-    };
-    let Some(document) = window.document() else {
-        return false;
-    };
-    let Some(container) = document.get_element_by_id(container_id) else {
-        return false;
-    };
-    let scroll_top = container.scroll_top() as f64;
-    let client_height = container.client_height() as f64;
-    let scroll_height = container.scroll_height() as f64;
-    // Distance from current bottom-edge of the viewport to the
-    // content's bottom. Zero when fully scrolled down.
-    let distance_from_bottom = scroll_height - (scroll_top + client_height);
-    distance_from_bottom <= tolerance_px
+/// What the DM read rule needs to mark the open thread seen
+/// from any of its triggers, raw DOM callbacks included.
+#[derive(Clone)]
+// Only `check` reads the thread, and it needs the DOM.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+struct ThreadSeenWitness {
+    room: VerifyingKey,
+    peer: MemberId,
+    /// The newest inbound DM the thread's last render showed (0: none).
+    newest_inbound_ts: Rc<std::cell::Cell<u64>>,
+    /// Whether the thread instance this witness belongs to is still mounted.
+    /// Once it is not, the DOM ids `check` reads belong to another thread.
+    mounted: Rc<std::cell::Cell<bool>>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-fn is_near_bottom(_container_id: &str, _tolerance_px: f64) -> bool {
+impl ThreadSeenWitness {
+    /// Mark the thread seen up to its newest inbound DM if the reader can see
+    /// the end of the thread right now: the thread is in the foreground (the
+    /// tab is visible and no modal covers it, see `foreground::in_foreground`)
+    /// and the newest DM's bottom is on screen, within
+    /// `NEWEST_IN_VIEW_SLACK_PX`. The newest
+    /// inbound DM is at or above the newest DM, so the reader has reached it.
+    ///
+    /// The same rule as rooms (`conversation.rs`'s `note_newest_seen`). Safe
+    /// from a raw DOM callback: it reads no signal, and
+    /// `mark_thread_read` defers its write and never moves backwards.
+    ///
+    /// Does nothing once its thread instance has unmounted: a queued placement
+    /// or observer report can run after that, and the thread on screen by then
+    /// is not the one this witness would mark.
+    #[cfg(target_arch = "wasm32")]
+    fn check(&self) {
+        if !self.mounted.get() {
+            return;
+        }
+        let ts = self.newest_inbound_ts.get();
+        if ts == 0
+            || !dm_scroll_container().is_some_and(|c| {
+                crate::components::foreground::in_foreground(Some(DM_THREAD_MODAL), &c)
+                    && sentinel_in_view(&c, "dm-bottom-sentinel")
+            })
+        {
+            return;
+        }
+        crate::components::direct_messages::mark_thread_read(self.room, self.peer, ts);
+    }
+}
+
+/// Does an arrival rendering now follow? Only into a thread in the foreground
+/// (no modal over it, see `foreground::in_foreground`) whose newest DM's bottom
+/// sits within `DM_FOLLOW_BAND_PX` of its view's bottom edge. Called from
+/// render, before the patch; a thread not yet in the DOM (the opening) does
+/// not follow, which the opening placement covers.
+#[cfg(target_arch = "wasm32")]
+fn dm_arrival_follows() -> bool {
+    dm_scroll_container().is_some_and(|container| {
+        follows_arrival(
+            crate::components::foreground::in_foreground(Some(DM_THREAD_MODAL), &container),
+            newest_bottom_below_view(&container, "dm-bottom-sentinel"),
+            DM_FOLLOW_BAND_PX,
+        )
+    })
+}
+
+/// The DM thread's scroll container, if it is currently in the DOM.
+#[cfg(target_arch = "wasm32")]
+fn dm_scroll_container() -> Option<web_sys::Element> {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("dm-scroll-container"))
+}
+
+/// Watch `dm-bottom-sentinel`, whose top edge is the newest DM's bottom, and
+/// publish whether it is on screen to `newest_in_view` (see
+/// [`observe_sentinel`]). Each report also re-applies the read rule, since the
+/// reader scrolling the end into view is what usually changes it. Replaces
+/// any observer already in `slot`.
+#[cfg(target_arch = "wasm32")]
+fn observe_newest_dm(
+    slot: &std::cell::RefCell<Option<SentinelObserver>>,
+    newest_in_view: Signal<bool>,
+    seen_witness: ThreadSeenWitness,
+) {
+    drop(slot.borrow_mut().take());
+    let (Some(root), Some(sentinel)) = (
+        dm_scroll_container(),
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("dm-bottom-sentinel")),
+    ) else {
+        return;
+    };
+    *slot.borrow_mut() = observe_sentinel(&root, &sentinel, move |in_view| {
+        seen_witness.check();
+        // The Latest control renders from this signal, so the write goes
+        // through `defer`. By then the modal may have closed and taken the
+        // signal with it: `try_*` skips that, and skips a write that would
+        // change nothing.
+        crate::util::defer(move || {
+            let mut newest_in_view = newest_in_view;
+            if newest_in_view.try_peek().is_ok_and(|v| *v != in_view) {
+                if let Ok(mut v) = newest_in_view.try_write() {
+                    *v = in_view;
+                }
+            }
+        });
+    });
+}
+
+/// Run a queued opening or own-send placement. The example test build lets
+/// `holdNextDmPlacement` hold it here, inside its task, so a spec can unmount
+/// the thread before it runs.
+#[cfg(target_arch = "wasm32")]
+fn run_placement(placement: Box<dyn FnOnce()>) {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    crate::test_hooks::run_or_hold_dm_placement(placement);
+    #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
+    placement();
+}
+
+/// Whether the test hooks forced this `ROOMS` read to fail like a contended
+/// one (`failNextDmRoomRead`). Always `false` outside the example test build.
+fn forced_room_read_failure() -> bool {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    return crate::test_hooks::take_dm_room_read_failure();
+    #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
     false
-}
-
-/// Scroll the DM thread container to its bottom edge using the given
-/// behavior (smooth on subsequent triggers, instant on initial mount).
-/// No-op when the container isn't in the DOM yet — safe to call from
-/// effect bodies.
-#[cfg(target_arch = "wasm32")]
-fn scroll_dm_container_to_bottom(behavior: web_sys::ScrollBehavior) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let Some(document) = window.document() else {
-        return;
-    };
-    let Some(container) = document.get_element_by_id("dm-scroll-container") else {
-        return;
-    };
-    let opts = web_sys::ScrollToOptions::new();
-    opts.set_top(container.scroll_height() as f64);
-    opts.set_behavior(behavior);
-    container.scroll_to_with_scroll_to_options(&opts);
 }
 
 /// Pure helper: merge an incoming DM_DRAFT body into whatever the user
@@ -2270,6 +2529,63 @@ mod tests {
              when it's Some (i.e. the bubble is the last one). Without this \
              write the auto-scroll effect's signal stays at None and #283 \
              silently re-regresses."
+        );
+    }
+
+    fn dm_key(timestamp: u64, token: u8) -> DmKey {
+        DmKey {
+            timestamp,
+            token: PurgeToken([token; 16]),
+        }
+    }
+
+    #[test]
+    fn only_a_newer_newest_dm_is_an_arrival() {
+        let before = dm_key(100, 1);
+        assert!(
+            is_newer_dm(Some(&before), Some(&dm_key(101, 0))),
+            "a later DM"
+        );
+        assert!(
+            is_newer_dm(Some(&before), Some(&dm_key(100, 2))),
+            "same second, higher token"
+        );
+        assert!(!is_newer_dm(Some(&before), Some(&before)), "a re-render");
+        assert!(
+            !is_newer_dm(Some(&before), Some(&dm_key(99, 9))),
+            "the newest purged"
+        );
+        assert!(is_newer_dm(None, Some(&before)), "the first DM of a thread");
+        assert!(!is_newer_dm(Some(&before), None), "an emptied thread");
+        assert!(!is_newer_dm(None, None));
+    }
+
+    #[test]
+    fn a_purge_lowers_the_dm_baseline() {
+        let recorded = std::cell::Cell::new(None);
+        assert!(
+            note_newest_dm(&recorded, Some(dm_key(500, 0))),
+            "the first DM"
+        );
+        assert!(
+            !note_newest_dm(&recorded, Some(dm_key(100, 0))),
+            "a purge of the newest is not an arrival"
+        );
+        assert!(
+            note_newest_dm(&recorded, Some(dm_key(200, 0))),
+            "a DM below the purged one, above what is left"
+        );
+        assert!(
+            !note_newest_dm(&recorded, None),
+            "a purge that empties the thread"
+        );
+        assert!(
+            note_newest_dm(&recorded, Some(dm_key(50, 0))),
+            "the first DM after the thread was emptied"
+        );
+        assert!(
+            !note_newest_dm(&recorded, Some(dm_key(50, 0))),
+            "a re-render"
         );
     }
 }

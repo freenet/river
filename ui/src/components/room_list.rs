@@ -10,11 +10,10 @@ pub(crate) mod room_name_field;
 use crate::components::app::chat_delegate::{
     retry_rooms_load, save_rooms_to_delegate, RoomsLoadState, ROOMS_LOAD_STATE,
 };
-use crate::components::app::document_title::{
-    count_unread_in_room_data_with_mode, mark_current_room_as_read,
-};
+use crate::components::app::document_title::count_unread_in_room_data_with_mode;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
+use crate::components::back_to_chat::BackToChatButton;
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
 use crate::components::room_list::join_with_code_modal::JoinWithCodeModal;
@@ -23,8 +22,8 @@ use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
     icons::fa_solid_icons::{
-        FaArrowLeft, FaArrowsUpDown, FaChevronDown, FaChevronUp, FaComments, FaFileImport, FaLock,
-        FaPlus, FaRightToBracket, FaTriangleExclamation,
+        FaArrowsUpDown, FaChevronDown, FaChevronUp, FaComments, FaFileImport, FaLock, FaPlus,
+        FaRightToBracket, FaTriangleExclamation,
     },
     Icon,
 };
@@ -335,10 +334,10 @@ pub fn RoomList() -> Element {
             class: "w-full md:w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
             // Mobile back button (hidden on desktop)
             div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
-                button {
-                    class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Chat),
-                    Icon { icon: FaArrowLeft, width: 16, height: 16 }
+                BackToChatButton {
+                    class: "p-2",
+                    icon_size: 16,
+                    testid: "rooms-back-to-chat-button",
                 }
                 span { class: "ml-2 text-sm font-semibold text-text", "Rooms" }
             }
@@ -577,8 +576,9 @@ pub fn RoomList() -> Element {
                                     // Defer signal mutations to a clean execution context to
                                     // prevent RefCell re-entrant borrow panics.
                                     crate::util::defer(move || {
+                                        // The title effect applies the read rule
+                                        // on this write.
                                         *CURRENT_ROOM.write() = CurrentRoom { owner_key: Some(room_key) };
-                                        mark_current_room_as_read();
                                         // Switch to chat view on mobile
                                         *MOBILE_VIEW.write() = MobileView::Chat;
                                         spawn(async move {
@@ -601,10 +601,12 @@ pub fn RoomList() -> Element {
                                         }
                                     }
                                     // Unread badge — hidden for the current
-                                    // room (its messages are marked read on
-                                    // open, so a badge there would only
-                                    // flicker) and for Muted rooms (their
-                                    // count is always 0, freenet/river#500).
+                                    // room, by design (it can hold messages
+                                    // the reader has not seen yet, but its
+                                    // Latest button
+                                    // offers those), and for Muted rooms
+                                    // (their count is always 0,
+                                    // freenet/river#500).
                                     // Styling mirrors the DM rail badge plus
                                     // `flex-shrink-0` so a long truncated
                                     // room name can't squash it; the accent

@@ -1,14 +1,13 @@
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{
-    MobileView, CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_VIEW, ROOMS, SYNC_STATUS,
-};
+use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS, SYNC_STATUS};
+use crate::components::back_to_chat::BackToChatButton;
 use crate::util::confusable::{
     ConfusableTier, ImpersonationChecker, ImpersonationWarning, ProtectedName, ProtectedRole,
 };
 use crate::util::display_name::display_nickname;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaArrowLeft, FaFileExport, FaUserPlus, FaUsers};
+use dioxus_free_icons::icons::fa_solid_icons::{FaFileExport, FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::identity::IdentityExport;
@@ -1588,10 +1587,10 @@ pub fn MemberList() -> Element {
             div { class: "px-4 py-3 border-b border-border flex-shrink-0",
                 div { class: "flex items-center gap-2",
                     // Mobile back button
-                    button {
-                        class: "md:hidden p-1 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                        onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Chat),
-                        Icon { icon: FaArrowLeft, width: 14, height: 14 }
+                    BackToChatButton {
+                        class: "md:hidden p-1",
+                        icon_size: 14,
+                        testid: "members-back-to-chat-button",
                     }
                     h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",
                         Icon { icon: FaUsers, width: 16, height: 16 }
@@ -1856,6 +1855,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
         div {
             class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
             onclick: move |_| is_active.set(false),
+            crate::components::foreground::ModalPresence { name: "member-token-export" }
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-xl w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
@@ -2566,6 +2566,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
         div {
             class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
             onclick: move |_| reset_and_close(),
+            crate::components::foreground::ModalPresence { name: "member-token-import" }
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
                 onclick: move |e| e.stop_propagation(),

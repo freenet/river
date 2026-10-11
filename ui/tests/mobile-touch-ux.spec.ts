@@ -5,8 +5,8 @@ import { waitForApp, selectRoom } from "./example-room";
 //   1. Touch-accessible message action menu (kebab), since the hover action
 //      bar can never appear on a device without a hover pointer.
 //   2. Header hamburger spacing: see room-header-layout.spec.ts.
-//   3. A scroll-to-latest button shown whenever the history is not pinned to
-//      the bottom, plus a snap-to-bottom on room switch.
+//   3. A scroll-to-latest button shown whenever the newest message's bottom
+//      is off screen, plus a jump to the newest message on room switch.
 
 // Whether this browser context has no hover pointer (i.e. a touch device).
 // The kebab is shown only in that case; the hover action bar only otherwise.
@@ -347,7 +347,7 @@ test.describe("Room-switch scroll reset (#402.3)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    // Enter a room and scroll up so it is no longer pinned to the bottom.
+    // Enter a room and scroll up until its newest message is off screen.
     await selectRoom(page, "Your Private Room");
     await waitSettledAtBottom(page);
     await scrollUpUntilButtonVisible(page);

@@ -5,10 +5,11 @@ import { waitForApp } from "./example-room";
 // (#243 structured invite-DM variant + auto-scroll):
 //
 //   * The modal exposes a stable `id="dm-scroll-container"` on the
-//     scrollable thread body. The auto-scroll effect targets that id;
-//     if it gets renamed without updating the JS lookup, the
-//     mount-jump-to-bottom, outbound-send scroll, and "near-bottom"
-//     inbound-scroll all silently regress to "no scroll happens."
+//     scrollable thread body. The auto-scroll effect and the Latest
+//     control target that id; if it gets renamed without updating the JS
+//     lookup, the mount-jump-to-bottom, the outbound-send jump and Latest
+//     all silently regress to "no scroll happens." (Inbound DMs follow a
+//     reader at the end; dm-thread-scroll.spec.ts covers where the view goes.)
 //   * Empty-state copy ("No messages yet. Say hello!") still appears
 //     when there are zero DMs — example-data populates no DMs so this
 //     is the default state for the smoke test.

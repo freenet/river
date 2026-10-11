@@ -78,6 +78,23 @@ seeds `DM_LAST_SEEN` from the max inbound DM timestamp per
 arriving inbound DM would be instantly marked seen and never surface as
 unread.
 
+**Read rule and scrolling.** The follow-at-end policy and its rationale live
+in [history-scrolling.md](history-scrolling.md).
+An open thread advances `DM_LAST_SEEN` (`mark_thread_read`) only up to an inbound DM
+that was on screen while the thread was in the foreground (tab visible, no
+modal other than the thread over it, `foreground::in_foreground`) — never from
+render, since an arrival can render below the fold. `ThreadSeenWitness::check`
+in `dm_thread_modal.rs` measures `dm-bottom-sentinel` against the thread's
+view; it runs after the thread changes, on `FOREGROUND_CHANGED` (the tab
+became visible or a modal over the thread closed), from the newest-DM
+observer, and after the opening, own-send, follow and Latest placements. An
+inbound DM follows a reader at the end (newest DM's bottom within
+`DM_FOLLOW_BAND_PX` = 50px, measured before the patch by
+`dm_arrival_follows`); otherwise the Latest control (`dm-scroll-to-latest`)
+shows while the newest DM's bottom is more than a few px off screen, and
+jumps instantly. The modal body is keyed by `(room, peer)`, so opening
+another thread remounts it (and its witness).
+
 ## Share-invite-via-DM picker
 
 `INVITE_VIA_DM_PICKER` global signal opens

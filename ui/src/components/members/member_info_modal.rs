@@ -462,6 +462,7 @@ pub fn MemberInfoModal() -> Element {
                         });
                     }
                 },
+                crate::components::foreground::ModalPresence { name: "member-info" }
                 // Overlay
                 div {
                     class: "absolute inset-0 bg-black/50",

@@ -14,6 +14,49 @@ export async function waitForApp(page: Page) {
   );
 }
 
+/// Two animation frames, so a patch's effects and the layout they cause land.
+export function nextFrames(page: Page): Promise<void> {
+  return page.evaluate(
+    () => new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r()))),
+  );
+}
+
+/// Let a patch, its effects and any deferred mark land, so that a geometry or
+/// unread count read afterwards is not just early.
+export async function settle(page: Page) {
+  await nextFrames(page);
+  await page.waitForTimeout(300);
+}
+
+// Force the tab's visibility state: override the `document.hidden` and
+// `document.visibilityState` getters and dispatch `visibilitychange`, the way
+// Chromium, WebKit and Firefox do when the tab goes to the background or back.
+export async function setTabVisibility(page: Page, state: "hidden" | "visible") {
+  await page.evaluate((state) => {
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => state === "hidden",
+    });
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => state,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, state);
+}
+
+/// The (N) of the title while the tab is hidden: unread across every room and
+/// DM thread, the open one included. Hides the tab if it is not hidden
+/// already, and lets the hide's mark land first.
+export async function hiddenTitleCount(page: Page): Promise<number> {
+  if (await page.evaluate(() => document.visibilityState !== "hidden")) {
+    await setTabVisibility(page, "hidden");
+  }
+  await settle(page);
+  const counted = /^\((\d+)\) /.exec(await page.title());
+  return counted ? Number(counted[1]) : 0;
+}
+
 // Scoped to the room list: once a room is open the header title has the same name.
 export async function selectListedRoom(page: Page, roomName: string) {
   const roomBtn = page.getByTestId("room-list").getByRole("button", { name: roomName });
@@ -39,7 +82,23 @@ export async function selectRoom(page: Page, roomName: string) {
   await selectListedRoom(page, roomName);
   await page.setViewportSize(vp);
   // Let layout settle after the resize round trip (mobile-safari measured too early).
-  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  await nextFrames(page);
+}
+
+/// A room's unread badge in the room list. Hidden while it is the current
+/// room, so callers open another room first.
+export function roomUnreadBadge(page: Page, roomName: string): Locator {
+  return page.getByTestId("room-list").getByRole("button", { name: roomName }).getByTestId("room-unread-badge");
+}
+
+/// The unread badge on whichever hamburger is showing (room header or no-room panel).
+export function hamburgerBadge(page: Page): Locator {
+  return page.getByTestId("hamburger-rooms-button").filter({ visible: true }).getByTestId("hamburger-unread-badge");
+}
+
+/// The members panel back arrow's badge; the rooms panel's arrow shares its test id.
+export function membersBackToChatBadge(page: Page): Locator {
+  return page.getByTestId("members-back-to-chat-button").getByTestId("back-to-chat-unread-badge");
 }
 
 export function memberRows(page: Page): Locator {
