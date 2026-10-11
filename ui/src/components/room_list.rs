@@ -616,19 +616,17 @@ pub fn RoomList() -> Element {
                                             Icon { width: 12, height: 12, icon: FaLock }
                                         }
                                     }
-                                    // Unread badge — absent for Muted rooms
+                                    // Unread badge, absent for Muted rooms
                                     // (their count is always 0,
-                                    // freenet/river#500) and for the open
-                                    // room while the chat shows (its count is
-                                    // 0 then, see `room_items`). The open
-                                    // room's badge is `md:hidden`: on desktop
-                                    // the chat always shows, whatever
+                                    // freenet/river#500) and for the open room
+                                    // while the chat shows (see `room_items`).
+                                    // The open room's badge is `md:hidden`: on
+                                    // desktop the chat always shows, whatever
                                     // `MOBILE_VIEW` says.
-                                    // Styling mirrors the DM rail badge plus
-                                    // `flex-shrink-0` so a long truncated
-                                    // room name can't squash it; the accent
-                                    // styling applies to any nonzero count,
-                                    // whichever mode produced it.
+                                    //
+                                    // Styling mirrors the DM rail badge, plus
+                                    // `flex-shrink-0` so a long truncated room
+                                    // name can't squash it.
                                     if unread > 0 {
                                         span {
                                             class: if is_current {

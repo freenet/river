@@ -410,12 +410,8 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         }
     });
 
-    // The read rule: the thread is marked seen only up to an
-    // inbound DM the reader has had on screen with the tab visible, never from
-    // render. Rendering an arrival is not seeing it: it lands below the fold.
-    // `ThreadSeenWitness::check` applies the rule; it runs after the thread's
-    // messages change, when the tab becomes visible, from the newest-DM
-    // observer, and after the opening, own-send and Latest placements.
+    // The read rule (`ThreadSeenWitness::check`): never from render, since an
+    // arrival renders below the fold.
     let seen_witness = use_hook(|| ThreadSeenWitness {
         room,
         peer,
@@ -447,12 +443,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         });
     }
 
-    // Placement (`.claude/rules/history-scrolling.md`): the opening and an own
-    // send jump to the end, and an inbound DM follows a reader at the end; any
-    // other arrival leaves the thread where it is, and the Latest control
-    // offers it. Render sets `to_end`, a pending request to go to the end, and
-    // queues an effect that completes it once that render is in the DOM, like
-    // the room's `complete_scroll_request`. Pending from the start: the opening.
+    // Placement (`.claude/rules/history-scrolling.md`): render sets `to_end`,
+    // a pending request to go to the end, and queues an effect that completes
+    // it once that render is in the DOM. Pending from the start: the opening.
     let to_end = use_hook(|| Rc::new(std::cell::Cell::new(true)));
     // `OUTBOUND_SEND_COUNTER` as last seen, so a bump tells an own send from an
     // arrival. Starts at the counter as this thread mounts: a send before it
@@ -497,7 +490,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         };
     };
     // A thread opened empty has no opening to place: its first DM is an
-    // arrival like any other (review item 6 on #753).
+    // arrival like any other (#753).
     if view_data.identity_known && view_data.messages.is_empty() {
         to_end.set(false);
     }
@@ -990,10 +983,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                 }
                             }
                         }
-                        // Right under the newest DM: an IntersectionObserver
-                        // watches it for the Latest control, so scrolling does
-                        // no DOM queries (#151). Remounts with the thread body,
-                        // and each mount replaces the observer.
+                        // Right under the newest DM, watched by `observe_newest`.
+                        // Remounts with the thread body, and each mount replaces
+                        // the observer.
                         div {
                             id: "dm-bottom-sentinel",
                             class: "h-px pointer-events-none",
@@ -1742,19 +1734,13 @@ struct ThreadSeenWitness {
 
 impl ThreadSeenWitness {
     /// Mark the thread seen up to its newest inbound DM if the reader can see
-    /// the end of the thread right now: the thread is in the foreground (the
-    /// tab is visible and it has layout, see `foreground::in_foreground`)
-    /// and the newest DM's bottom is on screen, within
-    /// `NEWEST_IN_VIEW_SLACK_PX`. The newest
-    /// inbound DM is at or above the newest DM, so the reader has reached it.
+    /// the end of the thread right now (`HistoryDom::end_seen`); the rule is
+    /// in `.claude/rules/history-scrolling.md`. Safe from a raw DOM callback:
+    /// it reads no signal, and `mark_thread_read` defers its write and never
+    /// moves backwards.
     ///
-    /// The same rule as rooms (`conversation.rs`'s `note_newest_seen`). Safe
-    /// from a raw DOM callback: it reads no signal, and
-    /// `mark_thread_read` defers its write and never moves backwards.
-    ///
-    /// Every caller runs while its thread is mounted (its effects, the Latest
-    /// click, and the sentinel observer, which is disconnected with the
-    /// thread), so the DOM ids it reads are this thread's.
+    /// Every caller runs while its thread is mounted, so the DOM ids it reads
+    /// are this thread's.
     #[cfg(target_arch = "wasm32")]
     fn check(&self) {
         let ts = self.newest_inbound_ts.get();

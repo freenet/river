@@ -48,16 +48,6 @@ pub static DM_LAST_SEEN: GlobalSignal<HashMap<(VerifyingKey, MemberId), u64>> =
 /// actually advance the stored cutoff? `current` is the existing
 /// `DM_LAST_SEEN` entry for the `(room, peer)` pair (`None` = no entry
 /// yet, which reads as cutoff 0 everywhere else).
-///
-/// Split out because the answer gates whether `mark_thread_read`
-/// touches the signal at all: `DmThreadModalBody` calls
-/// `mark_thread_read` from every read-rule trigger while a thread is
-/// open, and `with_mut` notifies subscribers even when the mutation changed
-/// nothing — so an unconditional write turned an open DM thread into a
-/// continuous write pulse on `DM_LAST_SEEN`, widening the contention
-/// window that blanked the DM rail (issue #499).
-/// Pinned by the `thread_read_needs_write_*` tests plus the wiring pin
-/// `mark_thread_read_write_is_gated_pinned`.
 fn thread_read_needs_write(current: Option<u64>, up_to_ts: u64) -> bool {
     up_to_ts > current.unwrap_or(0)
 }
@@ -66,21 +56,22 @@ fn thread_read_needs_write(current: Option<u64>, up_to_ts: u64) -> bool {
 /// `up_to_ts`. The open thread calls it only with an inbound DM the reader
 /// has had on screen with the tab visible; see
 /// `ThreadSeenWitness` in `dm_thread_modal.rs`.
+///
+/// The write is gated on [`thread_read_needs_write`]. The open thread calls
+/// this from every read-rule trigger, and `with_mut` notifies subscribers
+/// even when the mutation changed nothing, so an unconditional write turned
+/// an open DM thread into a continuous write pulse on `DM_LAST_SEEN`,
+/// widening the contention window that blanked the DM rail (issue #499).
 // Its one caller measures the DOM, so it exists only on wasm32.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
     crate::util::defer(move || {
-        // Skip the write when the stored cutoff would not advance —
-        // `with_mut` notifies subscribers even for a no-op mutation and
-        // this runs again and again while a thread is open (issue #499
-        // write-pulse). `try_peek` registers no subscription; it fails
-        // ONLY while a live WRITE borrow exists on `DM_LAST_SEEN` — and
-        // on that same synchronous stack `with_mut` (which is
-        // `f(&mut *self.write())`, a panicking borrow) would be a
-        // GUARANTEED panic. So a contended peek must SKIP, never fall
-        // through to the write, and nudge: the nudge re-runs the thread's
-        // witness effect, which calls this again. Pinned by
-        // `mark_thread_read_write_is_gated_pinned`.
+        // `try_peek` registers no subscription; it fails ONLY while a live
+        // WRITE borrow exists on `DM_LAST_SEEN` — and on that same
+        // synchronous stack `with_mut` (which is `f(&mut *self.write())`, a
+        // panicking borrow) would be a GUARANTEED panic. So a contended peek
+        // must SKIP, never fall through to the write, and nudge: the nudge
+        // re-runs the thread's witness effect, which calls this again.
         let Ok(needs_write) = DM_LAST_SEEN
             .try_peek()
             .map(|seen| thread_read_needs_write(seen.get(&(room, peer)).copied(), up_to_ts))
@@ -968,15 +959,12 @@ mod tests {
         }
     }
 
-    /// Issue #499 write-pulse: `mark_thread_read` is called from every
-    /// read-rule trigger while a thread is open, and `with_mut` notifies
-    /// subscribers even when the mutation is a no-op — so the `with_mut`
-    /// MUST stay gated on `thread_read_needs_write`. Source-scrape (the function needs a
-    /// Dioxus runtime to exercise): match whitespace-stripped source so
-    /// rustfmt reflowing can't fake a failure; cut at `mod tests` (this
-    /// file has exactly one) so these needles can't satisfy their own
-    /// check; bound the segment by the NEXT function head so a gate
-    /// elsewhere in the file can't vacuously pass.
+    /// `mark_thread_read`'s `with_mut` stays gated on
+    /// `thread_read_needs_write` (see its doc). Source-scrape (the function
+    /// needs a Dioxus runtime to exercise): match whitespace-stripped source
+    /// so rustfmt reflowing can't fake a failure; cut at `mod tests` so these
+    /// needles can't satisfy their own check; bound the segment by the NEXT
+    /// function head so a gate elsewhere in the file can't vacuously pass.
     #[test]
     fn mark_thread_read_write_is_gated_pinned() {
         let src = include_str!("direct_messages.rs");
@@ -1009,15 +997,9 @@ mod tests {
              re-applies its read rule (issue #499 write-pulse)"
         );
 
-        // A contended peek must SKIP the write and nudge. `try_peek` fails
-        // only while a live WRITE borrow exists on DM_LAST_SEEN, and on
-        // that same synchronous stack `with_mut` is a panicking borrow —
-        // so falling through (an `unwrap_or(true)`) is a guaranteed RefCell
-        // panic. The nudge re-runs the thread's witness effect, which calls
-        // mark_thread_read again, so the skipped advance is retried.
-        // (Needles built with concat! so this comment and the
-        // assertion literals cannot drift into matching themselves —
-        // they sit inside the cut anyway, belt and braces.)
+        // A contended peek must SKIP the write and nudge (see the comment in
+        // `mark_thread_read`). Needles built with concat! so the assertion
+        // literals cannot match themselves.
         let skip_on_contention = concat!(
             "else{crate::util::signal_guard::",
             "schedule_nudge();return;};"
@@ -1038,7 +1020,7 @@ mod tests {
         );
     }
 
-    /// Decision table for the issue #499 write-pulse gate.
+    /// Decision table for `thread_read_needs_write`.
     #[test]
     fn thread_read_needs_write_only_when_cutoff_advances() {
         // No stored entry: any positive timestamp advances the cutoff…

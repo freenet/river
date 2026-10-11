@@ -257,7 +257,7 @@ fn display_item_key(item: &DisplayItem) -> String {
 /// renders as a SINGLE keyed node — otherwise Dioxus takes the list key from
 /// the fragment's first root, which would be the keyless separator expression,
 /// silently dropping the whole group list to positional diffing and leaking
-/// per-group component state on mid-list edits (freenet/river#326 review).
+/// per-group component state on mid-list edits (freenet/river#326).
 enum DisplayRow {
     DateSeparator { key: String, label: String },
     Item(DisplayItem),
@@ -862,7 +862,7 @@ pub(crate) fn decrypt_message_content(
                 // (or the rotation fallback) will decrypt the actual
                 // content.
                 //
-                // Wording note (skeptical review M1 on PR #286): the
+                // Wording note (PR #286): the
                 // `secrets` map is `#[serde(skip)]`, so EVERY cold-start
                 // of an established private room transiently lands
                 // here until `repopulate_secrets_from_state` rehydrates
@@ -2608,12 +2608,10 @@ struct RangeHold {
     keep: Option<usize>,
 }
 
-/// A one-shot request to take the view to the end of `room`'s history:
-/// opening the room, the reader's own send, Latest, or an arrival followed for
-/// a reader at the end (`follow_arrival_at_end`). A room change replaces it,
-/// and the render drops one made for another room. The reading-position
-/// corrections stand down while it is pending. Any other arrival preserves the
-/// reader's place; see `.claude/rules/history-scrolling.md`.
+/// A one-shot request to take the view to the end of `room`'s history
+/// (`.claude/rules/history-scrolling.md`). The render drops one made for
+/// another room, and the reading-position corrections stand down while it is
+/// pending.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ScrollRequest {
     room: Option<ed25519_dalek::VerifyingKey>,
@@ -2638,10 +2636,7 @@ const READING_ANCHOR_ROWS: usize = 7;
 
 /// Does the end hold survive the step from the last render's range to this
 /// one, given each range's newest message (`None` for an empty range)? Only
-/// when both have one and it is unchanged: a change of newest message ends
-/// it, deleting the newest included. A backfill, a message inserted above the
-/// newest, a trim and rows changing height (decryption, an edit, an image)
-/// all keep it.
+/// when both have one and it is unchanged.
 fn end_hold_survives(before: Option<&MessageId>, now: Option<&MessageId>) -> bool {
     before.is_some() && before == now
 }
@@ -2690,7 +2685,7 @@ struct ReaderPosition {
     /// The IDENTITY of the item the last render's window started at, so
     /// arrivals GROW the window instead of sliding it (#501), and so index
     /// shifts from at-cap message pruning cannot move the head in content
-    /// space (#505 review, blocker 1). See [`WindowAnchor`].
+    /// space (#505). See [`WindowAnchor`].
     window_anchor: std::cell::RefCell<Option<WindowAnchor>>,
     /// Identity of a held range's last items (newest first), set only while
     /// `HistoryWindow::has_newer`. Relocated like `window_anchor`.
@@ -2734,13 +2729,10 @@ struct ReaderPosition {
     /// arrival against and what `note_newest_seen` publishes.
     range_newest: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, NewestKey)>>,
     /// The reading rows measured just before a patch that adds or removes
-    /// rows above them: the backfill sentinel's, before it grows the window,
-    /// and the render's, before it swaps the window head for a later item (the
-    /// head was pruned out from under the anchor, or newer paging slid past
-    /// it). With scroll anchoring off nothing else compensates, so
-    /// `correct_view_after_patch` puts the rows back where they were. Offsets
-    /// are from the view's top, so the clamp the browser applies when a patch
-    /// shortens the content, before the effect runs, cancels out (#505).
+    /// rows above them (the backfill, a head swap), for
+    /// `correct_view_after_patch` to put back. Offsets are from the view's
+    /// top, so the clamp the browser applies when a patch shortens the
+    /// content, before the effect runs, cancels out (#505).
     restore_after_patch: std::cell::RefCell<Option<ReadingAnchor>>,
 }
 
@@ -2889,12 +2881,7 @@ fn relocate_anchor(total: usize, hint: usize, is_anchor: impl Fn(usize) -> bool)
 /// toward rendering MORE history rather than losing the reader's place.
 ///
 /// The head reposition (`correct_view_after_patch`) compensates the reader for
-/// the TOP-CONTIGUOUS removals this relocation deals in (at-cap drains,
-/// batched or not, including a re-keyed multi-message head group, and small
-/// leading deletes the spares still cover). It does NOT make every removal
-/// invisible: a bulk MID-window removal (a ban purge) or late-loading media
-/// above the viewport still shifts the reader — tracked as follow-up
-/// work (#507), not covered here.
+/// the top-contiguous removals this relocation deals in.
 fn relocate_window(
     total: usize,
     anchor: &WindowAnchor,
@@ -2936,7 +2923,7 @@ fn relocate_tail(
 ///
 /// The relocation walk compares keys against up to every item on a miss;
 /// building a `String` per probe made that O(total) allocations per render at
-/// the at-cap steady state (#505 re-review).
+/// the at-cap steady state (#505).
 fn display_item_key_matches(item: &DisplayItem, key: &str) -> bool {
     match item {
         DisplayItem::Messages(group) => group.messages[0].id == key,
@@ -2958,7 +2945,7 @@ const TRIM_HEADROOM_PX: f64 = 200.0;
 /// short enough for that (browser zoom-out, a tall portrait monitor over a
 /// modest window) would re-fire the backfill the moment the trim lands:
 /// trim → backfill → restore → settle at the bottom → trim, a silent render
-/// loop at full speed (#505 re-review). The settle handler then skips the
+/// loop at full speed (#505). The settle handler then skips the
 /// trim and the window stays grown, bounded by the ceiling.
 ///
 /// The tail is measured. An average-row-height estimate looped on rooms whose
@@ -2978,7 +2965,7 @@ fn trim_would_rearm_backfill(retained_tail_px: i32, client_height: i32) -> bool 
 /// `requested` by the number of arrivals), and a growth step computed from the
 /// stale requested size can resolve to a start the anchor already renders —
 /// zero new rows, no DOM change, so the sentinel's IntersectionObserver never
-/// re-fires and paging dead-ends (#505 review, blocker 2). Growing from the
+/// re-fires and paging dead-ends (#505). Growing from the
 /// rendered size guarantees every step reveals `WINDOW_GROWTH_ITEMS` more
 /// items than are currently on screen.
 fn grown_window(requested: usize, rendered: usize) -> usize {
@@ -3051,7 +3038,7 @@ impl HistoryWindow {
         // The ceiling on arrival growth; never on reader-requested backfill.
         // One growth step of grace above the requested size, so a range
         // backfilled to the ceiling still renders the next arrivals before its
-        // end holds (#505 review).
+        // end holds (#505).
         let cap = (window + WINDOW_GROWTH_ITEMS)
             .max(WINDOW_ITEMS_CEILING)
             .max(1);
@@ -3091,7 +3078,7 @@ fn resolve_rendered_range(
 ) -> (HistoryWindow, bool) {
     // Re-locate the anchored window by IDENTITY: at-cap pruning shifts every
     // index, so the stored index is only a hint, and the head key alone can
-    // vanish while its neighbors survive (#505 blockers; see `WindowAnchor`
+    // vanish while its neighbors survive (#505; see `WindowAnchor`
     // and `relocate_window`). A pending request (Latest, an own send) swaps a
     // held range for the latest one, so it forgets all three.
     let select_latest = reader.request.get().is_some() && reader.has_newer.get();
@@ -3413,27 +3400,24 @@ fn land_at_end(reader: &ReaderPosition, container: &web_sys::Element) {
 /// - The head reposition, when the render swapped the window head for a
 ///   later item: the head was pruned out from under the anchor (an at-cap
 ///   room drains its oldest message on every arrival), or newer paging slid
-///   the start past it (#505 review, blocker 1). With `overflow-anchor: none`
-///   the browser no longer compensates, so this is the one piece of scroll
-///   anchoring reimplemented under our own control.
+///   the start past it (#505).
 ///
-/// Known limitation, deliberately accepted: a mid-window removal (a deletion,
-/// a ban purge) or late-loading media above the viewport still shifts the
-/// reader — rare events, versus the every-arrival churn this compensates
-/// (#507). Full generality is what browser scroll anchoring does; it stays
-/// off because Safari before 27 has none.
+/// Browser scroll anchoring is off (see the container's `style`), so nothing
+/// else compensates. A mid-window removal or late-loading media above the
+/// viewport still shifts the reader: #507, in
+/// `.claude/rules/history-scrolling.md`.
 ///
 /// Synchronous, not deferred: Dioxus has already patched the DOM when effects
 /// run, and reading layout here forces the reflow the correction needs. A
 /// macrotask hop let the browser paint one frame of the moved rows at the
 /// wrong offset before the correction landed — a flicker native scroll
-/// anchoring used to mask (#505 review).
+/// anchoring used to mask (#505).
 #[cfg(target_arch = "wasm32")]
 fn correct_view_after_patch(reader: &ReaderPosition) {
     let Some(anchor) = reader.restore_after_patch.borrow_mut().take() else {
         return;
     };
-    // An explicit request owns the view until it lands (#501 H3).
+    // An explicit request owns the view until it lands (#501).
     if reader.request.get().is_some() {
         return;
     }
@@ -3443,14 +3427,11 @@ fn correct_view_after_patch(reader: &ReaderPosition) {
     }
 }
 
-/// Follow an arrival for a reader at the end: ask for one move to the end when
-/// this render brings a newer newest message (`is_arrival`) and, before the
-/// patch, the room was in the foreground (`foreground::in_foreground`) with its
-/// newest message's bottom within `FOLLOW_BAND_PX` of the view's bottom
-/// edge. Runs in render, so the DOM still shows the previous render; measuring
-/// after the patch would count the arrival's own height against the band.
-/// Stateless: nothing is remembered between arrivals, so nothing can latch
-/// (#486, #508, #723). See `.claude/rules/history-scrolling.md`.
+/// Follow an arrival for a reader at the end, by the rule in
+/// `.claude/rules/history-scrolling.md`: ask for one move to the end when this
+/// render brings a newer newest message and `HistoryDom::arrival_follows`.
+/// Runs in render, so the DOM still shows the previous render; measuring after
+/// the patch would count the arrival's own height against the band.
 #[cfg(target_arch = "wasm32")]
 fn follow_arrival_at_end(
     groups: &[DisplayItem],
@@ -3501,7 +3482,7 @@ fn complete_scroll_request(reader: &ReaderPosition, mut opening_snap_done: Signa
     }
     reader.request.set(None);
     land_at_end(reader, &container);
-    // The strips wait for the view to reach the end once (#501 H2). Deferred:
+    // The strips wait for the view to reach the end once (#501). Deferred:
     // this can run from a raw observer callback, and the signal is rendered.
     crate::util::defer(move || {
         if CURRENT_ROOM.peek().owner_key == request.room && !*opening_snap_done.peek() {
@@ -3511,18 +3492,10 @@ fn complete_scroll_request(reader: &ReaderPosition, mut opening_snap_done: Signa
     true
 }
 
-/// Publish the newest message as seen if the reader can see it now: the history
-/// is in the foreground (`foreground::in_foreground`: the tab is visible, it
-/// has layout, and no DM thread covers it) and not awaiting its reveal restore, the
-/// rendered range reaches the room's latest message, and that message's bottom
-/// is on screen. Marking a room read never goes past what
-/// this publishes; see `document_title::NEWEST_SEEN`.
-///
-/// Called wherever one of those can change: the Latest observer, each settle,
-/// each render, the reveal, a completed request, the tab becoming visible and
-/// a DM thread closing.
-/// Touches no signal itself, so raw JS callbacks may call it; the write is
-/// deferred.
+/// Publish the newest message as seen if the reader can see it now (the read
+/// rule in `.claude/rules/history-scrolling.md`). Marking a room read never
+/// goes past what this publishes; see `document_title::NEWEST_SEEN`. Touches
+/// no signal itself, so raw JS callbacks may call it; the write is deferred.
 #[cfg(target_arch = "wasm32")]
 fn note_newest_seen(reader: &ReaderPosition) {
     // Only a range that reaches the latest message has a candidate.
@@ -3615,7 +3588,7 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
             }
             // See `trim_is_due`. Any settle counts, ours included, so a touch
             // reader who only returns to the bottom through the
-            // scroll-to-latest button still trims (#505 review).
+            // scroll-to-latest button still trims (#505).
             //
             // Deferred: this runs from a raw JS callback with no Dioxus scope,
             // and `window_items` is a signal the render subscribes to. See
@@ -3883,7 +3856,7 @@ pub fn Conversation() -> Element {
     // sentinel only mounts once this is true: a freshly-opened >window room
     // renders at `scrollTop = 0` for a beat before the snap runs, and a
     // sentinel mounted during that beat is intersecting, fires, and cascades
-    // the backfill until the whole room is rendered (#501 H2). A signal, not a
+    // the backfill until the whole room is rendered (#501). A signal, not a
     // `Cell`, because the sentinel's `if` in rsx renders from it. Set by
     // `complete_scroll_request`.
     let mut opening_snap_done = use_signal(|| false);
@@ -3892,7 +3865,7 @@ pub fn Conversation() -> Element {
     // room — not only in the effect below, which runs AFTER the first render
     // of the new room has already resolved against the OLD room's anchor and
     // requested size (cloning and patching up to a fully-backfilled room's
-    // depth for one wasted frame; #505 review). Cells are safe to write
+    // depth for one wasted frame; #505). Cells are safe to write
     // during render; the signals (`window_items`, `opening_snap_done`) still
     // reset in the effect, so this render substitutes `INITIAL_WINDOW_ITEMS`
     // below and keeps the sentinel unmounted until they catch up.
@@ -3917,7 +3890,7 @@ pub fn Conversation() -> Element {
             // The new room opens at its newest message; this also cancels a
             // request made in the old room, and drops the captures taken from
             // the OLD room's geometry, which must not restore into the new
-            // room (#505 re-review).
+            // room (#505).
             reader_position.request_end(room);
             reader_position.extend_newer.set(false);
             reader_position
@@ -4181,14 +4154,7 @@ pub fn Conversation() -> Element {
         groups
     });
 
-    // Use IntersectionObserver to track whether the user is near the bottom of the
-    // chat scroll container.  This replaces the old `onscroll` handler that performed
-    // DOM queries (scrollTop / clientHeight / scrollHeight) on every scroll event,
-    // causing visible scroll-bar jank on mobile (issue #151).
-    //
-    // A 1px invisible sentinel div sits right under the newest rendered row,
-    // inside `#chat-content` and above its bottom padding, so it intersects
-    // exactly while that row's bottom is on screen (see `observe_sentinel`).
+    // The Latest observer on `bottom-sentinel` (`observe_newest`).
     #[cfg(target_arch = "wasm32")]
     let observer_reader = reader_position.clone();
     #[cfg(target_arch = "wasm32")]
@@ -4228,15 +4194,9 @@ pub fn Conversation() -> Element {
         });
     }
 
-    // After each render that can move rows, in this order: the backfill
-    // restore and the head reposition (`correct_view_after_patch`), which
-    // stand down while an explicit request is pending, then finishing that
-    // request (`complete_scroll_request`), which waits for the render it asked
-    // for: the new room's rows, the sent message, or the latest range Latest
-    // selected. A hidden panel's request is finished by the reveal instead
-    // (see `on_history_resize`). Last, the read rule against what the render
-    // left on screen: a deletion can bring the newest message into view, and
-    // a short room shows an arrival in full.
+    // After each render that can move rows: the patch corrections, which
+    // stand down while a request is pending, then the pending request, then
+    // the read rule against what the render left on screen.
     #[cfg(target_arch = "wasm32")]
     {
         let reader_position = reader_position.clone();
@@ -4332,7 +4292,7 @@ pub fn Conversation() -> Element {
                 // that actually protects the ROOMS write is the
                 // `crate::util::defer` below (a real setTimeout) — inlining
                 // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512 review).
+                // handler's stack (freenet/river#512).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -4511,7 +4471,7 @@ pub fn Conversation() -> Element {
                 // that actually protects the ROOMS write is the
                 // `crate::util::defer` below (a real setTimeout) — inlining
                 // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512 review).
+                // handler's stack (freenet/river#512).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -4643,7 +4603,7 @@ pub fn Conversation() -> Element {
                 // that actually protects the ROOMS write is the
                 // `crate::util::defer` below (a real setTimeout) — inlining
                 // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512 review).
+                // handler's stack (freenet/river#512).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -4772,14 +4732,14 @@ pub fn Conversation() -> Element {
                 // ONLY after the delta applies locally — a rejected send
                 // (empty, over-size, serialize/sign/delta failure) then leaves
                 // the scroll position untouched rather than taking a later
-                // unrelated message to the end (#402 review).
+                // unrelated message to the end (#402).
                 let reader_position = reader_position.clone();
                 // Retained even though this block no longer awaits anything:
                 // it keeps the body off the event handler's stack. The guard
                 // that actually protects the ROOMS write is the
                 // `crate::util::defer` below (a real setTimeout) — inlining
                 // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512 review).
+                // handler's stack (freenet/river#512).
                 spawn_local(async move {
                     use river_core::room_state::content::{
                         ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
@@ -4954,7 +4914,7 @@ pub fn Conversation() -> Element {
                             // the room this send targeted. This runs two task
                             // hops after the keypress (`spawn_local`, then
                             // `defer`'s setTimeout), so they may have switched
-                            // rooms (#402 review).
+                            // rooms (#402).
                             if CURRENT_ROOM.peek().owner_key == Some(current_room) {
                                 reader_position.request_end(Some(current_room));
                             }
@@ -5440,33 +5400,20 @@ pub fn Conversation() -> Element {
                     // Invisible sentinel right under the newest rendered row,
                     // after the history list and above `#chat-content`'s bottom
                     // padding, so its top edge is that row's bottom (the
-                    // newer-history strip before it has no height). An
-                    // IntersectionObserver watches it instead of using
-                    // onscroll, which avoids per-scroll-event DOM queries that
-                    // cause scroll jank on mobile (see issue #151), and the
-                    // read rule measures it (`HistoryDom::end_seen`).
+                    // newer-history strip before it has no height). Watched by
+                    // `observe_newest` and measured by `HistoryDom::end_seen`.
                     div {
                         id: "bottom-sentinel",
                         class: "h-px pointer-events-none",
                     }
                 }
             }
-                // Scroll-to-latest button (#402): shown whenever the newest
-                // message's bottom is off screen, past a few px of slack.
-                // Reuses the `newest_in_view` IntersectionObserver
-                // state, so it appears after scrolling up even a little, or
-                // when an arrival lands below the view, and hides once the
-                // newest message's bottom is in view. Handy on every device but
-                // especially on touch, where there is no scrollbar to drag.
-                //
-                // Also shown while a held range withholds newer items.
+                // Latest (#402): shown while the newest message's bottom is off
+                // screen, or a held range withholds newer items.
                 if !newest_in_view() || reader_position.has_newer.get() {
                     LatestButton {
                         aria_label: "Scroll to latest messages",
                         test_id: "scroll-to-bottom",
-                        // Do NOT optimistically set `newest_in_view` here: the
-                        // IntersectionObserver flips it (hiding the button) once
-                        // the sentinel actually reaches view. #402.
                         onclick: {
                             let reader_position = reader_position.clone();
                             move |_| {
@@ -5682,7 +5629,7 @@ pub fn Conversation() -> Element {
                         // which arms the 60s backstop, runs only after a
                         // successful connect — so without the pill that user
                         // would watch a spinner with nothing telling them the
-                        // socket is down (#509 review).
+                        // socket is down (#509).
                         match crate::components::room_list::current_room_list_display() {
                             crate::components::room_list::RoomListDisplay::Loading => rsx! {
                                 div {
@@ -5863,14 +5810,14 @@ fn MessageGroupComponent(
     // right-anchored (open leftward). Chosen from the tap's horizontal position
     // so the menu always opens toward the viewport centre regardless of
     // self/other side or bubble width, and never clips its content off a narrow
-    // screen edge (#402 review).
+    // screen edge (#402).
     let mut menu_align_left: Signal<bool> = use_signal(|| false);
 
     // Max height (px) for the kebab action menu, measured at tap time as the
     // actual space available on the chosen side within the chat scrollport. The
     // menu is `overflow-y-auto`, so on a very short/landscape viewport where it
     // fits neither side fully it scrolls internally instead of being clipped by
-    // the scroll container with Edit/Delete unreachable (#402 review).
+    // the scroll container with Edit/Delete unreachable (#402).
     let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
 
     // Track if emoji picker should appear above (true) or below (false) the button
@@ -6484,14 +6431,14 @@ fn MessageGroupComponent(
                                                 // `right-full`/`left-full` (NOT `translate`): a transform
                                                 // would become the containing block for the `fixed`
                                                 // dismiss backdrop below, shrinking it to this element
-                                                // instead of the viewport (#402 review).
+                                                // instead of the viewport (#402).
                                                 // Raise the OPEN wrapper above sibling kebabs: every
                                                 // `.touch-actions` is z-50, and later ones paint above an
                                                 // open popover, so without this a nearby message's kebab
                                                 // could sit over the menu rows and steal the tap. `z-[60]`
                                                 // lifts the whole open popover+backdrop above them (and its
                                                 // backdrop then covers those kebabs, so a tap on one just
-                                                // dismisses). (#402 review)
+                                                // dismisses). (#402)
                                                 class: format!(
                                                     "touch-actions absolute top-1 {} {}",
                                                     if menu_open { "z-[60]" } else { "z-50" },
@@ -6530,7 +6477,7 @@ fn MessageGroupComponent(
                                                             // fit below AND there's more room above. A received menu
                                                             // (2 rows) is shorter than an own menu (4 rows), so it
                                                             // stays down in cases where an own menu would flip.
-                                                            // (#402 review)
+                                                            // (#402)
                                                             let (sp_top, sp_bottom) = web_sys::window()
                                                                 .and_then(|w| w.document())
                                                                 .and_then(|d| {
@@ -6569,7 +6516,7 @@ fn MessageGroupComponent(
                                                                 menu_align_left.set(align_left);
                                                                 menu_max_h.set(max_h);
                                                                 // Dismiss any open reaction picker so the two
-                                                                // popovers can't stack (#402 review).
+                                                                // popovers can't stack (#402).
                                                                 open_emoji_picker.set(None);
                                                                 open_action_menu.set(Some(id));
                                                             });
@@ -6621,7 +6568,7 @@ fn MessageGroupComponent(
                                                                 let picker_id = format!("inline-{}", msg_id_menu_react);
                                                                 // Inherit the kebab's flip direction so the picker
                                                                 // for a bottom message also opens upward, not
-                                                                // clipped by the composer (#402 review).
+                                                                // clipped by the composer (#402).
                                                                 let above = *menu_show_above.peek();
                                                                 crate::util::defer(move || {
                                                                     picker_show_above.set(above);
@@ -6755,7 +6702,7 @@ fn MessageGroupComponent(
                                                 // Raise the whole picker (grid + z-40 backdrop) above the
                                                 // z-50 message kebabs while it's open, so a nearby closed
                                                 // kebab can't paint over the emoji grid and steal a tap
-                                                // (mirrors the action menu's z-[60] behaviour). (#402 review)
+                                                // (mirrors the action menu's z-[60] behaviour). (#402)
                                                 class: format!(
                                                     "relative group/react inline-flex items-center {}",
                                                     if is_inline_picker_open { "z-[60]" } else { "" }
@@ -7245,7 +7192,7 @@ mod tests {
 
         // Arrival-grace headroom: a range backfilled TO the ceiling still
         // renders the next few arrivals — the cap sits one growth step above
-        // the request (#505 review).
+        // the request (#505).
         let at_ceiling = WINDOW_ITEMS_CEILING;
         let anchor = 1000 - at_ceiling;
         let w = HistoryWindow::resolve(1010, at_ceiling, Some(anchor));
@@ -7268,7 +7215,7 @@ mod tests {
         }
     }
 
-    /// #505 blocker 1: the anchor is re-located by IDENTITY. An at-cap room
+    /// #505: the anchor is re-located by IDENTITY. An at-cap room
     /// prunes its oldest message per arrival, shifting every index down — the
     /// walk below is that steady state, and the head must stay the same ITEM
     /// (its index marching toward 0), not the same index.
@@ -7315,7 +7262,7 @@ mod tests {
         );
     }
 
-    /// #505 re-review blocker: a MULTI-message head group RE-KEYS when an
+    /// #505: a MULTI-message head group RE-KEYS when an
     /// at-cap drain consumes its first message (a group's key is its first
     /// message's id). The old key is gone while the group itself survives —
     /// the spares must still pin the window to the survivors.
@@ -7403,7 +7350,7 @@ mod tests {
     }
 
     /// Skip the trim when the measured tail would leave the backfill strip in
-    /// view; trim and backfill would otherwise loop (#505 re-review).
+    /// view; trim and backfill would otherwise loop (#505).
     #[test]
     fn the_trim_skips_when_the_tail_would_rearm_the_sentinel() {
         let reach = |client: i32| client + BACKFILL_LEAD_PX + TRIM_HEADROOM_PX as i32;
@@ -7431,8 +7378,7 @@ mod tests {
     }
 
     /// Past the ceiling, the range holds its end instead of sliding its start,
-    /// wherever the reader is, and later arrivals don't grow it (#732 review
-    /// 42f541b6).
+    /// wherever the reader is, and later arrivals don't grow it (#732).
     #[test]
     fn the_range_holds_its_end_at_the_ceiling() {
         let opened = HistoryWindow::resolve(201, INITIAL_WINDOW_ITEMS, None);
@@ -7618,10 +7564,10 @@ mod tests {
         assert_eq!(relocate_anchor(0, 0, |_| true), None, "empty list");
     }
 
-    /// #505 blocker 2: one backfill growth step must always reveal more than
+    /// #505: one backfill growth step must always reveal more than
     /// what is RENDERED — growing from the stale requested size can resolve to
     /// a start the anchor already renders (zero new rows, sentinel never
-    /// re-fires, paging dead-ends). The trace is the review's: open at 1000
+    /// re-fires, paging dead-ends). The trace: open at 1000
     /// items, 61 arrivals, page up.
     #[test]
     fn a_growth_step_reveals_rows_even_after_arrivals_grew_the_window() {
@@ -7715,7 +7661,7 @@ mod tests {
         // Anchored on needles unique to the ROOM-SWITCH reset. The obvious
         // needle — `window_items.set(INITIAL_WINDOW_ITEMS)` — also matches
         // the bottom-settle trim, so deleting the room reset would have
-        // false-passed against it (#505 review).
+        // false-passed against it (#505).
         assert!(
             squashed.contains(
                 "prev_render_room.set(Some(room));*reader_position.window_anchor.borrow_mut()=None;"
@@ -9406,7 +9352,7 @@ mod tests {
     fn marker_in_query_string_not_beautified() {
         // External redirect URLs that happen to embed the marker in a query
         // parameter must NOT be presented as Freenet links — that would be a
-        // phishing vector (caught by Codex review of #223).
+        // phishing vector (#223).
         let url = format!("https://evil.example/redirect?next=/v1/contract/web/{SAMPLE_ID}/");
         let html = message_to_html(&url);
         assert!(
@@ -9613,7 +9559,7 @@ mod tests {
         // `..` segments. Without this guard, the same-origin rewrite would
         // hand the browser a path that normalizes onto unrelated endpoints
         // on the reader's local gateway — turning a paste into a CSRF-style
-        // redirect. (Caught in skeptical review of #224.)
+        // redirect. (#224)
         let url = format!(
             "http://attacker.example/v1/contract/web/{SAMPLE_ID}/../../v1/peer/diagnostics"
         );
@@ -11495,12 +11441,9 @@ mod autoscroll_wiring_pins {
         );
     }
 
-    /// The scroll container must opt out of browser scroll anchoring. Safari
-    /// before 27 has none, so the app's own corrections (backfill restore, head
-    /// reposition, reveal restore) are the single owner of the reader's
-    /// position; with anchoring on as well, every other engine would apply both
-    /// and over-correct, and CI (whose WebKit anchors) could not see what iOS 26
-    /// and older do.
+    /// The scroll container opts out of browser scroll anchoring (see the
+    /// comment at its `style`). With anchoring on, CI's WebKit, which anchors,
+    /// could not see what iOS 26 and older do.
     #[test]
     fn the_scroll_container_disables_scroll_anchoring() {
         assert!(
@@ -11514,12 +11457,8 @@ mod autoscroll_wiring_pins {
     /// The #501/#505 windowing races the browser suite catches only when they
     /// fire, so these pins are their deterministic guard: the deferred trim
     /// re-checks the room, the backfill restore stands down while an explicit
-    /// request is pending (H3), and the backfill sentinel waits for the
-    /// opening (H2) and for the room-switch reset to catch up. The rest of
-    /// the trim contract (at the bottom only, within the slack, re-measured,
-    /// geometry-gated) is covered on every browser project by the
-    /// conversation-autoscroll "Render ceiling and trimming" and "very tall
-    /// viewport" tests.
+    /// request is pending, and the backfill sentinel waits for the opening and
+    /// for the room-switch reset to catch up.
     #[test]
     fn the_window_trims_at_the_bottom_and_backfill_waits_for_the_opening() {
         let dense = dense_production_source();
@@ -11555,8 +11494,7 @@ mod autoscroll_wiring_pins {
     /// backfill sentinel before it grows the window, and the render when it
     /// swaps the head. The restore measures from the view's top, so neither
     /// the browser's clamp of `scrollTop` nor rows appended below the view in
-    /// the same patch move it. The rest is covered on every browser project by
-    /// the conversation-autoscroll at-cap drain, newer-page and backfill tests.
+    /// the same patch move it.
     #[test]
     fn head_swaps_reposition_the_reader() {
         let dense = dense_production_source();

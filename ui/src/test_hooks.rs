@@ -111,7 +111,7 @@ pub fn install_test_hooks() {
     // A burst in ONE state mutation — one delta application, one re-render —
     // as a network delta carrying many messages produces. The windowing specs
     // use it to grow an anchored window well past one backfill step without
-    // paying per-delivery render round-trips (#505 blocker 2).
+    // paying per-delivery render round-trips (#505).
     set_hook(
         "appendMessages",
         Closure::<dyn FnMut(u32)>::new(move |count: u32| {
@@ -257,7 +257,7 @@ thread_local! {
 /// APPENDED arrivals ALTERNATE between two identities per message, so a burst
 /// of N arrivals is N display items rather than folding into one group — a
 /// six-arrival follow loop that renders as a single item exercises the
-/// windowing's grow/trim interleave zero times (#505 review).
+/// windowing's grow/trim interleave zero times (#505).
 fn test_author(delivery: Delivery) -> (SigningKey, &'static str) {
     match delivery {
         Delivery::Append => {
@@ -367,7 +367,7 @@ fn push_test_message(
 /// What a real arrival does once the room is at `max_recent_messages`: drain
 /// the oldest. Mirrors `MessagesV1::apply_delta`
 /// (common/src/room_state/message.rs) — without this, the hooks grow the
-/// message list unboundedly and the at-cap index-shift path (#505 blocker 1)
+/// message list unboundedly and the at-cap index-shift path (#505)
 /// is unreachable from the browser suite.
 fn prune_to_cap(room: &mut RoomData) {
     let max = room
