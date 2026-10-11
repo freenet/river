@@ -104,7 +104,9 @@ Accepted trade-offs:
   grows or the phone keyboard opens, the browser keeps the view's top edge,
   so the bottom of the view is covered. Paging and panel reveals retain their
   reading-position corrections; deleting the reading row uses the row above
-  as the preferred fallback.
+  as the preferred fallback. The reading row is the first row whose top lies
+  inside the view, else the row the view's top cuts through (a message
+  taller than the view, not the row starting below the fold).
 - Latest appears when the newest message's bottom is more than 4px below
   the visible area, or a held range withholds newer messages. The margin is
   measured against the message, not the padding below it.
@@ -125,7 +127,8 @@ bulk removal above a parked reader remain follow-up work.
 ## DM threads
 
 DM threads share the policy: opening, own send and Latest jump instantly,
-and an inbound DM follows a reader at the end by the rule above, with the
+an own send being one to this thread (a send completing in another thread,
+counted per `(room, peer)`, never moves it), and an inbound DM follows a reader at the end by the rule above, with the
 same band. A thread opened empty has no opening to place, so its first DMs
 follow by the same rule (in a hidden tab they leave it at the top). Latest
 uses the same 4px message-bottom margin. The thread updates its read cutoff
