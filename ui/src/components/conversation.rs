@@ -204,8 +204,8 @@ struct EventSummary {
     /// [`NewestKey`]). The clamped `last_time` still controls presentation and
     /// grouping.
     last_sent_ms: i64,
-    /// The newest event folded in, for the read rule (see
-    /// [`display_item_last_message_id`]).
+    /// The newest event folded in, for the follow and read rules (see
+    /// [`display_item_newest`]).
     last_message_id: MessageId,
 }
 
@@ -227,13 +227,17 @@ fn display_item_time_ms(item: &DisplayItem) -> i64 {
     }
 }
 
-/// The newest display message `item` renders: what the read rule marks when
-/// the item is the newest one on screen.
-fn display_item_last_message_id(item: &DisplayItem) -> Option<MessageId> {
-    match item {
-        DisplayItem::Messages(group) => group.messages.last().map(|m| m.message_id.clone()),
-        DisplayItem::Event(summary) => Some(summary.last_message_id.clone()),
-    }
+/// The newest display message `item` renders: what the follow rule compares,
+/// and what the read rule marks when the item is the newest one on screen.
+fn display_item_newest(item: &DisplayItem) -> Option<NewestKey> {
+    let (time_ms, id) = match item {
+        DisplayItem::Messages(group) => {
+            let message = group.messages.last()?;
+            (message.sent_ms, message.message_id.clone())
+        }
+        DisplayItem::Event(summary) => (summary.last_sent_ms, summary.last_message_id.clone()),
+    };
+    Some(NewestKey { time_ms, id })
 }
 
 /// The stable per-item key used on the item's rendered root, reused to derive
@@ -2658,15 +2662,9 @@ struct NewestKey {
 }
 
 /// The [`NewestKey`] of the last display item, if any.
-fn newest_key(groups: &[DisplayItem]) -> Option<NewestKey> {
-    let (time_ms, id) = match groups.last()? {
-        DisplayItem::Messages(group) => {
-            let message = group.messages.last()?;
-            (message.sent_ms, message.message_id.clone())
-        }
-        DisplayItem::Event(summary) => (summary.last_sent_ms, summary.last_message_id.clone()),
-    };
-    Some(NewestKey { time_ms, id })
+#[cfg(test)]
+fn newest_key(items: &[DisplayItem]) -> Option<NewestKey> {
+    items.last().and_then(display_item_newest)
 }
 
 /// The value a contended read stands in with: the last good one, but only if
@@ -2723,14 +2721,6 @@ struct ReaderPosition {
     extend_newer: std::cell::Cell<bool>,
     /// Bumped on every room change, so a deferred trim can detect one.
     room_epoch: std::cell::Cell<u64>,
-    /// The room and newest display message of the last render, set only when
-    /// its range reaches the room's latest message. What `note_newest_seen`
-    /// publishes once its bottom is on screen.
-    newest_rendered: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, MessageId)>>,
-    /// The room and [`NewestKey`] of the last render whose range reached the
-    /// room's latest message: what `follow_arrival_at_end` compares an
-    /// arrival against.
-    newest_key: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, NewestKey)>>,
     /// The last value `note_newest_seen` published, so a repeat check (every
     /// settle, every render) schedules nothing.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -2748,10 +2738,12 @@ struct ReaderPosition {
     /// hiding end it; an arrival that is followed lands a new request, which
     /// holds again.
     end_hold: std::cell::Cell<Option<i32>>,
-    /// The newest message of the last render's range (`None` for an empty
-    /// range), so the next render can tell a change of newest message from
-    /// rows changing height.
-    range_newest: std::cell::RefCell<Option<MessageId>>,
+    /// The room and newest message of the last render's range (`None` for an
+    /// empty range). The next render tells a change of newest message from
+    /// rows changing height by it. While the range reaches the room's latest
+    /// message (`!has_newer`), it is what `follow_arrival_at_end` compares an
+    /// arrival against and what `note_newest_seen` publishes.
+    range_newest: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, NewestKey)>>,
     /// The backfill sentinel's capture just before it grows the window, so
     /// the restore can put the reader back on the row they were looking at.
     /// See [`ProbeCapture`] and `correct_view_after_patch`.
@@ -2792,7 +2784,6 @@ impl ReaderPosition {
     /// range, so the next render's range is never compared against it.
     fn forget_range(&self) {
         *self.range_newest.borrow_mut() = None;
-        *self.newest_key.borrow_mut() = None;
         self.end_hold.set(None);
     }
 }
@@ -3283,16 +3274,11 @@ fn resolve_rendered_range(
     // A change of newest message ends the end hold; anything else keeps it.
     // Against the last render, so a request's own render (an own
     // send's message) comes before its hold.
-    let shown_newest = shown.last().and_then(display_item_last_message_id);
+    let shown_newest = room.zip(shown.last().and_then(display_item_newest));
     let before = reader.range_newest.replace(shown_newest.clone());
-    if !end_hold_survives(before.as_ref(), shown_newest.as_ref()) {
+    let id = |newest: &Option<(_, NewestKey)>| newest.as_ref().map(|(_, key)| key.id.clone());
+    if !end_hold_survives(id(&before).as_ref(), id(&shown_newest).as_ref()) {
         reader.end_hold.set(None);
-    }
-    // The read rule's candidate: only a range that reaches the latest message
-    // has it.
-    if !history_window.has_newer {
-        *reader.newest_rendered.borrow_mut() = room.zip(shown_newest);
-        *reader.newest_key.borrow_mut() = room.zip(newest_key(groups));
     }
     // Tell the settle handler whether a bottom-settle trim would shrink
     // anything.
@@ -3668,12 +3654,13 @@ fn follow_arrival_at_end(
         return;
     };
     let previous = reader
-        .newest_key
+        .range_newest
         .borrow()
         .as_ref()
         .filter(|(rendered_room, _)| *rendered_room == room)
         .map(|(_, key)| key.clone());
-    if !is_arrival(previous.as_ref(), newest_key(groups).as_ref(), false) {
+    let now = groups.last().and_then(display_item_newest);
+    if !is_arrival(previous.as_ref(), now.as_ref(), false) {
         return;
     }
     if ROOM_HISTORY.arrival_follows() {
@@ -3727,7 +3714,16 @@ fn complete_scroll_request(reader: &ReaderPosition, mut opening_snap_done: Signa
 /// deferred.
 #[cfg(target_arch = "wasm32")]
 fn note_newest_seen(reader: &ReaderPosition) {
-    let Some(newest) = reader.newest_rendered.borrow().clone() else {
+    // Only a range that reaches the latest message has a candidate.
+    if reader.has_newer.get() {
+        return;
+    }
+    let Some(newest) = reader
+        .range_newest
+        .borrow()
+        .as_ref()
+        .map(|(room, key)| (*room, key.id.clone()))
+    else {
         return;
     };
     if reader.seen_noted.borrow().as_ref() == Some(&newest) {
@@ -5380,9 +5376,6 @@ pub fn Conversation() -> Element {
                     id: "chat-scroll-container",
                     div { class: "max-w-4xl mx-auto px-4 py-4", id: "chat-content",
                     {
-                        // Set again below when this render's range reaches the
-                        // room's latest message.
-                        *reader_position.newest_rendered.borrow_mut() = None;
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
                             match message_groups.read().as_deref() {
@@ -12000,7 +11993,7 @@ mod reader_state_tests {
     /// The newest message id of a render of `items`, as the resolver
     /// extracts it.
     fn newest(items: &[DisplayItem]) -> Option<MessageId> {
-        items.last().and_then(display_item_last_message_id)
+        items.last().and_then(display_item_newest).map(|key| key.id)
     }
 
     /// `items` with `extra` inserted above the last one.
