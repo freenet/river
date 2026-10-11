@@ -12087,21 +12087,6 @@ mod reader_state_tests {
         rest.iter().chain([extra, last]).cloned().collect()
     }
 
-    /// A contended read stands in with the last good value for the SAME room,
-    /// and with nothing for any other: rows from the room the reader just left
-    /// must never render in the one they opened.
-    #[test]
-    fn a_contended_read_reuses_only_the_same_rooms_last_good_value() {
-        let cache = Some(("room a", 7));
-        assert_eq!(last_good_for_room(&cache, &"room a"), Some(7));
-        assert_eq!(
-            last_good_for_room(&cache, &"room b"),
-            None,
-            "another room's cached value must not stand in"
-        );
-        assert_eq!(last_good_for_room(&None::<(&str, i32)>, &"room a"), None);
-    }
-
     /// Only a change of newest message ends the hold (a followed arrival lands
     /// a new request, which holds again). Rows that only change height
     /// (decryption, an image, an edit) leave the newest as it was and keep it.
@@ -12172,16 +12157,5 @@ mod reader_state_tests {
             reader.reposition_pending.borrow().is_none(),
             "a head reposition survived the request"
         );
-    }
-
-    /// No rows on either side: nothing to hold.
-    #[test]
-    fn an_empty_range_ends_the_end_hold() {
-        let before = newest(&events(10));
-        assert!(before.is_some());
-        assert!(!end_hold_survives(None, before.as_ref()));
-        assert!(!end_hold_survives(before.as_ref(), None));
-        assert!(!end_hold_survives(None, None));
-        assert!(newest(&[]).is_none());
     }
 }

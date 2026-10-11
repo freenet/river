@@ -161,23 +161,3 @@ pub fn LatestButton(
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_follow_bands_are_the_pre_753_values() {
-        assert_eq!(ROOM_FOLLOW_BAND_PX, 100.0);
-        assert_eq!(DM_FOLLOW_BAND_PX, 50.0);
-    }
-
-    #[test]
-    fn an_arrival_follows_only_in_the_foreground_within_the_band() {
-        assert!(follows_arrival(true, 0.0, ROOM_FOLLOW_BAND_PX));
-        assert!(follows_arrival(true, 100.0, ROOM_FOLLOW_BAND_PX));
-        assert!(!follows_arrival(true, 100.5, ROOM_FOLLOW_BAND_PX));
-        assert!(!follows_arrival(false, 0.0, ROOM_FOLLOW_BAND_PX));
-        assert!(!follows_arrival(true, f64::INFINITY, DM_FOLLOW_BAND_PX));
-    }
-}

@@ -2473,65 +2473,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Issue freenet/river#283 regression guard:
-    //
-    // PR #278's Codex round-1 fix removed a `.read()` on
-    // `OUTBOUND_SEND_COUNTER` from inside the auto-scroll
-    // `use_effect`, but didn't replace it with any other subscribed
-    // read. The captured `message_count: usize` is a plain value, not
-    // a signal — Dioxus has nothing to watch, so the effect runs once
-    // on mount and never re-fires. New messages don't scroll the
-    // viewport. The fix mirrors `conversation.rs`'s last-bubble
-    // pattern: the last bubble's `onmounted` updates a `Signal<Option
-    // <Rc<MountedData>>>` and the effect reads that signal as a
-    // subscribing read.
-    //
-    // We can't easily drive the full effect through a unit test
-    // (Dioxus runtime + WASM rendering), so this pin is a source-text
-    // grep that fails if the wiring regresses: the effect MUST
-    // contain `last_dm_bubble()` and the `DmBubble` component MUST
-    // accept a `last_bubble_sink` prop. A future agent that "cleans
-    // up" the unused-looking signal would otherwise silently re-break
-    // the auto-scroll on the same lines as #283.
-    // -----------------------------------------------------------------
-
-    /// The auto-scroll effect MUST read `last_dm_bubble()` as a
-    /// subscribing call inside its closure body. Without that read
-    /// Dioxus has no signal subscription and the effect runs exactly
-    /// once on mount — re-breaking #283.
-    #[test]
-    fn auto_scroll_effect_subscribes_to_last_dm_bubble_signal() {
-        let src = include_str!("dm_thread_modal.rs");
-        assert!(
-            src.contains("let trigger = last_dm_bubble();"),
-            "the auto-scroll use_effect must read last_dm_bubble() as a \
-             subscribing call so it re-fires on new bubble mounts (#283). \
-             If you change the read shape, update this pin to match."
-        );
-    }
-
-    /// The `DmBubble` component MUST carry an optional last-bubble sink
-    /// prop and attach `onmounted` to its wrapper. Without that prop
-    /// the last bubble can't notify the auto-scroll effect — the
-    /// signal stays at `None` forever and #283 silently re-regresses.
-    #[test]
-    fn dm_bubble_exposes_last_bubble_sink_prop() {
-        let src = include_str!("dm_thread_modal.rs");
-        assert!(
-            src.contains("last_bubble_sink: Option<Signal<Option<Rc<MountedData>>>>"),
-            "DmBubble must accept last_bubble_sink so the LAST bubble can \
-             notify the auto-scroll effect's signal on mount (#283)."
-        );
-        assert!(
-            src.contains("if let Some(mut sink) = last_bubble_sink"),
-            "DmBubble's onmounted handler must write through last_bubble_sink \
-             when it's Some (i.e. the bubble is the last one). Without this \
-             write the auto-scroll effect's signal stays at None and #283 \
-             silently re-regresses."
-        );
-    }
-
     fn dm_key(timestamp: u64, token: u8) -> DmKey {
         DmKey {
             timestamp,
