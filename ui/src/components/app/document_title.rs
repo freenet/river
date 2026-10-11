@@ -1000,9 +1000,10 @@ mod tests {
     /// re-creates the reported bug — a muted room inflating the total —
     /// while leaving the whole Rust suite and the whole browser suite green.
     /// The hamburger is covered end-to-end by `room-unread-badge.spec.ts`'s
-    /// sum check; the title cannot be, because
-    /// `title-unread-badge.spec.ts` shows the visible→hidden transition marks
-    /// every room read, so the fixture's title never carries an `(N)`.
+    /// sum check. The title is not: `title-unread-badge.spec.ts` hides the tab
+    /// and asserts only that an `(N)` appears (hiding marks just the current
+    /// room read, so unopened rooms still count), never that N is the
+    /// mode-aware sum. This pin is what holds the title to it.
     #[test]
     fn every_cross_room_total_is_mode_aware() {
         let source = include_str!("document_title.rs");
