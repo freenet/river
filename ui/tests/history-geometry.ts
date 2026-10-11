@@ -234,15 +234,12 @@ export async function readerReturnsToEnd(page: Page) {
   await scrollAndSettle(page, "end");
 }
 
-/// The reader leaves the end and comes back by themselves. An explicit request
-/// (opening, own send, Latest) holds the end while rows change height until
-/// the reader first scrolls away; after this, a height change
-/// meets a reader at the end who is not held there.
-export async function readerLeavesAndReturnsToEnd(page: Page) {
+/// The reader scrolls a little way up from the end and stays there. The end
+/// hold, which a request or a scroll settling at the end arms, is released;
+/// the newest message is still within the follow band.
+export async function readerLeavesTheEnd(page: Page) {
   await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).top - 60);
   expect(await distanceFromBottom(page), "premise: the reader left the end").toBeGreaterThan(AT_BOTTOM_EPSILON_PX);
-  await readerReturnsToEnd(page);
-  await expectSettledAtBottom(page, "premise: the reader came back to the end");
 }
 
 /// The row the reader is looking at: an item row fully inside the visible part

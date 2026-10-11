@@ -25,7 +25,8 @@ import {
   newestRowFromViewBottom,
   nextFrames,
   openRoomAtBottom,
-  readerLeavesAndReturnsToEnd,
+  readerLeavesTheEnd,
+  readerReturnsToEnd,
   readerParksNewestBelow,
   readerScrollsTo,
   readerScrollsWithoutGesture,
@@ -119,12 +120,12 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
     await expect(page.getByTestId("scroll-to-bottom"), "nothing is below a followed reader").toHaveCount(0);
   });
 
-  test("a mid-list insert that does not remount the last row does not move a reader at the end", async ({
+  test("a mid-list insert that does not remount the last row does not move a reader near the end", async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
-    // Out of the opening's end hold, which an insert above the newest keeps.
-    await readerLeavesAndReturnsToEnd(page);
+    // Out of the end hold, which an insert above the newest keeps.
+    await readerLeavesTheEnd(page);
     const row = await expectReadingRow(page);
     const heightBefore = (await scrollMetrics(page)).height;
 
@@ -195,13 +196,13 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
 test.describe("Layout-only growth does not move the view (#486)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  test("a resize that reflows the history does not take a reader at the end to the newest message", async ({
+  test("a resize that reflows the history does not take a reader near the end to the newest message", async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
-    // A reader back at the end by themselves: right after the opening, the
-    // end is held through height changes (covered below).
-    await readerLeavesAndReturnsToEnd(page);
+    // Near the end but out of the end hold, which keeps the end through
+    // height changes (covered below).
+    await readerLeavesTheEnd(page);
 
     const { height: before, top: topBefore } = await scrollMetrics(page);
 
@@ -1384,6 +1385,36 @@ test.describe("The end holds after an explicit request", () => {
       await expectSettledAtBottom(page, "a row grew after the opening backfilled and left the newest message off screen");
       await expect(page.getByTestId("scroll-to-bottom"), "Latest offered at the end").toHaveCount(0);
     });
+  });
+});
+
+test.describe("The end holds for a reader who scrolls back to it", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("a reader who scrolls back to the end by hand keeps the newest message when the composer grows", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await readerScrollsWithoutGesture(page, 0);
+    await expectParkedAwayFromEnd(page, "premise: the reader parked up the history");
+    await readerReturnsToEnd(page);
+    await expectSettledAtBottom(page, "premise: the reader scrolled back to the end");
+    const roomyViewport = (await scrollMetrics(page)).client;
+    const newest = await newestRowFromViewBottom(page);
+
+    await page.getByTestId("message-input").fill(LONG_DRAFT);
+    await expect
+      .poll(async () => (await scrollMetrics(page)).client, {
+        timeout: 5_000,
+        message: "premise: the multi-line draft grew the composer",
+      })
+      .toBeLessThan(roomyViewport - WELL_AWAY_FROM_END_PX);
+
+    await expectRowHeld(page, newest.key, newest.gap, "the composer grew and covered the newest message", {
+      fromBottom: "bottom",
+    });
+    await expect(page.getByTestId("scroll-to-bottom"), "Latest offered at the end").toHaveCount(0);
   });
 });
 

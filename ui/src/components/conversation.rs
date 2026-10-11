@@ -2720,12 +2720,12 @@ struct ReaderPosition {
     /// settle, every render) schedules nothing.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     seen_noted: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, MessageId)>>,
-    /// The end hold: `Some(scrollTop)` while the view sits at
-    /// the end an explicit request put it at. Rows changing height take it
-    /// back there (the ResizeObserver). The reader's first scroll away, a
-    /// change of newest message (the render), a room change and the panel
-    /// hiding end it; an arrival that is followed lands a new request, which
-    /// holds again.
+    /// The end hold: `Some(scrollTop)` while the view sits at the end an
+    /// explicit request put it at, or a scroll settled at. Rows changing
+    /// height take it back there (the ResizeObserver). The reader's first
+    /// scroll away, a change of newest message (the render), a room change and
+    /// the panel hiding end it; an arrival that is followed lands a new
+    /// request, which holds again.
     end_hold: std::cell::Cell<Option<i32>>,
     /// The room and newest message of the last render's range (`None` for an
     /// empty range). The next render tells a change of newest message from
@@ -3373,6 +3373,15 @@ fn retained_tail_height(container: &web_sys::Element, retained: usize) -> Option
 #[cfg(target_arch = "wasm32")]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
+/// Is the view within the end hold's release margin of the scroller's
+/// absolute end? Inside it a settle arms the hold; past it an upward scroll
+/// releases it.
+#[cfg(target_arch = "wasm32")]
+fn at_end_within_release_margin(container: &web_sys::Element) -> bool {
+    let from_end = container.scroll_height() - container.scroll_top() - container.client_height();
+    from_end as f64 <= NEWEST_IN_VIEW_SLACK_PX
+}
+
 /// Take the view to the end and hold it there.
 #[cfg(target_arch = "wasm32")]
 fn hold_end(reader: &ReaderPosition, container: &web_sys::Element) {
@@ -3634,8 +3643,20 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
                     window_items.set(INITIAL_WINDOW_ITEMS);
                 });
             }
-            remember_reading_position(&reader);
-            note_newest_seen(&reader);
+            // A reader who scrolled back to the end by hand is held there, as a
+            // landed request would be, so the composer growing or the phone
+            // keyboard opening keeps the newest message in view. Arrivals still
+            // follow only by the follow rule: the hold ends on a newer newest.
+            if reader.end_hold.get().is_none()
+                && reader.request.get().is_none()
+                && !reader.has_newer.get()
+                && at_end_within_release_margin(&container)
+            {
+                hold_end(&reader, &container);
+            } else {
+                remember_reading_position(&reader);
+                note_newest_seen(&reader);
+            }
         }) as Box<dyn FnMut()>)
     };
     let settle_fn: js_sys::Function = settle.as_ref().unchecked_ref::<js_sys::Function>().clone();
@@ -3696,11 +3717,10 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
             return;
         };
         let top = container.scroll_top();
-        let from_end = container.scroll_height() - top - container.client_height();
         // Only a move UP counts. A row growing leaves `scrollTop` alone (the
         // ResizeObserver then takes the view back to the end), and a clamp
         // when the history shrinks lands on the end.
-        if top < held_top && from_end as f64 > NEWEST_IN_VIEW_SLACK_PX {
+        if top < held_top && !at_end_within_release_margin(&container) {
             reader.end_hold.set(None);
         } else {
             reader.end_hold.set(Some(top));

@@ -85,21 +85,24 @@ Accepted trade-offs:
   change cannot apply it to the next room. It waits for rows and visible
   layout when necessary. A request whose render would hold the range's end at
   the ceiling takes the latest range instead.
-- After that request lands, an end hold keeps the end visible while rows
-  change height, such as images loading or private messages decrypting. A
-  change of newest message ends the hold, including deleting the newest; a
-  followed arrival lands a new request, which holds again. A backfill, a
-  message inserted above the newest, a trim and rows changing height keep
-  it. Scrolling upward more than 4px from the scroller's absolute end, hiding
+- After that request lands, an end hold keeps the end visible while the
+  history or the chat area changes height: images loading, private messages
+  decrypting, the composer growing, the phone keyboard opening. A scroll that
+  settles within 4px of the scroller's absolute end, with the range reaching
+  the latest message, arms the same hold, so a reader who scrolls back to the
+  end by hand is held too. A change of newest message ends the hold,
+  including deleting the newest, so an arrival follows only by the rule
+  above; a followed arrival lands a new request, which holds again. A
+  backfill, a message inserted above the newest, a trim and rows changing
+  height keep it. Scrolling upward more than 4px from the scroller's absolute end, hiding
   the panel, changing rooms or an empty range also releases it. Accepted for
   now: padding below the newest message lets a small upward scroll release
   the hold while the message is still visible and Latest stays hidden.
 - Outside that hold, a size change gets no correction: when the composer
   grows or the phone keyboard opens, the browser keeps the view's top edge,
-  so the bottom of the view is covered. That includes a reader who scrolled
-  back to the end by hand, since only a request holds. Paging and panel
-  reveals retain their reading-position corrections; deleting the reading row
-  uses the row above as the preferred fallback.
+  so the bottom of the view is covered. Paging and panel reveals retain their
+  reading-position corrections; deleting the reading row uses the row above
+  as the preferred fallback.
 - Latest appears when the newest message's bottom is more than 4px below
   the visible area, or a held range withholds newer messages. The margin is
   measured against the message, not the padding below it.

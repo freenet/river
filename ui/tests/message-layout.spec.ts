@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { waitForApp, selectRoom, openOwnMessageEdit, openRoomWithComposer } from "./example-room";
-import { readerLeavesAndReturnsToEnd } from "./history-geometry";
+import { readerLeavesTheEnd } from "./history-geometry";
 
 // Regression tests for freenet/river#205, #206, #207:
 //   #205 edit box wider than view
@@ -795,7 +795,7 @@ test.describe("Editing the last message keeps its controls reachable (A08)", () 
     );
     // The send holds the end while rows grow, which would
     // reveal the form on its own. Release it, so the form's reveal is tested.
-    await readerLeavesAndReturnsToEnd(page);
+    await readerLeavesTheEnd(page);
 
     await openOwnMessageEdit(page, lastRow.locator('[id^="msg-"]').last());
     // The form reveals itself; measure once the view has stopped.
