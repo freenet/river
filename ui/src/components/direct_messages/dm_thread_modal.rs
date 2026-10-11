@@ -20,8 +20,7 @@ use crate::components::room_list::receive_invitation_modal::present_invitation;
 use crate::components::scroll_to_latest::LatestButton;
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
-    follows_arrival, newest_bottom_below_view, observe_sentinel, scroll_to_end, sentinel_in_view,
-    SentinelObserver, DM_FOLLOW_BAND_PX,
+    observe_sentinel, scroll_to_end, HistoryDom, SentinelObserver, DM_FOLLOW_BAND_PX,
 };
 use crate::room_data::SendMessageError;
 use dioxus::logger::tracing::{error, info, warn};
@@ -46,11 +45,20 @@ const DM_BODY_BYTE_CAP: usize = MAX_DM_CIPHERTEXT_BYTES - 256;
 /// takes it out of the foreground.
 const DM_THREAD_MODAL: &str = "dm-thread";
 
+/// The thread's scroll container and newest-DM sentinel.
+#[cfg(target_arch = "wasm32")]
+const DM_HISTORY: HistoryDom = HistoryDom {
+    container_id: "dm-scroll-container",
+    sentinel_id: "dm-bottom-sentinel",
+    modal_except: Some(DM_THREAD_MODAL),
+    band: DM_FOLLOW_BAND_PX,
+};
+
 /// Monotonic counter bumped every time the local user sends a DM from
 /// any open thread modal. The auto-scroll effect reads this via
 /// `.peek()` (non-reactive) to distinguish "user sent a message"
 /// (scroll to it once) from "peer sent a message" (followed only for a
-/// reader at the end, see `dm_arrival_follows`; otherwise the Latest
+/// reader at the end, see `HistoryDom::arrival_follows`; otherwise the Latest
 /// control offers it). Wrap-around is fine — the effect compares
 /// for inequality with a stored previous value.
 ///
@@ -491,7 +499,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         use_hook(|| std::rc::Rc::new(std::cell::Cell::new(*OUTBOUND_SEND_COUNTER.peek())));
     // The newest DM the last render showed (a purge lowers it), and whether
     // the render that first showed it found the reader at the end
-    // (`dm_arrival_follows`), read before the patch. Set in render; the effect
+    // (`HistoryDom::arrival_follows`), read before the patch. Set in render; the effect
     // consumes the flag.
     let newest_recorded = use_hook(|| Rc::new(std::cell::Cell::new(None::<DmKey>)));
     let follow_pending = use_hook(|| Rc::new(std::cell::Cell::new(false)));
@@ -528,7 +536,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     if !mounted.get() {
                         return;
                     }
-                    if let Some(container) = dm_scroll_container() {
+                    if let Some(container) = DM_HISTORY.container() {
                         scroll_to_end(&container);
                     }
                     // The end is on screen now, so it counts as seen.
@@ -592,7 +600,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     // the patch, a tall arrival's own height would count against the band.
     if note_newest_dm(&newest_recorded, newest_dm_key(&view_data.messages)) {
         #[cfg(target_arch = "wasm32")]
-        follow_pending.set(dm_arrival_follows());
+        follow_pending.set(DM_HISTORY.arrival_follows());
     }
     let peer_label = view_data.peer_nickname.clone();
     let peer_still_member = view_data.peer_still_member;
@@ -1091,7 +1099,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                 move |_| {
                                     #[cfg(target_arch = "wasm32")]
                                     {
-                                        if let Some(container) = dm_scroll_container() {
+                                        if let Some(container) = DM_HISTORY.container() {
                                             scroll_to_end(&container);
                                         }
                                         seen_witness.check();
@@ -1847,40 +1855,11 @@ impl ThreadSeenWitness {
             return;
         }
         let ts = self.newest_inbound_ts.get();
-        if ts == 0
-            || !dm_scroll_container().is_some_and(|c| {
-                crate::components::foreground::in_foreground(Some(DM_THREAD_MODAL), &c)
-                    && sentinel_in_view(&c, "dm-bottom-sentinel")
-            })
-        {
+        if ts == 0 || !DM_HISTORY.end_seen() {
             return;
         }
         crate::components::direct_messages::mark_thread_read(self.room, self.peer, ts);
     }
-}
-
-/// Does an arrival rendering now follow? Only into a thread in the foreground
-/// (no modal over it, see `foreground::in_foreground`) whose newest DM's bottom
-/// sits within `DM_FOLLOW_BAND_PX` of its view's bottom edge. Called from
-/// render, before the patch; a thread not yet in the DOM (the opening) does
-/// not follow, which the opening placement covers.
-#[cfg(target_arch = "wasm32")]
-fn dm_arrival_follows() -> bool {
-    dm_scroll_container().is_some_and(|container| {
-        follows_arrival(
-            crate::components::foreground::in_foreground(Some(DM_THREAD_MODAL), &container),
-            newest_bottom_below_view(&container, "dm-bottom-sentinel"),
-            DM_FOLLOW_BAND_PX,
-        )
-    })
-}
-
-/// The DM thread's scroll container, if it is currently in the DOM.
-#[cfg(target_arch = "wasm32")]
-fn dm_scroll_container() -> Option<web_sys::Element> {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("dm-scroll-container"))
 }
 
 /// Watch `dm-bottom-sentinel`, whose top edge is the newest DM's bottom, and
@@ -1895,12 +1874,7 @@ fn observe_newest_dm(
     seen_witness: ThreadSeenWitness,
 ) {
     drop(slot.borrow_mut().take());
-    let (Some(root), Some(sentinel)) = (
-        dm_scroll_container(),
-        web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.get_element_by_id("dm-bottom-sentinel")),
-    ) else {
+    let (Some(root), Some(sentinel)) = (DM_HISTORY.container(), DM_HISTORY.sentinel()) else {
         return;
     };
     *slot.borrow_mut() = observe_sentinel(&root, &sentinel, move |in_view| {

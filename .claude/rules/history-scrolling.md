@@ -46,7 +46,7 @@ that room out.
 
 The check is **stateless and measured before the patch.** It reads the DOM in
 the render that brings the arrival, while the DOM still shows the previous
-render (`follow_arrival_at_end`, `dm_arrival_follows`). Nothing is remembered
+render (`follow_arrival_at_end`, `HistoryDom::arrival_follows`). Nothing is remembered
 between arrivals, so no flag can latch:
 
 - [#486](https://github.com/freenet/river/issues/486): the old follow gate

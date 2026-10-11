@@ -66,12 +66,20 @@ fn modal_open_except(except: Option<&str>) -> bool {
     OPEN_MODALS.with(|open| open.borrow().iter().any(|n| Some(*n) != except))
 }
 
-/// The tab is visible, `container` has layout (a hidden mobile panel measures
-/// 0), and no modal but `except` is open.
+/// Does a history container have layout? On a phone the chat panel is
+/// `display:none` behind Rooms or Members, and every row then measures 0.
+/// `MOBILE_VIEW` can't tell: on desktop all panels show whatever it says.
+#[cfg(target_arch = "wasm32")]
+pub fn has_layout(container: &web_sys::Element) -> bool {
+    container.client_height() > 0
+}
+
+/// The tab is visible, `container` has layout, and no modal but `except` is
+/// open.
 #[cfg(target_arch = "wasm32")]
 pub fn in_foreground(except: Option<&str>, container: &web_sys::Element) -> bool {
     crate::components::app::document_title::get_visibility_state()
-        && container.client_height() > 0
+        && has_layout(container)
         && !modal_open_except(except)
 }
 

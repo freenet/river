@@ -16,9 +16,10 @@ use crate::components::members::{
 };
 use crate::components::scroll_to_latest::LatestButton;
 #[cfg(target_arch = "wasm32")]
+use crate::components::foreground::has_layout;
+#[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
-    follows_arrival, newest_bottom_below_view, observe_sentinel, scroll_to_end, sentinel_in_view,
-    NEWEST_IN_VIEW_SLACK_PX, ROOM_FOLLOW_BAND_PX,
+    observe_sentinel, scroll_to_end, HistoryDom, NEWEST_IN_VIEW_SLACK_PX, ROOM_FOLLOW_BAND_PX,
 };
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
@@ -3329,13 +3330,14 @@ fn remember_reading_position(reader: &ReaderPosition) {
     let _ = reader;
 }
 
-/// Read the chat history's scroll container, if it is currently in the DOM.
+/// The room history's scroll container and newest-message sentinel.
 #[cfg(target_arch = "wasm32")]
-fn chat_scroll_container() -> Option<web_sys::Element> {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("chat-scroll-container"))
-}
+const ROOM_HISTORY: HistoryDom = HistoryDom {
+    container_id: "chat-scroll-container",
+    sentinel_id: "bottom-sentinel",
+    modal_except: None,
+    band: ROOM_FOLLOW_BAND_PX,
+};
 
 /// The furthest down `container` can be scrolled, in px.
 #[cfg(target_arch = "wasm32")]
@@ -3370,7 +3372,7 @@ fn first_history_row_offset(keys: &[String]) -> Option<(String, i32)> {
     if keys.is_empty() {
         return None;
     }
-    let container = chat_scroll_container()?;
+    let container = ROOM_HISTORY.container()?;
     let rows = container.query_selector_all("[data-item-key]").ok()?;
     // Candidate key -> offsetTop. Bounded by `keys.len()`, not by the rendered
     // window: measuring every row cost an `offsetTop` and a map insert per row
@@ -3402,19 +3404,11 @@ fn first_history_row_offset(keys: &[String]) -> Option<(String, i32)> {
 #[cfg(target_arch = "wasm32")]
 fn first_history_row_identity() -> Option<(String, i32)> {
     use wasm_bindgen::JsCast;
-    let container = chat_scroll_container()?;
+    let container = ROOM_HISTORY.container()?;
     let el = container.query_selector("[data-item-key]").ok()??;
     let key = el.get_attribute("data-item-key")?;
     let html = el.dyn_ref::<web_sys::HtmlElement>()?;
     Some((key, html.offset_top()))
-}
-
-/// Does the history have layout? On a phone the chat panel is `display:none`
-/// behind Rooms or Members, and every row then measures 0. `MOBILE_VIEW` can't
-/// tell: on desktop all panels show whatever it says.
-#[cfg(target_arch = "wasm32")]
-fn history_has_layout(container: &web_sys::Element) -> bool {
-    container.client_height() > 0
 }
 
 /// Measure the first message or event row that starts inside the view, with
@@ -3423,8 +3417,8 @@ fn history_has_layout(container: &web_sys::Element) -> bool {
 #[cfg(target_arch = "wasm32")]
 fn capture_reading_anchor(range_start: usize) -> Option<ReadingAnchor> {
     use wasm_bindgen::JsCast;
-    let container = chat_scroll_container()?;
-    if !history_has_layout(&container) {
+    let container = ROOM_HISTORY.container()?;
+    if !has_layout(&container) {
         return None;
     }
     let view_top = container.get_bounding_client_rect().top();
@@ -3506,7 +3500,7 @@ fn capture_reading_anchor(range_start: usize) -> Option<ReadingAnchor> {
 #[cfg(target_arch = "wasm32")]
 fn restore_reading_anchor(anchor: &ReadingAnchor, shift_offsets_by: i32) -> bool {
     use wasm_bindgen::JsCast;
-    let Some(container) = chat_scroll_container() else {
+    let Some(container) = ROOM_HISTORY.container() else {
         return false;
     };
     let view_top = container.get_bounding_client_rect().top();
@@ -3643,7 +3637,7 @@ fn correct_view_after_patch(reader: &ReaderPosition) {
     if reader.request.get().is_some() {
         return;
     }
-    let Some(container) = chat_scroll_container() else {
+    let Some(container) = ROOM_HISTORY.container() else {
         return;
     };
     if let Some(capture) = backfill {
@@ -3652,7 +3646,7 @@ fn correct_view_after_patch(reader: &ReaderPosition) {
         }
     }
     // Hidden rows measure 0; the reveal restores the reader instead.
-    if let Some(capture) = head_swap.filter(|_| history_has_layout(&container)) {
+    if let Some(capture) = head_swap.filter(|_| has_layout(&container)) {
         if let Some(shift) = capture.shift(&container).filter(|shift| *shift != 0) {
             // From the PRE-patch offset; see `reposition_pending`.
             container.set_scroll_top((capture.scroll_top + shift).max(0));
@@ -3690,14 +3684,7 @@ fn follow_arrival_at_end(
     if !is_arrival(previous.as_ref(), newest_key(groups).as_ref()) {
         return;
     }
-    let Some(container) = chat_scroll_container() else {
-        return;
-    };
-    if follows_arrival(
-        crate::components::foreground::in_foreground(None, &container),
-        newest_bottom_below_view(&container, "bottom-sentinel"),
-        ROOM_FOLLOW_BAND_PX,
-    ) {
+    if ROOM_HISTORY.arrival_follows() {
         reader.request_end(Some(room));
     }
 }
@@ -3711,10 +3698,10 @@ fn complete_scroll_request(reader: &ReaderPosition, mut opening_snap_done: Signa
     let Some(request) = reader.request.get() else {
         return false;
     };
-    let Some(container) = chat_scroll_container() else {
+    let Some(container) = ROOM_HISTORY.container() else {
         return false;
     };
-    if !history_has_layout(&container)
+    if !has_layout(&container)
         || reader.hidden.get()
         || !container
             .query_selector("[data-item-key]")
@@ -3754,13 +3741,7 @@ fn note_newest_seen(reader: &ReaderPosition) {
     if reader.seen_noted.borrow().as_ref() == Some(&newest) {
         return;
     }
-    let Some(container) = chat_scroll_container() else {
-        return;
-    };
-    if !crate::components::foreground::in_foreground(None, &container)
-        || reader.hidden.get()
-        || !sentinel_in_view(&container, "bottom-sentinel")
-    {
+    if reader.hidden.get() || !ROOM_HISTORY.end_seen() {
         return;
     }
     *reader.seen_noted.borrow_mut() = Some(newest.clone());
@@ -3784,7 +3765,7 @@ fn note_newest_seen(reader: &ReaderPosition) {
 #[cfg(target_arch = "wasm32")]
 fn trim_is_due(container: &web_sys::Element, overgrown: bool, reader: &ReaderPosition) -> bool {
     if !overgrown
-        || !history_has_layout(container)
+        || !has_layout(container)
         || reader.has_newer.get()
         || reader.hidden.get()
         || reader.request.get().is_some()
@@ -3809,7 +3790,7 @@ fn trim_is_due(container: &web_sys::Element, overgrown: bool, reader: &ReaderPos
 fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<ReaderPosition>) -> bool {
     use wasm_bindgen::prelude::*;
 
-    let Some(container) = chat_scroll_container() else {
+    let Some(container) = ROOM_HISTORY.container() else {
         return false;
     };
 
@@ -3822,11 +3803,11 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
     let settle = {
         let reader = reader.clone();
         Closure::wrap(Box::new(move || {
-            let Some(container) = chat_scroll_container() else {
+            let Some(container) = ROOM_HISTORY.container() else {
                 return;
             };
             // Hidden, everything measures 0 and would read as "at the bottom".
-            if !history_has_layout(&container) {
+            if !has_layout(&container) {
                 return;
             }
             // Revealed but not restored yet: not the reader's position.
@@ -3851,7 +3832,7 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
                     if reader.room_epoch.get() != epoch {
                         return;
                     }
-                    if !chat_scroll_container().is_some_and(|c| trim_is_due(&c, true, &reader)) {
+                    if !ROOM_HISTORY.container().is_some_and(|c| trim_is_due(&c, true, &reader)) {
                         // Still overgrown; a later settle at the bottom may trim.
                         reader.window_overgrown.set(true);
                         return;
@@ -3926,7 +3907,7 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
         let Some(held_top) = reader.end_hold.get() else {
             return;
         };
-        let Some(container) = chat_scroll_container() else {
+        let Some(container) = ROOM_HISTORY.container() else {
             return;
         };
         let top = container.scroll_top();
@@ -3958,10 +3939,10 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
 /// a row changing height takes the view back to the end.
 #[cfg(target_arch = "wasm32")]
 fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
-    let Some(container) = chat_scroll_container() else {
+    let Some(container) = ROOM_HISTORY.container() else {
         return;
     };
-    if !history_has_layout(&container) {
+    if !has_layout(&container) {
         reader.hidden.set(true);
         reader.observed_height.set(0);
         // The view the hold kept is gone.
@@ -4027,7 +4008,7 @@ fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
 fn observe_history_resize(reader: Rc<ReaderPosition>, opening_snap_done: Signal<bool>) -> bool {
     use wasm_bindgen::prelude::*;
 
-    let Some(container) = chat_scroll_container() else {
+    let Some(container) = ROOM_HISTORY.container() else {
         return false;
     };
     let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
@@ -4440,13 +4421,8 @@ pub fn Conversation() -> Element {
     let observer_reader = reader_position.clone();
     #[cfg(target_arch = "wasm32")]
     use_effect(move || {
-        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
-            return;
-        };
-        let (Some(sentinel), Some(root)) = (
-            document.get_element_by_id("bottom-sentinel"),
-            document.get_element_by_id("chat-scroll-container"),
-        ) else {
+        let (Some(sentinel), Some(root)) = (ROOM_HISTORY.sentinel(), ROOM_HISTORY.container())
+        else {
             return;
         };
 
@@ -5472,7 +5448,7 @@ pub fn Conversation() -> Element {
                                                 first_history_row_offset,
                                             ),
                                             // Hidden rows all measure 0.
-                                            chat_scroll_container().filter(history_has_layout),
+                                            ROOM_HISTORY.container().filter(has_layout),
                                         ) {
                                             *reader_position.reposition_pending.borrow_mut() =
                                                 Some(ProbeCapture {
@@ -5564,7 +5540,7 @@ pub fn Conversation() -> Element {
                                                                     Some(container),
                                                                     Some((probe_key, probe_top)),
                                                                 ) = (
-                                                                    chat_scroll_container(),
+                                                                    ROOM_HISTORY.container(),
                                                                     first_history_row_identity(),
                                                                 ) {
                                                                     *reader_position.backfill_anchor.borrow_mut() =
@@ -5740,7 +5716,7 @@ pub fn Conversation() -> Element {
                     // IntersectionObserver watches it instead of using
                     // onscroll, which avoids per-scroll-event DOM queries that
                     // cause scroll jank on mobile (see issue #151), and the
-                    // read rule measures it (`sentinel_in_view`).
+                    // read rule measures it (`HistoryDom::end_seen`).
                     div {
                         id: "bottom-sentinel",
                         class: "h-px pointer-events-none",
@@ -5778,7 +5754,7 @@ pub fn Conversation() -> Element {
                                 });
                             } else {
                                 #[cfg(target_arch = "wasm32")]
-                                if let Some(container) = chat_scroll_container() {
+                                if let Some(container) = ROOM_HISTORY.container() {
                                     land_at_end(&reader_position, &container);
                                 }
                             }

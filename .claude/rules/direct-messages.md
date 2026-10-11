@@ -90,7 +90,7 @@ became visible or a modal over the thread closed), from the newest-DM
 observer, and after the opening, own-send, follow and Latest placements. An
 inbound DM follows a reader at the end (newest DM's bottom within
 `DM_FOLLOW_BAND_PX` = 50px, measured before the patch by
-`dm_arrival_follows`); otherwise the Latest control (`dm-scroll-to-latest`)
+`HistoryDom::arrival_follows`); otherwise the Latest control (`dm-scroll-to-latest`)
 shows while the newest DM's bottom is more than a few px off screen, and
 jumps instantly. The modal body is keyed by `(room, peer)`, so opening
 another thread remounts it (and its witness).

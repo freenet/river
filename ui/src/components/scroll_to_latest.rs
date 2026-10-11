@@ -18,55 +18,84 @@ pub const NEWEST_IN_VIEW_SLACK_PX: f64 = 4.0;
 /// when an arrival lands and still be followed to the end. The pre-#753
 /// `BOTTOM_THRESHOLD_PX`, now measured from the newest message's bottom rather
 /// than the scroller's absolute end (`.claude/rules/history-scrolling.md`).
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(target_arch = "wasm32")]
 pub const ROOM_FOLLOW_BAND_PX: f64 = 100.0;
 
 /// The DM thread's [`ROOM_FOLLOW_BAND_PX`]: the pre-#753 `is_near_bottom`
 /// tolerance.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(target_arch = "wasm32")]
 pub const DM_FOLLOW_BAND_PX: f64 = 50.0;
 
-/// Does an arrival follow? Only into a conversation in the foreground whose
-/// newest item's bottom sat at most `band` px below the view before the patch.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn follows_arrival(in_foreground: bool, newest_below_view: f64, band: f64) -> bool {
-    in_foreground && newest_below_view <= band
+/// A scrolling history whose newest item's bottom is the top edge of a
+/// sentinel: the room history or the DM thread.
+#[cfg(target_arch = "wasm32")]
+pub struct HistoryDom {
+    pub container_id: &'static str,
+    pub sentinel_id: &'static str,
+    /// The modal the history lives in, which does not cover it.
+    pub modal_except: Option<&'static str>,
+    /// How far below the view the newest item's bottom may sit, before the
+    /// patch, for an arrival to follow.
+    pub band: f64,
 }
 
-/// How far (px) the newest item's bottom, the top edge of the sentinel
-/// `sentinel_id`, sits below `container`'s visible bottom: 0 while it is on
-/// screen, infinite when there is no sentinel or no layout.
 #[cfg(target_arch = "wasm32")]
-pub fn newest_bottom_below_view(container: &web_sys::Element, sentinel_id: &str) -> f64 {
-    let Some(sentinel) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id(sentinel_id))
-    else {
-        return f64::INFINITY;
-    };
-    let view = container.get_bounding_client_rect();
-    if view.height() <= 0.0 {
-        return f64::INFINITY;
+impl HistoryDom {
+    pub fn container(&self) -> Option<web_sys::Element> {
+        element_by_id(self.container_id)
     }
-    (sentinel.get_bounding_client_rect().top() - view.bottom()).max(0.0)
+
+    pub fn sentinel(&self) -> Option<web_sys::Element> {
+        element_by_id(self.sentinel_id)
+    }
+
+    /// Does an arrival rendering now follow? Only into a history in the
+    /// foreground whose newest item's bottom sat at most `band` px below the
+    /// view. Called from render, before the patch.
+    pub fn arrival_follows(&self) -> bool {
+        self.container().is_some_and(|container| {
+            crate::components::foreground::in_foreground(self.modal_except, &container)
+                && self.newest_bottom_below_view(&container) <= self.band
+        })
+    }
+
+    /// Is the history in the foreground with its newest item's bottom on
+    /// screen, within [`NEWEST_IN_VIEW_SLACK_PX`]? The same edge, and the same
+    /// slack, as the Latest button's observer. A live layout read rather than
+    /// the observer's last report, which lags a patch that just put an arrival
+    /// below the fold.
+    pub fn end_seen(&self) -> bool {
+        self.container().is_some_and(|container| {
+            crate::components::foreground::in_foreground(self.modal_except, &container)
+                && self.sentinel().is_some_and(|sentinel| {
+                    let view = container.get_bounding_client_rect();
+                    let edge = sentinel.get_bounding_client_rect().top();
+                    view.height() > 0.0
+                        && edge >= view.top()
+                        && edge <= view.bottom() + NEWEST_IN_VIEW_SLACK_PX
+                })
+        })
+    }
+
+    /// How far (px) the newest item's bottom sits below `container`'s visible
+    /// bottom: 0 while it is on screen, infinite with no sentinel or no layout.
+    fn newest_bottom_below_view(&self, container: &web_sys::Element) -> f64 {
+        let Some(sentinel) = self.sentinel() else {
+            return f64::INFINITY;
+        };
+        let view = container.get_bounding_client_rect();
+        if view.height() <= 0.0 {
+            return f64::INFINITY;
+        }
+        (sentinel.get_bounding_client_rect().top() - view.bottom()).max(0.0)
+    }
 }
 
-/// Is the sentinel `sentinel_id`, whose top edge is the newest item's bottom,
-/// on screen in `container`, within [`NEWEST_IN_VIEW_SLACK_PX`]? The same edge,
-/// and the same slack, as the Latest button's observer. A live layout read
-/// rather than the observer's last report, which lags a patch that just put an
-/// arrival below the fold. A container with no height has nothing on screen.
 #[cfg(target_arch = "wasm32")]
-pub fn sentinel_in_view(container: &web_sys::Element, sentinel_id: &str) -> bool {
-    let Some(sentinel) = web_sys::window()
+fn element_by_id(id: &str) -> Option<web_sys::Element> {
+    web_sys::window()
         .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id(sentinel_id))
-    else {
-        return false;
-    };
-    let view = container.get_bounding_client_rect();
-    let edge = sentinel.get_bounding_client_rect().top();
-    view.height() > 0.0 && edge >= view.top() && edge <= view.bottom() + NEWEST_IN_VIEW_SLACK_PX
+        .and_then(|d| d.get_element_by_id(id))
 }
 
 /// An IntersectionObserver on one sentinel, with the callback it calls.
@@ -143,7 +172,7 @@ pub fn scroll_to_end(container: &web_sys::Element) {
 
 /// The round Latest button in the corner of a scroll area. Instant and
 /// one-shot: it leaves nothing behind, and a later arrival follows only by the
-/// ordinary rule (`follows_arrival`). The caller's observer hides
+/// ordinary rule (`HistoryDom::arrival_follows`). The caller's observer hides
 /// it once the end is in view; nothing hides it optimistically (#402).
 #[component]
 pub fn LatestButton(
