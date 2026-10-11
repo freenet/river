@@ -16,11 +16,6 @@ type RiverTestHooks = {
   deliverDmForPeer(peerIndex: 0 | 1, text: string): void;
   // Admits the peer as a member with no DMs, for an empty thread.
   admitDmPeer(peerIndex: 0 | 1): void;
-  holdNextDmPlacement(): void;
-  heldDmPlacementCount(): number;
-  // Throws if no placement is held.
-  releaseHeldDmPlacement(): void;
-  releasedDmPlacementsRun(): number;
 };
 
 // One hook per round trip.

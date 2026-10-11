@@ -178,7 +178,7 @@ impl OutboundDmsCache {
     /// Insert an entry — exposed so unit tests can construct a
     /// populated cache without depending on the delegate I/O path.
     /// Production callers should go through
-    /// `chat_delegate::save_outbound_dm` to also get per-pair cap
+    /// `chat_delegate::save_outbound_dm_now` to also get per-pair cap
     /// eviction and a delegate save.
     #[cfg(test)]
     pub(crate) fn insert_for_test(&mut self, entry: OutboundDmEntry) {
@@ -357,7 +357,7 @@ pub async fn send_structured_dm(
     peer: MemberId,
     body: river_core::room_state::dm_body::DirectMessageBody,
 ) -> SendDmOutcome {
-    use crate::components::app::chat_delegate::{save_outbound_dm, unhide_dm_thread};
+    use crate::components::app::chat_delegate::{save_outbound_dm_now, unhide_dm_thread};
     use crate::components::app::{mark_needs_sync, ROOMS};
     use freenet_scaffold::ComposableState;
     use river_core::room_state::direct_messages::{compose_direct_message, DirectMessagesDelta};
@@ -535,7 +535,7 @@ pub async fn send_structured_dm(
 
         if matches!(outcome, SendDmOutcome::Sent) {
             mark_needs_sync(room);
-            save_outbound_dm(
+            save_outbound_dm_now(
                 room,
                 self_id,
                 peer,

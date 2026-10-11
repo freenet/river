@@ -100,51 +100,6 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
-    // Hold the NEXT DM thread placement (the opening or own-send jump) once
-    // its task has started, before it touches the DOM, until
-    // `releaseHeldDmPlacement`. One-shot: later placements run as usual.
-    set_hook(
-        "holdNextDmPlacement",
-        Closure::<dyn FnMut()>::new(move || {
-            DM_PLACEMENT_HOLD_ARMED.with(|armed| armed.set(true));
-        })
-        .into_js_value(),
-    );
-
-    // How many placements are held right now (0 or 1).
-    set_hook(
-        "heldDmPlacementCount",
-        Closure::<dyn FnMut() -> u32>::new(move || {
-            HELD_DM_PLACEMENT.with(|held| u32::from(held.borrow().is_some()))
-        })
-        .into_js_value(),
-    );
-
-    // Run the held placement, in a fresh task as it would have run. Throws if
-    // nothing is held, so a release that does nothing cannot pass silently.
-    set_hook(
-        "releaseHeldDmPlacement",
-        Closure::<dyn FnMut()>::new(move || {
-            // Out of the RefCell before it runs, so it cannot re-enter the borrow.
-            let Some(action) = HELD_DM_PLACEMENT.with(|held| held.borrow_mut().take()) else {
-                wasm_bindgen::throw_str("__riverTest.releaseHeldDmPlacement: no placement is held");
-            };
-            crate::util::safe_spawn_local(async move {
-                RELEASED_DM_PLACEMENTS_RUN.with(|n| n.set(n.get() + 1));
-                action();
-            });
-        })
-        .into_js_value(),
-    );
-
-    // How many released placements have run, so a test can wait for its
-    // release to land rather than guess.
-    set_hook(
-        "releasedDmPlacementsRun",
-        Closure::<dyn FnMut() -> u32>::new(move || RELEASED_DM_PLACEMENTS_RUN.with(|n| n.get()))
-            .into_js_value(),
-    );
-
     set_hook(
         "insertMessageBeforeLast",
         Closure::<dyn FnMut(String)>::new(move |text: String| {
@@ -276,31 +231,6 @@ pub fn install_test_hooks() {
     );
 
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
-}
-
-thread_local! {
-    /// The next DM placement is to be held (`holdNextDmPlacement`).
-    static DM_PLACEMENT_HOLD_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The held DM placement, as the thread queued it.
-    static HELD_DM_PLACEMENT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
-    /// Released DM placements that have run (`releasedDmPlacementsRun`).
-    static RELEASED_DM_PLACEMENTS_RUN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-/// Run a DM thread placement now, or hold it if `holdNextDmPlacement` armed a
-/// hold. The thread calls this from inside the placement's task.
-pub(crate) fn run_or_hold_dm_placement(action: Box<dyn FnOnce()>) {
-    if !DM_PLACEMENT_HOLD_ARMED.with(|armed| armed.replace(false)) {
-        action();
-        return;
-    }
-    let displaced = HELD_DM_PLACEMENT.with(|held| held.borrow_mut().replace(action));
-    if displaced.is_some() {
-        web_sys::console::error_1(
-            &"__riverTest.holdNextDmPlacement: a held placement was never released".into(),
-        );
-    }
 }
 
 /// Where a delivered message lands in the room's message list.

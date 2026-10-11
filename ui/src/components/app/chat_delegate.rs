@@ -9392,9 +9392,12 @@ async fn do_save_outbound_dms_to_delegate() -> Result<(), String> {
 /// `MAX_DM_MESSAGES_PER_PAIR` entries cached, the oldest is evicted so
 /// the cache stays bounded.
 ///
-/// All signal mutation goes through [`crate::util::defer`] per the
-/// WASM signal-safety rules.
-pub fn save_outbound_dm(
+/// Writes `OUTBOUND_DMS` directly, so call it only from inside a
+/// [`crate::util::defer`] closure (the WASM signal-safety rules). Both
+/// senders do, in the same closure that adds the DM to `ROOMS`, so the sent
+/// bubble renders with its plaintext from its first frame, and an open
+/// thread's jump to it lands on its final height.
+pub fn save_outbound_dm_now(
     room_owner_vk: ed25519_dalek::VerifyingKey,
     sender: MemberId,
     recipient: MemberId,
@@ -9413,41 +9416,39 @@ pub fn save_outbound_dm(
         plaintext,
     };
 
-    crate::util::defer(move || {
-        OUTBOUND_DMS.with_mut(|cache| {
-            cache.by_token.insert(
-                (room_owner_vk, entry.recipient, entry.purge_token),
-                entry.clone(),
-            );
+    OUTBOUND_DMS.with_mut(|cache| {
+        cache.by_token.insert(
+            (room_owner_vk, entry.recipient, entry.purge_token),
+            entry.clone(),
+        );
 
-            // Per-pair cap eviction: drop the oldest entries for this
-            // (room, sender, recipient) tuple until we are back under
-            // the contract's cap.
-            let room_bytes = room_owner_vk.to_bytes();
-            let mut pair_entries: Vec<_> = cache
-                .by_token
-                .iter()
-                .filter(|(_, e)| {
-                    e.room_owner_vk == room_bytes
-                        && e.sender == entry.sender
-                        && e.recipient == entry.recipient
-                })
-                .map(|(k, e)| (*k, e.timestamp))
-                .collect();
-            if pair_entries.len() > MAX_DM_MESSAGES_PER_PAIR {
-                pair_entries.sort_by_key(|(_, ts)| *ts);
-                let drop_count = pair_entries.len() - MAX_DM_MESSAGES_PER_PAIR;
-                for (key, _) in pair_entries.into_iter().take(drop_count) {
-                    cache.by_token.remove(&key);
-                }
+        // Per-pair cap eviction: drop the oldest entries for this
+        // (room, sender, recipient) tuple until we are back under
+        // the contract's cap.
+        let room_bytes = room_owner_vk.to_bytes();
+        let mut pair_entries: Vec<_> = cache
+            .by_token
+            .iter()
+            .filter(|(_, e)| {
+                e.room_owner_vk == room_bytes
+                    && e.sender == entry.sender
+                    && e.recipient == entry.recipient
+            })
+            .map(|(k, e)| (*k, e.timestamp))
+            .collect();
+        if pair_entries.len() > MAX_DM_MESSAGES_PER_PAIR {
+            pair_entries.sort_by_key(|(_, ts)| *ts);
+            let drop_count = pair_entries.len() - MAX_DM_MESSAGES_PER_PAIR;
+            for (key, _) in pair_entries.into_iter().take(drop_count) {
+                cache.by_token.remove(&key);
             }
-        });
+        }
+    });
 
-        crate::util::safe_spawn_local(async {
-            if let Err(e) = save_outbound_dms_to_delegate().await {
-                warn!("Failed to persist outbound DM cache: {}", e);
-            }
-        });
+    crate::util::safe_spawn_local(async {
+        if let Err(e) = save_outbound_dms_to_delegate().await {
+            warn!("Failed to persist outbound DM cache: {}", e);
+        }
     });
 }
 

@@ -170,7 +170,9 @@ plaintext in the chat delegate.
   hit → plaintext; miss → legacy placeholder. Pinned by
   `dm_outbound_lookup_returns_plaintext_on_hit` /
   `…_returns_err_on_miss`.
-- **Save path**: `save_outbound_dm()` defers the cache insert, enforces
+- **Save path**: `save_outbound_dm_now()` inserts into the cache at once
+  (both senders call it inside the `defer` block that adds the DM to
+  `ROOMS`, so the sent bubble never renders as a placeholder), enforces
   `MAX_DM_MESSAGES_PER_PAIR` eviction, and queues a coalesced save via
   `save_outbound_dms_to_delegate`. The coalesce primitive is the shared
   `coalesce_save` helper in `chat_delegate.rs`, driven by a

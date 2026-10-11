@@ -90,15 +90,14 @@ export function recordedScrolls(page: Page) {
   );
 }
 
-/// Wait `holdMs`, then assert the open thread never left where it was when
-/// `recordScrolls` started, not even in passing. `soft` lets the assertions
-/// after it still report.
-export async function expectStill(page: Page, why: string, { soft = false, holdMs = 600 } = {}) {
-  if (holdMs > 0) await page.waitForTimeout(holdMs);
+/// Wait a moment, then assert the open thread never left where it was when
+/// `recordScrolls` started, not even in passing.
+export async function expectStill(page: Page, why: string) {
+  await page.waitForTimeout(600);
   const { start, seen } = await recordedScrolls(page);
   const { top } = await scrollMetrics(page, DM_VIEW);
   const furthest = Math.max(0, ...[...seen, top].map((t) => Math.abs(t - start)));
-  (soft ? expect.soft : expect)(furthest, why).toBeLessThanOrEqual(STILL_PX);
+  expect(furthest, why).toBeLessThanOrEqual(STILL_PX);
 }
 
 /// Uncaught page errors and console errors from now on: a WASM panic or a

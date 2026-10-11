@@ -28,6 +28,7 @@ import {
   openThread,
   railBadge,
   recordedScrolls,
+  recordPageErrors,
   recordScrolls,
   scrollThreadTo,
 } from "./dm-thread";
@@ -253,6 +254,29 @@ test.describe("DM thread scroll position", () => {
 // Hook-driven, so it runs on one engine; the describe above covers the view on
 // every engine.
 test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
+  test("a thread opened in a hidden tab lands on its newest DM and is seen once the tab is visible", async ({
+    page,
+  }) => {
+    const errors = recordPageErrors(page);
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+    await callRiverTest(page, "appendDmsForPeer", DM_PEER.index, HISTORY);
+    await expect(railBadge(page), "premise: the history is unread").toHaveText(String(HISTORY), { timeout: 5_000 });
+    await setTabVisibility(page, "hidden");
+
+    await openThread(page, DM_PEER, NEWEST_HISTORY);
+
+    await expectAtEnd(page, "opening a thread in a hidden tab should land on its newest DM");
+    await settle(page);
+    await expect(railBadge(page), "a thread opened in a hidden tab was marked seen").toHaveText(String(HISTORY));
+    await recordScrolls(page);
+    await setTabVisibility(page, "visible");
+    await expect(railBadge(page), "the tab came back on the thread's end and it still counts unread").toHaveCount(0);
+    await expectStill(page, "the tab coming back moved the thread");
+    expect(errors).toEqual([]);
+  });
+
   test("an inbound DM at the end in a hidden tab lands below the view, offers Latest, and stays unread until the reader scrolls to it", async ({
     page,
   }) => {

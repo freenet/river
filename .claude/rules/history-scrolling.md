@@ -128,16 +128,19 @@ to the newest rendered inbound DM timestamp only when it is in the foreground
 and the newest DM's bottom is on screen, and re-checks when the tab becomes
 visible.
 
-A thread's opening, own-send and follow placements run in a task queued after
-the render, and both they and the read witness find the thread through the
-global `dm-scroll-container` and `dm-bottom-sentinel` ids. Each mounted thread
-body therefore owns a lifetime flag, set false synchronously when it
-unmounts; a queued placement checks it as it runs, before any DOM lookup, and
-the witness checks it before measuring. Work from a closed thread must not
-scroll, or count as seen, whichever thread is open by then, including a
-reopened instance of the same `(room, peer)`, which gets a fresh flag. A read
-the witness already granted may still commit after a close. Pinned by
-`ui/tests/dm-thread-lifecycle.spec.ts`.
+A thread's opening, own send and followed arrival each set a pending request
+to go to the end, in render, and that render queues an effect
+(`queue_effect`) that completes it with an instant jump once the render is in
+the DOM, like the room's `complete_scroll_request`. Dioxus drops a removed
+scope's queued effects, so no placement can outlive its thread. An own send's
+plaintext is cached in the same `defer` block that adds it to `ROOMS`
+(`save_outbound_dm_now`), so the jump lands on the sent bubble's final
+height. The placement and the read witness find the thread through the
+global `dm-scroll-container` and `dm-bottom-sentinel` ids, and every caller
+of the witness runs while its thread is mounted: its effects (whose queued
+runs Dioxus drops with the thread), the Latest click, and the sentinel
+observer, which is disconnected with the thread. A read the witness already
+granted may still commit after a close.
 
 This shared policy does not imply identical position correction machinery.
 DM threads do not currently have the room history's end hold, so a composer
