@@ -19,7 +19,7 @@ use crate::components::members::{
 use crate::components::scroll_to_latest::{is_arrival, LatestButton};
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
-    observe_sentinel, scroll_to_end, HistoryDom, NEWEST_IN_VIEW_SLACK_PX, ROOM_FOLLOW_BAND_PX,
+    observe_newest, scroll_to_end, HistoryDom, NEWEST_IN_VIEW_SLACK_PX, ROOM_FOLLOW_BAND_PX,
 };
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
@@ -4416,18 +4416,8 @@ pub fn Conversation() -> Element {
     let observer_reader = reader_position.clone();
     #[cfg(target_arch = "wasm32")]
     use_effect(move || {
-        let (Some(sentinel), Some(root)) = (ROOM_HISTORY.sentinel(), ROOM_HISTORY.container())
-        else {
-            return;
-        };
-
         let reader_position = observer_reader.clone();
-        let observer = observe_sentinel(&root, &sentinel, move |intersecting| {
-            // Deferred: `newest_in_view` is subscribed in render (the
-            // scroll-to-latest button), so a direct `.set()` from this raw
-            // callback would notify from an empty scope and panic on Firefox
-            // mobile. (#402)
-            crate::util::defer(move || newest_in_view.set(intersecting));
+        let observer = observe_newest(&ROOM_HISTORY, newest_in_view, move |intersecting| {
             // The reader scrolled to the newest message, or it came back
             // into view: the read rule may mark it.
             if intersecting {

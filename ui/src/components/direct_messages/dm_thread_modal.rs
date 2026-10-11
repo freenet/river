@@ -20,7 +20,7 @@ use crate::components::room_list::receive_invitation_modal::present_invitation;
 use crate::components::scroll_to_latest::{is_arrival, LatestButton};
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
-    observe_sentinel, scroll_to_end, HistoryDom, SentinelObserver, DM_FOLLOW_BAND_PX,
+    observe_newest, scroll_to_end, HistoryDom, SentinelObserver, DM_FOLLOW_BAND_PX,
 };
 use crate::room_data::SendMessageError;
 use dioxus::logger::tracing::{error, info, warn};
@@ -558,7 +558,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
     // Drives the Latest control: is the newest DM's bottom on screen, give or
     // take `NEWEST_IN_VIEW_SLACK_PX`? Written only by the observer on
-    // `dm-bottom-sentinel` (see `observe_newest_dm`), so nothing reads layout
+    // `dm-bottom-sentinel` (see `observe_newest`), so nothing reads layout
     // on scroll. Starts `true` so the control stays hidden until it reports.
     let newest_in_view = use_signal(|| true);
     // That observer, held for as long as the modal is open: replaced when the
@@ -1073,12 +1073,18 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             onmounted: {
                                 let seen_witness = seen_witness.clone();
                                 move |_| {
+                                    // Each report re-applies the read rule:
+                                    // the reader scrolling the end into view
+                                    // is what usually changes it.
                                     #[cfg(target_arch = "wasm32")]
-                                    observe_newest_dm(
-                                        &newest_dm_observer,
-                                        newest_in_view,
-                                        seen_witness.clone(),
-                                    );
+                                    {
+                                        drop(newest_dm_observer.borrow_mut().take());
+                                        let seen_witness = seen_witness.clone();
+                                        *newest_dm_observer.borrow_mut() =
+                                            observe_newest(&DM_HISTORY, newest_in_view, move |_| {
+                                                seen_witness.check()
+                                            });
+                                    }
                                     #[cfg(not(target_arch = "wasm32"))]
                                     let _ = &seen_witness;
                                 }
@@ -1851,38 +1857,6 @@ impl ThreadSeenWitness {
         }
         crate::components::direct_messages::mark_thread_read(self.room, self.peer, ts);
     }
-}
-
-/// Watch `dm-bottom-sentinel`, whose top edge is the newest DM's bottom, and
-/// publish whether it is on screen to `newest_in_view` (see
-/// [`observe_sentinel`]). Each report also re-applies the read rule, since the
-/// reader scrolling the end into view is what usually changes it. Replaces
-/// any observer already in `slot`.
-#[cfg(target_arch = "wasm32")]
-fn observe_newest_dm(
-    slot: &std::cell::RefCell<Option<SentinelObserver>>,
-    newest_in_view: Signal<bool>,
-    seen_witness: ThreadSeenWitness,
-) {
-    drop(slot.borrow_mut().take());
-    let (Some(root), Some(sentinel)) = (DM_HISTORY.container(), DM_HISTORY.sentinel()) else {
-        return;
-    };
-    *slot.borrow_mut() = observe_sentinel(&root, &sentinel, move |in_view| {
-        seen_witness.check();
-        // The Latest control renders from this signal, so the write goes
-        // through `defer`. By then the modal may have closed and taken the
-        // signal with it: `try_*` skips that, and skips a write that would
-        // change nothing.
-        crate::util::defer(move || {
-            let mut newest_in_view = newest_in_view;
-            if newest_in_view.try_peek().is_ok_and(|v| *v != in_view) {
-                if let Ok(mut v) = newest_in_view.try_write() {
-                    *v = in_view;
-                }
-            }
-        });
-    });
 }
 
 /// Run a queued opening or own-send placement. The example test build lets

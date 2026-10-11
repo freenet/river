@@ -133,7 +133,7 @@ impl Drop for SentinelObserver {
 /// (.claude/rules/dioxus-signal-safety.md). `None` if the browser refused the
 /// observer.
 #[cfg(target_arch = "wasm32")]
-pub fn observe_sentinel(
+fn observe_sentinel(
     root: &web_sys::Element,
     sentinel: &web_sys::Element,
     mut on_change: impl FnMut(bool) + 'static,
@@ -167,6 +167,31 @@ pub fn observe_sentinel(
     Some(SentinelObserver {
         observer,
         _callback: callback,
+    })
+}
+
+/// Watch `dom`'s sentinel and publish whether the newest item's bottom is on
+/// screen to `in_view`, calling `on_report` with each report first. The write
+/// is deferred, and skipped once the signal has gone with its component or
+/// would not change. `None` if either element is missing or the browser
+/// refused the observer.
+#[cfg(target_arch = "wasm32")]
+pub fn observe_newest(
+    dom: &HistoryDom,
+    in_view: Signal<bool>,
+    mut on_report: impl FnMut(bool) + 'static,
+) -> Option<SentinelObserver> {
+    let (root, sentinel) = (dom.container()?, dom.sentinel()?);
+    observe_sentinel(&root, &sentinel, move |now| {
+        on_report(now);
+        crate::util::defer(move || {
+            let mut in_view = in_view;
+            if in_view.try_peek().is_ok_and(|v| *v != now) {
+                if let Ok(mut v) = in_view.try_write() {
+                    *v = now;
+                }
+            }
+        });
     })
 }
 
