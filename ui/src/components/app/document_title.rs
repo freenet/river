@@ -21,7 +21,7 @@ use web_sys::VisibilityState;
 const APP_NAME: &str = "River";
 
 /// Global signal tracking whether the document is currently visible
-pub static DOCUMENT_VISIBLE: GlobalSignal<bool> = Global::new(|| true);
+static DOCUMENT_VISIBLE: GlobalSignal<bool> = Global::new(|| true);
 
 /// Tracks whether the document title manager has been initialized
 static TITLE_MANAGER_INITIALIZED: GlobalSignal<bool> = Global::new(|| false);
