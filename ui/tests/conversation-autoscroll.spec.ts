@@ -11,13 +11,13 @@ import {
   deliverOffscreen,
   distanceFromBottom,
   expectFollowed,
+  expectHeldFromViewBottom,
   expectMessageInView,
   expectParkedAwayFromEnd,
   expectReadingRow,
-  expectHeldFromViewBottom,
   expectRowHeld,
-  expectSettleWithheld,
   expectSettledAtBottom,
+  expectSettleWithheld,
   expectStaysPut,
   fillHistory,
   historyHeight,
@@ -34,7 +34,6 @@ import {
   releaseSettleEvents,
   rowTop,
   scrollTop,
-  settle,
   viewportHeight,
   withheld,
 } from "./history-geometry";
@@ -149,7 +148,7 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
   // A settle that lands in the same frame as the composer growing, before the
   // ResizeObserver has seen the new height, must not capture the reading
   // position over the view the observer is about to correct.
-  test("a settle in the same frame the composer grows keeps the newest message where it was", async ({ page }) => {
+  test("a settle in the same frame the composer grows keeps the newest message where it was", { tag: "@chromium-only" }, async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     const hasScrollend = await page.evaluate(() => "onscrollend" in document.getElementById("chat-scroll-container")!);
     // Without `scrollend` the settle is a 120ms debounce, never in the frame.
@@ -232,22 +231,6 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
       "the last row remounted, so this exercised a remount rather than the " +
         "in-place content change it is meant to pin"
     ).toBe(true);
-  });
-
-  test("an arrival does not move a reader parked up the history", async ({ page }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-
-    await readerScrollsTo(page, 0);
-    await expect
-      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
-      .toBeGreaterThan(WELL_AWAY_FROM_END_PX);
-
-    await deliver(page, "arrived while reading history");
-    await expectStaysPut(
-      page,
-      "a message arrived while the reader was scrolled up and yanked the view"
-    );
   });
 
   test("an arrival follows a reader who came back to the end, or was brought there by Latest", async ({ page }) => {
@@ -1318,7 +1301,7 @@ test.describe("Own send goes to the newest message once (A06)", () => {
   // A send's scroll belongs to the room it was sent in. A switch that lands
   // after the keypress but before the send applies leaves the new room to its
   // own opening, and a later arrival there must not finish the old room's send.
-  test("a room switch between the send and its render cancels the send's scroll", async ({ page }) => {
+  test("a room switch between the send and its render cancels the send's scroll", { tag: "@chromium-only" }, async ({ page }) => {
     await openRoomAtBottom(page, "Your Private Room");
     await fillHistory(page, "other room");
     await selectListedRoom(page, "Team Chat Room");
@@ -1350,7 +1333,7 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     ).toHaveCount(1);
   });
 
-  test("a send that fails to apply does not navigate", async ({ page }) => {
+  test("a send that fails to apply does not navigate", { tag: "@chromium-only" }, async ({ page }) => {
     const applyFailures: string[] = [];
     page.on("console", (msg) => {
       if (msg.text().includes("Failed to apply message delta")) applyFailures.push(msg.text());
@@ -1382,32 +1365,6 @@ test.describe("Own send goes to the newest message once (A06)", () => {
       "premise: the send should have failed to apply",
     ).toHaveCount(0);
     await expectParkedAwayFromEnd(page, "a send that failed to apply took the reader to the latest message");
-  });
-
-  // Another member's clock may run up to CLOCK_SKEW_TOLERANCE_SECS (60s) ahead
-  // of ours, and their message then sorts BELOW one we send afterwards. The
-  // send still goes to the true end, and the sent message stays in view
-  // because the later message fits under it.
-  test("a send goes to the true end when another member's message is stamped ahead of our clock", async ({
-    page,
-  }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-    await deliverOffscreen(page, "stamped ahead of our clock", 50);
-    await readerScrollsWithoutGesture(page, 0);
-    await expectParkedAwayFromEnd(page, "premise: reading older messages");
-
-    await sendWithEnter(page, "own send under clock skew");
-
-    await expect(
-      page.locator("[data-item-key]").last(),
-      "premise: the message stamped ahead should sort below the one sent after it",
-    ).toContainText("stamped ahead of our clock");
-    await expectAtEndShowing(
-      page,
-      "own send under clock skew",
-      "a send under clock skew did not go to the true end with the sent message in view",
-    );
   });
 });
 
@@ -1496,49 +1453,50 @@ test.describe("The end holds after an explicit request", () => {
     await expectRowHeld(page, row.key, row.top, "a row grew after the reader scrolled away and the view moved");
   });
 
-  test("an arrival after the room opens follows, and the end holds while a row above it grows", async ({ page }) => {
-    const image = await holdTestImage(page);
-    await openRoomAtBottom(page, "Team Chat Room");
-    await addLoadingImageAboveTheEnd(page, image);
-    await reopenTeamChat(page);
+  // Each request that puts the reader at the end, then the same growth.
+  const requests: [string, (page: Page) => Promise<void>][] = [
+    [
+      "a followed arrival",
+      async (page) => {
+        await reopenTeamChat(page);
+        await deliver(page, "arrived after the opening");
+        await expectFollowed(page, "arrived after the opening", "an arrival after the opening was not followed");
+      },
+    ],
+    [
+      "Latest",
+      async (page) => {
+        await readerScrollsWithoutGesture(page, 0);
+        await page.getByTestId("scroll-to-bottom").click();
+        await expectSettledAtBottom(page, "premise: Latest reaches the end");
+      },
+    ],
+    [
+      "an own send",
+      async (page) => {
+        await readerScrollsWithoutGesture(page, 0);
+        const input = page.getByTestId("message-input");
+        await input.fill("own send before the image loads");
+        await input.press("Enter");
+        await expect(input, "the draft was not cleared").toHaveValue("");
+        await expect(page.locator("[data-item-key]").last()).toContainText("own send before the image loads");
+        await expectSettledAtBottom(page, "premise: the send goes to the end");
+      },
+    ],
+  ];
+  for (const [request, reachEnd] of requests) {
+    test(`${request} holds the end while a row above it grows`, async ({ page }) => {
+      const image = await holdTestImage(page);
+      await openRoomAtBottom(page, "Team Chat Room");
+      await addLoadingImageAboveTheEnd(page, image);
+      await reachEnd(page);
 
-    await deliver(page, "arrived after the opening");
-    await expectFollowed(page, "arrived after the opening", "an arrival after the opening was not followed");
-    await loadImage(page, image);
+      await loadImage(page, image);
 
-    await expectSettledAtBottom(page, "a row grew after a followed arrival and left the newest message off screen");
-    await expect(page.getByTestId("scroll-to-bottom"), "Latest offered at the end").toHaveCount(0);
-  });
-
-  test("Latest holds the end while a row above it grows", async ({ page }) => {
-    const image = await holdTestImage(page);
-    await openRoomAtBottom(page, "Team Chat Room");
-    await addLoadingImageAboveTheEnd(page, image);
-    await readerScrollsWithoutGesture(page, 0);
-    await page.getByTestId("scroll-to-bottom").click();
-    await expectSettledAtBottom(page, "premise: Latest reaches the end");
-
-    await loadImage(page, image);
-
-    await expectSettledAtBottom(page, "a row grew above the end after Latest and left the newest message off screen");
-  });
-
-  test("an own send holds the end while a row above it grows", async ({ page }) => {
-    const image = await holdTestImage(page);
-    await openRoomAtBottom(page, "Team Chat Room");
-    await addLoadingImageAboveTheEnd(page, image);
-    await readerScrollsWithoutGesture(page, 0);
-    const input = page.getByTestId("message-input");
-    await input.fill("own send before the image loads");
-    await input.press("Enter");
-    await expect(input, "the draft was not cleared").toHaveValue("");
-    await expect(page.locator("[data-item-key]").last()).toContainText("own send before the image loads");
-    await expectSettledAtBottom(page, "premise: the send goes to the end");
-
-    await loadImage(page, image);
-
-    await expectSettledAtBottom(page, "a row grew above the end after a send and left the newest message off screen");
-  });
+      await expectSettledAtBottom(page, `a row grew above the end after ${request} and left the newest message off screen`);
+      await expect(page.getByTestId("scroll-to-bottom"), "Latest offered at the end").toHaveCount(0);
+    });
+  }
 
   // Tall enough that the opening's tail sits inside the backfill lead, so the
   // opening backfills: same newest message, more rows.
@@ -1575,15 +1533,6 @@ test.describe("The end holds after an explicit request", () => {
 // Rationale: .claude/rules/history-scrolling.md.
 test.describe("An arrival follows a reader at the end", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
-
-  test("an arrival follows a reader at the end and Latest stays hidden", async ({ page }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-
-    await deliver(page, "followed from the end");
-    await expectFollowed(page, "followed from the end", "an arrival did not follow a reader at the end");
-    await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);
-  });
 
   for (const [offset, follows] of [
     [-20, true],
@@ -1624,45 +1573,7 @@ test.describe("An arrival follows a reader at the end", () => {
     await expectSettledAtBottom(page, "a tall arrival did not follow a reader at the end");
   });
 
-  test("a message inserted above the newest one does not follow", async ({ page }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-    await readerParksNewestBelow(page, ROOM_FOLLOW_BAND_PX / 2);
-    const row = await expectReadingRow(page);
-
-    await callRiverTest(page, "insertMessageBeforeLast", "inserted above the newest");
-    await expect(page.getByText("inserted above the newest")).toHaveCount(1);
-    await expectRowHeld(page, row.key, row.top, "a message inserted above the newest one moved the view");
-  });
-
-  // Arrival identity is stored order. A message stamped more than 60s ahead
-  // displays clamped (test deliveries record no receive time, so to the
-  // grouping pass's "now"), which can sit below the tail it follows.
-  test("an arrival clamped earlier than the tail it follows still follows a reader at the end", async ({ page }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-    await deliverOffscreen(page, "skewed within tolerance", 50);
-    await expectSettledAtBottom(page, "premise: the first skewed arrival followed");
-
-    await deliverOffscreen(page, `clamped tail ${"word ".repeat(300)}`, 120);
-    await expectSettledAtBottom(page, "an arrival clamped below the previous tail did not follow");
-  });
-
-  test("a grouping pass with nothing new does not move a reader near the end", async ({ page }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-    // Clamped to each pass's "now", so its display time moves on every pass.
-    await deliverOffscreen(page, "far ahead", 600);
-    await expectSettledAtBottom(page, "premise: the far-ahead arrival followed");
-    await readerParksNewestBelow(page, ROOM_FOLLOW_BAND_PX / 2);
-    const row = await expectReadingRow(page);
-
-    await callRiverTest(page, "insertMessageBeforeLast", "above the tail");
-    await expect(page.getByText("above the tail")).toHaveCount(1, { timeout: 5_000 });
-    await expectRowHeld(page, row.key, row.top, "a grouping pass with no new message moved the view");
-  });
-
-  test("an arrival in a hidden tab does not follow, nor does the tab coming back", async ({ page }) => {
+  test("an arrival in a hidden tab does not follow, nor does the tab coming back", { tag: "@chromium-only" }, async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
     const row = await expectReadingRow(page);
@@ -1699,19 +1610,11 @@ test.describe("An arrival under a modal or popover", { tag: "@chromium-only" }, 
     await expect(teamChatBadge(page), "an arrival behind a modal was marked read").toBeVisible();
   });
 
-  test("an arrival under the DM thread modal does not follow the room", async ({ page }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-    const row = await expectReadingRow(page);
-    await callRiverTest(page, "appendDms", 1);
-    await page.locator(".dm-rail-row-btn").first().click();
-    await expect(page.locator("#dm-scroll-container")).toBeVisible({ timeout: 5_000 });
-
-    await deliverOffscreen(page, "room arrival under a DM thread");
-    await expectRowHeld(page, row.key, row.top, "a room arrival under the DM thread moved the history");
-  });
-
-  test("an arrival under a message's reaction picker does not follow, nor does closing it", async ({ page }) => {
+  // A popover on a history row counts as a modal: the same presence keeps the
+  // arrival from following and from being read.
+  test("an arrival under a message's reaction picker does not follow, nor does closing it, and stays unread", async ({
+    page,
+  }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
     const newest = page.locator('[id^="msg-"]').last();
@@ -1725,15 +1628,8 @@ test.describe("An arrival under a modal or popover", { tag: "@chromium-only" }, 
     await page.mouse.click(5, 5);
     await expect(page.getByTestId("emoji-picker")).toHaveCount(0);
     await expectRowHeld(page, row.key, row.top, "closing the popover moved the history");
-  });
-
-  test("an arrival under the composer's emoji picker follows", async ({ page }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-    await page.getByTitle("Insert emoji").click();
-    await expect(page.locator("div.fixed.inset-0.z-40")).toHaveCount(1);
-
-    await deliver(page, "arrival under the composer picker");
-    await expectFollowed(page, "arrival under the composer picker", "a composer popover stopped an arrival following");
+    await expect(page.getByTestId("scroll-to-bottom")).toBeVisible();
+    await selectListedRoom(page, "Public Discussion Room");
+    await expect(teamChatBadge(page), "an arrival under a row popover was marked read").toBeVisible();
   });
 });

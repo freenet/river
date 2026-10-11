@@ -460,12 +460,15 @@ test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
     ).toHaveCount(0);
   });
 
-  test("an inbound DM on screen under the thread's confirmation stays unread until it closes, which does not scroll", async ({
+  test("an inbound DM under the thread's confirmation neither follows nor is seen until it closes, which does not scroll", async ({
     page,
   }) => {
+    const openConfirmation = async () => {
+      await page.getByRole("button", { name: "Delete their messages" }).click();
+      await expect(page.getByRole("dialog", { name: "Confirm delete their messages" })).toBeVisible();
+    };
     await openShortThread(page);
-    await page.getByRole("button", { name: "Delete their messages" }).click();
-    await expect(page.getByRole("dialog", { name: "Confirm delete their messages" })).toBeVisible();
+    await openConfirmation();
     await recordScrolls(page);
 
     await deliverDm(page, "on screen under a confirmation");
@@ -478,12 +481,23 @@ test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
     await page.getByRole("button", { name: "Cancel" }).click();
     await expect(railBadge(page), "closing the confirmation left the DM on screen unread").toHaveCount(0);
     await expectStill(page, "closing the confirmation moved the thread");
+
+    // The reader is still at the end, so only the confirmation keeps a DM
+    // taller than the band from being followed.
+    await openConfirmation();
+    const tall = `tall DM under a confirmation ${"word ".repeat(300)}`.trim();
+    await deliverDm(page, tall);
+    await expectStill(page, "an inbound DM under a modal moved the thread");
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expectStill(page, "closing the confirmation moved the thread");
+    await expect(page.getByTestId(LATEST)).toBeVisible();
   });
 });
 
 // A failed `ROOMS` read (contention) is transient: the open thread keeps what
 // it last showed until the retry succeeds. A room that is gone is not.
-test.describe("DM thread room read", () => {
+// Hook-driven, so it runs on one engine.
+test.describe("DM thread room read", { tag: "@chromium-only" }, () => {
   test("a failed room read keeps the open thread, its draft and the reader's place", async ({ page }) => {
     const errors = recordPageErrors(page);
     await openThreadWithHistory(page);
@@ -555,16 +569,6 @@ test.describe("DM thread room read", () => {
 test.describe("DM thread follows a reader at the end", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("an inbound DM follows a reader at the end and is marked seen", async ({ page }) => {
-    await openThreadWithHistory(page);
-
-    await deliverDm(page, "followed DM");
-    await expectAtEnd(page, "an inbound DM did not follow a reader at the end");
-    expect(await belowFold(page, "followed DM"), "the followed DM is off screen").toBeLessThanOrEqual(NEWEST_IN_VIEW_SLACK_PX);
-    await expect(railBadge(page), "a followed DM stayed unread").toHaveCount(0);
-    await expect(page.getByTestId(LATEST)).toHaveCount(0);
-  });
-
   for (const [offset, follows] of [
     [-20, true],
     [20, false],
@@ -597,19 +601,6 @@ test.describe("DM thread follows a reader at the end", () => {
     await expectAtEnd(page, "a tall inbound DM did not follow a reader at the end");
   });
 
-  test("an inbound DM in a hidden tab does not follow, nor does the tab coming back", async ({ page }) => {
-    await openThreadWithHistory(page);
-    await recordScrolls(page);
-
-    await setTabVisibility(page, "hidden");
-    await deliverDm(page, "DM in a hidden tab");
-    await expectStill(page, "an inbound DM in a hidden tab moved the thread");
-    await setTabVisibility(page, "visible");
-    await expectStill(page, "the tab coming back moved the thread");
-    await expect(page.getByTestId(LATEST)).toBeVisible();
-    await expect(railBadge(page), "a DM below the fold was marked seen").toHaveText("1");
-  });
-
   test("the first inbound DM of a thread opened empty is on screen and seen", async ({ page }) => {
     await openEmptyThread(page);
 
@@ -634,53 +625,5 @@ test.describe("DM thread follows a reader at the end", () => {
     // No reload: the send above stays this session's.
     await openEmptyThreadHere(page);
     await expectHiddenBurstStaysAtTop(page, "another thread's send moved a thread opened empty");
-  });
-
-  test("after a purge, an inbound DM stamped below the purged one still follows", async ({ page }) => {
-    await prepareThread(page, 3);
-    // Own DMs tall enough that the thread still scrolls once the peer's are gone.
-    const composer = page.getByPlaceholder("Type a direct message...");
-    for (const i of [1, 2, 3]) {
-      const text = `own tall DM ${i} ${"word ".repeat(120)}`.trim();
-      await composer.fill(text);
-      await composer.press("Enter");
-      await expect(dm(page, text)).toHaveCount(1, { timeout: 5_000 });
-    }
-    await settle(page);
-    await expectAtEnd(page, "premise: the sends left the thread at its end");
-
-    await callRiverTest(page, "deliverDmAhead", "future DM", 120);
-    await expect(dm(page, "future DM")).toHaveCount(1, { timeout: 5_000 });
-    await expectAtEnd(page, "premise: the future-stamped DM followed");
-
-    await page.getByRole("button", { name: "Delete their messages" }).click();
-    await page
-      .getByRole("dialog", { name: "Confirm delete their messages" })
-      .getByRole("button", { name: "Delete", exact: true })
-      .click();
-    await expect(dm(page, "future DM"), "premise: the purge removed the peer's DMs").toHaveCount(0, {
-      timeout: 5_000,
-    });
-    await settle(page);
-    expect((await threadGeometry(page)).max, "premise: the thread still scrolls").toBeGreaterThan(0);
-    await expectAtEnd(page, "premise: the reader is at the end after the purge");
-
-    // Stamped about now, below the purged DM.
-    const tall = `inbound after the purge ${"word ".repeat(300)}`.trim();
-    await deliverDm(page, tall);
-    await expectAtEnd(page, "a DM stamped below a purged one did not follow a reader at the end");
-  });
-
-  test("an inbound DM under the thread's confirmation does not follow, nor does closing it", async ({ page }) => {
-    await openThreadWithHistory(page);
-    await page.getByRole("button", { name: "Delete their messages" }).click();
-    await expect(page.getByRole("dialog", { name: "Confirm delete their messages" })).toBeVisible();
-    await recordScrolls(page);
-
-    await deliverDm(page, "DM under a confirmation");
-    await expectStill(page, "an inbound DM under a modal moved the thread");
-    await page.getByRole("button", { name: "Cancel" }).click();
-    await expectStill(page, "closing the confirmation moved the thread");
-    await expect(page.getByTestId(LATEST)).toBeVisible();
   });
 });

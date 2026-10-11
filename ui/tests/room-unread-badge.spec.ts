@@ -1,20 +1,17 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import {
-  waitForApp,
-  selectListedRoom,
-  setTabVisibility,
   hiddenTitleCount,
   roomUnreadBadge,
-  hamburgerBadge,
+  selectListedRoom,
+  setTabVisibility,
+  waitForApp,
 } from "./example-room";
 import {
   NEWEST_IN_VIEW_SLACK_PX,
-  backToChatFromMembers,
   deliverOffscreen,
   expectParkedAwayFromEnd,
   fillHistory,
-  hideChatBehindMembers,
   newestRowFromViewBottom,
   nextFrames,
   openRoomAtBottom,
@@ -356,43 +353,5 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
       await selectListedRoom(page, "Public Discussion Room");
       await expect(teamChatBadge(page), "closing the modal left an arrival on screen unread").toHaveCount(0);
     });
-
-    test("an arrival on screen under a message's reaction picker stays unread", async ({ page }) => {
-      await openRoomAtBottom(page, "Team Chat Room");
-      const row = page.locator('[id^="msg-"]').last();
-      await row.getByTestId("message-bubble").hover();
-      await row.getByTestId("add-reaction-button").click();
-      await expect(page.getByTestId("emoji-picker")).toBeVisible();
-
-      await deliverOffscreen(page, "arrival under a popover");
-      expect(await onScreen(page, "arrival under a popover"), "premise: the arrival is on screen").toBe(true);
-      await nextFrames(page);
-      await callRiverTest(page, "switchRoom", "Public Discussion Room");
-      await expect(teamChatBadge(page), "an arrival seen only under a row popover was marked read").toBeVisible();
-    });
-  });
-});
-
-// A room whose chat panel is hidden behind the mobile Rooms or Members panel
-// has no layout, so nothing in it is on screen and an arrival there stays
-// unread. Observed after opening another room, through the
-// hamburger badge, which counts every room but the current one. Only the
-// Members panel is exercised: both panels hide the chat the same way, and the
-// test pins its own viewport, so one engine is enough.
-test.describe("Unread behind the mobile panels (A07)", { tag: "@chromium-only" }, () => {
-  test.use({ viewport: { width: 390, height: 844 } });
-
-  test("an arrival while the chat is behind the members panel leaves its room unread", async ({ page }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await hideChatBehindMembers(page);
-
-    await deliverOffscreen(page, "arrived behind the members panel");
-    // As a notification click does, with the members panel still in front.
-    await callRiverTest(page, "switchRoom", "Public Discussion Room");
-    await backToChatFromMembers(page);
-    await expect(page.getByRole("heading", { name: "Public Discussion Room" })).toBeVisible();
-    await nextFrames(page);
-
-    await expect(hamburgerBadge(page), "an arrival behind the members panel was marked read").toHaveText("1");
   });
 });

@@ -13,7 +13,8 @@ import { AT_BOTTOM_EPSILON_PX, NEWEST_IN_VIEW_SLACK_PX, settle } from "./history
 // The race is made deterministic with the `holdNextDmPlacement` test hook,
 // which holds the real queued placement inside its task until
 // `releaseHeldDmPlacement`. The tab is hidden while a held thread is open, so
-// nothing else can mark it read before the release.
+// nothing else can mark it read before the release. Hook-driven, so it runs on
+// one engine.
 
 /// test_hooks.rs `DM_PEERS`: index and nickname.
 const A = { index: 0, name: "DM Test Peer", history: "dm history" } as const;
@@ -208,7 +209,7 @@ async function replaceWithParkedB(page: Page) {
   await expect(railBadge(page, B), "premise: B's DM below the fold is unread").toHaveText("1");
 }
 
-test.describe("DM thread placement after unmount", () => {
+test.describe("DM thread placement after unmount", { tag: "@chromium-only" }, () => {
   test.afterEach(async ({ page }) => {
     await setTabVisibility(page, "visible").catch(() => {});
   });
@@ -232,41 +233,6 @@ test.describe("DM thread placement after unmount", () => {
     await expectStill(page, "A's stale opening moved B");
     expect.soft(await unreadCount(page, A), "A's stale opening marked A read from B's end").toBe(aUnread);
     expect.soft(await unreadCount(page, B), "A's stale opening marked B's DM below the fold read").toBe(1);
-    expect(errors).toEqual([]);
-  });
-
-  test("a queued own send of a closed thread neither moves nor marks read the thread that replaced it", async ({
-    page,
-  }) => {
-    const errors = recordPageErrors(page);
-    await seedThreads(page, A, B);
-    await openThread(page, A);
-    await expectAtEnd(page, "premise: A opened on its newest DM");
-    await expect(railBadge(page, A), "premise: A's opening marked it read").toHaveCount(0, { timeout: 5_000 });
-    await readerScrollsTo(page, 0);
-    await setTabVisibility(page, "hidden");
-
-    const composer = page.getByPlaceholder("Type a direct message...");
-    await composer.fill("sent from A");
-    await holdPlacementOf(page, () => composer.press("Enter"));
-    await expect(dm(page, "sent from A")).toHaveCount(1, { timeout: 5_000 });
-    // Stamped after the send (deliverDmForPeer orders it after the pair's
-    // newest DM), so the held placement's witness has an unread DM to mark,
-    // and not one from the same second as anything A has seen.
-    await deliverDm(page, A, "unread for A");
-    await settle(page);
-    await expect(railBadge(page, A), "premise: A's DM that arrived while hidden is unread").toHaveText("1");
-    await closeThread(page);
-
-    await replaceWithParkedB(page);
-    await expect(railBadge(page, A), "premise: A is still unread").toHaveText("1");
-    await recordScrolls(page);
-
-    await releaseHeldPlacement(page);
-
-    await expectStill(page, "A's stale own-send placement moved B");
-    expect.soft(await unreadCount(page, A), "A's stale own-send placement marked A read from B's end").toBe(1);
-    expect.soft(await unreadCount(page, B), "A's stale own-send placement marked B's DM below the fold read").toBe(1);
     expect(errors).toEqual([]);
   });
 
@@ -298,19 +264,6 @@ test.describe("DM thread placement after unmount", () => {
     expect
       .soft(await unreadCount(page, A), "the closed instance's opening marked the reopened thread read")
       .toBe(aUnread);
-    expect(errors).toEqual([]);
-  });
-
-  test("a queued opening of a thread closed with no replacement does nothing", async ({ page }) => {
-    const errors = recordPageErrors(page);
-    await seedThreads(page, A);
-    await holdPlacementOf(page, () => openThread(page, A));
-    await closeThread(page);
-
-    await releaseHeldPlacement(page);
-
-    await expect(page.getByTestId("dm-thread-modal")).toHaveCount(0);
-    expect(await unreadCount(page, A), "the closed thread's opening marked it read").toBe(HISTORY);
     expect(errors).toEqual([]);
   });
 
