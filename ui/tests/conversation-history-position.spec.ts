@@ -3,6 +3,7 @@ import { callRiverTest } from "./river-test";
 import { hamburgerBadge, membersBackToChatBadge, selectListedRoom } from "./example-room";
 import {
   ALL_PROJECTS,
+  READING_ROW_BUDGET_PX,
   WELL_AWAY_FROM_END_PX,
   backToChatFromMembers,
   deliverOffscreen,
@@ -13,17 +14,14 @@ import {
   expectSettledAtBottom,
   fillHistory,
   hideChatBehindMembers,
-  historyHeight,
   holdTestImage,
   knownFailure,
   nextFrames,
   openRoomAtBottom,
-  READING_ROW_BUDGET_PX,
   readerScrollsWithoutGesture,
   readingRow,
-  rowTop,
-  scrollTop,
-  viewportHeight,
+  rowOffset,
+  scrollMetrics,
   withheld,
 } from "./history-geometry";
 
@@ -78,7 +76,7 @@ test.describe("Reading position when content above changes (A02)", () => {
     await parkWithRowAtTop(page, afterImage);
     await expectParkedAwayFromEnd(page);
     expect(
-      (await rowTop(page, imageKey))!,
+      (await rowOffset(page, imageKey))!,
       "premise: the image row is above the visible history",
     ).toBeLessThan(0);
     const row = await readingRow(page);
@@ -114,7 +112,7 @@ test.describe("Reading position when content above changes (A02)", () => {
     const row = await readingRow(page, "keep 2:");
     expect(row, "premise: the reader is looking at a surviving row").not.toBeNull();
     expect(
-      (await rowTop(page, await keyOf(page, "purge-me 7:")))!,
+      (await rowOffset(page, await keyOf(page, "purge-me 7:")))!,
       "premise: every removed row is above the visible history",
     ).toBeLessThan(0);
 
@@ -141,8 +139,8 @@ test.describe("Reading position when content above changes (A02)", () => {
     // The row above stays put. Not the row below: alternating authors mean
     // the rows either side merge into one group once this one is gone.
     expect(row!.prevKey, "premise: a row precedes it").not.toBeNull();
-    const prevTop = (await rowTop(page, row!.prevKey!))!;
-    const before = await scrollTop(page);
+    const prevTop = (await rowOffset(page, row!.prevKey!))!;
+    const before = (await scrollMetrics(page)).top;
 
     await callRiverTest(page, "removeMessages", "keep 2:");
     await expect(page.getByText("keep 2:", { exact: false })).toHaveCount(0, { timeout: 5_000 });
@@ -152,7 +150,7 @@ test.describe("Reading position when content above changes (A02)", () => {
       await distanceFromBottom(page),
       "deleting the reader's row took them to the latest message",
     ).toBeGreaterThan(WELL_AWAY_FROM_END_PX);
-    expect(Math.abs((await scrollTop(page)) - before), "the view moved when the reader's row was deleted").toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
+    expect(Math.abs((await scrollMetrics(page)).top - before), "the view moved when the reader's row was deleted").toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
     await expectRowHeld(page, row!.prevKey!, prevTop, "the row above the deleted one moved");
   });
 });
@@ -179,7 +177,7 @@ test.describe("Deleting the reading row while the chat is hidden (A02)", () => {
     // Not the row below: alternating authors mean the rows either side merge
     // into one group once this one is gone.
     expect(row!.prevKey, "premise: a row precedes it").not.toBeNull();
-    const prevTop = (await rowTop(page, row!.prevKey!))!;
+    const prevTop = (await rowOffset(page, row!.prevKey!))!;
 
     await hideChatBehindMembers(page);
     await callRiverTest(page, "removeMessages", "keep 2:");
@@ -351,9 +349,9 @@ test.describe("Opening a room that is temporarily empty (A03)", () => {
     await callRiverTest(page, "appendMessages", 30);
     await expect(page.getByText("batched arrival 29", { exact: false })).toHaveCount(1, { timeout: 5_000 });
     expect(
-      await historyHeight(page),
+      (await scrollMetrics(page)).height,
       "premise: the first messages should overflow the view",
-    ).toBeGreaterThan((await viewportHeight(page)) + WELL_AWAY_FROM_END_PX);
+    ).toBeGreaterThan((await scrollMetrics(page)).client + WELL_AWAY_FROM_END_PX);
     await expectSettledAtBottom(page, "the room opened empty did not open at its newest message");
 
     // The opening landed once: a reader who then leaves the end is not taken

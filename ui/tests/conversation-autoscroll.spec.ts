@@ -11,7 +11,6 @@ import {
   deliverOffscreen,
   distanceFromBottom,
   expectFollowed,
-  expectHeldFromViewBottom,
   expectMessageInView,
   expectParkedAwayFromEnd,
   expectReadingRow,
@@ -20,7 +19,6 @@ import {
   expectSettleWithheld,
   expectStaysPut,
   fillHistory,
-  historyHeight,
   holdSettleEvents,
   holdTestImage,
   newestRowFromViewBottom,
@@ -32,9 +30,8 @@ import {
   readerScrollsWithoutGesture,
   readingRow,
   releaseSettleEvents,
-  rowTop,
-  scrollTop,
-  viewportHeight,
+  rowOffset,
+  scrollMetrics,
   withheld,
 } from "./history-geometry";
 
@@ -62,7 +59,7 @@ const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join(
 // the end, which grows with every arrival whether or not the view moved. When
 // the chat area itself changes height (the composer), the view keeps its
 // BOTTOM edge instead, so those steps measure the newest
-// message against the bottom of the view (`expectHeldFromViewBottom`).
+// message against the bottom of the view (`expectRowHeld` with `fromBottom`).
 //
 // Assumes the example-data build, which exposes `window.__riverTest` for
 // delivering INBOUND messages. Sending through the composer is an explicit
@@ -76,7 +73,7 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
-    const roomyViewport = await viewportHeight(page);
+    const roomyViewport = (await scrollMetrics(page)).client;
     const newest = await newestRowFromViewBottom(page);
 
     // Typing a long message grows the composer, which takes more than 100px off
@@ -87,7 +84,7 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
     // The premise, asserted rather than assumed: the window over the history
     // has to shrink by more than the old margin.
     await expect
-      .poll(() => viewportHeight(page), {
+      .poll(async () => (await scrollMetrics(page)).client, {
         timeout: 5_000,
         message:
           "premise: the composer did not grow by more than the old 100px " +
@@ -97,7 +94,9 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
 
     // The window shrinks from the bottom and the view keeps its bottom edge,
     // so the newest message stays where it was above the composer.
-    await expectHeldFromViewBottom(page, newest.key, newest.gap, "the composer grew and the newest message moved");
+    await expectRowHeld(page, newest.key, newest.gap, "the composer grew and the newest message moved", {
+      fromBottom: "bottom",
+    });
 
     // #486's recorded failure was a run of arrivals; a loop catches a follow
     // that works for one arrival and latches off for a later one.
@@ -110,7 +109,7 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
     // so the reader is still at the end and the next arrival follows too.
     await page.getByTestId("message-input").fill("");
     await expect
-      .poll(() => viewportHeight(page), { timeout: 5_000 })
+      .poll(async () => (await scrollMetrics(page)).client, { timeout: 5_000 })
       .toBeGreaterThan(roomyViewport - WELL_AWAY_FROM_END_PX);
     await expectSettledAtBottom(page, "the composer collapsed and the view lost its bottom edge");
     await deliver(page, "arrived after the draft was cleared");
@@ -122,7 +121,7 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
   // settle, so several resizes before the next settle must not compound.
   test("a draft typed line by line before any settle keeps the newest message where it was", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
-    const roomyViewport = await viewportHeight(page);
+    const roomyViewport = (await scrollMetrics(page)).client;
     const newest = await newestRowFromViewBottom(page);
     const input = page.getByTestId("message-input");
 
@@ -134,15 +133,19 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
       await nextFrames(page);
     }
     await expect
-      .poll(() => viewportHeight(page), {
+      .poll(async () => (await scrollMetrics(page)).client, {
         timeout: 5_000,
         message: "premise: the draft should take more than the old margin off the history",
       })
       .toBeLessThan(roomyViewport - WELL_AWAY_FROM_END_PX);
     await expectSettleWithheld(page);
-    await expectHeldFromViewBottom(page, newest.key, newest.gap, "a draft grown one line at a time moved the newest message");
+    await expectRowHeld(page, newest.key, newest.gap, "a draft grown one line at a time moved the newest message", {
+      fromBottom: "bottom",
+    });
     await releaseSettleEvents(page);
-    await expectHeldFromViewBottom(page, newest.key, newest.gap, "the late settle moved the newest message");
+    await expectRowHeld(page, newest.key, newest.gap, "the late settle moved the newest message", {
+      fromBottom: "bottom",
+    });
   });
 
   // A settle that lands in the same frame as the composer growing, before the
@@ -154,7 +157,7 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
     // Without `scrollend` the settle is a 120ms debounce, never in the frame.
     test.skip(!hasScrollend, "no scrollend: the settle cannot land in the same frame");
     await readerLeavesAndReturnsToEnd(page);
-    const roomyViewport = await viewportHeight(page);
+    const roomyViewport = (await scrollMetrics(page)).client;
     const newest = await newestRowFromViewBottom(page);
 
     // On `document`, so it runs after the app's own input handler has grown
@@ -176,11 +179,12 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
 
     const premise = await page.evaluate(() => (window as any).__riverSameFrameSettle);
     expect(premise?.shrunk, "premise: the composer should grow inside the input handler").toBe(true);
-    await expectHeldFromViewBottom(
+    await expectRowHeld(
       page,
       newest.key,
       newest.gap,
       "a settle in the same frame the composer grew lost the bottom edge",
+      { fromBottom: "bottom" },
     );
   });
 
@@ -191,7 +195,7 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
     // Out of the opening's end hold, which an insert above the newest keeps.
     await readerLeavesAndReturnsToEnd(page);
     const row = await expectReadingRow(page);
-    const heightBefore = await historyHeight(page);
+    const heightBefore = (await scrollMetrics(page)).height;
 
     // Tag the last row so we can prove afterwards that it was diffed, not
     // remounted. A remount is the old `onmounted` path; a diff is the content
@@ -216,7 +220,7 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
       "premise: the insert should land",
     ).toHaveCount(1, { timeout: 5_000 });
     expect(
-      await historyHeight(page),
+      (await scrollMetrics(page)).height,
       "premise: the insert should make the history taller",
     ).toBeGreaterThan(heightBefore);
 
@@ -240,7 +244,7 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
     // The reader scrolls back to the end THEMSELVES. Under the old pin, this
     // settle had to re-arm following; now the next arrival measures afresh.
     await readerScrollsTo(page, 0);
-    await readerScrollsWithoutGesture(page, await historyHeight(page));
+    await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).height);
     await expectSettledAtBottom(page, "the reader's own scroll should reach the bottom");
     await deliver(page, "arrived after the reader scrolled back down");
     await expectFollowed(page, "arrived after the reader scrolled back down", "the reader returned to the end and an arrival was not followed");
@@ -268,9 +272,7 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
     // end is held through height changes (covered below).
     await readerLeavesAndReturnsToEnd(page);
 
-    const before = await historyHeight(page);
-    const topBefore = await scrollTop(page);
-    const viewBefore = await viewportHeight(page);
+    const { height: before, top: topBefore, client: viewBefore } = await scrollMetrics(page);
 
     // Narrowing the window makes every message wrap onto more lines, so the
     // history gets taller and its end drops below the fold. No state changed,
@@ -286,7 +288,7 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
     // layout change ever flattens that again, this fails loudly instead of
     // going quietly vacuous.
     await expect
-      .poll(() => historyHeight(page), {
+      .poll(async () => (await scrollMetrics(page)).height, {
         timeout: 5_000,
         message:
           "narrowing the window did not make the history taller, so this test " +
@@ -302,9 +304,9 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
     // scroll position by exactly the difference.
     await nextFrames(page);
     await page.waitForTimeout(600);
-    const heightChange = viewBefore - (await viewportHeight(page));
+    const heightChange = viewBefore - (await scrollMetrics(page)).client;
     expect(
-      Math.abs((await scrollTop(page)) - topBefore - heightChange),
+      Math.abs((await scrollMetrics(page)).top - topBefore - heightChange),
       `the history reflowed taller and the view was moved (chat area height change: ${heightChange}px)`,
     ).toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
   });
@@ -335,20 +337,22 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
     // Not held at the end by the opening, which would take
     // the view to the grown row's end and hide what this test measures.
     await readerLeavesAndReturnsToEnd(page);
-    const roomyViewport = await viewportHeight(page);
+    const roomyViewport = (await scrollMetrics(page)).client;
     // Its TOP: the row grows below the bottom edge, and content growth is not
     // followed.
     const newest = await newestRowFromViewBottom(page, "top");
     await page.getByTestId("message-input").fill(LONG_DRAFT);
     await expect
-      .poll(() => viewportHeight(page), {
+      .poll(async () => (await scrollMetrics(page)).client, {
         timeout: 5_000,
         message:
           "premise: the composer did not grow enough that clearing it would " +
           "clamp the view, so this test is not exercising the same-frame race",
       })
       .toBeLessThan(roomyViewport - WELL_AWAY_FROM_END_PX);
-    await expectHeldFromViewBottom(page, newest.key, newest.gap, "the composer grew and the newest message moved", "top");
+    await expectRowHeld(page, newest.key, newest.gap, "the composer grew and the newest message moved", {
+      fromBottom: "top",
+    });
 
     // On `document`, so it runs after the app's own input handler has
     // collapsed the composer, before any frame. Reading clientHeight there
@@ -384,12 +388,12 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
     expect(premise.grew, "premise: the newest row should have grown").toBeGreaterThan(
       AT_BOTTOM_EPSILON_PX,
     );
-    await expectHeldFromViewBottom(
+    await expectRowHeld(
       page,
       newest.key,
       newest.gap,
       "the history grew in the same frame the composer collapsed and the newest message moved",
-      "top",
+      { fromBottom: "top" },
     );
   });
 });
@@ -519,7 +523,7 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
 
     // Park mid-history: away from the end and far enough from the top not
     // to trigger a backfill.
-    const mid = Math.floor((await historyHeight(page)) / 2);
+    const mid = Math.floor((await scrollMetrics(page)).height / 2);
     await readerScrollsTo(page, mid);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
@@ -563,7 +567,7 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
     await openRoomAtBottom(page, CAPPED_ROOM, DEEP_ROOM_PATH);
     await expectWindowedRenderActive(page);
 
-    const mid = Math.floor((await historyHeight(page)) / 2);
+    const mid = Math.floor((await scrollMetrics(page)).height / 2);
     await readerScrollsTo(page, mid);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
@@ -624,10 +628,7 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
     // Deliberately NO settle wait before delivering: the batch lands while
     // the reader's `scrollend` is still in flight, so the reposition has to
     // hold the rows without a settle having recorded where the reader is.
-    const parkedAt = Math.max(
-      0,
-      (await historyHeight(page)) - (await viewportHeight(page)) - 400
-    );
+    const parkedAt = Math.max(0, (await scrollMetrics(page)).max - 400);
     await readerScrollsTo(page, parkedAt);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
@@ -743,7 +744,7 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
 
     // Park mid-history so the batch below grows the window (a settle at the
     // end would trim the divergence away before paging).
-    const mid = Math.floor((await historyHeight(page)) / 2);
+    const mid = Math.floor((await scrollMetrics(page)).height / 2);
     await readerScrollsTo(page, mid);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
@@ -869,17 +870,17 @@ test.describe("Arrival before the reader's settle (A01)", () => {
     ).toContainText("tall filler");
 
     await holdSettleEvents(page);
-    await readerScrollsTo(page, (await scrollTop(page)) - 300);
+    await readerScrollsTo(page, (await scrollMetrics(page)).top - 300);
     await expectSettleWithheld(page);
     const row = await readingRow(page);
     expect(row, "premise: a row is fully in view after scrolling up").not.toBeNull();
-    const heightBefore = await historyHeight(page);
+    const heightBefore = (await scrollMetrics(page)).height;
 
     // One arrival per tall row: the at-cap prune drains exactly those.
     await callRiverTest(page, "appendMessages", TALL_HEAD_TALL_ROWS);
     await expect(page.getByText("tall filler", { exact: false })).toHaveCount(0, { timeout: 5_000 });
     expect(
-      heightBefore - (await historyHeight(page)),
+      heightBefore - (await scrollMetrics(page)).height,
       "premise: the burst should shrink the history by more than the reader scrolled",
     ).toBeGreaterThan(300);
     await nextFrames(page);
@@ -986,7 +987,7 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     // Already at the end means no scroll and no settle to wait for.
     const readToEnd = async () => {
       if ((await distanceFromBottom(page)) > AT_BOTTOM_EPSILON_PX) {
-        await readerScrollsWithoutGesture(page, await historyHeight(page));
+        await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).height);
       }
     };
     for (let i = 0; i < 10 && (await withheld(page)) > 0; i++) {
@@ -1180,7 +1181,7 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
       expect(await page.locator("[data-item-key]").count(), "the stale trim removed rows").toBe(rows);
 
       // Prove the grown window is eligible to trim once the reader returns.
-      await readerScrollsWithoutGesture(page, await historyHeight(page));
+      await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).height);
       await expect.poll(() => page.locator("[data-item-key]").count(), {
         message: "returning to the exact bottom should trim the grown window",
       }).toBe(INITIAL_RENDERED_ITEMS);
@@ -1221,7 +1222,7 @@ test.describe("Trimming on a very tall viewport (A05)", () => {
     expect(
       tail,
       "premise: a trimmed (initial-size, short) window must sit within the backfill strip's reach of the viewport",
-    ).toBeLessThan((await viewportHeight(page)) + 800);
+    ).toBeLessThan((await scrollMetrics(page)).client + 800);
 
     const counts = await observeRowCounts(page);
     expect(
@@ -1415,7 +1416,7 @@ test.describe("The end holds after an explicit request", () => {
     await selectListedRoom(page, "Team Chat Room");
     await page.mouse.move(0, 0);
     await expectSettledAtBottom(page, "premise: the room opens at its newest message");
-    const imageTop = await rowTop(page, (await imageRow(page).getAttribute("data-item-key"))!);
+    const imageTop = await rowOffset(page, (await imageRow(page).getAttribute("data-item-key"))!);
     expect(imageTop, "premise: the image row is in view").toBeGreaterThan(0);
   }
 
@@ -1440,11 +1441,11 @@ test.describe("The end holds after an explicit request", () => {
     await openRoomAtBottom(page, "Team Chat Room");
     await addLoadingImageAboveTheEnd(page, image);
     await reopenTeamChat(page);
-    await readerScrollsWithoutGesture(page, (await scrollTop(page)) - 150);
+    await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).top - 150);
     await expectParkedAwayFromEnd(page, "premise: the reader scrolled away from the end");
     const row = await expectReadingRow(page);
     expect(
-      (await rowTop(page, (await imageRow(page).getAttribute("data-item-key"))!))!,
+      (await rowOffset(page, (await imageRow(page).getAttribute("data-item-key"))!))!,
       "premise: the image row is below the reading row",
     ).toBeGreaterThan(row.top);
 
@@ -1514,9 +1515,7 @@ test.describe("The end holds after an explicit request", () => {
         .poll(() => page.locator("[data-item-key]").count(), { message: "premise: the opening backfilled" })
         .toBeGreaterThan(INITIAL_RENDERED_ITEMS);
       await expectSettledAtBottom(page, "premise: the backfill kept the reader at the end");
-      expect(await historyHeight(page), "premise: the history overflows").toBeGreaterThan(
-        await viewportHeight(page),
-      );
+      expect((await scrollMetrics(page)).max, "premise: the history overflows").toBeGreaterThan(0);
 
       await loadImage(page, image);
 

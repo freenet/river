@@ -17,7 +17,7 @@ import {
   openRoomAtBottom,
   readerReturnsToEnd,
   readerScrollsWithoutGesture,
-  scrollTop,
+  scrollMetrics,
 } from "./history-geometry";
 
 // Regression test for: unread message counts were surfaced in the document
@@ -192,11 +192,11 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
     page,
   }) => {
     await parkInTeamChat(page);
-    const before = await scrollTop(page);
+    const before = (await scrollMetrics(page)).top;
 
     await deliverOffscreen(page, "short unseen arrival");
     expect(await onScreen(page, "short unseen arrival"), "the arrival was brought on screen").toBe(false);
-    expect(await scrollTop(page), "the arrival moved a parked reader").toBeCloseTo(before, 0);
+    expect((await scrollMetrics(page)).top, "the arrival moved a parked reader").toBeCloseTo(before, 0);
     await expect(latest(page), "no Latest offered for an unseen arrival").toBeVisible();
 
     await selectListedRoom(page, "Public Discussion Room");
@@ -345,11 +345,11 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
       await openMemberInfo(page);
       await deliverOffscreen(page, "arrival read on close");
       expect(await belowView(page, "arrival read on close"), "premise: all of the arrival is on screen").toBeLessThanOrEqual(0);
-      const before = await scrollTop(page);
+      const before = (await scrollMetrics(page)).top;
 
       await closeMemberInfo(page);
       await nextFrames(page);
-      expect(await scrollTop(page), "closing the modal moved the view").toBeCloseTo(before, 0);
+      expect((await scrollMetrics(page)).top, "closing the modal moved the view").toBeCloseTo(before, 0);
       await selectListedRoom(page, "Public Discussion Room");
       await expect(teamChatBadge(page), "closing the modal left an arrival on screen unread").toHaveCount(0);
     });

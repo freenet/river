@@ -48,37 +48,45 @@ export function knownFailure(projects: readonly string[], reference: string) {
 /// Every browser project in playwright.config.ts.
 export const ALL_PROJECTS = ["chromium", "firefox", "webkit", "mobile-chrome", "mobile-safari"] as const;
 
-/// scrollHeight - scrollTop - clientHeight: how far the end of the history is
-/// below the visible area. 0 means the newest message is fully in view.
-export function distanceFromBottom(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.getElementById("chat-scroll-container");
-    if (!el) return Number.NaN;
-    return el.scrollHeight - el.scrollTop - el.clientHeight;
-  });
+/// Which scroller a geometry helper reads: the room history or a DM thread,
+/// each with the sentinel that marks its newest item's bottom edge. They settle
+/// differently: the room waits for `scrollend`, which its own settle logic
+/// listens for; the DM thread has no settle logic, so a `scroll` and the frame
+/// after it are enough.
+type HistoryView = { container: string; sentinel: string; settle: "scrollend" | "frame" };
+const ROOM_VIEW: HistoryView = {
+  container: "chat-scroll-container",
+  sentinel: "bottom-sentinel",
+  settle: "scrollend",
+};
+export const DM_VIEW: HistoryView = {
+  container: "dm-scroll-container",
+  sentinel: "dm-bottom-sentinel",
+  settle: "frame",
+};
+
+/// Where the view is scrolled (`top`, at most `max`), the history's total
+/// `height`, the height of the window onto it (`client`, which shrinks when the
+/// composer grows), and `toEnd`: how far the end of the history is below the
+/// visible area, 0 when the newest item is fully in view. NaN when the
+/// scroller is not in the DOM.
+export function scrollMetrics(page: Page, view: HistoryView = ROOM_VIEW) {
+  return page.evaluate((id) => {
+    const el = document.getElementById(id);
+    if (!el) return { top: NaN, height: NaN, client: NaN, max: NaN, toEnd: NaN };
+    return {
+      top: el.scrollTop,
+      height: el.scrollHeight,
+      client: el.clientHeight,
+      max: el.scrollHeight - el.clientHeight,
+      toEnd: el.scrollHeight - el.scrollTop - el.clientHeight,
+    };
+  }, view.container);
 }
 
-/// Total height of the rendered history, independent of where it is scrolled.
-export function historyHeight(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.getElementById("chat-scroll-container");
-    return el ? el.scrollHeight : Number.NaN;
-  });
-}
-
-/// Height of the WINDOW onto the history. Shrinks when the composer grows.
-export function viewportHeight(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.getElementById("chat-scroll-container");
-    return el ? el.clientHeight : Number.NaN;
-  });
-}
-
-export function scrollTop(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.getElementById("chat-scroll-container");
-    return el ? el.scrollTop : Number.NaN;
-  });
+/// `scrollMetrics().toEnd`, the measure most polls wait on.
+export async function distanceFromBottom(page: Page, view: HistoryView = ROOM_VIEW): Promise<number> {
+  return (await scrollMetrics(page, view)).toEnd;
 }
 
 /// How many newer items the rendered range is holding back, from the
@@ -96,9 +104,9 @@ export async function expectParkedAwayFromEnd(page: Page, why = "premise: parked
   expect(await distanceFromBottom(page), why).toBeGreaterThan(WELL_AWAY_FROM_END_PX);
 }
 
-export async function expectSettledAtBottom(page: Page, why: string, timeout = 5_000) {
+export async function expectSettledAtBottom(page: Page, why: string, view: HistoryView = ROOM_VIEW) {
   await expect
-    .poll(() => distanceFromBottom(page), { timeout, message: why })
+    .poll(() => distanceFromBottom(page, view), { timeout: 5_000, message: why })
     .toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
 }
 
@@ -117,13 +125,9 @@ export async function deliver(page: Page, text: string) {
 
 /// Like `deliver`, but only waits for the patch: the arrival may land below a
 /// parked reader's viewport, where `toBeVisible` would still pass but says
-/// nothing about where the view is. `aheadSeconds` stamps it ahead of our clock.
-export async function deliverOffscreen(page: Page, text: string, aheadSeconds?: number) {
-  if (aheadSeconds !== undefined) {
-    await callRiverTest(page, "appendMessageAhead", text, aheadSeconds);
-  } else {
-    await callRiverTest(page, "appendMessage", text);
-  }
+/// nothing about where the view is.
+export async function deliverOffscreen(page: Page, text: string) {
+  await callRiverTest(page, "appendMessage", text);
   await expect(page.getByText(text, { exact: false })).toHaveCount(1, { timeout: 5_000 });
 }
 
@@ -156,38 +160,42 @@ export async function readerScrollsTo(page: Page, top: number) {
 
 /// The same, waiting for the settle, so the app has seen the move end before
 /// the caller acts. Tests that need an un-settled move use `readerScrollsTo`.
-export async function readerScrollsWithoutGesture(page: Page, top: number) {
-  await scrollAndSettle(page, top);
+export async function readerScrollsWithoutGesture(page: Page, top: number, view: HistoryView = ROOM_VIEW) {
+  await scrollAndSettle(page, top, view);
 }
 
 /// Move the history to `target` (or its end) with no gesture event, and wait
-/// for the move to settle. A target the container clamps to where it already
-/// is scrolls nothing, so there is no settle to wait for.
+/// for the move to settle as `view.settle` says. A target the container clamps
+/// to where it already is scrolls nothing, so there is no settle to wait for.
 ///
 /// The listener goes on before the move, and the move and the wait share one
 /// `evaluate`, so a settle that lands quickly cannot be missed. `"end"` is
 /// resolved in the page, from the history's height at the moment of the move.
-async function scrollAndSettle(page: Page, target: number | "end") {
-  await page.evaluate(async (t) => {
-    const el = document.getElementById("chat-scroll-container")!;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let onSettle: (() => void) | undefined;
-    const settled = new Promise<void>((resolve, reject) => {
-      onSettle = resolve;
-      timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
-      el.addEventListener("scrollend", onSettle);
-    });
-    try {
-      const before = el.scrollTop;
-      el.scrollTop = t === "end" ? el.scrollHeight : t;
-      // Unmoved: no settle is coming, and the timer must not reject a
-      // promise nobody awaits.
-      if (el.scrollTop !== before) await settled;
-    } finally {
-      clearTimeout(timer);
-      el.removeEventListener("scrollend", onSettle!);
-    }
-  }, target);
+async function scrollAndSettle(page: Page, target: number | "end", view: HistoryView = ROOM_VIEW) {
+  await page.evaluate(
+    async ({ id, settle, t }) => {
+      const el = document.getElementById(id)!;
+      const event = settle === "scrollend" ? "scrollend" : "scroll";
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let onSettle: (() => void) | undefined;
+      const settled = new Promise<void>((resolve, reject) => {
+        onSettle = settle === "scrollend" ? resolve : () => requestAnimationFrame(() => resolve());
+        timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
+        el.addEventListener(event, onSettle);
+      });
+      try {
+        const before = el.scrollTop;
+        el.scrollTop = t === "end" ? el.scrollHeight : t;
+        // Unmoved: no settle is coming, and the timer must not reject a
+        // promise nobody awaits.
+        if (el.scrollTop !== before) await settled;
+      } finally {
+        clearTimeout(timer);
+        el.removeEventListener(event, onSettle!);
+      }
+    },
+    { id: view.container, settle: view.settle, t: target },
+  );
 }
 
 /// Hold for a moment and assert the view did not move.
@@ -196,9 +204,9 @@ async function scrollAndSettle(page: Page, target: number | "end") {
 /// when content grows, so it would tolerate a partial yank of up to the new
 /// message's height.
 export async function expectStaysPut(page: Page, why: string) {
-  const before = await scrollTop(page);
+  const before = (await scrollMetrics(page)).top;
   await page.waitForTimeout(600);
-  expect(await scrollTop(page), why).toBeCloseTo(before, 0);
+  expect((await scrollMetrics(page)).top, why).toBeCloseTo(before, 0);
 }
 
 /// Add enough history to have somewhere to scroll back through, and leave the
@@ -226,7 +234,7 @@ export async function readerReturnsToEnd(page: Page) {
 /// the reader first scrolls away; after this, a height change
 /// meets a reader at the end who is not held there.
 export async function readerLeavesAndReturnsToEnd(page: Page) {
-  await readerScrollsWithoutGesture(page, (await scrollTop(page)) - 60);
+  await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).top - 60);
   expect(await distanceFromBottom(page), "premise: the reader left the end").toBeGreaterThan(AT_BOTTOM_EPSILON_PX);
   await readerReturnsToEnd(page);
   await expectSettledAtBottom(page, "premise: the reader came back to the end");
@@ -293,61 +301,46 @@ export async function expectFollowed(page: Page, text: string, why: string) {
   await expectMessageInView(page, text, why);
 }
 
-/// How far the newest message's bottom (`#bottom-sentinel`'s top, the edge
-/// the follow rule measures) sits below the visible history. Negative: above
-/// its bottom edge.
-export function newestBelowView(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const c = document.getElementById("chat-scroll-container")!;
-    const s = document.getElementById("bottom-sentinel")!;
+/// How far the newest item's bottom (`view.sentinel`'s top, the edge the
+/// follow rule measures) sits below the visible history. Negative: above its
+/// bottom edge.
+export function newestBelowView(page: Page, view: HistoryView = ROOM_VIEW): Promise<number> {
+  return page.evaluate(({ container, sentinel }) => {
+    const c = document.getElementById(container)!;
+    const s = document.getElementById(sentinel)!;
     return s.getBoundingClientRect().top - c.getBoundingClientRect().bottom;
-  });
+  }, view);
 }
 
-/// The reader scrolls so the newest message's bottom sits `below` px under the
+/// The reader scrolls so the newest item's bottom sits `below` px under the
 /// view's bottom edge, and the move settles.
-export async function readerParksNewestBelow(page: Page, below: number) {
-  const target = (await scrollTop(page)) + (await newestBelowView(page)) - below;
-  await readerScrollsWithoutGesture(page, target);
-  expect(Math.abs((await newestBelowView(page)) - below), "premise: parked where asked").toBeLessThanOrEqual(2);
+export async function readerParksNewestBelow(page: Page, below: number, view: HistoryView = ROOM_VIEW) {
+  const target = (await scrollMetrics(page, view)).top + (await newestBelowView(page, view)) - below;
+  await readerScrollsWithoutGesture(page, target, view);
+  expect(Math.abs((await newestBelowView(page, view)) - below), "premise: parked where asked").toBeLessThanOrEqual(2);
 }
 
-/// A row's top relative to the container's top, or null when it is not in the
-/// DOM (deleted from the data, or evicted from the rendered range).
-export function rowTop(page: Page, key: string): Promise<number | null> {
-  return page.evaluate((k) => {
-    const c = document.getElementById("chat-scroll-container")!;
-    const row = c.querySelector(`[data-item-key="${CSS.escape(k)}"]`);
-    return row ? row.getBoundingClientRect().top - c.getBoundingClientRect().top : null;
-  }, key);
-}
-
-/// Measure `key` after the patch has settled and again a moment later, so a
-/// late correction (or a late yank) counts against the row too.
-export async function expectRowHeld(page: Page, key: string, expectedTop: number, why: string) {
-  for (let i = 0; i < 2; i++) {
-    await settle(page);
-    const top = await rowTop(page, key);
-    expect(top, `${why} (the row left the DOM)`).not.toBeNull();
-    expect(Math.abs(top! - expectedTop), `${why} (moved ${top! - expectedTop}px)`).toBeLessThanOrEqual(
-      READING_ROW_BUDGET_PX,
-    );
-  }
-}
-
-/// Which edge of a row to measure against the bottom of the view.
+/// Which edge of a row to measure.
 type RowEdge = "top" | "bottom";
 
-/// How far a row's `edge` sits above the bottom edge of the visible history,
-/// or null when it is not in the DOM.
-function rowGapFromViewBottom(page: Page, key: string, edge: RowEdge = "bottom"): Promise<number | null> {
+/// How a row's place is measured: `"top"` is its top below the view's top
+/// edge; `{ fromBottom }` is how far that edge of it sits above the view's
+/// bottom edge, which is what a row keeps when the chat area changes height.
+type RowMeasure = "top" | { fromBottom: RowEdge };
+
+/// Where row `key` sits by `measure`, or null when it is not in the DOM
+/// (deleted from the data, or evicted from the rendered range).
+export function rowOffset(page: Page, key: string, measure: RowMeasure = "top"): Promise<number | null> {
   return page.evaluate(
-    ([k, e]) => {
+    ({ k, m }) => {
       const c = document.getElementById("chat-scroll-container")!;
       const row = c.querySelector(`[data-item-key="${CSS.escape(k)}"]`);
-      return row ? c.getBoundingClientRect().bottom - row.getBoundingClientRect()[e as "top" | "bottom"] : null;
+      if (!row) return null;
+      const view = c.getBoundingClientRect();
+      const r = row.getBoundingClientRect();
+      return m === "top" ? r.top - view.top : view.bottom - r[m.fromBottom];
     },
-    [key, edge] as const,
+    { k: key, m: measure },
   );
 }
 
@@ -358,25 +351,27 @@ export async function newestRowFromViewBottom(
 ): Promise<{ key: string; gap: number }> {
   const key = await page.locator("[data-item-key]").last().getAttribute("data-item-key");
   expect(key, "premise: the history has rows").not.toBeNull();
-  return { key: key!, gap: (await rowGapFromViewBottom(page, key!, edge))! };
+  return { key: key!, gap: (await rowOffset(page, key!, { fromBottom: edge }))! };
 }
 
-/// `expectRowHeld` for the bottom edge of the view: when the chat area changes
-/// height, the row keeps its distance from the bottom.
-export async function expectHeldFromViewBottom(
+/// Measure `key` by `measure` after the patch has settled and again a moment
+/// later, so a late correction (or a late yank) counts against the row too.
+/// With `{ fromBottom }`, the row keeps its distance from the bottom of the
+/// view when the chat area changes height.
+export async function expectRowHeld(
   page: Page,
   key: string,
-  expectedGap: number,
+  expected: number,
   why: string,
-  edge: RowEdge = "bottom",
+  measure: RowMeasure = "top",
 ) {
   for (let i = 0; i < 2; i++) {
     await settle(page);
-    const gap = await rowGapFromViewBottom(page, key, edge);
-    expect(gap, `${why} (the row left the DOM)`).not.toBeNull();
-    expect(Math.abs(gap! - expectedGap), `${why} (moved ${expectedGap - gap!}px)`).toBeLessThanOrEqual(
-      READING_ROW_BUDGET_PX,
-    );
+    const at = await rowOffset(page, key, measure);
+    expect(at, `${why} (the row left the DOM)`).not.toBeNull();
+    // Positive: the row moved down.
+    const moved = measure === "top" ? at! - expected : expected - at!;
+    expect(Math.abs(moved), `${why} (moved ${moved}px)`).toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
   }
 }
 
