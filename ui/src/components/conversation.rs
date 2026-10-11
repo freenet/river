@@ -2630,12 +2630,6 @@ struct ReadingAnchor {
     rows: Vec<(String, i32)>,
     /// Display-item index at capture time; a relocation hint.
     item_hint: usize,
-    /// The container's `clientHeight` at capture, so a later height change can
-    /// hold the bottom edge as it was then, whatever clamped in between.
-    view_height: i32,
-    /// The container's `clientWidth` at capture. After a width change the rows
-    /// have rewrapped and their saved offsets describe another layout.
-    view_width: i32,
 }
 
 /// Rows a [`ReadingAnchor`] remembers, the reading row included.
@@ -2709,9 +2703,10 @@ struct ReaderPosition {
     window_overgrown: std::cell::Cell<bool>,
     /// See [`ReadingAnchor`].
     anchor: std::cell::RefCell<Option<ReadingAnchor>>,
-    /// What the ResizeObserver last saw of the container.
+    /// Whether the ResizeObserver last saw the container without layout
+    /// (behind a mobile panel). The next resize with layout restores.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    view: std::cell::Cell<HistoryView>,
+    hidden: std::cell::Cell<bool>,
     /// The last render's `HistoryWindow::has_newer`.
     has_newer: std::cell::Cell<bool>,
     /// The pending explicit scroll, if any. While newer items are held back
@@ -2749,24 +2744,10 @@ struct ReaderPosition {
     restore_after_patch: std::cell::RefCell<Option<ReadingAnchor>>,
 }
 
-/// What the ResizeObserver last saw of the history container.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-enum HistoryView {
-    #[default]
-    Unmeasured,
-    /// Seen without layout since the last restore; the next resize restores.
-    Hidden,
-    /// Laid out at this `clientHeight`. A settle that measures another height
-    /// has beaten the observer to a resize, and must not capture over the
-    /// position the observer is about to correct from.
-    Shown(i32),
-}
-
 impl ReaderPosition {
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fn hidden(&self) -> bool {
-        self.view.get() == HistoryView::Hidden
+        self.hidden.get()
     }
 
     /// Ask for one move to the end of `room`'s history (see [`ScrollRequest`]).
@@ -2818,18 +2799,16 @@ fn locate_reading_item(items: &[DisplayItem], anchor: &ReadingAnchor) -> Option<
 }
 
 /// The scroll shift that puts the first surviving remembered row back at its
-/// offset, moved by `offset_shift` (the height change since capture, to hold
-/// the bottom edge instead of the top). `None` when none is rendered.
+/// offset. `None` when none is rendered.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn reading_anchor_shift(
     anchor: &ReadingAnchor,
-    offset_shift: i32,
     top_now: impl Fn(&str) -> Option<i32>,
 ) -> Option<i32> {
     anchor
         .rows
         .iter()
-        .find_map(|(key, saved)| top_now(key).map(|now| now - (saved + offset_shift)))
+        .find_map(|(key, saved)| top_now(key).map(|now| now - saved))
 }
 
 /// The identity of the window's head: which display item the last render
@@ -3245,12 +3224,6 @@ const ROOM_HISTORY: HistoryDom = HistoryDom {
     band: ROOM_FOLLOW_BAND_PX,
 };
 
-/// The furthest down `container` can be scrolled, in px.
-#[cfg(target_arch = "wasm32")]
-fn max_scroll_top(container: &web_sys::Element) -> i32 {
-    (container.scroll_height() - container.client_height()).max(0)
-}
-
 /// Measure the first message or event row that starts inside the view, with
 /// its nearest neighbours. A binary search over item rows keeps this to a
 /// handful of layout reads, cheap enough for every settle.
@@ -3330,25 +3303,22 @@ fn capture_reading_anchor(range_start: usize) -> Option<ReadingAnchor> {
     Some(ReadingAnchor {
         rows,
         item_hint: range_start + lo as usize,
-        view_height: container.client_height(),
-        view_width: container.client_width(),
     })
 }
 
-/// Scroll so `anchor`'s first surviving row is back at its saved offset, plus
-/// `shift_offsets_by`. False when none of its rows is rendered.
+/// Scroll so `anchor`'s first surviving row is back at its saved offset.
 #[cfg(target_arch = "wasm32")]
-fn restore_reading_anchor(anchor: &ReadingAnchor, shift_offsets_by: i32) -> bool {
+fn restore_reading_anchor(anchor: &ReadingAnchor) {
     use wasm_bindgen::JsCast;
     let Some(container) = ROOM_HISTORY.container() else {
-        return false;
+        return;
     };
     let view_top = container.get_bounding_client_rect().top();
     let Ok(els) = container.query_selector_all("[data-anchor-key]") else {
-        return false;
+        return;
     };
     // One pass, measuring only the remembered keys, and stopping once they are
-    // all found. Runs on a reveal and on every chat-area height change.
+    // all found.
     let mut tops: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
     for i in 0..els.length() {
         if tops.len() == anchor.rows.len() {
@@ -3367,14 +3337,12 @@ fn restore_reading_anchor(anchor: &ReadingAnchor, shift_offsets_by: i32) -> bool
             }
         }
     }
-    let Some(shift) = reading_anchor_shift(anchor, shift_offsets_by, |key| tops.get(key).copied())
-    else {
-        return false;
+    let Some(shift) = reading_anchor_shift(anchor, |key| tops.get(key).copied()) else {
+        return;
     };
     if shift != 0 {
         container.set_scroll_top(container.scroll_top() + shift);
     }
-    true
 }
 
 /// Height a trim to the newest `retained` items would leave. `None` when no
@@ -3425,18 +3393,6 @@ fn land_at_end(reader: &ReaderPosition, container: &web_sys::Element) {
     hold_end(reader, container);
 }
 
-/// While the end hold is on, take the view back to the end after a size
-/// change: a row above it grew (an image, decryption, a font) or the chat area
-/// changed height. Returns whether it held.
-#[cfg(target_arch = "wasm32")]
-fn keep_end_held(reader: &ReaderPosition, container: &web_sys::Element) -> bool {
-    let held = reader.end_hold.get().is_some();
-    if held {
-        hold_end(reader, container);
-    }
-    held
-}
-
 /// Keep the reader's view still across the patch that just landed, from the
 /// reading rows captured before it (`ReaderPosition::restore_after_patch`),
 /// consumed here, applied or not.
@@ -3475,7 +3431,7 @@ fn correct_view_after_patch(reader: &ReaderPosition) {
     }
     // Hidden rows measure 0; the reveal restores the reader instead.
     if ROOM_HISTORY.container().is_some_and(|c| has_layout(&c)) {
-        restore_reading_anchor(&anchor, 0);
+        restore_reading_anchor(&anchor);
     }
 }
 
@@ -3679,15 +3635,7 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
                     window_items.set(INITIAL_WINDOW_ITEMS);
                 });
             }
-            // A settle in the same frame as a chat-area height change, before
-            // the ResizeObserver has handled it, would capture the new height
-            // over a view the observer has yet to correct, and the correction
-            // would be lost. The observer corrects from the last capture
-            // instead, and the next settle captures.
-            if !matches!(reader.view.get(), HistoryView::Shown(h) if h != container.client_height())
-            {
-                remember_reading_position(&reader);
-            }
+            remember_reading_position(&reader);
             note_newest_seen(&reader);
         }) as Box<dyn FnMut()>)
     };
@@ -3771,30 +3719,28 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
 
 /// A size change of the history. The container's size is the history's only
 /// notice that the chat panel was hidden (it measures 0 behind the mobile
-/// Rooms or Members panel) or shown again, and that the chat area changed
-/// height (the composer, the phone keyboard, a toolbar). `#chat-content` is
-/// observed too, for one job only: while the end hold is on,
-/// a row changing height takes the view back to the end.
+/// Rooms or Members panel) or shown again. While the end hold is on, any size
+/// change, of the container (the composer, the phone keyboard) or of
+/// `#chat-content` (a row growing), takes the view back to the end. Otherwise
+/// the browser keeps the top edge.
 #[cfg(target_arch = "wasm32")]
 fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
     let Some(container) = ROOM_HISTORY.container() else {
         return;
     };
     if !has_layout(&container) {
-        reader.view.set(HistoryView::Hidden);
+        reader.hidden.set(true);
         // The view the hold kept is gone.
         reader.end_hold.set(None);
         return;
     }
-    let height = container.client_height();
-    let previous = reader.view.replace(HistoryView::Shown(height));
     // Revealed: finish a request made while hidden (a room opened behind the
     // panel), else put the reader back on their row.
-    if previous == HistoryView::Hidden {
+    if reader.hidden.replace(false) {
         if !complete_scroll_request(reader, opening_snap_done) {
             let anchor = reader.anchor.borrow().clone();
             if let Some(anchor) = anchor {
-                restore_reading_anchor(&anchor, 0);
+                restore_reading_anchor(&anchor);
             }
             // The revealed height need not be the one captured.
             remember_reading_position(reader);
@@ -3802,41 +3748,8 @@ fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
         }
         return;
     }
-    // Held at the end since an explicit request: back to the end, whatever
-    // changed size.
-    if keep_end_held(reader, &container) {
-        return;
-    }
-    // The chat area changed height: keep the view's BOTTOM edge, so the top
-    // gets covered or uncovered and a reader at the end keeps seeing the newest
-    // message. Width alone, or the history alone, leaves the
-    // height alone and gets no correction.
-    let HistoryView::Shown(previous) = previous else {
-        return;
-    };
-    if height == previous {
-        return;
-    }
-    // Exact: the reading rows go back to where they were, relative to the
-    // bottom edge, as of the last capture. Computed from that state, not from
-    // `scrollTop`, so a clamp or a growth in between (or several resizes before
-    // the next settle) cannot be counted twice. Not across a width change: the
-    // rewrap moved the rows, and width reflow gets no correction.
-    let anchor = reader.anchor.borrow().clone();
-    if anchor.is_some_and(|anchor| {
-        anchor.view_width == container.client_width()
-            && restore_reading_anchor(&anchor, height - anchor.view_height)
-    }) {
-        return;
-    }
-    // No usable remembered row: keep the edge arithmetically.
-    let top = container.scroll_top();
-    if height < previous {
-        container.set_scroll_top(top + (previous - height));
-    } else if top + SCROLL_TOP_SLACK_PX < max_scroll_top(&container) {
-        // At the new maximum the browser's clamp already holds the end; a
-        // reader who was within the growth of the end lands on it.
-        container.set_scroll_top(top - (height - previous));
+    if reader.end_hold.get().is_some() {
+        hold_end(reader, &container);
     }
 }
 
@@ -7648,46 +7561,23 @@ mod tests {
                 ("below".into(), 120),
             ],
             item_hint: 0,
-            view_height: 700,
-            view_width: 800,
         };
         // Everything survives: the reading row goes back to 40px.
         let dom = |rows: &'static [(&'static str, i32)]| {
             move |k: &str| rows.iter().find(|(rk, _)| *rk == k).map(|(_, t)| *t)
         };
         assert_eq!(
-            reading_anchor_shift(&anchor, 0, dom(&[("read", -600), ("below", -520)])),
+            reading_anchor_shift(&anchor, dom(&[("read", -600), ("below", -520)])),
             Some(-640)
         );
         // The reading row was deleted: the row above is restored to ITS
         // offset, even though the row below survived too.
         assert_eq!(
-            reading_anchor_shift(&anchor, 0, dom(&[("below", 700), ("above", 10)])),
+            reading_anchor_shift(&anchor, dom(&[("below", 700), ("above", 10)])),
             Some(40)
         );
         // Nothing survives: no move at all.
-        assert_eq!(reading_anchor_shift(&anchor, 0, dom(&[("other", 0)])), None);
-    }
-
-    /// A height change holds the bottom edge as it was at capture: the offsets
-    /// move by the change, whatever the browser did to `scrollTop` meanwhile.
-    #[test]
-    fn the_reading_anchor_holds_the_bottom_edge_through_a_height_change() {
-        let anchor = ReadingAnchor {
-            rows: vec![("read".into(), 40)],
-            item_hint: 0,
-            view_height: 700,
-            view_width: 800,
-        };
-        let at = |top: i32| move |k: &str| (k == "read").then_some(top);
-        // Shrunk by 200, nothing scrolled yet: scroll down by 200.
-        assert_eq!(reading_anchor_shift(&anchor, 500 - 700, at(40)), Some(200));
-        // Grown by 200 after the browser already clamped 150 of it (the row
-        // moved down by 150): only the remaining 50, never 200 again.
-        assert_eq!(reading_anchor_shift(&anchor, 900 - 700, at(190)), Some(-50));
-        // Two resizes before the next capture (700 -> 600 -> 500), the first
-        // already corrected: the second is measured from the capture too.
-        assert_eq!(reading_anchor_shift(&anchor, 500 - 700, at(-60)), Some(100));
+        assert_eq!(reading_anchor_shift(&anchor, dom(&[("other", 0)])), None);
     }
 
     /// `relocate_anchor` search order and fallbacks.
@@ -11624,7 +11514,7 @@ mod autoscroll_wiring_pins {
         let corrections = dense
             .split("fncorrect_view_after_patch(")
             .nth(1)
-            .and_then(|body| body.split("restore_reading_anchor(&anchor,0);").next())
+            .and_then(|body| body.split("restore_reading_anchor(&anchor);").next())
             .expect("correct_view_after_patch is missing");
         assert!(
             corrections.contains("letSome(anchor)=reader.restore_after_patch.borrow_mut().take()")
@@ -11789,8 +11679,6 @@ mod reader_state_tests {
         *reader.restore_after_patch.borrow_mut() = Some(ReadingAnchor {
             rows: vec![("a".to_string(), 10)],
             item_hint: 0,
-            view_height: 700,
-            view_width: 800,
         });
 
         reader.request_end(None);

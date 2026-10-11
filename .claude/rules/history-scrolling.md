@@ -96,10 +96,12 @@ Accepted trade-offs:
   the panel, changing rooms or an empty range also releases it. Accepted for
   now: padding below the newest message lets a small upward scroll release
   the hold while the message is still visible and Latest stays hidden.
-- Outside that hold, a change in chat-area height preserves the bottom edge
-  of the view. Width-only reflow gets no correction. Paging and panel reveals
-  retain their reading-position corrections; deleting the reading row uses
-  the row above as the preferred fallback.
+- Outside that hold, a size change gets no correction: when the composer
+  grows or the phone keyboard opens, the browser keeps the view's top edge,
+  so the bottom of the view is covered. That includes a reader who scrolled
+  back to the end by hand, since only a request holds. Paging and panel
+  reveals retain their reading-position corrections; deleting the reading row
+  uses the row above as the preferred fallback.
 - Latest appears when the newest message's bottom is more than 4px below
   the visible area, or a held range withholds newer messages. The margin is
   measured against the message, not the padding below it.
@@ -140,6 +142,6 @@ the witness already granted may still commit after a close. Pinned by
 `ui/tests/dm-thread-lifecycle.spec.ts`.
 
 This shared policy does not imply identical position correction machinery.
-DM threads do not currently have the room history's end hold or explicit
-composer/keyboard bottom-edge correction. Their timestamp cutoff and its
+DM threads do not currently have the room history's end hold, so a composer
+or keyboard resize gets no correction there at all. Their timestamp cutoff and its
 limitations are described in [direct-messages.md](direct-messages.md).
