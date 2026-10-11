@@ -19,6 +19,7 @@ import {
   readerScrollsWithoutGesture,
   scrollMetrics,
 } from "./history-geometry";
+import { DM_PEER, closeThread, newestHistoryDm, openThread } from "./dm-thread";
 
 // Regression test for: unread message counts were surfaced in the document
 // <title> and the DM rail, but rooms in the Rooms list had no unread
@@ -313,45 +314,41 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
     });
   });
 
-  // The same short history, read under a modal: an arrival on screen behind
-  // one is not seen until it closes, and closing it reads without scrolling.
-  test.describe("under a modal", { tag: "@chromium-only" }, () => {
+  // The same short history, read under a DM thread: an arrival on screen
+  // behind one is not seen until it closes, and closing it reads without
+  // scrolling. Other dialogs do not cover the room.
+  test.describe("under a DM thread", { tag: "@chromium-only" }, () => {
     test.use({ viewport: { width: 1280, height: 2400 } });
 
-    async function openMemberInfo(page: Page) {
-      await page.locator('[data-testid^="member-item-"]').first().click();
-      await expect(page.getByTestId("member-info-modal")).toBeVisible({ timeout: 5_000 });
+    async function openDmThread(page: Page) {
+      await callRiverTest(page, "appendDmsForPeer", DM_PEER.index, 1);
+      await openThread(page, DM_PEER, newestHistoryDm(DM_PEER, 1));
     }
 
-    async function closeMemberInfo(page: Page) {
-      await page.getByTestId("member-info-close-button").click();
-      await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
-    }
-
-    test("an arrival on screen under a modal stays unread", async ({ page }) => {
+    test("an arrival on screen under a DM thread stays unread", async ({ page }) => {
       await openRoomAtBottom(page, "Team Chat Room");
-      await openMemberInfo(page);
+      await openDmThread(page);
 
-      await deliverOffscreen(page, "arrival under a modal");
-      expect(await belowView(page, "arrival under a modal"), "premise: all of the arrival is on screen").toBeLessThanOrEqual(0);
+      await deliverOffscreen(page, "arrival under a DM thread");
+      expect(await belowView(page, "arrival under a DM thread"), "premise: all of the arrival is on screen").toBeLessThanOrEqual(0);
       await nextFrames(page);
-      // Away with the modal still open, so its closing cannot read the room.
+      // Away with the thread still open, so its closing cannot read the room.
       await callRiverTest(page, "switchRoom", "Public Discussion Room");
-      await expect(teamChatBadge(page), "an arrival seen only under a modal was marked read").toBeVisible();
+      await expect(teamChatBadge(page), "an arrival seen only under a DM thread was marked read").toBeVisible();
     });
 
-    test("closing the modal reads an arrival on screen without moving the view", async ({ page }) => {
+    test("closing the DM thread reads an arrival on screen without moving the view", async ({ page }) => {
       await openRoomAtBottom(page, "Team Chat Room");
-      await openMemberInfo(page);
+      await openDmThread(page);
       await deliverOffscreen(page, "arrival read on close");
       expect(await belowView(page, "arrival read on close"), "premise: all of the arrival is on screen").toBeLessThanOrEqual(0);
       const before = (await scrollMetrics(page)).top;
 
-      await closeMemberInfo(page);
+      await closeThread(page);
       await nextFrames(page);
-      expect((await scrollMetrics(page)).top, "closing the modal moved the view").toBeCloseTo(before, 0);
+      expect((await scrollMetrics(page)).top, "closing the DM thread moved the view").toBeCloseTo(before, 0);
       await selectListedRoom(page, "Public Discussion Room");
-      await expect(teamChatBadge(page), "closing the modal left an arrival on screen unread").toHaveCount(0);
+      await expect(teamChatBadge(page), "closing the DM thread left an arrival on screen unread").toHaveCount(0);
     });
   });
 });

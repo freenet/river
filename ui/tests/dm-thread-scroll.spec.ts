@@ -40,8 +40,7 @@ import {
 //
 // And when the thread counts as seen: only up to an inbound DM that was on
 // screen while the thread was in the foreground. One that lands below the
-// fold, or arrives while the tab is hidden or a modal covers the thread,
-// stays unread.
+// fold, or arrives while the tab is hidden, stays unread.
 //
 // The thread is populated through the `appendDmsForPeer` / `deliverDmForPeer`
 // test hooks, which add sender-signed DMs from a test member (DM_PEER unless
@@ -353,39 +352,6 @@ test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
       railBadge(page),
       "the tab came back with the DM on screen and the thread still counts it unread",
     ).toHaveCount(0);
-  });
-
-  test("an inbound DM under the thread's confirmation neither follows nor is seen until it closes, which does not scroll", async ({
-    page,
-  }) => {
-    const openConfirmation = async () => {
-      await page.getByRole("button", { name: "Delete their messages" }).click();
-      await expect(page.getByRole("dialog", { name: "Confirm delete their messages" })).toBeVisible();
-    };
-    await openShortThread(page);
-    await openConfirmation();
-    await recordScrolls(page);
-
-    await deliverDm(page, "on screen under a confirmation");
-    expect(await belowFold(page, "on screen under a confirmation"), "premise: all of the DM is on screen").toBeLessThanOrEqual(
-      0,
-    );
-    await settle(page);
-    await expect(railBadge(page), "a DM seen only under a modal was marked seen").toHaveText("1");
-
-    await page.getByRole("button", { name: "Cancel" }).click();
-    await expect(railBadge(page), "closing the confirmation left the DM on screen unread").toHaveCount(0);
-    await expectStill(page, "closing the confirmation moved the thread");
-
-    // The reader is still at the end, so only the confirmation keeps a DM
-    // taller than the band from being followed.
-    await openConfirmation();
-    const tall = `tall DM under a confirmation ${"word ".repeat(300)}`.trim();
-    await deliverDm(page, tall);
-    await expectStill(page, "an inbound DM under a modal moved the thread");
-    await page.getByRole("button", { name: "Cancel" }).click();
-    await expectStill(page, "closing the confirmation moved the thread");
-    await expect(page.getByTestId(LATEST)).toBeVisible();
   });
 });
 

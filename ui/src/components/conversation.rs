@@ -3241,7 +3241,7 @@ fn remember_reading_position(reader: &ReaderPosition) {
 const ROOM_HISTORY: HistoryDom = HistoryDom {
     container_id: "chat-scroll-container",
     sentinel_id: "bottom-sentinel",
-    modal_except: None,
+    under_dm_thread: true,
     band: ROOM_FOLLOW_BAND_PX,
 };
 
@@ -3549,14 +3549,14 @@ fn complete_scroll_request(reader: &ReaderPosition, mut opening_snap_done: Signa
 
 /// Publish the newest message as seen if the reader can see it now: the history
 /// is in the foreground (`foreground::in_foreground`: the tab is visible, it
-/// has layout, and no modal covers it) and not awaiting its reveal restore, the
+/// has layout, and no DM thread covers it) and not awaiting its reveal restore, the
 /// rendered range reaches the room's latest message, and that message's bottom
 /// is on screen. Marking a room read never goes past what
 /// this publishes; see `document_title::NEWEST_SEEN`.
 ///
 /// Called wherever one of those can change: the Latest observer, each settle,
-/// each render, the reveal, a completed request, and `FOREGROUND_CHANGED` (the
-/// tab becoming visible, a modal closing).
+/// each render, the reveal, a completed request, the tab becoming visible and
+/// a DM thread closing.
 /// Touches no signal itself, so raw JS callbacks may call it; the write is
 /// deferred.
 #[cfg(target_arch = "wasm32")]
@@ -4319,17 +4319,24 @@ pub fn Conversation() -> Element {
         });
     }
 
-    // Back in the foreground (the tab became visible, a modal closed): whatever
-    // is on screen now counts as seen, which nothing else would notice (no
-    // scroll, no resize, no observer change). Never scrolls.
+    // Back in the foreground (the tab became visible, a DM thread closed):
+    // whatever is on screen now counts as seen, which nothing else would
+    // notice (no scroll, no resize, no observer change). Never scrolls.
     #[cfg(target_arch = "wasm32")]
     {
         let reader_position = reader_position.clone();
         use_effect(move || {
-            // Anchored before the fallible read, this effect's only
-            // subscription (freenet/river#555).
+            // Anchored before the fallible reads, this effect's only
+            // subscriptions (freenet/river#555).
             crate::util::signal_guard::anchor();
-            if crate::components::foreground::FOREGROUND_CHANGED
+            if crate::components::app::document_title::DOCUMENT_VISIBLE
+                .try_read()
+                .is_err()
+            {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            }
+            if crate::components::direct_messages::OPEN_DM_THREAD
                 .try_read()
                 .is_err()
             {
@@ -5816,7 +5823,6 @@ pub fn Conversation() -> Element {
                 div {
                     class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
                     onclick: move |_| pending_delete.set(None),
-                    crate::components::foreground::ModalPresence { name: "delete-message-confirm" }
                     div {
                         class: "bg-panel rounded-lg shadow-xl p-6 max-w-sm mx-4",
                         onclick: move |e| e.stop_propagation(),
@@ -6659,7 +6665,6 @@ fn MessageGroupComponent(
                                                         ),
                                                         style: format!("max-height: {}px", *menu_max_h.read()),
                                                         "data-testid": "message-action-menu",
-                                                        crate::components::foreground::ModalPresence { name: "message-popover" }
                                                         button {
                                                             class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
                                                             onclick: move |_| {
@@ -6870,7 +6875,6 @@ fn MessageGroupComponent(
                                                         ),
                                                         style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
                                                         onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                        crate::components::foreground::ModalPresence { name: "message-popover" }
                                                         {FREQUENT_EMOJIS.iter().map(|emoji| {
                                                             let emoji_str = emoji.to_string();
                                                             let msg_id = msg_id_react.clone();

@@ -41,16 +41,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// envelope overhead is accounted for. 32 KiB - 256 byte safety margin.
 const DM_BODY_BYTE_CAP: usize = MAX_DM_CIPHERTEXT_BYTES - 256;
 
-/// The thread's own `ModalPresence` name. Only a modal OTHER than the thread
-/// takes it out of the foreground.
-const DM_THREAD_MODAL: &str = "dm-thread";
-
 /// The thread's scroll container and newest-DM sentinel.
 #[cfg(target_arch = "wasm32")]
 const DM_HISTORY: HistoryDom = HistoryDom {
     container_id: "dm-scroll-container",
     sentinel_id: "dm-bottom-sentinel",
-    modal_except: Some(DM_THREAD_MODAL),
+    under_dm_thread: false,
     band: DM_FOLLOW_BAND_PX,
 };
 
@@ -471,9 +467,8 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 crate::util::signal_guard::schedule_nudge();
                 return;
             };
-            // ...and when the thread may be back in the foreground (the tab
-            // became visible, a modal over it closed).
-            if crate::components::foreground::FOREGROUND_CHANGED
+            // ...and when the tab becomes visible.
+            if crate::components::app::document_title::DOCUMENT_VISIBLE
                 .try_read()
                 .is_err()
             {
@@ -986,7 +981,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     confirm_delete_open.set(false);
                 }
             },
-            crate::components::foreground::ModalPresence { name: DM_THREAD_MODAL }
             // Backdrop
             div {
                 class: "absolute inset-0 bg-black/50",
@@ -1310,7 +1304,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             confirm_delete_open.set(false);
                         }
                     },
-                    crate::components::foreground::ModalPresence { name: "dm-confirm-delete" }
                     // Inner backdrop — clicking it cancels.
                     div {
                         class: "absolute inset-0 bg-black/60",
@@ -1834,7 +1827,7 @@ struct ThreadSeenWitness {
 impl ThreadSeenWitness {
     /// Mark the thread seen up to its newest inbound DM if the reader can see
     /// the end of the thread right now: the thread is in the foreground (the
-    /// tab is visible and no modal covers it, see `foreground::in_foreground`)
+    /// tab is visible and it has layout, see `foreground::in_foreground`)
     /// and the newest DM's bottom is on screen, within
     /// `NEWEST_IN_VIEW_SLACK_PX`. The newest
     /// inbound DM is at or above the newest DM, so the reader has reached it.

@@ -20,8 +20,10 @@ use web_sys::VisibilityState;
 
 const APP_NAME: &str = "River";
 
-/// Global signal tracking whether the document is currently visible
-static DOCUMENT_VISIBLE: GlobalSignal<bool> = Global::new(|| true);
+/// Global signal tracking whether the document is currently visible. The read
+/// rule's re-check effects (`conversation.rs`, `dm_thread_modal.rs`) subscribe
+/// to it, so whatever is on screen when the tab comes back counts as seen.
+pub(crate) static DOCUMENT_VISIBLE: GlobalSignal<bool> = Global::new(|| true);
 
 /// Tracks whether the document title manager has been initialized
 static TITLE_MANAGER_INITIALIZED: GlobalSignal<bool> = Global::new(|| false);
@@ -938,11 +940,8 @@ fn on_visibility_change() {
     *DOCUMENT_VISIBLE.write() = is_visible;
 
     // Tab became visible: the `DOCUMENT_VISIBLE` write above re-runs the title
-    // effect, which marks what the reader saw, and the foreground bump re-runs
-    // the read rule's checks against what is on screen now.
-    if is_visible && !was_visible {
-        crate::util::defer(crate::components::foreground::note_foreground_changed);
-    }
+    // effect, which marks what the reader saw, and the read rule's re-check
+    // effects, which look at what is on screen now.
     if !is_visible && was_visible {
         // Tab is going from visible to hidden. Only the room the user was
         // actually looking at gets marked read — see

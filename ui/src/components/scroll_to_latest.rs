@@ -44,8 +44,8 @@ pub fn is_arrival<K: Ord>(previous: Option<&K>, now: Option<&K>, first_counts: b
 pub struct HistoryDom {
     pub container_id: &'static str,
     pub sentinel_id: &'static str,
-    /// The modal the history lives in, which does not cover it.
-    pub modal_except: Option<&'static str>,
+    /// Whether an open DM thread covers this history: true for the room.
+    pub under_dm_thread: bool,
     /// How far below the view the newest item's bottom may sit, before the
     /// patch, for an arrival to follow.
     pub band: f64,
@@ -66,7 +66,7 @@ impl HistoryDom {
     /// view. Called from render, before the patch.
     pub fn arrival_follows(&self) -> bool {
         self.container().is_some_and(|container| {
-            crate::components::foreground::in_foreground(self.modal_except, &container)
+            crate::components::foreground::in_foreground(self.under_dm_thread, &container)
                 && self.newest_bottom_below_view(&container) <= self.band
         })
     }
@@ -78,7 +78,7 @@ impl HistoryDom {
     /// below the fold.
     pub fn end_seen(&self) -> bool {
         self.container().is_some_and(|container| {
-            crate::components::foreground::in_foreground(self.modal_except, &container)
+            crate::components::foreground::in_foreground(self.under_dm_thread, &container)
                 && self.sentinel().is_some_and(|sentinel| {
                     let view = container.get_bounding_client_rect();
                     let edge = sentinel.get_bounding_client_rect().top();

@@ -84,7 +84,6 @@ pub fn NotificationModal() -> Element {
         // Backdrop (same pattern as EditRoomModal).
         div {
             class: "fixed inset-0 z-50 flex items-center justify-center",
-            crate::components::foreground::ModalPresence { name: "notification" }
             div {
                 class: "absolute inset-0 bg-black/50",
                 // Signal mutation from an event handler must be deferred

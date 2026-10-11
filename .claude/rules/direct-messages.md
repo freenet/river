@@ -81,12 +81,13 @@ unread.
 **Read rule and scrolling.** The follow-at-end policy and its rationale live
 in [history-scrolling.md](history-scrolling.md).
 An open thread advances `DM_LAST_SEEN` (`mark_thread_read`) only up to an inbound DM
-that was on screen while the thread was in the foreground (tab visible, no
-modal other than the thread over it, `foreground::in_foreground`) — never from
+that was on screen while the thread was in the foreground (tab visible and
+the thread laid out, `foreground::in_foreground`; its own confirmation dialog
+does not count) — never from
 render, since an arrival can render below the fold. `ThreadSeenWitness::check`
 in `dm_thread_modal.rs` measures `dm-bottom-sentinel` against the thread's
-view; it runs after the thread changes, on `FOREGROUND_CHANGED` (the tab
-became visible or a modal over the thread closed), from the newest-DM
+view; it runs after the thread changes, when the tab becomes visible
+(`DOCUMENT_VISIBLE`), from the newest-DM
 observer, and after the opening, own-send, follow and Latest placements. An
 inbound DM follows a reader at the end (newest DM's bottom within
 `DM_FOLLOW_BAND_PX` = 50px, measured before the patch by

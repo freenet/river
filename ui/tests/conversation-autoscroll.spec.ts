@@ -34,6 +34,7 @@ import {
   scrollMetrics,
   withheld,
 } from "./history-geometry";
+import { DM_PEER, closeThread, newestHistoryDm, openThread } from "./dm-thread";
 
 /// A draft long enough to take more than WELL_AWAY_FROM_END_PX off the history.
 const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
@@ -1586,49 +1587,27 @@ test.describe("An arrival follows a reader at the end", () => {
   });
 });
 
-// Desktop-only surfaces (the member list, hover actions), engine-agnostic.
-test.describe("An arrival under a modal or popover", { tag: "@chromium-only" }, () => {
+// Only an open DM thread covers the room; other dialogs and popovers do not.
+// Desktop-only (the DM rail), engine-agnostic.
+test.describe("An arrival under a DM thread", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  const teamChatBadge = (page: Page) => roomUnreadBadge(page, "Team Chat Room");
-
-  test("an arrival under a modal does not follow, nor does closing it", async ({ page }) => {
+  test("an arrival under a DM thread does not follow, nor does closing it, and stays unread", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
+    await callRiverTest(page, "appendDmsForPeer", DM_PEER.index, 1);
     const row = await expectReadingRow(page);
-    await page.locator('[data-testid^="member-item-"]').first().click();
-    await expect(page.getByTestId("member-info-modal")).toBeVisible({ timeout: 5_000 });
+    await openThread(page, DM_PEER, newestHistoryDm(DM_PEER, 1));
 
-    await deliverOffscreen(page, "arrival under a modal");
-    await expectRowHeld(page, row.key, row.top, "an arrival under a modal moved the history");
-    await page.getByTestId("member-info-close-button").click();
-    await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
-    await expectRowHeld(page, row.key, row.top, "closing the modal moved the history");
+    await deliverOffscreen(page, "arrival under a DM thread");
+    await expectRowHeld(page, row.key, row.top, "an arrival under a DM thread moved the history");
+    await closeThread(page);
+    await expectRowHeld(page, row.key, row.top, "closing the DM thread moved the history");
     await expect(page.getByTestId("scroll-to-bottom")).toBeVisible();
     await selectListedRoom(page, "Public Discussion Room");
-    await expect(teamChatBadge(page), "an arrival behind a modal was marked read").toBeVisible();
-  });
-
-  // A popover on a history row counts as a modal: the same presence keeps the
-  // arrival from following and from being read.
-  test("an arrival under a message's reaction picker does not follow, nor does closing it, and stays unread", async ({
-    page,
-  }) => {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-    const newest = page.locator('[id^="msg-"]').last();
-    await newest.getByTestId("message-bubble").hover();
-    await newest.getByTestId("add-reaction-button").click();
-    await expect(page.getByTestId("emoji-picker")).toBeVisible();
-    const row = await expectReadingRow(page);
-
-    await deliverOffscreen(page, "arrival under a popover");
-    await expectRowHeld(page, row.key, row.top, "an arrival under a row popover moved the history");
-    await page.mouse.click(5, 5);
-    await expect(page.getByTestId("emoji-picker")).toHaveCount(0);
-    await expectRowHeld(page, row.key, row.top, "closing the popover moved the history");
-    await expect(page.getByTestId("scroll-to-bottom")).toBeVisible();
-    await selectListedRoom(page, "Public Discussion Room");
-    await expect(teamChatBadge(page), "an arrival under a row popover was marked read").toBeVisible();
+    await expect(
+      roomUnreadBadge(page, "Team Chat Room"),
+      "an arrival under a DM thread was marked read",
+    ).toBeVisible();
   });
 });

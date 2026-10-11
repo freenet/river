@@ -19,12 +19,10 @@ An arrival scrolls a room or a DM thread to its newest message only when
 both of these hold at the moment it arrives:
 
 1. **The conversation is in the foreground** (`foreground::in_foreground`):
-   the tab is visible, the history has layout (on mobile, the chat panel is
-   the one showing), and no modal covers it. For the room that means no
-   modal at all, the DM thread included; for a DM thread, no modal other than
-   the thread itself. Popovers attached to a history row (the message action
-   menu, the reaction picker) count as modals; composer popovers do not,
-   because the composer does not scroll.
+   the tab is visible and the history has layout (on mobile, the chat panel
+   is the one showing). For the room, no DM thread is open
+   (`OPEN_DM_THREAD`). No other dialog or popover counts, the thread's own
+   confirmation included.
 2. **The reader is at the end or near it:** before the patch, the newest
    item's bottom (`bottom-sentinel` / `dm-bottom-sentinel`, the same edge as
    Latest and the read rule, not the scroller's absolute end) sits at most
@@ -33,7 +31,7 @@ both of these hold at the moment it arrives:
    `is_near_bottom(.., 50.0)` at `8cf54dd7`), which measured from the
    absolute end.
 
-**Only an arrival follows.** A tab becoming visible, a modal closing, or a
+**Only an arrival follows.** A tab becoming visible, a DM thread closing, or a
 mobile panel revealing the chat never scrolls: messages that arrived in the
 meantime stay below, Latest appears, and they stay unread until the reader
 reaches them.
@@ -66,18 +64,16 @@ inserted above it, and a join folding into the trailing event summary (which
 raises the key) are told apart by it. The 60s clock-skew clamp only affects
 grouping and the timestamp shown.
 
-**`ModalPresence` rule.** Every modal root, and any popover attached to a
-history row, must mount a `foreground::ModalPresence`. It registers the modal
-while mounted and bumps `FOREGROUND_CHANGED` when it unmounts. A modal without
-one lets arrivals scroll, and the history be read, behind it.
-`every_modal_root_has_a_presence` enforces it.
-
 Accepted trade-offs:
 
 - A reader dragging within the band when an arrival lands is taken to the
   end. The pre-#753 code fought this with `reader_moved_up_since`, the latch
   behind #508.
-- The history follows, and is read, under composer popovers.
+- The history follows, and is read, under every dialog and popover except a
+  DM thread over the room: member info, room settings, invite and ban
+  dialogs, the message action menu and the reaction picker. The reader is at
+  the end anyway when the dialog closes, but those arrivals count as read
+  without having been on screen unobstructed.
 - A same-millisecond (room) or same-second (DM) arrival whose id or token
   sorts lower than the previous newest is not followed.
 - A room message stamped far ahead stays the last row until real time passes
@@ -109,8 +105,9 @@ Accepted trade-offs:
 - A room's read marker advances when the history is in the foreground (same
   predicate as following), has completed its reveal restore, the rendered
   range reaches the room's latest message, and that message's bottom is on
-  screen within the same 4px margin. It re-checks on `FOREGROUND_CHANGED`
-  (the tab became visible or a modal closed), without scrolling. Scrolling
+  screen within the same 4px margin. It re-checks when the tab becomes
+  visible (`DOCUMENT_VISIBLE`) or a DM thread closes (`OPEN_DM_THREAD`),
+  without scrolling. Scrolling
   through a partial range does not advance it. Every mark-read path is
   bounded by the message published in `NEWEST_SEEN`.
 
@@ -127,8 +124,8 @@ and an inbound DM follows a reader at the end by the rule above, with the
 follow by the same rule (in a hidden tab they leave it at the top). Latest
 uses the same 4px message-bottom margin. The thread updates its read cutoff
 to the newest rendered inbound DM timestamp only when it is in the foreground
-and the newest DM's bottom is on screen, and re-checks on
-`FOREGROUND_CHANGED`.
+and the newest DM's bottom is on screen, and re-checks when the tab becomes
+visible.
 
 A thread's opening, own-send and follow placements run in a task queued after
 the render, and both they and the read witness find the thread through the
