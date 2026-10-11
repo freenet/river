@@ -7,30 +7,6 @@
 //! proves nothing about how an arriving one behaves. These write straight into
 //! `ROOMS`, as an arriving network update does.
 //!
-//! A real arrival's author is a member, because the contract only keeps
-//! messages signed by a member or the owner, so the hooks admit their test
-//! identities as members too (see `admit_test_member`). Without that, the
-//! first message the reader sends re-applies that rule locally and drops every
-//! message the hooks delivered.
-//!
-//! None of these hooks scroll. Where the view ends up is the app's doing.
-//!
-//! The DM hooks (`appendDms`, `deliverDm`) do the same for a DM thread between
-//! self and one fixed test identity, which they admit like the others. Unlike
-//! the room hooks they run the DM field's own `apply_delta`, so every DM is
-//! sealed to self, sender-signed, and kept in the contract's order and caps.
-//!
-//! `appendDmsForPeer` and `deliverDmForPeer` do the same for a second fixed
-//! test identity (peer 1), so a spec can switch between two threads; peer 0 is
-//! the identity `appendDms` and `deliverDm` use.
-//!
-//! `failNextDmRoomRead` makes the open DM thread's next `ROOMS` read fail, as
-//! a contended one does, and `dmRoomReadFailuresTaken` reports when it has.
-//!
-//! `holdNextDmPlacement` holds the next DM thread placement (the opening or
-//! own-send jump) after its task starts and before it runs, so a spec can
-//! unmount the thread underneath it; `releaseHeldDmPlacement` runs it.
-//!
 //! The room hooks skip `apply_delta`'s verification on purpose, and every hook
 //! admits test identities on self's say-so, so none may be reachable anywhere
 //! the result could be pushed to the network. The module compiles only for
@@ -59,7 +35,6 @@ use river_core::room_state::{
     ChatRoomParametersV1,
 };
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen::convert::FromWasmAbi;
 use wasm_bindgen::JsValue;
 
 pub fn install_test_hooks() {
@@ -71,152 +46,138 @@ pub fn install_test_hooks() {
         return;
     }
 
-    fn expose<A: FromWasmAbi + 'static>(
-        hooks: &js_sys::Object,
-        name: &str,
-        hook: impl FnMut(A) + 'static,
-    ) {
-        let hook = Closure::<dyn FnMut(A)>::new(hook).into_js_value();
-        let _ = js_sys::Reflect::set(hooks, &JsValue::from_str(name), &hook);
-    }
-
-    fn expose2<A: FromWasmAbi + 'static, B: FromWasmAbi + 'static>(
-        hooks: &js_sys::Object,
-        name: &str,
-        hook: impl FnMut(A, B) + 'static,
-    ) {
-        let hook = Closure::<dyn FnMut(A, B)>::new(hook).into_js_value();
-        let _ = js_sys::Reflect::set(hooks, &JsValue::from_str(name), &hook);
-    }
-
-    fn expose_getter(hooks: &js_sys::Object, name: &str, hook: impl FnMut() -> u32 + 'static) {
-        let hook = Closure::<dyn FnMut() -> u32>::new(hook).into_js_value();
-        let _ = js_sys::Reflect::set(hooks, &JsValue::from_str(name), &hook);
-    }
-
     let hooks = js_sys::Object::new();
+    let set_hook = |name: &str, hook: JsValue| {
+        let _ = js_sys::Reflect::set(&hooks, &JsValue::from_str(name), &hook);
+    };
 
-    expose(&hooks, "appendMessage", move |text: String| {
-        crate::util::defer(move || deliver([(text, Delivery::Append)]));
-    });
-
-    // An arrival from a member whose clock runs `seconds` ahead of ours. Up to
-    // the 60s skew tolerance in conversation.rs it keeps its own timestamp, so
-    // a message sent here afterwards sorts ABOVE it (the A06 clock-skew case).
-    expose2(
-        &hooks,
-        "appendMessageAhead",
-        move |text: String, seconds: u32| {
-            crate::util::defer(move || deliver([(text, Delivery::Ahead(seconds))]));
-        },
+    set_hook(
+        "appendMessage",
+        Closure::<dyn FnMut(String)>::new(move |text: String| {
+            crate::util::defer(move || deliver([(text, Delivery::Append)]));
+        })
+        .into_js_value(),
     );
 
-    // A DM history from the test peer to self, in ONE mutation: `count`
-    // messages labelled `dm history NN`, a minute apart and all in the past,
-    // so a DM sent or delivered afterwards sorts below them. Long enough at 30
-    // to make the thread scroll on every test viewport.
-    expose(&hooks, "appendDms", move |count: u32| {
-        crate::util::defer(move || append_dm_history(&DM_PEERS[0], count));
-    });
-
-    // One inbound DM from the test peer, stamped after every DM in the thread
-    // so it renders as the newest.
-    expose(&hooks, "deliverDm", move |text: String| {
-        crate::util::defer(move || deliver_dms(&DM_PEERS[0], vec![text], DmStamp::Newest));
-    });
-
-    // One inbound DM from the test peer stamped `seconds` ahead of now, within
-    // the DM field's future-skew limit.
-    expose2(
-        &hooks,
-        "deliverDmAhead",
-        move |text: String, seconds: u32| {
-            crate::util::defer(move || {
-                deliver_dms(&DM_PEERS[0], vec![text], DmStamp::Ahead(seconds.into()))
-            });
-        },
+    // A DM history from test peer `peer` to self, in ONE mutation: `count`
+    // messages labelled "<history_label> NN", a minute apart and all in the
+    // past, so a DM sent or delivered afterwards sorts below them. Long enough
+    // at 30 to make the thread scroll on every test viewport.
+    set_hook(
+        "appendDmsForPeer",
+        Closure::<dyn FnMut(u32, u32)>::new(move |peer: u32, count: u32| {
+            let peer = dm_peer(peer);
+            crate::util::defer(move || append_dm_history(peer, count));
+        })
+        .into_js_value(),
     );
 
-    // `appendDms` and `deliverDm` for a chosen test peer: 0 is the one those
-    // use, 1 a second identity with its own thread.
-    expose2(&hooks, "appendDmsForPeer", move |peer: u32, count: u32| {
-        let peer = dm_peer(peer);
-        crate::util::defer(move || append_dm_history(peer, count));
-    });
-    expose2(
-        &hooks,
+    // One inbound DM from test peer `peer`, stamped after every DM in the
+    // thread so it renders as the newest.
+    set_hook(
         "deliverDmForPeer",
-        move |peer: u32, text: String| {
+        Closure::<dyn FnMut(u32, String)>::new(move |peer: u32, text: String| {
             let peer = dm_peer(peer);
             crate::util::defer(move || deliver_dms(peer, vec![text], DmStamp::Newest));
-        },
+        })
+        .into_js_value(),
     );
 
     // Admit a test peer to the current room with no DMs, so a spec can open
     // an empty thread with them from Member Info.
-    expose(&hooks, "admitDmPeer", move |peer: u32| {
-        let peer = dm_peer(peer);
-        crate::util::defer(move || {
-            with_current_room_mut(|room, room_key| {
-                let room_key = *room_key;
-                let peer_sk = SigningKey::from_bytes(&peer.seed);
-                admit_with_nickname(room, &room_key, &peer_sk, peer.nickname);
-            })
-        });
-    });
+    set_hook(
+        "admitDmPeer",
+        Closure::<dyn FnMut(u32)>::new(move |peer: u32| {
+            let peer = dm_peer(peer);
+            crate::util::defer(move || {
+                with_current_room_mut(|room, room_key| {
+                    let room_key = *room_key;
+                    let peer_sk = SigningKey::from_bytes(&peer.seed);
+                    admit_with_nickname(room, &room_key, &peer_sk, peer.nickname);
+                })
+            });
+        })
+        .into_js_value(),
+    );
 
     // Hold the NEXT DM thread placement (the opening or own-send jump) once
     // its task has started, before it touches the DOM, until
     // `releaseHeldDmPlacement`. One-shot: later placements run as usual.
-    expose(&hooks, "holdNextDmPlacement", move |_: JsValue| {
-        DM_PLACEMENT_HOLD_ARMED.with(|armed| armed.set(true));
-    });
+    set_hook(
+        "holdNextDmPlacement",
+        Closure::<dyn FnMut()>::new(move || {
+            DM_PLACEMENT_HOLD_ARMED.with(|armed| armed.set(true));
+        })
+        .into_js_value(),
+    );
 
     // How many placements are held right now (0 or 1).
-    expose_getter(&hooks, "heldDmPlacementCount", move || {
-        HELD_DM_PLACEMENT.with(|held| u32::from(held.borrow().is_some()))
-    });
+    set_hook(
+        "heldDmPlacementCount",
+        Closure::<dyn FnMut() -> u32>::new(move || {
+            HELD_DM_PLACEMENT.with(|held| u32::from(held.borrow().is_some()))
+        })
+        .into_js_value(),
+    );
 
     // Run the held placement, in a fresh task as it would have run. Throws if
     // nothing is held, so a release that does nothing cannot pass silently.
-    expose(&hooks, "releaseHeldDmPlacement", move |_: JsValue| {
-        // Out of the RefCell before it runs, so it cannot re-enter the borrow.
-        let Some(action) = HELD_DM_PLACEMENT.with(|held| held.borrow_mut().take()) else {
-            wasm_bindgen::throw_str("__riverTest.releaseHeldDmPlacement: no placement is held");
-        };
-        crate::util::safe_spawn_local(async move {
-            RELEASED_DM_PLACEMENTS_RUN.with(|n| n.set(n.get() + 1));
-            action();
-        });
-    });
+    set_hook(
+        "releaseHeldDmPlacement",
+        Closure::<dyn FnMut()>::new(move || {
+            // Out of the RefCell before it runs, so it cannot re-enter the borrow.
+            let Some(action) = HELD_DM_PLACEMENT.with(|held| held.borrow_mut().take()) else {
+                wasm_bindgen::throw_str("__riverTest.releaseHeldDmPlacement: no placement is held");
+            };
+            crate::util::safe_spawn_local(async move {
+                RELEASED_DM_PLACEMENTS_RUN.with(|n| n.set(n.get() + 1));
+                action();
+            });
+        })
+        .into_js_value(),
+    );
 
     // How many released placements have run, so a test can wait for its
     // release to land rather than guess.
-    expose_getter(&hooks, "releasedDmPlacementsRun", move || {
-        RELEASED_DM_PLACEMENTS_RUN.with(|n| n.get())
-    });
+    set_hook(
+        "releasedDmPlacementsRun",
+        Closure::<dyn FnMut() -> u32>::new(move || RELEASED_DM_PLACEMENTS_RUN.with(|n| n.get()))
+            .into_js_value(),
+    );
 
-    expose(&hooks, "insertMessageBeforeLast", move |text: String| {
-        crate::util::defer(move || deliver([(text, Delivery::BeforeLast)]));
-    });
+    set_hook(
+        "insertMessageBeforeLast",
+        Closure::<dyn FnMut(String)>::new(move |text: String| {
+            crate::util::defer(move || deliver([(text, Delivery::BeforeLast)]));
+        })
+        .into_js_value(),
+    );
 
     // A burst in ONE state mutation — one delta application, one re-render —
     // as a network delta carrying many messages produces. The windowing specs
     // use it to grow an anchored window well past one backfill step without
     // paying per-delivery render round-trips (#505 blocker 2).
-    expose(&hooks, "appendMessages", move |count: u32| {
-        crate::util::defer(move || {
-            deliver((0..count).map(|i| (format!("batched arrival {i:02}"), Delivery::Append)))
-        });
-    });
+    set_hook(
+        "appendMessages",
+        Closure::<dyn FnMut(u32)>::new(move |count: u32| {
+            crate::util::defer(move || {
+                deliver((0..count).map(|i| (format!("batched arrival {i:02}"), Delivery::Append)))
+            });
+        })
+        .into_js_value(),
+    );
 
     // Remove every message in the current room whose text contains the given
     // substring, in ONE mutation — the shape of a ban purge or a retention
     // drain, which take messages out of the list rather than adding a delete
     // action. The scroll specs use it for deletions above and at the reader.
-    expose(&hooks, "removeMessages", move |needle: String| {
-        crate::util::defer(move || remove_messages(&needle));
-    });
+    set_hook(
+        "removeMessages",
+        Closure::<dyn FnMut(String)>::new(move |needle: String| {
+            crate::util::defer(move || remove_messages(&needle));
+        })
+        .into_js_value(),
+    );
 
     // Put the current room in the state of a private room whose secret this
     // device does not hold. A send then falls back to a public body, which
@@ -228,90 +189,111 @@ pub fn install_test_hooks() {
     // Only for a room self owns: the configuration is re-signed with the
     // owner's key, because a configuration that fails its signature check
     // reads as a room still awaiting its initial sync, which has no composer.
-    expose(&hooks, "makeRoomPrivateWithoutSecret", move |_: JsValue| {
-        crate::util::defer(|| {
-            with_current_room_mut(|room, room_key| {
-                let Some(owner_sk) = room
-                    .signing_key()
-                    .filter(|sk| sk.verifying_key() == *room_key)
-                    .cloned()
-                else {
-                    web_sys::console::error_1(
-                        &"__riverTest.makeRoomPrivateWithoutSecret: self must own the room".into(),
-                    );
-                    return;
-                };
-                let mut config = room.room_state.configuration.configuration.clone();
-                config.privacy_mode = PrivacyMode::Private;
-                room.room_state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
-                room.secrets.clear();
-                room.current_secret_version = None;
+    set_hook(
+        "makeRoomPrivateWithoutSecret",
+        Closure::<dyn FnMut()>::new(move || {
+            crate::util::defer(|| {
+                with_current_room_mut(|room, room_key| {
+                    let Some(owner_sk) = room
+                        .signing_key()
+                        .filter(|sk| sk.verifying_key() == *room_key)
+                        .cloned()
+                    else {
+                        web_sys::console::error_1(
+                            &"__riverTest.makeRoomPrivateWithoutSecret: self must own the room"
+                                .into(),
+                        );
+                        return;
+                    };
+                    let mut config = room.room_state.configuration.configuration.clone();
+                    config.privacy_mode = PrivacyMode::Private;
+                    room.room_state.configuration =
+                        AuthorizedConfigurationV1::new(config, &owner_sk);
+                    room.secrets.clear();
+                    room.current_secret_version = None;
+                });
             });
-        });
-    });
+        })
+        .into_js_value(),
+    );
 
     // Drive the no-room screen's load states (freenet/river#509), which the
     // example build, always seeded with rooms, never leaves. Clears ROOMS too:
     // `room_list_display_state` renders the list whenever there is anything to show.
-    expose(&hooks, "setRoomsLoadState", move |state: String| {
-        let parsed = match state.as_str() {
-            "loading" => RoomsLoadState::Loading,
-            "migrating" => RoomsLoadState::Migrating,
-            "failed" => RoomsLoadState::LoadFailed,
-            "loaded" => RoomsLoadState::Loaded,
-            other => wasm_bindgen::throw_str(&format!("unknown rooms load state {other:?}")),
-        };
-        crate::util::defer(move || {
-            ROOMS.with_mut(|rooms| {
-                rooms.map.clear();
-                rooms.room_order.clear();
-                rooms.current_room_key = None;
+    set_hook(
+        "setRoomsLoadState",
+        Closure::<dyn FnMut(String)>::new(move |state: String| {
+            let parsed = match state.as_str() {
+                "loading" => RoomsLoadState::Loading,
+                "migrating" => RoomsLoadState::Migrating,
+                "failed" => RoomsLoadState::LoadFailed,
+                "loaded" => RoomsLoadState::Loaded,
+                other => wasm_bindgen::throw_str(&format!("unknown rooms load state {other:?}")),
+            };
+            crate::util::defer(move || {
+                ROOMS.with_mut(|rooms| {
+                    rooms.map.clear();
+                    rooms.room_order.clear();
+                    rooms.current_room_key = None;
+                });
+                *CURRENT_ROOM.write() = CurrentRoom { owner_key: None };
+                *ROOMS_LOAD_STATE.write() = parsed;
             });
-            *CURRENT_ROOM.write() = CurrentRoom { owner_key: None };
-            *ROOMS_LOAD_STATE.write() = parsed;
-        });
-    });
+        })
+        .into_js_value(),
+    );
 
     // Make the open DM thread's next `ROOMS` read take its failed-read branch,
     // as a contended read does, and nudge so that read happens. If no thread
     // is open, the next one to open takes it.
-    expose(&hooks, "failNextDmRoomRead", move |_: JsValue| {
-        DM_ROOM_READ_FAILURE.with(|f| f.set(true));
-        crate::util::signal_guard::schedule_nudge();
-    });
+    set_hook(
+        "failNextDmRoomRead",
+        Closure::<dyn FnMut()>::new(move || {
+            DM_ROOM_READ_FAILURE.with(|f| f.set(true));
+            crate::util::signal_guard::schedule_nudge();
+        })
+        .into_js_value(),
+    );
 
     // How many forced DM room-read failures have been taken, so a test can wait
     // for its failure to land rather than guess.
-    expose_getter(&hooks, "dmRoomReadFailuresTaken", move || {
-        DM_ROOM_READS_FAILED.with(|n| n.get())
-    });
+    set_hook(
+        "dmRoomReadFailuresTaken",
+        Closure::<dyn FnMut() -> u32>::new(move || DM_ROOM_READS_FAILED.with(|n| n.get()))
+            .into_js_value(),
+    );
 
     // Switch rooms the way a notification click does: CURRENT_ROOM changes
     // while whatever modal is open stays open. The room list is behind the
     // modal's backdrop, so the UI itself cannot do this from a test.
-    expose(&hooks, "switchRoom", move |name: String| {
-        // Everything inside `defer`: reading ROOMS needs the Dioxus runtime, which
-        // a raw JS call does not have (and `panic = "abort"` would kill the page).
-        crate::util::defer(move || {
-            let key = ROOMS.peek().map.iter().find_map(|(key, room)| {
-                let sealed = &room.room_state.configuration.configuration.display.name;
-                let shown = crate::util::ecies::unseal_bytes_with_secrets(sealed, &room.secrets)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                    .unwrap_or_else(|_| sealed.to_string_lossy());
-                (shown == name).then_some(*key)
-            });
-            match key {
-                Some(key) => {
-                    *CURRENT_ROOM.write() = CurrentRoom {
-                        owner_key: Some(key),
-                    };
+    set_hook(
+        "switchRoom",
+        Closure::<dyn FnMut(String)>::new(move |name: String| {
+            // Everything inside `defer`: reading ROOMS needs the Dioxus runtime, which
+            // a raw JS call does not have (and `panic = "abort"` would kill the page).
+            crate::util::defer(move || {
+                let key = ROOMS.peek().map.iter().find_map(|(key, room)| {
+                    let sealed = &room.room_state.configuration.configuration.display.name;
+                    let shown =
+                        crate::util::ecies::unseal_bytes_with_secrets(sealed, &room.secrets)
+                            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                            .unwrap_or_else(|_| sealed.to_string_lossy());
+                    (shown == name).then_some(*key)
+                });
+                match key {
+                    Some(key) => {
+                        *CURRENT_ROOM.write() = CurrentRoom {
+                            owner_key: Some(key),
+                        };
+                    }
+                    None => web_sys::console::error_1(
+                        &format!("__riverTest.switchRoom: no room named {name:?}").into(),
+                    ),
                 }
-                None => web_sys::console::error_1(
-                    &format!("__riverTest.switchRoom: no room named {name:?}").into(),
-                ),
-            }
-        });
-    });
+            });
+        })
+        .into_js_value(),
+    );
 
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
@@ -363,8 +345,6 @@ enum Delivery {
     /// WITHOUT remounting its last row, which is the case the old
     /// `onmounted`-on-the-last-bubble scroll trigger could not see.
     BeforeLast,
-    /// At the end, stamped this many seconds ahead of our clock.
-    Ahead(u32),
 }
 
 // Drives the append-author alternation, across single and batched deliveries.
@@ -392,8 +372,6 @@ fn test_author(delivery: Delivery) -> (SigningKey, &'static str) {
             }
         }
         Delivery::BeforeLast => (SigningKey::from_bytes(&[0x7B; 32]), "Test Sender Insert"),
-        // Its own identity, so it never groups with the arrival before it.
-        Delivery::Ahead(_) => (SigningKey::from_bytes(&[0x8C; 32]), "Test Sender Ahead"),
     }
 }
 
@@ -470,11 +448,7 @@ fn push_test_message(
     let author = MemberId::from(&sk.verifying_key());
     admit_with_nickname(room, room_key, &sk, nickname);
 
-    let now = crate::util::get_current_system_time();
-    let time = match delivery {
-        Delivery::Ahead(seconds) => now + std::time::Duration::from_secs(seconds.into()),
-        Delivery::Append | Delivery::BeforeLast => now,
-    };
+    let time = crate::util::get_current_system_time();
     let message = AuthorizedMessageV1::new(
         MessageV1 {
             room_owner: MemberId::from(room_key),
@@ -487,7 +461,7 @@ fn push_test_message(
 
     let messages = &mut room.room_state.recent_messages.messages;
     let at = match delivery {
-        Delivery::Append | Delivery::Ahead(_) => messages.len(),
+        Delivery::Append => messages.len(),
         Delivery::BeforeLast => messages.len().saturating_sub(1),
     };
     messages.insert(at, message);
@@ -556,9 +530,8 @@ struct DmPeer {
     history_label: &'static str,
 }
 
-/// The DM hooks' test peers, by index. Peer 0 is the one `appendDms` and
-/// `deliverDm` use (`dm-thread-scroll.spec.ts`); peer 1 gives a spec a second
-/// thread in the same room (`dm-thread-lifecycle.spec.ts`).
+/// The DM hooks' test peers, by index: a spec that needs a second thread in the
+/// same room uses peer 1.
 const DM_PEERS: [DmPeer; 2] = [
     DmPeer {
         seed: [0x9D; 32],
@@ -583,7 +556,7 @@ fn dm_peer(index: u32) -> &'static DmPeer {
 }
 
 /// `count` DMs from `peer` labelled "<history_label> NN", a minute apart and
-/// all in the past, in ONE mutation (see `appendDms`).
+/// all in the past, in ONE mutation (see `appendDmsForPeer`).
 fn append_dm_history(peer: &DmPeer, count: u32) {
     deliver_dms(
         peer,
@@ -603,8 +576,6 @@ enum DmStamp {
     /// the delivery sorts last even within one second of the previous one
     /// (the thread orders same-second DMs by signature).
     Newest,
-    /// `now` plus this many seconds: a sender whose clock runs ahead.
-    Ahead(u64),
 }
 
 /// Deliver `texts` from `peer` to self in the current room, in ONE `ROOMS`
@@ -642,7 +613,6 @@ fn deliver_dms(peer: &DmPeer, texts: Vec<String>, stamp: DmStamp) {
                     .fold(now, u64::max),
                 1,
             ),
-            DmStamp::Ahead(seconds) => (now + seconds, 1),
         };
         let new_messages: Vec<_> = texts
             .into_iter()
