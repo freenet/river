@@ -7141,6 +7141,154 @@ mod tests {
             );
         }
     }
+
+    /// Byte offsets of `name(` calls in the code of `src`, outside comments
+    /// and literals. Skips the `fn name(` definition.
+    fn code_calls(src: &str, name: &str) -> Vec<usize> {
+        use crate::util::{lex, Lexeme};
+        let kinds = lex(src);
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        src.match_indices(&format!("{name}("))
+            .map(|(at, _)| at)
+            .filter(|&at| kinds[at] == Lexeme::Code)
+            .filter(|&at| at == 0 || !is_ident(src.as_bytes()[at - 1]))
+            .filter(|&at| {
+                let before = src[..at].trim_end();
+                let is_def = before.ends_with("fn")
+                    && before.len() > 2
+                    && !is_ident(before.as_bytes()[before.len() - 3]);
+                !is_def
+            })
+            .collect()
+    }
+
+    /// The [`code_calls`] of `name` that are not inside a `defer(move ||`
+    /// closure.
+    fn calls_outside_defer(src: &str, name: &str) -> Vec<usize> {
+        use crate::util::{lex, Lexeme};
+        let kinds = lex(src);
+        // Each closure spans `defer(` to its matching `)`, counting only
+        // delimiters in code. Matching the call's parens rather than finding
+        // the first `});` keeps a nested `ROOMS.with_mut(|r| { … });` from
+        // ending the span early.
+        let spans: Vec<(usize, usize)> = src
+            .match_indices("defer(move ||")
+            .filter(|&(at, _)| kinds[at] == Lexeme::Code)
+            .filter_map(|(at, _)| {
+                let open = at + "defer".len();
+                let mut depth = 0i32;
+                for (i, c) in src.bytes().enumerate().skip(open) {
+                    if kinds[i] != Lexeme::Code {
+                        continue;
+                    }
+                    match c {
+                        b'(' | b'{' | b'[' => depth += 1,
+                        b')' | b'}' | b']' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        return Some((open, i));
+                    }
+                }
+                None
+            })
+            .collect();
+        code_calls(src, name)
+            .into_iter()
+            .filter(|&at| !spans.iter().any(|&(s, e)| s < at && at < e))
+            .collect()
+    }
+
+    /// The common shape: the writer runs inside the sender's `defer`.
+    #[test]
+    fn calls_outside_defer_accepts_a_call_inside_the_closure() {
+        let src = "fn send() {\n    crate::util::defer(move || {\n        mark_needs_sync(room);\n        save_outbound_dm_now(room, plaintext);\n    });\n}\n";
+        assert!(calls_outside_defer(src, "save_outbound_dm_now").is_empty());
+    }
+
+    /// A call after the closure ends runs synchronously in the caller.
+    #[test]
+    fn calls_outside_defer_flags_a_call_after_the_closure() {
+        let src = "fn send() {\n    crate::util::defer(move || {\n        mark_needs_sync(room);\n    });\n    save_outbound_dm_now(room, plaintext);\n}\n";
+        let at = src.find("save_outbound_dm_now(").unwrap();
+        assert_eq!(calls_outside_defer(src, "save_outbound_dm_now"), vec![at]);
+    }
+
+    /// A nested closure's `});` inside the `defer` must not end its span.
+    /// Both real senders have this shape (`ROOMS.with_mut(|rooms| { … });`
+    /// before the cache write).
+    #[test]
+    fn calls_outside_defer_accepts_a_call_after_a_nested_closure() {
+        let src = "fn send() {\n    crate::util::defer(move || {\n        let ok = ROOMS.with_mut(|r| {\n            r.insert(dm);\n            true\n        });\n        if ok {\n            save_outbound_dm_now(room, plaintext);\n        }\n    });\n}\n";
+        assert!(calls_outside_defer(src, "save_outbound_dm_now").is_empty());
+    }
+
+    /// The definition is not a call.
+    #[test]
+    fn calls_outside_defer_skips_the_definition() {
+        let src = "pub fn save_outbound_dm_now(\n    room: VerifyingKey,\n) {\n    OUTBOUND_DMS.with_mut(|c| c.insert(room));\n}\n";
+        assert!(calls_outside_defer(src, "save_outbound_dm_now").is_empty());
+    }
+
+    /// Mutation check on a real sender: `send_structured_dm`'s cache write,
+    /// moved from inside its `defer` to just after the closure, is caught.
+    #[test]
+    fn calls_outside_defer_flags_send_structured_dm_with_the_write_moved_out() {
+        let prod = crate::util::source_scan::production_only(include_str!("../direct_messages.rs"));
+        assert!(calls_outside_defer(&prod, "save_outbound_dm_now").is_empty());
+
+        let call = "save_outbound_dm_now(\n                room,\n                self_id,\n                peer,\n                purge_token,\n                dm_timestamp,\n                plaintext_for_cache,\n            );\n";
+        let at = prod.find(call).expect("send_structured_dm's cache write");
+        // The `defer` statement's terminator, at its own indentation.
+        let terminator = "\n    });\n";
+        let end = at + prod[at..].find(terminator).unwrap() + terminator.len();
+        let moved = format!(
+            "{}{}{call}{}",
+            &prod[..at],
+            &prod[at + call.len()..end],
+            &prod[end..]
+        );
+        assert_eq!(
+            calls_outside_defer(&moved, "save_outbound_dm_now"),
+            vec![end - call.len()]
+        );
+    }
+
+    /// These writers touch a GlobalSignal without deferring, so each caller
+    /// must run them inside a `defer` closure (dioxus-signal-safety.md).
+    /// `save_outbound_dm_now` must not defer internally: it has to land in
+    /// the macrotask that adds the DM to `ROOMS` (direct-messages.md, Save
+    /// path). Whole files are scanned, not `production_only`, which would cut
+    /// this file at its `mod tests` and miss the `hydrate_*` wrappers below
+    /// it; no test calls these writers outside a string literal.
+    #[test]
+    fn defer_only_writers_are_called_inside_defer() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let files: Vec<_> = crate::util::source_scan::rust_files(&root)
+            .into_iter()
+            .map(|path| {
+                let src = std::fs::read_to_string(&path).expect("readable source file");
+                (path, src)
+            })
+            .collect();
+        for name in [
+            "save_outbound_dm_now",
+            "hydrate_outbound_dms_cache_now",
+            "hydrate_hidden_dm_threads_now",
+        ] {
+            let mut calls = 0;
+            for (path, src) in &files {
+                calls += code_calls(src, name).len();
+                assert!(
+                    calls_outside_defer(src, name).is_empty(),
+                    "{}: {name} called outside a defer closure; it writes a \
+                     GlobalSignal synchronously (dioxus-signal-safety.md)",
+                    path.display()
+                );
+            }
+            assert!(calls > 0, "no call of {name} found; the pin is vacuous");
+        }
+    }
 }
 
 /// Remove a `room_owner_vk` from the per-session ensure-subscription dedup
@@ -8474,6 +8622,8 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
 
 /// The body of [`hydrate_outbound_dms_cache`] WITHOUT the `defer` wrapper.
 /// See [`hydrate_hidden_dm_threads_now`] for why a caller would want this.
+/// Call it only inside a `defer` closure;
+/// `defer_only_writers_are_called_inside_defer` enforces this.
 pub(crate) fn hydrate_outbound_dms_cache_now(entries: Vec<OutboundDmEntry>) {
     use crate::components::direct_messages::OUTBOUND_DMS;
     // Symmetric with `hydrate_hidden_dm_threads_now`: skip the GlobalSignal
@@ -8700,6 +8850,7 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
 /// first, so through the wrapper it would serialise the PRE-merge cache and
 /// then seal the predecessor as imported. Callers that need the write to have
 /// happened run this inside their own single `defer` and signal from there.
+/// `defer_only_writers_are_called_inside_defer` enforces this.
 pub(crate) fn hydrate_hidden_dm_threads_now(entries: Vec<HiddenDmThreadEntry>) {
     use crate::components::direct_messages::HIDDEN_DM_THREADS;
     // Shared with the wrapper rather than left there: `merge_outbound_dms`
@@ -9397,6 +9548,7 @@ async fn do_save_outbound_dms_to_delegate() -> Result<(), String> {
 /// senders do, in the same closure that adds the DM to `ROOMS`, so the sent
 /// bubble renders with its plaintext from its first frame, and an open
 /// thread's jump to it lands on its final height.
+/// `defer_only_writers_are_called_inside_defer` enforces this.
 pub fn save_outbound_dm_now(
     room_owner_vk: ed25519_dalek::VerifyingKey,
     sender: MemberId,
