@@ -602,6 +602,9 @@ fn count_unread_dms_with(
     total
 }
 
+type NotificationModes =
+    std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::NotificationMode>;
+
 /// Sum mode-aware unread messages across every room in `map` except
 /// `exclude` (`None` excludes nothing — the document-title total).
 ///
@@ -621,19 +624,23 @@ fn count_unread_dms_with(
 /// [`count_unread_behind_rooms_panel`].
 pub fn count_unread_excluding_room(
     map: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
-    modes: &std::collections::HashMap<
-        ed25519_dalek::VerifyingKey,
-        crate::room_data::NotificationMode,
-    >,
+    modes: &NotificationModes,
     exclude: Option<&ed25519_dalek::VerifyingKey>,
 ) -> usize {
     map.iter()
         .filter(|(owner_key, _)| Some(*owner_key) != exclude)
-        .map(|(owner_key, room_data)| {
-            let mode = modes.get(owner_key).copied().unwrap_or_default();
-            count_unread_in_room_data_with_mode(room_data, mode)
-        })
+        .map(|(owner_key, room_data)| unread_under_mode(modes, owner_key, room_data))
         .sum()
+}
+
+/// One room's unread count under its notification mode (absent = `All`).
+fn unread_under_mode(
+    modes: &NotificationModes,
+    owner_key: &ed25519_dalek::VerifyingKey,
+    room_data: &crate::room_data::RoomData,
+) -> usize {
+    let mode = modes.get(owner_key).copied().unwrap_or_default();
+    count_unread_in_room_data_with_mode(room_data, mode)
 }
 
 /// Mode-aware unread messages in `room` alone: 0 for `None` or a room not in
@@ -641,17 +648,13 @@ pub fn count_unread_excluding_room(
 /// key per test, as for [`count_unread_excluding_room`].
 fn count_unread_in_room(
     map: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
-    modes: &std::collections::HashMap<
-        ed25519_dalek::VerifyingKey,
-        crate::room_data::NotificationMode,
-    >,
+    modes: &NotificationModes,
     room: Option<&ed25519_dalek::VerifyingKey>,
 ) -> usize {
-    let Some((owner_key, room_data)) = room.and_then(|key| map.get_key_value(key)) else {
-        return 0;
-    };
-    let mode = modes.get(owner_key).copied().unwrap_or_default();
-    count_unread_in_room_data_with_mode(room_data, mode)
+    room.and_then(|key| map.get_key_value(key))
+        .map_or(0, |(owner_key, room_data)| {
+            unread_under_mode(modes, owner_key, room_data)
+        })
 }
 
 /// Count unread messages waiting *behind* the mobile rooms panel: rooms
@@ -758,17 +761,11 @@ fn mark_current_room_as_read() {
         };
         read_marker_update(&rooms.map, current_owner_key, seen.as_ref())
     };
-    let Some((owner_key, new_last_read_id)) = update else {
+    let Some(update) = update else {
         return;
     };
-
-    // Update the last read message ID
-    ROOMS.with_mut(|rooms| {
-        if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-            info!("Marking room as read up to message {:?}", new_last_read_id);
-            room_data.last_read_message_id = Some(new_last_read_id);
-        }
-    });
+    info!("Marking room as read up to message {:?}", update.1);
+    apply_read_marker(update);
 
     // Use safe_spawn_local to avoid re-entrant borrow of wasm-bindgen-futures
     crate::util::safe_spawn_local(async {
@@ -817,6 +814,15 @@ fn read_marker_update(
         return None;
     }
     Some((owner_key, seen_id.clone()))
+}
+
+/// Move a room's read marker as [`read_marker_update`] decided.
+fn apply_read_marker((owner_key, id): (ed25519_dalek::VerifyingKey, MessageId)) {
+    ROOMS.with_mut(|rooms| {
+        if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+            room_data.last_read_message_id = Some(id);
+        }
+    });
 }
 
 /// The two independent outcomes of a visible->hidden `visibilitychange`.
@@ -900,13 +906,8 @@ fn mark_current_room_as_read_on_hide() {
     // subscriber notifications can find a current scope, and breaks the call
     // stack so no other RefCell borrows are active when subscribers re-read.
     crate::util::defer(move || {
-        if let Some((owner_key, new_last_read_id)) = actions.mark {
-            ROOMS.with_mut(|rooms| {
-                if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                    room_data.last_read_message_id = Some(new_last_read_id);
-                }
-            });
-
+        if let Some(update) = actions.mark {
+            apply_read_marker(update);
             info!("Marked current room as read on tab hide");
         }
 
