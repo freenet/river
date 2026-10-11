@@ -4120,7 +4120,7 @@ pub fn Conversation() -> Element {
     };
     // Drives the scroll-to-latest button: "is the newest message's bottom on
     // screen right now?".
-    let mut is_at_bottom = use_signal(|| true);
+    let mut newest_in_view = use_signal(|| true);
     // How many trailing display items the history renders. Grows only when the
     // reader reaches the top of what is rendered — see `INITIAL_WINDOW_ITEMS`.
     let mut window_items = use_signal(|| INITIAL_WINDOW_ITEMS);
@@ -4209,7 +4209,7 @@ pub fn Conversation() -> Element {
                 opening_snap_done.set(false);
                 // Hide the scroll-to-latest button until the observer reports
                 // on the new room.
-                is_at_bottom.set(true);
+                newest_in_view.set(true);
             }
         });
     }
@@ -4452,11 +4452,11 @@ pub fn Conversation() -> Element {
 
         let reader_position = observer_reader.clone();
         let observer = observe_sentinel(&root, &sentinel, move |intersecting| {
-            // Deferred: `is_at_bottom` is subscribed in render (the
+            // Deferred: `newest_in_view` is subscribed in render (the
             // scroll-to-latest button), so a direct `.set()` from this raw
             // callback would notify from an empty scope and panic on Firefox
             // mobile. (#402)
-            crate::util::defer(move || is_at_bottom.set(intersecting));
+            crate::util::defer(move || newest_in_view.set(intersecting));
             // The reader scrolled to the newest message, or it came back
             // into view: the read rule may mark it.
             if intersecting {
@@ -5749,18 +5749,18 @@ pub fn Conversation() -> Element {
             }
                 // Scroll-to-latest button (#402): shown whenever the newest
                 // message's bottom is off screen, past a few px of slack.
-                // Reuses the `is_at_bottom` IntersectionObserver
+                // Reuses the `newest_in_view` IntersectionObserver
                 // state, so it appears after scrolling up even a little, or
                 // when an arrival lands below the view, and hides once the
                 // newest message's bottom is in view. Handy on every device but
                 // especially on touch, where there is no scrollbar to drag.
                 //
                 // Also shown while a held range withholds newer items.
-                if !is_at_bottom() || reader_position.has_newer.get() {
+                if !newest_in_view() || reader_position.has_newer.get() {
                     LatestButton {
                         aria_label: "Scroll to latest messages",
                         test_id: "scroll-to-bottom",
-                        // Do NOT optimistically set `is_at_bottom` here: the
+                        // Do NOT optimistically set `newest_in_view` here: the
                         // IntersectionObserver flips it (hiding the button) once
                         // the sentinel actually reaches view. #402.
                         onclick: {
