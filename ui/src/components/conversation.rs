@@ -2707,11 +2707,9 @@ struct ReaderPosition {
     window_overgrown: std::cell::Cell<bool>,
     /// See [`ReadingAnchor`].
     anchor: std::cell::RefCell<Option<ReadingAnchor>>,
-    /// Seen without layout since the last restore; the next resize restores.
+    /// What the ResizeObserver last saw of the container.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    hidden: std::cell::Cell<bool>,
-    /// First rendered display item, for the capture's index hint.
-    range_start: std::cell::Cell<usize>,
+    view: std::cell::Cell<HistoryView>,
     /// The last render's `HistoryWindow::has_newer`.
     has_newer: std::cell::Cell<bool>,
     /// The pending explicit scroll, if any. While newer items are held back
@@ -2725,12 +2723,6 @@ struct ReaderPosition {
     /// settle, every render) schedules nothing.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     seen_noted: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, MessageId)>>,
-    /// The container's last non-zero `clientHeight` the ResizeObserver
-    /// handled; 0 while hidden or not yet measured. A settle that measures
-    /// another height has beaten the observer to a resize, and must not
-    /// capture over the position the observer is about to correct from.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    observed_height: std::cell::Cell<i32>,
     /// The end hold: `Some(scrollTop)` while the view sits at
     /// the end an explicit request put it at. Rows changing height take it
     /// back there (the ResizeObserver). The reader's first scroll away, a
@@ -2765,7 +2757,26 @@ struct ReaderPosition {
     reposition_pending: std::cell::RefCell<Option<ProbeCapture>>,
 }
 
+/// What the ResizeObserver last saw of the history container.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum HistoryView {
+    #[default]
+    Unmeasured,
+    /// Seen without layout since the last restore; the next resize restores.
+    Hidden,
+    /// Laid out at this `clientHeight`. A settle that measures another height
+    /// has beaten the observer to a resize, and must not capture over the
+    /// position the observer is about to correct from.
+    Shown(i32),
+}
+
 impl ReaderPosition {
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn hidden(&self) -> bool {
+        self.view.get() == HistoryView::Hidden
+    }
+
     /// Ask for one move to the end of `room`'s history (see [`ScrollRequest`]).
     fn request_end(&self, room: Option<ed25519_dalek::VerifyingKey>) {
         self.request.set(Some(ScrollRequest { room }));
@@ -3269,7 +3280,6 @@ fn resolve_rendered_range(
             .collect(),
         index: history_window.end - 1,
     });
-    reader.range_start.set(history_window.start);
     reader.has_newer.set(history_window.has_newer);
     // A change of newest message ends the end hold; anything else keeps it.
     // Against the last render, so a request's own render (an own
@@ -3301,8 +3311,15 @@ const SCROLL_SETTLE_DEBOUNCE_MS: i32 = 120;
 /// breakpoint hide relies on the last settle.
 fn remember_reading_position(reader: &ReaderPosition) {
     #[cfg(target_arch = "wasm32")]
-    if let Some(anchor) = capture_reading_anchor(reader.range_start.get()) {
-        *reader.anchor.borrow_mut() = Some(anchor);
+    {
+        let range_start = reader
+            .window_anchor
+            .borrow()
+            .as_ref()
+            .map_or(0, |a| a.index);
+        if let Some(anchor) = capture_reading_anchor(range_start) {
+            *reader.anchor.borrow_mut() = Some(anchor);
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     let _ = reader;
@@ -3647,7 +3664,7 @@ fn follow_arrival_at_end(
     reader: &ReaderPosition,
 ) {
     // A pending request already owns the view; a held range is not at the end.
-    if reader.request.get().is_some() || reader.has_newer.get() || reader.hidden.get() {
+    if reader.request.get().is_some() || reader.has_newer.get() || reader.hidden() {
         return;
     }
     let Some(room) = room else {
@@ -3681,7 +3698,7 @@ fn complete_scroll_request(reader: &ReaderPosition, mut opening_snap_done: Signa
         return false;
     };
     if !has_layout(&container)
-        || reader.hidden.get()
+        || reader.hidden()
         || !container
             .query_selector("[data-item-key]")
             .is_ok_and(|row| row.is_some())
@@ -3729,7 +3746,7 @@ fn note_newest_seen(reader: &ReaderPosition) {
     if reader.seen_noted.borrow().as_ref() == Some(&newest) {
         return;
     }
-    if reader.hidden.get() || !ROOM_HISTORY.end_seen() {
+    if reader.hidden() || !ROOM_HISTORY.end_seen() {
         return;
     }
     *reader.seen_noted.borrow_mut() = Some(newest.clone());
@@ -3755,7 +3772,7 @@ fn trim_is_due(container: &web_sys::Element, overgrown: bool, reader: &ReaderPos
     if !overgrown
         || !has_layout(container)
         || reader.has_newer.get()
-        || reader.hidden.get()
+        || reader.hidden()
         || reader.request.get().is_some()
     {
         return false;
@@ -3799,7 +3816,7 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
                 return;
             }
             // Revealed but not restored yet: not the reader's position.
-            if reader.hidden.get() {
+            if reader.hidden() {
                 return;
             }
             // See `trim_is_due`. Any settle counts, ours included, so a touch
@@ -3837,8 +3854,8 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
             // over a view the observer has yet to correct, and the correction
             // would be lost. The observer corrects from the last capture
             // instead, and the next settle captures.
-            let observed = reader.observed_height.get();
-            if observed == 0 || container.client_height() == observed {
+            if !matches!(reader.view.get(), HistoryView::Shown(h) if h != container.client_height())
+            {
                 remember_reading_position(&reader);
             }
             note_newest_seen(&reader);
@@ -3934,17 +3951,16 @@ fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
         return;
     };
     if !has_layout(&container) {
-        reader.hidden.set(true);
-        reader.observed_height.set(0);
+        reader.view.set(HistoryView::Hidden);
         // The view the hold kept is gone.
         reader.end_hold.set(None);
         return;
     }
     let height = container.client_height();
-    let previous = reader.observed_height.replace(height);
+    let previous = reader.view.replace(HistoryView::Shown(height));
     // Revealed: finish a request made while hidden (a room opened behind the
     // panel), else put the reader back on their row.
-    if reader.hidden.replace(false) {
+    if previous == HistoryView::Hidden {
         if !complete_scroll_request(reader, opening_snap_done) {
             let anchor = reader.anchor.borrow().clone();
             if let Some(anchor) = anchor {
@@ -3965,7 +3981,10 @@ fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
     // gets covered or uncovered and a reader at the end keeps seeing the newest
     // message. Width alone, or the history alone, leaves the
     // height alone and gets no correction.
-    if previous == 0 || height == previous {
+    let HistoryView::Shown(previous) = previous else {
+        return;
+    };
+    if height == previous {
         return;
     }
     // Exact: the reading rows go back to where they were, relative to the
