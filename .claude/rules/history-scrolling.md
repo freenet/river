@@ -37,10 +37,11 @@ meantime stay below, Latest appears, and they stay unread until the reader
 reaches them.
 
 While another mobile panel (Rooms or Members) replaces the chat, Latest is
-hidden with it, so the open room's unread count, under its notification mode,
-shows on that panel's back-to-chat button (`back_to_chat.rs`). No other badge
-changes: the hamburger and the open room's row in the room list still leave
-that room out.
+hidden with it, so the open room's row in the room list shows its unread
+count, under its notification mode, as every other row does (`room_list.rs`,
+while `MOBILE_VIEW` is not `Chat`; `md:hidden`, since on desktop the chat
+always shows). While the chat shows, that row has no badge, and the
+hamburger, which shows only with the chat, always leaves the open room out.
 
 The check is **stateless and measured before the patch.** It reads the DOM in
 the render that brings the arrival, while the DOM still shows the previous

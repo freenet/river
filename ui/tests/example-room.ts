@@ -85,8 +85,8 @@ export async function selectRoom(page: Page, roomName: string) {
   await nextFrames(page);
 }
 
-/// A room's unread badge in the room list. Hidden while it is the current
-/// room, so callers open another room first.
+/// A room's unread badge in the room list. Absent for the current room while
+/// the chat shows, so callers open another room first or hide the chat.
 export function roomUnreadBadge(page: Page, roomName: string): Locator {
   return page.getByTestId("room-list").getByRole("button", { name: roomName }).getByTestId("room-unread-badge");
 }
@@ -94,11 +94,6 @@ export function roomUnreadBadge(page: Page, roomName: string): Locator {
 /// The unread badge on whichever hamburger is showing (room header or no-room panel).
 export function hamburgerBadge(page: Page): Locator {
   return page.getByTestId("hamburger-rooms-button").filter({ visible: true }).getByTestId("hamburger-unread-badge");
-}
-
-/// The members panel back arrow's badge; the rooms panel's arrow shares its test id.
-export function membersBackToChatBadge(page: Page): Locator {
-  return page.getByTestId("members-back-to-chat-button").getByTestId("back-to-chat-unread-badge");
 }
 
 export function memberRows(page: Page): Locator {

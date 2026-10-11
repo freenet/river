@@ -211,6 +211,16 @@ pub fn RoomList() -> Element {
         // it re-poll a macrotask later instead.
         crate::util::signal_guard::anchor();
         let current_room_key = CURRENT_ROOM.read().owner_key;
+        // While another mobile panel replaces the chat, Latest is hidden with
+        // it, so the open room's row badges its unread messages too
+        // (`.claude/rules/history-scrolling.md`).
+        let chat_hidden = match MOBILE_VIEW.try_read() {
+            Ok(view) => *view != MobileView::Chat,
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                false
+            }
+        };
         let Ok(rooms) = ROOMS.try_read() else {
             crate::util::signal_guard::schedule_nudge();
             return Vec::new();
@@ -280,7 +290,13 @@ pub fn RoomList() -> Element {
                     .get(&room_key)
                     .copied()
                     .unwrap_or_default();
-                let unread = count_unread_in_room_data_with_mode(room_data, mode);
+                // The open room's Latest button offers its unread messages
+                // while the chat shows, so its row badges none.
+                let unread = if is_current && !chat_hidden {
+                    0
+                } else {
+                    count_unread_in_room_data_with_mode(room_data, mode)
+                };
                 // Badge label matches what is being counted: qualifying
                 // mentions/replies for MentionsAndReplies rooms, all unread
                 // messages otherwise. (Muted rooms never render the badge.)
@@ -600,21 +616,26 @@ pub fn RoomList() -> Element {
                                             Icon { width: 12, height: 12, icon: FaLock }
                                         }
                                     }
-                                    // Unread badge — hidden for the current
-                                    // room, by design (it can hold messages
-                                    // the reader has not seen yet, but its
-                                    // Latest button
-                                    // offers those), and for Muted rooms
+                                    // Unread badge — absent for Muted rooms
                                     // (their count is always 0,
-                                    // freenet/river#500).
+                                    // freenet/river#500) and for the open
+                                    // room while the chat shows (its count is
+                                    // 0 then, see `room_items`). The open
+                                    // room's badge is `md:hidden`: on desktop
+                                    // the chat always shows, whatever
+                                    // `MOBILE_VIEW` says.
                                     // Styling mirrors the DM rail badge plus
                                     // `flex-shrink-0` so a long truncated
                                     // room name can't squash it; the accent
                                     // styling applies to any nonzero count,
                                     // whichever mode produced it.
-                                    if unread > 0 && !is_current {
+                                    if unread > 0 {
                                         span {
-                                            class: "ml-2 flex-shrink-0 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
+                                            class: if is_current {
+                                                "ml-2 flex-shrink-0 inline-flex md:hidden items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white"
+                                            } else {
+                                                "ml-2 flex-shrink-0 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white"
+                                            },
                                             "data-testid": "room-unread-badge",
                                             title: "{badge_title}",
                                             "aria-label": "{badge_aria}",
