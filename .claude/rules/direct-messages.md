@@ -90,7 +90,7 @@ view; it runs after the thread changes, when the tab becomes visible
 (`DOCUMENT_VISIBLE`), from the newest-DM
 observer, and after the opening, own-send, follow and Latest placements. An
 inbound DM follows a reader at the end (newest DM's bottom within
-`DM_FOLLOW_BAND_PX` = 50px, measured before the patch by
+`FOLLOW_BAND_PX` = 100px, the room's band, measured before the patch by
 `HistoryDom::arrival_follows`); otherwise the Latest control (`dm-scroll-to-latest`)
 shows while the newest DM's bottom is more than a few px off screen, and
 jumps instantly. The modal body is keyed by `(room, peer)`, so opening

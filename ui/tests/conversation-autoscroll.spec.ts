@@ -3,9 +3,10 @@ import { callRiverTest } from "./river-test";
 import { roomUnreadBadge, selectListedRoom, setTabVisibility } from "./example-room";
 import {
   AT_BOTTOM_EPSILON_PX,
+  BAND_EDGES,
+  FOLLOW_BAND_PX,
   HISTORY_ROWS,
   READING_ROW_BUDGET_PX,
-  ROOM_FOLLOW_BAND_PX,
   WELL_AWAY_FROM_END_PX,
   deliver,
   deliverOffscreen,
@@ -40,7 +41,7 @@ import { DM_PEER, closeThread, newestHistoryDm, openThread } from "./dm-thread";
 const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
 
 // An arrival follows a reader at the end: the newest message's bottom within
-// ROOM_FOLLOW_BAND_PX of the view's bottom edge before the patch, in the
+// FOLLOW_BAND_PX of the view's bottom edge before the patch, in the
 // foreground. Anywhere else it keeps the reader's place, and the Latest button
 // is how a reader reaches what arrived below them.
 // Rationale: .claude/rules/history-scrolling.md.
@@ -1387,18 +1388,15 @@ test.describe("The end holds after an explicit request", () => {
 });
 
 // An arrival follows a reader at the end, measured before the patch: the
-// newest message's bottom within ROOM_FOLLOW_BAND_PX of the view's bottom
+// newest message's bottom within FOLLOW_BAND_PX of the view's bottom
 // edge, in a visible tab, with no modal over the history. Nothing else
 // follows, and nothing scrolls when the tab or a modal comes back.
 // Rationale: .claude/rules/history-scrolling.md.
 test.describe("An arrival follows a reader at the end", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  for (const [offset, follows] of [
-    [-20, true],
-    [20, false],
-  ] as const) {
-    const below = ROOM_FOLLOW_BAND_PX + offset;
+  for (const [offset, follows] of BAND_EDGES) {
+    const below = FOLLOW_BAND_PX + offset;
     test(`an arrival ${follows ? "follows" : "does not follow"} a reader whose newest message sits ${below}px below the view`, async ({
       page,
     }) => {
@@ -1429,7 +1427,7 @@ test.describe("An arrival follows a reader at the end", () => {
     const height = await page
       .locator("[data-anchor-key]", { hasText: "tall arrival word" })
       .evaluate((el) => el.getBoundingClientRect().height);
-    expect(height, "premise: the arrival is taller than the band").toBeGreaterThan(ROOM_FOLLOW_BAND_PX);
+    expect(height, "premise: the arrival is taller than the band").toBeGreaterThan(FOLLOW_BAND_PX);
     await expectSettledAtBottom(page, "a tall arrival did not follow a reader at the end");
   });
 

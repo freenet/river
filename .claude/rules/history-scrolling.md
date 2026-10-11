@@ -26,10 +26,8 @@ both of these hold at the moment it arrives:
 2. **The reader is at the end or near it:** before the patch, the newest
    item's bottom (`bottom-sentinel` / `dm-bottom-sentinel`, the same edge as
    Latest and the read rule, not the scroller's absolute end) sits at most
-   `ROOM_FOLLOW_BAND_PX` (100) or `DM_FOLLOW_BAND_PX` (50) below the view's
-   bottom edge. Those are the pre-#753 values (`BOTTOM_THRESHOLD_PX` and
-   `is_near_bottom(.., 50.0)` at `8cf54dd7`), which measured from the
-   absolute end.
+   `FOLLOW_BAND_PX` (100) below the view's bottom edge, in a room and in a DM
+   thread alike.
 
 **Only an arrival follows.** A tab becoming visible, a DM thread closing, or a
 mobile panel revealing the chat never scrolls: messages that arrived in the
@@ -56,7 +54,7 @@ between arrivals, so no flag can latch:
   reader's settle never re-armed the pin.
 
 Measuring after the patch would count the arrival's own height against the
-band, which is why the pre-#753 DM check missed tall inbound DMs.
+band, so a tall arrival would never follow.
 
 An arrival is a strictly newer newest message: `NewestKey` (the sender's
 unclamped time, then id: display order) in the room, `DmKey` (timestamp, then
@@ -123,7 +121,7 @@ bulk removal above a parked reader remain follow-up work.
 
 DM threads share the policy: opening, own send and Latest jump instantly,
 and an inbound DM follows a reader at the end by the rule above, with the
-50px band. A thread opened empty has no opening to place, so its first DMs
+same band. A thread opened empty has no opening to place, so its first DMs
 follow by the same rule (in a hidden tab they leave it at the top). Latest
 uses the same 4px message-bottom margin. The thread updates its read cutoff
 to the newest rendered inbound DM timestamp only when it is in the foreground

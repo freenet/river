@@ -3,7 +3,8 @@ import { callRiverTest } from "./river-test";
 import { waitForApp, selectRoom, setTabVisibility, hiddenTitleCount, memberRows } from "./example-room";
 import {
   AT_BOTTOM_EPSILON_PX,
-  DM_FOLLOW_BAND_PX,
+  BAND_EDGES,
+  FOLLOW_BAND_PX,
   DM_VIEW,
   NEWEST_IN_VIEW_SLACK_PX,
   nextFrames,
@@ -35,7 +36,7 @@ import {
 // Where a DM thread's view goes: opening it lands on the
 // newest DM, an own send jumps to the end once, and Latest jumps there on
 // request. An inbound DM follows a reader at the end of a thread in the
-// foreground (DM_FOLLOW_BAND_PX); anywhere else it lands below and Latest
+// foreground (FOLLOW_BAND_PX); anywhere else it lands below and Latest
 // offers it. Nothing else moves the view.
 //
 // And when the thread counts as seen: only up to an inbound DM that was on
@@ -423,18 +424,15 @@ test.describe("DM thread room read", { tag: "@chromium-only" }, () => {
 });
 
 // An inbound DM follows a reader at the end of the thread: the newest DM's
-// bottom within DM_FOLLOW_BAND_PX of the view's bottom edge before the patch,
+// bottom within FOLLOW_BAND_PX of the view's bottom edge before the patch,
 // in a visible tab, with no modal over the thread. Nothing else follows, and
 // nothing scrolls when the tab or a modal comes back.
 // Rationale: .claude/rules/history-scrolling.md.
 test.describe("DM thread follows a reader at the end", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  for (const [offset, follows] of [
-    [-20, true],
-    [20, false],
-  ] as const) {
-    const below = DM_FOLLOW_BAND_PX + offset;
+  for (const [offset, follows] of BAND_EDGES) {
+    const below = FOLLOW_BAND_PX + offset;
     test(`an inbound DM ${follows ? "follows" : "does not follow"} a reader whose newest DM sits ${below}px below the view`, async ({
       page,
     }) => {
@@ -458,7 +456,7 @@ test.describe("DM thread follows a reader at the end", () => {
 
     await deliverDm(page, tall);
     const height = await dm(page, tall).evaluate((el) => el.parentElement!.getBoundingClientRect().height);
-    expect(height, "premise: the DM is taller than the band").toBeGreaterThan(DM_FOLLOW_BAND_PX);
+    expect(height, "premise: the DM is taller than the band").toBeGreaterThan(FOLLOW_BAND_PX);
     await expectAtEnd(page, "a tall inbound DM did not follow a reader at the end");
   });
 

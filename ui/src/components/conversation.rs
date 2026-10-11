@@ -21,7 +21,7 @@ use crate::components::scroll_to_latest::is_arrival;
 use crate::components::scroll_to_latest::LatestButton;
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
-    observe_newest, scroll_to_end, HistoryDom, NEWEST_IN_VIEW_SLACK_PX, ROOM_FOLLOW_BAND_PX,
+    observe_newest, scroll_to_end, HistoryDom, NEWEST_IN_VIEW_SLACK_PX,
 };
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
@@ -3221,7 +3221,6 @@ const ROOM_HISTORY: HistoryDom = HistoryDom {
     container_id: "chat-scroll-container",
     sentinel_id: "bottom-sentinel",
     under_dm_thread: true,
-    band: ROOM_FOLLOW_BAND_PX,
 };
 
 /// Measure the first message or event row that starts inside the view, with
@@ -3438,7 +3437,7 @@ fn correct_view_after_patch(reader: &ReaderPosition) {
 /// Follow an arrival for a reader at the end: ask for one move to the end when
 /// this render brings a newer newest message (`is_arrival`) and, before the
 /// patch, the room was in the foreground (`foreground::in_foreground`) with its
-/// newest message's bottom within `ROOM_FOLLOW_BAND_PX` of the view's bottom
+/// newest message's bottom within `FOLLOW_BAND_PX` of the view's bottom
 /// edge. Runs in render, so the DOM still shows the previous render; measuring
 /// after the patch would count the arrival's own height against the band.
 /// Stateless: nothing is remembered between arrivals, so nothing can latch

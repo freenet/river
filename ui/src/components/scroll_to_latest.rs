@@ -14,17 +14,11 @@ use dioxus_free_icons::Icon;
 #[cfg(target_arch = "wasm32")]
 pub const NEWEST_IN_VIEW_SLACK_PX: f64 = 4.0;
 
-/// How far below the visible area (in px) the room's newest message may sit
-/// when an arrival lands and still be followed to the end. The pre-#753
-/// `BOTTOM_THRESHOLD_PX`, now measured from the newest message's bottom rather
-/// than the scroller's absolute end (`.claude/rules/history-scrolling.md`).
+/// How far below the visible area (in px) the newest item's bottom may sit
+/// when an arrival lands and still be followed to the end, in the room and in
+/// a DM thread (`.claude/rules/history-scrolling.md`).
 #[cfg(target_arch = "wasm32")]
-pub const ROOM_FOLLOW_BAND_PX: f64 = 100.0;
-
-/// The DM thread's [`ROOM_FOLLOW_BAND_PX`]: the pre-#753 `is_near_bottom`
-/// tolerance.
-#[cfg(target_arch = "wasm32")]
-pub const DM_FOLLOW_BAND_PX: f64 = 50.0;
+pub const FOLLOW_BAND_PX: f64 = 100.0;
 
 /// Did a newer newest item arrive? Only a strictly greater key counts: an
 /// edit, a deletion of the newest and a re-render do not. `first_counts`
@@ -46,9 +40,6 @@ pub struct HistoryDom {
     pub sentinel_id: &'static str,
     /// Whether an open DM thread covers this history: true for the room.
     pub under_dm_thread: bool,
-    /// How far below the view the newest item's bottom may sit, before the
-    /// patch, for an arrival to follow.
-    pub band: f64,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -62,12 +53,12 @@ impl HistoryDom {
     }
 
     /// Does an arrival rendering now follow? Only into a history in the
-    /// foreground whose newest item's bottom sat at most `band` px below the
-    /// view. Called from render, before the patch.
+    /// foreground whose newest item's bottom sat at most [`FOLLOW_BAND_PX`]
+    /// below the view. Called from render, before the patch.
     pub fn arrival_follows(&self) -> bool {
         self.container().is_some_and(|container| {
             crate::components::foreground::in_foreground(self.under_dm_thread, &container)
-                && self.newest_bottom_below_view(&container) <= self.band
+                && self.newest_bottom_below_view(&container) <= FOLLOW_BAND_PX
         })
     }
 

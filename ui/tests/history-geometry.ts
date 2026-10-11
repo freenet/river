@@ -20,11 +20,16 @@ export const WELL_AWAY_FROM_END_PX = 100;
 export const NEWEST_IN_VIEW_SLACK_PX = 4;
 /// Slack for fractional layout after a scroll that did land at the bottom.
 export const AT_BOTTOM_EPSILON_PX = 4;
-/// scroll_to_latest.rs `ROOM_FOLLOW_BAND_PX` / `DM_FOLLOW_BAND_PX`: how far
-/// below the view the newest message's bottom may sit when an arrival lands and
-/// still be followed.
-export const ROOM_FOLLOW_BAND_PX = 100;
-export const DM_FOLLOW_BAND_PX = 50;
+/// scroll_to_latest.rs `FOLLOW_BAND_PX`, shared by the room and the DM thread:
+/// how far below the view the newest message's bottom may sit when an arrival
+/// lands and still be followed.
+export const FOLLOW_BAND_PX = 100;
+/// The band's edge, tested once per surface: a reader parked this far inside
+/// the band follows, and this far outside it does not.
+export const BAND_EDGES = [
+  [-20, true],
+  [20, false],
+] as const;
 /// How far a row the reader is looking at may move and still count as "kept
 /// in place". Independent of the app's own slack (#732).
 export const READING_ROW_BUDGET_PX = 4;

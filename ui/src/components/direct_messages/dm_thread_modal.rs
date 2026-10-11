@@ -20,7 +20,7 @@ use crate::components::room_list::receive_invitation_modal::present_invitation;
 use crate::components::scroll_to_latest::{is_arrival, LatestButton};
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
-    observe_newest, scroll_to_end, HistoryDom, SentinelObserver, DM_FOLLOW_BAND_PX,
+    observe_newest, scroll_to_end, HistoryDom, SentinelObserver,
 };
 use crate::room_data::SendMessageError;
 use dioxus::logger::tracing::{error, info, warn};
@@ -47,7 +47,6 @@ const DM_HISTORY: HistoryDom = HistoryDom {
     container_id: "dm-scroll-container",
     sentinel_id: "dm-bottom-sentinel",
     under_dm_thread: false,
-    band: DM_FOLLOW_BAND_PX,
 };
 
 /// Monotonic counter bumped every time the local user sends a DM from
