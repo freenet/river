@@ -2738,25 +2738,15 @@ struct ReaderPosition {
     /// message (`!has_newer`), it is what `follow_arrival_at_end` compares an
     /// arrival against and what `note_newest_seen` publishes.
     range_newest: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, NewestKey)>>,
-    /// The backfill sentinel's capture just before it grows the window, so
-    /// the restore can put the reader back on the row they were looking at.
-    /// See [`ProbeCapture`] and `correct_view_after_patch`.
-    backfill_anchor: std::cell::RefCell<Option<ProbeCapture>>,
-    /// A pending "keep the reader's view still" adjustment: when a render
-    /// swaps the window head for a LATER item (the head was pruned out from
-    /// under the anchor, or newer paging slid past it), the rows above the
-    /// viewport shrink, and with scroll anchoring disabled nothing
-    /// compensates. The render captures a [`ProbeCapture`] here (see
-    /// `select_reposition_probe`); `correct_view_after_patch` re-measures
-    /// the row after the patch and shifts `scrollTop` by the difference.
-    ///
-    /// The scroll offset is captured too because the browser clamps
-    /// `scrollTop` down on its own when a patch shortens the content, BEFORE
-    /// the effect runs: computing the target from the post-clamp offset would
-    /// apply the shift on top of the clamp (#505 delta review). A trade: a
-    /// live read is immune to the reader scrolling between render and effect,
-    /// a captured one to the clamp, and the clamp is far more frequent.
-    reposition_pending: std::cell::RefCell<Option<ProbeCapture>>,
+    /// The reading rows measured just before a patch that adds or removes
+    /// rows above them: the backfill sentinel's, before it grows the window,
+    /// and the render's, before it swaps the window head for a later item (the
+    /// head was pruned out from under the anchor, or newer paging slid past
+    /// it). With scroll anchoring off nothing else compensates, so
+    /// `correct_view_after_patch` puts the rows back where they were. Offsets
+    /// are from the view's top, so the clamp the browser applies when a patch
+    /// shortens the content, before the effect runs, cancels out (#505).
+    restore_after_patch: std::cell::RefCell<Option<ReadingAnchor>>,
 }
 
 /// What the ResizeObserver last saw of the history container.
@@ -2786,11 +2776,20 @@ impl ReaderPosition {
     }
 
     /// Forget a backfill restore or head reposition still waiting for its
-    /// effect. Each was measured against the view a request is replacing, and
-    /// an effect that ran after the request completed would undo it.
+    /// effect. It was measured against the view a request is replacing, and an
+    /// effect that ran after the request completed would undo it.
     fn drop_pending_corrections(&self) {
-        *self.backfill_anchor.borrow_mut() = None;
-        *self.reposition_pending.borrow_mut() = None;
+        *self.restore_after_patch.borrow_mut() = None;
+    }
+
+    /// Measure the reading rows before a patch moves rows above them (see
+    /// `restore_after_patch`). Nothing to measure without layout.
+    #[cfg(target_arch = "wasm32")]
+    fn capture_before_patch(&self) {
+        // The index hint only serves `keep`, which never reads this capture.
+        if let Some(anchor) = capture_reading_anchor(0) {
+            *self.restore_after_patch.borrow_mut() = Some(anchor);
+        }
     }
 
     /// No range on screen, or a new room's: end the hold and forget the last
@@ -2907,9 +2906,8 @@ fn relocate_anchor(total: usize, hint: usize, is_anchor: impl Fn(usize) -> bool)
 /// survivor. It is a DEGRADED answer for the other way to lose that many
 /// contiguous leading items (a ban purge or bulk delete of >=
 /// [`WINDOW_ANCHOR_KEYS`] display items above the reader): the window jumps
-/// to the front of the room, bounded only by the ceiling, and the reposition
-/// probe finds nothing to measure against. Rare, and it fails toward
-/// rendering MORE history rather than losing the reader's place entirely.
+/// to the front of the room, bounded only by the ceiling. Rare, and it fails
+/// toward rendering MORE history rather than losing the reader's place.
 ///
 /// The head reposition (`correct_view_after_patch`) compensates the reader for
 /// the TOP-CONTIGUOUS removals this relocation deals in (at-cap drains,
@@ -2955,50 +2953,6 @@ fn relocate_tail(
     })
 }
 
-/// How many rows past the window head the reposition capture will probe for a
-/// row that exists in the PRE-patch DOM.
-///
-/// The new head itself may have no pre-patch row to measure, for two reasons:
-///
-/// * a multi-message head group whose first message was drained RE-KEYS (a
-///   group's key is its first message's id), so its new key is in no
-///   pre-patch row (#505 re-review blocker);
-/// * relocation landing via SPARE `k` sets `start = i - k`, widening the
-///   window backward by `k` items that were not rendered pre-patch at all, so
-///   the first `k` candidates cannot have pre-patch rows either.
-///
-/// A head-only — or too-short — probe dead-fires, and the parked reader is
-/// left uncompensated. Sized to [`WINDOW_ANCHOR_KEYS`] so the walk covers the
-/// SPARE term exactly (`k <= WINDOW_ANCHOR_KEYS - 1`, needing `k + 1`
-/// candidates). The full count of leading candidates without pre-patch rows is
-/// `k + (relocated.start - history_window.start)`, and that second term is
-/// non-zero only when `resolve_held` pulls the start back below the relocated
-/// head — the bulk mid-window removal `relocate_window` already declares
-/// out of scope. For a top-contiguous removal every surviving row at or below
-/// the head shifts by the same amount, so whichever candidate lands measures
-/// the shift exactly.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-const REPOSITION_PROBE_ROWS: usize = WINDOW_ANCHOR_KEYS;
-
-/// Pick the row the reposition will measure: the first of the leading
-/// `REPOSITION_PROBE_ROWS` post-patch keys that has a PRE-patch row.
-///
-/// `pre_patch_offsets` is handed the whole candidate list at once so the DOM
-/// is scanned a single time (see `first_history_row_offset`) rather than once
-/// per candidate inside the render body.
-///
-/// Only the wasm render path calls this at runtime; natively it is exercised
-/// by the unit tests, hence the targeted allow rather than a cfg that would
-/// hide it from them.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn select_reposition_probe(
-    keys_from_head: impl Iterator<Item = String>,
-    pre_patch_offsets: impl Fn(&[String]) -> Option<(String, i32)>,
-) -> Option<(String, i32)> {
-    let candidates: Vec<String> = keys_from_head.take(REPOSITION_PROBE_ROWS).collect();
-    pre_patch_offsets(&candidates)
-}
-
 /// Does `key` identify `item`, without allocating a key `String`?
 ///
 /// The relocation walk compares keys against up to every item on a miss;
@@ -3008,51 +2962,6 @@ fn display_item_key_matches(item: &DisplayItem, key: &str) -> bool {
     match item {
         DisplayItem::Messages(group) => group.messages[0].id == key,
         DisplayItem::Event(summary) => summary.id == key,
-    }
-}
-
-/// A row's position captured before a patch, so `correct_view_after_patch`
-/// can keep the reader's view still after it: the backfill sentinel's capture
-/// before it grows the window (`ReaderPosition::backfill_anchor`), and the
-/// render's before it swaps the window head for a later item
-/// (`ReaderPosition::reposition_pending`).
-///
-/// Only ever constructed on wasm (the capture reads the DOM), hence the
-/// native allow rather than a cfg that would also hide the type from the
-/// component's non-wasm compile.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-#[derive(Clone, PartialEq, Debug)]
-struct ProbeCapture {
-    /// `data-item-key` of a row that survives the patch: the head row for a
-    /// backfill (revealed rows land ABOVE it), the one
-    /// `select_reposition_probe` picks for a head swap. Its `offsetTop` shift
-    /// measures EXACTLY the height added or removed above the viewport —
-    /// unlike the raw `scrollHeight` delta, which also counts content
-    /// appended BELOW the viewport when an arrival batches into the same
-    /// patch, over-shifting the reader by that content's height (#505
-    /// re-review).
-    probe_key: String,
-    /// The probe row's `offsetTop` at capture time.
-    probe_top: i32,
-    /// `scrollTop` at capture time.
-    scroll_top: i32,
-    /// Backfill only: `scrollHeight` at capture time, the fallback delta if
-    /// the probe row vanishes in the same patch (an at-cap drain re-keying
-    /// it; rare). A head swap whose probe row vanished is left alone.
-    scroll_height: Option<i32>,
-}
-
-impl ProbeCapture {
-    /// How far the content above the viewport moved since the capture: the
-    /// probe row's `offsetTop` shift, else the `scrollHeight` fallback.
-    #[cfg(target_arch = "wasm32")]
-    fn shift(&self, container: &web_sys::Element) -> Option<i32> {
-        match history_row_offset_top(&self.probe_key) {
-            Some(post_top) => Some(post_top - self.probe_top),
-            None => self
-                .scroll_height
-                .map(|scroll_height| container.scroll_height() - scroll_height),
-        }
     }
 }
 
@@ -3342,72 +3251,6 @@ fn max_scroll_top(container: &web_sys::Element) -> i32 {
     (container.scroll_height() - container.client_height()).max(0)
 }
 
-/// The `offsetTop` of the history row carrying `data-item-key == key`, if it
-/// is currently in the DOM.
-///
-/// Matched by comparing attributes rather than an attribute SELECTOR, so a key
-/// never needs CSS escaping. The scan is bounded by the rendered window (≤ a
-/// few hundred rows) and only runs on the rare head-swap paths.
-#[cfg(target_arch = "wasm32")]
-fn history_row_offset_top(key: &str) -> Option<i32> {
-    first_history_row_offset(&[key.to_string()]).map(|(_, top)| top)
-}
-
-/// The first of `keys` (in order) that has a row in the CURRENT DOM, as
-/// `(key, offsetTop)`.
-///
-/// One DOM pass for the whole candidate list rather than one pass per
-/// candidate: the walk can legitimately need to try [`REPOSITION_PROBE_ROWS`]
-/// of them, and the old shape re-ran `querySelectorAll` plus an attribute read
-/// per row for each — `candidates x rows` FFI calls. (Not repeated reflows:
-/// the DOM does not change between scans, so layout stayed cached after the
-/// first `offsetTop`.) Only CANDIDATE rows are measured, so a match on the
-/// first row costs a handful of string compares and a single `offsetTop`.
-#[cfg(target_arch = "wasm32")]
-fn first_history_row_offset(keys: &[String]) -> Option<(String, i32)> {
-    use wasm_bindgen::JsCast;
-    if keys.is_empty() {
-        return None;
-    }
-    let container = ROOM_HISTORY.container()?;
-    let rows = container.query_selector_all("[data-item-key]").ok()?;
-    // Candidate key -> offsetTop. Bounded by `keys.len()`, not by the rendered
-    // window: measuring every row cost an `offsetTop` and a map insert per row
-    // (up to the ceiling, 240) on a path that runs per arrival in an at-cap
-    // room. The `String` per row is NOT saved — `get_attribute` allocates one
-    // either way; what this avoids is the layout read and the insert.
-    let mut present: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-    for i in 0..rows.length() {
-        if present.len() == keys.len() {
-            break;
-        }
-        let Some(node) = rows.item(i) else { continue };
-        let Some(el) = node.dyn_ref::<web_sys::HtmlElement>() else {
-            continue;
-        };
-        if let Some(k) = el.get_attribute("data-item-key") {
-            if keys.iter().any(|c| c == &k) {
-                present.entry(k).or_insert_with(|| el.offset_top());
-            }
-        }
-    }
-    // Priority is the CANDIDATE order (nearest the head first), not DOM order.
-    keys.iter()
-        .find_map(|k| present.get(k).map(|top| (k.clone(), *top)))
-}
-
-/// The first history row carrying a `data-item-key` — the current window head
-/// item's row — as `(key, offsetTop)`. The backfill capture probes it.
-#[cfg(target_arch = "wasm32")]
-fn first_history_row_identity() -> Option<(String, i32)> {
-    use wasm_bindgen::JsCast;
-    let container = ROOM_HISTORY.container()?;
-    let el = container.query_selector("[data-item-key]").ok()??;
-    let key = el.get_attribute("data-item-key")?;
-    let html = el.dyn_ref::<web_sys::HtmlElement>()?;
-    Some((key, html.offset_top()))
-}
-
 /// Measure the first message or event row that starts inside the view, with
 /// its nearest neighbours. A binary search over item rows keeps this to a
 /// handful of layout reads, cheap enough for every settle.
@@ -3595,8 +3438,8 @@ fn keep_end_held(reader: &ReaderPosition, container: &web_sys::Element) -> bool 
 }
 
 /// Keep the reader's view still across the patch that just landed, from the
-/// captures taken before it (see [`ProbeCapture`]). Both are consumed here,
-/// applied or not.
+/// reading rows captured before it (`ReaderPosition::restore_after_patch`),
+/// consumed here, applied or not.
 ///
 /// - The backfill restore: the revealed items land ABOVE the current offset,
 ///   so without it the history jumps by their full height. Restoring the
@@ -3608,9 +3451,7 @@ fn keep_end_held(reader: &ReaderPosition, container: &web_sys::Element) -> bool 
 ///   room drains its oldest message on every arrival), or newer paging slid
 ///   the start past it (#505 review, blocker 1). With `overflow-anchor: none`
 ///   the browser no longer compensates, so this is the one piece of scroll
-///   anchoring reimplemented under our own control. Re-measuring the probe
-///   row gives exactly how far the content above the viewport shifted,
-///   date-separator churn included.
+///   anchoring reimplemented under our own control.
 ///
 /// Known limitation, deliberately accepted: a mid-window removal (a deletion,
 /// a ban purge) or late-loading media above the viewport still shifts the
@@ -3625,29 +3466,16 @@ fn keep_end_held(reader: &ReaderPosition, container: &web_sys::Element) -> bool 
 /// anchoring used to mask (#505 review).
 #[cfg(target_arch = "wasm32")]
 fn correct_view_after_patch(reader: &ReaderPosition) {
-    let backfill = reader.backfill_anchor.borrow_mut().take();
-    let head_swap = reader.reposition_pending.borrow_mut().take();
-    if backfill.is_none() && head_swap.is_none() {
+    let Some(anchor) = reader.restore_after_patch.borrow_mut().take() else {
         return;
-    }
+    };
     // An explicit request owns the view until it lands (#501 H3).
     if reader.request.get().is_some() {
         return;
     }
-    let Some(container) = ROOM_HISTORY.container() else {
-        return;
-    };
-    if let Some(capture) = backfill {
-        if let Some(shift) = capture.shift(&container).filter(|shift| *shift > 0) {
-            container.set_scroll_top(capture.scroll_top + shift);
-        }
-    }
     // Hidden rows measure 0; the reveal restores the reader instead.
-    if let Some(capture) = head_swap.filter(|_| has_layout(&container)) {
-        if let Some(shift) = capture.shift(&container).filter(|shift| *shift != 0) {
-            // From the PRE-patch offset; see `reposition_pending`.
-            container.set_scroll_top((capture.scroll_top + shift).max(0));
-        }
+    if ROOM_HISTORY.container().is_some_and(|c| has_layout(&c)) {
+        restore_reading_anchor(&anchor, 0);
     }
 }
 
@@ -5436,27 +5264,9 @@ pub fn Conversation() -> Element {
                                     // needs no compensation.
                                     if head_removed && reader_position.request.get().is_none() {
                                         // The DOM still shows the previous
-                                        // render here. See
-                                        // `reposition_pending`.
+                                        // render here.
                                         #[cfg(target_arch = "wasm32")]
-                                        if let (Some((probe_key, probe_top)), Some(container)) = (
-                                            select_reposition_probe(
-                                                groups[history_window.start..history_window.end]
-                                                    .iter()
-                                                    .map(display_item_key),
-                                                first_history_row_offset,
-                                            ),
-                                            // Hidden rows all measure 0.
-                                            ROOM_HISTORY.container().filter(has_layout),
-                                        ) {
-                                            *reader_position.reposition_pending.borrow_mut() =
-                                                Some(ProbeCapture {
-                                                    probe_key,
-                                                    probe_top,
-                                                    scroll_top: container.scroll_top(),
-                                                    scroll_height: None,
-                                                });
-                                        }
+                                        reader_position.capture_before_patch();
                                     }
                                     let withheld_newer = groups.len() - history_window.end;
                                     let groups =
@@ -5532,27 +5342,10 @@ pub fn Conversation() -> Element {
                                                         let reader_position = reader_position.clone();
                                                         move |evt: dioxus::prelude::Event<VisibleData>| {
                                                             if evt.data().is_intersecting().unwrap_or(false) {
-                                                                // Capture BEFORE the re-render; see
-                                                                // `ProbeCapture`.
+                                                                // Before the re-render; see
+                                                                // `restore_after_patch`.
                                                                 #[cfg(target_arch = "wasm32")]
-                                                                if let (
-                                                                    Some(container),
-                                                                    Some((probe_key, probe_top)),
-                                                                ) = (
-                                                                    ROOM_HISTORY.container(),
-                                                                    first_history_row_identity(),
-                                                                ) {
-                                                                    *reader_position.backfill_anchor.borrow_mut() =
-                                                                        Some(ProbeCapture {
-                                                                            probe_key,
-                                                                            probe_top,
-                                                                            scroll_top: container
-                                                                                .scroll_top(),
-                                                                            scroll_height: Some(
-                                                                                container.scroll_height(),
-                                                                            ),
-                                                                        });
-                                                                }
+                                                                reader_position.capture_before_patch();
                                                                 // See `grown_window`.
                                                                 window_items.with_mut(|n| {
                                                                     *n = grown_window(*n, reader_position.window_rendered.get())
@@ -5596,9 +5389,6 @@ pub fn Conversation() -> Element {
                                                         rsx! {
                                                             div {
                                                                 key: "{key}",
-                                                                // Identity tag for the
-                                                                // head-reposition machinery
-                                                                // (`history_row_offset_top`).
                                                                 "data-item-key": "{key}",
                                                                 // For `capture_reading_anchor`.
                                                                 "data-anchor-key": "{key}",
@@ -5614,9 +5404,9 @@ pub fn Conversation() -> Element {
                                                         let key = group.messages[0].id.clone();
                                                         rsx! {
                                                             // The wrapper exists to carry
-                                                            // `data-item-key` — the identity
-                                                            // the head-reposition machinery
-                                                            // locates rows by — since a
+                                                            // `data-item-key`, which marks the
+                                                            // item rows the scroll code
+                                                            // measures, since a
                                                             // component cannot carry a DOM
                                                             // attribute directly. It is the
                                                             // keyed list child, so diffing
@@ -7592,11 +7382,9 @@ mod tests {
     /// #505 re-review blocker: a MULTI-message head group RE-KEYS when an
     /// at-cap drain consumes its first message (a group's key is its first
     /// message's id). The old key is gone while the group itself survives —
-    /// the spares must still pin the window to the survivors, and the
-    /// reposition probe must skip the un-measurable new head key and land on
-    /// a row that existed pre-patch.
+    /// the spares must still pin the window to the survivors.
     #[test]
-    fn a_rekeyed_multi_message_head_group_is_still_anchored_and_measurable() {
+    fn a_rekeyed_multi_message_head_group_is_still_anchored() {
         // Window head at index 0: a group keyed by its first message "m0",
         // followed by neighbors. The at-cap drain consumes "m0"; the group
         // survives RE-KEYED as "m1". (Modelled at the key level — exactly
@@ -7616,88 +7404,6 @@ mod tests {
             relocated.start, 0,
             "the first spare (\"b\", found at index 1, offset 1 in the \
              anchor) pins the window back to the re-keyed group"
-        );
-
-        // The measured probe: the new head key "m1" has NO pre-patch row —
-        // a head-only probe dead-fires and the parked reader crawls one
-        // intra-group line per arrival. The walk lands on "b", which does.
-        let probe = select_reposition_probe(
-            post_keys.iter().map(|k| k.to_string()),
-            pre_patch_dom(&[("m0", 100), ("b", 160), ("c", 220)]),
-        );
-        assert_eq!(
-            probe,
-            Some(("b".to_string(), 160)),
-            "the probe must walk past the un-measurable re-keyed head to the \
-             first row that existed pre-patch"
-        );
-    }
-
-    /// A pre-patch DOM as a `first_history_row_offset`-shaped lookup: the
-    /// first candidate key that has a row, with its offset.
-    fn pre_patch_dom(rows: &[(&'static str, i32)]) -> impl Fn(&[String]) -> Option<(String, i32)> {
-        let rows = rows.to_vec();
-        move |keys: &[String]| {
-            keys.iter().find_map(|k| {
-                rows.iter()
-                    .find(|(rk, _)| rk == k)
-                    .map(|(_, top)| (k.clone(), *top))
-            })
-        }
-    }
-
-    /// The probe walk must outlast the DEEPEST spare the anchor can relocate
-    /// through. Landing via spare `k` sets `start = i - k`, widening the
-    /// window backward by `k` items that were never rendered pre-patch, so
-    /// the first `k` candidates cannot have pre-patch rows. A walk shorter
-    /// than `WINDOW_ANCHOR_KEYS` dead-fires exactly when the removal is
-    /// biggest — a bulk delete of several contiguous leading items above a
-    /// parked reader (#505 delta review).
-    #[test]
-    fn the_probe_walk_outlasts_the_deepest_spare() {
-        assert!(
-            REPOSITION_PROBE_ROWS >= WINDOW_ANCHOR_KEYS,
-            "the probe walk must cover every spare the anchor can land on"
-        );
-
-        // Anchor: head + 7 spares. A bulk delete removes the head and the
-        // first 6 spares; relocation lands on spare 7 ("s7"), so the window
-        // widens back by 7 items that have no pre-patch rows.
-        let anchor = WindowAnchor {
-            keys: (0..WINDOW_ANCHOR_KEYS)
-                .map(|i| {
-                    if i == 0 {
-                        "head".to_string()
-                    } else {
-                        format!("s{i}")
-                    }
-                })
-                .collect(),
-            index: 20,
-        };
-        let post_keys: Vec<String> = (0..7)
-            .map(|i| format!("older{i}"))
-            .chain(std::iter::once("s7".to_string()))
-            .chain((0..10).map(|i| format!("rest{i}")))
-            .collect();
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(!relocated.head_survived);
-        assert_eq!(
-            relocated.start, 0,
-            "spare 7 found at index 7, offset 7 in the anchor → start 0"
-        );
-
-        // Only the 8th candidate ("s7") has a pre-patch row; the seven
-        // widened-in rows above it do not. A 4-row walk finds nothing.
-        let probe = select_reposition_probe(
-            post_keys.iter().map(|k| k.to_string()),
-            pre_patch_dom(&[("s7", 480), ("rest0", 540)]),
-        );
-        assert_eq!(
-            probe,
-            Some(("s7".to_string(), 480)),
-            "the walk must reach the deepest spare's row, or the compensation \
-             silently dead-fires on the largest removals"
         );
     }
 
@@ -11910,20 +11616,17 @@ mod autoscroll_wiring_pins {
              scheduled it is a task old, and the reader may have switched \
              rooms since"
         );
-        // Both captures are taken, and the guard returns, before either
-        // correction is applied.
+        // The capture is taken, and the guard returns, before the restore.
         let corrections = dense
             .split("fncorrect_view_after_patch(")
             .nth(1)
-            .and_then(|body| body.split("ifletSome(capture)=backfill").next())
+            .and_then(|body| body.split("restore_reading_anchor(&anchor,0);").next())
             .expect("correct_view_after_patch is missing");
         assert!(
-            corrections.contains("letbackfill=reader.backfill_anchor.borrow_mut().take();")
-                && corrections
-                    .contains("lethead_swap=reader.reposition_pending.borrow_mut().take();")
+            corrections.contains("letSome(anchor)=reader.restore_after_patch.borrow_mut().take()")
                 && corrections.contains("ifreader.request.get().is_some(){return;}"),
-            "the backfill restore (#501 H3) and the head reposition must each \
-             stand down while an explicit request is pending"
+            "the backfill restore (#501 H3) and the head reposition must stand \
+             down while an explicit request is pending"
         );
         assert!(
             dense.contains(
@@ -11935,29 +11638,39 @@ mod autoscroll_wiring_pins {
         );
     }
 
-    /// The two #505 compensation details no browser test can force: the head
-    /// reposition shifts from the PRE-patch offset, and the backfill restore
-    /// measures its probe row rather than the `scrollHeight` delta. The rest
-    /// of the wiring (row identity, the capture, the measured shift, the
-    /// probe walk over a re-keyed head group) is covered on every browser
-    /// project by the conversation-autoscroll at-cap drain, newer-page and
-    /// backfill tests.
+    /// Both #505 compensations capture the reading rows before the patch: the
+    /// backfill sentinel before it grows the window, and the render when it
+    /// swaps the head. The restore measures from the view's top, so neither
+    /// the browser's clamp of `scrollTop` nor rows appended below the view in
+    /// the same patch move it. The rest is covered on every browser project by
+    /// the conversation-autoscroll at-cap drain, newer-page and backfill tests.
     #[test]
     fn head_swaps_reposition_the_reader() {
         let dense = dense_production_source();
-        assert!(
-            dense.contains("container.set_scroll_top((capture.scroll_top+shift).max(0));"),
-            "the reposition target must be computed from the PRE-patch scroll \
-             offset — the browser clamps `scrollTop` down before the effect \
-             runs when a patch shortens the content, and shifting from the \
-             clamped value applies the clamp twice (#505 delta review)"
+        for guard in [
+            "ifhead_removed&&reader_position.request.get().is_none(){",
+            "ifevt.data().is_intersecting().unwrap_or(false){",
+        ] {
+            let body = dense
+                .split(guard)
+                .nth(1)
+                .and_then(|after| after.split('}').next())
+                .unwrap_or_else(|| panic!("`{guard}` is missing"));
+            assert!(
+                body.contains("reader_position.capture_before_patch();"),
+                "the head swap and the backfill must each capture before the patch"
+            );
+        }
+        assert_eq!(
+            dense
+                .matches("reader_position.capture_before_patch();")
+                .count(),
+            2,
+            "one capture for the head swap and one for the backfill"
         );
         assert!(
-            dense.contains("matchhistory_row_offset_top(&self.probe_key)"),
-            "the backfill restore must reposition by the measured probe row, \
-             not the raw scrollHeight delta — the delta counts arrivals \
-             appended BELOW the viewport in the same patch and over-shifts \
-             the reader (#505 re-review)"
+            dense.contains("letview_top=container.get_bounding_client_rect().top();"),
+            "the reading rows are measured from the view's top"
         );
     }
 }
@@ -12069,29 +11782,19 @@ mod reader_state_tests {
     #[test]
     fn requesting_the_end_drops_pending_corrections() {
         let reader = ReaderPosition::default();
-        *reader.backfill_anchor.borrow_mut() = Some(ProbeCapture {
-            probe_key: "a".to_string(),
-            probe_top: 10,
-            scroll_top: 20,
-            scroll_height: Some(30),
-        });
-        *reader.reposition_pending.borrow_mut() = Some(ProbeCapture {
-            probe_key: "a".to_string(),
-            probe_top: 10,
-            scroll_top: 20,
-            scroll_height: None,
+        *reader.restore_after_patch.borrow_mut() = Some(ReadingAnchor {
+            rows: vec![("a".to_string(), 10)],
+            item_hint: 0,
+            view_height: 700,
+            view_width: 800,
         });
 
         reader.request_end(None);
 
         assert_eq!(reader.request.get(), Some(ScrollRequest { room: None }));
         assert!(
-            reader.backfill_anchor.borrow().is_none(),
-            "a backfill restore survived the request"
-        );
-        assert!(
-            reader.reposition_pending.borrow().is_none(),
-            "a head reposition survived the request"
+            reader.restore_after_patch.borrow().is_none(),
+            "a backfill restore or head reposition survived the request"
         );
     }
 }
