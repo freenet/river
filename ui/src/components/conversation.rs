@@ -10,13 +10,13 @@ use crate::components::app::{
     ROOMS,
 };
 use crate::components::back_to_chat::CountBadge;
+#[cfg(target_arch = "wasm32")]
+use crate::components::foreground::has_layout;
 use crate::components::members::{
     deputy_badges_for_viewer, impersonation_checker_for_viewer, impersonation_warning_for_display,
     privilege_in_view, DeputyBadge,
 };
-use crate::components::scroll_to_latest::LatestButton;
-#[cfg(target_arch = "wasm32")]
-use crate::components::foreground::has_layout;
+use crate::components::scroll_to_latest::{is_arrival, LatestButton};
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
     observe_sentinel, scroll_to_end, HistoryDom, NEWEST_IN_VIEW_SLACK_PX, ROOM_FOLLOW_BAND_PX,
@@ -2669,14 +2669,6 @@ fn newest_key(groups: &[DisplayItem]) -> Option<NewestKey> {
     Some(NewestKey { time_ms, id })
 }
 
-/// Did a message arrive after the newest one the last render showed? Only a
-/// strictly greater newest message counts: an edit, a deletion of the newest,
-/// a message inserted above it, and a first render do not.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn is_arrival(previous: Option<&NewestKey>, now: Option<&NewestKey>) -> bool {
-    matches!((previous, now), (Some(previous), Some(now)) if now > previous)
-}
-
 /// The value a contended read stands in with: the last good one, but only if
 /// it was taken for `room`. Another room's rows never render in this one.
 fn last_good_for_room<K: PartialEq, T: Clone>(cache: &Option<(K, T)>, room: &K) -> Option<T> {
@@ -3681,7 +3673,7 @@ fn follow_arrival_at_end(
         .as_ref()
         .filter(|(rendered_room, _)| *rendered_room == room)
         .map(|(_, key)| key.clone());
-    if !is_arrival(previous.as_ref(), newest_key(groups).as_ref()) {
+    if !is_arrival(previous.as_ref(), newest_key(groups).as_ref(), false) {
         return;
     }
     if ROOM_HISTORY.arrival_follows() {
@@ -3832,7 +3824,10 @@ fn install_scroll_settle_listener(window_items: Signal<usize>, reader: Rc<Reader
                     if reader.room_epoch.get() != epoch {
                         return;
                     }
-                    if !ROOM_HISTORY.container().is_some_and(|c| trim_is_due(&c, true, &reader)) {
+                    if !ROOM_HISTORY
+                        .container()
+                        .is_some_and(|c| trim_is_due(&c, true, &reader))
+                    {
                         // Still overgrown; a later settle at the bottom may trim.
                         reader.window_overgrown.set(true);
                         return;
@@ -7390,49 +7385,6 @@ mod tests {
         );
     }
 
-    /// The newest item is on screen for ANY window size — including the
-    /// degenerate zero, which would otherwise render a history the reader
-    /// cannot scroll into (the window only ever grows upward from the bottom).
-    fn newest(time_ms: i64, seed: &[u8]) -> NewestKey {
-        NewestKey {
-            time_ms,
-            id: MessageId(freenet_scaffold::util::fast_hash(seed)),
-        }
-    }
-
-    #[test]
-    fn only_a_newer_newest_message_is_an_arrival() {
-        let before = newest(1_000, b"a");
-        assert!(
-            is_arrival(Some(&before), Some(&newest(2_000, b"b"))),
-            "a later message"
-        );
-        assert!(
-            !is_arrival(Some(&before), Some(&before)),
-            "an edit or a re-render"
-        );
-        assert!(
-            !is_arrival(Some(&before), Some(&newest(500, b"z"))),
-            "the newest deleted"
-        );
-        assert!(
-            !is_arrival(None, Some(&before)),
-            "a first render or a held range"
-        );
-        assert!(!is_arrival(Some(&before), None), "an emptied room");
-        // Same millisecond: the id decides, so the order is total.
-        let (low, high) = {
-            let (x, y) = (newest(1_000, b"x"), newest(1_000, b"y"));
-            if x < y {
-                (x, y)
-            } else {
-                (y, x)
-            }
-        };
-        assert!(is_arrival(Some(&low), Some(&high)));
-        assert!(!is_arrival(Some(&high), Some(&low)));
-    }
-
     #[test]
     fn a_join_folding_into_the_trailing_summary_raises_the_newest_key() {
         let summary = |last_time_ms: i64, seed: &[u8]| {
@@ -7447,10 +7399,13 @@ mod tests {
         let before = newest_key(&[summary(1_000, b"join-1")]);
         // The same summary item, now holding a second join.
         let after = newest_key(&[summary(2_000, b"join-2")]);
-        assert!(is_arrival(before.as_ref(), after.as_ref()));
+        assert!(is_arrival(before.as_ref(), after.as_ref(), false));
         assert_eq!(newest_key(&[]), None);
     }
 
+    /// The newest item is on screen for ANY window size — including the
+    /// degenerate zero, which would otherwise render a history the reader
+    /// cannot scroll into (the window only ever grows upward from the bottom).
     #[test]
     fn the_window_always_renders_the_newest_item() {
         for total in 1..200usize {
@@ -11857,7 +11812,8 @@ mod group_messages_clock_tests {
 
         assert!(is_arrival(
             newest_key(&before).as_ref(),
-            newest_key(&after).as_ref()
+            newest_key(&after).as_ref(),
+            false
         ));
     }
 }

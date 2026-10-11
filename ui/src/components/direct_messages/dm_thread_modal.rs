@@ -17,7 +17,7 @@ use crate::components::direct_messages::{
 };
 use crate::components::members::Invitation;
 use crate::components::room_list::receive_invitation_modal::present_invitation;
-use crate::components::scroll_to_latest::LatestButton;
+use crate::components::scroll_to_latest::{is_arrival, LatestButton};
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
     observe_sentinel, scroll_to_end, HistoryDom, SentinelObserver, DM_FOLLOW_BAND_PX,
@@ -1516,20 +1516,11 @@ fn newest_dm_key(messages: &[RenderedDm]) -> Option<DmKey> {
         .max()
 }
 
-/// Did a DM arrive after the newest one recorded? Only a strictly greater key
-/// counts: a purge of the newest DM lowers it, and a re-render keeps it.
-fn is_newer_dm(previous: Option<&DmKey>, newest: Option<&DmKey>) -> bool {
-    match (previous, newest) {
-        (None, Some(_)) => true,
-        (Some(previous), Some(newest)) => newest > previous,
-        _ => false,
-    }
-}
-
-/// Record `now` as the newest rendered DM; true when it is an arrival (newer than the last one recorded).
+/// Record `now` as the newest rendered DM; true when it is an arrival (newer
+/// than the last one recorded). A purge of the newest DM lowers the record.
 fn note_newest_dm(recorded: &std::cell::Cell<Option<DmKey>>, now: Option<DmKey>) -> bool {
     let previous = recorded.replace(now);
-    is_newer_dm(previous.as_ref(), now.as_ref())
+    is_arrival(previous.as_ref(), now.as_ref(), true)
 }
 
 #[component]
@@ -2452,27 +2443,6 @@ mod tests {
             timestamp,
             token: PurgeToken([token; 16]),
         }
-    }
-
-    #[test]
-    fn only_a_newer_newest_dm_is_an_arrival() {
-        let before = dm_key(100, 1);
-        assert!(
-            is_newer_dm(Some(&before), Some(&dm_key(101, 0))),
-            "a later DM"
-        );
-        assert!(
-            is_newer_dm(Some(&before), Some(&dm_key(100, 2))),
-            "same second, higher token"
-        );
-        assert!(!is_newer_dm(Some(&before), Some(&before)), "a re-render");
-        assert!(
-            !is_newer_dm(Some(&before), Some(&dm_key(99, 9))),
-            "the newest purged"
-        );
-        assert!(is_newer_dm(None, Some(&before)), "the first DM of a thread");
-        assert!(!is_newer_dm(Some(&before), None), "an emptied thread");
-        assert!(!is_newer_dm(None, None));
     }
 
     #[test]

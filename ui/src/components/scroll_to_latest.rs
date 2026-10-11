@@ -26,6 +26,18 @@ pub const ROOM_FOLLOW_BAND_PX: f64 = 100.0;
 #[cfg(target_arch = "wasm32")]
 pub const DM_FOLLOW_BAND_PX: f64 = 50.0;
 
+/// Did a newer newest item arrive? Only a strictly greater key counts: an
+/// edit, a deletion of the newest and a re-render do not. `first_counts`
+/// says whether a first item after none is one: a DM thread opened empty
+/// follows its first DMs, but a room's first render is not an arrival.
+pub fn is_arrival<K: Ord>(previous: Option<&K>, now: Option<&K>, first_counts: bool) -> bool {
+    match (previous, now) {
+        (Some(previous), Some(now)) => now > previous,
+        (None, Some(_)) => first_counts,
+        _ => false,
+    }
+}
+
 /// A scrolling history whose newest item's bottom is the top edge of a
 /// sentinel: the room history or the DM thread.
 #[cfg(target_arch = "wasm32")]
@@ -187,6 +199,36 @@ pub fn LatestButton(
             "data-testid": test_id,
             onclick: move |evt| onclick.call(evt),
             Icon { icon: FaChevronDown, width: 18, height: 18 }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_strictly_newer_newest_item_is_an_arrival() {
+        for first_counts in [false, true] {
+            assert!(is_arrival(Some(&1), Some(&2), first_counts), "a later item");
+            assert!(
+                !is_arrival(Some(&1), Some(&1), first_counts),
+                "an edit or a re-render"
+            );
+            assert!(
+                !is_arrival(Some(&2), Some(&1), first_counts),
+                "the newest deleted"
+            );
+            assert!(
+                !is_arrival(Some(&1), None, first_counts),
+                "an emptied history"
+            );
+            assert!(!is_arrival(None::<&i32>, None, first_counts));
+            assert_eq!(
+                is_arrival(None, Some(&1), first_counts),
+                first_counts,
+                "a first item"
+            );
         }
     }
 }
