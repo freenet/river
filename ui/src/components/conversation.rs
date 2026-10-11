@@ -16,7 +16,9 @@ use crate::components::members::{
     deputy_badges_for_viewer, impersonation_checker_for_viewer, impersonation_warning_for_display,
     privilege_in_view, DeputyBadge,
 };
-use crate::components::scroll_to_latest::{is_arrival, LatestButton};
+#[cfg(any(target_arch = "wasm32", test))]
+use crate::components::scroll_to_latest::is_arrival;
+use crate::components::scroll_to_latest::LatestButton;
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::{
     observe_newest, scroll_to_end, HistoryDom, NEWEST_IN_VIEW_SLACK_PX, ROOM_FOLLOW_BAND_PX,
