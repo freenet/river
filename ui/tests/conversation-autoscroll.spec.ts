@@ -681,6 +681,8 @@ const INITIAL_RENDERED_ITEMS = 60;
 const ARRIVAL_CEILING_ITEMS = INITIAL_RENDERED_ITEMS * 4;
 /// How far above the end the newer-history trigger reaches (BACKFILL_LEAD_PX).
 const NEWER_TRIGGER_REACH_PX = 800;
+/// The trim above the reader in #747's last review round (~6,000px; measured 6,120-6,200).
+const NEWER_PAGE_SHIFT_FLOOR_PX = 4_500;
 /// Tall rows at the head of "Tall Head Room" (at its message cap).
 const TALL_HEAD_TALL_ROWS = 8;
 /// Tall rows at the head of "Uneven Tail Room", numbered 00 up.
@@ -870,8 +872,9 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     await expectFollowed(page, "arrival after paging to the newest", "an arrival after paging to the newest was not followed");
   });
 
-  // A newer page slides the range's start past the ceiling. The reader's row
-  // stays put through that page and the next arrival.
+  // A newer page trims ~6,000px above the reader (#747's last review round)
+  // as it slides the range's start past the ceiling. The reader's row stays
+  // put through that page and the next arrival.
   test("a newer page keeps the reader's row", async ({ page }) => {
     await openRoomAtBottom(page, "Deep History Room", "/?deep-history-room=1&deep-history-retention=1");
     await readerScrollsWithoutGesture(page, 1_000);
@@ -881,8 +884,8 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
       .toBeGreaterThan(INITIAL_RENDERED_ITEMS);
     const before = await withheld(page);
 
-    // One task: move into the trigger's reach and note the row in view,
-    // before the page lands.
+    // One task: move into the trigger's reach and note the row in view, with
+    // its offset in the content, before the page lands.
     const row = await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       c.scrollTop = c.scrollHeight - c.clientHeight - 400;
@@ -890,13 +893,25 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
       for (const r of Array.from(c.querySelectorAll<HTMLElement>("[data-item-key]"))) {
         const rect = r.getBoundingClientRect();
         if (rect.height > 0 && rect.top >= cTop && rect.bottom <= cTop + c.clientHeight) {
-          return { key: r.getAttribute("data-item-key")!, top: rect.top - cTop };
+          const top = rect.top - cTop;
+          return { key: r.getAttribute("data-item-key")!, top, contentTop: top + c.scrollTop };
         }
       }
       return null;
     });
     expect(row, "premise: a row is fully in view").not.toBeNull();
     await expect.poll(() => withheld(page), { message: "premise: a newer page should land" }).toBeLessThan(before);
+    // The row's content offset drops by exactly the height trimmed above it.
+    const contentTopAfter = await page.evaluate((k) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const r = c.querySelector(`[data-item-key="${CSS.escape(k)}"]`);
+      return r ? r.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop : null;
+    }, row!.key);
+    expect(contentTopAfter, "premise: the reader's row is still rendered").not.toBeNull();
+    expect(
+      row!.contentTop - contentTopAfter!,
+      `premise: the newer page should trim at least ${NEWER_PAGE_SHIFT_FLOOR_PX}px above the reader`,
+    ).toBeGreaterThanOrEqual(NEWER_PAGE_SHIFT_FLOOR_PX);
     await expectRowHeld(page, row!.key, row!.top, "a newer page moved the reader's row");
 
     const paged = await withheld(page);
