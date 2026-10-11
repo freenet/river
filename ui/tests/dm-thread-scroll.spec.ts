@@ -364,8 +364,8 @@ test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
 
 // An inbound DM follows a reader at the end of the thread: the newest DM's
 // bottom within FOLLOW_BAND_PX of the view's bottom edge before the patch,
-// in a visible tab, with no modal over the thread. Nothing else follows, and
-// nothing scrolls when the tab or a modal comes back.
+// in a visible tab. Nothing else follows, and nothing scrolls when the tab
+// comes back.
 // Rationale: .claude/rules/history-scrolling.md.
 test.describe("DM thread follows a reader at the end", () => {
   test.use({ viewport: { width: 1280, height: 800 } });

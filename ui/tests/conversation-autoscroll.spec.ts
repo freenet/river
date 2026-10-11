@@ -1420,8 +1420,8 @@ test.describe("The end holds for a reader who scrolls back to it", () => {
 
 // An arrival follows a reader at the end, measured before the patch: the
 // newest message's bottom within FOLLOW_BAND_PX of the view's bottom
-// edge, in a visible tab, with no modal over the history. Nothing else
-// follows, and nothing scrolls when the tab or a modal comes back.
+// edge, in a visible tab, with no DM thread over the history. Nothing else
+// follows, and nothing scrolls when the tab comes back or the thread closes.
 // Rationale: .claude/rules/history-scrolling.md.
 test.describe("An arrival follows a reader at the end", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
