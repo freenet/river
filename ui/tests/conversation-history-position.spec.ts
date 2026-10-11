@@ -6,6 +6,7 @@ import {
   READING_ROW_BUDGET_PX,
   WELL_AWAY_FROM_END_PX,
   backToChatFromMembers,
+  deliver,
   deliverOffscreen,
   distanceFromBottom,
   expectParkedAwayFromEnd,
@@ -29,10 +30,9 @@ import {
 // the chat panel is hidden or the room empty (A03). The reading row is measured relative to the
 // container, by message identity, against READING_ROW_BUDGET_PX.
 
-/// Scroll a settled reader so `key`'s row sits 40px below the top of the
-/// visible history.
-async function parkWithRowAtTop(page: Page, key: string) {
-  const gap = 40;
+/// Scroll a settled reader so `key`'s row sits `gap` px below the top of the
+/// visible history (above it when negative).
+async function parkWithRowAtTop(page: Page, key: string, gap = 40) {
   const target = await page.evaluate(
     ([k, g]) => {
       const c = document.getElementById("chat-scroll-container")!;
@@ -186,6 +186,59 @@ test.describe("Deleting the reading row while the chat is hidden (A02)", () => {
 
     await expectParkedAwayFromEnd(page, "the reveal took the reader to the latest message");
     await expectRowHeld(page, row!.prevKey!, prevTop, "the row above the deleted one moved across the hidden deletion");
+  });
+
+  // A message taller than the view is the one being read while it spans the
+  // view, not the row below it, which starts below the fold.
+  test("deleting a message that spans the view while the chat is hidden holds the row above on reveal", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page, "keep");
+    await fillHistory(page, "more");
+    await deliver(page, `span: ${"word ".repeat(600)}`.trim());
+    await fillHistory(page, "tail");
+    await fillHistory(page, "last");
+    const spanKey = await keyOf(page, "span:");
+    await parkWithRowAtTop(page, spanKey, -100);
+    const geometry = await page.evaluate((k) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const view = c.getBoundingClientRect();
+      const rows = Array.from(c.querySelectorAll("[data-item-key]"));
+      const i = rows.findIndex((r) => r.getAttribute("data-item-key") === k);
+      const span = rows[i].getBoundingClientRect();
+      const startsInView = Array.from(c.querySelectorAll("[data-anchor-key]")).filter((el) => {
+        const top = el.getBoundingClientRect().top;
+        return top >= view.top - 0.5 && top < view.bottom;
+      }).length;
+      return {
+        spanHeight: span.height,
+        viewHeight: c.clientHeight,
+        spanTop: span.top - view.top,
+        spanBottomBelowView: span.bottom - view.bottom,
+        startsInView,
+        scrollTop: c.scrollTop,
+        belowView: c.scrollHeight - c.scrollTop - c.clientHeight,
+        prevKey: rows[i - 1]?.getAttribute("data-item-key") ?? null,
+      };
+    }, spanKey);
+    expect(geometry.spanHeight, "premise: the message is taller than the view").toBeGreaterThan(geometry.viewHeight + 200);
+    expect(geometry.spanTop, "premise: the message starts above the view").toBeLessThan(0);
+    expect(geometry.spanBottomBelowView, "premise: the message ends below the view").toBeGreaterThan(0);
+    expect(geometry.startsInView, "premise: no row starts inside the view").toBe(0);
+    // Either clamp would hide a restore that moved the wrong way.
+    expect(geometry.scrollTop, "premise: room to scroll up by the message's height").toBeGreaterThan(geometry.spanHeight);
+    expect(geometry.belowView, "premise: room below once the message is gone").toBeGreaterThan(geometry.spanHeight);
+    expect(geometry.prevKey, "premise: a row precedes the message").not.toBeNull();
+    const prevTop = (await rowOffset(page, geometry.prevKey!))!;
+
+    await hideChatBehindMembers(page);
+    await callRiverTest(page, "removeMessages", "span:");
+    await expect(page.getByText("span:", { exact: false })).toHaveCount(0, { timeout: 5_000 });
+    await backToChatFromMembers(page);
+
+    await expectParkedAwayFromEnd(page, "the reveal took the reader to the latest message");
+    await expectRowHeld(page, geometry.prevKey!, prevTop, "the row above the deleted message moved across the hidden deletion");
   });
 });
 

@@ -345,8 +345,9 @@ pub(super) const ROOM_HISTORY: HistoryDom = HistoryDom {
     under_dm_thread: true,
 };
 
-/// Measure the first message or event row that starts inside the view, with
-/// its nearest neighbours. A binary search over item rows keeps this to a
+/// Measure the first message or event row that starts inside the view (else
+/// the one the view's top cuts through, see [`reading_row_index`]), with its
+/// nearest neighbours. A binary search over item rows keeps this to a
 /// handful of layout reads, cheap enough for every settle.
 #[cfg(target_arch = "wasm32")]
 fn capture_reading_anchor(range_start: usize) -> Option<ReadingAnchor> {
@@ -355,7 +356,8 @@ fn capture_reading_anchor(range_start: usize) -> Option<ReadingAnchor> {
     if !has_layout(&container) {
         return None;
     }
-    let view_top = container.get_bounding_client_rect().top();
+    let view = container.get_bounding_client_rect();
+    let view_top = view.top();
     let rows = container.query_selector_all("[data-item-key]").ok()?;
     let row = |i: u32| {
         rows.item(i)
@@ -399,12 +401,11 @@ fn capture_reading_anchor(range_start: usize) -> Option<ReadingAnchor> {
             }
         }
     }
-    // The row being read: the first one whose top is in view, else the one
-    // the visible top cuts through.
-    let reading = found
+    let edges: Vec<(f64, f64)> = found
         .iter()
-        .position(|(_, top, _)| *top >= view_top - 0.5)
-        .or_else(|| found.iter().position(|(_, _, bottom)| *bottom > view_top))?;
+        .map(|(_, top, bottom)| (*top, *bottom))
+        .collect();
+    let reading = reading_row_index(&edges, view_top, view.bottom())?;
     let mut rows = Vec::with_capacity(READING_ANCHOR_ROWS);
     let entry = |i: usize| (found[i].0.clone(), (found[i].1 - view_top).round() as i32);
     rows.push(entry(reading));
@@ -425,6 +426,18 @@ fn capture_reading_anchor(range_start: usize) -> Option<ReadingAnchor> {
         rows,
         item_hint: range_start + lo as usize,
     })
+}
+
+/// Index of the row being read among `rows` (`(top, bottom)`, page order): the
+/// first whose top lies in the view, else the one the view's top cuts through.
+#[cfg(any(target_arch = "wasm32", test))]
+fn reading_row_index(rows: &[(f64, f64)], view_top: f64, view_bottom: f64) -> Option<usize> {
+    rows.iter()
+        .position(|&(top, _)| top >= view_top - 0.5 && top < view_bottom)
+        .or_else(|| {
+            rows.iter()
+                .position(|&(top, bottom)| top < view_top && bottom > view_top)
+        })
 }
 
 /// Scroll so `anchor`'s first surviving row is back at its saved offset.
@@ -1070,6 +1083,33 @@ mod tests {
         );
         // Nothing survives: no move at all.
         assert_eq!(reading_anchor_shift(&anchor, dom(&[("other", 0)])), None);
+    }
+
+    /// The reading row is the first starting inside the view, else the one
+    /// the view's top cuts through: never a row starting below the view.
+    #[test]
+    fn the_reading_row_starts_inside_the_view_or_spans_its_top() {
+        let (top, bottom) = (0.0, 600.0);
+        // A message spanning the whole view, the next one below the fold.
+        assert_eq!(
+            reading_row_index(&[(-100.0, 900.0), (900.0, 1000.0)], top, bottom),
+            Some(0)
+        );
+        // The first row starting inside the view, not the one cut above it.
+        assert_eq!(
+            reading_row_index(&[(-50.0, 40.0), (40.0, 120.0)], top, bottom),
+            Some(1)
+        );
+        // Subpixel above the top still counts as starting inside.
+        assert_eq!(
+            reading_row_index(&[(-0.4, 80.0), (80.0, 160.0)], top, bottom),
+            Some(0)
+        );
+        // Every row above the view: none is being read.
+        assert_eq!(
+            reading_row_index(&[(-200.0, -100.0), (-100.0, 0.0)], top, bottom),
+            None
+        );
     }
 }
 
