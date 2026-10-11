@@ -2,6 +2,8 @@
 description: Reader-position policy for room history and DM threads
 globs:
   - ui/src/components/conversation.rs
+  - ui/src/components/conversation/history_scroll.rs
+  - ui/src/components/conversation/history_window.rs
   - ui/src/components/scroll_to_latest.rs
   - ui/src/components/foreground.rs
   - ui/src/components/app/document_title.rs

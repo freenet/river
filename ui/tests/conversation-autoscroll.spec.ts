@@ -677,7 +677,7 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
 /// Rows the history renders when a room opens, and trims back to.
 const INITIAL_RENDERED_ITEMS = 60;
 /// How far arrivals alone may grow the rendered range from an opening window
-/// (WINDOW_ITEMS_CEILING in conversation.rs).
+/// (WINDOW_ITEMS_CEILING in conversation/history_window.rs).
 const ARRIVAL_CEILING_ITEMS = INITIAL_RENDERED_ITEMS * 4;
 /// How far above the end the newer-history trigger reaches (BACKFILL_LEAD_PX).
 const NEWER_TRIGGER_REACH_PX = 800;

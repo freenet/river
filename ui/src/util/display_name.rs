@@ -97,7 +97,7 @@
 //!   at all (Nerd Fonts map a large PUA range to icons, including shields), so
 //!   a PUA nickname renders as a badge on any machine with such a font
 //!   installed. River *also* uses `U+E000`/`U+E001` as internal sentinels in
-//!   [`crate::components::conversation::message_to_html_with_mentions`], so
+//!   [`crate::components::conversation::markdown::message_to_html_with_mentions`], so
 //!   stripping PUA additionally keeps a nickname from smuggling a sentinel
 //!   into the mention-chip substitution.
 //!
