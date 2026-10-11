@@ -201,9 +201,8 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     });
 
     // The thread as plain Strings, so the render holds no ROOMS borrow. The
-    // body is keyed by thread, so `last_view` is this thread's last good view:
-    // a contended read shows it instead of unmounting the thread, and a room
-    // that is gone clears it.
+    // body is keyed by thread, so `last_view` is this thread's last good view
+    // (see `next_view`).
     let last_view = use_hook(|| Rc::new(std::cell::RefCell::new(None::<ViewData>)));
     let view = use_memo({
         let last_view = last_view.clone();
@@ -211,18 +210,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // Before the fallible reads: a contended pass subscribes to nothing
             // else (freenet/river#555).
             crate::util::signal_guard::anchor();
-            let read = if forced_room_read_failure() {
-                None
-            } else {
-                ROOMS.try_read().ok()
-            };
-            let Some(rooms) = read else {
+            let Ok(rooms) = ROOMS.try_read() else {
                 crate::util::signal_guard::schedule_nudge();
-                return last_view.borrow().clone();
+                return next_view(&mut last_view.borrow_mut(), RoomRead::Contended);
             };
             let Some(room_data) = rooms.map.get(&room) else {
-                *last_view.borrow_mut() = None;
-                return None;
+                return next_view(&mut last_view.borrow_mut(), RoomRead::Gone);
             };
 
             // INBOUND bodies are ECIES-sealed to us, so reading them needs the
@@ -437,8 +430,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 identity_known: self_id.is_some(),
                 can_send: self_sk.is_some(),
             };
-            *last_view.borrow_mut() = Some(view.clone());
-            Some(view)
+            next_view(&mut last_view.borrow_mut(), RoomRead::Read(view))
         }
     });
 
@@ -1862,13 +1854,33 @@ fn run_placement(placement: Box<dyn FnOnce()>) {
     placement();
 }
 
-/// Whether the test hooks forced this `ROOMS` read to fail like a contended
-/// one (`failNextDmRoomRead`). Always `false` outside the example test build.
-fn forced_room_read_failure() -> bool {
-    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
-    return crate::test_hooks::take_dm_room_read_failure();
-    #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
-    false
+/// The outcome of the thread's `ROOMS` read.
+enum RoomRead<V> {
+    /// The read failed because `ROOMS` was borrowed: transient, retried by the
+    /// nudge.
+    Contended,
+    /// The thread's room is no longer loaded.
+    Gone,
+    /// The thread, built from a successful read.
+    Read(V),
+}
+
+/// What the thread shows after a `ROOMS` read, given `last`, its last good
+/// view, which this updates. A contended read keeps showing `last` rather than
+/// unmounting the thread, which would drop its draft and the reader's place
+/// (`.claude/rules/dioxus-signal-safety.md`); a room that is gone clears it.
+fn next_view<V: Clone>(last: &mut Option<V>, read: RoomRead<V>) -> Option<V> {
+    match read {
+        RoomRead::Contended => last.clone(),
+        RoomRead::Gone => {
+            *last = None;
+            None
+        }
+        RoomRead::Read(view) => {
+            *last = Some(view.clone());
+            Some(view)
+        }
+    }
 }
 
 /// Pure helper: merge an incoming DM_DRAFT body into whatever the user
@@ -2409,6 +2421,42 @@ mod tests {
             timestamp,
             token: PurgeToken([token; 16]),
         }
+    }
+
+    #[test]
+    fn a_contended_room_read_keeps_the_last_view_and_a_gone_room_clears_it() {
+        let mut last = None;
+        assert_eq!(
+            next_view(&mut last, RoomRead::Contended),
+            None,
+            "a read contended before any view has nothing to keep"
+        );
+        assert_eq!(next_view(&mut last, RoomRead::Read("first")), Some("first"));
+        assert_eq!(
+            next_view(&mut last, RoomRead::Contended),
+            Some("first"),
+            "a contended read unmounted the open thread"
+        );
+        assert_eq!(
+            next_view(&mut last, RoomRead::Contended),
+            Some("first"),
+            "a second contended read lost the view the first one kept"
+        );
+        assert_eq!(
+            next_view(&mut last, RoomRead::Read("second")),
+            Some("second")
+        );
+        assert_eq!(
+            next_view(&mut last, RoomRead::Contended),
+            Some("second"),
+            "a contended read showed a view older than the last good one"
+        );
+        assert_eq!(next_view(&mut last, RoomRead::Gone), None, "a gone room");
+        assert_eq!(
+            next_view(&mut last, RoomRead::Contended),
+            None,
+            "a contended read after the room went revived its thread"
+        );
     }
 
     #[test]

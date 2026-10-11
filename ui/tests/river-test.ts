@@ -11,8 +11,6 @@ type RiverTestHooks = {
   makeRoomPrivateWithoutSecret(): void;
   setRoomsLoadState(state: RoomsLoadState): void;
   switchRoom(name: string): void;
-  failNextDmRoomRead(): void;
-  dmRoomReadFailuresTaken(): number;
   // Peer 0 and peer 1 are two fixed test identities, each with its own thread. Others throw.
   appendDmsForPeer(peerIndex: 0 | 1, count: number): void;
   deliverDmForPeer(peerIndex: 0 | 1, text: string): void;

@@ -243,26 +243,6 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
-    // Make the open DM thread's next `ROOMS` read take its failed-read branch,
-    // as a contended read does, and nudge so that read happens. If no thread
-    // is open, the next one to open takes it.
-    set_hook(
-        "failNextDmRoomRead",
-        Closure::<dyn FnMut()>::new(move || {
-            DM_ROOM_READ_FAILURE.with(|f| f.set(true));
-            crate::util::signal_guard::schedule_nudge();
-        })
-        .into_js_value(),
-    );
-
-    // How many forced DM room-read failures have been taken, so a test can wait
-    // for its failure to land rather than guess.
-    set_hook(
-        "dmRoomReadFailuresTaken",
-        Closure::<dyn FnMut() -> u32>::new(move || DM_ROOM_READS_FAILED.with(|n| n.get()))
-            .into_js_value(),
-    );
-
     // Switch rooms the way a notification click does: CURRENT_ROOM changes
     // while whatever modal is open stays open. The room list is behind the
     // modal's backdrop, so the UI itself cannot do this from a test.
@@ -299,10 +279,6 @@ pub fn install_test_hooks() {
 }
 
 thread_local! {
-    /// A forced DM room-read failure is pending (`failNextDmRoomRead`).
-    static DM_ROOM_READ_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Forced DM room-read failures taken so far (`dmRoomReadFailuresTaken`).
-    static DM_ROOM_READS_FAILED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The next DM placement is to be held (`holdNextDmPlacement`).
     static DM_PLACEMENT_HOLD_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The held DM placement, as the thread queued it.
@@ -325,15 +301,6 @@ pub(crate) fn run_or_hold_dm_placement(action: Box<dyn FnOnce()>) {
             &"__riverTest.holdNextDmPlacement: a held placement was never released".into(),
         );
     }
-}
-
-/// Take a pending forced failure for the DM thread's `ROOMS` read, counting it.
-pub(crate) fn take_dm_room_read_failure() -> bool {
-    let forced = DM_ROOM_READ_FAILURE.with(|f| f.replace(false));
-    if forced {
-        DM_ROOM_READS_FAILED.with(|n| n.set(n.get() + 1));
-    }
-    forced
 }
 
 /// Where a delivered message lands in the room's message list.
