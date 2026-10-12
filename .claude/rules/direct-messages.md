@@ -159,8 +159,8 @@ plaintext in the chat delegate.
   `CoalesceState` (futures-Mutex + AtomicBool DIRTY +
   `Mutex<Result<(), String>>` last-result store). The last-result store
   propagates failures to queued callers whose own loop runs zero
-  iterations, so e.g. `mark_legacy_migration_done()` in
-  `response_handler.rs` can't see a false-`Ok` from a catch-up save
+  iterations, so e.g. the migration walk's flush (which seals a
+  predecessor `Done` on `Ok`) can't see a false-`Ok` from a catch-up save
   that actually failed. A chain of N rapid mutations produces at most 2
   delegate writes. `save_outbound_dms_to_delegate` and
   `save_rooms_to_delegate` both share the helper — grep `CoalesceState`
