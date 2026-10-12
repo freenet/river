@@ -2052,6 +2052,8 @@ pub(crate) mod tests_support {
         pub(crate) silent: bool,
         /// GETs for these keys never answer (per-key silence).
         pub(crate) silent_get_keys: Vec<Vec<u8>>,
+        /// `ListRequest` never answers (GETs still do).
+        pub(crate) silent_list: bool,
         /// When a GET asks for `.0`, reply names key `.1` with value `.2` —
         /// a mis-correlated answer.
         pub(crate) wrong_key_reply: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
@@ -2187,7 +2189,7 @@ pub(crate) mod tests_support {
                     self.log
                         .borrow_mut()
                         .push((target.bytes().to_vec(), "list".into()));
-                    if sim.silent {
+                    if sim.silent || sim.silent_list {
                         return Ok(None);
                     }
                     let keys = sim
@@ -4702,6 +4704,25 @@ mod tests {
             "a top-up that did not run is not counted"
         );
         channel.silence(&pred_key(2), false);
+        // The index answers but the listing does not: still not a run.
+        channel
+            .delegates
+            .borrow_mut()
+            .get_mut(pred_key(2).bytes())
+            .unwrap()
+            .silent_list = true;
+        assert!(run(&mut seam, t0).is_err());
+        assert_eq!(
+            block_on(read_topup_window(&channel, &successor_key())).unwrap(),
+            None,
+            "a top-up whose listing went unanswered is not counted"
+        );
+        channel
+            .delegates
+            .borrow_mut()
+            .get_mut(pred_key(2).bytes())
+            .unwrap()
+            .silent_list = false;
 
         // Runs are counted until the window ends.
         for i in 1..=TOPUP_WINDOW_LOADS {
