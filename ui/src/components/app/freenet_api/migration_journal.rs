@@ -590,22 +590,6 @@ async fn begin_unlocked() -> Option<JournalStatus> {
             );
             let recorded = status.clone();
             update_session(move |s| s.on_begin_ok(recorded));
-            // Before any import of this load can apply a predecessor's DM
-            // archive set: the persisted #776 ranks (#768 round 4, S1). Every
-            // sweep merge and the walk wait for `begin`. A failed read is
-            // retried on the next `begin`; until it succeeds nothing is
-            // written back over the record.
-            if !chat_delegate::hidden_ranks_loaded() {
-                match super::delegate_migration::read_hidden_ranks_record(
-                    &NodeDelegateChannel,
-                    &chat_delegate::current_delegate_key(),
-                )
-                .await
-                {
-                    Ok(record) => chat_delegate::load_hidden_ranks_record(record),
-                    Err(e) => warn!("could not read the DM-archive ranks ({e}); retried"),
-                }
-            }
             Some(status)
         }
         Err(e) => {

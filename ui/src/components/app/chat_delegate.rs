@@ -4729,27 +4729,12 @@ mod tests {
     #[test]
     fn the_hidden_thread_hydration_paths_apply_the_776_rules() {
         let src = include_str!("chat_delegate.rs");
-        // Anchored at a line start, so the anchors quoted in this test do not
-        // match themselves.
         let body = |anchor: &str| -> &str {
-            let start = src
-                .find(&format!("\n{anchor}"))
-                .unwrap_or_else(|| panic!("{anchor}"));
+            let start = src.find(anchor).unwrap_or_else(|| panic!("{anchor}"));
             &src[start..start + src[start..].find("\n}\n").expect("end")]
         };
         let current = body("pub(crate) fn hydrate_hidden_dm_threads_now(");
         assert!(current.contains("hydrate_hidden_entries_now(entries, None);"));
-        // #768 round 4, S1: the current load keeps persisted provenance, an
-        // import persists the ranks, and `begin` loads them before any import.
-        assert!(!current.contains("forget_legacy_hidden_provenance("));
-        let legacy_full = body("pub(crate) fn import_legacy_hidden_threads_now(");
-        assert!(legacy_full.contains("persist_hidden_ranks();"));
-        let journal = include_str!("freenet_api/migration_journal.rs");
-        let begin = &journal[journal.find("async fn begin_unlocked()").expect("begin")..];
-        let begin = &begin[..begin.find("\n}\n").expect("end")];
-        let ok = begin.find("Ok(status) => {").expect("Ok arm");
-        assert!(begin[ok..].contains("read_hidden_ranks_record("));
-        assert!(begin[ok..].contains("chat_delegate::load_hidden_ranks_record(record)"));
         let legacy = body("pub(crate) fn import_legacy_hidden_threads_now(");
         assert!(legacy.contains("hydrate_hidden_entries_now(entries, Some(rank));"));
         let shared = body("fn hydrate_hidden_entries_now(");
@@ -8831,100 +8816,6 @@ pub(crate) fn union_resurrections(
 static LEGACY_HIDDEN_RANKS: std::sync::LazyLock<Mutex<LegacyHiddenRanks>> =
     std::sync::LazyLock::new(|| Mutex::new(LegacyHiddenRanks::default()));
 
-/// The persisted form of [`LegacyHiddenRanks`] (#768 round 4, S1): stored in
-/// the current delegate so the ranked rule and the heal hold ACROSS page loads,
-/// whichever generation answers first and in whichever load.
-#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HiddenRanksRecord {
-    pub(crate) authority: Option<u32>,
-    pub(crate) provenance: Vec<([u8; 32], MemberId, u32)>,
-    pub(crate) seen: Vec<(u32, Vec<([u8; 32], MemberId, u64)>)>,
-}
-
-impl LegacyHiddenRanks {
-    /// The persisted form (sorted, so equal state encodes equally).
-    pub(crate) fn to_record(&self) -> HiddenRanksRecord {
-        let mut provenance: Vec<_> = self
-            .provenance
-            .iter()
-            .map(|((vk, peer), r)| (vk.to_bytes(), *peer, *r))
-            .collect();
-        provenance.sort_by_key(|(vk, peer, _)| (*vk, *peer));
-        let seen = self
-            .seen
-            .iter()
-            .map(|(rank, set)| {
-                let mut v: Vec<_> = set
-                    .iter()
-                    .map(|((vk, peer), ts)| (vk.to_bytes(), *peer, *ts))
-                    .collect();
-                v.sort_by_key(|(vk, peer, _)| (*vk, *peer));
-                (*rank, v)
-            })
-            .collect();
-        HiddenRanksRecord {
-            authority: self.authority,
-            provenance,
-            seen,
-        }
-    }
-
-    /// Fold a persisted record into this session's state: the highest
-    /// authority, the highest rank per provenance entry, every seen set.
-    /// Merging (rather than replacing) keeps anything this session already
-    /// imported before the record was read.
-    pub(crate) fn merge_record(&mut self, record: &HiddenRanksRecord) {
-        if let Some(a) = record.authority {
-            self.authority = Some(self.authority.map_or(a, |b| b.max(a)));
-        }
-        for (vk, peer, rank) in &record.provenance {
-            if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(vk) {
-                let slot = self.provenance.entry((vk, *peer)).or_insert(*rank);
-                *slot = (*slot).max(*rank);
-            }
-        }
-        for (rank, set) in &record.seen {
-            let mine = self.seen.entry(*rank).or_default();
-            for (vk, peer, ts) in set {
-                if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(vk) {
-                    let slot = mine.entry((vk, *peer)).or_insert(*ts);
-                    *slot = (*slot).max(*ts);
-                }
-            }
-        }
-    }
-}
-
-/// Whether this session read the persisted record. Until it has, nothing is
-/// written back: a write would replace the record with this session's partial
-/// state.
-static HIDDEN_RANKS_LOADED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Fold the persisted record into this session's ranks (once per session).
-pub(crate) fn load_hidden_ranks_record(record: Option<HiddenRanksRecord>) {
-    if let Ok(mut r) = LEGACY_HIDDEN_RANKS.lock() {
-        if let Some(record) = record {
-            r.merge_record(&record);
-        }
-        HIDDEN_RANKS_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Whether this session has read the persisted record.
-pub(crate) fn hidden_ranks_loaded() -> bool {
-    HIDDEN_RANKS_LOADED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// This session's ranks in persisted form, once the record has been read
-/// (`None` before: see [`HIDDEN_RANKS_LOADED`]).
-pub(crate) fn hidden_ranks_record_to_store() -> Option<HiddenRanksRecord> {
-    if !HIDDEN_RANKS_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-    LEGACY_HIDDEN_RANKS.lock().ok().map(|r| r.to_record())
-}
-
 /// What applying predecessor rank `rank`'s archive set does.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct LegacyHiddenPlan {
@@ -8969,14 +8860,10 @@ pub(crate) fn plan_legacy_hidden_import(
 /// The user (or the successor's own store) now owns these keys: no predecessor
 /// may remove them.
 fn forget_legacy_hidden_provenance(keys: &[(ed25519_dalek::VerifyingKey, MemberId)]) {
-    let mut changed = false;
     if let Ok(mut r) = LEGACY_HIDDEN_RANKS.lock() {
         for key in keys {
-            changed |= r.provenance.remove(key).is_some();
+            r.provenance.remove(key);
         }
-    }
-    if changed {
-        crate::components::app::freenet_api::delegate_migration::persist_hidden_ranks();
     }
 }
 
@@ -8985,7 +8872,6 @@ fn forget_legacy_hidden_provenance(keys: &[(ed25519_dalek::VerifyingKey, MemberI
 /// that runs inside its own `defer` (see [`hydrate_hidden_dm_threads_now`]).
 pub(crate) fn import_legacy_hidden_threads_now(entries: Vec<HiddenDmThreadEntry>, rank: u32) {
     hydrate_hidden_entries_now(entries, Some(rank));
-    crate::components::app::freenet_api::delegate_migration::persist_hidden_ranks();
 }
 
 /// Apply predecessor rank `rank`'s archive set to `hidden` under the ranked
@@ -9235,10 +9121,17 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
 /// then seal the predecessor as imported. Callers that need the write to have
 /// happened run this inside their own single `defer` and signal from there.
 pub(crate) fn hydrate_hidden_dm_threads_now(entries: Vec<HiddenDmThreadEntry>) {
-    // The CURRENT delegate's own entries. Their legacy provenance, if a
-    // predecessor supplied them in an earlier load, is persisted and kept
-    // (#768 round 4, S1): a newer predecessor answering in a later load must
-    // still be able to remove an entry an older one supplied.
+    // The CURRENT delegate's own entries: it owns them from now on, so no
+    // predecessor's ranked import may remove them (#776).
+    let keys: Vec<(ed25519_dalek::VerifyingKey, MemberId)> = entries
+        .iter()
+        .filter_map(|e| {
+            ed25519_dalek::VerifyingKey::from_bytes(&e.room_owner_vk)
+                .ok()
+                .map(|vk| (vk, e.peer))
+        })
+        .collect();
+    forget_legacy_hidden_provenance(&keys);
     hydrate_hidden_entries_now(entries, None);
 }
 
