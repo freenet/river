@@ -1664,6 +1664,33 @@ test.describe("The end holds for a reader who scrolls back to it", () => {
   });
 });
 
+// The history's own corrections (the backfill restore, the head reposition,
+// the reveal restore, the end hold) are the only ones: the scroller opts out
+// of browser scroll anchoring, so the engines that anchor cannot correct the
+// same move twice, nor hide from these specs what an engine without
+// anchoring would show. history_scroll.rs pins the inline style in the
+// source; this checks what the browser actually computes, so a stylesheet
+// rule overriding it fails here.
+test.describe("Browser scroll anchoring is off on the history", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("the history scroller computes overflow-anchor: none", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    expect((await scrollMetrics(page)).max, "premise: the history overflows").toBeGreaterThan(0);
+
+    const anchoring = await page.getByTestId("chat-scroll-container").evaluate((el) => ({
+      supported: CSS.supports("overflow-anchor", "none"),
+      computed: getComputedStyle(el).overflowAnchor,
+    }));
+    // Every engine these projects drive supports the property, Playwright's
+    // WebKit included (playwright.config.ts). Safari before 27 has neither
+    // scroll anchoring nor the property, and no project runs it. An engine
+    // without it fails here rather than passing on an unset style.
+    expect(anchoring.supported, "premise: the engine supports overflow-anchor").toBe(true);
+    expect(anchoring.computed, "browser scroll anchoring is on for the history").toBe("none");
+  });
+});
+
 // An arrival follows a reader at the end, measured before the patch: the
 // newest message's bottom within FOLLOW_BAND_PX of the view's bottom
 // edge, in a visible tab, with no DM thread over the history. Nothing else

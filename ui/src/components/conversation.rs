@@ -2322,6 +2322,7 @@ pub fn Conversation() -> Element {
                     // scanner seeing it.
                     style: "overflow-anchor:none;",
                     id: "chat-scroll-container",
+                    "data-testid": "chat-scroll-container",
                     div { class: "max-w-4xl mx-auto px-4 py-4", id: "chat-content",
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
