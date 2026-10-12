@@ -675,15 +675,13 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
 /// Pure, so the union rule is unit-testable and mutation-testable on its own.
 pub(crate) fn candidate_keys(listed: &[ChatDelegateKey]) -> Vec<Vec<u8>> {
     let mut keys: Vec<Vec<u8>> = Vec::new();
-    let mut meta = false;
     for k in listed {
         let b = k.as_bytes();
         if is_migration_bookkeeping_key(b) {
             continue;
         }
         if b == ROOMS_META_KEY {
-            meta = true;
-            continue;
+            continue; // always probed, last (below)
         }
         if !keys.iter().any(|existing| existing == b) {
             keys.push(b.to_vec());
@@ -696,9 +694,10 @@ pub(crate) fn candidate_keys(listed: &[ChatDelegateKey]) -> Vec<Vec<u8>> {
             keys.push(fixed.to_vec());
         }
     }
-    if meta {
-        keys.push(ROOMS_META_KEY.to_vec());
-    }
+    // `rooms_meta` is probed ALWAYS (#768 review A4): every per-room-era save
+    // writes it, so it is the witness that an absent or short index is a read
+    // fault, not an empty delegate.
+    keys.push(ROOMS_META_KEY.to_vec());
     keys
 }
 
@@ -795,6 +794,18 @@ impl<C: RiverDelegateChannel> PredecessorSecretsIo for RiverPredecessorIo<'_, C>
                 .iter()
                 .any(|k| k.as_bytes() == storage_key.as_slice());
             match self.get_key(predecessor, &storage_key).await? {
+                Some(_) if !is_listed && !index_absent => {
+                    // A frozen generation's failed index read became an empty
+                    // index that its next store rewrote as a one-key index
+                    // (freenet/river#592): listing and index then agree, and
+                    // are both short. A probed key that is stored but missing
+                    // from an index that exists proves it (#768 review A4).
+                    return Err(format!(
+                        "{:?} is stored but its index does not list it; the index is \
+                         short (freenet/river#592)",
+                        String::from_utf8_lossy(&storage_key)
+                    ));
+                }
                 Some(value) => {
                     if index_absent {
                         return Err(format!(
@@ -2250,14 +2261,15 @@ mod tests {
     /// `room_order` merge only keeps rooms already present).
     #[test]
     fn candidate_keys_union_fixed_probes_exclude_markers_meta_last() {
-        // Empty index still probes the single-blob era's keys.
+        // Empty index still probes the fixed keys, rooms_meta last.
         assert_eq!(
             candidate_keys(&[]),
             vec![
                 ROOMS_STORAGE_KEY.to_vec(),
-                OUTBOUND_DMS_STORAGE_KEY.to_vec()
+                OUTBOUND_DMS_STORAGE_KEY.to_vec(),
+                ROOMS_META_KEY.to_vec(),
             ],
-            "an empty legacy index must STILL probe rooms_data + outbound_dms"
+            "an empty legacy index must STILL probe rooms_data + outbound_dms + rooms_meta"
         );
 
         let listed = vec![
@@ -4094,5 +4106,62 @@ mod tests {
             );
         }
         assert!(production.contains("chat_delegate::room_set_complete(self.attempt)"));
+    }
+
+    /// #768 review A4 (migration probe P1): a frozen generation's corrupt
+    /// index became empty, and its next store rewrote it as a one-key index.
+    /// Listing and index agree and are both short, so only a probed key that
+    /// is stored but unlisted can prove it. Refused, never certified.
+    #[test]
+    fn a_rewritten_short_index_is_refused_by_a_stored_unlisted_fixed_key() {
+        let (a, b) = (vk(1), vk(2));
+        let slot = |r, seed| cbor(&RoomSlot::Present(Box::new(room_with_identity(r, seed))));
+        for witness in [OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY] {
+            let mut gen0 = DelegateSim::default();
+            gen0.store
+                .insert(chat_delegate::room_storage_key(&a), slot(a, 3));
+            gen0.store
+                .insert(chat_delegate::room_storage_key(&b), slot(b, 4));
+            let value = if witness == ROOMS_META_KEY {
+                cbor(&RoomsMeta {
+                    current_room_key: None,
+                    notification_modes: HashMap::new(),
+                    room_order: vec![a, b],
+                })
+            } else {
+                cbor(&OutboundDmStore::default())
+            };
+            gen0.store.insert(witness.to_vec(), value);
+            gen0.listed = Some(vec![chat_delegate::room_storage_key(&b)]);
+            let channel = channel_with_gen0(gen0);
+            let (report, seam) = walk(&channel, MemorySeam::new());
+            assert_gen0_refused(&report, &channel, &seam);
+        }
+    }
+
+    /// #768 review A4 (migration probe P2): an absent index beside per-room
+    /// keys and a stored `rooms_meta` is a read fault, not an empty delegate:
+    /// `rooms_meta` is always probed, so it witnesses the fault.
+    #[test]
+    fn an_absent_index_beside_a_stored_rooms_meta_is_a_fault() {
+        let a = vk(1);
+        let mut gen0 = DelegateSim::default();
+        gen0.store.insert(
+            chat_delegate::room_storage_key(&a),
+            cbor(&RoomSlot::Present(Box::new(room_with_identity(a, 3)))),
+        );
+        gen0.store.insert(
+            ROOMS_META_KEY.to_vec(),
+            cbor(&RoomsMeta {
+                current_room_key: None,
+                notification_modes: HashMap::new(),
+                room_order: vec![],
+            }),
+        );
+        gen0.listed = Some(vec![]);
+        gen0.raw_index = Some(None);
+        let channel = channel_with_gen0(gen0);
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert_gen0_refused(&report, &channel, &seam);
     }
 }
