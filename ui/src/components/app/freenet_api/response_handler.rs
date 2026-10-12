@@ -20,15 +20,15 @@ use crate::components::app::chat_delegate::{
     complete_pending_signing_key_request, current_delegate_source_rank, current_load_attempt,
     decide_legacy_migration_action, decide_per_room_load_action, enqueue_delegate_request,
     fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
-    import_legacy_hidden_threads, is_legacy_delegate_key, legacy_scoped_correlation,
-    load_state_after_probe_legacy, mark_fetch_failure_if_current, mark_outbound_dms_hydrated,
-    mark_room_set_complete, note_current_list_response, note_delegate_response_for_register_ack,
-    parse_room_storage_key, per_room_terminal, prune_outbound_dms_for_purges,
-    request_outbound_dms_once, response_correlation_base, room_storage_key,
-    save_outbound_dms_to_delegate, save_rooms_to_delegate, seed_saved_slots_from_load,
-    send_delegate_request, send_delegate_request_to, set_load_state_if_current,
-    source_rank_for_delegate_key, LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest,
-    RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
+    is_legacy_delegate_key, legacy_scoped_correlation, load_state_after_probe_legacy,
+    mark_fetch_failure_if_current, mark_outbound_dms_hydrated, mark_room_set_complete,
+    note_current_list_response, note_delegate_response_for_register_ack, parse_room_storage_key,
+    per_room_terminal, prune_outbound_dms_for_purges, request_outbound_dms_once,
+    response_correlation_base, room_storage_key, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, seed_saved_slots_from_load, send_delegate_request,
+    send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
+    LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
+    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -512,10 +512,7 @@ impl ResponseHandler {
                                                         || sweep_may_merge(&legacy_key, None).await
                                                     {
                                                         handle_outbound_dms_get_response(
-                                                            value,
-                                                            Some(source_rank_for_delegate_key(
-                                                                legacy_key.bytes(),
-                                                            )),
+                                                            value, true,
                                                         );
                                                     } else {
                                                         // Retry, not a silent
@@ -524,7 +521,7 @@ impl ResponseHandler {
                                                     }
                                                 });
                                             } else {
-                                                handle_outbound_dms_get_response(value, None);
+                                                handle_outbound_dms_get_response(value, false);
                                             }
                                         } else if key.as_bytes() == ROOMS_META_KEY
                                             || parse_room_storage_key(key.as_bytes()).is_some()
@@ -2263,10 +2260,7 @@ fn hydrate_loaded_rooms_with_authority(
 /// even though they have no merge to wait for — so the invariant "the latch
 /// is only ever flipped from inside a deferred macrotask" holds without a
 /// branch-specific exception to remember.
-/// `legacy_rank`: `Some(rank)` for a predecessor's store (its archive entries
-/// are imported ranked, freenet/river#776), `None` for the current delegate's.
-fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, legacy_rank: Option<u32>) {
-    let is_legacy_delegate = legacy_rank.is_some();
+fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: bool) {
     let Some(bytes) = value else {
         info!(
             "No outbound-DMs blob present in delegate ({})",
@@ -2284,12 +2278,16 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, legacy_rank: Option<
 
     match from_reader::<OutboundDmStore, _>(&bytes[..]) {
         Ok(store) => {
-            // A predecessor's archive entries are imported ranked (#776).
-            let count = hydrate_outbound_dms_cache(store.entries);
-            let hidden_count = match legacy_rank {
-                Some(rank) => import_legacy_hidden_threads(store.hidden_threads, rank),
-                None => hydrate_hidden_dm_threads(store.hidden_threads),
+            // A predecessor's archive entries are NOT imported here
+            // (freenet/river#776): the journaled walk imports every
+            // predecessor's DM store while the journal is incomplete, and only
+            // it knows which generation is the newest one holding archive data.
+            let hidden_count = if is_legacy_delegate {
+                0
+            } else {
+                hydrate_hidden_dm_threads(store.hidden_threads)
             };
+            let count = hydrate_outbound_dms_cache(store.entries);
             info!(
                 "Hydrated {} outbound-DM entries and {} hidden DM thread entries from {} delegate",
                 count,
@@ -3006,21 +3004,21 @@ mod tests {
             .find(&["||", gate.as_str(), "None).await"].concat())
             .expect("the legacy outbound_dms arm must call the journal gate");
         let dm_merge = production[dm_gate..]
-            .find("handle_outbound_dms_get_response(value,Some(source_rank_for_delegate_key(legacy_key.bytes())))")
+            .find("handle_outbound_dms_get_response(value,true)")
             .expect("the legacy outbound_dms handler must follow its gate");
         assert!(
             dm_merge < 120,
             "the gate must guard the legacy DM merge directly"
         );
-        // ...and the handler imports a predecessor's archive set RANKED
-        // (freenet/river#776), never through the plain union.
+        // ...and the handler never imports a predecessor's archive entries
+        // (freenet/river#776): the walk alone does, by the journal's rule.
         let handler = production
             .find("fnhandle_outbound_dms_get_response(")
             .expect("the DM handler");
         let handler = &production[handler..handler + 2500];
-        assert!(
-            handler.contains("Some(rank)=>import_legacy_hidden_threads(store.hidden_threads,rank)")
-        );
+        assert!(handler.contains(
+            "lethidden_count=ifis_legacy_delegate{0}else{hydrate_hidden_dm_threads(store.hidden_threads)};"
+        ));
 
         // Legacy per-room: gate (with the item count) before reconstruct+hydrate.
         let f = production

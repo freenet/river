@@ -556,7 +556,15 @@ pub(crate) struct RiverPredecessorIo<'a, C: RiverDelegateChannel> {
     /// Room slots a short-index refusal proved exist, to merge after the walk:
     /// `(predecessor, digest, [(storage key, value)])` (#768 round 3, S3).
     salvage: Vec<(DelegateKey, [u8; 32], Vec<SecretPair>)>,
+    /// This walk's answers: whether each predecessor that exported held any
+    /// data (shared with the writer for [`newest_archive_holder`]).
+    walk_answers: WalkAnswers,
 }
+
+/// Which predecessors exported in this walk, and whether they held data.
+/// Shared between the walk's reader and writer: the walk runs newest-first,
+/// so a newer generation's answer is known before an older one is imported.
+pub(crate) type WalkAnswers = std::rc::Rc<std::cell::RefCell<HashMap<[u8; 32], bool>>>;
 
 impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
     pub(crate) fn new(channel: &'a C) -> Self {
@@ -565,6 +573,7 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
             prewarmed: HashMap::new(),
             short_index_refused: Vec::new(),
             salvage: Vec::new(),
+            walk_answers: WalkAnswers::default(),
         }
     }
 
@@ -960,6 +969,11 @@ impl<C: RiverDelegateChannel> PredecessorSecretsIo for RiverPredecessorIo<'_, C>
                 }
             }
         }
+        if let Ok(key) = <[u8; 32]>::try_from(predecessor.bytes()) {
+            self.walk_answers
+                .borrow_mut()
+                .insert(key, !pairs.is_empty());
+        }
         Ok(pairs)
     }
 }
@@ -1121,12 +1135,11 @@ pub(crate) trait RiverImportSeam {
         source_rank: u32,
     ) -> impl Future<Output = Result<(), String>>;
 
-    /// Merge a recovered outbound-DM store into the local cache. With
-    /// `archive_rank`, its archive entries (`hidden_threads`) are imported
-    /// ranked at that generation (freenet/river#776: a newer generation's set
-    /// is authoritative); with `None` (the post-resolve top-up) only the DM
-    /// entries are merged and the archive state is not touched at all: an
-    /// empty set at a rank would claim authority and delete archives.
+    /// Merge a recovered outbound-DM store into the local cache. Its archive
+    /// entries (`hidden_threads`) are merged only with `archive_rank`, which
+    /// the walk passes only for the newest generation holding archive data
+    /// ([`newest_archive_holder`], freenet/river#776). With `None` (an older
+    /// generation, or the post-resolve top-up) only the DM entries are merged.
     fn merge_outbound_dms(
         &mut self,
         store: OutboundDmStore,
@@ -1297,10 +1310,10 @@ impl RiverImportSeam for LiveImportSeam {
                 return;
             }
             chat_delegate::hydrate_outbound_dms_cache_now(store.entries);
-            // The archive entries are imported ranked (#776), and only when
-            // the caller imports them (the top-up does not).
-            if let Some(rank) = archive_rank {
-                chat_delegate::import_legacy_hidden_threads_now(store.hidden_threads, rank);
+            // Archive entries only from the newest generation holding archive
+            // data (#776); the caller decides (`newest_archive_holder`).
+            if archive_rank.is_some() {
+                chat_delegate::hydrate_hidden_dm_threads_now(store.hidden_threads);
             }
             let _ = tx.send(Ok(()));
         });
@@ -1384,6 +1397,12 @@ pub(crate) struct RiverSuccessorIo<'a, C: RiverDelegateChannel, S: RiverImportSe
     /// The lineage as `(delegate key, code hash)` in generation order, to read
     /// an imported `rooms_meta`'s identity provenance (#768 round 2 item 4).
     lineage_pairs: Vec<([u8; 32], [u8; 32])>,
+    /// The journal as last loaded or stored in this walk: what
+    /// [`newest_archive_holder`] reads, including predecessors resolved
+    /// earlier in this same walk.
+    journal: Option<Vec<u8>>,
+    /// This walk's answers (see [`WalkAnswers`]).
+    walk_answers: WalkAnswers,
 }
 
 impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S> {
@@ -1393,7 +1412,28 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
             seam,
             successor,
             lineage_pairs: Vec::new(),
+            journal: None,
+            walk_answers: WalkAnswers::default(),
         }
+    }
+
+    /// `Some(generation)` when `generation` is the newest predecessor holding
+    /// archive data, by this walk's journal ([`newest_archive_holder`]).
+    fn archive_rank(&self, generation: u32) -> Option<u32> {
+        let journal = self
+            .journal
+            .as_deref()
+            .and_then(|b| freenet_migrate::MigrationJournal::decode(b).ok());
+        let not_installed = not_installed().clone();
+        let answers = self.walk_answers.borrow().clone();
+        newest_archive_holder(
+            generation,
+            &self.lineage_pairs,
+            journal.as_ref(),
+            &|k| answers.get(k).copied(),
+            &|k| not_installed.contains(k),
+        )
+        .then_some(generation)
     }
 
     /// Know the lineage, so an imported `rooms_meta`'s identity provenance can
@@ -1696,7 +1736,7 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
             RecoveredItem::OutboundDms(store) => {
                 match self
                     .seam
-                    .merge_outbound_dms(*store, Some(item.generation))
+                    .merge_outbound_dms(*store, self.archive_rank(item.generation))
                     .await
                 {
                     Ok(()) => ItemWrite::Written,
@@ -1737,12 +1777,14 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> JournaledSuccessorIo
     /// mismatched reply): `None` would make a later store start the journal
     /// afresh over a stored one.
     async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
-        get_current(
+        let loaded = get_current(
             self.channel,
             &self.successor,
             MIGRATION_JOURNAL_KEY.to_vec(),
         )
-        .await
+        .await?;
+        self.journal = loaded.clone();
+        Ok(loaded)
     }
 
     /// Durable on return: waits for the delegate's acknowledgement.
@@ -1753,7 +1795,9 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> JournaledSuccessorIo
             MIGRATION_JOURNAL_KEY.to_vec(),
             journal,
         )
-        .await
+        .await?;
+        self.journal = Some(journal.to_vec());
+        Ok(())
     }
 
     // `journal_key` keeps the default (`MIGRATION_JOURNAL_KEY`), which every
@@ -2131,6 +2175,7 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     reader.short_index_refused = refused.clone().unwrap_or_default();
     reader.prewarm(lineage).await;
     let mut writer = RiverSuccessorIo::new(channel, seam, successor.clone()).with_lineage(lineage);
+    writer.walk_answers = reader.walk_answers.clone();
     let report = migrate_delegate_secrets_journaled(
         &mut writer,
         &mut reader,
@@ -2145,6 +2190,50 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
         salvage_short_index_rooms(channel, &mut seam, &successor, lineage, refused, salvage).await;
     }
     (report, seam)
+}
+
+/// Whether predecessor `generation` is the NEWEST generation holding DM
+/// archive data, so its `hidden_threads` may be merged into the successor
+/// (freenet/river#776). Un-archiving deletes an entry with no tombstone, so
+/// merging an older generation's archives could bring back one a newer
+/// generation deleted; only the newest data-holding generation's set is
+/// merged, and nothing is ever removed.
+///
+/// Every NEWER generation must be known to hold nothing: it exported nothing
+/// earlier in this walk (`answered`), or it is resolved by the journal and
+/// not data-bearing, or pending but typed "not installed" (by its
+/// last walk's absent streak, or by this walk's pre-warm: a generation this
+/// node never ran is never resolved). A newer generation that holds data, is
+/// silent, was refused, or is missing from an unreadable journal makes this
+/// one skip its archives. The cost of a wrong skip is a thread shown
+/// un-archived; no message is lost. Pure.
+pub(crate) fn newest_archive_holder(
+    generation: u32,
+    lineage_pairs: &[([u8; 32], [u8; 32])],
+    journal: Option<&freenet_migrate::MigrationJournal>,
+    answered: &dyn Fn(&[u8; 32]) -> Option<bool>,
+    not_installed: &dyn Fn(&[u8; 32]) -> bool,
+) -> bool {
+    lineage_pairs
+        .iter()
+        .enumerate()
+        .filter(|(g, _)| *g as u32 > generation)
+        .all(|(_, (key, code))| {
+            if let Some(held_data) = answered(key) {
+                return !held_data;
+            }
+            let entry =
+                journal.and_then(|j| j.entry(&DelegateKey::new(*key, CodeHash::new(*code))));
+            match entry.map(|e| e.state) {
+                Some(freenet_migrate::JournalState::Resolved(r)) => !r.is_data_bearing(),
+                Some(freenet_migrate::JournalState::Pending { absent_streak, .. }) => {
+                    absent_streak > 0 || not_installed(key)
+                }
+                // No entry (an unreadable journal) or a state this build does
+                // not know: assume it may hold data.
+                _ => false,
+            }
+        })
 }
 
 /// Recover the room slots a short-index refusal proved exist (#768 round 3,
@@ -2767,13 +2856,12 @@ mod tests {
         rooms: Rooms,
         ranks: MergeRanks,
         dm_merges: Vec<OutboundDmStore>,
-        /// Archive entries, imported through the production composition
-        /// (`apply_legacy_hidden_import`) at the rank the walk passes.
+        /// Archive entries, merged by the production hydration rule when the
+        /// walk passes an archive rank.
         hidden: HashMap<
             (VerifyingKey, river_core::room_state::member::MemberId),
             river_core::chat_delegate::HiddenDmThreadEntry,
         >,
-        hidden_ranks: chat_delegate::LegacyHiddenRanks,
         flushes: usize,
         fail_flush: bool,
         /// Every rooms/DM merge reports this failure.
@@ -2787,7 +2875,6 @@ mod tests {
                 ranks: MergeRanks::default(),
                 dm_merges: Vec::new(),
                 hidden: HashMap::new(),
-                hidden_ranks: chat_delegate::LegacyHiddenRanks::default(),
                 flushes: 0,
                 fail_flush: false,
                 fail_merge: None,
@@ -2810,14 +2897,13 @@ mod tests {
             if let Some(e) = &self.fail_merge {
                 return Err(e.clone());
             }
-            if let Some(rank) = archive_rank {
-                let _ = chat_delegate::apply_legacy_hidden_import(
-                    &mut self.hidden,
-                    &mut self.hidden_ranks,
+            if archive_rank.is_some() {
+                let (to_insert, _) = chat_delegate::resolve_hidden_thread_hydration(
                     store.hidden_threads.clone(),
-                    rank,
+                    &self.hidden,
                     &HashSet::new(),
                 );
+                self.hidden.extend(to_insert);
             }
             self.dm_merges.push(store);
             Ok(())
@@ -3852,7 +3938,7 @@ mod tests {
         // public helpers would re-defer, putting the writes back on a later
         // macrotask and restoring the bug even with the await in place.
         for helper in [
-            "import_legacy_hidden_threads_now(",
+            "hydrate_hidden_dm_threads_now(",
             "hydrate_outbound_dms_cache_now(",
         ] {
             assert!(
@@ -3862,7 +3948,6 @@ mod tests {
         }
         assert!(
             !body.contains("hydrate_hidden_dm_threads(")
-                && !body.contains("import_legacy_hidden_threads(")
                 && !body.contains("hydrate_outbound_dms_cache("),
             "merge_outbound_dms must NOT call the deferring public hydrate \
              helpers — they schedule a further macrotask, so the awaited signal \
@@ -3871,11 +3956,9 @@ mod tests {
         // #768 round 4, M1: the archive import runs only for a caller that
         // passes a rank (the top-up passes `None`).
         let guard = body
-            .find("if let Some(rank) = archive_rank {")
+            .find("if archive_rank.is_some() {")
             .expect("the archive import is guarded by archive_rank");
-        let import = body
-            .find("import_legacy_hidden_threads_now(")
-            .expect("import");
+        let import = body.find("hydrate_hidden_dm_threads_now(").expect("import");
         assert!(guard < import && import < guard + 200);
         // The load-bearing ordering: the completion signal must be sent from
         // INSIDE the defer closure, after the writes. Signalling before the
@@ -3922,7 +4005,7 @@ mod tests {
              signalling outside it makes the await return pre-merge (B2)"
         );
         for helper in [
-            "import_legacy_hidden_threads_now(",
+            "hydrate_hidden_dm_threads_now(",
             "hydrate_outbound_dms_cache_now(",
         ] {
             let at = body.find(helper).expect("helper call");
@@ -5507,15 +5590,20 @@ mod tests {
     }
 
     /// #768 round 4, M1: the top-up merges DM entries without touching the
-    /// archive state. An archive a lower generation supplied survives it, and
-    /// the newest predecessor gains no authority from it (an empty set at its
-    /// rank would have deleted that archive).
+    /// archive state: the newest predecessor's archive set (which the walk
+    /// already imported once, if it was the newest holder) is never merged
+    /// again, and an archive already in the successor is left alone.
     #[test]
     fn a_topup_never_touches_archive_state() {
         use freenet_scaffold::util::FastHash;
         use river_core::room_state::member::MemberId;
         let room = vk(1);
-        let peer = MemberId(FastHash(2));
+        let (peer, other) = (MemberId(FastHash(2)), MemberId(FastHash(3)));
+        let hidden = |p| river_core::chat_delegate::HiddenDmThreadEntry {
+            room_owner_vk: room.to_bytes(),
+            peer: p,
+            hidden_at_ts: 5,
+        };
         let store = OutboundDmStore {
             entries: vec![river_core::chat_delegate::OutboundDmEntry {
                 room_owner_vk: room.to_bytes(),
@@ -5525,7 +5613,8 @@ mod tests {
                 timestamp: 10,
                 plaintext: "hi".into(),
             }],
-            hidden_threads: Vec::new(),
+            // An old tab archived `other` in the predecessor after it resolved.
+            hidden_threads: vec![hidden(other)],
         };
         let channel = MockChannel::default().with_delegate(&pred_key(2), {
             let mut g = DelegateSim::default();
@@ -5534,29 +5623,16 @@ mod tests {
             g
         });
         let mut seam = MemorySeam::new();
-        // As if the walk had imported gen 1's archive (gen 2 had no DM store).
-        let archived = river_core::chat_delegate::HiddenDmThreadEntry {
-            room_owner_vk: room.to_bytes(),
-            peer,
-            hidden_at_ts: 5,
-        };
-        let _ = chat_delegate::apply_legacy_hidden_import(
-            &mut seam.hidden,
-            &mut seam.hidden_ranks,
-            vec![archived],
-            lineage3()[1].generation,
-            &HashSet::new(),
-        );
+        seam.hidden.insert((room, peer), hidden(peer));
         let merged = block_on(top_up_from_with(&channel, &mut seam, &lineage3()[2])).unwrap();
         assert_eq!(merged, 1, "the DM entry is topped up");
         assert!(
             seam.hidden.contains_key(&(room, peer)),
-            "the top-up must not delete an archive a lower generation supplied"
+            "an archive is left alone"
         );
-        assert_eq!(
-            seam.hidden_ranks.authority,
-            Some(lineage3()[1].generation),
-            "the top-up claims no archive authority"
+        assert!(
+            !seam.hidden.contains_key(&(room, other)),
+            "the top-up merges no archive entries"
         );
     }
 
@@ -5611,6 +5687,172 @@ mod tests {
         assert_eq!(merged, 0);
         assert!(seam.0.dm_merges.is_empty(), "nothing merged");
         assert_eq!(seam.0.flushes, 0, "nothing saved");
+    }
+
+    /// Fixture for the #776 journal rule: gen 1 (older) archived K; gen 2
+    /// (newer) holds `newer_hidden` in a DM store of its own, or nothing at
+    /// all (`None`: no data, so the journal resolves it as holding none).
+    fn archive_fixture(
+        newer_hidden: Option<Vec<river_core::chat_delegate::HiddenDmThreadEntry>>,
+    ) -> (
+        MockChannel,
+        (VerifyingKey, river_core::room_state::member::MemberId),
+        river_core::chat_delegate::HiddenDmThreadEntry,
+    ) {
+        use freenet_scaffold::util::FastHash;
+        let room = vk(1);
+        let peer = river_core::room_state::member::MemberId(FastHash(2));
+        let k = river_core::chat_delegate::HiddenDmThreadEntry {
+            room_owner_vk: room.to_bytes(),
+            peer,
+            hidden_at_ts: 10,
+        };
+        let with_dms = |hidden: Vec<river_core::chat_delegate::HiddenDmThreadEntry>| {
+            let mut g = DelegateSim::default();
+            g.store.insert(
+                OUTBOUND_DMS_STORAGE_KEY.to_vec(),
+                cbor(&OutboundDmStore {
+                    entries: Vec::new(),
+                    hidden_threads: hidden,
+                }),
+            );
+            g
+        };
+        let gen2 = match newer_hidden {
+            Some(h) => with_dms(h),
+            None => DelegateSim::default(),
+        };
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), with_dms(vec![k.clone()]))
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+        (channel, (room, peer), k)
+    }
+
+    /// One page load: a fresh walk over the previous load's archive state.
+    fn archive_load(channel: &MockChannel, prev: &MemorySeam) -> MemorySeam {
+        let mut seam = MemorySeam::new();
+        seam.hidden = prev.hidden.clone();
+        walk(channel, seam).1
+    }
+
+    /// #776 journal rule within one load: the newest generation holding data
+    /// is the only one whose archives merge. A newer generation with data and
+    /// no K keeps K out; a newer one that answered with nothing, or that is
+    /// typed "not installed", lets the older generation's K in.
+    #[test]
+    fn only_the_newest_data_holding_generation_merges_archives() {
+        let (channel, key, _) = archive_fixture(Some(vec![]));
+        let seam = archive_load(&channel, &MemorySeam::new());
+        assert!(
+            !seam.hidden.contains_key(&key),
+            "a newer data holder lacking K wins"
+        );
+
+        let (channel, key, _) = archive_fixture(None);
+        let seam = archive_load(&channel, &MemorySeam::new());
+        assert!(
+            seam.hidden.contains_key(&key),
+            "a newer generation holding nothing defers"
+        );
+
+        // Not installed: keys no other test uses, because `NOT_INSTALLED` is
+        // process-global and another walk's pre-warm clears it for its own
+        // targets (shared keys made this case flaky).
+        let (_, key, k) = archive_fixture(None);
+        let table = [
+            ([0x71u8; 32], [0xf1u8; 32]),
+            ([0x72; 32], [0xf2; 32]),
+            ([0x73; 32], [0xf3; 32]),
+        ];
+        let lineage = river_delegate_lineage(&table);
+        let key_of = |i: usize| DelegateKey::new(table[i].0, CodeHash::new(table[i].1));
+        let mut older = DelegateSim::default();
+        older.store.insert(
+            OUTBOUND_DMS_STORAGE_KEY.to_vec(),
+            cbor(&OutboundDmStore {
+                entries: Vec::new(),
+                hidden_threads: vec![k],
+            }),
+        );
+        let channel = MockChannel::default()
+            .with_delegate(&key_of(0), DelegateSim::default())
+            .with_delegate(&key_of(1), older)
+            .with_delegate(
+                &key_of(2),
+                DelegateSim {
+                    not_installed: true,
+                    ..Default::default()
+                },
+            )
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let (_, seam) = block_on(walk_with(
+            &channel,
+            MemorySeam::new(),
+            successor_key(),
+            &lineage,
+        ));
+        assert!(
+            seam.hidden.contains_key(&key),
+            "a newer generation not installed defers"
+        );
+    }
+
+    /// #776 across page loads, NEWER generation silent first: load 1 must not
+    /// merge the older generation's K (the newer one may hold data), and once
+    /// the newer one answers in load 2 its set is the one that counts.
+    #[test]
+    fn a_silent_newer_generation_keeps_older_archives_out_across_loads() {
+        // The newer generation un-archived K.
+        let (channel, key, _) = archive_fixture(Some(vec![]));
+        channel.silence(&pred_key(2), true);
+        let load1 = archive_load(&channel, &MemorySeam::new());
+        assert!(
+            !load1.hidden.contains_key(&key),
+            "load 1: the older K is held back"
+        );
+        channel.silence(&pred_key(2), false);
+        let load2 = archive_load(&channel, &load1);
+        assert!(
+            !load2.hidden.contains_key(&key),
+            "load 2: the un-archive stands"
+        );
+        // The newer generation still archives K: it arrives with it.
+        let (channel, key, k) = archive_fixture(None);
+        channel.put(
+            &pred_key(2),
+            OUTBOUND_DMS_STORAGE_KEY,
+            &cbor(&OutboundDmStore {
+                entries: Vec::new(),
+                hidden_threads: vec![k],
+            }),
+        );
+        channel.silence(&pred_key(2), true);
+        let load1 = archive_load(&channel, &MemorySeam::new());
+        channel.silence(&pred_key(2), false);
+        let load2 = archive_load(&channel, &load1);
+        assert!(
+            load2.hidden.contains_key(&key),
+            "the newer generation's archive arrives"
+        );
+    }
+
+    /// #776 across page loads, OLDER generation silent first: the newer one
+    /// resolves holding data in load 1; when the older one answers in load 2
+    /// its K stays out.
+    #[test]
+    fn an_older_generation_answering_later_never_resurrects_an_archive() {
+        let (channel, key, _) = archive_fixture(Some(vec![]));
+        channel.silence(&pred_key(1), true);
+        let load1 = archive_load(&channel, &MemorySeam::new());
+        assert!(!load1.hidden.contains_key(&key));
+        channel.silence(&pred_key(1), false);
+        let load2 = archive_load(&channel, &load1);
+        assert!(
+            !load2.hidden.contains_key(&key),
+            "the older K must not come back"
+        );
     }
 
     /// freenet/river#776 through the real walk: the newest predecessor (gen 2)

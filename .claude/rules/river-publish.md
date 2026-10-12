@@ -405,16 +405,21 @@ up: a room a tab on an older build (V32) creates after the journal resolved V32
 stays in V32, not destroyed, and is not picked up.
 
 **Archive entries across generations** (freenet/river#776). Un-archiving a DM
-thread deletes its `hidden_threads` entry with no tombstone, so a union of
-every generation's entries brings back one the user removed in a newer
-generation. A predecessor's archive set is imported RANKED: the newest
-predecessor whose set was applied is authoritative, an older one's set is
-ignored, and a newer one removes entries an older one supplied that it no
-longer holds (`apply_legacy_hidden_import`; the successor's own and the user's
-entries are never removed by it). The walk, the top-up and the sweep all go
-through it. There is no "a newer outbound DM supersedes the entry" repair: an
-archive's `hidden_at_ts` is the newest INBOUND timestamp, not the archive time,
-so it would un-archive every thread the user replied to and then archived.
+thread deletes its `hidden_threads` entry with no tombstone, so merging an
+older generation's archives can bring back one the user removed in a newer
+generation. Only the NEWEST predecessor holding archive data has its
+`hidden_threads` merged (`newest_archive_holder`): every newer generation must
+be known to hold nothing (it exported nothing earlier in the same walk, or the
+journal resolved it as not data-bearing, or it is typed "not installed").
+Otherwise that generation's archives are skipped. The walk runs newest-first,
+so a newer answer is known first. Nothing is ever removed. The sweep and the
+top-up never merge archives; the walk does, and it imports every
+predecessor's DM store while the journal is incomplete. A wrong skip shows a
+thread un-archived; it never loses a message. Accounts #772 already re-archived
+are not healed (see the follow-up issue linked from #776). There is no "a newer
+outbound DM supersedes the entry" repair: an archive's `hidden_at_ts` is the
+newest INBOUND timestamp, not the archive time, so it would un-archive every
+thread the user replied to and then archived.
 
 **Migrated identities keep their source rank across loads** (#768 review
 B3): `rooms_meta.identity_sources` records which legacy generation supplied a
