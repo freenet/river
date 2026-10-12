@@ -4583,60 +4583,6 @@ mod tests {
         );
     }
 
-    /// #772's union migration resurrected an archive into V33 (rank 29) that
-    /// V32 (rank 28) had deleted and V31 (rank 27) still held at the same
-    /// cutoff. The import drops it, in every arrival order; and it keeps an
-    /// entry V32 also holds, one whose cutoff differs from the older copy (a
-    /// re-archive after new inbound DMs), and one when V32 never answered.
-    #[test]
-    fn a_union_resurrected_archive_is_healed_and_real_ones_are_kept() {
-        let room = sk(6).verifying_key();
-        let (k, kept_b, kept_ts) = (
-            MemberId(FastHash(31)),
-            MemberId(FastHash(32)),
-            MemberId(FastHash(33)),
-        );
-        let e = |p: MemberId, ts: u64| make_hidden_entry(room, p, ts);
-        let v33 = vec![e(k, 10), e(kept_b, 10), e(kept_ts, 20)];
-        let v32 = vec![e(kept_b, 10)];
-        let v31 = vec![e(k, 10), e(kept_b, 10), e(kept_ts, 15)];
-        let orders: [[(u32, &Vec<HiddenDmThreadEntry>); 3]; 3] = [
-            [(29, &v33), (28, &v32), (27, &v31)],
-            [(27, &v31), (28, &v32), (29, &v33)],
-            [(28, &v32), (29, &v33), (27, &v31)],
-        ];
-        for order in orders {
-            let (mut hidden, mut ranks) = (HiddenMap::new(), LegacyHiddenRanks::default());
-            for (rank, set) in order {
-                import(&mut hidden, &mut ranks, rank, set.clone());
-            }
-            assert!(
-                !hidden.contains_key(&(room, k)),
-                "the resurrected archive is healed"
-            );
-            assert!(
-                hidden.contains_key(&(room, kept_b)),
-                "V32 holds it too: a real archive"
-            );
-            assert!(
-                hidden.contains_key(&(room, kept_ts)),
-                "a different cutoff: a re-archive"
-            );
-        }
-        // V32 never answered: nothing to compare against, nothing dropped.
-        let (mut hidden, mut ranks) = (HiddenMap::new(), LegacyHiddenRanks::default());
-        import(&mut hidden, &mut ranks, 29, v33.clone());
-        import(&mut hidden, &mut ranks, 27, v31.clone());
-        assert!(hidden.contains_key(&(room, k)));
-        // The successor's own entry is never dropped.
-        let (mut hidden, mut ranks) = (HiddenMap::new(), LegacyHiddenRanks::default());
-        hidden.insert((room, k), e(k, 10));
-        for (rank, set) in [(29, &v33), (28, &v32), (27, &v31)] {
-            import(&mut hidden, &mut ranks, rank, set.clone());
-        }
-        assert!(hidden.contains_key(&(room, k)));
-    }
-
     /// The ranked rule never removes what the successor or the user own, keeps
     /// an archive both generations hold, and still lets a later generation
     /// delete it.
@@ -8774,43 +8720,6 @@ pub(crate) struct LegacyHiddenRanks {
     pub(crate) authority: Option<u32>,
     /// Entries a predecessor supplied, by the rank that supplied them.
     pub(crate) provenance: HashMap<(ed25519_dalek::VerifyingKey, MemberId), u32>,
-    /// Every predecessor archive set seen this session, by rank: what
-    /// [`union_resurrections`] compares.
-    pub(crate) seen:
-        std::collections::BTreeMap<u32, HashMap<(ed25519_dalek::VerifyingKey, MemberId), u64>>,
-}
-
-/// Archive entries an earlier UNION migration resurrected into the newest
-/// predecessor (#776; #772's migration wrote them). The signature: the
-/// newest predecessor seen (A) holds the entry; the next-newer predecessor
-/// that answered (B) does not; and some generation older than B holds it with
-/// the SAME `hidden_at_ts`. A union copied it from that older generation into
-/// A after B had deleted it (an un-archive).
-///
-/// The one real archive that matches: re-archived in A, with no inbound DM
-/// since, after being un-archived in B, while an older generation still held
-/// it. Dropping it only shows the thread again; no message is lost, and the
-/// user can archive it again. Only entries a predecessor supplied are
-/// considered (the successor's own and the user's are never dropped). Pure.
-pub(crate) fn union_resurrections(
-    ranks: &LegacyHiddenRanks,
-) -> Vec<(ed25519_dalek::VerifyingKey, MemberId)> {
-    let mut newest_first = ranks.seen.iter().rev();
-    let (Some((_, a)), Some((&b_rank, b))) = (newest_first.next(), newest_first.next()) else {
-        return Vec::new();
-    };
-    let older: Vec<_> = ranks.seen.range(..b_rank).map(|(_, set)| set).collect();
-    let mut out: Vec<_> = a
-        .iter()
-        .filter(|(key, ts)| {
-            ranks.provenance.contains_key(key)
-                && !b.contains_key(key)
-                && older.iter().any(|set| set.get(key) == Some(ts))
-        })
-        .map(|(key, _)| *key)
-        .collect();
-    out.sort_by_key(|(vk, peer)| (vk.to_bytes(), *peer));
-    out
 }
 
 static LEGACY_HIDDEN_RANKS: std::sync::LazyLock<Mutex<LegacyHiddenRanks>> =
@@ -8884,13 +8793,6 @@ pub(crate) fn apply_legacy_hidden_import(
     rank: u32,
     suppressed: &HashSet<(ed25519_dalek::VerifyingKey, MemberId)>,
 ) -> Vec<String> {
-    let set = ranks.seen.entry(rank).or_default();
-    for e in &entries {
-        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&e.room_owner_vk) {
-            let ts = set.entry((vk, e.peer)).or_insert(e.hidden_at_ts);
-            *ts = (*ts).max(e.hidden_at_ts);
-        }
-    }
     let plan = plan_legacy_hidden_import(rank, entries, ranks);
     for key in &plan.remove {
         if ranks.provenance.remove(key).is_some() {
@@ -8922,11 +8824,6 @@ pub(crate) fn apply_legacy_hidden_import(
         *slot = (*slot).max(rank);
     }
     ranks.authority = Some(ranks.authority.map_or(rank, |a| a.max(rank)));
-    // Heal what #772's union migration resurrected (see `union_resurrections`).
-    for key in union_resurrections(ranks) {
-        ranks.provenance.remove(&key);
-        hidden.remove(&key);
-    }
     diagnostics
 }
 

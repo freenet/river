@@ -412,12 +412,7 @@ predecessor whose set was applied is authoritative, an older one's set is
 ignored, and a newer one removes entries an older one supplied that it no
 longer holds (`apply_legacy_hidden_import`; the successor's own and the user's
 entries are never removed by it). The walk, the top-up and the sweep all go
-through it. It also heals entries #772's union migration resurrected
-(`union_resurrections`): an entry the newest predecessor holds, the next-newer
-answering predecessor lacks, and an older one holds at the SAME `hidden_at_ts`
-is dropped. The only real archive with that signature is one re-archived with
-no inbound DM since after being un-archived a generation earlier; dropping it
-only shows the thread again. There is no "a newer outbound DM supersedes the entry" repair: an
+through it. There is no "a newer outbound DM supersedes the entry" repair: an
 archive's `hidden_at_ts` is the newest INBOUND timestamp, not the archive time,
 so it would un-archive every thread the user replied to and then archived.
 
