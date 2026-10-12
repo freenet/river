@@ -227,6 +227,11 @@ pub(crate) const SHORT_INDEX_KEY: &[u8] = b"__river_migration_short_index__";
 /// What [`SHORT_INDEX_KEY`] holds.
 pub(crate) type ShortIndexRecord = Vec<([u8; 32], [u8; 32])>;
 
+/// The DM-archive ranks of #776 (`chat_delegate::HiddenRanksRecord`),
+/// persisted so the ranked rule and the heal hold across page loads (#768
+/// round 4, S1). River's own bookkeeping, never migrated.
+pub(crate) const HIDDEN_RANKS_KEY: &[u8] = b"__river_migration_hidden_ranks__";
+
 /// The digest a [`SHORT_INDEX_KEY`] entry records.
 pub(crate) fn short_index_digest(raw_index: &[u8], rooms_meta: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
@@ -262,6 +267,7 @@ pub(crate) fn is_migration_bookkeeping_key(key: &[u8]) -> bool {
         || key == WALK_CADENCE_KEY
         || key == TOPUP_WINDOW_KEY
         || key == SHORT_INDEX_KEY
+        || key == HIDDEN_RANKS_KEY
         || key == KEY_INDEX_STORAGE_KEY
         || key == KV_INTENT_STORAGE_KEY
 }
@@ -2194,6 +2200,49 @@ async fn salvage_short_index_rooms<C: RiverDelegateChannel, S: RiverImportSeam>(
             warn!("short-index salvage: could not record the refusal ({e})");
         }
     }
+}
+
+/// Read [`HIDDEN_RANKS_KEY`] (`Ok(None)` when none is stored). An undecodable
+/// record reads as none: it only weakens the cross-load rule to the
+/// session-scoped one, and the next store rewrites it.
+pub(crate) async fn read_hidden_ranks_record<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+) -> Result<Option<chat_delegate::HiddenRanksRecord>, String> {
+    Ok(get_current(channel, successor, HIDDEN_RANKS_KEY.to_vec())
+        .await?
+        .and_then(|bytes| ciborium::from_reader(bytes.as_slice()).ok()))
+}
+
+/// Store [`HIDDEN_RANKS_KEY`], awaiting the delegate's ack.
+pub(crate) async fn store_hidden_ranks_record<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+    record: &chat_delegate::HiddenRanksRecord,
+) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(record, &mut bytes).map_err(|e| e.to_string())?;
+    put_current(channel, successor, HIDDEN_RANKS_KEY.to_vec(), &bytes).await
+}
+
+/// Persist this session's DM-archive ranks in the background, once the
+/// record was read this session (best effort: a lost write weakens the next
+/// load to the session-scoped rule, it loses no data).
+pub(crate) fn persist_hidden_ranks() {
+    let Some(record) = chat_delegate::hidden_ranks_record_to_store() else {
+        return;
+    };
+    crate::util::safe_spawn_local(async move {
+        if let Err(e) = store_hidden_ranks_record(
+            &NodeDelegateChannel,
+            &chat_delegate::current_delegate_key(),
+            &record,
+        )
+        .await
+        {
+            warn!("could not persist the DM-archive ranks ({e}); the next load retries");
+        }
+    });
 }
 
 /// Read [`SHORT_INDEX_KEY`] (`Ok(empty)` when none is stored).
@@ -5393,6 +5442,76 @@ mod tests {
             seam.dm_merges[0].hidden_threads.is_empty(),
             "hidden threads are never re-merged by the top-up"
         );
+    }
+
+    /// #768 round 4, S1: the #776 ranked rule holds ACROSS page loads, in both
+    /// orders. Each load starts a new session whose ranks come only from the
+    /// persisted record (stored and read through the production functions),
+    /// and whose archive state is what the previous load left in the store.
+    #[test]
+    fn the_archive_ranks_hold_across_page_loads_in_both_orders() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::room_state::member::MemberId;
+        let room = vk(1);
+        let peer = MemberId(FastHash(2));
+        let k = river_core::chat_delegate::HiddenDmThreadEntry {
+            room_owner_vk: room.to_bytes(),
+            peer,
+            hidden_at_ts: 10,
+        };
+        let with_dms = |hidden: Vec<river_core::chat_delegate::HiddenDmThreadEntry>| {
+            let mut g = DelegateSim::default();
+            g.store.insert(
+                OUTBOUND_DMS_STORAGE_KEY.to_vec(),
+                cbor(&OutboundDmStore {
+                    entries: Vec::new(),
+                    hidden_threads: hidden,
+                }),
+            );
+            g
+        };
+        // One page load: a fresh session seam over the previous load's state.
+        let load = |channel: &MockChannel, prev: &MemorySeam| -> MemorySeam {
+            let mut seam = MemorySeam::new();
+            seam.hidden = prev.hidden.clone();
+            if let Some(record) =
+                block_on(read_hidden_ranks_record(channel, &successor_key())).unwrap()
+            {
+                seam.hidden_ranks.merge_record(&record);
+            }
+            let (_, mut seam) = walk(channel, seam);
+            block_on(store_hidden_ranks_record(
+                channel,
+                &successor_key(),
+                &seam.hidden_ranks.to_record(),
+            ))
+            .unwrap();
+            seam.dm_merges.clear();
+            seam
+        };
+        // gen 2 (newer) un-archived K; gen 1 (older) still holds it.
+        for newer_first in [true, false] {
+            let channel = MockChannel::default()
+                .with_delegate(&pred_key(0), DelegateSim::default())
+                .with_delegate(&pred_key(1), with_dms(vec![k.clone()]))
+                .with_delegate(&pred_key(2), with_dms(vec![]))
+                .with_delegate(&successor_key(), DelegateSim::default());
+            let (first, second) = if newer_first {
+                (pred_key(2), pred_key(1))
+            } else {
+                (pred_key(1), pred_key(2))
+            };
+            channel.silence(&second, true);
+            let load1 = load(&channel, &MemorySeam::new());
+            channel.silence(&second, false);
+            let load2 = load(&channel, &load1);
+            assert!(
+                !load2.hidden.contains_key(&(room, peer)),
+                "newer_first={newer_first}: the un-archived thread came back across loads \
+                 (first answered: {:?})",
+                first.bytes()[0]
+            );
+        }
     }
 
     /// #768 round 4, M1: the top-up merges DM entries without touching the
