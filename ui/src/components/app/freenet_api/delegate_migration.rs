@@ -556,15 +556,26 @@ pub(crate) struct RiverPredecessorIo<'a, C: RiverDelegateChannel> {
     /// Room slots a short-index refusal proved exist, to merge after the walk:
     /// `(predecessor, digest, [(storage key, value)])` (#768 round 3, S3).
     salvage: Vec<(DelegateKey, [u8; 32], Vec<SecretPair>)>,
-    /// This walk's answers: whether each predecessor that exported held any
-    /// data (shared with the writer for [`newest_archive_holder`]).
+    /// This walk's answers: whether each predecessor that exported holds a DM
+    /// store (shared with the writer for [`newest_archive_holder`]).
     walk_answers: WalkAnswers,
 }
 
-/// Which predecessors exported in this walk, and whether they held data.
-/// Shared between the walk's reader and writer: the walk runs newest-first,
-/// so a newer generation's answer is known before an older one is imported.
+/// Which predecessors exported in this walk, and whether each holds a DM
+/// store (`outbound_dms`). Shared between the walk's reader and writer: the
+/// walk runs newest-first, so a newer generation's answer is known before an
+/// older one is imported.
 pub(crate) type WalkAnswers = std::rc::Rc<std::cell::RefCell<HashMap<[u8; 32], bool>>>;
+
+/// Whether an export holds a DM store: the archive "data" of #776. A
+/// generation with rooms but no DM store never saved a DM store, so the user
+/// archived or un-archived nothing in it (both save the store): it holds no
+/// archive decision, and an older generation's archives may merge past it.
+pub(crate) fn holds_dm_store(pairs: &[SecretPair]) -> bool {
+    pairs
+        .iter()
+        .any(|(k, _)| k.as_slice() == OUTBOUND_DMS_STORAGE_KEY)
+}
 
 impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
     pub(crate) fn new(channel: &'a C) -> Self {
@@ -972,7 +983,7 @@ impl<C: RiverDelegateChannel> PredecessorSecretsIo for RiverPredecessorIo<'_, C>
         if let Ok(key) = <[u8; 32]>::try_from(predecessor.bytes()) {
             self.walk_answers
                 .borrow_mut()
-                .insert(key, !pairs.is_empty());
+                .insert(key, holds_dm_store(&pairs));
         }
         Ok(pairs)
     }
@@ -2199,9 +2210,13 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
 /// generation deleted; only the newest data-holding generation's set is
 /// merged, and nothing is ever removed.
 ///
-/// Every NEWER generation must be known to hold nothing: it exported nothing
-/// earlier in this walk (`answered`), or it is resolved by the journal and
-/// not data-bearing, or pending but typed "not installed" (by its
+/// Every NEWER generation must be known to hold no archive data, meaning no
+/// DM store: it exported no DM store earlier in this walk (`answered`; rooms
+/// alone do not count, see [`holds_dm_store`]), or it is resolved by the
+/// journal and not data-bearing (the journal does not record which items,
+/// so a generation resolved data-bearing in an EARLIER load counts as
+/// holding archives, the conservative side), or pending but typed "not
+/// installed" (by its
 /// last walk's absent streak, or by this walk's pre-warm: a generation this
 /// node never ran is never resolved). A newer generation that holds data, is
 /// silent, was refused, or is missing from an unreadable journal makes this
@@ -5797,6 +5812,27 @@ mod tests {
             seam.hidden.contains_key(&key),
             "a newer generation not installed defers"
         );
+    }
+
+    /// #776: archive "data" means a DM store. A newer generation that holds
+    /// rooms but no DM store never recorded an archive decision (archiving and
+    /// un-archiving both save the DM store), so the older generation's archive
+    /// merges past it.
+    #[test]
+    fn a_newer_generation_with_rooms_but_no_dm_store_lets_older_archives_in() {
+        let (channel, key, _) = archive_fixture(None);
+        let r = vk(9);
+        channel.put(
+            &pred_key(2),
+            &chat_delegate::room_storage_key(&r),
+            &cbor(&RoomSlot::Present(Box::new(room_with_identity(r, 5)))),
+        );
+        let seam = archive_load(&channel, &MemorySeam::new());
+        assert!(
+            seam.rooms.map.contains_key(&r),
+            "the newer generation's room imported"
+        );
+        assert!(seam.hidden.contains_key(&key), "the older archive merges");
     }
 
     /// #776 across page loads, NEWER generation silent first: load 1 must not

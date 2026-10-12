@@ -409,8 +409,12 @@ thread deletes its `hidden_threads` entry with no tombstone, so merging an
 older generation's archives can bring back one the user removed in a newer
 generation. Only the NEWEST predecessor holding archive data has its
 `hidden_threads` merged (`newest_archive_holder`): every newer generation must
-be known to hold nothing (it exported nothing earlier in the same walk, or the
-journal resolved it as not data-bearing, or it is typed "not installed").
+be known to hold no DM store (it exported none earlier in the same walk, or
+the journal resolved it as not data-bearing, or it is typed "not installed").
+A generation with rooms but no DM store counts as holding none: archiving and
+un-archiving both save the store, so it holds no archive decision. A
+generation resolved data-bearing in an EARLIER load counts as holding one,
+because the journal does not record which items it held.
 Otherwise that generation's archives are skipped. The walk runs newest-first,
 so a newer answer is known first. Nothing is ever removed. The sweep and the
 top-up never merge archives; the walk does, and it imports every

@@ -1294,6 +1294,13 @@ mod tests {
             !body.contains("store_walk_cadence(&channel, &successor, 0)"),
             "the cadence reset must not be written before the walk runs"
         );
+        // S-C (#768 round 4): the recorded short-index refusals reach the
+        // cadence. They are read from the record, and both the counter gate and
+        // the decision receive them (not an empty list).
+        assert!(body.contains("read_short_index_record(&channel, &successor)"));
+        let squeezed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(squeezed.contains("needs_cadence_counter(&status,&short_refused)"));
+        assert!(squeezed.contains("walk_decision(&status,&short_refused,skips)"));
         // In the driver: the reset happens at the function's own level, after
         // the early return of a run without a walk, and before the walk.
         let run = block(
