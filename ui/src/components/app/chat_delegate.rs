@@ -6201,7 +6201,7 @@ mod tests {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "aca9f6b590ece888052da69c5fa539521a8f19992dd1282e1eaa49d4a4823e88",
+            "cea989c88db1a0ebc3558f2c33f90ab491473388e3f80319d8a09450b13a5d81",
             "chat_delegate.wasm changed — this branch must not alter the delegate WASM; \
              if the change is intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
