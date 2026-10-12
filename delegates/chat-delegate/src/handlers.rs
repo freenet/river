@@ -19,8 +19,19 @@ impl SecretStore for DelegateCtx {
     fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
         DelegateCtx::get_secret(self, key)
     }
+    /// The host's answer in the delegate. Natively the context stores nothing
+    /// and always answers `false`; the handlers' native tests (which never
+    /// read back) then behave as before the write checks became uniform.
     fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
-        DelegateCtx::set_secret(self, key, value)
+        #[cfg(target_family = "wasm")]
+        {
+            DelegateCtx::set_secret(self, key, value)
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let _ = DelegateCtx::set_secret(self, key, value);
+            true
+        }
     }
     fn remove_secret(&mut self, key: &[u8]) {
         let _ = DelegateCtx::remove_secret(self, key);
@@ -193,6 +204,137 @@ pub(crate) fn handle_application_message(
 // Key-Value Storage Handlers
 // ============================================================================
 
+// ============================================================================
+// Crash-safe key-value writes (freenet/river#592, #768 review)
+// ============================================================================
+//
+// A store of a NEW key, and a delete of a listed key, each take two writes: the
+// value and the key index. A crash (a node restart, a killed process) between
+// them must never wedge the store or lose a value. So such an operation first
+// records its intent under `<origin>:::kv_intent`, then writes, then clears the
+// intent; and every key-value operation first recovers a recorded intent
+// ([`open_kv`]): an interrupted add indexes the key if its value landed, an
+// interrupted delete finishes. Recovery is idempotent, so a crash during it is
+// recovered the next time. Writes to an already-listed key are one write and
+// need no intent.
+//
+// The index itself is created (empty) before the first value is ever written,
+// so a stored key can never exist without an index: an index that reads back
+// absent beside a stored key is therefore a read fault (freenet-core#5857),
+// and is refused rather than rewritten short ([`get_key_index`]).
+
+/// Suffix of the per-origin intent record (see the section docs).
+const KV_INTENT_SUFFIX: &str = "::kv_intent";
+
+/// A multi-write key-value operation in flight (see the section docs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum KvIntent {
+    /// Store a key the index does not list yet.
+    Add(ChatDelegateKey),
+    /// Delete a key the index lists.
+    Delete(ChatDelegateKey),
+}
+
+fn create_intent_key(origin: &Origin) -> Vec<u8> {
+    format!(
+        "{}{}{}",
+        origin.to_b58(),
+        ORIGIN_KEY_SEPARATOR,
+        KV_INTENT_SUFFIX
+    )
+    .into_bytes()
+}
+
+/// Write `value` under `key`, or fail.
+fn put_secret(
+    ctx: &mut impl SecretStore,
+    key: &[u8],
+    value: &[u8],
+    what: &str,
+) -> Result<(), DelegateError> {
+    if ctx.set_secret(key, value) {
+        Ok(())
+    } else {
+        Err(DelegateError::Other(format!(
+            "Failed to store {what} via host function"
+        )))
+    }
+}
+
+fn record_intent(
+    ctx: &mut impl SecretStore,
+    origin: &Origin,
+    intent: &KvIntent,
+) -> Result<(), DelegateError> {
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(intent, &mut bytes)
+        .map_err(|e| DelegateError::Deser(format!("Failed to serialize intent: {e}")))?;
+    put_secret(
+        ctx,
+        &create_intent_key(origin),
+        &bytes,
+        "the key-value intent",
+    )
+}
+
+/// Open the key-value store for an operation: read (or first create) the key
+/// index, and finish any operation a crash interrupted. Returns the index.
+fn open_kv(ctx: &mut impl SecretStore, origin: &Origin) -> Result<KeyIndex, DelegateError> {
+    let index_key = create_index_key(origin);
+    let mut index = get_key_index(ctx, origin, &index_key)?;
+    let intent_key = create_intent_key(origin);
+    if let Some(bytes) = ctx.get_secret(&intent_key) {
+        match ciborium::from_reader::<KvIntent, _>(bytes.as_slice()) {
+            Ok(KvIntent::Add(key)) => {
+                // Index the key if its value landed; if it did not, the store
+                // was never acknowledged and there is nothing to keep.
+                let landed = ctx.get_secret(&create_origin_key(origin, &key)).is_some();
+                if landed && !index.keys.contains(&key) {
+                    index.keys.push(key);
+                    set_key_index(ctx, &index_key, &index)?;
+                }
+            }
+            Ok(KvIntent::Delete(key)) => {
+                if index.keys.contains(&key) {
+                    index.keys.retain(|k| k != &key);
+                    set_key_index(ctx, &index_key, &index)?;
+                }
+                ctx.remove_secret(&create_origin_key(origin, &key));
+            }
+            Err(e) => logging::info(&format!(
+                "Dropping an undecodable key-value intent record: {e}"
+            )),
+        }
+        ctx.remove_secret(&intent_key);
+    }
+    Ok(index)
+}
+
+/// Write `enveloped` under `key`: one write when the index already lists the
+/// key, otherwise intent, value, index, clear (see the section docs).
+fn write_value(
+    ctx: &mut impl SecretStore,
+    origin: &Origin,
+    index: &mut KeyIndex,
+    key: &ChatDelegateKey,
+    enveloped: &[u8],
+) -> Result<(), DelegateError> {
+    let secret_key = create_origin_key(origin, key);
+    if index.keys.contains(key) {
+        return put_secret(ctx, &secret_key, enveloped, "secret");
+    }
+    record_intent(ctx, origin, &KvIntent::Add(key.clone()))?;
+    put_secret(ctx, &secret_key, enveloped, "secret")?;
+    index.keys.push(key.clone());
+    set_key_index(ctx, &create_index_key(origin), index)?;
+    ctx.remove_secret(&create_intent_key(origin));
+    logging::info(&format!(
+        "Added key to index, now has {} keys",
+        index.keys.len()
+    ));
+    Ok(())
+}
+
 /// Handle a store request - stores value and updates the index
 fn handle_store_request(
     ctx: &mut impl SecretStore,
@@ -200,45 +342,21 @@ fn handle_store_request(
     key: ChatDelegateKey,
     value: Vec<u8>,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    // Create a unique key for this origin's data
-    let secret_key = create_origin_key(origin, &key);
-    let index_key = create_index_key(origin);
-
-    // Read the index FIRST: an index that exists but does not decode fails
-    // the request before anything is written (freenet/river#592), rather than
-    // being replaced by a one-key index that hides every other key.
-    let mut key_index = get_key_index(ctx, origin, &index_key)?;
+    // Open the store FIRST: an index that exists but does not decode, or reads
+    // back absent beside a stored key, fails the request before anything is
+    // written (freenet/river#592), and an interrupted earlier write is finished.
+    let mut key_index = open_kv(ctx, origin)?;
 
     // Wrap the value in a versioned envelope, bumping the generation, so
     // that plain (non-CAS) writers stay consistent with CAS readers and
     // never leave an un-versioned value behind (freenet/river#345).
+    let secret_key = create_origin_key(origin, &key);
     let enveloped = apply_unconditional_store(ctx.get_secret(&secret_key).as_deref(), &value);
-
-    // Store the value directly via host function
-    // Note: In WASM, set_secret returns true on success. In non-WASM tests, it always returns false.
-    #[cfg(target_family = "wasm")]
-    if !ctx.set_secret(&secret_key, &enveloped) {
-        return Err(DelegateError::Other(
-            "Failed to store secret via host function".into(),
-        ));
-    }
-    #[cfg(not(target_family = "wasm"))]
-    let _ = ctx.set_secret(&secret_key, &enveloped);
-
+    write_value(ctx, origin, &mut key_index, &key, &enveloped)?;
     logging::info(&format!(
         "Stored secret with key length {}",
         secret_key.len()
     ));
-
-    // Update the key index (read above, before the value was written).
-    if !key_index.keys.contains(&key) {
-        key_index.keys.push(key.clone());
-        set_key_index(ctx, &index_key, &key_index)?;
-        logging::info(&format!(
-            "Added key to index, now has {} keys",
-            key_index.keys.len()
-        ));
-    }
 
     // Create response for the client
     let response = ChatDelegateResponseMsg::StoreResponse {
@@ -281,34 +399,31 @@ fn handle_get_request(
 /// see the "generation resets on delete" section in `versioning.rs` before
 /// wiring a delete for a key that uses compare-and-swap.
 ///
-/// The index is updated BEFORE the value is removed, and only when it lists
-/// the key (freenet/river#592). So a failed index write leaves the key listed
-/// AND present, never a listed key with no value (a "stale" entry a migration
-/// reader cannot tell from a failed read), and a delete of an unlisted key
-/// never rewrites the index at all.
+/// A listed key is deleted as intent, index, value, clear, so a crash anywhere
+/// is finished by the next operation ([`open_kv`]); the index is never left
+/// listing a key with no value (a "stale" entry a migration reader cannot tell
+/// from a failed read). A delete of an unlisted key never rewrites the index.
 fn handle_delete_request(
     ctx: &mut impl SecretStore,
     origin: &Origin,
     key: ChatDelegateKey,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    // Create keys
     let secret_key = create_origin_key(origin, &key);
     let index_key = create_index_key(origin);
-
-    // Update the key index first, and only if it lists the key. An index that
-    // does not decode fails the request before anything is removed.
-    let mut key_index = get_key_index(ctx, origin, &index_key)?;
+    let mut key_index = open_kv(ctx, origin)?;
     if key_index.keys.contains(&key) {
+        record_intent(ctx, origin, &KvIntent::Delete(key.clone()))?;
         key_index.keys.retain(|k| k != &key);
         set_key_index(ctx, &index_key, &key_index)?;
+        ctx.remove_secret(&secret_key);
+        ctx.remove_secret(&create_intent_key(origin));
         logging::info(&format!(
             "Removed key from index, now has {} keys",
             key_index.keys.len()
         ));
+    } else {
+        ctx.remove_secret(&secret_key);
     }
-
-    // Remove the secret via host function
-    ctx.remove_secret(&secret_key);
     logging::info("Removed secret");
 
     // Create response for the client
@@ -325,13 +440,12 @@ fn handle_list_request(
     ctx: &mut impl SecretStore,
     origin: &Origin,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    let index_key = create_index_key(origin);
-
-    // Get the key index directly. An index that exists but does not decode
-    // is an error, never an empty list (freenet/river#592): a migration
-    // reading this delegate as a predecessor would otherwise certify a short
-    // export as everything it holds.
-    let key_index = get_key_index(ctx, origin, &index_key)?;
+    // An index that exists but does not decode, or reads back absent beside a
+    // stored key, is an error, never an empty list (freenet/river#592): a
+    // migration reading this delegate as a predecessor would otherwise certify
+    // a short export as everything it holds. An interrupted write is finished
+    // first, so the listing includes every value that landed.
+    let key_index = open_kv(ctx, origin)?;
     logging::info(&format!(
         "Returning list with {} keys",
         key_index.keys.len()
@@ -382,9 +496,8 @@ fn handle_cas_store_request(
     expected_generation: u64,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let secret_key = create_origin_key(origin, &key);
-    let index_key = create_index_key(origin);
-    // Read the index before writing anything (see `handle_store_request`).
-    let mut key_index = get_key_index(ctx, origin, &index_key)?;
+    // Open the store before writing anything (see `handle_store_request`).
+    let mut key_index = open_kv(ctx, origin)?;
 
     let result = match apply_cas_store(
         ctx.get_secret(&secret_key).as_deref(),
@@ -392,27 +505,15 @@ fn handle_cas_store_request(
         expected_generation,
     ) {
         CasOutcome::Stored { generation, bytes } => {
-            // Note: In WASM, set_secret returns true on success. In non-WASM
-            // tests, it always returns false (storage is a no-op there).
-            #[cfg(target_family = "wasm")]
-            if !ctx.set_secret(&secret_key, &bytes) {
+            // A conflict writes nothing; a match writes as the plain store does
+            // (one write for a listed key, else intent, value, index, clear).
+            if let Err(e) = write_value(ctx, origin, &mut key_index, &key, &bytes) {
                 let response = ChatDelegateResponseMsg::CasStoreResponse {
                     key,
-                    result: CasStoreResult::Failed(
-                        "Failed to store secret via host function".into(),
-                    ),
+                    result: CasStoreResult::Failed(format!("{e:?}")),
                 };
                 return Ok(vec![create_app_response(&response)?]);
             }
-            #[cfg(not(target_family = "wasm"))]
-            let _ = ctx.set_secret(&secret_key, &bytes);
-
-            // Update the key index (same as the plain store path).
-            if !key_index.keys.contains(&key) {
-                key_index.keys.push(key.clone());
-                set_key_index(ctx, &index_key, &key_index)?;
-            }
-
             logging::info(&format!("CasStore stored at generation {generation}"));
             CasStoreResult::Stored { generation }
         }
@@ -609,6 +710,12 @@ fn get_key_index(
                 )));
             }
         }
+        // Genuinely fresh: create the (empty) index now, before any value is
+        // written, so no stored key can ever exist without one. A crash before
+        // this write leaves nothing stored; one after it leaves an empty index.
+        let empty = KeyIndex::default();
+        set_key_index(ctx, index_key, &empty)?;
+        return Ok(empty);
     }
     decode_key_index(stored.as_deref())
 }
@@ -636,17 +743,7 @@ fn set_key_index(
     ciborium::ser::into_writer(key_index, &mut index_bytes)
         .map_err(|e| DelegateError::Deser(format!("Failed to serialize key index: {e}")))?;
 
-    // Note: In WASM, set_secret returns true on success. In non-WASM tests, it always returns false.
-    #[cfg(target_family = "wasm")]
-    if !ctx.set_secret(index_key, &index_bytes) {
-        return Err(DelegateError::Other(
-            "Failed to store key index via host function".into(),
-        ));
-    }
-    #[cfg(not(target_family = "wasm"))]
-    let _ = ctx.set_secret(index_key, &index_bytes);
-
-    Ok(())
+    put_secret(ctx, index_key, &index_bytes, "key index")
 }
 
 // ============================================================================
@@ -1156,6 +1253,18 @@ mod tests {
         map: BTreeMap<Vec<u8>, Vec<u8>>,
         /// Every mutation, in order: ("set" | "remove", key).
         log: Vec<(&'static str, Vec<u8>)>,
+        /// A crash: once this many mutations have run, every later one fails
+        /// (a set returns `false`, a remove does nothing), as if the process
+        /// had died between two writes.
+        crash_after: Option<usize>,
+        mutations: usize,
+    }
+
+    impl FakeSecrets {
+        fn crashed(&mut self) -> bool {
+            self.mutations += 1;
+            self.crash_after.is_some_and(|n| self.mutations > n)
+        }
     }
 
     impl SecretStore for FakeSecrets {
@@ -1163,11 +1272,17 @@ mod tests {
             self.map.get(key).cloned()
         }
         fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
+            if self.crashed() {
+                return false;
+            }
             self.log.push(("set", key.to_vec()));
             self.map.insert(key.to_vec(), value.to_vec());
             true
         }
         fn remove_secret(&mut self, key: &[u8]) {
+            if self.crashed() {
+                return;
+            }
             self.log.push(("remove", key.to_vec()));
             self.map.remove(key);
         }
@@ -1273,11 +1388,20 @@ mod tests {
         let mut f = store_with(&["room:a", "room:b"]);
         handle_delete_request(&mut f, &origin(), ck("room:a")).unwrap();
         assert_eq!(index_of(&f), vec![ck("room:b")]);
-        let order: Vec<_> = f.log.iter().map(|(op, _)| *op).collect();
-        assert_eq!(order, vec!["set", "remove"], "index first, then the value");
-
-        // (The failed-index-write half, "the value stays", cannot run natively:
-        // the `set_secret` failure checks are `#[cfg(target_family = "wasm")]`.)
+        let intent = create_intent_key(&origin());
+        let index = create_index_key(&origin());
+        let value = create_origin_key(&origin(), &ck("room:a"));
+        let order: Vec<_> = f.log.iter().map(|(op, k)| (*op, k.clone())).collect();
+        assert_eq!(
+            order,
+            vec![
+                ("set", intent.clone()),
+                ("set", index),
+                ("remove", value),
+                ("remove", intent)
+            ],
+            "intent, index, value, clear (crash-safe: see the crash tests)"
+        );
     }
 
     #[test]
@@ -1344,5 +1468,200 @@ mod tests {
         let mut fresh = FakeSecrets::default();
         handle_store_request(&mut fresh, &origin(), ck("rooms_meta"), b"m".to_vec()).unwrap();
         assert_eq!(index_of(&fresh), vec![ck("rooms_meta")]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Crash between ANY two writes (#768 review, item 7): fail after each
+    // individual write of each operation, restart, and show that the next
+    // list, store, CAS and delete all succeed and nothing acknowledged is
+    // lost. Atomicity of the interrupted operation itself: it either took
+    // effect (its key listed AND readable) or did not (unlisted AND absent),
+    // never half (listed with no value, or a value nothing lists).
+    // ---------------------------------------------------------------------
+
+    fn listed(f: &mut FakeSecrets) -> Vec<ChatDelegateKey> {
+        match extract_response(handle_list_request(f, &origin()).expect("list after a crash"))
+            .unwrap()
+        {
+            ChatDelegateResponseMsg::ListResponse { keys } => keys,
+            other => panic!("expected ListResponse, got {other:?}"),
+        }
+    }
+
+    fn value_of(f: &FakeSecrets, k: &str) -> Option<Vec<u8>> {
+        read_versioned(
+            f.map
+                .get(&create_origin_key(&origin(), &ck(k)))
+                .map(|v| v.as_slice()),
+        )
+        .0
+    }
+
+    /// After recovery: every listed key is readable, every readable
+    /// (non-bookkeeping) key is listed, and the four operations work.
+    fn assert_recovers(mut f: FakeSecrets, must_keep: &[&str], what: &str) {
+        f.crash_after = None;
+        let keys = listed(&mut f);
+        for k in &keys {
+            assert!(
+                value_of(&f, std::str::from_utf8(&k.0).unwrap()).is_some(),
+                "{what}: {k:?} listed with no value"
+            );
+        }
+        for k in must_keep {
+            assert!(
+                keys.contains(&ck(k)),
+                "{what}: acknowledged {k} lost from the listing"
+            );
+            assert!(value_of(&f, k).is_some(), "{what}: acknowledged {k} lost");
+        }
+        // Every stored origin key (other than bookkeeping) is listed.
+        let prefix = format!("{}{}", origin().to_b58(), ORIGIN_KEY_SEPARATOR).into_bytes();
+        for raw in f.map.keys().filter(|k| k.starts_with(&prefix)) {
+            let k = &raw[prefix.len()..];
+            if k == KEY_INDEX_SUFFIX.as_bytes() || k == KV_INTENT_SUFFIX.as_bytes() {
+                continue;
+            }
+            assert!(
+                keys.contains(&ChatDelegateKey(k.to_vec())),
+                "{what}: a stored value nothing lists: {:?}",
+                String::from_utf8_lossy(k)
+            );
+        }
+        assert!(
+            !f.map.contains_key(&create_intent_key(&origin())),
+            "{what}: the intent is cleared"
+        );
+        handle_store_request(&mut f, &origin(), ck("room:new"), b"n".to_vec())
+            .unwrap_or_else(|e| panic!("{what}: store after recovery: {e:?}"));
+        handle_cas_store_request(&mut f, &origin(), ck("room:cas"), b"c".to_vec(), 0)
+            .unwrap_or_else(|e| panic!("{what}: CAS after recovery: {e:?}"));
+        handle_delete_request(&mut f, &origin(), ck("room:new"))
+            .unwrap_or_else(|e| panic!("{what}: delete after recovery: {e:?}"));
+        let keys = listed(&mut f);
+        assert!(
+            keys.contains(&ck("room:cas")) && !keys.contains(&ck("room:new")),
+            "{what}"
+        );
+        for k in must_keep {
+            assert!(
+                keys.contains(&ck(k)),
+                "{what}: {k} lost after the follow-up ops"
+            );
+        }
+    }
+
+    /// Writes an operation makes on `start`, counted on a crash-free copy.
+    fn writes_of(start: &FakeSecrets, op: &dyn Fn(&mut FakeSecrets)) -> usize {
+        let mut f = FakeSecrets {
+            map: start.map.clone(),
+            ..Default::default()
+        };
+        op(&mut f);
+        f.mutations
+    }
+
+    fn crash_at_every_write(
+        start: FakeSecrets,
+        op: &dyn Fn(&mut FakeSecrets),
+        keep: &[&str],
+        what: &str,
+    ) {
+        let n = writes_of(&start, op);
+        assert!(n > 0, "{what}: the operation must write");
+        for crash_after in 0..n {
+            let mut f = FakeSecrets {
+                map: start.map.clone(),
+                crash_after: Some(crash_after),
+                ..Default::default()
+            };
+            op(&mut f);
+            assert_recovers(
+                f,
+                keep,
+                &format!("{what}, crash after write {crash_after} of {n}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_crash_between_any_two_writes_of_a_store_wedges_nothing() {
+        let op = |f: &mut FakeSecrets| {
+            let _ = handle_store_request(f, &origin(), ck("rooms_meta"), b"m".to_vec());
+        };
+        crash_at_every_write(
+            store_with(&["room:a"]),
+            &op,
+            &["room:a"],
+            "store new witness key",
+        );
+        let op2 = |f: &mut FakeSecrets| {
+            let _ = handle_store_request(f, &origin(), ck("room:a"), b"m2".to_vec());
+        };
+        crash_at_every_write(
+            store_with(&["room:a"]),
+            &op2,
+            &["room:a"],
+            "store listed key",
+        );
+    }
+
+    #[test]
+    fn a_crash_between_any_two_writes_of_a_cas_wedges_nothing() {
+        let op = |f: &mut FakeSecrets| {
+            let _ = handle_cas_store_request(f, &origin(), ck("room:b"), b"b".to_vec(), 0);
+        };
+        crash_at_every_write(store_with(&["room:a"]), &op, &["room:a"], "CAS new key");
+    }
+
+    #[test]
+    fn a_crash_between_any_two_writes_of_a_delete_wedges_nothing() {
+        let op = |f: &mut FakeSecrets| {
+            let _ = handle_delete_request(f, &origin(), ck("room:a"));
+        };
+        crash_at_every_write(
+            store_with(&["room:a", "rooms_meta"]),
+            &op,
+            &["rooms_meta"],
+            "delete listed key",
+        );
+    }
+
+    /// The first load of a fresh delegate: list creates the empty index, then
+    /// the first store writes a witness key (`rooms_meta`). A crash at any
+    /// write of that sequence never leaves a witness without an index (the
+    /// refusal that used to lock the user out for good).
+    #[test]
+    fn a_crash_during_the_first_load_and_first_store_wedges_nothing() {
+        let op = |f: &mut FakeSecrets| {
+            if handle_list_request(f, &origin()).is_ok() {
+                let _ = handle_store_request(f, &origin(), ck("rooms_meta"), b"m".to_vec());
+            }
+        };
+        crash_at_every_write(
+            FakeSecrets::default(),
+            &op,
+            &[],
+            "first load + first witness store",
+        );
+        // And a first STORE without a list before it.
+        let op2 = |f: &mut FakeSecrets| {
+            let _ = handle_store_request(f, &origin(), ck("rooms_meta"), b"m".to_vec());
+        };
+        crash_at_every_write(FakeSecrets::default(), &op2, &[], "first witness store");
+    }
+
+    /// The A5 guarantee holds alongside crash recovery: an index that reads
+    /// back ABSENT beside a stored witness (a read fault, not a crash: a crash
+    /// cannot produce it, since the index is created before any value) is
+    /// refused, never rewritten short, on every path.
+    #[test]
+    fn recovery_never_rewrites_a_short_index_over_a_read_fault() {
+        let mut f = store_with(&["rooms_meta", "room:a"]);
+        f.map.remove(&create_index_key(&origin()));
+        let before = f.map.clone();
+        assert!(handle_list_request(&mut f, &origin()).is_err());
+        assert!(handle_store_request(&mut f, &origin(), ck("room:b"), b"x".to_vec()).is_err());
+        assert_eq!(f.map, before);
     }
 }
