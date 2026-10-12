@@ -845,8 +845,50 @@ impl<C: RiverDelegateChannel> PredecessorSecretsIo for RiverPredecessorIo<'_, C>
                 }
             }
         }
+        // The common #592 shape (#768 round 2 item 9): the short index was
+        // rewritten by a later `rooms_meta` store, so it lists `rooms_meta`
+        // and passes the fixed-key check above while room A's slot (and its
+        // `self_sk`) is stored but unlisted. `rooms_meta` names the rooms the
+        // generation held: probe each named room slot that is not listed.
+        let named = pairs
+            .iter()
+            .find(|(k, _)| k.as_slice() == ROOMS_META_KEY)
+            .and_then(|(_, v)| ciborium::from_reader::<RoomsMeta, _>(v.as_slice()).ok())
+            .map(|meta| rooms_named_by_meta(&meta))
+            .unwrap_or_default();
+        for vk in named {
+            let slot_key = chat_delegate::room_storage_key(&vk);
+            if listed.iter().any(|k| k.as_bytes() == slot_key.as_slice()) {
+                continue;
+            }
+            if self.get_key(predecessor, &slot_key).await?.is_some() {
+                return Err(format!(
+                    "{:?} is named by rooms_meta and stored, but the index does not list \
+                     it; the index is short (freenet/river#592)",
+                    String::from_utf8_lossy(&slot_key)
+                ));
+            }
+        }
         Ok(pairs)
     }
+}
+
+/// Every room a `rooms_meta` names: its order, its notification modes, its
+/// cursor and its identity provenance, deduplicated.
+pub(crate) fn rooms_named_by_meta(meta: &RoomsMeta) -> Vec<ed25519_dalek::VerifyingKey> {
+    let mut named: Vec<ed25519_dalek::VerifyingKey> = Vec::new();
+    let all = meta
+        .room_order
+        .iter()
+        .chain(meta.notification_modes.keys())
+        .chain(meta.current_room_key.iter())
+        .chain(meta.identity_sources.iter().map(|(vk, _)| vk));
+    for vk in all {
+        if !named.contains(vk) {
+            named.push(*vk);
+        }
+    }
+    named
 }
 
 // ---------------------------------------------------------------------------
@@ -4493,6 +4535,64 @@ mod tests {
             let (report, seam) = walk(&channel, MemorySeam::new());
             assert_gen0_refused(&report, &channel, &seam);
         }
+    }
+
+    /// #768 round 2 item 9 (migration probe R1b), the COMMON #592 shape: the
+    /// short index was rewritten by a later `rooms_meta` store, so it lists
+    /// `rooms_meta` itself and the fixed-key check passes, while room A's slot
+    /// is stored but unlisted. `rooms_meta` names A (in its order, its
+    /// notification modes, or its cursor): the probe of A's slot refuses the
+    /// export. A named room whose slot is genuinely absent is not a fault.
+    #[test]
+    fn a_short_index_that_lists_rooms_meta_is_refused_by_a_named_room() {
+        use crate::room_data::NotificationMode;
+        let (a, b) = (vk(1), vk(2));
+        let slot = |r, seed| cbor(&RoomSlot::Present(Box::new(room_with_identity(r, seed))));
+        let metas = [
+            RoomsMeta {
+                room_order: vec![b, a],
+                ..Default::default()
+            },
+            RoomsMeta {
+                notification_modes: HashMap::from([(a, NotificationMode::default())]),
+                ..Default::default()
+            },
+            RoomsMeta {
+                current_room_key: Some(a),
+                ..Default::default()
+            },
+        ];
+        for meta in metas {
+            let mut gen0 = DelegateSim::default();
+            gen0.store
+                .insert(chat_delegate::room_storage_key(&a), slot(a, 3));
+            gen0.store
+                .insert(chat_delegate::room_storage_key(&b), slot(b, 4));
+            gen0.store.insert(ROOMS_META_KEY.to_vec(), cbor(&meta));
+            gen0.listed = Some(vec![
+                chat_delegate::room_storage_key(&b),
+                ROOMS_META_KEY.to_vec(),
+            ]);
+            let channel = channel_with_gen0(gen0);
+            let (report, seam) = walk(&channel, MemorySeam::new());
+            assert_gen0_refused(&report, &channel, &seam);
+        }
+
+        // Control: rooms_meta names A, but A's slot is genuinely gone.
+        let mut gen0 = DelegateSim::default();
+        gen0.store
+            .insert(chat_delegate::room_storage_key(&b), slot(b, 4));
+        gen0.store.insert(
+            ROOMS_META_KEY.to_vec(),
+            cbor(&RoomsMeta {
+                room_order: vec![b, a],
+                ..Default::default()
+            }),
+        );
+        let channel = channel_with_gen0(gen0);
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert!(report.is_complete(), "{report:?}");
+        assert!(seam.rooms.map.contains_key(&b));
     }
 
     /// #768 review A4 (migration probe P2): an absent index beside per-room
