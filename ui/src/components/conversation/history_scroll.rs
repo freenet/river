@@ -100,7 +100,8 @@ pub(super) struct ReaderPosition {
     /// height take it back there (the ResizeObserver). The reader's first
     /// scroll away, a change of newest message (the render), a room change and
     /// the panel hiding end it; an arrival that is followed lands a new
-    /// request, which holds again.
+    /// request, which holds again. A clamp from the chat area growing keeps
+    /// it.
     end_hold: std::cell::Cell<Option<HeldView>>,
     /// The room and newest message of the last render's range (`None` for an
     /// empty range). The next render tells a change of newest message from
@@ -516,11 +517,15 @@ struct HeldView {
 }
 
 /// Does a scroll from `held` to `now`, ending `from_end` px from the
-/// scroller's absolute end, release the end hold? An upward move that ends
-/// more than 4px from the end.
+/// scroller's absolute end, release the end hold? Only a move the reader
+/// made: both edges rose and the view ended more than 4px from the end. A
+/// clamp from the chat area growing raises only the top, even with a row
+/// growing in the same frame.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn hold_released(held: HeldView, now: HeldView, from_end: i32) -> bool {
-    now.top < held.top && from_end as f64 > NEWEST_IN_VIEW_SLACK_PX
+    now.top < held.top
+        && now.bottom < held.bottom - SCROLL_TOP_SLACK_PX
+        && from_end as f64 > NEWEST_IN_VIEW_SLACK_PX
 }
 
 /// The view's edges as [`HeldView`] records them.
@@ -857,10 +862,12 @@ pub(super) fn install_scroll_settle_listener(
         cb.forget();
     }
 
-    // Release the hold on an upward scroll more than 4px from the scroller's
-    // absolute end. Accepted for now: the padding below the newest message
-    // lets this release while that message is visible and Latest stays hidden.
-    // Returns at once unless a hold is on, keeping the scroll path light (#151).
+    // Release the hold only on a move the reader made: an upward scroll that
+    // raises both of the view's edges and ends more than 4px from the
+    // scroller's absolute end (`hold_released`). Accepted for now: the padding
+    // below the newest message lets this release while that message is
+    // visible and Latest stays hidden. Returns at once unless a hold is on,
+    // keeping the scroll path light (#151).
     let release_hold = Closure::wrap(Box::new(move |_: web_sys::Event| {
         let Some(held) = reader.end_hold.get() else {
             return;
@@ -870,9 +877,11 @@ pub(super) fn install_scroll_settle_listener(
         };
         let now = view_of(&container);
         let from_end = container.scroll_height() - now.bottom;
-        // Only a move UP counts. A row growing leaves `scrollTop` alone (the
-        // ResizeObserver then takes the view back to the end), and a clamp
-        // when the history shrinks lands on the end.
+        // A row growing leaves `scrollTop` alone, and a clamp when the history
+        // shrinks lands on the end. A clamp from the chat area growing (the
+        // composer collapsing, the keyboard closing) raises only the top edge,
+        // even when a row grows in the same frame. In each case the
+        // ResizeObserver then takes the view back to the end.
         if hold_released(held, now, from_end) {
             reader.end_hold.set(None);
         } else {
@@ -1059,6 +1068,63 @@ mod tests {
                 "{what}"
             );
         }
+    }
+
+    /// Only a move the reader made releases the end hold: both of the view's
+    /// edges rise and it ends more than 4px from the end. A clamp from the
+    /// chat area growing raises only the top edge, even when a row grows in
+    /// the same frame.
+    #[test]
+    fn the_end_hold_releases_only_on_a_move_the_reader_made() {
+        let view = |top, bottom| HeldView { top, bottom };
+        let held = view(1133, 1633);
+        let mut wrong = Vec::new();
+        for (now, from_end, released, what) in [
+            (view(1073, 1573), 60, true, "the reader scrolls up 60px"),
+            (
+                view(1127, 1627),
+                6,
+                true,
+                "the reader scrolls up 6px, past the margin",
+            ),
+            (
+                view(1130, 1630),
+                3,
+                false,
+                "the reader scrolls up 3px, inside the margin",
+            ),
+            (
+                view(871, 1633),
+                0,
+                false,
+                "the composer collapses and the view clamps to the end",
+            ),
+            (
+                view(871, 1633),
+                80,
+                false,
+                "the composer collapses while the newest row grows 80px in the same frame",
+            ),
+            (
+                view(871, 1632),
+                80,
+                false,
+                "the same, with a 1px rounding difference",
+            ),
+            (
+                view(1100, 1600),
+                0,
+                false,
+                "the content shrinks and the view clamps to the end",
+            ),
+            (view(1133, 1633), 0, false, "no move"),
+            (view(1140, 1640), 0, false, "a move down"),
+        ] {
+            if hold_released(held, now, from_end) != released {
+                wrong.push(format!("{what}: expected released = {released}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// A backfill restore or head reposition measured before a request must

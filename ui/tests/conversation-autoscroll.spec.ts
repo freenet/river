@@ -1426,6 +1426,106 @@ test.describe("The end holds after an explicit request", () => {
     await expectSettledAtBottom(page, "the history reflowed taller and the held end was lost");
   });
 
+  // Clearing the draft clamps scrollTop up while the newest row grows in the same frame; the view's bottom edge stays put, so the hold does too.
+  test("the end hold keeps the end when the newest row grows in the same frame the composer collapses", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    const roomyViewport = (await scrollMetrics(page)).client;
+    const newest = await newestRowFromViewBottom(page);
+    await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      for (const type of ["scroll", "scrollend"]) {
+        c.addEventListener(type, () => {
+          (window as any).__riverLastScrollEvent = type;
+        });
+      }
+    });
+    await page.getByTestId("message-input").fill(LONG_DRAFT);
+    await expect
+      .poll(async () => (await scrollMetrics(page)).client, {
+        timeout: 5_000,
+        message:
+          "premise: the composer did not grow enough that clearing it would clamp the " +
+          "view, so this test is not exercising the same-frame race",
+      })
+      .toBeLessThan(roomyViewport - WELL_AWAY_FROM_END_PX);
+    await expectRowHeld(page, newest.key, newest.gap, "the composer grew and the newest message moved", {
+      fromBottom: "bottom",
+    });
+    // A hold_end still settling would re-record the held top after the clamp
+    // and hide the race.
+    await page.waitForFunction(
+      () => (window as any).__riverLastScrollEvent === "scrollend",
+      undefined,
+      { timeout: 5_000 },
+    );
+
+    // On `document`, so it runs after the app's own input handler has
+    // collapsed the composer, before any frame.
+    const GROWTH_PX = 80;
+    await page.evaluate(
+      ({ grow, collapsedAbove }) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const rows = c.querySelectorAll("[data-item-key]");
+        const newestRow = rows[rows.length - 1] as HTMLElement;
+        const onInput = () => {
+          // Reading clientHeight forces the collapse (and the scrollTop clamp) now.
+          const collapsed = c.clientHeight > collapsedAbove;
+          const before = c.scrollHeight;
+          newestRow.style.paddingBottom = `${grow}px`;
+          (window as any).__riverSameFrame = {
+            collapsed,
+            grew: c.scrollHeight - before,
+          };
+        };
+        document.addEventListener("input", onInput, { once: true });
+      },
+      { grow: GROWTH_PX, collapsedAbove: roomyViewport - WELL_AWAY_FROM_END_PX },
+    );
+    await page.getByTestId("message-input").fill("");
+
+    const premise = await page.evaluate(() => (window as any).__riverSameFrame);
+    expect(premise.collapsed, "premise: the composer should collapse inside the input handler").toBe(true);
+    expect(premise.grew, "premise: the newest row should have grown").toBeGreaterThan(AT_BOTTOM_EPSILON_PX);
+    await expectSettledAtBottom(
+      page,
+      "the newest row grew in the same frame the composer collapsed and the held end was lost",
+    );
+  });
+
+  // 3px up stays inside the release margin and keeps the hold; 6px up releases it.
+  for (const [up, held] of [
+    [3, true],
+    [6, false],
+  ] as const) {
+    test(`a reader ${up}px up from the end ${held ? "keeps" : "releases"} the end hold`, async ({ page }) => {
+      await openRoomAtBottom(page, "Team Chat Room");
+      const { height, client } = await scrollMetrics(page);
+      await readerScrollsWithoutGesture(page, height - client - up);
+      // The settle leaves the reader where they scrolled. A hold released
+      // inside the margin would re-arm at the settle and take them to the end.
+      const distance = await distanceFromBottom(page);
+      expect(Math.abs(distance - up), `the settle undid the reader's ${up}px scroll`).toBeLessThanOrEqual(1);
+
+      const GROWTH_PX = 30;
+      await page.evaluate((grow) => {
+        const rows = document.getElementById("chat-scroll-container")!.querySelectorAll("[data-item-key]");
+        (rows[rows.length - 1] as HTMLElement).style.paddingBottom = `${grow}px`;
+      }, GROWTH_PX);
+
+      if (held) {
+        await expectSettledAtBottom(page, `a ${up}px scroll released the end hold`);
+      } else {
+        // Long enough for a late re-land to show.
+        await page.waitForTimeout(1_000);
+        expect(await distanceFromBottom(page), `a ${up}px scroll kept the end hold`).toBeGreaterThanOrEqual(
+          up + GROWTH_PX - AT_BOTTOM_EPSILON_PX,
+        );
+      }
+    });
+  }
+
   // Tall enough that the opening's tail sits inside the backfill lead, so the
   // opening backfills: same newest message, more rows.
   test.describe("with an opening backfill", () => {
