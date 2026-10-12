@@ -4538,6 +4538,194 @@ mod tests {
         }
     }
 
+    // ===== freenet/river#776: archive entries across generations =====
+
+    type HiddenMap = HashMap<(ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry>;
+
+    fn import(
+        hidden: &mut HiddenMap,
+        ranks: &mut LegacyHiddenRanks,
+        rank: u32,
+        entries: Vec<HiddenDmThreadEntry>,
+    ) {
+        let _ = apply_legacy_hidden_import(hidden, ranks, entries, rank, &HashSet::new());
+    }
+
+    /// The #776 case: V31 (rank 27) still holds an archive entry the user
+    /// removed in V32 (rank 28) by replying. Whichever generation answers
+    /// first, the newer one's deletion wins.
+    #[test]
+    fn a_newer_generations_unarchive_wins_over_an_older_archive() {
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let stale = make_hidden_entry(room, peer, 1_000);
+        // Newest first.
+        let (mut hidden, mut ranks) = (HiddenMap::new(), LegacyHiddenRanks::default());
+        import(&mut hidden, &mut ranks, 28, vec![]);
+        import(&mut hidden, &mut ranks, 27, vec![stale.clone()]);
+        assert!(
+            hidden.is_empty(),
+            "an older archive must not resurrect: {hidden:?}"
+        );
+        // Oldest first.
+        let (mut hidden, mut ranks) = (HiddenMap::new(), LegacyHiddenRanks::default());
+        import(&mut hidden, &mut ranks, 27, vec![stale.clone()]);
+        assert!(hidden.contains_key(&(room, peer)));
+        import(&mut hidden, &mut ranks, 28, vec![]);
+        assert!(
+            hidden.is_empty(),
+            "the newer generation's deletion removes it"
+        );
+    }
+
+    /// The ranked rule never removes what the successor or the user own, keeps
+    /// an archive both generations hold, and still lets a later generation
+    /// delete it.
+    #[test]
+    fn the_ranked_archive_import_keeps_owned_and_shared_entries() {
+        let room = sk(2).verifying_key();
+        let (p1, p2, p3) = (
+            MemberId(FastHash(1)),
+            MemberId(FastHash(2)),
+            MemberId(FastHash(3)),
+        );
+        let mut hidden = HiddenMap::new();
+        // The successor's own entry (no provenance).
+        hidden.insert((room, p1), make_hidden_entry(room, p1, 50));
+        let mut ranks = LegacyHiddenRanks::default();
+        import(
+            &mut hidden,
+            &mut ranks,
+            27,
+            vec![make_hidden_entry(room, p2, 10)],
+        );
+        import(
+            &mut hidden,
+            &mut ranks,
+            28,
+            vec![
+                make_hidden_entry(room, p2, 10),
+                make_hidden_entry(room, p3, 20),
+            ],
+        );
+        assert!(
+            hidden.contains_key(&(room, p1)),
+            "owned entries are never removed"
+        );
+        assert!(
+            hidden.contains_key(&(room, p2)),
+            "an archive both generations hold stays"
+        );
+        assert!(hidden.contains_key(&(room, p3)));
+        import(
+            &mut hidden,
+            &mut ranks,
+            29,
+            vec![make_hidden_entry(room, p3, 20)],
+        );
+        assert!(hidden.contains_key(&(room, p1)));
+        assert!(
+            !hidden.contains_key(&(room, p2)),
+            "the newest generation deleted it"
+        );
+        assert!(hidden.contains_key(&(room, p3)));
+        // An older generation answering last changes nothing.
+        import(
+            &mut hidden,
+            &mut ranks,
+            27,
+            vec![make_hidden_entry(room, p2, 10)],
+        );
+        assert!(!hidden.contains_key(&(room, p2)));
+    }
+
+    /// The repair rule: an archive entry is superseded by an outbound DM to
+    /// that peer in that room NEWER than its cutoff, and only by that.
+    #[test]
+    fn a_newer_outbound_dm_supersedes_an_archive_entry() {
+        use crate::components::direct_messages::OutboundDmsCache;
+        let room = sk(3).verifying_key();
+        let other_room = sk(4).verifying_key();
+        let (peer, other) = (MemberId(FastHash(21)), MemberId(FastHash(22)));
+        let mut hidden = HiddenMap::new();
+        hidden.insert((room, peer), make_hidden_entry(room, peer, 100));
+        hidden.insert((room, other), make_hidden_entry(room, other, 100));
+        let dm = |room: ed25519_dalek::VerifyingKey, to: MemberId, ts: u64, tok: u8| {
+            let e = OutboundDmEntry {
+                room_owner_vk: room.to_bytes(),
+                sender: MemberId(FastHash(99)),
+                recipient: to,
+                purge_token: river_core::room_state::direct_messages::PurgeToken([tok; 16]),
+                timestamp: ts,
+                plaintext: "x".into(),
+            };
+            ((room, to, e.purge_token), e)
+        };
+        let mut cache = OutboundDmsCache::default();
+        for (k, e) in [
+            dm(room, peer, 100, 1),       // not newer: keeps it
+            dm(other_room, peer, 500, 2), // other room: keeps it
+            dm(room, other, 99, 3),       // older: keeps it
+        ] {
+            cache.by_token.insert(k, e);
+        }
+        assert!(hidden_superseded_by_outbound(&hidden, &cache).is_empty());
+        let (k, e) = dm(room, peer, 101, 4);
+        cache.by_token.insert(k, e);
+        assert_eq!(
+            hidden_superseded_by_outbound(&hidden, &cache),
+            vec![(room, peer)]
+        );
+    }
+
+    /// #768 round 3, N2: the top-up merges only DM entries the cache does not
+    /// already hold at least as fresh.
+    #[test]
+    fn only_entries_the_cache_does_not_hold_are_topped_up() {
+        use crate::components::direct_messages::OutboundDmsCache;
+        let room = sk(5).verifying_key();
+        let e = |tok: u8, ts: u64| OutboundDmEntry {
+            room_owner_vk: room.to_bytes(),
+            sender: MemberId(FastHash(1)),
+            recipient: MemberId(FastHash(2)),
+            purge_token: river_core::room_state::direct_messages::PurgeToken([tok; 16]),
+            timestamp: ts,
+            plaintext: "x".into(),
+        };
+        let mut cache = OutboundDmsCache::default();
+        let held = e(1, 10);
+        cache
+            .by_token
+            .insert((room, held.recipient, held.purge_token), held.clone());
+        let fresh = entries_not_held(vec![held.clone(), e(1, 11), e(2, 5)], &cache);
+        assert_eq!(fresh, vec![e(1, 11), e(2, 5)]);
+        assert!(entries_not_held(vec![held], &cache).is_empty());
+    }
+
+    /// The live hydration paths apply the #776 rules: the current delegate's
+    /// load runs the repair, and a predecessor's archive set goes through the
+    /// ranked import (the source pins for the migration seam and the sweep
+    /// are in `delegate_migration.rs` and `response_handler.rs`).
+    #[test]
+    fn the_hidden_thread_hydration_paths_apply_the_776_rules() {
+        let src = include_str!("chat_delegate.rs");
+        let body = |anchor: &str| -> &str {
+            let start = src.find(anchor).unwrap_or_else(|| panic!("{anchor}"));
+            &src[start..start + src[start..].find("\n}\n").expect("end")]
+        };
+        let current = body("pub(crate) fn hydrate_hidden_dm_threads_now(");
+        assert!(current.contains("repair_hidden_against_outbound_now();"));
+        let legacy = body("pub(crate) fn import_legacy_hidden_threads_now(");
+        assert!(legacy.contains("hydrate_hidden_entries_now(entries, Some(rank));"));
+        assert!(legacy.contains("repair_hidden_against_outbound_now();"));
+        let shared = body("fn hydrate_hidden_entries_now(");
+        assert!(shared.contains(
+            "apply_legacy_hidden_import(hidden, &mut ranks, entries, rank, &suppressed)"
+        ));
+        let outbound = body("pub(crate) fn hydrate_outbound_dms_cache_now(");
+        assert!(outbound.contains("repair_hidden_against_outbound_now();"));
+    }
+
     /// Baseline: with no current entries and no suppression, every
     /// incoming entry is inserted.
     #[test]
@@ -5143,8 +5331,8 @@ mod tests {
         // The needle is assembled at runtime so this test's own source does NOT
         // contain the contiguous call string (else it would self-match). Count
         // the CALL form (name + `();`); the fn def uses `() {`, so it isn't
-        // counted. Two calls = one in hydrate_outbound_dms_cache, one in
-        // hydrate_hidden_dm_threads.
+        // counted. Three calls = one in hydrate_outbound_dms_cache, one in
+        // hydrate_hidden_dm_threads, one in the #776 repair rule.
         let src = include_str!("chat_delegate.rs");
         let needle = format!(
             "{}{}",
@@ -5152,7 +5340,7 @@ mod tests {
         );
         assert_eq!(
             src.matches(&needle).count(),
-            2,
+            3,
             "both hydrate_outbound_dms_cache and hydrate_hidden_dm_threads must \
              persist the sanitized store when a tombstone filters a late entry"
         );
@@ -6671,7 +6859,11 @@ mod tests {
                 self.room_merges.push(source_rank);
                 Ok(())
             }
-            async fn merge_outbound_dms(&mut self, _store: OutboundDmStore) -> Result<(), String> {
+            async fn merge_outbound_dms(
+                &mut self,
+                _store: OutboundDmStore,
+                _source_rank: u32,
+            ) -> Result<(), String> {
                 self.dm_merges += 1;
                 Ok(())
             }
@@ -8516,6 +8708,8 @@ pub(crate) fn hydrate_outbound_dms_cache_now(entries: Vec<OutboundDmEntry>) {
             persist_sanitized_dm_store_after_tombstone_filter();
         }
     }
+    // A newer outbound DM supersedes an archive entry for that peer (#776).
+    repair_hidden_against_outbound_now();
 }
 
 /// Persist the sanitized outbound-DM store after a tombstone filter dropped a
@@ -8532,6 +8726,238 @@ fn persist_sanitized_dm_store_after_tombstone_filter() {
             );
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Archive entries across delegate generations (freenet/river#776)
+// ---------------------------------------------------------------------------
+//
+// Un-archiving a DM thread deletes its `hidden_threads` entry and leaves no
+// tombstone, so a union of every generation's archive entries (the hydration
+// rule: insert anything absent, keep the larger `hidden_at_ts`) brings back an
+// entry the user removed in a newer generation while an older one still holds
+// it. Two rules stop that:
+//
+// * Ranked import ([`plan_legacy_hidden_import`]): among PREDECESSOR
+//   generations, the newest one whose archive set has been applied is
+//   authoritative. An older generation's set is ignored, and a newer one's set
+//   removes entries an older generation supplied that it does not hold. The
+//   successor's own entries, and the user's in-session archive actions, carry
+//   no legacy provenance and are never removed by this.
+// * Repair ([`hidden_superseded_by_outbound`]): an entry is dropped when the
+//   outbound-DM cache holds a DM to that peer in that room NEWER than its
+//   `hidden_at_ts`. Sending a DM un-archives the thread (`unhide_dm_thread`,
+//   #265), so such an entry can only be a resurrected one. This also heals a
+//   store the #772 migration already wrote one into.
+
+/// Which predecessor generation's archive set this session applied, and which
+/// generation supplied each in-memory entry that came from a predecessor.
+/// Session-scoped, like the merge ranks it mirrors.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct LegacyHiddenRanks {
+    /// The highest predecessor rank whose archive set has been applied.
+    pub(crate) authority: Option<u32>,
+    /// Entries a predecessor supplied, by the rank that supplied them.
+    pub(crate) provenance: HashMap<(ed25519_dalek::VerifyingKey, MemberId), u32>,
+}
+
+static LEGACY_HIDDEN_RANKS: std::sync::LazyLock<Mutex<LegacyHiddenRanks>> =
+    std::sync::LazyLock::new(|| Mutex::new(LegacyHiddenRanks::default()));
+
+/// What applying predecessor rank `rank`'s archive set does.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LegacyHiddenPlan {
+    /// Entries to hydrate (through the usual newest-cutoff rule).
+    pub(crate) apply: Vec<HiddenDmThreadEntry>,
+    /// Predecessor-supplied entries this newer generation no longer holds.
+    pub(crate) remove: Vec<(ed25519_dalek::VerifyingKey, MemberId)>,
+}
+
+/// Plan the import of predecessor rank `rank`'s archive set (#776). Pure.
+pub(crate) fn plan_legacy_hidden_import(
+    rank: u32,
+    incoming: Vec<HiddenDmThreadEntry>,
+    ranks: &LegacyHiddenRanks,
+) -> LegacyHiddenPlan {
+    if ranks.authority.is_some_and(|a| rank < a) {
+        // A newer generation's set already answered: it is authoritative,
+        // including for the entries it deleted.
+        return LegacyHiddenPlan::default();
+    }
+    let incoming_keys: HashSet<(ed25519_dalek::VerifyingKey, MemberId)> = incoming
+        .iter()
+        .filter_map(|e| {
+            ed25519_dalek::VerifyingKey::from_bytes(&e.room_owner_vk)
+                .ok()
+                .map(|vk| (vk, e.peer))
+        })
+        .collect();
+    let mut remove: Vec<_> = ranks
+        .provenance
+        .iter()
+        .filter(|(key, &supplied_by)| supplied_by < rank && !incoming_keys.contains(key))
+        .map(|(key, _)| *key)
+        .collect();
+    remove.sort_by_key(|(vk, peer)| (vk.to_bytes(), *peer));
+    LegacyHiddenPlan {
+        apply: incoming,
+        remove,
+    }
+}
+
+/// The archive entries in `hidden` that a NEWER outbound DM to the same peer in
+/// the same room supersedes (#776 repair rule). Pure.
+pub(crate) fn hidden_superseded_by_outbound(
+    hidden: &HashMap<(ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry>,
+    outbound: &crate::components::direct_messages::OutboundDmsCache,
+) -> Vec<(ed25519_dalek::VerifyingKey, MemberId)> {
+    let mut newest: HashMap<(ed25519_dalek::VerifyingKey, MemberId), u64> = HashMap::new();
+    for ((room, recipient, _), entry) in &outbound.by_token {
+        let slot = newest.entry((*room, *recipient)).or_insert(0);
+        *slot = (*slot).max(entry.timestamp);
+    }
+    let mut out: Vec<_> = hidden
+        .iter()
+        .filter(|(key, entry)| newest.get(key).is_some_and(|ts| *ts > entry.hidden_at_ts))
+        .map(|(key, _)| *key)
+        .collect();
+    out.sort_by_key(|(vk, peer)| (vk.to_bytes(), *peer));
+    out
+}
+
+/// Apply the repair rule to the live signals. Returns how many entries it
+/// dropped; persists the store when it dropped any (so the healed state
+/// survives a reload).
+fn repair_hidden_against_outbound_now() -> usize {
+    use crate::components::direct_messages::{HIDDEN_DM_THREADS, OUTBOUND_DMS};
+    let superseded = {
+        let (Ok(hidden), Ok(outbound)) = (HIDDEN_DM_THREADS.try_read(), OUTBOUND_DMS.try_read())
+        else {
+            return 0;
+        };
+        hidden_superseded_by_outbound(&hidden, &outbound)
+    };
+    if superseded.is_empty() {
+        return 0;
+    }
+    HIDDEN_DM_THREADS.with_mut(|hidden| {
+        for key in &superseded {
+            hidden.remove(key);
+        }
+    });
+    forget_legacy_hidden_provenance(&superseded);
+    info!(
+        "Dropped {} DM archive entry(ies) a newer outbound DM supersedes (freenet/river#776)",
+        superseded.len()
+    );
+    persist_sanitized_dm_store_after_tombstone_filter();
+    superseded.len()
+}
+
+/// The user (or the successor's own store) now owns these keys: no predecessor
+/// may remove them.
+fn forget_legacy_hidden_provenance(keys: &[(ed25519_dalek::VerifyingKey, MemberId)]) {
+    if let Ok(mut r) = LEGACY_HIDDEN_RANKS.lock() {
+        for key in keys {
+            r.provenance.remove(key);
+        }
+    }
+}
+
+/// Import predecessor rank `rank`'s archive set (#776): the ranked plan, then
+/// the usual hydration for what it applies, then the repair rule. For a caller
+/// that runs inside its own `defer` (see [`hydrate_hidden_dm_threads_now`]).
+pub(crate) fn import_legacy_hidden_threads_now(entries: Vec<HiddenDmThreadEntry>, rank: u32) {
+    hydrate_hidden_entries_now(entries, Some(rank));
+    repair_hidden_against_outbound_now();
+}
+
+/// Apply predecessor rank `rank`'s archive set to `hidden` under the ranked
+/// rule (#776), then the usual hydration rule for what it applies. Pure over
+/// its arguments, so the walk's tests run exactly this composition.
+pub(crate) fn apply_legacy_hidden_import(
+    hidden: &mut HashMap<(ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry>,
+    ranks: &mut LegacyHiddenRanks,
+    entries: Vec<HiddenDmThreadEntry>,
+    rank: u32,
+    suppressed: &HashSet<(ed25519_dalek::VerifyingKey, MemberId)>,
+) -> Vec<String> {
+    let plan = plan_legacy_hidden_import(rank, entries, ranks);
+    for key in &plan.remove {
+        if ranks.provenance.remove(key).is_some() {
+            hidden.remove(key);
+        }
+    }
+    // Entries the successor or the user own (no legacy provenance) stay owned.
+    let owned: HashSet<(ed25519_dalek::VerifyingKey, MemberId)> = hidden
+        .keys()
+        .filter(|k| !ranks.provenance.contains_key(k))
+        .copied()
+        .collect();
+    let held: Vec<(ed25519_dalek::VerifyingKey, MemberId)> = plan
+        .apply
+        .iter()
+        .filter_map(|e| {
+            ed25519_dalek::VerifyingKey::from_bytes(&e.room_owner_vk)
+                .ok()
+                .map(|vk| (vk, e.peer))
+        })
+        .filter(|k| !owned.contains(k) && !suppressed.contains(k))
+        .collect();
+    let (to_insert, diagnostics) = resolve_hidden_thread_hydration(plan.apply, hidden, suppressed);
+    for (key, entry) in to_insert {
+        hidden.insert(key, entry);
+    }
+    for key in held {
+        let slot = ranks.provenance.entry(key).or_insert(rank);
+        *slot = (*slot).max(rank);
+    }
+    ranks.authority = Some(ranks.authority.map_or(rank, |a| a.max(rank)));
+    diagnostics
+}
+
+/// The entries of `entries` the outbound-DM cache does not already hold at
+/// least as fresh (#768 round 3, N2). A read, not a write: no `defer` needed.
+/// Unreadable: all of them (the merge itself keeps the fresher copy).
+pub(crate) fn outbound_entries_not_held(entries: Vec<OutboundDmEntry>) -> Vec<OutboundDmEntry> {
+    use crate::components::direct_messages::OUTBOUND_DMS;
+    let Ok(cache) = OUTBOUND_DMS.try_read() else {
+        return entries;
+    };
+    entries_not_held(entries, &cache)
+}
+
+/// The pure half of [`outbound_entries_not_held`].
+pub(crate) fn entries_not_held(
+    entries: Vec<OutboundDmEntry>,
+    cache: &crate::components::direct_messages::OutboundDmsCache,
+) -> Vec<OutboundDmEntry> {
+    entries
+        .into_iter()
+        .filter(|e| {
+            let Ok(room) = ed25519_dalek::VerifyingKey::from_bytes(&e.room_owner_vk) else {
+                return true;
+            };
+            !cache
+                .by_token
+                .get(&(room, e.recipient, e.purge_token))
+                .is_some_and(|held| held.timestamp >= e.timestamp)
+        })
+        .collect()
+}
+
+/// [`import_legacy_hidden_threads_now`] in its own `defer`, for UI call sites.
+pub(crate) fn import_legacy_hidden_threads(entries: Vec<HiddenDmThreadEntry>, rank: u32) -> usize {
+    let count = entries.len();
+    crate::util::defer(move || import_legacy_hidden_threads_now(entries, rank));
+    count
+}
+
+#[cfg(test)]
+pub(crate) fn reset_legacy_hidden_ranks() {
+    if let Ok(mut r) = LEGACY_HIDDEN_RANKS.lock() {
+        *r = LegacyHiddenRanks::default();
+    }
 }
 
 /// Session-scoped tombstone set for `(room, peer)` pairs the local
@@ -8688,6 +9114,25 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
 /// then seal the predecessor as imported. Callers that need the write to have
 /// happened run this inside their own single `defer` and signal from there.
 pub(crate) fn hydrate_hidden_dm_threads_now(entries: Vec<HiddenDmThreadEntry>) {
+    // The CURRENT delegate's own entries: it owns them from now on, so no
+    // predecessor's ranked import may remove them (#776).
+    let keys: Vec<(ed25519_dalek::VerifyingKey, MemberId)> = entries
+        .iter()
+        .filter_map(|e| {
+            ed25519_dalek::VerifyingKey::from_bytes(&e.room_owner_vk)
+                .ok()
+                .map(|vk| (vk, e.peer))
+        })
+        .collect();
+    forget_legacy_hidden_provenance(&keys);
+    hydrate_hidden_entries_now(entries, None);
+    repair_hidden_against_outbound_now();
+}
+
+/// The hydration rule itself (newest cutoff wins, session tombstones and the
+/// #414 room tombstone filter), shared by the current delegate's hydration and
+/// the ranked predecessor import.
+fn hydrate_hidden_entries_now(entries: Vec<HiddenDmThreadEntry>, legacy_rank: Option<u32>) {
     use crate::components::direct_messages::HIDDEN_DM_THREADS;
     // Shared with the wrapper rather than left there: `merge_outbound_dms`
     // calls this directly, and `hidden_threads` is `#[serde(default)]`, so
@@ -8695,7 +9140,9 @@ pub(crate) fn hydrate_hidden_dm_threads_now(entries: Vec<HiddenDmThreadEntry>) {
     // otherwise perform a no-op WRITE to a GlobalSignal — marking it dirty and
     // notifying subscribers once per predecessor during migration. Given the
     // #499/#555 contention family, gratuitous global-signal writes are not free.
-    if entries.is_empty() {
+    // A predecessor's EMPTY archive set still counts under the ranked rule
+    // (#776): the user may have un-archived everything in that generation.
+    if entries.is_empty() && legacy_rank.is_none() {
         return;
     }
     {
@@ -8729,13 +9176,26 @@ pub(crate) fn hydrate_hidden_dm_threads_now(entries: Vec<HiddenDmThreadEntry>) {
                 }
             };
         HIDDEN_DM_THREADS.with_mut(|hidden| {
-            let (to_insert, diagnostics) =
-                resolve_hidden_thread_hydration(entries, hidden, &suppressed);
+            let diagnostics = match legacy_rank {
+                Some(rank) => match LEGACY_HIDDEN_RANKS.lock() {
+                    Ok(mut ranks) => {
+                        apply_legacy_hidden_import(hidden, &mut ranks, entries, rank, &suppressed)
+                    }
+                    Err(e) => vec![format!(
+                        "LEGACY_HIDDEN_RANKS lock poisoned ({e}); not importing archive entries"
+                    )],
+                },
+                None => {
+                    let (to_insert, diagnostics) =
+                        resolve_hidden_thread_hydration(entries, hidden, &suppressed);
+                    for (key, entry) in to_insert {
+                        hidden.insert(key, entry);
+                    }
+                    diagnostics
+                }
+            };
             for diag in diagnostics {
                 warn!("{}", diag);
-            }
-            for (key, entry) in to_insert {
-                hidden.insert(key, entry);
             }
         });
         // Persist the sanitized store when a tombstone dropped a late archive
@@ -8820,6 +9280,7 @@ pub fn hide_dm_thread(
     };
     crate::util::defer(move || {
         let mut changed = false;
+        forget_legacy_hidden_provenance(&[(room_owner_vk, peer)]);
         HIDDEN_DM_THREADS.with_mut(|hidden| {
             let key = (room_owner_vk, peer);
             match decide_hide_action(hidden.get(&key), entry) {
@@ -8861,6 +9322,7 @@ pub fn unhide_dm_thread(room_owner_vk: ed25519_dalek::VerifyingKey, peer: Member
     }
 
     crate::util::defer(move || {
+        forget_legacy_hidden_provenance(&[(room_owner_vk, peer)]);
         HIDDEN_DM_THREADS.with_mut(|hidden| {
             hidden.remove(&(room_owner_vk, peer));
         });

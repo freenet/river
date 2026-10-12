@@ -1121,11 +1121,25 @@ pub(crate) trait RiverImportSeam {
         source_rank: u32,
     ) -> impl Future<Output = Result<(), String>>;
 
-    /// Merge a recovered outbound-DM store into the local cache.
+    /// Merge a recovered outbound-DM store into the local cache. Its archive
+    /// entries (`hidden_threads`) are imported ranked at `source_rank`
+    /// (freenet/river#776: a newer generation's set is authoritative).
     fn merge_outbound_dms(
         &mut self,
         store: OutboundDmStore,
+        source_rank: u32,
     ) -> impl Future<Output = Result<(), String>>;
+
+    /// The entries of `entries` the local outbound-DM cache does not already
+    /// hold at least as fresh. The post-resolve top-up merges only these, so an
+    /// unchanged predecessor costs no merge and no save (#768 round 3, N2).
+    /// Default: all of them.
+    fn new_outbound_entries(
+        &mut self,
+        entries: Vec<river_core::chat_delegate::OutboundDmEntry>,
+    ) -> impl Future<Output = Vec<river_core::chat_delegate::OutboundDmEntry>> {
+        std::future::ready(entries)
+    }
 
     /// Persist everything merged so far; `Ok` only when the save REALLY
     /// landed. This is the durability boundary the crate's flush contract
@@ -1242,7 +1256,11 @@ impl RiverImportSeam for LiveImportSeam {
             .map_err(|_| "rooms merge was dropped before running".to_string())?
     }
 
-    async fn merge_outbound_dms(&mut self, store: OutboundDmStore) -> Result<(), String> {
+    async fn merge_outbound_dms(
+        &mut self,
+        store: OutboundDmStore,
+        source_rank: u32,
+    ) -> Result<(), String> {
         self.ensure_room_set_complete()?;
         self.dms_dirty = true;
         // Same helpers the sweep's legacy DM arm uses, and idempotent per entry
@@ -1275,12 +1293,21 @@ impl RiverImportSeam for LiveImportSeam {
                 ));
                 return;
             }
-            chat_delegate::hydrate_hidden_dm_threads_now(store.hidden_threads);
+            // Entries first, so the #776 repair rule sees this store's DMs
+            // when the archive entries are imported (ranked, #776).
             chat_delegate::hydrate_outbound_dms_cache_now(store.entries);
+            chat_delegate::import_legacy_hidden_threads_now(store.hidden_threads, source_rank);
             let _ = tx.send(Ok(()));
         });
         rx.await
             .map_err(|_| "outbound-DM merge was dropped before running".to_string())?
+    }
+
+    async fn new_outbound_entries(
+        &mut self,
+        entries: Vec<river_core::chat_delegate::OutboundDmEntry>,
+    ) -> Vec<river_core::chat_delegate::OutboundDmEntry> {
+        chat_delegate::outbound_entries_not_held(entries)
     }
 
     async fn lower_identity_ranks(
@@ -1661,10 +1688,12 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
                 }
                 ItemWrite::Written
             }
-            RecoveredItem::OutboundDms(store) => match self.seam.merge_outbound_dms(*store).await {
-                Ok(()) => ItemWrite::Written,
-                Err(e) => ItemWrite::retryable(e),
-            },
+            RecoveredItem::OutboundDms(store) => {
+                match self.seam.merge_outbound_dms(*store, item.generation).await {
+                    Ok(()) => ItemWrite::Written,
+                    Err(e) => ItemWrite::retryable(e),
+                }
+            }
             // Never imported, never a failure: the successor's state stands.
             RecoveredItem::MigrationMarker | RecoveredItem::Unrecognized => {
                 ItemWrite::AlreadyAuthoritative
@@ -1735,7 +1764,11 @@ impl RiverImportSeam for NoImports {
     async fn merge_rooms(&mut self, _rooms: Rooms, _source_rank: u32) -> Result<(), String> {
         Err("a journal-only operation tried to import rooms".to_string())
     }
-    async fn merge_outbound_dms(&mut self, _store: OutboundDmStore) -> Result<(), String> {
+    async fn merge_outbound_dms(
+        &mut self,
+        _store: OutboundDmStore,
+        _source_rank: u32,
+    ) -> Result<(), String> {
         Err("a journal-only operation tried to import outbound DMs".to_string())
     }
     async fn flush(&mut self) -> Result<(), String> {
@@ -2003,6 +2036,10 @@ pub(crate) async fn top_up_in_window_with<C: RiverDelegateChannel, S: RiverImpor
 /// leaves the data in the predecessor, and the next load in the window reads
 /// it again. A silent predecessor is an `Err` (not a run). Returns the items
 /// merged. [`top_up_in_window_with`] bounds it.
+///
+/// Only the newest predecessor is topped up: a room a tab on an OLDER build
+/// creates after the journal resolved that older generation stays there (not
+/// destroyed) and is not picked up (#768 round 3, N3).
 pub(crate) async fn top_up_from_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     channel: &C,
     seam: &mut S,
@@ -2042,11 +2079,18 @@ pub(crate) async fn top_up_from_with<C: RiverDelegateChannel, S: RiverImportSeam
             // would re-archive a thread the user un-archived in the new build
             // (#768 round 2 item 6). An old tab's later archive is not carried
             // (a lost archive is recoverable; a re-hidden thread is a surprise).
+            // And only entries the cache does not already hold: an unchanged
+            // predecessor costs no merge and no save (#768 round 3, N2).
+            let fresh = seam.new_outbound_entries(store.entries).await;
+            if fresh.is_empty() {
+                continue;
+            }
             let entries_only = OutboundDmStore {
-                entries: store.entries,
+                entries: fresh,
                 hidden_threads: Vec::new(),
             };
-            seam.merge_outbound_dms(entries_only).await?;
+            seam.merge_outbound_dms(entries_only, predecessor.generation)
+                .await?;
             merged += 1;
         } else if let Some(rooms) = rooms_to_merge(&item) {
             seam.merge_rooms(rooms, predecessor.generation).await?;
@@ -2711,6 +2755,13 @@ mod tests {
         rooms: Rooms,
         ranks: MergeRanks,
         dm_merges: Vec<OutboundDmStore>,
+        /// Archive entries, imported through the production composition
+        /// (`apply_legacy_hidden_import`) at the rank the walk passes.
+        hidden: HashMap<
+            (VerifyingKey, river_core::room_state::member::MemberId),
+            river_core::chat_delegate::HiddenDmThreadEntry,
+        >,
+        hidden_ranks: chat_delegate::LegacyHiddenRanks,
         flushes: usize,
         fail_flush: bool,
         /// Every rooms/DM merge reports this failure.
@@ -2723,6 +2774,8 @@ mod tests {
                 rooms: empty_rooms(),
                 ranks: MergeRanks::default(),
                 dm_merges: Vec::new(),
+                hidden: HashMap::new(),
+                hidden_ranks: chat_delegate::LegacyHiddenRanks::default(),
                 flushes: 0,
                 fail_flush: false,
                 fail_merge: None,
@@ -2737,10 +2790,21 @@ mod tests {
             }
             apply_recovered_rooms(&mut self.rooms, rooms, source_rank, &mut self.ranks)
         }
-        async fn merge_outbound_dms(&mut self, store: OutboundDmStore) -> Result<(), String> {
+        async fn merge_outbound_dms(
+            &mut self,
+            store: OutboundDmStore,
+            source_rank: u32,
+        ) -> Result<(), String> {
             if let Some(e) = &self.fail_merge {
                 return Err(e.clone());
             }
+            let _ = chat_delegate::apply_legacy_hidden_import(
+                &mut self.hidden,
+                &mut self.hidden_ranks,
+                store.hidden_threads.clone(),
+                source_rank,
+                &HashSet::new(),
+            );
             self.dm_merges.push(store);
             Ok(())
         }
@@ -3774,7 +3838,7 @@ mod tests {
         // public helpers would re-defer, putting the writes back on a later
         // macrotask and restoring the bug even with the await in place.
         for helper in [
-            "hydrate_hidden_dm_threads_now(",
+            "import_legacy_hidden_threads_now(",
             "hydrate_outbound_dms_cache_now(",
         ] {
             assert!(
@@ -3784,6 +3848,7 @@ mod tests {
         }
         assert!(
             !body.contains("hydrate_hidden_dm_threads(")
+                && !body.contains("import_legacy_hidden_threads(")
                 && !body.contains("hydrate_outbound_dms_cache("),
             "merge_outbound_dms must NOT call the deferring public hydrate \
              helpers — they schedule a further macrotask, so the awaited signal \
@@ -3834,7 +3899,7 @@ mod tests {
              signalling outside it makes the await return pre-merge (B2)"
         );
         for helper in [
-            "hydrate_hidden_dm_threads_now(",
+            "import_legacy_hidden_threads_now(",
             "hydrate_outbound_dms_cache_now(",
         ] {
             let at = body.find(helper).expect("helper call");
@@ -4844,7 +4909,7 @@ mod tests {
             ("async fn merge_rooms(", "ROOMS.with_mut("),
             (
                 "async fn merge_outbound_dms(",
-                "hydrate_hidden_dm_threads_now(",
+                "hydrate_outbound_dms_cache_now(",
             ),
         ] {
             let at = seam.find(f).unwrap();
@@ -5310,6 +5375,102 @@ mod tests {
         );
     }
 
+    /// #768 round 3, N2: an unchanged predecessor's DM entries cost no merge
+    /// and no save on each top-up run.
+    #[test]
+    fn a_topup_with_nothing_new_merges_and_saves_nothing() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::room_state::member::MemberId;
+        let room = vk(1);
+        let store = OutboundDmStore {
+            entries: vec![river_core::chat_delegate::OutboundDmEntry {
+                room_owner_vk: room.to_bytes(),
+                sender: MemberId(FastHash(1)),
+                recipient: MemberId(FastHash(2)),
+                purge_token: river_core::room_state::direct_messages::PurgeToken([7; 16]),
+                timestamp: 10,
+                plaintext: "hi".into(),
+            }],
+            hidden_threads: Vec::new(),
+        };
+        let channel = MockChannel::default().with_delegate(&pred_key(2), {
+            let mut g = DelegateSim::default();
+            g.store
+                .insert(OUTBOUND_DMS_STORAGE_KEY.to_vec(), cbor(&store));
+            g
+        });
+        struct HoldsAll(MemorySeam);
+        impl RiverImportSeam for HoldsAll {
+            async fn merge_rooms(&mut self, r: Rooms, rank: u32) -> Result<(), String> {
+                self.0.merge_rooms(r, rank).await
+            }
+            async fn merge_outbound_dms(
+                &mut self,
+                s: OutboundDmStore,
+                rank: u32,
+            ) -> Result<(), String> {
+                self.0.merge_outbound_dms(s, rank).await
+            }
+            async fn new_outbound_entries(
+                &mut self,
+                _entries: Vec<river_core::chat_delegate::OutboundDmEntry>,
+            ) -> Vec<river_core::chat_delegate::OutboundDmEntry> {
+                Vec::new()
+            }
+            async fn flush(&mut self) -> Result<(), String> {
+                self.0.flush().await
+            }
+        }
+        let mut seam = HoldsAll(MemorySeam::new());
+        let merged = block_on(top_up_from_with(&channel, &mut seam, &lineage3()[2])).unwrap();
+        assert_eq!(merged, 0);
+        assert!(seam.0.dm_merges.is_empty(), "nothing merged");
+        assert_eq!(seam.0.flushes, 0, "nothing saved");
+    }
+
+    /// freenet/river#776 through the real walk: the newest predecessor (gen 2)
+    /// no longer holds an archive entry (the user un-archived it there), an
+    /// older one (gen 1) still does. The walk passes each generation's rank,
+    /// so the entry stays deleted.
+    #[test]
+    fn the_walk_never_resurrects_an_archive_entry_a_newer_generation_deleted() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::room_state::member::MemberId;
+        let room = vk(1);
+        let peer = MemberId(FastHash(2));
+        let store = |hidden: Vec<river_core::chat_delegate::HiddenDmThreadEntry>| OutboundDmStore {
+            entries: Vec::new(),
+            hidden_threads: hidden,
+        };
+        let archived = river_core::chat_delegate::HiddenDmThreadEntry {
+            room_owner_vk: room.to_bytes(),
+            peer,
+            hidden_at_ts: 10,
+        };
+        let with_dms = |s: OutboundDmStore| {
+            let mut g = DelegateSim::default();
+            g.store.insert(OUTBOUND_DMS_STORAGE_KEY.to_vec(), cbor(&s));
+            g
+        };
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), with_dms(store(vec![archived.clone()])))
+            .with_delegate(&pred_key(2), with_dms(store(vec![])))
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert!(report.is_complete(), "{report:?}");
+        assert_eq!(
+            seam.dm_merges.len(),
+            2,
+            "both generations' stores were imported"
+        );
+        assert!(
+            seam.hidden.is_empty(),
+            "an older generation's archive entry must not come back: {:?}",
+            seam.hidden
+        );
+    }
+
     /// Even when a deleted room IS offered (a seam that knows nothing), the
     /// ranked merge keeps the current delegate's tombstone.
     #[test]
@@ -5328,8 +5489,12 @@ mod tests {
             async fn merge_rooms(&mut self, r: Rooms, rank: u32) -> Result<(), String> {
                 self.0.merge_rooms(r, rank).await
             }
-            async fn merge_outbound_dms(&mut self, s: OutboundDmStore) -> Result<(), String> {
-                self.0.merge_outbound_dms(s).await
+            async fn merge_outbound_dms(
+                &mut self,
+                s: OutboundDmStore,
+                rank: u32,
+            ) -> Result<(), String> {
+                self.0.merge_outbound_dms(s, rank).await
             }
             async fn flush(&mut self) -> Result<(), String> {
                 self.0.flush().await

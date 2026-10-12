@@ -399,6 +399,22 @@ all, plus its outbound-DM entries (never its hidden threads), through the
 ranked merge. The window (`__river_migration_topup_window__`) is 14 days or
 30 top-ups that actually ran, and restarts whenever V33's index digest
 changes. The top-up is its own driver request: it never forces a walk.
+Only DM entries the cache does not already hold are merged, so an unchanged
+predecessor costs no merge and no save. Only the NEWEST predecessor is topped
+up: a room a tab on an older build (V32) creates after the journal resolved V32
+stays in V32, not destroyed, and is not picked up.
+
+**Archive entries across generations** (freenet/river#776). Un-archiving a DM
+thread deletes its `hidden_threads` entry with no tombstone, so a union of
+every generation's entries brings back one the user removed in a newer
+generation. A predecessor's archive set is imported RANKED: the newest
+predecessor whose set was applied is authoritative, an older one's set is
+ignored, and a newer one removes entries an older one supplied that it no
+longer holds (`apply_legacy_hidden_import`; the successor's own and the user's
+entries are never removed by it). And an archive entry is dropped whenever the
+outbound-DM cache holds a NEWER DM to that peer in that room (a reply
+un-archives), which also heals stores the #772 migration already wrote one into.
+The walk, the top-up and the sweep all go through it.
 
 **Migrated identities keep their source rank across loads** (#768 review
 B3): `rooms_meta.identity_sources` records which legacy generation supplied a
