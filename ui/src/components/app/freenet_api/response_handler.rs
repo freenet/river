@@ -11,24 +11,24 @@ mod update_response;
 use super::delegate_migration::{is_migration_bookkeeping_key, SweepWrite};
 use super::error::SynchronizerError;
 use super::migration_journal::{
-    gate_sweep_import, interrupted_import_for_recovery, start_journal_load,
+    gate_sweep_import_retrying, interrupted_import_for_recovery, start_journal_load,
 };
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
     arm_legacy_migration_recovery, await_delegate_response, claim_list_load,
     complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
-    complete_pending_signing_key_request, current_delegate_source_rank,
+    complete_pending_signing_key_request, current_delegate_source_rank, current_load_attempt,
     decide_legacy_migration_action, decide_per_room_load_action, enqueue_delegate_request,
     fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
     is_legacy_delegate_key, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_outbound_dms_hydrated, mark_room_set_complete, note_current_list_response,
-    note_delegate_response_for_register_ack, parse_room_storage_key, per_room_terminal,
-    prune_outbound_dms_for_purges, request_outbound_dms_once, response_correlation_base,
-    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate,
-    seed_saved_slots_from_load, send_delegate_request, send_delegate_request_to,
-    set_load_state_if_current, source_rank_for_delegate_key, LegacyMigrationAction,
-    LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY,
-    ROOMS_META_KEY, ROOMS_STORAGE_KEY,
+    mark_fetch_failure_if_current, mark_outbound_dms_hydrated, mark_room_set_complete,
+    note_current_list_response, note_delegate_response_for_register_ack, parse_room_storage_key,
+    per_room_terminal, prune_outbound_dms_for_purges, request_outbound_dms_once,
+    response_correlation_base, room_storage_key, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, seed_saved_slots_from_load, send_delegate_request,
+    send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
+    LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
+    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -349,6 +349,15 @@ impl ResponseHandler {
                                                             // and must answer before the merge
                                                             // (freenet/river#763). Fixed-key arm, so no
                                                             // item count.
+                                                            //
+                                                            // A reply that completed a WALK waiter
+                                                            // is the walk's to import: the sweep's
+                                                            // own probe registers none, so it is not
+                                                            // this arm's (#768 review A3, as the
+                                                            // ListResponse arm does).
+                                                            if completed {
+                                                                continue;
+                                                            }
                                                             let legacy_key =
                                                                 responding_delegate.clone();
                                                             crate::util::safe_spawn_local(
@@ -358,14 +367,20 @@ impl ResponseHandler {
                                                                         None,
                                                                     )
                                                                     .await
-                                                                        && hydrate_loaded_rooms(
+                                                                    {
+                                                                        if hydrate_loaded_rooms(
                                                                             loaded_rooms,
                                                                             true,
                                                                             delegate_source_rank,
                                                                             worker.attempt(),
-                                                                        )
-                                                                    {
-                                                                        schedule_subscription_timeout_check();
+                                                                        ) {
+                                                                            schedule_subscription_timeout_check();
+                                                                        }
+                                                                    } else {
+                                                                        // Known-stored data not
+                                                                        // merged: Retry, never a
+                                                                        // false "no rooms" (A2).
+                                                                        worker.mark_fetch_failure();
                                                                     }
                                                                     drop(worker);
                                                                 },
@@ -484,8 +499,14 @@ impl ResponseHandler {
                                             if is_legacy_delegate {
                                                 // Journal-gated in its own task
                                                 // (freenet/river#763); fixed-key
-                                                // arm, so no item count.
+                                                // arm, so no item count. A reply
+                                                // that completed a WALK waiter is
+                                                // the walk's (#768 review A3).
+                                                if completed {
+                                                    continue;
+                                                }
                                                 let legacy_key = responding_delegate.clone();
+                                                let attempt = current_load_attempt();
                                                 crate::util::safe_spawn_local(async move {
                                                     if value.is_none()
                                                         || sweep_may_merge(&legacy_key, None).await
@@ -493,6 +514,10 @@ impl ResponseHandler {
                                                         handle_outbound_dms_get_response(
                                                             value, true,
                                                         );
+                                                    } else {
+                                                        // Retry, not a silent
+                                                        // drop (A2).
+                                                        mark_fetch_failure_if_current(attempt);
                                                     }
                                                 });
                                             } else {
@@ -1466,6 +1491,9 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     // its rooms stay in the predecessor and the journaled walk or a later load
     // imports them.
     if !sweep_may_merge(&legacy_key, Some(items_read)).await {
+        // Known-stored rooms not merged on this load: Retry, never a false
+        // "no rooms" (#768 review A2).
+        worker.mark_fetch_failure();
         return;
     }
 
@@ -1491,7 +1519,7 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
 /// merge (it fills a partial one; a room deleted since stays deleted). Any
 /// journal failure skips the merge on this load.
 async fn sweep_may_merge(legacy_key: &DelegateKey, items: Option<u32>) -> bool {
-    sweep_write_allows_merge(gate_sweep_import(legacy_key, items).await)
+    sweep_write_allows_merge(gate_sweep_import_retrying(legacy_key, items).await)
 }
 
 /// The journal's answer as the sweep's yes/no. A `Skip` must never merge: an
@@ -3372,8 +3400,9 @@ mod tests {
         // LoadFailed rather than a false Empty; NOT a `value: None` skip.
         assert_eq!(
             body.matches("mark_fetch_failure()").count(),
-            4,
-            "legacy slot transport-Err, unparseable-slot Err, Ok(other), and meta-GET Err arms must mark"
+            5,
+            "legacy slot transport-Err, unparseable-slot Err, Ok(other), meta-GET Err, and \
+             the journal-gate refusal (#768 review A2) must mark"
         );
         // The `value: None` arm (definitive missing value) is a legitimate skip,
         // NOT a fetch failure. Bound the window to that arm alone (the adjacent
@@ -4400,5 +4429,50 @@ mod tests {
         assert!(sweep_write_allows_merge(SweepWrite::Merge));
         assert!(sweep_write_allows_merge(SweepWrite::MergeUnflagged));
         assert!(!sweep_write_allows_merge(SweepWrite::Skip));
+    }
+
+    /// #768 review A2 + A3, pinned in source (the arms are wasm-only):
+    /// - a legacy `rooms_data` / `outbound_dms` reply that COMPLETED a walk
+    ///   waiter is the walk's, never merged a second time by the sweep;
+    /// - every sweep arm the journal refuses marks the load's fetch failure,
+    ///   so the UI shows Retry and the walk does not run over the set.
+    #[test]
+    fn sweep_arms_skip_walk_replies_and_mark_a_refused_merge() {
+        let src = include_str!("response_handler.rs");
+        let production: String =
+            crate::util::strip_comments(src.split("mod tests {").next().expect("production"))
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+        let rooms = production
+            .find("SuccessfullyloadedroomsfromLEGACYdelegate")
+            .expect("legacy rooms_data arm");
+        let arm = &production[rooms..rooms + 1500];
+        let skip = arm
+            .find("ifcompleted{continue;}")
+            .expect("rooms_data skips walk replies");
+        let gate = arm.find("sweep_may_merge(").expect("gate");
+        assert!(skip < gate);
+        assert!(
+            arm.contains("}else{worker.mark_fetch_failure();}"),
+            "a refused rooms_data merge marks the fetch failure"
+        );
+
+        let dm = production
+            .find("letlegacy_key=responding_delegate.clone();letattempt=current_load_attempt();")
+            .expect("legacy outbound_dms arm");
+        let before = &production[dm - 80..dm];
+        assert!(
+            before.contains("ifcompleted{continue;}"),
+            "outbound_dms skips walk replies"
+        );
+        assert!(production[dm..dm + 500].contains("mark_fetch_failure_if_current(attempt);"));
+
+        let per_room = production
+            .find("if!sweep_may_merge(&legacy_key,Some(items_read)).await{")
+            .expect("per-room gate");
+        assert!(
+            production[per_room..per_room + 120].contains("worker.mark_fetch_failure();return;")
+        );
     }
 }

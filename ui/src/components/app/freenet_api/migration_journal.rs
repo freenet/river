@@ -437,6 +437,88 @@ pub(crate) async fn gate_sweep_import(responding: &DelegateKey, items: Option<u3
     write
 }
 
+/// Gate attempts per sweep merge, and the waits between them. A journal round
+/// trip that fails once (a slow node, a displaced waiter) usually succeeds on a
+/// retry; skipping straight away would leave that predecessor to the walk
+/// while older generations merge first (freenet/river#768 review A2).
+const SWEEP_GATE_BACKOFF_MS: [u64; 2] = [1_000, 3_000];
+
+/// Run `gate` until it allows the merge, at most `1 + backoff.len()` times,
+/// waiting `backoff[i]` before retry `i + 1`. Generic so the retry shape is
+/// natively testable.
+pub(crate) async fn with_gate_retries<G, GF, S, SF>(
+    mut gate: G,
+    mut sleep: S,
+    backoff: &[u64],
+) -> SweepWrite
+where
+    G: FnMut() -> GF,
+    GF: Future<Output = SweepWrite>,
+    S: FnMut(u64) -> SF,
+    SF: Future<Output = ()>,
+{
+    let mut write = gate().await;
+    for ms in backoff {
+        if write != SweepWrite::Skip {
+            break;
+        }
+        sleep(*ms).await;
+        write = gate().await;
+    }
+    write
+}
+
+/// `generation + 1` of the newest legacy generation whose data the sweep held
+/// but the journal would not let it merge this page load (`0`: none).
+static SWEEP_SKIPPED_NEWEST: AtomicU32 = AtomicU32::new(0);
+
+/// Whether generation `generation` is OLDER than one the sweep had to skip
+/// this page load (`skipped_marker` = that generation + 1). River migrates
+/// under Union, so the walk would import it anyway; but the sweep merging an
+/// older generation's copy and saving it while a newer one that answered with
+/// data is held back is exactly the cross-load shadowing freenet-migrate#42
+/// warns about. So the sweep leaves older generations to the walk too.
+pub(crate) fn older_than_a_skipped_newer(generation: u32, skipped_marker: u32) -> bool {
+    skipped_marker > generation.saturating_add(1)
+}
+
+/// The sweep's journal gate for data read from the legacy delegate
+/// `responding` (freenet/river#763, #768 review A2): refused outright if a
+/// newer generation was skipped this page load; otherwise
+/// [`gate_sweep_import`], retried with bounded backoff. A final skip is
+/// recorded so older generations are held back with it. The caller marks the
+/// load's fetch failure on a skip, so the UI offers Retry rather than a false
+/// "no rooms".
+pub(crate) async fn gate_sweep_import_retrying(
+    responding: &DelegateKey,
+    items: Option<u32>,
+) -> SweepWrite {
+    let Some(generation) = LINEAGE
+        .iter()
+        .find(|e| e.delegate_key.as_slice() == responding.bytes())
+        .map(|e| e.generation)
+    else {
+        return SweepWrite::Skip;
+    };
+    if older_than_a_skipped_newer(generation, SWEEP_SKIPPED_NEWEST.load(Ordering::Relaxed)) {
+        warn!(
+            "sweep: legacy gen {generation} held back: a newer generation's data was skipped \
+             this load"
+        );
+        return SweepWrite::Skip;
+    }
+    let write = with_gate_retries(
+        || gate_sweep_import(responding, items),
+        |ms| crate::util::sleep(std::time::Duration::from_millis(ms)),
+        &SWEEP_GATE_BACKOFF_MS,
+    )
+    .await;
+    if write == SweepWrite::Skip {
+        SWEEP_SKIPPED_NEWEST.fetch_max(generation.saturating_add(1), Ordering::Relaxed);
+    }
+    write
+}
+
 // ---------------------------------------------------------------------------
 // The walk driver
 // ---------------------------------------------------------------------------
@@ -1113,5 +1195,79 @@ mod tests {
             "no more than the cap per page load"
         );
         assert!(!session().walk_in_flight);
+    }
+
+    // ---------------- the sweep gate's retries (review A2) ----------------
+
+    fn scripted_gate(
+        answers: Vec<SweepWrite>,
+    ) -> (
+        impl FnMut() -> std::future::Ready<SweepWrite>,
+        std::rc::Rc<Cell<usize>>,
+    ) {
+        let calls = std::rc::Rc::new(Cell::new(0usize));
+        let c = calls.clone();
+        let answers = RefCell::new(VecDeque::from(answers));
+        let gate = move || {
+            c.set(c.get() + 1);
+            std::future::ready(answers.borrow_mut().pop_front().unwrap_or(SweepWrite::Skip))
+        };
+        (gate, calls)
+    }
+
+    #[test]
+    fn a_journal_refusal_is_retried_with_backoff_before_the_sweep_skips() {
+        let slept = RefCell::new(Vec::new());
+        let (gate, calls) = scripted_gate(vec![SweepWrite::Skip, SweepWrite::Merge]);
+        let w = futures::executor::block_on(with_gate_retries(
+            gate,
+            |ms| {
+                slept.borrow_mut().push(ms);
+                std::future::ready(())
+            },
+            &SWEEP_GATE_BACKOFF_MS,
+        ));
+        assert_eq!(w, SweepWrite::Merge);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(*slept.borrow(), vec![SWEEP_GATE_BACKOFF_MS[0]]);
+
+        let slept = RefCell::new(Vec::new());
+        let (gate, calls) = scripted_gate(vec![]);
+        let w = futures::executor::block_on(with_gate_retries(
+            gate,
+            |ms| {
+                slept.borrow_mut().push(ms);
+                std::future::ready(())
+            },
+            &SWEEP_GATE_BACKOFF_MS,
+        ));
+        assert_eq!(w, SweepWrite::Skip, "bounded: it gives up");
+        assert_eq!(calls.get(), 1 + SWEEP_GATE_BACKOFF_MS.len());
+        assert_eq!(*slept.borrow(), SWEEP_GATE_BACKOFF_MS.to_vec());
+
+        let (gate, calls) = scripted_gate(vec![SweepWrite::MergeUnflagged]);
+        let w = futures::executor::block_on(with_gate_retries(
+            gate,
+            |_| std::future::ready(()),
+            &SWEEP_GATE_BACKOFF_MS,
+        ));
+        assert_eq!(w, SweepWrite::MergeUnflagged);
+        assert_eq!(calls.get(), 1, "an allowed merge is not retried");
+    }
+
+    /// Once a newer generation's data was skipped, the sweep holds back every
+    /// older generation for the page load; the skipped one and newer ones are
+    /// not held back by it.
+    #[test]
+    fn a_skipped_newer_generation_holds_back_older_ones() {
+        assert!(!older_than_a_skipped_newer(5, 0), "nothing skipped");
+        let skipped_28 = 28 + 1;
+        assert!(older_than_a_skipped_newer(27, skipped_28));
+        assert!(older_than_a_skipped_newer(0, skipped_28));
+        assert!(
+            !older_than_a_skipped_newer(28, skipped_28),
+            "itself: retried on its own"
+        );
+        assert!(!older_than_a_skipped_newer(29, skipped_28), "newer");
     }
 }
