@@ -1828,7 +1828,16 @@ pub(crate) async fn top_up_from_with<C: RiverDelegateChannel, S: RiverImportSeam
         };
         let item = classify_recovered(b, &value);
         if let RecoveredItem::OutboundDms(store) = item {
-            seam.merge_outbound_dms(*store).await?;
+            // DM ENTRIES only. The predecessor's `hidden_threads` were imported
+            // once by the walk; re-merging them on every load in the window
+            // would re-archive a thread the user un-archived in the new build
+            // (#768 round 2 item 6). An old tab's later archive is not carried
+            // (a lost archive is recoverable; a re-hidden thread is a surprise).
+            let entries_only = OutboundDmStore {
+                entries: store.entries,
+                hidden_threads: Vec::new(),
+            };
+            seam.merge_outbound_dms(entries_only).await?;
             merged += 1;
         } else if let Some(rooms) = rooms_to_merge(&item) {
             seam.merge_rooms(rooms, predecessor.generation).await?;
@@ -4570,6 +4579,49 @@ mod tests {
         // Idempotent: a second top-up finds nothing new.
         let again = block_on(top_up_from_with(&channel, &mut seam, &lineage3()[2])).unwrap();
         assert_eq!(again, 0);
+    }
+
+    /// #768 round 2 item 6: the top-up merges the predecessor's DM entries,
+    /// never its `hidden_threads`, so a thread the user un-archived in the new
+    /// build is not archived again on every load of the window.
+    #[test]
+    fn the_topup_merges_dm_entries_but_never_hidden_threads() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::room_state::member::MemberId;
+        let room = vk(1);
+        let store = OutboundDmStore {
+            entries: vec![river_core::chat_delegate::OutboundDmEntry {
+                room_owner_vk: room.to_bytes(),
+                sender: MemberId(FastHash(1)),
+                recipient: MemberId(FastHash(2)),
+                purge_token: river_core::room_state::direct_messages::PurgeToken([7; 16]),
+                timestamp: 10,
+                plaintext: "hi".into(),
+            }],
+            hidden_threads: vec![river_core::chat_delegate::HiddenDmThreadEntry {
+                room_owner_vk: room.to_bytes(),
+                peer: MemberId(FastHash(2)),
+                hidden_at_ts: 10,
+            }],
+        };
+        let channel = MockChannel::default().with_delegate(&pred_key(2), {
+            let mut g = DelegateSim::default();
+            g.store
+                .insert(OUTBOUND_DMS_STORAGE_KEY.to_vec(), cbor(&store));
+            g
+        });
+        let mut seam = MemorySeam::new();
+        let merged = block_on(top_up_from_with(&channel, &mut seam, &lineage3()[2])).unwrap();
+        assert_eq!(merged, 1);
+        assert_eq!(seam.dm_merges.len(), 1);
+        assert_eq!(
+            seam.dm_merges[0].entries, store.entries,
+            "entries are topped up"
+        );
+        assert!(
+            seam.dm_merges[0].hidden_threads.is_empty(),
+            "hidden threads are never re-merged by the top-up"
+        );
     }
 
     /// Even when a deleted room IS offered (a seam that knows nothing), the
