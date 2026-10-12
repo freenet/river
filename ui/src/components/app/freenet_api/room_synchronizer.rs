@@ -656,10 +656,10 @@ pub(crate) fn seed_put_request(
 pub(crate) fn owed_rekey_merge(
     room: &crate::room_data::RoomData,
 ) -> Option<Vec<freenet_stdlib::prelude::ContractInstanceId>> {
-    if room.is_awaiting_initial_sync() || room.rekey_merge_owed.is_empty() {
+    if room.is_awaiting_initial_sync() || room.rekey_merge.owed.is_empty() {
         return None;
     }
-    Some(room.rekey_merge_owed.iter().map(|k| *k.id()).collect())
+    Some(room.rekey_merge.owed.iter().map(|k| *k.id()).collect())
 }
 
 /// The merge a room `merge_from_source` just reported as re-keyed off
@@ -671,7 +671,7 @@ pub(crate) fn fresh_rekey_merge(
     room: &crate::room_data::RoomData,
     old_contract_key: &freenet_stdlib::prelude::ContractKey,
 ) -> Option<Vec<freenet_stdlib::prelude::ContractInstanceId>> {
-    owed_rekey_merge(room).filter(|_| room.rekey_merge_owed.contains(old_contract_key))
+    owed_rekey_merge(room).filter(|_| room.rekey_merge.owed.contains(old_contract_key))
 }
 
 /// The code-free subscribe for a room the network should already hold
@@ -905,18 +905,21 @@ impl RoomSynchronizer {
                         Some(RoomSyncStatus::Subscribing | RoomSyncStatus::Subscribed)
                     )
                 });
-                // A room already subscribing or subscribed this session (a
-                // second copy reporting the re-key late) is not pulled back:
-                // its merge runs in the background from the sweep instead.
-                let owed_merge = owed_merge.filter(|_| !already_syncing);
-
-                // Otherwise (no merge owed, or a placeholder) the room needs
-                // nothing special: the subscribe sweep below picks it up like
-                // any other room, and its subscribe GET's empty or missing
-                // answer runs the #292 probe of the older generations.
-                if let Some(owed) = owed_merge {
-                    // `Subscribing` keeps the sweep away; each probe hop
-                    // refreshes it, and the merge's seed PUT takes it from there.
+                // No merge owed, or a placeholder: the room needs nothing
+                // special. The subscribe sweep below picks it up like any other
+                // room, and its subscribe GET's empty or missing answer runs the
+                // #292 probe of the older generations.
+                if let Some(owed) = owed_merge.clone().filter(|_| already_syncing) {
+                    // A room already subscribing or subscribed this session (a
+                    // second copy reporting the re-key late) is not pulled
+                    // back, and the sweep below skips it, so its merge runs in
+                    // the background from here.
+                    start_rekey_merge(*owner_vk, owed, room_state.clone(), false).await;
+                } else if let Some(owed) = owed_merge {
+                    // `Subscribing` keeps the sweep away while the walk holds
+                    // the seed: each probe hop refreshes it, for at most
+                    // `REKEY_SEED_WAIT`, after which (or once the walk ends)
+                    // the seed PUT takes it from there.
                     SYNC_INFO.with_mut(|sync_info| {
                         sync_info.update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
                     });
@@ -1087,10 +1090,16 @@ impl RoomSynchronizer {
                 }
 
                 // A re-key merge still owed from an earlier load (its older key
-                // did not answer then, freenet/river#769): retry it alongside
-                // the subscribe. Once per load; the room already has state
-                // under its current key, so nothing waits on it.
-                let owed_merge = ROOMS.read().map.get(owner_vk).and_then(owed_rekey_merge);
+                // did not answer then, freenet/river#769), or the one-time
+                // merge from the predecessor generation (#771): run it
+                // alongside the subscribe, asking only the owed keys. Once per
+                // load; the room already has state under its current key, so
+                // nothing waits on it. Fallible, as in `rooms_awaiting_subscription`: a contended
+                // ROOMS skips the retry this time, never panics.
+                let owed_merge = ROOMS
+                    .try_read()
+                    .ok()
+                    .and_then(|rooms| rooms.map.get(owner_vk).and_then(owed_rekey_merge));
                 if let Some(owed) = owed_merge {
                     start_rekey_merge(*owner_vk, owed, state.clone(), false).await;
                 }
@@ -2330,6 +2339,12 @@ mod tests {
             body[..subscribing].contains("fresh_rekey_merge(room_data,old_contract_key)"),
             "only a fresh re-key blocks the room on its merge"
         );
+        // A room already syncing this session is skipped by the sweep, so its
+        // merge must start from here, in the background (#771 review).
+        let syncing = body
+            .find("ifletSome(owed)=owed_merge.clone().filter(|_|already_syncing){start_rekey_merge(*owner_vk,owed,room_state.clone(),false).await;}")
+            .expect("an already-syncing room merges in the background");
+        assert!(syncing < subscribing);
         let retry = body
             .find("start_rekey_merge(*owner_vk,owed,state.clone(),false)")
             .expect("an owed merge is retried in the background");

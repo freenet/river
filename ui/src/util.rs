@@ -1185,7 +1185,7 @@ let id = ar"\"; // n();
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            rekey_merge_owed: Vec::new(),
+            rekey_merge: Default::default(),
             invitation_secrets: std::collections::BTreeMap::new(),
         };
         room_data.regenerate_contract_key();

@@ -479,7 +479,7 @@ pub async fn handle_get_response(
                             self_member_info: None,
                             self_nickname: None,
                             previous_contract_key: None,
-                            rekey_merge_owed: Vec::new(),
+                            rekey_merge: Default::default(),
                             invitation_secrets: std::collections::BTreeMap::new(),
                         }
                     });
@@ -1338,7 +1338,7 @@ pub(crate) fn request_seed_put(owner_vk: ed25519_dalek::VerifyingKey) {
 /// * A backward-probe hop: the legacy generation answered that it holds
 ///   nothing, so the walk advances now instead of after its watchdog.
 /// * A room whose code-free subscribe GET is outstanding re-seeds with a PUT.
-///   If the room still owes a re-key merge (`rekey_merge_owed` is set,
+///   If the room still owes a re-key merge (`rekey_merge.owed` is set,
 ///   freenet/river#769), the older keys are merged in first, so the seed is
 ///   not just this device's snapshot.
 /// * An imported room still holding its placeholder probes the older

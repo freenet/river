@@ -100,10 +100,17 @@
 //! to the one this device last synced under, folds every one that has state,
 //! merges the result into `ROOMS` (CRDT merge, never a replace), and only then
 //! lets the room's seed PUT go out, carrying the merged state. The room's
-//! `rekey_merge_owed` is the durable "merge still owed" marker. It is cleared
+//! `rekey_merge.owed` is the durable "merge still owed" marker. It is cleared
 //! only once the generation it names has answered with the room's state and
 //! that state has merged in, so an old key that is slow, unreachable or
-//! answers `NotFound` is asked again on a later load.
+//! answers `NotFound` is asked again on a later load (only the owed keys, in
+//! the background), for at most [`MAX_UNFINISHED_REKEY_LOADS`] loads.
+//!
+//! The walk holds the seed PUT for at most [`REKEY_SEED_WAIT`]: dead older
+//! keys each wait out the 12 s watchdog, and a room must not sit at
+//! "connecting" for that. At the deadline the room is seeded with what it
+//! holds and the walk finishes in the background; its merge then reaches the
+//! new key as an ordinary update.
 
 use crate::components::app::freenet_api::constants::REPUT_DELAY_MS;
 use crate::components::app::freenet_api::response_handler::get_response::{
@@ -152,6 +159,20 @@ const _: () = assert!(
     (PROBE_GET_TIMEOUT.as_millis() as u64) < REPUT_DELAY_MS,
     "PROBE_GET_TIMEOUT must stay below REPUT_DELAY_MS or a probe is reclaimed mid-walk"
 );
+
+/// How long a re-key merge may hold a room's seed PUT (freenet/river#769).
+/// The immediate predecessor generation normally answers well inside this
+/// (0.2 s in the rehearsal), so the seed carries the old key's messages. A walk
+/// still running at the deadline (dead older keys, each waiting out the 12 s
+/// watchdog) seeds what the room holds now and finishes in the background;
+/// what it merges later reaches the new key as an ordinary update.
+const REKEY_SEED_WAIT: Duration = Duration::from_secs(5);
+
+/// How many consecutive page loads a re-key merge may end with keys still owed
+/// before the remaining keys are given up. Each such key held this room, but
+/// one that has not returned it in this many loads is almost certainly gone
+/// from the network, and asking again costs a GET on every load.
+pub(crate) const MAX_UNFINISHED_REKEY_LOADS: u32 = 5;
 
 /// River's app-supplied state semantics for the sans-IO decision driver: how to
 /// decode a legacy GET response, whether it is *real* state, and how to fold it
@@ -278,6 +299,9 @@ struct ProbeEntry {
     /// For a re-key merge, the generations the room owes a merge from.
     owed: Vec<ContractInstanceId>,
     purpose: ProbePurpose,
+    /// Unique per walk, so a seed deadline armed for one walk cannot act on a
+    /// later walk for the same owner.
+    walk: u64,
 }
 
 impl ProbeEntry {
@@ -311,6 +335,7 @@ impl ProbeEntry {
             fold_failed,
             owed,
             purpose,
+            walk: next_fire_token(),
         }
     }
 
@@ -438,6 +463,27 @@ pub(crate) fn rekey_candidates(
     out
 }
 
+/// The generations a background re-key merge asks: only the owed ones, newest
+/// first (registry order, then any unregistered owed key). A retry, or the
+/// one-time predecessor merge, has no blocking seed to protect, and walking
+/// every skipped generation again on each load would grow with the registry.
+pub(crate) fn owed_candidates(
+    legacy_newest_first: &[ContractInstanceId],
+    owed: &[ContractInstanceId],
+) -> Vec<ContractInstanceId> {
+    let mut out: Vec<ContractInstanceId> = legacy_newest_first
+        .iter()
+        .filter(|id| owed.contains(id))
+        .copied()
+        .collect();
+    for o in owed {
+        if !out.contains(o) {
+            out.push(*o);
+        }
+    }
+    out
+}
+
 /// What a finished re-key merge does (freenet/river#769). Pure, so each arm is
 /// testable without a runtime.
 #[derive(Debug)]
@@ -459,6 +505,15 @@ pub(crate) struct RekeyFinish {
 /// that leaves any owed key unsatisfied still merges what it found and seeds,
 /// and the next load asks again. If folding two generations failed, nothing
 /// is satisfied.
+///
+/// The answer for an old key may come from this node's own stored copy rather
+/// than from other peers: the device subscribed to that key before the re-key,
+/// so its node usually still hosts it. That copy is counted as the old key's
+/// state. freenet-core keeps a hosted copy in the contract's update mesh while
+/// the node is connected, so it is current; on a node isolated since the
+/// re-key it can be stale, and the key comes off the marker having merged only
+/// what the node held. What it missed is not lost: the members who wrote it
+/// still hold it and carry it forward when they upgrade.
 pub(crate) fn plan_rekey_finish(
     outcome: Outcome<ChatRoomStateV1>,
     owed: &[ContractInstanceId],
@@ -502,7 +557,46 @@ fn make_seed(entry: &mut ProbeEntry, owner_vk: VerifyingKey) {
         crate::util::defer(move || {
             SYNC_INFO.with_mut(|sync_info| sync_info.touch_subscribing_since(&owner_vk));
         });
+        arm_seed_deadline(owner_vk, entry.walk);
     }
+}
+
+/// The synchronous half of a seed deadline: if walk `walk` for `owner_vk` is
+/// still running and still holds its room's seed, let go of it, so the walk
+/// finishes in the background. Returns whether the caller must seed now.
+fn take_seed_deadline(owner_vk: VerifyingKey, walk: u64) -> bool {
+    let mut drivers = drivers();
+    match drivers.get_mut(&owner_vk) {
+        Some(entry)
+            if entry.walk == walk && entry.purpose == (ProbePurpose::RekeyMerge { seed: true }) =>
+        {
+            entry.purpose = ProbePurpose::RekeyMerge { seed: false };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Bound how long a re-key merge holds its room's seed PUT to
+/// [`REKEY_SEED_WAIT`]. At the deadline a walk still running seeds the room
+/// with what it holds now and carries on in the background; its merge later
+/// reaches the new key through `mark_needs_sync`.
+fn arm_seed_deadline(owner_vk: VerifyingKey, walk: u64) {
+    safe_spawn_local(async move {
+        sleep(REKEY_SEED_WAIT).await;
+        if take_seed_deadline(owner_vk, walk) {
+            info!(
+                "Re-key merge for room {:?} still running after {}s — seeding the new key \
+                 now and finishing the merge in the background",
+                MemberId::from(owner_vk),
+                REKEY_SEED_WAIT.as_secs()
+            );
+            crate::util::defer(move || {
+                SYNC_INFO.with_mut(|sync_info| sync_info.require_seed_put(&owner_vk));
+                request_seed_put(owner_vk);
+            });
+        }
+    });
 }
 
 /// Outcome of asking for a re-key merge.
@@ -520,12 +614,13 @@ pub enum RekeyStart {
 /// Merge what the older room-contract generations hold for `owner_vk`'s room
 /// into `ROOMS` (freenet/river#769), then, if `seed`, re-seed the current key.
 ///
-/// `owed` is the room's persisted `rekey_merge_owed`: the older contract ids
+/// `owed` is the room's persisted `rekey_merge.owed`: the older contract ids
 /// it was synced under and still owes a merge from. With `seed`, the caller
-/// must hold the room out of
-/// the subscribe sweep (status `Subscribing`) until this finishes: the seed PUT
-/// is the merge's last step, so it carries the old key's messages rather than
-/// only this device's snapshot.
+/// must hold the room out of the subscribe sweep (status `Subscribing`): the
+/// seed PUT is the merge's last step, so it carries the old key's messages
+/// rather than only this device's snapshot. The walk seeds when it ends or at
+/// [`REKEY_SEED_WAIT`], whichever comes first. Without `seed`, only the owed
+/// keys are asked, and nothing waits on the walk.
 pub async fn start_rekey_merge(
     owner_vk: VerifyingKey,
     owed: Vec<ContractInstanceId>,
@@ -550,7 +645,14 @@ pub async fn start_rekey_merge(
         .iter()
         .map(|k| *k.id())
         .collect();
-    let candidates = rekey_candidates(&legacy, &owed);
+    // A seeding walk is the first load after a re-key: it also asks the
+    // generations a device that skipped releases never synced under, and is
+    // bounded by the seed deadline. A background walk asks only what is owed.
+    let candidates = if seed {
+        rekey_candidates(&legacy, &owed)
+    } else {
+        owed_candidates(&legacy, &owed)
+    };
     info!(
         "Re-key merge for room {:?}: asking {} older generation(s) before {} (freenet/river#769)",
         MemberId::from(owner_vk),
@@ -561,17 +663,19 @@ pub async fn start_rekey_merge(
             "merging in the background"
         }
     );
-    // `rekey_candidates` keeps the registry's newest-first order.
-    drivers().insert(
+    // Both candidate lists keep the registry's newest-first order.
+    let entry = ProbeEntry::new(
         owner_vk,
-        ProbeEntry::new(
-            owner_vk,
-            local_snapshot,
-            candidates,
-            ProbePurpose::RekeyMerge { seed },
-            owed,
-        ),
+        local_snapshot,
+        candidates,
+        ProbePurpose::RekeyMerge { seed },
+        owed,
     );
+    let walk = entry.walk;
+    drivers().insert(owner_vk, entry);
+    if seed {
+        arm_seed_deadline(owner_vk, walk);
+    }
     pump_probe(owner_vk).await;
     RekeyStart::Started
 }
@@ -856,7 +960,6 @@ fn finish_rekey_merge(owner_vk: VerifyingKey, seed: bool, plan: RekeyFinish) {
         satisfied,
         ..
     } = plan;
-    let changes_room = recovered.is_some() || !satisfied.is_empty();
     crate::util::defer(move || {
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
@@ -866,10 +969,9 @@ fn finish_rekey_merge(owner_vk: VerifyingKey, seed: bool, plan: RekeyFinish) {
     });
     // Save the merged room and the updated marker together (one room slot),
     // and let a subscribed room push the merged-in messages as a delta. FIFO
-    // `defer` puts this after the merge above.
-    if changes_room {
-        crate::components::app::mark_needs_sync(owner_vk);
-    }
+    // `defer` puts this after the merge above. Always: even a walk that found
+    // nothing changes the marker's attempt count.
+    crate::components::app::mark_needs_sync(owner_vk);
     if seed {
         // After the merge (FIFO): the seed PUT reads the room from ROOMS, so it
         // carries the old key's messages and anything typed meanwhile.
@@ -883,8 +985,9 @@ fn finish_rekey_merge(owner_vk: VerifyingKey, seed: bool, plan: RekeyFinish) {
 /// Fold a finished re-key merge into the room: merge the recovered state (a
 /// CRDT merge, never a replace), then take the owed keys that answered off the
 /// marker, but only if that merge landed. A merge that fails leaves the room
-/// and the marker as they were, so the next load tries again. Returns whether
-/// the merge landed.
+/// and the owed keys as they were, so the next load tries again. A walk that
+/// leaves keys owed counts toward [`MAX_UNFINISHED_REKEY_LOADS`], at which the
+/// rest are given up. Returns whether the merge landed.
 pub(crate) fn apply_rekey_finish(
     room_data: &mut crate::room_data::RoomData,
     recovered: Option<ChatRoomStateV1>,
@@ -901,10 +1004,25 @@ pub(crate) fn apply_rekey_finish(
         ),
         None => true,
     };
+    let marker = &mut room_data.rekey_merge;
     if merged {
-        room_data
-            .rekey_merge_owed
-            .retain(|k| !satisfied.contains(k.id()));
+        marker.owed.retain(|k| !satisfied.contains(k.id()));
+    }
+    if marker.owed.is_empty() {
+        marker.unfinished_loads = 0;
+    } else {
+        marker.unfinished_loads += 1;
+        if marker.unfinished_loads >= MAX_UNFINISHED_REKEY_LOADS {
+            warn!(
+                "Re-key merge for room {:?}: {} older key(s) did not return the room in {} \
+                 loads — no longer asking",
+                MemberId::from(owner_vk),
+                marker.owed.len(),
+                marker.unfinished_loads
+            );
+            marker.owed.clear();
+            marker.unfinished_loads = 0;
+        }
     }
     merged
 }
@@ -1396,7 +1514,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            rekey_merge_owed: Vec::new(),
+            rekey_merge: Default::default(),
             invitation_secrets: std::collections::BTreeMap::new(),
         }
     }
@@ -1404,6 +1522,8 @@ mod tests {
     /// How one probe GET of the walk ends, in [`walk_rekey`].
     enum Reply {
         State(ChatRoomStateV1),
+        /// Raw bytes, for an answer that is not a decodable room state.
+        Bytes(Vec<u8>),
         NotFound,
         Silent,
     }
@@ -1435,6 +1555,7 @@ mod tests {
             routes().insert(id, (vk, token));
             let taken = match replies.next().expect("a reply per GET") {
                 Reply::State(state) => take_probe_response(id, &encode(&state)),
+                Reply::Bytes(bytes) => take_probe_response(id, &bytes),
                 Reply::NotFound => take_probe_absent(id),
                 Reply::Silent => {
                     assert!(take_probe_timeout(id, vk, token));
@@ -1518,7 +1639,7 @@ mod tests {
         assert_eq!(finish.satisfied, vec![id(81)]);
 
         let mut room = room_data(&sk, local_state);
-        room.rekey_merge_owed = vec![contract_key_with_id(81)];
+        room.rekey_merge.owed = vec![contract_key_with_id(81)];
         assert!(apply_rekey_finish(
             &mut room,
             finish.recovered,
@@ -1529,7 +1650,7 @@ mod tests {
         expected.sort();
         assert_eq!(texts(&room.room_state), expected, "all 16 messages survive");
         assert!(
-            room.rekey_merge_owed.is_empty(),
+            room.rekey_merge.owed.is_empty(),
             "the merge is no longer owed"
         );
     }
@@ -1563,7 +1684,7 @@ mod tests {
         let sk = SigningKey::from_bytes(&[88u8; 32]);
         let before = room_with_messages(&sk, &["m1", "m2"]);
         let mut room = room_data(&sk, before.clone());
-        room.rekey_merge_owed = vec![contract_key_with_id(88)];
+        room.rekey_merge.owed = vec![contract_key_with_id(88)];
         // A newer configuration makes the room private while the recovered
         // state still carries a public message: the merge applies the
         // configuration, then rejects the message, part-way through.
@@ -1595,7 +1716,7 @@ mod tests {
             room.room_state, before,
             "no half-merged state is left behind"
         );
-        assert_eq!(room.rekey_merge_owed, vec![contract_key_with_id(88)]);
+        assert_eq!(room.rekey_merge.owed, vec![contract_key_with_id(88)]);
     }
 
     /// The owed old key does not return the room, whether it stays silent or
@@ -1877,6 +1998,283 @@ mod tests {
         assert!(
             seed_arm.contains("crate::util::defer(move||{SYNC_INFO"),
             "the seed itself is deferred, behind the merge"
+        );
+    }
+
+    /// The source of this file before its test module, comments and
+    /// whitespace removed, for the wiring pins below.
+    fn production_source() -> String {
+        crate::util::strip_comments(
+            include_str!("backward_probe.rs")
+                .split("mod tests {")
+                .next()
+                .unwrap(),
+        )
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+    }
+
+    /// The real adapter, end to end through a Dioxus runtime: a background
+    /// merge (the retry, or the one-time predecessor merge of #771) asks only
+    /// the owed key, merges what it returns into ROOMS, clears the marker,
+    /// drops its driver entry, and runs at most once per page load.
+    #[test]
+    fn a_background_rekey_merge_runs_once_per_load_and_asks_only_owed_keys() {
+        use dioxus::prelude::*;
+        let sk = SigningKey::from_bytes(&[95u8; 32]);
+        let vk = sk.verifying_key();
+        let legacy = owner_vk_to_legacy_contract_keys(&vk);
+        assert!(
+            legacy.len() > 2,
+            "fixture: the registry has older generations"
+        );
+        // Owed: a generation two releases back. A walk over the skipped ones
+        // would ask legacy[0] first.
+        let owed_key = legacy[2];
+        let owed_id = *owed_key.id();
+        let local = room_with_messages(&sk, &["m1", "m2"]);
+        let old_state = room_with_messages(&sk, &["m1", "m2", "m3"]);
+
+        let dom = VirtualDom::new(|| rsx! {});
+        dom.in_scope(ScopeId::ROOT, || {
+            futures::executor::block_on(async {
+                let mut room = room_data(&sk, local.clone());
+                room.rekey_merge.owed = vec![owed_key];
+                ROOMS.with_mut(|rooms| rooms.map.insert(vk, room));
+
+                assert_eq!(
+                    start_rekey_merge(vk, vec![owed_id], local.clone(), false).await,
+                    RekeyStart::Started
+                );
+                assert!(routes().contains_key(&owed_id), "the owed key is asked");
+                assert!(
+                    !routes().contains_key(legacy[0].id()),
+                    "a background merge does not walk the skipped generations"
+                );
+                assert_eq!(
+                    start_rekey_merge(vk, vec![owed_id], local.clone(), false).await,
+                    RekeyStart::AlreadyRunning
+                );
+
+                assert!(deliver_probe_response(owed_id, &encode(&old_state)).await);
+                assert!(
+                    drivers().get(&vk).is_none(),
+                    "the driver entry is removed once the walk is done"
+                );
+                let rooms = ROOMS.read();
+                let room = &rooms.map[&vk];
+                assert_eq!(texts(&room.room_state), strs(&["m1", "m2", "m3"]));
+                assert!(
+                    room.rekey_merge.owed.is_empty(),
+                    "the merge is no longer owed"
+                );
+                drop(rooms);
+
+                assert_eq!(
+                    start_rekey_merge(vk, vec![owed_id], local, false).await,
+                    RekeyStart::AlreadyAttempted,
+                    "at most one merge per owner per page load"
+                );
+            })
+        });
+    }
+
+    /// Only the owed keys are asked by a background merge, in registry order;
+    /// an unregistered owed key is asked last.
+    #[test]
+    fn owed_candidates_are_only_the_owed_keys_newest_first() {
+        let legacy = vec![id(30), id(29), id(28), id(27)];
+        assert_eq!(owed_candidates(&legacy, &[id(28)]), vec![id(28)]);
+        assert_eq!(
+            owed_candidates(&legacy, &[id(27), id(29)]),
+            vec![id(29), id(27)]
+        );
+        assert_eq!(
+            owed_candidates(&legacy, &[id(99), id(28)]),
+            vec![id(28), id(99)]
+        );
+    }
+
+    /// Two owed keys, only one answers: only that one comes off the marker, and
+    /// the walk counts as unfinished.
+    #[test]
+    fn a_partial_rekey_finish_keeps_the_keys_that_did_not_answer() {
+        let sk = SigningKey::from_bytes(&[96u8; 32]);
+        let mut room = room_data(&sk, room_with_messages(&sk, &["m1"]));
+        room.rekey_merge.owed = vec![contract_key_with_id(97), contract_key_with_id(98)];
+        assert!(apply_rekey_finish(
+            &mut room,
+            Some(room_with_messages(&sk, &["m1", "m2"])),
+            &[id(97)],
+            sk.verifying_key()
+        ));
+        assert_eq!(room.rekey_merge.owed, vec![contract_key_with_id(98)]);
+        assert_eq!(room.rekey_merge.unfinished_loads, 1);
+        assert_eq!(texts(&room.room_state), strs(&["m1", "m2"]));
+    }
+
+    /// A key that never returns the room is given up after
+    /// `MAX_UNFINISHED_REKEY_LOADS` loads, not asked forever; a walk that
+    /// finishes resets the count.
+    #[test]
+    fn a_key_that_never_answers_is_given_up_after_a_bounded_number_of_loads() {
+        let sk = SigningKey::from_bytes(&[99u8; 32]);
+        let vk = sk.verifying_key();
+        let mut room = room_data(&sk, room_with_messages(&sk, &["m1"]));
+        room.rekey_merge.owed = vec![contract_key_with_id(100)];
+        for load in 1..MAX_UNFINISHED_REKEY_LOADS {
+            assert!(apply_rekey_finish(&mut room, None, &[], vk));
+            assert_eq!(room.rekey_merge.owed, vec![contract_key_with_id(100)]);
+            assert_eq!(room.rekey_merge.unfinished_loads, load);
+        }
+        assert!(apply_rekey_finish(&mut room, None, &[], vk));
+        assert!(room.rekey_merge.owed.is_empty(), "given up");
+        assert_eq!(room.rekey_merge.unfinished_loads, 0);
+
+        room.rekey_merge.owed = vec![contract_key_with_id(100)];
+        room.rekey_merge.unfinished_loads = MAX_UNFINISHED_REKEY_LOADS - 1;
+        assert!(apply_rekey_finish(
+            &mut room,
+            Some(room_with_messages(&sk, &["m1"])),
+            &[id(100)],
+            vk
+        ));
+        assert!(room.rekey_merge.owed.is_empty());
+        assert_eq!(
+            room.rekey_merge.unfinished_loads, 0,
+            "a finished walk resets"
+        );
+    }
+
+    /// An owed key answering with an empty (placeholder) state or with bytes
+    /// that are not a room state has not returned the room. Another owed key
+    /// returns real state in the same walk, so the merge itself lands: only
+    /// that key is satisfied, and the one that answered junk stays owed.
+    #[test]
+    fn an_owed_key_answering_empty_or_garbage_satisfies_nothing() {
+        let sk = SigningKey::from_bytes(&[101u8; 32]);
+        let local = room_with_messages(&sk, &["m1"]);
+        for junk in [
+            Reply::State(ChatRoomStateV1::default()),
+            Reply::Bytes(vec![0xff; 16]),
+        ] {
+            let finish = walk_rekey(
+                &sk,
+                local.clone(),
+                &[id(102), id(101)],
+                vec![id(101), id(102)],
+                vec![junk, Reply::State(room_with_messages(&sk, &["m1", "m2"]))],
+            );
+            assert!(finish.recovered.is_some(), "the real answer is merged");
+            assert_eq!(finish.satisfied, vec![id(101)], "only the real answer");
+            assert!(!finish.complete);
+        }
+    }
+
+    /// The seed deadline lets go of the room's seed only for the walk it was
+    /// armed for, only while that walk still holds the seed, and only once.
+    #[test]
+    fn a_seed_deadline_releases_only_its_own_seeding_walk() {
+        let vk = SigningKey::from_bytes(&[103u8; 32]).verifying_key();
+        let entry = ProbeEntry::new(
+            vk,
+            ChatRoomStateV1::default(),
+            vec![id(103)],
+            ProbePurpose::RekeyMerge { seed: true },
+            vec![id(103)],
+        );
+        let walk = entry.walk;
+        drivers().insert(vk, entry);
+        assert!(
+            !take_seed_deadline(vk, walk + 1_000_000),
+            "another walk's deadline"
+        );
+        assert!(
+            take_seed_deadline(vk, walk),
+            "the walk still holds the seed"
+        );
+        assert_eq!(
+            drivers().get(&vk).unwrap().purpose,
+            ProbePurpose::RekeyMerge { seed: false },
+            "the walk carries on in the background"
+        );
+        assert!(!take_seed_deadline(vk, walk), "only once");
+        drivers().remove(&vk);
+        assert!(
+            !take_seed_deadline(vk, walk),
+            "a finished walk seeded itself"
+        );
+
+        let recover = ProbeEntry::new(
+            vk,
+            ChatRoomStateV1::default(),
+            vec![id(103)],
+            ProbePurpose::Recover,
+            Vec::new(),
+        );
+        let walk = recover.walk;
+        drivers().insert(vk, recover);
+        assert!(
+            !take_seed_deadline(vk, walk),
+            "a #292 probe is not bounded here"
+        );
+        drivers().remove(&vk);
+    }
+
+    /// Wiring pins for the bounded seed (#771 review, must-fix B): every
+    /// way a walk comes to hold the seed arms the deadline, and the deadline
+    /// seeds through the ordinary seed path.
+    #[test]
+    fn every_seeding_walk_arms_the_seed_deadline() {
+        let src = production_source();
+        let section = |head: &str, next: &str| {
+            let start = src.find(head).expect(head);
+            src[start..start + src[start..].find(next).expect(next)].to_string()
+        };
+        let start = section(
+            "pubasyncfnstart_rekey_merge(",
+            "pubasyncfnstart_backward_probe(",
+        );
+        let arm = start
+            .find("ifseed{arm_seed_deadline(owner_vk,walk);}")
+            .expect("a seeding walk arms its deadline");
+        let pump = start.find("pump_probe(owner_vk).await;").expect("pumps");
+        assert!(arm < pump, "armed before the first GET goes out");
+        assert!(
+            start.contains("letcandidates=ifseed{rekey_candidates(&legacy,&owed)}else{owed_candidates(&legacy,&owed)};"),
+            "a background merge asks only the owed keys"
+        );
+        assert!(
+            section("fnmake_seed(", "fntake_seed_deadline(").contains("ifupgrade_to_seed(entry){")
+                && section("fnmake_seed(", "fntake_seed_deadline(")
+                    .contains("arm_seed_deadline(owner_vk,entry.walk);"),
+            "a background walk told to seed arms its deadline too"
+        );
+        let deadline = section("fnarm_seed_deadline(", "pubasyncfnstart_rekey_merge(");
+        let take = deadline
+            .find("iftake_seed_deadline(owner_vk,walk){")
+            .expect("the deadline acts only if the walk still holds the seed");
+        let flag = deadline
+            .find("sync_info.require_seed_put(&owner_vk)")
+            .expect("forces the PUT route");
+        let put = deadline.find("request_seed_put(owner_vk)").expect("seeds");
+        assert!(take < flag && flag < put);
+    }
+
+    /// Wiring pin: the walk's terminal step plans the re-key finish from the
+    /// entry's OWN owed keys, hits and fold flag, and applies that plan.
+    #[test]
+    fn pump_probe_plans_the_rekey_finish_from_its_own_entry() {
+        let src = production_source();
+        let start = src.find("asyncfnpump_probe(").expect("fn exists");
+        let body =
+            &src[start..start + src[start..].find("fnfinish_rekey_merge(").expect("next fn")];
+        assert!(
+            body.contains(
+                "ifletProbePurpose::RekeyMerge{seed}=entry.purpose{ifletSome(outcome)=outcome{letplan=plan_rekey_finish(outcome,&entry.owed,&entry.hits,entry.fold_failed.load(Ordering::Relaxed),);finish_rekey_merge(owner_vk,seed,plan);}return;}"
+            ),
+            "the re-key finish must be planned from this walk's entry and applied"
         );
     }
 }
