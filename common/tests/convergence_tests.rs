@@ -2820,3 +2820,110 @@ fn test_merge_owner_ban_across_diverged_states() {
     ciborium::ser::into_writer(&merged_21, &mut bytes_21).unwrap();
     assert_eq!(bytes_12, bytes_21, "Owner ban merge must be commutative");
 }
+
+/// After the owner lowers `max_members`, a peer that has not yet seen the new
+/// configuration still holds the larger member set. Exchanging states in both
+/// directions converges both peers on the same state under the new limit.
+/// Returns how many merges were rejected along the way.
+fn lower_max_members_with_a_stale_peer(held: usize, new_max: usize) -> usize {
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_id: MemberId = owner_sk.verifying_key().into();
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+    let config = |version: u32, max_members: usize| {
+        AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: owner_id,
+                configuration_version: version,
+                max_members,
+                max_recent_messages: held,
+                ..Default::default()
+            },
+            &owner_sk,
+        )
+    };
+
+    let mut members = Vec::new();
+    let mut messages = Vec::new();
+    for i in 0..held {
+        let (member, sk) = create_test_member(owner_id, owner_id);
+        messages.push(create_test_msg(owner_id, member.id(), &sk, i as u64));
+        members.push(create_authorized_member(member, &owner_sk));
+    }
+    members.sort_by_key(|m| m.member.id());
+    messages.sort_by(|a, b| {
+        a.message
+            .time
+            .cmp(&b.message.time)
+            .then_with(|| a.id().cmp(&b.id()))
+    });
+    let mut stale = ChatRoomStateV1 {
+        configuration: config(1, held),
+        members: MembersV1 { members },
+        recent_messages: MessagesV1 {
+            messages,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    stale.recent_messages.rebuild_actions_state();
+    stale
+        .verify(&stale, &parameters)
+        .expect("stale peer verifies");
+
+    // The owner's peer applies the lowered limit.
+    let mut updated = stale.clone();
+    let lower = river_core::room_state::ChatRoomStateV1Delta {
+        configuration: Some(config(2, new_max)),
+        ..Default::default()
+    };
+    updated
+        .apply_delta(&stale, &parameters, &Some(lower))
+        .expect("the configuration delta applies");
+    assert_eq!(updated.members.members.len(), new_max);
+
+    let ser = |s: &ChatRoomStateV1| {
+        let mut v = Vec::new();
+        ciborium::ser::into_writer(s, &mut v).unwrap();
+        v
+    };
+    // The updated peer hears from the stale one first. A rejected merge
+    // leaves the receiver as it was, as on the network.
+    let (mut a, mut b) = (stale, updated);
+    let mut rejected = 0;
+    for _ in 0..3 {
+        let mut next_b = b.clone();
+        match next_b.merge(&b, &parameters, &a) {
+            Ok(()) => b = next_b,
+            Err(_) => rejected += 1,
+        }
+        let mut next_a = a.clone();
+        match next_a.merge(&a, &parameters, &b) {
+            Ok(()) => a = next_a,
+            Err(_) => rejected += 1,
+        }
+    }
+    assert!(ser(&a) == ser(&b), "the peers converge");
+    assert_eq!(a.members.members.len(), new_max);
+    assert_eq!(a.configuration.configuration.max_members, new_max);
+    a.verify(&a, &parameters).unwrap();
+    rejected
+}
+
+/// The stale peer's members delta is larger than the new limit but within
+/// the work bound, so it is accepted and trimmed: no merge is rejected.
+#[test]
+fn lowering_max_members_converges_with_a_stale_peer() {
+    assert_eq!(lower_max_members_with_a_stale_peer(6, 2), 0);
+}
+
+/// From above the work bound: the stale peer's members delta is over it, so
+/// the updated peer rejects it until the stale peer has taken the new
+/// configuration and trimmed its own set. The peers then converge.
+#[test]
+fn lowering_max_members_from_above_the_work_bound_converges() {
+    assert_eq!(lower_max_members_with_a_stale_peer(1_003, 2), 1);
+}

@@ -109,33 +109,57 @@ impl ComposableState for MembersV1 {
         let max_members = parent_state.configuration.configuration.max_members;
 
         if let Some(delta) = delta {
+            // A bound on the compute work one delta can cause, not a room
+            // rule: each added member costs a signature check, and a delta
+            // much past `MIN_MEMBERS_DELTA_BOUND` members would exceed the
+            // contract's compute limit anyway. Deltas larger than
+            // `max_members` within the bound are accepted and trimmed below.
+            // A peer still holding a larger set from before a big
+            // `max_members` reduction can produce a delta over the bound; it
+            // is rejected only until that peer receives the new
+            // configuration and trims its own set.
+            let work_bound = max_members.max(MIN_MEMBERS_DELTA_BOUND);
+            if delta.added.len() > work_bound {
+                return Err(format!(
+                    "Members delta of {} exceeds {}",
+                    delta.added.len(),
+                    work_bound
+                ));
+            }
+
+            // The owner is never in the members list (`verify` rejects a
+            // record with the owner's id). Such a record in a delta is ignored
+            // here rather than failing the delta, so the rest of the delta
+            // applies the same way whatever else it carries.
+            let owner_id = parameters.owner_id();
+            let added: Vec<&AuthorizedMember> = delta
+                .added
+                .iter()
+                .filter(|m| m.member.id() != owner_id)
+                .collect();
+
             // Build a combined lookup map that includes both existing members
             // AND members being added in this delta. This is necessary because
             // during merge, a member and their inviter may both be in the delta
             // (e.g., member B invited by member A, both being added from the
             // other state). Without this, verify would fail with "Inviter not found".
             let mut combined_members_by_id = self.members_by_member_id();
-            for member in &delta.added {
+            for member in &added {
                 combined_members_by_id
                     .entry(member.member.id())
                     .or_insert(member);
             }
 
             // Verify that all new members have valid invites
-            for member in &delta.added {
-                self.verify_member_invite_with_lookup(member, parameters, &combined_members_by_id)?;
-            }
+            Self::verify_invite_chains(&added, parameters, &combined_members_by_id)?;
 
             // Add ALL new members (deduplicated), let remove_excess_members handle trimming.
             // This ensures CRDT convergence: regardless of delta order, the same set of
             // members will be kept based on the deterministic removal criteria.
-            for member in &delta.added {
+            let mut held: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
+            for member in added {
                 // Skip if this member already exists
-                if self
-                    .members
-                    .iter()
-                    .any(|m| m.member.id() == member.member.id())
-                {
+                if !held.insert(member.member.id()) {
                     continue;
                 }
                 self.members.push(member.clone());
@@ -162,25 +186,79 @@ impl ComposableState for MembersV1 {
     }
 }
 
+/// One delta may add `max(max_members, MIN_MEMBERS_DELTA_BOUND)` members.
+/// See `MembersV1::apply_delta`.
+const MIN_MEMBERS_DELTA_BOUND: usize = 1_000;
+
 impl MembersV1 {
-    /// Verify a member's invite chain using a pre-built lookup map.
-    /// The lookup map should include both existing members AND delta members
-    /// when called during apply_delta, so that inviters in the same delta
-    /// can be found.
-    fn verify_member_invite_with_lookup(
-        &self,
-        member: &AuthorizedMember,
+    /// Verify the invite chain of every member in `added` against a lookup
+    /// map that includes both existing members AND the delta's members, so
+    /// inviters in the same delta can be found.
+    ///
+    /// A walk starting from the record `members_by_id` holds for its id stops
+    /// at a record (compared in full, signature included) whose chain an
+    /// earlier walk already verified: every record past the first is a lookup
+    /// result, so the walks meet on the same records and stopping there gives
+    /// the result the full walk would. Each such record's signature is
+    /// checked at most once per call. A walk starting from another record
+    /// with the same id is done in full, as before, since the full walk also
+    /// fails when its own id reappears further up the chain.
+    fn verify_invite_chains<'a>(
+        added: &[&'a AuthorizedMember],
         parameters: &ChatRoomParametersV1,
-        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        members_by_id: &HashMap<MemberId, &'a AuthorizedMember>,
     ) -> Result<(), String> {
-        if member.member.invited_by == parameters.owner_id() {
-            // Member was invited by the owner, verify signature against owner's key
-            member
-                .verify_signature(&parameters.owner)
-                .map_err(|e| format!("Invalid signature for member invited by owner: {}", e))?;
-        } else {
-            // Member was invited by another member, verify the invite chain
-            self.get_invite_chain_with_lookup(member, parameters, members_by_id)?;
+        let owner_id = parameters.owner_id();
+        let mut verified: HashSet<&'a AuthorizedMember> = HashSet::new();
+        for member in added {
+            let use_memo = members_by_id
+                .get(&member.member.id())
+                .is_some_and(|held| *held == *member);
+            let mut path_ids = HashSet::new();
+            let mut path: Vec<&'a AuthorizedMember> = Vec::new();
+            let mut current: &'a AuthorizedMember = member;
+            loop {
+                if use_memo && verified.contains(current) {
+                    break;
+                }
+                let id = current.member.id();
+                if !path_ids.insert(id) {
+                    return Err(format!(
+                        "Circular invite chain detected for member {:?}",
+                        id
+                    ));
+                }
+                if current.member.invited_by == id {
+                    return Err(format!("Self-invitation detected for member {:?}", id));
+                }
+                path.push(current);
+                #[cfg(test)]
+                tests::count_invite_signature_check();
+                if current.member.invited_by == owner_id {
+                    current.verify_signature(&parameters.owner).map_err(|e| {
+                        format!(
+                            "Invalid signature for member {:?} invited by owner: {}",
+                            id, e
+                        )
+                    })?;
+                    break;
+                }
+                let inviter: &'a AuthorizedMember = members_by_id
+                    .get(&current.member.invited_by)
+                    .ok_or_else(|| {
+                    format!(
+                        "Inviter {:?} not found for member {:?}",
+                        current.member.invited_by, id
+                    )
+                })?;
+                current
+                    .verify_signature(&inviter.member.member_vk)
+                    .map_err(|e| format!("Invalid signature for member {:?}: {}", id, e))?;
+                current = inviter;
+            }
+            if use_memo {
+                verified.extend(path);
+            }
         }
         Ok(())
     }
@@ -753,6 +831,7 @@ impl Member {
 mod tests {
     use super::*;
     use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+    use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use std::time::SystemTime;
@@ -766,6 +845,269 @@ mod tests {
             member_vk: verifying_key,
         };
         (member, signing_key)
+    }
+
+    thread_local! {
+        static INVITE_SIGNATURE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_invite_signature_check() {
+        INVITE_SIGNATURE_CHECKS.with(|c| c.set(c.get() + 1));
+    }
+
+    fn invite_signature_checks() -> usize {
+        INVITE_SIGNATURE_CHECKS.with(|c| c.get())
+    }
+
+    /// A chain owner -> m0 -> m1 -> ... -> m{n-1}, each record signed by its
+    /// inviter, the signing key of the last member, and a state allowing
+    /// `max_members` members.
+    fn invite_chain(
+        n: usize,
+        max_members: usize,
+    ) -> (
+        ChatRoomStateV1,
+        ChatRoomParametersV1,
+        Vec<AuthorizedMember>,
+        SigningKey,
+    ) {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let mut chain = Vec::with_capacity(n);
+        let mut inviter_sk = owner_sk.clone();
+        let mut inviter_id = owner_id;
+        for _ in 0..n {
+            let (member, sk) = create_test_member(owner_id, inviter_id);
+            inviter_id = member.id();
+            chain.push(AuthorizedMember::new(member, &inviter_sk));
+            inviter_sk = sk;
+        }
+        let parent_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_members,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        (parent_state, parameters, chain, inviter_sk)
+    }
+
+    /// Each link of a chain added in one delta is verified once, whatever
+    /// order the delta lists the members in.
+    #[test]
+    fn a_chain_in_one_delta_verifies_each_link_once() {
+        let n = 64;
+        let (parent_state, parameters, chain, _) = invite_chain(n, n);
+        let mut deepest_first = chain.clone();
+        deepest_first.reverse();
+        for added in [chain, deepest_first] {
+            let mut members = MembersV1::default();
+            let before = invite_signature_checks();
+            members
+                .apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(added)))
+                .unwrap();
+            assert_eq!(invite_signature_checks() - before, n);
+            assert_eq!(members.members.len(), n);
+        }
+    }
+
+    /// A record carrying the owner's id is ignored wherever it sits in the
+    /// delta, and the rest of the delta applies as it would without it.
+    #[test]
+    fn a_member_record_carrying_the_owner_id_is_ignored() {
+        let (mut parent_state, parameters, chain, last_sk) = invite_chain(2, 10);
+        let owner_id: MemberId = parameters.owner.into();
+        parent_state.members.members = chain;
+        let inviter_id = parent_state.members.members[1].member.id();
+        let (y, y_sk) = create_test_member(owner_id, inviter_id);
+        let y_record = AuthorizedMember::new(y.clone(), &last_sk);
+        let owner_record = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: y.id(),
+                member_vk: parameters.owner,
+            },
+            &y_sk,
+        );
+
+        let results: Vec<MembersV1> = [
+            vec![owner_record.clone(), y_record.clone()],
+            vec![y_record.clone(), owner_record],
+            vec![y_record],
+        ]
+        .into_iter()
+        .map(|added| {
+            let mut members = parent_state.members.clone();
+            members
+                .apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(added)))
+                .unwrap();
+            members
+        })
+        .collect();
+        assert_eq!(results[0], results[2]);
+        assert_eq!(results[1], results[2]);
+        assert!(results[2].members.iter().any(|m| m.member.id() == y.id()));
+        assert!(results[0].members.iter().all(|m| m.member.id() != owner_id));
+    }
+
+    /// Records for a room where `a` and `b` are invited by the owner:
+    /// `genuine` is `a`'s record; `other` carries `a`'s key, names `b` as
+    /// inviter and has a signature that does not verify for it; `y` is
+    /// invited by `a`.
+    struct SameIdRecords {
+        parent_state: ChatRoomStateV1,
+        parameters: ChatRoomParametersV1,
+        genuine: AuthorizedMember,
+        other: AuthorizedMember,
+        b: AuthorizedMember,
+        y: AuthorizedMember,
+    }
+
+    fn same_id_records() -> SameIdRecords {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let (a, a_sk) = create_test_member(owner_id, owner_id);
+        let (b, _) = create_test_member(owner_id, owner_id);
+        let (y, _) = create_test_member(owner_id, a.id());
+        let genuine = AuthorizedMember::new(a.clone(), &owner_sk);
+        let other = AuthorizedMember {
+            member: Member {
+                invited_by: b.id(),
+                ..a.clone()
+            },
+            signature: genuine.signature,
+        };
+        assert_eq!(other.member.id(), genuine.member.id());
+        let parent_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_members: 10,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        SameIdRecords {
+            parent_state,
+            parameters: ChatRoomParametersV1 {
+                owner: owner_sk.verifying_key(),
+            },
+            genuine,
+            other,
+            b: AuthorizedMember::new(b, &owner_sk),
+            y: AuthorizedMember::new(y, &a_sk),
+        }
+    }
+
+    /// A record whose own signature does not verify rejects the delta,
+    /// whatever else in the delta shares its id, in either order.
+    #[test]
+    fn a_record_sharing_an_id_with_a_verified_one_is_still_checked() {
+        let r = same_id_records();
+        let apply = |held: Vec<AuthorizedMember>, added: Vec<AuthorizedMember>| {
+            let mut members = MembersV1 { members: held };
+            members.apply_delta(
+                &r.parent_state,
+                &r.parameters,
+                &Some(MembersDelta::new(added)),
+            )
+        };
+        // Neither record held.
+        assert!(apply(vec![r.b.clone()], vec![r.genuine.clone(), r.other.clone()]).is_err());
+        assert!(apply(vec![r.b.clone()], vec![r.other.clone(), r.genuine.clone()]).is_err());
+        // The genuine record held, with a member it invited in the delta.
+        let held = vec![r.genuine.clone(), r.b.clone()];
+        assert!(apply(held.clone(), vec![r.y.clone(), r.other.clone()]).is_err());
+        assert!(apply(held.clone(), vec![r.other.clone(), r.y.clone()]).is_err());
+        assert!(apply(held, vec![r.y.clone()]).is_ok());
+    }
+
+    /// A second record for a held member's key, validly signed by a member
+    /// further down the held record's own subtree, makes the chain return to
+    /// its own id. The delta is rejected in either order, also when an earlier
+    /// walk in the same delta already verified the held record.
+    #[test]
+    fn a_record_whose_chain_returns_to_its_own_id_is_rejected() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let (x, x_sk) = create_test_member(owner_id, owner_id);
+        let (e, e_sk) = create_test_member(owner_id, x.id());
+        let (y, _) = create_test_member(owner_id, x.id());
+        let held = vec![
+            AuthorizedMember::new(x.clone(), &owner_sk),
+            AuthorizedMember::new(e.clone(), &x_sk),
+        ];
+        let y = AuthorizedMember::new(y, &x_sk);
+        let s = AuthorizedMember::new(
+            Member {
+                invited_by: e.id(),
+                ..x.clone()
+            },
+            &e_sk,
+        );
+        let parent_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_members: 10,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        for added in [
+            vec![y.clone(), s.clone()],
+            vec![s.clone(), y.clone()],
+            vec![s],
+        ] {
+            let mut members = MembersV1 {
+                members: held.clone(),
+            };
+            let result =
+                members.apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(added)));
+            assert!(result.is_err(), "{result:?}");
+        }
+    }
+
+    /// The bound is `max(max_members, MIN_MEMBERS_DELTA_BOUND)`. It is checked
+    /// before any record is verified, so repeated copies of one record suffice.
+    #[test]
+    fn a_members_delta_over_the_work_bound_is_rejected() {
+        for max_members in [10, MIN_MEMBERS_DELTA_BOUND + 500] {
+            let bound = max_members.max(MIN_MEMBERS_DELTA_BOUND);
+            let (parent_state, parameters, chain, _) = invite_chain(1, max_members);
+
+            let mut members = MembersV1::default();
+            let at_bound = vec![chain[0].clone(); bound];
+            members
+                .apply_delta(
+                    &parent_state,
+                    &parameters,
+                    &Some(MembersDelta::new(at_bound)),
+                )
+                .unwrap();
+            assert_eq!(members.members.len(), 1);
+
+            let mut members = MembersV1::default();
+            let over = vec![chain[0].clone(); bound + 1];
+            let result =
+                members.apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(over)));
+            assert!(result.is_err(), "max_members {max_members}");
+            assert!(members.members.is_empty());
+        }
     }
 
     #[test]
