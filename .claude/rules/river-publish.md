@@ -361,6 +361,32 @@ disagree, a listing that disagrees with it, an absent index beside a stored
 fixed key, and a listed key that answers "no value". A wrong refusal costs a
 retry; a wrong short answer would be certified complete.
 
+**The walk runs only over a complete current room set** (#768 review A1).
+A load attempt records `mark_room_set_complete` only when every listed slot
+and `rooms_meta` answered and decoded (a listed key with no value is a read
+fault, never a skip). The walk driver captures the attempt, waits for the load
+to settle, and aborts (re-arming the next attempt, without spending the walk
+budget) if the load is still pending at the cap, a reconnect began a new
+attempt, or the set is not complete; `LiveImportSeam` re-checks before every
+merge and its flush. Merging older copies into a set that failed to load, then
+saving, is #595's identity-overwrite chain.
+
+**The sweep's journal gate** is retried with backoff; a final refusal marks
+the load's fetch failure (Retry, not a false "no rooms") and holds back every
+older generation for the page load.
+
+**Post-resolve top-up** (#768 review B1). An old tab on the previous build
+keeps writing to the newest predecessor (V32) until it is closed. For 14 days
+or 30 loads after the journal resolves it (state under
+`__river_migration_topup_window__`), each load re-lists it and merges rooms
+the current delegate does not know at all, plus its outbound DMs, through the
+ranked merge.
+
+**Migrated identities keep their source rank across loads** (#768 review
+B3): `rooms_meta.identity_sources` records which legacy generation supplied a
+room's `self_sk`, and the load restores it, so a newer generation answering
+later still wins the identity conflict.
+
 The **identity-import gate** (#414) is composed from the journal: a walk in
 flight or a status not yet read waits; `begin` failing, a walk whose status is
 unknown, `interrupted_import()`, or permanently rejected items block, with a
