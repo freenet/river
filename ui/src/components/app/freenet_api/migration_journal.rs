@@ -35,6 +35,7 @@
 //! `Complete` over a partial copy another tab left. [`JournalSession`] keeps the
 //! last status `begin` or the walk returned, plus whether one is running.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
 
@@ -74,6 +75,48 @@ pub(crate) struct JournalSession {
     pub(crate) sweep_flagged_since_status: bool,
 }
 
+impl JournalSession {
+    /// `begin` succeeded and returned `status`.
+    pub(crate) fn on_begin_ok(&mut self, status: JournalStatus) {
+        self.begun = true;
+        self.begin_failed = false;
+        self.status = Some(status);
+        self.sweep_flagged_since_status = false;
+    }
+
+    /// `begin` failed. Only a load that has never begun is "failed": a later
+    /// failed re-begin leaves the last good answer standing.
+    pub(crate) fn on_begin_err(&mut self) {
+        self.begin_failed = !self.begun;
+    }
+
+    /// A walk finished and returned `status` (`None`: it was refused, or its
+    /// final store failed, so the journal's state is unknown).
+    pub(crate) fn on_walk_done(&mut self, status: Option<JournalStatus>) {
+        self.walk_status_unknown = status.is_none();
+        if let Some(status) = status {
+            self.begun = true;
+            self.begin_failed = false;
+            self.status = Some(status);
+            // Journal operations are serialised, so every sweep flag raised
+            // before this walk took the lock is in the status it returned.
+            self.sweep_flagged_since_status = false;
+        }
+    }
+
+    /// What [`interrupted_import_for_recovery`] can answer now; `None` keeps it
+    /// waiting for `begin`.
+    pub(crate) fn recovery_answer(&self) -> Option<bool> {
+        if let Some(status) = &self.status {
+            return Some(status.interrupted_import() || self.sweep_flagged_since_status);
+        }
+        if self.begin_failed {
+            return Some(true);
+        }
+        None
+    }
+}
+
 static SESSION: LazyLock<Mutex<JournalSession>> =
     LazyLock::new(|| Mutex::new(JournalSession::default()));
 
@@ -103,6 +146,10 @@ static GATE_OVERRIDE: AtomicBool = AtomicBool::new(false);
 pub static JOURNAL_GATE_VERSION: GlobalSignal<u64> = Global::new(|| 0);
 
 fn bump_gate_version() {
+    // Natively `defer` runs its closure at once, and a `GlobalSignal` write
+    // outside a Dioxus runtime panics, so the native tests of the driver skip
+    // the re-render nudge (nothing renders there).
+    #[cfg(not(test))]
     crate::util::defer(|| {
         *JOURNAL_GATE_VERSION.write() += 1;
     });
@@ -207,6 +254,22 @@ pub(crate) enum WalkDecision {
     },
 }
 
+/// Whether the cadence counter must be read to decide the walk: only for a
+/// status the rate limit can apply to (see [`walk_decision`]).
+pub(crate) fn needs_cadence_counter(status: &JournalStatus) -> bool {
+    !status.is_complete()
+        && !status.interrupted_import()
+        && status.pending_all_absent(CADENCE_ABSENT_STREAK)
+}
+
+/// Whether a sweep write the journal allowed raises the "flagged since the
+/// status" bit and asks for a walk. Only a freshly FLAGGED import does: an
+/// already-imported predecessor merges unflagged, and a skipped one writes
+/// nothing.
+pub(crate) fn sweep_write_raises_flag(write: SweepWrite) -> bool {
+    write == SweepWrite::Merge
+}
+
 /// Decide the walk from the status `begin` returned (freenet/river#761).
 ///
 /// `Complete` is out of reach while generations this node never had stay
@@ -256,10 +319,7 @@ pub(crate) fn start_journal_load() {
             let _ops = JOURNAL_OPS.lock().await;
             let channel = NodeDelegateChannel;
             let successor = chat_delegate::current_delegate_key();
-            let needs_counter = !status.is_complete()
-                && !status.interrupted_import()
-                && status.pending_all_absent(CADENCE_ABSENT_STREAK);
-            let skips = if needs_counter {
+            let skips = if needs_cadence_counter(&status) {
                 read_walk_cadence(&channel, &successor).await.ok()
             } else {
                 None
@@ -314,17 +374,12 @@ async fn begin_unlocked() -> Option<JournalStatus> {
                 status.rejected_items()
             );
             let recorded = status.clone();
-            update_session(move |s| {
-                s.begun = true;
-                s.begin_failed = false;
-                s.status = Some(recorded);
-                s.sweep_flagged_since_status = false;
-            });
+            update_session(move |s| s.on_begin_ok(recorded));
             Some(status)
         }
         Err(e) => {
             warn!("migration journal: begin failed ({e}); no migrated write will happen until it succeeds");
-            update_session(|s| s.begin_failed = !s.begun);
+            update_session(JournalSession::on_begin_err);
             None
         }
     }
@@ -340,14 +395,8 @@ pub(crate) async fn interrupted_import_for_recovery() -> bool {
     const MAX_MS: u64 = 30_000;
     let mut waited = 0;
     loop {
-        {
-            let s = session();
-            if let Some(status) = &s.status {
-                return status.interrupted_import() || s.sweep_flagged_since_status;
-            }
-            if s.begin_failed {
-                return true;
-            }
+        if let Some(answer) = session().recovery_answer() {
+            return answer;
         }
         if waited >= MAX_MS {
             return true;
@@ -381,7 +430,7 @@ pub(crate) async fn gate_sweep_import(responding: &DelegateKey, items: Option<u3
         )
         .await
     };
-    if write == SweepWrite::Merge {
+    if sweep_write_raises_flag(write) {
         update_session(|s| s.sweep_flagged_since_status = true);
         poke_walk();
     }
@@ -423,7 +472,45 @@ pub(crate) fn poke_walk() {
     crate::util::safe_spawn_local(walk_driver());
 }
 
+/// What the walk driver reads from and does to its environment. The live
+/// implementation is the node/Dioxus runtime ([`LiveWalkEnv`]); the native
+/// tests substitute a scripted one, because the driver's branches (the
+/// fetch-failure gate of freenet/river#595, the wait for the load to settle,
+/// the walk cap, a poke landing mid-walk) are otherwise reachable only in a
+/// browser.
+pub(crate) trait WalkEnv {
+    /// Load workers still in flight (the sweep and the room load).
+    fn pending_load_workers(&self) -> u32;
+    /// Whether this load attempt saw a room fail to load.
+    fn saw_fetch_failure(&self) -> bool;
+    /// Wait `ms` milliseconds.
+    fn sleep(&self, ms: u64) -> impl Future<Output = ()>;
+    /// Run one journaled walk to completion.
+    fn run_walk(&self) -> impl Future<Output = ()>;
+}
+
+struct LiveWalkEnv;
+
+impl WalkEnv for LiveWalkEnv {
+    fn pending_load_workers(&self) -> u32 {
+        chat_delegate::pending_load_workers()
+    }
+    fn saw_fetch_failure(&self) -> bool {
+        chat_delegate::saw_fetch_failure()
+    }
+    async fn sleep(&self, ms: u64) {
+        crate::util::sleep(std::time::Duration::from_millis(ms)).await
+    }
+    async fn run_walk(&self) {
+        run_walk_locked().await
+    }
+}
+
 async fn walk_driver() {
+    walk_driver_with(&LiveWalkEnv).await
+}
+
+async fn walk_driver_with<E: WalkEnv>(env: &E) {
     loop {
         while WALK_POKED.swap(false, Ordering::Relaxed) {
             if WALKS_THIS_LOAD.fetch_add(1, Ordering::Relaxed) >= MAX_WALKS_PER_LOAD {
@@ -434,11 +521,11 @@ async fn walk_driver() {
                 break;
             }
             let mut waited = 0u64;
-            while chat_delegate::pending_load_workers() != 0 && waited < WALK_QUIESCENCE_MAX_MS {
-                crate::util::sleep(std::time::Duration::from_millis(WALK_QUIESCENCE_POLL_MS)).await;
+            while env.pending_load_workers() != 0 && waited < WALK_QUIESCENCE_MAX_MS {
+                env.sleep(WALK_QUIESCENCE_POLL_MS).await;
                 waited += WALK_QUIESCENCE_POLL_MS;
             }
-            if !walk_may_run(chat_delegate::saw_fetch_failure()) {
+            if !walk_may_run(env.saw_fetch_failure()) {
                 warn!(
                     "migration journal: a room failed to load on this attempt; not walking \
                      over an incomplete room set (freenet/river#595). The next load attempt \
@@ -448,7 +535,7 @@ async fn walk_driver() {
                 LOAD_ARMED.store(false, Ordering::Relaxed);
                 continue;
             }
-            run_walk_locked().await;
+            env.run_walk().await;
         }
         WALK_DRIVER_RUNNING.store(false, Ordering::Relaxed);
         // A poke that landed after the last check found the driver still
@@ -486,17 +573,7 @@ async fn run_walk_locked() {
     .await;
     log_migration_report(&report);
     let status = report.status.clone();
-    update_session(move |s| {
-        s.walk_status_unknown = status.is_none();
-        if let Some(status) = status {
-            s.begun = true;
-            s.begin_failed = false;
-            s.status = Some(status);
-            // Journal operations are serialised, so every sweep flag raised
-            // before this walk took the lock is in the status it returned.
-            s.sweep_flagged_since_status = false;
-        }
-    });
+    update_session(move |s| s.on_walk_done(status));
 }
 
 #[cfg(test)]
@@ -700,14 +777,251 @@ mod tests {
         assert!(!walk_may_run(true));
         let src = include_str!("migration_journal.rs");
         let driver = src
-            .find(&["async fn walk", "_driver()"].concat())
+            .find(&["async fn walk", "_driver_with<"].concat())
             .expect("walk driver");
         let body = &src[driver..];
         let body = &body[..body.find("\n}\n").expect("driver ends")];
         let gate = body
-            .find("walk_may_run(chat_delegate::saw_fetch_failure())")
+            .find("walk_may_run(env.saw_fetch_failure())")
             .expect("the driver must gate on the load's fetch failures");
-        let run = body.find("run_walk_locked().await").expect("the walk runs");
+        let run = body.find("env.run_walk().await").expect("the walk runs");
         assert!(gate < run, "the gate must precede the walk");
+    }
+
+    // ---------------- probes added by the testing review of PR #768 ----------------
+
+    /// The session transitions the driver applies (wasm-only code, so the
+    /// transitions are pure methods the native tests can reach).
+    #[test]
+    fn session_transitions_keep_the_gate_honest() {
+        // A failed first begin blocks; a failed RE-begin leaves the good answer.
+        let mut s = JournalSession::default();
+        s.on_begin_err();
+        assert!(s.begin_failed);
+        assert_eq!(import_gate(&s, false), ImportGate::Blocked);
+        s.on_begin_ok(JournalStatus::Complete { rejected_items: 0 });
+        assert!(!s.begin_failed && s.begun);
+        assert_eq!(import_gate(&s, false), ImportGate::Open);
+        s.on_begin_err();
+        assert!(
+            !s.begin_failed,
+            "a failed re-begin must not discard the last good answer"
+        );
+        assert_eq!(import_gate(&s, false), ImportGate::Open);
+
+        // A sweep flag blocks until a begin or a walk returns a status that
+        // knows about it.
+        s.sweep_flagged_since_status = true;
+        assert_eq!(import_gate(&s, false), ImportGate::Blocked);
+        let mut after_begin = s.clone();
+        after_begin.on_begin_ok(JournalStatus::Complete { rejected_items: 0 });
+        assert_eq!(import_gate(&after_begin, false), ImportGate::Open);
+        let mut after_walk = s.clone();
+        after_walk.on_walk_done(Some(JournalStatus::Complete { rejected_items: 0 }));
+        assert_eq!(import_gate(&after_walk, false), ImportGate::Open);
+
+        // A walk with no status (refused, or its store failed) blocks and keeps
+        // the old status; the next walk with a status clears it.
+        let mut w = known(JournalStatus::Complete { rejected_items: 0 });
+        w.on_walk_done(None);
+        assert!(w.walk_status_unknown && w.status.is_some());
+        assert_eq!(import_gate(&w, false), ImportGate::Blocked);
+        w.on_walk_done(Some(JournalStatus::Complete { rejected_items: 0 }));
+        assert!(!w.walk_status_unknown);
+        assert_eq!(import_gate(&w, false), ImportGate::Open);
+
+        // A walk's status replaces begin's, including rejected items.
+        w.on_walk_done(Some(JournalStatus::Complete { rejected_items: 2 }));
+        assert_eq!(import_gate(&w, false), ImportGate::Blocked);
+    }
+
+    /// `interrupted_import_for_recovery`'s decision per session state: the
+    /// recovery re-run is the only path that restores rooms an interrupted
+    /// migration never wrote, so "unknown" must lean to recovering.
+    #[test]
+    fn recovery_answers_lean_to_recovering() {
+        assert_eq!(
+            JournalSession::default().recovery_answer(),
+            None,
+            "wait for begin"
+        );
+        let mut failed = JournalSession::default();
+        failed.on_begin_err();
+        assert_eq!(failed.recovery_answer(), Some(true));
+        assert_eq!(
+            known(JournalStatus::Complete { rejected_items: 0 }).recovery_answer(),
+            Some(false)
+        );
+        let mut flagged = known(JournalStatus::Complete { rejected_items: 0 });
+        flagged.sweep_flagged_since_status = true;
+        assert_eq!(
+            flagged.recovery_answer(),
+            Some(true),
+            "a flag the status does not know yet"
+        );
+        assert_eq!(known(interrupted_status()).recovery_answer(), Some(true));
+    }
+
+    #[test]
+    fn only_a_freshly_flagged_sweep_import_raises_the_flag() {
+        assert!(sweep_write_raises_flag(SweepWrite::Merge));
+        assert!(!sweep_write_raises_flag(SweepWrite::MergeUnflagged));
+        assert!(!sweep_write_raises_flag(SweepWrite::Skip));
+    }
+
+    /// The counter is read only for a status the rate limit can apply to.
+    #[test]
+    fn the_cadence_counter_is_read_only_when_it_can_apply() {
+        assert!(needs_cadence_counter(&all_absent_status()));
+        assert!(!needs_cadence_counter(&JournalStatus::Complete {
+            rejected_items: 0
+        }));
+        assert!(
+            !needs_cadence_counter(&fresh_status()),
+            "nothing typed-absent yet"
+        );
+        assert!(!needs_cadence_counter(&interrupted_status()));
+    }
+
+    // ---------------- the walk driver, against a scripted environment ----------------
+
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+
+    /// The driver's state is process-global (like the page load it models), so
+    /// the driver tests run one at a time and start from a fresh load.
+    static DRIVER_TESTS: Mutex<()> = Mutex::new(());
+
+    fn fresh_load() -> std::sync::MutexGuard<'static, ()> {
+        let guard = DRIVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        WALK_POKED.store(false, Ordering::Relaxed);
+        WALK_DRIVER_RUNNING.store(false, Ordering::Relaxed);
+        WALKS_THIS_LOAD.store(0, Ordering::Relaxed);
+        LOAD_ARMED.store(true, Ordering::Relaxed);
+        *session() = JournalSession::default();
+        guard
+    }
+
+    #[derive(Default)]
+    struct ScriptedEnv {
+        /// `pending_load_workers` answers these in turn, then 0.
+        workers: RefCell<VecDeque<u32>>,
+        /// `pending_load_workers` answers this forever when set.
+        stuck_workers: Cell<Option<u32>>,
+        fetch_failure: Cell<bool>,
+        /// Called at the start of each walk (a sweep poking mid-walk, say).
+        during_walk: RefCell<Option<Box<dyn Fn()>>>,
+        log: RefCell<Vec<&'static str>>,
+    }
+
+    impl WalkEnv for ScriptedEnv {
+        fn pending_load_workers(&self) -> u32 {
+            if let Some(n) = self.stuck_workers.get() {
+                return n;
+            }
+            self.workers.borrow_mut().pop_front().unwrap_or(0)
+        }
+        fn saw_fetch_failure(&self) -> bool {
+            self.fetch_failure.get()
+        }
+        async fn sleep(&self, _ms: u64) {
+            self.log.borrow_mut().push("sleep");
+        }
+        async fn run_walk(&self) {
+            self.log.borrow_mut().push("walk");
+            if let Some(f) = self.during_walk.borrow_mut().take() {
+                f();
+            }
+        }
+    }
+
+    fn walks(env: &ScriptedEnv) -> usize {
+        env.log.borrow().iter().filter(|e| **e == "walk").count()
+    }
+
+    /// Ask for a walk and run the driver to the end (the native `poke_walk`
+    /// raises the flag; the spawn it would make is a no-op off the browser).
+    fn poke_and_drive(env: &ScriptedEnv) {
+        poke_walk();
+        futures::executor::block_on(walk_driver_with(env));
+    }
+
+    #[test]
+    fn the_driver_walks_once_and_clears_the_in_flight_flag() {
+        let _g = fresh_load();
+        let env = ScriptedEnv::default();
+        poke_walk();
+        assert!(
+            session().walk_in_flight,
+            "a requested walk holds the gate Pending"
+        );
+        futures::executor::block_on(walk_driver_with(&env));
+        assert_eq!(walks(&env), 1);
+        assert!(!session().walk_in_flight);
+        assert!(LOAD_ARMED.load(Ordering::Relaxed));
+        assert!(!WALK_DRIVER_RUNNING.load(Ordering::Relaxed));
+    }
+
+    /// freenet/river#595: never walk over a room set that failed to load, and
+    /// let the next load attempt start the journal work again. The scrape
+    /// test next to `walk_may_run` is satisfied by a driver whose gate is
+    /// disabled; this one is not.
+    #[test]
+    fn the_driver_does_not_walk_over_a_failed_room_load_and_rearms_the_load() {
+        let _g = fresh_load();
+        let env = ScriptedEnv::default();
+        env.fetch_failure.set(true);
+        poke_and_drive(&env);
+        assert_eq!(walks(&env), 0, "no walk over an incomplete room set");
+        assert!(
+            !LOAD_ARMED.load(Ordering::Relaxed),
+            "the next load attempt must be able to start the journal work again"
+        );
+        assert!(!session().walk_in_flight, "the gate must not stay Pending");
+    }
+
+    /// freenet/river#253 ordering: the walk waits for the load's workers to
+    /// settle, and only then walks.
+    #[test]
+    fn the_driver_waits_for_the_load_workers_before_walking() {
+        let _g = fresh_load();
+        let env = ScriptedEnv::default();
+        *env.workers.borrow_mut() = VecDeque::from([2, 1]);
+        poke_and_drive(&env);
+        assert_eq!(*env.log.borrow(), vec!["sleep", "sleep", "walk"]);
+    }
+
+    /// The wait is bounded: workers that never settle delay the walk by
+    /// `WALK_QUIESCENCE_MAX_MS`, not for good.
+    #[test]
+    fn the_wait_for_the_load_workers_is_bounded() {
+        let _g = fresh_load();
+        let env = ScriptedEnv::default();
+        env.stuck_workers.set(Some(1));
+        poke_and_drive(&env);
+        let sleeps = env.log.borrow().iter().filter(|e| **e == "sleep").count() as u64;
+        assert_eq!(sleeps, WALK_QUIESCENCE_MAX_MS / WALK_QUIESCENCE_POLL_MS);
+        assert_eq!(walks(&env), 1);
+    }
+
+    /// A poke that lands while a walk runs (the sweep flagging an import) gets
+    /// its own walk in the same session; a burst of pokes never exceeds the cap.
+    #[test]
+    fn a_poke_during_a_walk_is_walked_and_the_cap_holds() {
+        let _g = fresh_load();
+        let env = ScriptedEnv::default();
+        *env.during_walk.borrow_mut() = Some(Box::new(poke_walk));
+        poke_and_drive(&env);
+        assert_eq!(walks(&env), 2, "the mid-walk poke must be served");
+
+        for _ in 0..10 {
+            poke_and_drive(&env);
+        }
+        assert_eq!(
+            walks(&env) as u32,
+            MAX_WALKS_PER_LOAD,
+            "no more than the cap per page load"
+        );
+        assert!(!session().walk_in_flight);
     }
 }

@@ -1462,7 +1462,14 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
 /// merge (it fills a partial one; a room deleted since stays deleted). Any
 /// journal failure skips the merge on this load.
 async fn sweep_may_merge(legacy_key: &DelegateKey, items: Option<u32>) -> bool {
-    match gate_sweep_import(legacy_key, items).await {
+    sweep_write_allows_merge(gate_sweep_import(legacy_key, items).await)
+}
+
+/// The journal's answer as the sweep's yes/no. A `Skip` must never merge: an
+/// unflagged merge that a killed tab interrupts leaves a partial import no
+/// later load knows to recover.
+fn sweep_write_allows_merge(write: SweepWrite) -> bool {
+    match write {
         SweepWrite::Merge | SweepWrite::MergeUnflagged => true,
         SweepWrite::Skip => false,
     }
@@ -4333,5 +4340,12 @@ mod tests {
             )),
             "the delegate-response path must capture the responding generation's rank"
         );
+    }
+
+    #[test]
+    fn only_a_journal_yes_lets_the_sweep_merge() {
+        assert!(sweep_write_allows_merge(SweepWrite::Merge));
+        assert!(sweep_write_allows_merge(SweepWrite::MergeUnflagged));
+        assert!(!sweep_write_allows_merge(SweepWrite::Skip));
     }
 }

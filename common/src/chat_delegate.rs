@@ -1624,4 +1624,47 @@ mod tests {
             none
         );
     }
+
+    /// Room-scale values (the field reports ~1.2 MB stored rooms, 2.3 MB as the
+    /// old integer array) decode in full in BOTH encodings, and the legacy
+    /// decoder (which a predecessor's reply goes through) is not capped by its
+    /// preallocation guard. Every other test here uses 1000 bytes.
+    #[test]
+    fn byte_fields_round_trip_at_room_scale_in_both_encodings() {
+        let value: Vec<u8> = (0..=255u8).cycle().take(1_200_000).collect();
+        let key = ChatDelegateKey(b"room:big".to_vec());
+
+        let new = to_cbor(&ChatDelegateResponseMsg::GetResponse {
+            key: key.clone(),
+            value: Some(value.clone()),
+        });
+        assert!(new.len() < value.len() + 64, "byte string, not ~2x");
+        match from_cbor::<ChatDelegateResponseMsg>(&new) {
+            ChatDelegateResponseMsg::GetResponse { value: Some(v), .. } => assert!(v == value),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let old = to_cbor(&legacy::Response::GetResponse {
+            key: lk(&key),
+            value: Some(value.clone()),
+        });
+        assert!(
+            old.len() > value.len() * 18 / 10,
+            "this IS the legacy shape"
+        );
+        match from_cbor::<ChatDelegateResponseMsg>(&old) {
+            ChatDelegateResponseMsg::GetResponse { value: Some(v), .. } => assert!(v == value),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // And a request of that size reaches a legacy decoder intact.
+        let req = to_cbor(&ChatDelegateRequestMsg::StoreRequest {
+            key: key.clone(),
+            value: value.clone(),
+        });
+        match from_cbor::<legacy::Request>(&req) {
+            legacy::Request::StoreRequest { value: v, .. } => assert!(v == value),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 }

@@ -1662,6 +1662,18 @@ mod tests {
             .contains("claim_once_per_attempt(&REGISTERED_FOR_ATTEMPT, attempt)"));
     }
 
+    /// The page load's own attempt is `LOAD_ATTEMPT_GEN == 0` and every claim
+    /// slot starts at 0, so the marker is `attempt + 1`: a fresh slot must GRANT
+    /// attempt 0, or the first `ListResponse` of every page load is ignored as
+    /// "already claimed" and no room ever loads. `registration_is_claimed_once`
+    /// uses attempt 7, which hides this.
+    #[test]
+    fn a_fresh_slot_grants_the_first_attempt_of_a_page_load() {
+        let slot = AtomicU32::new(0);
+        assert!(claim_once_per_attempt(&slot, 0));
+        assert!(!claim_once_per_attempt(&slot, 0), "once per attempt");
+    }
+
     /// freenet/river#757: a normal setup lists rooms (and loads outbound DMs)
     /// WITHOUT registering the delegate first; only Retry registers up front.
     #[test]

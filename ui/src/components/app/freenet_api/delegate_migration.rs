@@ -1742,6 +1742,11 @@ pub(crate) mod tests_support {
         /// `GetVersionedRequest` and its `CasStoreRequest` for `.0`: applied
         /// (once) just before the first CAS for that key.
         pub(crate) cas_interleave: Option<(Vec<u8>, Vec<u8>)>,
+        /// Every plain store is refused with this error (nothing is written).
+        pub(crate) store_error: Option<String>,
+        /// A plain store's acknowledgement names this key instead of the one
+        /// stored (a mis-correlated answer).
+        pub(crate) store_ack_key: Option<Vec<u8>>,
     }
 
     impl DelegateSim {
@@ -1895,10 +1900,22 @@ pub(crate) mod tests_support {
                         return Ok(None);
                     }
                     let value_size = value.len();
+                    if let Some(e) = &sim.store_error {
+                        return Ok(Some(ChatDelegateResponseMsg::StoreResponse {
+                            key,
+                            value_size: 0,
+                            result: Err(e.clone()),
+                        }));
+                    }
                     *sim.generations.entry(kb.clone()).or_default() += 1;
                     sim.store.insert(kb, value);
+                    let ack = sim
+                        .store_ack_key
+                        .clone()
+                        .map(ChatDelegateKey::new)
+                        .unwrap_or(key);
                     Ok(Some(ChatDelegateResponseMsg::StoreResponse {
-                        key,
+                        key: ack,
                         value_size,
                         result: Ok(()),
                     }))
@@ -2000,8 +2017,17 @@ pub(crate) mod tests_support {
     /// installed" on `streak` consecutive journaled walks and nothing started:
     /// what `pending_all_absent` needs, reachable only through walks.
     pub(crate) fn all_absent_status(streak: u32) -> JournalStatus {
-        // Keys no other test uses: `NOT_INSTALLED` is process-global.
-        let table = [([0xA1u8; 32], [0xB1u8; 32]), ([0xA2u8; 32], [0xB2u8; 32])];
+        // Keys no other test, and no other CALL of this function, uses:
+        // `NOT_INSTALLED` is process-global, and a concurrent walk's pre-warm
+        // clears the evidence for the keys it probes. Two tests sharing one
+        // fixed key pair raced (the streak read 0 in about a fifth of runs
+        // when both ran), so every call takes a fresh pair.
+        static NEXT_PAIR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0x40);
+        let n = NEXT_PAIR.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        let table = [
+            ([n; 32], [n.wrapping_add(0x80); 32]),
+            ([n + 1; 32], [n.wrapping_add(0x81); 32]),
+        ];
         let lineage = river_delegate_lineage(&table);
         let mut channel = MockChannel::default();
         for (key, code) in table {
@@ -2097,6 +2123,8 @@ mod tests {
         dm_merges: Vec<OutboundDmStore>,
         flushes: usize,
         fail_flush: bool,
+        /// Every rooms/DM merge reports this failure.
+        fail_merge: Option<String>,
     }
 
     impl MemorySeam {
@@ -2107,15 +2135,22 @@ mod tests {
                 dm_merges: Vec::new(),
                 flushes: 0,
                 fail_flush: false,
+                fail_merge: None,
             }
         }
     }
 
     impl RiverImportSeam for MemorySeam {
         async fn merge_rooms(&mut self, rooms: Rooms, source_rank: u32) -> Result<(), String> {
+            if let Some(e) = &self.fail_merge {
+                return Err(e.clone());
+            }
             apply_recovered_rooms(&mut self.rooms, rooms, source_rank, &mut self.ranks)
         }
         async fn merge_outbound_dms(&mut self, store: OutboundDmStore) -> Result<(), String> {
+            if let Some(e) = &self.fail_merge {
+                return Err(e.clone());
+            }
             self.dm_merges.push(store);
             Ok(())
         }
@@ -3658,6 +3693,349 @@ mod tests {
         assert!(
             !last.expect("status").pending_all_absent(1),
             "silence is never 'not installed'"
+        );
+    }
+
+    // ---------------- probes added by the testing review of PR #768 ----------------
+
+    /// The in-progress marker's CAS must retry at the FRESH generation. Another
+    /// session records the weaker (empty) marker between our read and our
+    /// write: the conflict's value is weaker than ours, so we must write again,
+    /// and a stale generation would conflict until the attempts run out.
+    #[test]
+    fn a_wip_marker_conflict_with_a_weaker_value_is_retried_at_the_fresh_generation() {
+        let pred = pred_key(0);
+        let channel = channel_with_gen0(DelegateSim::default());
+        channel
+            .delegates
+            .borrow_mut()
+            .get_mut(successor_key().bytes())
+            .unwrap()
+            .cas_interleave = Some((
+            pred_wip_marker_key(&pred),
+            PRED_DONE_MARKER_VALUE_EMPTY.to_vec(),
+        ));
+        let mut w = writer(&channel);
+        block_on(w.record_marker(&pred, MigrationMarker::InProgress { saw_data: true }))
+            .expect("a conflict is retried at the generation it reported");
+        assert_eq!(
+            channel.stored(&successor_key(), &pred_wip_marker_key(&pred)),
+            Some(PRED_DONE_MARKER_VALUE_DATA.to_vec()),
+            "the data marker must land over the concurrent empty one"
+        );
+    }
+
+    /// The freenet/river#761 cadence counter: absent reads 0, the value
+    /// round-trips (little-endian, under its own key), and a value that is not
+    /// 4 bytes or a silent delegate is an `Err` (which walks), never a count.
+    #[test]
+    fn the_walk_cadence_counter_round_trips_and_fails_closed() {
+        let s = successor_key();
+        let channel = channel_with_gen0(DelegateSim::default());
+        assert_eq!(block_on(read_walk_cadence(&channel, &s)), Ok(0));
+        block_on(store_walk_cadence(&channel, &s, 0x0102_0304)).unwrap();
+        assert_eq!(
+            channel.stored(&s, WALK_CADENCE_KEY),
+            Some(0x0102_0304u32.to_le_bytes().to_vec())
+        );
+        assert_eq!(block_on(read_walk_cadence(&channel, &s)), Ok(0x0102_0304));
+        channel.put(&s, WALK_CADENCE_KEY, &[1, 2, 3]);
+        assert!(block_on(read_walk_cadence(&channel, &s)).is_err());
+
+        let silent = MockChannel::default().with_delegate(
+            &s,
+            DelegateSim {
+                silent: true,
+                ..Default::default()
+            },
+        );
+        assert!(block_on(read_walk_cadence(&silent, &s)).is_err());
+        assert!(block_on(store_walk_cadence(&silent, &s, 1)).is_err());
+    }
+
+    /// `get_marker`'s own refusal arms. With the WHOLE successor silent the
+    /// journal read fails first and masks them (the older test of this shape
+    /// stays green with both arms mutated to `Ok(None)`), so only the marker
+    /// read is made unreadable here: silent, or answered with another key's
+    /// name. Guessing "no marker" would re-import a possibly-done predecessor;
+    /// accepting the other key's value would seal it.
+    #[test]
+    fn an_unreadable_marker_stops_the_walk_even_when_the_journal_is_readable() {
+        let done = pred_done_marker_key(&pred_key(0));
+        for (what, successor) in [
+            (
+                "silent marker read",
+                DelegateSim {
+                    silent_get_keys: vec![done.clone()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "marker read answered with another key's name",
+                DelegateSim {
+                    wrong_key_reply: Some((
+                        done.clone(),
+                        pred_done_marker_key(&pred_key(1)),
+                        PRED_DONE_MARKER_VALUE_DATA.to_vec(),
+                    )),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let channel = MockChannel::default()
+                .with_delegate(&pred_key(0), gen0_with_blob())
+                .with_delegate(&pred_key(1), DelegateSim::default())
+                .with_delegate(&pred_key(2), DelegateSim::default())
+                .with_delegate(&successor_key(), successor);
+            let (report, seam) = walk(&channel, MemorySeam::new());
+            assert!(
+                matches!(
+                    report.predecessors.first(),
+                    Some(PredecessorMigration::WriterUnavailable { .. })
+                ),
+                "{what}: must stop the walk, got {report:?}"
+            );
+            assert!(
+                seam.rooms.map.is_empty(),
+                "{what}: nothing may be imported blind"
+            );
+            assert_eq!(
+                channel.requests_to_predecessors("get:"),
+                0,
+                "{what}: no predecessor fetch may run without marker bookkeeping"
+            );
+        }
+    }
+
+    /// What the journal makes of the two ways an item can fail. Bytes that do
+    /// not decode are a PERMANENT rejection: counted (the identity-import gate
+    /// blocks on it, and a raised `RIVER_IMPORT_REVISION` reopens it) and not
+    /// retried. A merge or save that fails is RETRYABLE: the predecessor stays
+    /// pending, nothing is counted rejected, and the next load tries again.
+    #[test]
+    fn an_undecodable_item_is_a_counted_permanent_rejection() {
+        let mut gen0 = DelegateSim::default();
+        gen0.store
+            .insert(ROOMS_STORAGE_KEY.to_vec(), vec![0xFF, 0x00, 0x13]);
+        let channel = channel_with_gen0(gen0);
+        let (journaled, seam) = walk_j(&channel, MemorySeam::new());
+        let status = journaled.status.expect("status");
+        assert_eq!(status.rejected_items(), 1, "{status:?}");
+        assert!(seam.rooms.map.is_empty());
+        let session = super::super::migration_journal::JournalSession {
+            begun: true,
+            status: Some(status),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::super::migration_journal::import_gate(&session, false),
+            super::super::migration_journal::ImportGate::Blocked,
+            "rejected items must hold the identity-import gate"
+        );
+    }
+
+    #[test]
+    fn a_failed_merge_is_retried_not_rejected() {
+        let channel = channel_with_gen0(gen0_with_blob());
+        let mut seam = MemorySeam::new();
+        seam.fail_merge = Some("merge refused".to_string());
+        let (journaled, _seam) = walk_j(&channel, seam);
+        let status = journaled.status.expect("status");
+        assert_eq!(
+            status.rejected_items(),
+            0,
+            "a retryable failure is not a rejection: {status:?}"
+        );
+        assert!(!journaled.report.is_complete());
+        assert!(journaled.report.retry_may_help());
+        assert_eq!(
+            channel.stored(&successor_key(), &pred_done_marker_key(&pred_key(0))),
+            None,
+            "a predecessor whose merge failed must not be sealed"
+        );
+
+        // And the next load, with the merge working, imports it.
+        let (_second, seam) = walk_j(&channel, MemorySeam::new());
+        assert!(seam.rooms.map.contains_key(&vk(1)));
+    }
+
+    #[test]
+    fn a_failed_dm_merge_is_retried_not_rejected() {
+        let mut gen0 = DelegateSim::default();
+        gen0.store.insert(
+            OUTBOUND_DMS_STORAGE_KEY.to_vec(),
+            cbor(&OutboundDmStore::default()),
+        );
+        let channel = channel_with_gen0(gen0);
+        let mut seam = MemorySeam::new();
+        seam.fail_merge = Some("dm merge refused".to_string());
+        let (journaled, _seam) = walk_j(&channel, seam);
+        let status = journaled.status.expect("status");
+        assert_eq!(status.rejected_items(), 0, "{status:?}");
+        assert!(journaled.report.retry_may_help());
+        assert_eq!(
+            channel.stored(&successor_key(), &pred_done_marker_key(&pred_key(0))),
+            None
+        );
+    }
+
+    /// The journal's and the markers' stores are durable only on the delegate's
+    /// OWN acknowledgement: a refusal, or an acknowledgement for another key,
+    /// is an error. Swallowing either would let a marker or the journal read
+    /// as recorded when it is not.
+    #[test]
+    fn a_refused_or_misaddressed_store_ack_is_an_error() {
+        let pred = pred_key(0);
+        for (what, successor) in [
+            (
+                "refused",
+                DelegateSim {
+                    store_error: Some("secret store full".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "acknowledged under another key",
+                DelegateSim {
+                    store_ack_key: Some(b"some-other-key".to_vec()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let channel = MockChannel::default().with_delegate(&successor_key(), successor);
+            let mut w = writer(&channel);
+            assert!(
+                block_on(w.store_journal(b"j")).is_err(),
+                "{what}: journal store"
+            );
+            assert!(
+                block_on(w.record_marker(&pred, MigrationMarker::Done { had_data: true })).is_err(),
+                "{what}: done marker store"
+            );
+            assert!(
+                block_on(store_walk_cadence(&channel, &successor_key(), 3)).is_err(),
+                "{what}: cadence"
+            );
+        }
+    }
+
+    /// A read answered for another key is a fault, never the value: the journal
+    /// is the authority every decision rests on.
+    #[test]
+    fn a_journal_read_answered_for_another_key_is_an_error() {
+        let successor = DelegateSim {
+            wrong_key_reply: Some((
+                MIGRATION_JOURNAL_KEY.to_vec(),
+                b"some-other-key".to_vec(),
+                b"not-the-journal".to_vec(),
+            )),
+            ..Default::default()
+        };
+        let channel = MockChannel::default().with_delegate(&successor_key(), successor);
+        let mut w = writer(&channel);
+        assert!(block_on(w.load_journal()).is_err());
+        assert!(
+            block_on(read_walk_cadence(&channel, &successor_key())).is_ok(),
+            "other keys unaffected"
+        );
+    }
+
+    /// A page load as the driver composes it: `begin`, a sweep merge that the
+    /// journal flags, the walk that resolves it, with the session updated by
+    /// the same transitions the driver applies. The gate must read Open on a
+    /// fresh node, Blocked from the flag until the walk's status knows about
+    /// it, and Open again; and a tab killed in between must be reported by the
+    /// next load's `begin`.
+    #[test]
+    fn a_page_load_moves_the_gate_open_blocked_open() {
+        use super::super::migration_journal::{
+            import_gate, sweep_write_raises_flag, ImportGate, JournalSession,
+        };
+        let channel = channel_with_gen0(gen0_with_blob());
+        let mut session = JournalSession::default();
+        assert_eq!(import_gate(&session, false), ImportGate::Pending);
+
+        let status = block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
+        session.on_begin_ok(status);
+        assert_eq!(
+            import_gate(&session, false),
+            ImportGate::Open,
+            "nothing started: nothing to wait for"
+        );
+
+        let write = note(&channel, 0, None);
+        assert_eq!(write, SweepWrite::Merge);
+        assert!(sweep_write_raises_flag(write));
+        session.sweep_flagged_since_status = true;
+        assert_eq!(import_gate(&session, false), ImportGate::Blocked);
+
+        // A kill here: the next load's begin reports the interrupted import and
+        // the recovery answer leans to re-running the sweep.
+        let mut next_load = JournalSession::default();
+        next_load
+            .on_begin_ok(block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap());
+        assert_eq!(import_gate(&next_load, false), ImportGate::Blocked);
+        assert_eq!(next_load.recovery_answer(), Some(true));
+
+        // Without a kill: the walk resolves it and its status clears the flag.
+        session.walk_in_flight = true;
+        assert_eq!(import_gate(&session, false), ImportGate::Pending);
+        let (walked, seam) = walk_j(&channel, MemorySeam::new());
+        assert!(seam.rooms.map.contains_key(&vk(1)));
+        session.walk_in_flight = false;
+        session.on_walk_done(walked.status);
+        assert_eq!(import_gate(&session, false), ImportGate::Open);
+        assert_eq!(session.recovery_answer(), Some(false));
+    }
+
+    /// `rooms_meta` carries the user's per-room notification choices as well as
+    /// the order: both must survive an import, and the legacy cursor must not.
+    #[test]
+    fn rooms_to_merge_keeps_notification_modes_and_order_but_not_the_cursor() {
+        let room = vk(1);
+        let meta = RecoveredItem::Meta(RoomsMeta {
+            current_room_key: Some(vk(2)),
+            notification_modes: HashMap::from([(room, crate::room_data::NotificationMode::Muted)]),
+            room_order: vec![room],
+        });
+        let rooms = rooms_to_merge(&meta).expect("meta merges");
+        assert!(matches!(
+            rooms.notification_modes.get(&room),
+            Some(crate::room_data::NotificationMode::Muted)
+        ));
+        assert_eq!(rooms.room_order, vec![room]);
+        assert!(rooms.current_room_key.is_none());
+    }
+
+    /// "Not installed" evidence belongs to ONE pre-warm burst. A typed answer
+    /// left over from an earlier burst (the sweep's probes, a previous walk)
+    /// must not turn this burst's plain silence into absence: that would feed
+    /// the freenet/river#761 cadence, which then walks one load in ten, for a
+    /// predecessor that is merely silent.
+    #[test]
+    fn evidence_of_an_earlier_burst_does_not_turn_silence_into_absence() {
+        // Keys no other test uses: `NOT_INSTALLED` is process-global.
+        let table = [([0xC1u8; 32], [0xD1u8; 32])];
+        let key = DelegateKey::new(table[0].0, CodeHash::new(table[0].1));
+        note_legacy_delegate_not_installed(&key);
+        let channel = MockChannel::default()
+            .with_delegate(
+                &key,
+                DelegateSim {
+                    silent: true,
+                    ..Default::default()
+                },
+            )
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let lineage = river_delegate_lineage(&table);
+        let mut last = None;
+        for _ in 0..3 {
+            let (report, _) = block_on(walk_with(&channel, NoImports, successor_key(), &lineage));
+            last = report.status;
+        }
+        assert!(
+            !last.expect("status").pending_all_absent(1),
+            "silence in this burst is silence, whatever an earlier burst heard"
         );
     }
 }
