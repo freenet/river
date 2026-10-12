@@ -986,6 +986,7 @@ impl RoomData {
     /// set rather than iterating `bans.0` directly.
     fn enforced_banned_member_ids(&self) -> std::collections::HashSet<MemberId> {
         self.room_state.members.banned_member_ids(
+            &self.room_state.ban_evidence,
             &self.room_state.bans,
             &self.room_state.member_info,
             &self.parameters(),
@@ -1035,6 +1036,7 @@ impl RoomData {
         }
         members
             .banned_member_ids(
+                &self.room_state.ban_evidence,
                 &self.room_state.bans,
                 &self.room_state.member_info,
                 &self.parameters(),

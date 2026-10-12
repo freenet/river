@@ -3075,3 +3075,184 @@ fn a_messages_delta_over_the_work_bound_is_rejected() {
         );
     }
 }
+
+/// After the owner lowers `max_user_bans`, a peer that has not yet seen the
+/// new configuration still holds the larger ban set and the ban evidence its
+/// bans reference (one record per ban here: a member's bans on members it
+/// invited). Exchanging states in both directions converges both peers on
+/// the same state under the new limit. Returns how many merges were
+/// rejected along the way.
+fn lower_max_user_bans_with_a_stale_peer(held: usize, new_max: usize) -> usize {
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_id: MemberId = owner_sk.verifying_key().into();
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+    let config = |version: u32, max_user_bans: usize| {
+        AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: owner_id,
+                configuration_version: version,
+                max_members: held + 1,
+                max_user_bans,
+                ..Default::default()
+            },
+            &owner_sk,
+        )
+    };
+
+    // A, invited by the owner, invited every target and bans each of them.
+    let (a, a_sk) = create_test_member(owner_id, owner_id);
+    let mut members = vec![create_authorized_member(a.clone(), &owner_sk)];
+    let mut bans = Vec::new();
+    for i in 0..held {
+        let (target, _) = create_test_member(owner_id, a.id());
+        bans.push(AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i as u64),
+                banned_user: target.id(),
+            },
+            a.id(),
+            &a_sk,
+        ));
+        members.push(create_authorized_member(target, &a_sk));
+    }
+    members.sort_by_key(|m| m.member.id());
+    let mut stale = ChatRoomStateV1 {
+        configuration: config(1, held),
+        bans: BansV1(bans),
+        members: MembersV1 { members },
+        ..Default::default()
+    };
+    stale.post_apply_cleanup(&parameters).unwrap();
+    assert_eq!(stale.ban_evidence.members.len(), held);
+    stale
+        .verify(&stale, &parameters)
+        .expect("stale peer verifies");
+
+    // The owner's peer applies the lowered limit.
+    let mut updated = stale.clone();
+    let lower = river_core::room_state::ChatRoomStateV1Delta {
+        configuration: Some(config(2, new_max)),
+        ..Default::default()
+    };
+    updated
+        .apply_delta(&stale, &parameters, &Some(lower))
+        .expect("the configuration delta applies");
+    assert_eq!(updated.bans.0.len(), new_max);
+    assert_eq!(updated.ban_evidence.members.len(), new_max);
+
+    let ser = |s: &ChatRoomStateV1| {
+        let mut v = Vec::new();
+        ciborium::ser::into_writer(s, &mut v).unwrap();
+        v
+    };
+    // The updated peer hears from the stale one first. A rejected merge
+    // leaves the receiver as it was, as on the network.
+    let (mut a, mut b) = (stale, updated);
+    let mut rejected = 0;
+    for _ in 0..3 {
+        let mut next_b = b.clone();
+        match next_b.merge(&b, &parameters, &a) {
+            Ok(()) => b = next_b,
+            Err(_) => rejected += 1,
+        }
+        let mut next_a = a.clone();
+        match next_a.merge(&a, &parameters, &b) {
+            Ok(()) => a = next_a,
+            Err(_) => rejected += 1,
+        }
+    }
+    assert!(ser(&a) == ser(&b), "the peers converge");
+    assert_eq!(a.bans.0.len(), new_max);
+    assert_eq!(a.ban_evidence.members.len(), new_max);
+    a.verify(&a, &parameters).unwrap();
+    rejected
+}
+
+/// The stale peer's ban delta is over the new `max_user_bans`, which
+/// `BansV1::apply_delta` refuses as a flood, so the updated peer rejects the
+/// stale peer's first merge, as it does on `main`. Once the stale peer has
+/// taken the new configuration and trimmed its bans and evidence, the peers
+/// converge. The evidence itself is never the reason for a rejection.
+#[test]
+fn lowering_max_user_bans_converges_with_a_stale_peer() {
+    assert_eq!(lower_max_user_bans_with_a_stale_peer(6, 2), 1);
+}
+
+/// A member bans the head and the tail of a 1003-deep invite chain under
+/// them. Both bans take effect, and every record on the chain stays as ban
+/// evidence, since the tail's ban references its ancestors. A peer that has
+/// none of it merges the state, and the two peers converge, in either order.
+#[test]
+fn a_deep_ban_evidence_chain_merges_into_a_fresh_peer() {
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+
+    let depth = 1_003;
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_id: MemberId = owner_sk.verifying_key().into();
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+    let (x, x_sk) = create_test_member(owner_id, owner_id);
+    let mut members = vec![create_authorized_member(x.clone(), &owner_sk)];
+    let (mut inviter_id, mut inviter_sk) = (x.id(), x_sk.clone());
+    let mut chain = Vec::new();
+    for _ in 0..depth {
+        let (member, sk) = create_test_member(owner_id, inviter_id);
+        members.push(create_authorized_member(member.clone(), &inviter_sk));
+        chain.push(member.id());
+        inviter_id = member.id();
+        inviter_sk = sk;
+    }
+    members.sort_by_key(|m| m.member.id());
+    let ban = |target: MemberId, secs: u64| {
+        AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                banned_user: target,
+            },
+            x.id(),
+            &x_sk,
+        )
+    };
+    let mut deep = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: owner_id,
+                max_members: depth + 1,
+                ..Default::default()
+            },
+            &owner_sk,
+        ),
+        bans: BansV1(vec![ban(chain[0], 1), ban(chain[depth - 1], 2)]),
+        members: MembersV1 { members },
+        ..Default::default()
+    };
+    deep.post_apply_cleanup(&parameters).unwrap();
+    assert_eq!(deep.members.members.len(), 1);
+    assert_eq!(deep.ban_evidence.members.len(), depth);
+    deep.verify(&deep, &parameters).unwrap();
+
+    let ser = |s: &ChatRoomStateV1| {
+        let mut v = Vec::new();
+        ciborium::ser::into_writer(s, &mut v).unwrap();
+        v
+    };
+    let fresh = ChatRoomStateV1 {
+        configuration: deep.configuration.clone(),
+        ..Default::default()
+    };
+    let mut a = fresh.clone();
+    a.merge(&fresh, &parameters, &deep)
+        .expect("a fresh peer merges the deep evidence");
+    let mut b = deep.clone();
+    b.merge(&deep, &parameters, &fresh).unwrap();
+    assert!(ser(&a) == ser(&b), "the peers converge");
+    assert!(ser(&a) == ser(&deep));
+    a.verify(&a, &parameters).unwrap();
+}
