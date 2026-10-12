@@ -14,6 +14,7 @@ categories = ["network-programming", "cryptography"]
 exclude = [
     "tests/room_message_retention_test.rs",
     "tests/in_delta_dedupe_test.rs",
+    "tests/message_signature_test.rs",
 ]
 
 [dependencies]

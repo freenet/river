@@ -213,9 +213,28 @@ impl ComposableState for MessagesV1 {
         let max_message_size = parent_state.configuration.configuration.max_message_size;
         let privacy_mode = &parent_state.configuration.configuration.privacy_mode;
 
+        // A new message is kept only if its signature verifies against its
+        // author's key: the owner's for the owner, otherwise the member's in
+        // `parent_state.members` (final by field order). Others are dropped,
+        // as `DirectMessagesV1::apply_delta` does, before the checks below
+        // can reject the delta over them. Held messages are not re-checked,
+        // so the cost follows the delta.
+        let members_by_id = parent_state.members.members_by_member_id();
+        let owner_id = parameters.owner_id();
+        let signed_by_author = |msg: &AuthorizedMessageV1| {
+            let key = if msg.message.author == owner_id {
+                Some(&parameters.owner)
+            } else {
+                members_by_id
+                    .get(&msg.message.author)
+                    .map(|m| &m.member.member_vk)
+            };
+            key.is_some_and(|key| msg.validate(key).is_ok())
+        };
+
         // Validate message constraints before adding
         if let Some(delta) = delta {
-            for msg in delta {
+            for msg in delta.iter().filter(|msg| signed_by_author(msg)) {
                 let content = &msg.message.content;
 
                 match content {
@@ -296,9 +315,7 @@ impl ComposableState for MessagesV1 {
             }
 
             // Deduplicate by message ID against held messages. A message
-            // repeated identically inside this delta is stored once; records
-            // that share an id but differ are all kept, so `verify` judges
-            // each of them.
+            // repeated identically inside this delta is stored once.
             let existing_ids: std::collections::HashSet<_> =
                 self.messages.iter().map(|m| m.id()).collect();
             let mut in_delta = std::collections::HashSet::new();
@@ -307,6 +324,7 @@ impl ComposableState for MessagesV1 {
                     .iter()
                     .filter(|msg| !existing_ids.contains(&msg.id()))
                     .filter(|msg| in_delta.insert(crate::util::record_digest(*msg)))
+                    .filter(|msg| signed_by_author(msg))
                     .cloned(),
             );
         }
@@ -317,8 +335,6 @@ impl ComposableState for MessagesV1 {
             .retain(|m| m.message.content.content_len() <= max_message_size);
 
         // Ensure all messages are signed by a valid member or the room owner, remove if not
-        let members_by_id = parent_state.members.members_by_member_id();
-        let owner_id = MemberId::from(&parameters.owner);
         self.messages.retain(|m| {
             members_by_id.contains_key(&m.message.author) || m.message.author == owner_id
         });
