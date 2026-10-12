@@ -2913,9 +2913,15 @@ mod tests {
         // The generic, indexed paths — the ones a `room:<vk>` blob is written
         // through. These MUST keep registering their keys, or every room stops
         // migrating, not just its identity key.
+        // Both go through `write_value` (the crash-safe intent/value/index
+        // sequence, #768 review), which is what indexes the key.
+        assert!(
+            body("fn write_value(").contains("set_key_index("),
+            "write_value must add the key to the delegate's key_index (freenet/river#612)"
+        );
         for anchor in ["fn handle_store_request(", "fn handle_cas_store_request("] {
             assert!(
-                body(anchor).contains("set_key_index("),
+                body(anchor).contains("write_value("),
                 "{anchor} must add its key to the delegate's key_index — that \
                  index is what the migration probe's ListRequest enumerates, so \
                  a write that skips it is a write that never migrates \
@@ -2939,7 +2945,8 @@ mod tests {
         // The claim above is only meaningful if ListRequest really is fed by the
         // index rather than by enumerating the secret store directly.
         assert!(
-            body("fn handle_list_request(").contains("get_key_index("),
+            body("fn handle_list_request(").contains("open_kv(")
+                && body("fn open_kv(").contains("get_key_index("),
             "ListRequest must answer from the key_index — if it ever enumerates \
              secrets directly, un-indexed secrets would become discoverable and \
              the entire migration hazard in freenet/river#612 changes shape"
