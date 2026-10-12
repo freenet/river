@@ -582,55 +582,26 @@ where
     write
 }
 
-/// `generation + 1` of the newest legacy generation whose data the sweep held
-/// but the journal would not let it merge this page load (`0`: none).
-static SWEEP_SKIPPED_NEWEST: AtomicU32 = AtomicU32::new(0);
-
-/// Whether generation `generation` is OLDER than one the sweep had to skip
-/// this page load (`skipped_marker` = that generation + 1). River migrates
-/// under Union, so the walk would import it anyway; but the sweep merging an
-/// older generation's copy and saving it while a newer one that answered with
-/// data is held back is exactly the cross-load shadowing freenet-migrate#42
-/// warns about. So the sweep leaves older generations to the walk too.
-pub(crate) fn older_than_a_skipped_newer(generation: u32, skipped_marker: u32) -> bool {
-    skipped_marker > generation.saturating_add(1)
-}
-
 /// The sweep's journal gate for data read from the legacy delegate
-/// `responding` (freenet/river#763, #768 review A2): refused outright if a
-/// newer generation was skipped this page load; otherwise
-/// [`gate_sweep_import`], retried with bounded backoff. A final skip is
-/// recorded so older generations are held back with it. The caller marks the
-/// load's fetch failure on a skip, so the UI offers Retry rather than a false
-/// "no rooms".
+/// `responding` (freenet/river#763, #768 review A2): [`gate_sweep_import`],
+/// retried with bounded backoff. The caller marks the load's fetch failure on
+/// a final skip, so the UI offers Retry rather than a false "no rooms"; that
+/// mark does NOT gate the walk (the walk's gate reads only the CURRENT
+/// delegate's load, `chat_delegate::room_set_complete`), so the walk still
+/// imports what the sweep could not merge. There is no hold-back of older
+/// generations: B3's persisted identity sources already keep a newer
+/// generation's identity winning across loads, and a hold-back only blocked
+/// the walk it meant to hand them to.
 pub(crate) async fn gate_sweep_import_retrying(
     responding: &DelegateKey,
     items: Option<u32>,
 ) -> SweepWrite {
-    let Some(generation) = LINEAGE
-        .iter()
-        .find(|e| e.delegate_key.as_slice() == responding.bytes())
-        .map(|e| e.generation)
-    else {
-        return SweepWrite::Skip;
-    };
-    if older_than_a_skipped_newer(generation, SWEEP_SKIPPED_NEWEST.load(Ordering::Relaxed)) {
-        warn!(
-            "sweep: legacy gen {generation} held back: a newer generation's data was skipped \
-             this load"
-        );
-        return SweepWrite::Skip;
-    }
-    let write = with_gate_retries(
+    with_gate_retries(
         || gate_sweep_import(responding, items),
         |ms| crate::util::sleep(std::time::Duration::from_millis(ms)),
         &SWEEP_GATE_BACKOFF_MS,
     )
-    .await;
-    if write == SweepWrite::Skip {
-        SWEEP_SKIPPED_NEWEST.fetch_max(generation.saturating_add(1), Ordering::Relaxed);
-    }
-    write
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,22 +1358,6 @@ mod tests {
         ));
         assert_eq!(w, SweepWrite::MergeUnflagged);
         assert_eq!(calls.get(), 1, "an allowed merge is not retried");
-    }
-
-    /// Once a newer generation's data was skipped, the sweep holds back every
-    /// older generation for the page load; the skipped one and newer ones are
-    /// not held back by it.
-    #[test]
-    fn a_skipped_newer_generation_holds_back_older_ones() {
-        assert!(!older_than_a_skipped_newer(5, 0), "nothing skipped");
-        let skipped_28 = 28 + 1;
-        assert!(older_than_a_skipped_newer(27, skipped_28));
-        assert!(older_than_a_skipped_newer(0, skipped_28));
-        assert!(
-            !older_than_a_skipped_newer(28, skipped_28),
-            "itself: retried on its own"
-        );
-        assert!(!older_than_a_skipped_newer(29, skipped_28), "newer");
     }
 
     // ---------------- the post-resolve top-up window (review B1) ----------------

@@ -124,8 +124,8 @@
 //!   What is NOT bounded across a load: a newer generation's TOMBSTONE for a
 //!   room an older generation still held present (the room comes back), and
 //!   an older build's tab saving `rooms_meta` without the field (it drops it).
-//!   The sweep also holds back older generations once a newer one's data was
-//!   refused this load (`migration_journal::older_than_a_skipped_newer`).
+//!   (The sweep no longer holds older generations back after a refusal: that
+//!   blocked the walk it meant to hand them to, #768 round 2.)
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -240,7 +240,13 @@ pub(crate) fn is_migration_bookkeeping_key(key: &[u8]) -> bool {
         || key == WALK_CADENCE_KEY
         || key == TOPUP_WINDOW_KEY
         || key == KEY_INDEX_STORAGE_KEY
+        || key == KV_INTENT_STORAGE_KEY
 }
+
+/// The delegate's crash-recovery intent record, as a plain `GetRequest` key
+/// (`delegates/chat-delegate/src/handlers.rs` `KV_INTENT_SUFFIX`). Never
+/// listed; bookkeeping.
+pub(crate) const KV_INTENT_STORAGE_KEY: &[u8] = b"::kv_intent";
 
 // ---------------------------------------------------------------------------
 // Transport seam
@@ -1050,8 +1056,18 @@ impl RiverImportSeam for LiveImportSeam {
     async fn merge_rooms(&mut self, rooms: Rooms, source_rank: u32) -> Result<(), String> {
         self.ensure_room_set_complete()?;
         self.rooms_dirty = true;
+        let attempt = self.attempt;
         let (tx, rx) = futures::channel::oneshot::channel::<Result<(), String>>();
         crate::util::defer(move || {
+            // Re-checked at the moment of the mutation (#768 round 2 item 5):
+            // a reconnect between the check above and this macrotask must not
+            // let a superseded attempt write into ROOMS.
+            if !chat_delegate::room_set_complete(attempt) {
+                let _ = tx.send(Err(
+                    "the load attempt changed before the merge ran; not merging".to_string(),
+                ));
+                return;
+            }
             let result = crate::components::app::ROOMS.with_mut(|current| {
                 let merged = chat_delegate::with_identity_source_ranks(|ranks| {
                     apply_recovered_rooms(current, rooms, source_rank, ranks)
@@ -1104,14 +1120,22 @@ impl RiverImportSeam for LiveImportSeam {
         // `_now` helpers are the same bodies without their own `defer`, so this
         // keeps the single-`setTimeout` execution context the signal-safety
         // rules require rather than writing signals inline.
-        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        let attempt = self.attempt;
+        let (tx, rx) = futures::channel::oneshot::channel::<Result<(), String>>();
         crate::util::defer(move || {
+            // Re-checked at the moment of the mutation (#768 round 2 item 5).
+            if !chat_delegate::room_set_complete(attempt) {
+                let _ = tx.send(Err(
+                    "the load attempt changed before the DM merge ran; not merging".to_string(),
+                ));
+                return;
+            }
             chat_delegate::hydrate_hidden_dm_threads_now(store.hidden_threads);
             chat_delegate::hydrate_outbound_dms_cache_now(store.entries);
-            let _ = tx.send(());
+            let _ = tx.send(Ok(()));
         });
         rx.await
-            .map_err(|_| "outbound-DM merge was dropped before running".to_string())
+            .map_err(|_| "outbound-DM merge was dropped before running".to_string())?
     }
 
     async fn known_rooms(&mut self) -> HashSet<[u8; 32]> {
@@ -3206,8 +3230,10 @@ mod tests {
         let defer_at = body
             .find("defer(move ||")
             .expect("the writes must run inside a defer closure");
+        // The SUCCESS signal: an early `tx.send(Err(..))` for a superseded
+        // attempt (#768 round 2 item 5) writes nothing and returns.
         let send_at = body
-            .find("tx.send(")
+            .find("tx.send(Ok(")
             .expect("the oneshot must be signalled");
         // Bound by the closure's TERMINATOR, not just its opening. `defer_at <
         // send_at` alone passes for a `tx.send` placed AFTER the whole closure
@@ -4245,6 +4271,29 @@ mod tests {
             );
         }
         assert!(production.contains("chat_delegate::room_set_complete(self.attempt)"));
+        // ...and again INSIDE each deferred mutation, before it touches a
+        // signal (#768 round 2 item 5): a reconnect between the check and the
+        // macrotask must not let a superseded attempt write.
+        for (f, mutation) in [
+            ("async fn merge_rooms(", "ROOMS.with_mut("),
+            (
+                "async fn merge_outbound_dms(",
+                "hydrate_hidden_dm_threads_now(",
+            ),
+        ] {
+            let at = seam.find(f).unwrap();
+            let body = &seam[at..];
+            let defer = body.find("crate::util::defer(move ||").expect("defer");
+            let recheck = body[defer..]
+                .find("if !chat_delegate::room_set_complete(attempt) {")
+                .map(|i| defer + i)
+                .unwrap_or_else(|| panic!("{f}: re-check inside the defer"));
+            let write = body.find(mutation).expect("mutation");
+            assert!(
+                defer < recheck && recheck < write,
+                "{f}: re-check before the write"
+            );
+        }
     }
 
     /// #768 review A4 (migration probe P1): a frozen generation's corrupt

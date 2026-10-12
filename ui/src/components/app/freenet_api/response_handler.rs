@@ -1033,12 +1033,6 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // follows hydration skip any room hydration left unchanged instead
             // of re-reading every room's full value (freenet/river#757).
             seed_saved_slots_from_load(&slots, meta.as_ref());
-            // Every listed slot and `rooms_meta` answered and decoded: this
-            // attempt holds the whole current room set, so the journaled walk
-            // may merge into it and save (freenet/river#763 review A1).
-            if !had_fetch_error {
-                mark_room_set_complete(worker.attempt());
-            }
             let identity_sources = meta
                 .as_ref()
                 .map(|m| m.identity_sources.clone())
@@ -1070,6 +1064,17 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                         )
                     });
                 });
+            }
+            // Every listed slot and `rooms_meta` answered and decoded: this
+            // attempt holds the whole current room set, so the journaled walk
+            // may merge into it and save (freenet/river#763 review A1). Set
+            // from a `defer` queued AFTER hydrate's merge and the rank restore
+            // (FIFO), so the latch cannot vouch for a set whose hydration has
+            // not landed (dioxus-signal-safety.md, readiness latches; #768
+            // round 2 item 2).
+            if !had_fetch_error {
+                let attempt = worker.attempt();
+                crate::util::defer(move || mark_room_set_complete(attempt));
             }
 
             // freenet/river#397 (Codex review 4): the current delegate's per-room
@@ -1251,12 +1256,6 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
             value: Some(bytes), ..
         }) => match from_reader::<Rooms, _>(&bytes[..]) {
             Ok(loaded) => {
-                // The current delegate's only room data is this blob, read
-                // whole: the set is complete (the recovery re-run is called
-                // from a per-room load, which records its own).
-                if !recovery {
-                    mark_room_set_complete(worker.attempt());
-                }
                 // A partial explosion is recovered on the next load: the blob
                 // stays beside the per-room keys it produced, and a per-room load
                 // that sees both re-runs it (`LoadPlan::PerRoom::has_blob`).
@@ -1290,6 +1289,14 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                 );
                 if had_rooms {
                     schedule_subscription_timeout_check();
+                }
+                // The current delegate's only room data is this blob, read
+                // whole: the set is complete (the recovery re-run is called
+                // from a per-room load, which records its own). Deferred after
+                // hydrate's merge, so it cannot vouch before it lands.
+                if !recovery {
+                    let attempt = worker.attempt();
+                    crate::util::defer(move || mark_room_set_complete(attempt));
                 }
                 // Explode into per-room keys (non-destructive: blob stays).
                 // hydrate defers the ROOMS merge via `defer()` (setTimeout 0),
@@ -3596,12 +3603,40 @@ mod tests {
             3,
             "rooms_meta decode, no-value and transport failures must set had_fetch_error"
         );
-        let after = &production[meta_end..meta_end + 600];
-        let squeezed: String = after.chars().filter(|c| !c.is_whitespace()).collect();
+        // The latch: only for a load with no failure, and from a `defer`
+        // queued AFTER hydrate's merge and the identity-rank restore (#768
+        // round 2 item 2), so it never vouches for a set still being hydrated.
+        let squeezed: String = crate::util::strip_comments(&production[meta_end..])
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let latch = squeezed
+            .find("if!had_fetch_error{letattempt=worker.attempt();crate::util::defer(move||mark_room_set_complete(attempt));}")
+            .expect("the room-set-complete latch must be set, deferred, only for a load with no failure");
+        let hydrate = squeezed
+            .find("hydrate_loaded_rooms(loaded,false,current_delegate_source_rank()")
+            .expect("hydrate");
+        let restore = squeezed
+            .find("crate::room_data::restore_identity_ranks(")
+            .expect("restore");
         assert!(
-            squeezed.contains("if!had_fetch_error{mark_room_set_complete(worker.attempt());}"),
-            "the room-set-complete latch must be set only for a load with no failure"
+            hydrate < latch && restore < latch,
+            "the latch is queued after both"
         );
+        let blob = production
+            .find("async fn migrate_current_blob_to_per_room(")
+            .expect("blob");
+        let blob: String = crate::util::strip_comments(&production[blob..])
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let bh = blob
+            .find("hydrate_loaded_rooms_with_authority(")
+            .expect("blob hydrate");
+        let bl = blob
+            .find("if!recovery{letattempt=worker.attempt();crate::util::defer(move||mark_room_set_complete(attempt));}")
+            .expect("the blob path's latch is deferred too");
+        assert!(bh < bl);
     }
 
     /// freenet/river#757: the per-room load must seed the save baseline from
