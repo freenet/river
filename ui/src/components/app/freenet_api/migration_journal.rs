@@ -393,10 +393,13 @@ pub(crate) fn load_plan(decision: WalkDecision, newest_resolved: bool) -> LoadPl
 
 /// How long, and for how many top-ups, the newest predecessor is re-read
 /// after the journal resolves it. An old tab still running the previous build
-/// keeps writing to it until it is closed; this covers a rollout, not for
-/// ever. A change to the predecessor's key index restarts the window (#768
-/// round 2 item 8), so the window ends only after the old tab's last key
-/// change, not after a fixed count of page loads.
+/// keeps writing to it until it is closed; the merging covers a rollout. A
+/// change to the predecessor's key index restarts the window (#768 round 2
+/// item 8), so the window ends only after the old tab's last key change, not
+/// after a fixed count of page loads. Deciding the window still costs two
+/// small reads on every load after it ends (the predecessor's raw index, to
+/// see whether it changed, and the stored window), for as long as the newest
+/// predecessor is the one this build resolved.
 pub(crate) const TOPUP_WINDOW_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 pub(crate) const TOPUP_WINDOW_LOADS: u32 = 30;
 
@@ -1768,6 +1771,14 @@ mod tests {
     #[test]
     fn import_anyway_opens_a_blocked_gate_without_resolving_it() {
         let _g = fresh_load();
+        /// Clears the process-global override even when an assertion fails.
+        struct ClearOverride;
+        impl Drop for ClearOverride {
+            fn drop(&mut self) {
+                GATE_OVERRIDE.store(false, Ordering::Relaxed);
+            }
+        }
+        let _clear = ClearOverride;
         GATE_OVERRIDE.store(false, Ordering::Relaxed);
         *session() = known(interrupted_status());
         assert_eq!(current_import_gate(), ImportGate::Blocked);
@@ -1788,6 +1799,5 @@ mod tests {
 
         session().walk_in_flight = true;
         assert_eq!(current_import_gate(), ImportGate::Pending);
-        GATE_OVERRIDE.store(false, Ordering::Relaxed);
     }
 }

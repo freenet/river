@@ -4560,8 +4560,29 @@ mod tests {
                 .filter(|c| !c.is_whitespace())
                 .collect()
         };
-        let cd = squeeze(include_str!("../chat_delegate.rs"));
-        assert!(cd.contains("meta.identity_sources=with_identity_source_ranks("));
+        // #768 round 3 CF3: the behaviour across a page load is pinned by
+        // composition (delegate_migration's
+        // `a_newer_generations_identity_wins_across_a_page_load`, whose reload
+        // calls `restore_identity_ranks` itself) plus this source pin of the
+        // live wiring. The pin locates each call in the function that runs it
+        // and checks the only condition guarding it, so a move into another
+        // function or behind another condition fails.
+        let cd_raw = include_str!("../chat_delegate.rs");
+        let cd = squeeze(cd_raw);
+        let save_fn = cd_raw
+            .find("\nasync fn do_save_rooms_to_delegate(force_flush: bool)")
+            .expect("the save path");
+        let save_len = cd_raw[save_fn..].find("\n}\n").expect("its end");
+        assert!(
+            squeeze(&cd_raw[save_fn..save_fn + save_len])
+                .contains("meta.identity_sources=with_identity_source_ranks("),
+            "the provenance is recorded by do_save_rooms_to_delegate"
+        );
+        assert_eq!(
+            cd.matches("meta.identity_sources=with_identity_source_ranks(")
+                .count(),
+            1
+        );
         let rh = squeeze(
             include_str!("response_handler.rs")
                 .split("mod tests {")
@@ -4581,6 +4602,24 @@ mod tests {
         assert!(
             rh[hydrate..restore].contains("crate::util::defer(move||{"),
             "deferred, so it runs after the merge's own defer"
+        );
+        // Bound from this load's rooms_meta before it is consumed, guarded
+        // only by "there is provenance to restore", and queued before the
+        // room-set latch (FIFO), so the walk cannot run ahead of it.
+        let bind = rh
+            .find("letidentity_sources=meta.as_ref().map(|m|m.identity_sources.clone()).unwrap_or_default();letloaded=reconstruct_rooms(slots,meta);")
+            .expect("identity_sources is bound from this load's rooms_meta");
+        assert!(bind < hydrate);
+        let guard = rh[hydrate..restore]
+            .rfind("if!identity_sources.is_empty(){crate::util::defer(move||{")
+            .expect("the restore's only guard");
+        assert!(hydrate + guard < restore);
+        let latch = rh
+            .find("crate::util::defer(move||mark_room_set_complete(attempt));")
+            .expect("the room-set latch");
+        assert!(
+            restore < latch,
+            "restore is queued before the room-set latch"
         );
     }
 }
