@@ -96,10 +96,17 @@ Accepted trade-offs:
   including deleting the newest, so an arrival follows only by the rule
   above; a followed arrival lands a new request, which holds again. A
   backfill, a message inserted above the newest, a trim and rows changing
-  height keep it. Scrolling upward more than 4px from the scroller's absolute end, hiding
-  the panel, changing rooms or an empty range also releases it. Accepted for
+  height keep it. A scroll the reader makes upward, raising both the view's
+  top and bottom edges and ending more than 4px from the scroller's absolute
+  end, releases it, as do hiding the panel, changing rooms and an empty range.
+  A clamp from the chat area growing (the composer collapsing, the keyboard
+  closing) raises only the top edge and keeps it, even when a row grows in
+  the same frame. Accepted for
   now: padding below the newest message lets a small upward scroll release
   the hold while the message is still visible and Latest stays hidden.
+  Known limitation: a reader who scrolls up in the same frame the chat area
+  grows by at least as much keeps the hold for that frame and is taken back
+  to the end once; their next scroll releases it.
 - Outside that hold, a size change gets no correction: when the composer
   grows or the phone keyboard opens, the browser keeps the view's top edge,
   so the bottom of the view is covered. Paging and panel reveals retain their
