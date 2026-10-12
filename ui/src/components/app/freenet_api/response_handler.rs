@@ -1039,6 +1039,10 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             if !had_fetch_error {
                 mark_room_set_complete(worker.attempt());
             }
+            let identity_sources = meta
+                .as_ref()
+                .map(|m| m.identity_sources.clone())
+                .unwrap_or_default();
             let loaded = reconstruct_rooms(slots, meta);
             // Capture emptiness BEFORE `loaded` is moved into hydrate, for the
             // authoritative terminal decision below.
@@ -1050,6 +1054,22 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                 worker.attempt(),
             ) {
                 schedule_subscription_timeout_check();
+            }
+            // Give each migrated identity its legacy source rank back. Deferred
+            // AFTER hydrate's (deferred, FIFO) merge, which records the rooms
+            // at the current rank; the walk only runs once the load settles
+            // (freenet/river#768 review B3).
+            if !identity_sources.is_empty() {
+                crate::util::defer(move || {
+                    crate::components::app::chat_delegate::with_identity_source_ranks(|ranks| {
+                        crate::room_data::restore_identity_ranks(
+                            &mut ranks.identity,
+                            &identity_sources,
+                            crate::components::app::chat_delegate::legacy_delegate_pairs(),
+                            current_delegate_source_rank(),
+                        )
+                    });
+                });
             }
 
             // freenet/river#397 (Codex review 4): the current delegate's per-room
@@ -3862,6 +3882,7 @@ mod tests {
             notification_modes: std::collections::HashMap::new(),
             // `ghost` is not a present room → must be pruned by apply_meta.
             room_order: vec![ghost, present],
+            identity_sources: Vec::new(),
         };
 
         let rooms = reconstruct_rooms(slots, Some(meta));
@@ -4473,6 +4494,41 @@ mod tests {
             .expect("per-room gate");
         assert!(
             production[per_room..per_room + 120].contains("worker.mark_fetch_failure();return;")
+        );
+    }
+
+    /// #768 review B3 wiring: the save persists each migrated identity's
+    /// legacy source in `rooms_meta`, and the per-room load restores it after
+    /// hydrate's merge (behaviour: `a_newer_generations_identity_wins_across_a_page_load`).
+    #[test]
+    fn identity_sources_are_saved_and_restored() {
+        let squeeze = |s: &str| -> String {
+            crate::util::strip_comments(s)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let cd = squeeze(include_str!("../chat_delegate.rs"));
+        assert!(cd.contains("meta.identity_sources=with_identity_source_ranks("));
+        let rh = squeeze(
+            include_str!("response_handler.rs")
+                .split("mod tests {")
+                .next()
+                .unwrap(),
+        );
+        let hydrate = rh
+            .find("hydrate_loaded_rooms(loaded,false,current_delegate_source_rank(),worker.attempt(),)")
+            .expect("current per-room hydrate");
+        let restore = rh
+            .find("crate::room_data::restore_identity_ranks(")
+            .expect("restore");
+        assert!(
+            hydrate < restore,
+            "restore runs after the hydrate merge is queued"
+        );
+        assert!(
+            rh[hydrate..restore].contains("crate::util::defer(move||{"),
+            "deferred, so it runs after the merge's own defer"
         );
     }
 }

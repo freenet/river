@@ -8014,7 +8014,18 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
     let (rooms, meta) = {
         let mut rooms = ROOMS.read().clone();
         rooms.current_room_key = CURRENT_ROOM.read().owner_key;
-        let meta = rooms.to_meta();
+        let mut meta = rooms.to_meta();
+        // Persist which legacy generation supplied each migrated identity, so
+        // a newer generation answering on a later load still outranks it
+        // (freenet/river#768 review B3).
+        meta.identity_sources = with_identity_source_ranks(|ranks| {
+            crate::room_data::persisted_identity_sources(
+                &rooms,
+                &ranks.identity,
+                LEGACY_DELEGATES,
+                current_delegate_source_rank(),
+            )
+        });
         (rooms, meta)
     };
 

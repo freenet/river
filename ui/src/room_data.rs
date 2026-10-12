@@ -2015,16 +2015,81 @@ pub struct RoomsMeta {
     pub notification_modes: HashMap<VerifyingKey, NotificationMode>,
     #[serde(default)]
     pub room_order: Vec<VerifyingKey>,
+    /// For each room whose identity (`self_sk`) was supplied by a LEGACY
+    /// delegate generation, that generation's delegate key (freenet/river#768
+    /// review B3). Without it, a room migrated from an older generation while
+    /// a newer one was silent reloads at the CURRENT delegate's rank, and the
+    /// newer generation's identity loses the conflict when it answers on a later
+    /// load: the user keeps an older signing key. Restored onto the in-memory
+    /// ranks after a load ([`restore_identity_ranks`]). Keyed by delegate key,
+    /// not registry index, so a registry change cannot shift it. Omitted when
+    /// empty, so a meta without legacy identities serializes exactly as before;
+    /// older builds ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_sources: Vec<(VerifyingKey, [u8; 32])>,
+}
+
+/// The [`RoomsMeta::identity_sources`] to persist: every present room whose
+/// in-memory identity rank is a LEGACY generation's (below `current_rank`),
+/// as that generation's delegate key, in a deterministic order. Rooms whose
+/// identity came from the current delegate or from an explicit user choice
+/// (authoritative) are not listed.
+pub fn persisted_identity_sources(
+    rooms: &Rooms,
+    identity_ranks: &HashMap<RoomKey, u32>,
+    legacy: &[([u8; 32], [u8; 32])],
+    current_rank: u32,
+) -> Vec<(VerifyingKey, [u8; 32])> {
+    let mut out: Vec<(VerifyingKey, [u8; 32])> = rooms
+        .map
+        .keys()
+        .filter_map(|vk| {
+            let rank = *identity_ranks.get(&vk.to_bytes())?;
+            if rank >= current_rank {
+                return None;
+            }
+            legacy.get(rank as usize).map(|(dk, _)| (*vk, *dk))
+        })
+        .collect();
+    out.sort_by_key(|(vk, _)| vk.to_bytes());
+    out
+}
+
+/// Restore persisted identity sources onto the in-memory ranks after the
+/// current delegate's rooms loaded: a room loaded at `current_rank` whose
+/// identity a legacy generation supplied gets that generation's rank back, so
+/// a NEWER generation answering later still wins the identity conflict
+/// (freenet/river#768 review B3). Only a rank the load just recorded is
+/// lowered: an explicit choice (authoritative, or no rank) or a rank another
+/// source set this session is left alone. A delegate key no longer in the
+/// registry is ignored.
+pub fn restore_identity_ranks(
+    identity_ranks: &mut HashMap<RoomKey, u32>,
+    sources: &[(VerifyingKey, [u8; 32])],
+    legacy: &[([u8; 32], [u8; 32])],
+    current_rank: u32,
+) {
+    for (vk, delegate_key) in sources {
+        let Some(rank) = legacy.iter().position(|(dk, _)| dk == delegate_key) else {
+            continue;
+        };
+        let key = vk.to_bytes();
+        if identity_ranks.get(&key) == Some(&current_rank) {
+            identity_ranks.insert(key, rank as u32);
+        }
+    }
 }
 
 impl Rooms {
     /// Project the list-level view preferences into a [`RoomsMeta`] for the
-    /// `rooms_meta` delegate key.
+    /// `rooms_meta` delegate key. (`identity_sources` is filled by the save,
+    /// which holds the rank registry.)
     pub fn to_meta(&self) -> RoomsMeta {
         RoomsMeta {
             current_room_key: self.current_room_key,
             notification_modes: self.notification_modes.clone(),
             room_order: self.room_order.clone(),
+            identity_sources: Vec::new(),
         }
     }
 
@@ -8840,5 +8905,80 @@ mod tests {
             .rekey_merge
             .owed
             .is_empty());
+    }
+
+    /// freenet/river#768 review B3: a `rooms_meta` without legacy identity
+    /// sources serializes byte-identically to the pre-B3 form (so nothing is
+    /// rewritten for it), and the pre-B3 form decodes with none.
+    #[test]
+    fn rooms_meta_identity_sources_are_backward_compatible() {
+        #[derive(Serialize)]
+        struct OldMeta {
+            current_room_key: Option<VerifyingKey>,
+            notification_modes: HashMap<VerifyingKey, NotificationMode>,
+            room_order: Vec<VerifyingKey>,
+        }
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let old = OldMeta {
+            current_room_key: Some(vk),
+            notification_modes: HashMap::new(),
+            room_order: vec![vk],
+        };
+        let new = RoomsMeta {
+            current_room_key: Some(vk),
+            notification_modes: HashMap::new(),
+            room_order: vec![vk],
+            identity_sources: Vec::new(),
+        };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        ciborium::ser::into_writer(&old, &mut a).unwrap();
+        ciborium::ser::into_writer(&new, &mut b).unwrap();
+        assert_eq!(a, b);
+        let decoded: RoomsMeta = ciborium::from_reader(a.as_slice()).unwrap();
+        assert!(decoded.identity_sources.is_empty());
+    }
+
+    #[test]
+    fn identity_sources_persist_only_legacy_ranks_and_restore_only_load_ranks() {
+        let legacy = [([10u8; 32], [0u8; 32]), ([11u8; 32], [0u8; 32])];
+        let current = 2;
+        let (a, b, c) = (
+            SigningKey::from_bytes(&[1u8; 32]).verifying_key(),
+            SigningKey::from_bytes(&[2u8; 32]).verifying_key(),
+            SigningKey::from_bytes(&[4u8; 32]).verifying_key(),
+        );
+        let mut rooms = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: HashMap::new(),
+            room_order: Vec::new(),
+            migrated_rooms: Vec::new(),
+        };
+        for vk in [a, b, c] {
+            rooms.map.insert(vk, test_minimal_room_data(vk));
+        }
+        let mut ranks = HashMap::new();
+        ranks.insert(a.to_bytes(), 0); // from legacy gen 0
+        ranks.insert(b.to_bytes(), current); // from the current delegate
+        ranks.insert(c.to_bytes(), SOURCE_RANK_AUTHORITATIVE); // an explicit choice
+        let sources = persisted_identity_sources(&rooms, &ranks, &legacy, current);
+        assert_eq!(sources, vec![(a, [10u8; 32])]);
+
+        // Reload: everything loaded at the current rank, except c (explicit).
+        let mut reloaded = HashMap::new();
+        reloaded.insert(a.to_bytes(), current);
+        reloaded.insert(b.to_bytes(), current);
+        reloaded.insert(c.to_bytes(), SOURCE_RANK_AUTHORITATIVE);
+        restore_identity_ranks(&mut reloaded, &sources, &legacy, current);
+        assert_eq!(reloaded[&a.to_bytes()], 0, "a's legacy source comes back");
+        assert_eq!(reloaded[&b.to_bytes()], current);
+        assert_eq!(reloaded[&c.to_bytes()], SOURCE_RANK_AUTHORITATIVE);
+
+        // A source no longer in the registry is ignored.
+        let mut r2 = HashMap::new();
+        r2.insert(a.to_bytes(), current);
+        restore_identity_ranks(&mut r2, &[(a, [99u8; 32])], &legacy, current);
+        assert_eq!(r2[&a.to_bytes()], current);
     }
 }

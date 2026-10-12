@@ -104,21 +104,23 @@
 //! * `LegacyBridge` is ignored: River's successor store was never written by
 //!   the crate's older generation-keyed `import_secrets_once` API, so there are
 //!   no legacy generation-keyed markers to bridge.
-//! * **Union shadowing (freenet-migrate#42) is bounded by the ranked merge
-//!   within a session, not across one.** Under Union a newest generation that
+//! * **Union shadowing (freenet-migrate#42) is bounded by the ranked merge,
+//!   within a session and across one.** Under Union a newest generation that
 //!   is refused (silent, or an empty answer after data) does not stop the walk,
-//!   so an older generation's copy of a room can be imported first. Within the
-//!   session, the newer generation's later answer still wins: precedence is
-//!   generation RANK, not arrival order (pinned by
-//!   `a_refused_newest_generation_does_not_shadow_it_within_the_session`). Once
-//!   the older copy has been saved, though, the next load reads it back from the
-//!   CURRENT delegate at the current delegate's rank, so a newer generation that
-//!   only answers on a later load loses an identity conflict to it and its
-//!   tombstone does not remove the room. Nothing is lost (rooms are only added,
-//!   messages CRDT-merge); the residual is an older `self_sk` kept for a room
-//!   the newer generation held under another identity, or a left room coming
-//!   back. In practice the newest generation is the delegate the user was
-//!   running until the upgrade, which is installed and answers.
+//!   so an older generation's copy of a room can be imported and saved first.
+//!   Precedence is generation RANK, not arrival order (pinned by
+//!   `a_refused_newest_generation_does_not_shadow_it_within_the_session`), and
+//!   the rank of a legacy-supplied identity is persisted in `rooms_meta`
+//!   (`RoomsMeta::identity_sources`) and restored after the next load, so a
+//!   newer generation answering on a later load still wins the identity
+//!   conflict (`a_newer_generations_identity_wins_across_a_page_load`, #768
+//!   review B3). Before that, the older `self_sk` reloaded at the current
+//!   delegate's rank and the newer generation's signing key was lost for good.
+//!   What is NOT bounded across a load: a newer generation's TOMBSTONE for a
+//!   room an older generation still held present (the room comes back), and
+//!   an older build's tab saving `rooms_meta` without the field (it drops it).
+//!   The sweep also holds back older generations once a newer one's data was
+//!   refused this load (`migration_journal::older_than_a_skipped_newer`).
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -2357,6 +2359,7 @@ mod tests {
             current_room_key: Some(owner),
             notification_modes: HashMap::new(),
             room_order: vec![owner],
+            identity_sources: Vec::new(),
         });
         let merged = rooms_to_merge(&meta).expect("meta converts");
         assert_eq!(merged.current_room_key, None, "meta cursor must be dropped");
@@ -2451,6 +2454,7 @@ mod tests {
                 current_room_key: Some(room_b),
                 notification_modes: HashMap::new(),
                 room_order: vec![room_b],
+                identity_sources: Vec::new(),
             }),
         );
         let channel = MockChannel::default()
@@ -4034,6 +4038,7 @@ mod tests {
             current_room_key: Some(vk(2)),
             notification_modes: HashMap::from([(room, crate::room_data::NotificationMode::Muted)]),
             room_order: vec![room],
+            identity_sources: Vec::new(),
         });
         let rooms = rooms_to_merge(&meta).expect("meta merges");
         assert!(matches!(
@@ -4127,6 +4132,7 @@ mod tests {
                     current_room_key: None,
                     notification_modes: HashMap::new(),
                     room_order: vec![a, b],
+                    identity_sources: Vec::new(),
                 })
             } else {
                 cbor(&OutboundDmStore::default())
@@ -4156,6 +4162,7 @@ mod tests {
                 current_room_key: None,
                 notification_modes: HashMap::new(),
                 room_order: vec![],
+                identity_sources: Vec::new(),
             }),
         );
         gen0.listed = Some(vec![]);
@@ -4163,5 +4170,88 @@ mod tests {
         let channel = channel_with_gen0(gen0);
         let (report, seam) = walk(&channel, MemorySeam::new());
         assert_gen0_refused(&report, &channel, &seam);
+    }
+
+    /// freenet/river#768 review B3 (migration probe P5), ACROSS a page load:
+    /// V32 (gen 2) is silent on the first burst and an older generation's
+    /// identity for a room is imported and saved; on the next load the room
+    /// reloads from the current delegate, and V32 then answers with its newer
+    /// identity. With the persisted identity source restored, the newer key
+    /// wins. The control (no restore: what reloading at the current rank did
+    /// before) keeps the older key, which is the bug.
+    #[test]
+    fn a_newer_generations_identity_wins_across_a_page_load() {
+        let room = vk(5);
+        let mut gen0 = DelegateSim::default();
+        gen0.store
+            .insert(ROOMS_STORAGE_KEY.to_vec(), rooms_blob_with(room, 50));
+        let mut gen2 = DelegateSim::default();
+        gen2.store
+            .insert(ROOMS_STORAGE_KEY.to_vec(), rooms_blob_with(room, 52));
+        gen2.silent = true;
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), gen0)
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+
+        // Load 1: gen0's identity lands and is saved, with its source.
+        let (_first, seam) = walk(&channel, MemorySeam::new());
+        let current_rank = table3().len() as u32;
+        let sources = crate::room_data::persisted_identity_sources(
+            &seam.rooms,
+            &seam.ranks.identity,
+            &table3(),
+            current_rank,
+        );
+        assert_eq!(sources, vec![(room, table3()[0].0)]);
+
+        // Load 2: V32 answers now.
+        channel
+            .delegates
+            .borrow_mut()
+            .get_mut(pred_key(2).bytes())
+            .unwrap()
+            .silent = false;
+        let reload = |restore: bool| {
+            let mut s = MemorySeam::new();
+            s.rooms = seam.rooms.clone();
+            // The current delegate's load records its rooms at its own rank.
+            s.ranks.identity.insert(room.to_bytes(), current_rank);
+            if restore {
+                crate::room_data::restore_identity_ranks(
+                    &mut s.ranks.identity,
+                    &sources,
+                    &table3(),
+                    current_rank,
+                );
+            }
+            s
+        };
+        let (_second, restored) = walk(&channel, reload(true));
+        assert_eq!(
+            restored.rooms.map[&room].self_verifying_key().unwrap(),
+            SigningKey::from_bytes(&[52; 32]).verifying_key(),
+            "V32's newer identity must win on the later load"
+        );
+
+        // Control: without the persisted source (the pre-B3 reload), the older
+        // key shadows the newer one for good.
+        let channel2 = MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), {
+                let mut g = DelegateSim::default();
+                g.store
+                    .insert(ROOMS_STORAGE_KEY.to_vec(), rooms_blob_with(room, 52));
+                g
+            })
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let (_c, unrestored) = walk(&channel2, reload(false));
+        assert_eq!(
+            unrestored.rooms.map[&room].self_verifying_key().unwrap(),
+            SigningKey::from_bytes(&[50; 32]).verifying_key(),
+            "control: reloaded at the current rank, the older key is kept"
+        );
     }
 }
