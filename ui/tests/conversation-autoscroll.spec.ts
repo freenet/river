@@ -103,7 +103,7 @@ test.describe("Arrivals follow a reader at the end (#486)", () => {
 
     // #486's recorded failure was a run of arrivals; a loop catches a follow
     // that works for one arrival and latches off for a later one.
-    for (let i = 1; i <= 2; i++) {
+    for (let i = 1; i <= 6; i++) {
       await deliver(page, `draft-open arrival ${i}`);
       await expectFollowed(page, `draft-open arrival ${i}`, `arrival ${i} landed while a draft was open and was not followed`);
     }
@@ -373,9 +373,8 @@ test.describe("Windowed history keeps the reader's place through arrivals (#501)
       await expectFollowed(page, `windowed arrival ${i}`, `arrival ${i} in a windowed room was not followed`);
     }
 
-    // Following lands at the exact end, where a settle may trim the grown
-    // window; either way it never holds more than the arrivals added.
-    expect(await items.count(), "the window grew past the arrivals").toBeLessThanOrEqual(itemsBefore + 6);
+    // Each followed arrival settles at the exact end, and that settle trims the window back to its opening size.
+    await expect.poll(() => items.count(), { message: "the bottom-settle trim did not return the window to its opening size" }).toBeLessThanOrEqual(itemsBefore);
   });
 
   test("arrivals do not move a reader parked in a windowed room's history", async ({
