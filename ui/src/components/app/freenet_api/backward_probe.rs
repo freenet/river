@@ -104,7 +104,8 @@
 //! only once the generation it names has answered with the room's state and
 //! that state has merged in, so an old key that is slow, unreachable or
 //! answers `NotFound` is asked again on a later load (only the owed keys, in
-//! the background), for at most [`MAX_UNFINISHED_REKEY_LOADS`] loads.
+//! the background), until [`MAX_UNFINISHED_REKEY_LOADS`] loads and
+//! [`REKEY_GIVE_UP_AFTER`] have both passed.
 //!
 //! The walk holds the seed PUT for at most [`REKEY_SEED_WAIT`]: dead older
 //! keys each wait out the 12 s watchdog, and a room must not sit at
@@ -173,6 +174,12 @@ const REKEY_SEED_WAIT: Duration = Duration::from_secs(5);
 /// one that has not returned it in this many loads is almost certainly gone
 /// from the network, and asking again costs a GET on every load.
 pub(crate) const MAX_UNFINISHED_REKEY_LOADS: u32 = 5;
+
+/// And only once this long has passed since the room first owed the merge:
+/// counting loads alone, tabs, reloads and loads before the node has peers
+/// could give up a live key holding the only copy of some messages within
+/// minutes.
+pub(crate) const REKEY_GIVE_UP_AFTER: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 /// River's app-supplied state semantics for the sans-IO decision driver: how to
 /// decode a legacy GET response, whether it is *real* state, and how to fold it
@@ -465,7 +472,7 @@ pub(crate) fn rekey_candidates(
 
 /// The generations a background re-key merge asks: only the owed ones, newest
 /// first (registry order, then any unregistered owed key). A retry, or the
-/// one-time predecessor merge, has no blocking seed to protect, and walking
+/// one-time merge from `previous_contract_key`, has no blocking seed to protect, and walking
 /// every skipped generation again on each load would grow with the registry.
 pub(crate) fn owed_candidates(
     legacy_newest_first: &[ContractInstanceId],
@@ -512,8 +519,9 @@ pub(crate) struct RekeyFinish {
 /// state. freenet-core keeps a hosted copy in the contract's update mesh while
 /// the node is connected, so it is current; on a node isolated since the
 /// re-key it can be stale, and the key comes off the marker having merged only
-/// what the node held. What it missed is not lost: the members who wrote it
-/// still hold it and carry it forward when they upgrade.
+/// what the node held. What it missed is usually carried forward by its
+/// authors when they upgrade; writers on an old riverctl, bots and members who
+/// left do not.
 pub(crate) fn plan_rekey_finish(
     outcome: Outcome<ChatRoomStateV1>,
     owed: &[ContractInstanceId],
@@ -963,7 +971,13 @@ fn finish_rekey_merge(owner_vk: VerifyingKey, seed: bool, plan: RekeyFinish) {
     crate::util::defer(move || {
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
-                apply_rekey_finish(room_data, recovered, &satisfied, owner_vk);
+                apply_rekey_finish(
+                    room_data,
+                    recovered,
+                    &satisfied,
+                    owner_vk,
+                    crate::util::get_current_system_time(),
+                );
             }
         });
     });
@@ -986,13 +1000,15 @@ fn finish_rekey_merge(owner_vk: VerifyingKey, seed: bool, plan: RekeyFinish) {
 /// CRDT merge, never a replace), then take the owed keys that answered off the
 /// marker, but only if that merge landed. A merge that fails leaves the room
 /// and the owed keys as they were, so the next load tries again. A walk that
-/// leaves keys owed counts toward [`MAX_UNFINISHED_REKEY_LOADS`], at which the
-/// rest are given up. Returns whether the merge landed.
+/// leaves keys owed counts toward [`MAX_UNFINISHED_REKEY_LOADS`]; the rest are
+/// given up once that many loads AND [`REKEY_GIVE_UP_AFTER`] have passed.
+/// Returns whether the merge landed.
 pub(crate) fn apply_rekey_finish(
     room_data: &mut crate::room_data::RoomData,
     recovered: Option<ChatRoomStateV1>,
     satisfied: &[ContractInstanceId],
     owner_vk: VerifyingKey,
+    now: std::time::SystemTime,
 ) -> bool {
     // The old key's own upgrade pointer means nothing under the current key
     // (freenet/river#427), so it stays out of the room.
@@ -1008,20 +1024,30 @@ pub(crate) fn apply_rekey_finish(
     if merged {
         marker.owed.retain(|k| !satisfied.contains(k.id()));
     }
+    let now_ms = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     if marker.owed.is_empty() {
         marker.unfinished_loads = 0;
+        marker.first_owed_at = None;
     } else {
         marker.unfinished_loads += 1;
-        if marker.unfinished_loads >= MAX_UNFINISHED_REKEY_LOADS {
+        let since = *marker.first_owed_at.get_or_insert(now_ms);
+        let owed_for = Duration::from_millis(now_ms.saturating_sub(since));
+        if marker.unfinished_loads >= MAX_UNFINISHED_REKEY_LOADS && owed_for >= REKEY_GIVE_UP_AFTER
+        {
             warn!(
                 "Re-key merge for room {:?}: {} older key(s) did not return the room in {} \
-                 loads — no longer asking",
+                 loads over {} hours — no longer asking",
                 MemberId::from(owner_vk),
                 marker.owed.len(),
-                marker.unfinished_loads
+                marker.unfinished_loads,
+                owed_for.as_secs() / 3600
             );
             marker.owed.clear();
             marker.unfinished_loads = 0;
+            marker.first_owed_at = None;
         }
     }
     merged
@@ -1644,7 +1670,8 @@ mod tests {
             &mut room,
             finish.recovered,
             &finish.satisfied,
-            sk.verifying_key()
+            sk.verifying_key(),
+            std::time::SystemTime::now()
         ));
         let mut expected = old_key.clone();
         expected.sort();
@@ -1710,7 +1737,8 @@ mod tests {
             &mut room,
             Some(bad),
             &[id(88)],
-            sk.verifying_key()
+            sk.verifying_key(),
+            std::time::SystemTime::now()
         ));
         assert_eq!(
             room.room_state, before,
@@ -1975,7 +2003,7 @@ mod tests {
         let body = &body[..body.find("fnfire_probe_get(").expect("next fn")];
         assert!(
             body.contains(
-                "ifletSome(room_data)=rooms.map.get_mut(&owner_vk){apply_rekey_finish(room_data,recovered,&satisfied,owner_vk);}"
+                "ifletSome(room_data)=rooms.map.get_mut(&owner_vk){apply_rekey_finish(room_data,recovered,&satisfied,owner_vk,crate::util::get_current_system_time(),);}"
             ),
             "the merge and the marker update run together, in the deferred ROOMS write"
         );
@@ -2016,7 +2044,7 @@ mod tests {
     }
 
     /// The real adapter, end to end through a Dioxus runtime: a background
-    /// merge (the retry, or the one-time predecessor merge of #771) asks only
+    /// merge (the retry, or the one-time merge of #771) asks only
     /// the owed key, merges what it returns into ROOMS, clears the marker,
     /// drops its driver entry, and runs at most once per page load.
     #[test]
@@ -2107,44 +2135,70 @@ mod tests {
             &mut room,
             Some(room_with_messages(&sk, &["m1", "m2"])),
             &[id(97)],
-            sk.verifying_key()
+            sk.verifying_key(),
+            std::time::SystemTime::now()
         ));
         assert_eq!(room.rekey_merge.owed, vec![contract_key_with_id(98)]);
         assert_eq!(room.rekey_merge.unfinished_loads, 1);
         assert_eq!(texts(&room.room_state), strs(&["m1", "m2"]));
     }
 
-    /// A key that never returns the room is given up after
-    /// `MAX_UNFINISHED_REKEY_LOADS` loads, not asked forever; a walk that
-    /// finishes resets the count.
+    /// A key that never returns the room is given up only once it has failed
+    /// on `MAX_UNFINISHED_REKEY_LOADS` loads AND `REKEY_GIVE_UP_AFTER` has
+    /// passed since the room first owed it: many quick reloads, or a few loads
+    /// spread over days, are not enough on their own. A finished walk resets.
     #[test]
-    fn a_key_that_never_answers_is_given_up_after_a_bounded_number_of_loads() {
+    fn a_key_that_never_answers_is_given_up_after_enough_loads_and_time() {
+        use std::time::{Duration, SystemTime};
         let sk = SigningKey::from_bytes(&[99u8; 32]);
         let vk = sk.verifying_key();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let owed = || vec![contract_key_with_id(100)];
         let mut room = room_data(&sk, room_with_messages(&sk, &["m1"]));
-        room.rekey_merge.owed = vec![contract_key_with_id(100)];
-        for load in 1..MAX_UNFINISHED_REKEY_LOADS {
-            assert!(apply_rekey_finish(&mut room, None, &[], vk));
-            assert_eq!(room.rekey_merge.owed, vec![contract_key_with_id(100)]);
-            assert_eq!(room.rekey_merge.unfinished_loads, load);
+
+        // Many loads in quick succession: still owed.
+        room.rekey_merge.owed = owed();
+        for load in 1..=MAX_UNFINISHED_REKEY_LOADS * 3 {
+            // The first walk at t0 starts the clock.
+            let now = t0 + Duration::from_secs(u64::from(load - 1) * 60);
+            assert!(apply_rekey_finish(&mut room, None, &[], vk, now));
+            assert_eq!(room.rekey_merge.owed, owed(), "load {load}: too soon");
         }
-        assert!(apply_rekey_finish(&mut room, None, &[], vk));
+        // The same count, a moment short of the window: still owed.
+        let almost = t0 + REKEY_GIVE_UP_AFTER - Duration::from_secs(1);
+        assert!(apply_rekey_finish(&mut room, None, &[], vk, almost));
+        assert_eq!(room.rekey_merge.owed, owed());
+        // Window passed: given up, and the bookkeeping resets.
+        assert!(apply_rekey_finish(
+            &mut room,
+            None,
+            &[],
+            vk,
+            t0 + REKEY_GIVE_UP_AFTER
+        ));
         assert!(room.rekey_merge.owed.is_empty(), "given up");
         assert_eq!(room.rekey_merge.unfinished_loads, 0);
+        assert_eq!(room.rekey_merge.first_owed_at, None);
 
-        room.rekey_merge.owed = vec![contract_key_with_id(100)];
-        room.rekey_merge.unfinished_loads = MAX_UNFINISHED_REKEY_LOADS - 1;
+        // A few loads spread over a long time: still owed.
+        room.rekey_merge.owed = owed();
+        for load in 0..MAX_UNFINISHED_REKEY_LOADS - 1 {
+            let now = t0 + REKEY_GIVE_UP_AFTER * (load + 1);
+            assert!(apply_rekey_finish(&mut room, None, &[], vk, now));
+            assert_eq!(room.rekey_merge.owed, owed(), "too few loads");
+        }
+
+        // A walk that finishes resets everything.
         assert!(apply_rekey_finish(
             &mut room,
             Some(room_with_messages(&sk, &["m1"])),
             &[id(100)],
-            vk
+            vk,
+            t0
         ));
         assert!(room.rekey_merge.owed.is_empty());
-        assert_eq!(
-            room.rekey_merge.unfinished_loads, 0,
-            "a finished walk resets"
-        );
+        assert_eq!(room.rekey_merge.unfinished_loads, 0);
+        assert_eq!(room.rekey_merge.first_owed_at, None);
     }
 
     /// An owed key answering with an empty (placeholder) state or with bytes

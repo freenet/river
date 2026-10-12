@@ -331,9 +331,9 @@ Both the UI and riverctl detect this automatically via `regenerate_contract_key(
 **Upgrade flow for an updated client (UI, freenet/river#769):**
 1. On load, `regenerate_contract_key()` detects old_key != new_key and records the old key
    in `RoomData::rekey_merge.owed` (kept if an older merge is still owed). A room whose
-   `previous_contract_key` is the immediate predecessor generation also owes one merge from it,
-   once (`RekeyMerge::predecessor_queued`), which recovers devices that re-keyed on a build
-   without this merge (freenet/river#771).
+   `previous_contract_key` is a registry generation also owes one merge from it, once
+   (`RekeyMerge::previous_queued`), which recovers devices that re-keyed on a build without
+   this merge (freenet/river#771).
 2. Before the subscribe sweep, `process_rooms` holds the room `Subscribing` and
    `start_rekey_merge` GETs every generation from the newest legacy one down to the owed key,
    CRDT-merging what it finds into the room. Then the room's seed PUT is sent, once, carrying
@@ -343,8 +343,9 @@ Both the UI and riverctl detect this automatically via `regenerate_contract_key(
    the background, and what it merges later goes out as an ordinary update.
 3. The marker clears only once the owed key itself returned the room's state and it merged.
    A slow, unreachable or `NotFound` old key seeds the local snapshot and is asked again, in
-   the background (only the owed keys), on later loads, up to `MAX_UNFINISHED_REKEY_LOADS`
-   (5) loads. Do not seal on a `NotFound`: on Freenet it is routinely a routing dead-end, and
+   the background (only the owed keys), on later loads. A key is given up only after
+   `MAX_UNFINISHED_REKEY_LOADS` (5) unfinished loads AND `REKEY_GIVE_UP_AFTER` (3 days) since
+   the room first owed it. Do not seal on a `NotFound`: on Freenet it is routinely a routing dead-end, and
    this device synced the room under that key. Owed merges that do not block a seed (retries,
    the predecessor merge) run alongside the subscribe and never delay the room.
 4. If room owner: also sends an `OptionalUpgradeV1` pointer on the old key for stragglers

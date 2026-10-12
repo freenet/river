@@ -208,8 +208,9 @@ pub fn record_identity_source(
 ///
 /// Old contract keys are NOT frozen after a re-key: members still on an older
 /// client keep writing to them. Taking a key off `owed` stops THIS device
-/// picking up later writes there; those writers carry their own messages
-/// forward when they upgrade (each runs this merge from its own snapshot).
+/// picking up later writes there; those messages are usually carried forward
+/// by their authors when they upgrade (each runs this merge from its own
+/// snapshot). Writers on an old riverctl, bots and members who left do not.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RekeyMerge {
     /// Keys a merge is still owed from. A key is added when the bundled WASM
@@ -219,27 +220,35 @@ pub struct RekeyMerge {
     /// must answer for itself (what reached the newer key is not on the older).
     #[serde(default)]
     pub owed: Vec<ContractKey>,
-    /// The immediate predecessor generation (the newest legacy room-contract
-    /// key) a merge was queued from, once. A device that re-keyed on a build
-    /// without this merge (6303d896, published without freenet/river#771)
-    /// saved the room under the new key with nothing owed, so the move is never
-    /// re-detected; it owes exactly one merge from the predecessor instead.
+    /// The `previous_contract_key` a merge was queued from, once (#771). A
+    /// device that re-keyed on a build without this merge (6303d896,
+    /// published without freenet/river#771) saved the room under the new key
+    /// with nothing owed, so the move is never re-detected; it owes exactly
+    /// one merge from the key it re-keyed off instead.
     #[serde(default)]
-    pub predecessor_queued: Option<ContractKey>,
+    pub previous_queued: Option<ContractKey>,
+    /// When (ms since the Unix epoch) the room last went from owing nothing
+    /// to owing a merge. Keys are given up only after both enough loads and
+    /// enough time, so tabs, reloads and loads before the node has peers
+    /// cannot give up a live key within minutes.
+    #[serde(default)]
+    pub first_owed_at: Option<u64>,
     /// Consecutive merge walks that ended with keys still owed. At
-    /// `MAX_UNFINISHED_REKEY_LOADS` the remaining keys are given up, so a key
-    /// that is gone for good does not cost a GET on every load forever.
+    /// `MAX_UNFINISHED_REKEY_LOADS`, and once `REKEY_GIVE_UP_AFTER` has passed
+    /// since `first_owed_at`, the remaining keys are given up, so a key that
+    /// is gone for good does not cost a GET on every load forever.
     #[serde(default)]
     pub unfinished_loads: u32,
 }
 
 impl RekeyMerge {
     /// Owe a merge from `key` (no-op if already owed). A newly owed key gets a
-    /// fresh run of attempts.
-    fn owe(&mut self, key: ContractKey) {
+    /// fresh run of attempts; the clock starts when the room first owes one.
+    fn owe(&mut self, key: ContractKey, now_ms: u64) {
         if !self.owed.contains(&key) {
             self.owed.push(key);
             self.unfinished_loads = 0;
+            self.first_owed_at.get_or_insert(now_ms);
         }
     }
 }
@@ -404,7 +413,8 @@ pub struct RoomData {
     /// One known way this can be lost, narrow: a pre-#769 River tab saving the
     /// room silently drops the field (unknown fields are ignored). The next
     /// load re-detects a re-key only if that tab also wrote back an older
-    /// `contract_key`; the one-time predecessor merge is queued again.
+    /// `contract_key`; the one-time merge from `previous_contract_key` is
+    /// queued again.
     #[serde(default)]
     pub rekey_merge: RekeyMerge,
     /// Room secrets recovered from the invitation artifact, by version.
@@ -576,24 +586,29 @@ impl RoomData {
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         let new_key =
             ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
+        let now_ms = crate::util::get_current_system_time()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         if new_key != self.contract_key {
             self.previous_contract_key = Some(self.contract_key);
-            self.rekey_merge.owe(self.contract_key);
+            self.rekey_merge.owe(self.contract_key, now_ms);
         }
-        // freenet/river#771: a room last re-keyed off the immediate predecessor
-        // generation owes one merge from it, unless one was already queued. This
-        // catches devices that re-keyed on a build without the merge, which
-        // saved the room under the new key with nothing owed. A room that never
-        // lived under an older key (`previous_contract_key` is `None`, e.g. one
-        // created after the re-key) owes nothing.
-        if let Some(predecessor) =
-            crate::util::owner_vk_to_legacy_contract_keys(&self.owner_vk).first()
-        {
-            if self.previous_contract_key.as_ref() == Some(predecessor)
-                && self.rekey_merge.predecessor_queued.as_ref() != Some(predecessor)
+        // freenet/river#771: a room owes one merge from the key it last
+        // re-keyed off, unless one was already queued. This catches devices
+        // that re-keyed on a build without the merge, which saved the room
+        // under the new key with nothing owed (and the key they re-keyed off
+        // may be older than the newest legacy one, if they skipped releases).
+        // Only a registry generation counts. A room that never lived under an
+        // older key (`previous_contract_key` is `None`, e.g. one created after
+        // the re-key) owes nothing.
+        if let Some(previous) = self.previous_contract_key {
+            if previous != new_key
+                && self.rekey_merge.previous_queued != Some(previous)
+                && crate::util::owner_vk_to_legacy_contract_keys(&self.owner_vk).contains(&previous)
             {
-                self.rekey_merge.predecessor_queued = Some(*predecessor);
-                self.rekey_merge.owe(*predecessor);
+                self.rekey_merge.previous_queued = Some(previous);
+                self.rekey_merge.owe(previous, now_ms);
             }
         }
         // Never owe a merge from the key the room now lives under (a rollback
@@ -8714,12 +8729,13 @@ mod tests {
 
     /// freenet/river#771 review, must-fix A: a device that re-keyed on a build
     /// without the re-key merge saved the room under the new key with nothing
-    /// owed, so the move is never re-detected. Its `previous_contract_key` is
-    /// the immediate predecessor generation, and that alone makes it owe one
-    /// background merge from it, exactly once. A room that never lived under
-    /// the predecessor owes nothing.
+    /// owed, so the move is never re-detected. Its `previous_contract_key` (the
+    /// immediate predecessor, or an older registry generation if it skipped
+    /// releases) alone makes it owe one background merge from that key,
+    /// exactly once. A room that never lived under an older registry key owes
+    /// nothing.
     #[test]
-    fn a_room_rekeyed_without_the_merge_owes_one_from_the_predecessor() {
+    fn a_room_rekeyed_without_the_merge_owes_one_from_its_previous_key() {
         use crate::components::app::freenet_api::room_synchronizer::owed_rekey_merge;
         let owner_sk = SigningKey::from_bytes(&[76u8; 32]);
         let owner_vk = owner_sk.verifying_key();
@@ -8744,7 +8760,11 @@ mod tests {
         );
         let room = live.map[&owner_vk].clone();
         assert_eq!(room.rekey_merge.owed, vec![predecessor]);
-        assert_eq!(room.rekey_merge.predecessor_queued, Some(predecessor));
+        assert_eq!(room.rekey_merge.previous_queued, Some(predecessor));
+        assert!(
+            room.rekey_merge.first_owed_at.is_some(),
+            "the give-up clock starts"
+        );
         assert_eq!(owed_rekey_merge(&room), Some(vec![*predecessor.id()]));
 
         // It survives a save, and the merge is queued only once: once it has
@@ -8767,15 +8787,29 @@ mod tests {
         assert_eq!(live.migrated_rooms, vec![(owner_vk, predecessor)]);
         assert_eq!(live.map[&owner_vk].rekey_merge.owed, vec![predecessor]);
 
-        // Never under the predecessor: created after the re-key, or last
-        // re-keyed off an older generation.
+        // A device that skipped releases re-keyed off an older generation on
+        // that build: it owes a merge from that one.
+        let mut older = make_rejoin_test_room(&owner_sk, &owner_sk, false);
+        older.previous_contract_key = Some(legacy[3]);
+        let room = load(older).map[&owner_vk].clone();
+        assert_eq!(room.rekey_merge.owed, vec![legacy[3]]);
+        assert_eq!(room.rekey_merge.previous_queued, Some(legacy[3]));
+
+        // Never under an older key (created after the re-key), or a previous
+        // key that is not a registry generation (a development build): nothing.
         let created_since = make_rejoin_test_room(&owner_sk, &owner_sk, false);
         assert!(load(created_since).map[&owner_vk]
             .rekey_merge
             .owed
             .is_empty());
-        let mut older = make_rejoin_test_room(&owner_sk, &owner_sk, false);
-        older.previous_contract_key = Some(legacy[1]);
-        assert!(load(older).map[&owner_vk].rekey_merge.owed.is_empty());
+        let mut unregistered = make_rejoin_test_room(&owner_sk, &owner_sk, false);
+        unregistered.previous_contract_key = Some(ContractKey::from_params_and_code(
+            Parameters::from(to_cbor_vec(&ChatRoomParametersV1 { owner: owner_vk })),
+            &ContractCode::from(b"a development build".to_vec()),
+        ));
+        assert!(load(unregistered).map[&owner_vk]
+            .rekey_merge
+            .owed
+            .is_empty());
     }
 }

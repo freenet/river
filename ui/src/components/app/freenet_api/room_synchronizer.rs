@@ -1091,7 +1091,7 @@ impl RoomSynchronizer {
 
                 // A re-key merge still owed from an earlier load (its older key
                 // did not answer then, freenet/river#769), or the one-time
-                // merge from the predecessor generation (#771): run it
+                // merge from the key the room last re-keyed off (#771): run it
                 // alongside the subscribe, asking only the owed keys. Once per
                 // load; the room already has state under its current key, so
                 // nothing waits on it. Fallible, as in `rooms_awaiting_subscription`: a contended

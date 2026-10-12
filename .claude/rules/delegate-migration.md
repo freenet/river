@@ -55,9 +55,9 @@ reads the generations from the newest down to the one a room was last synced
 under and merges them in before seeding the new key (freenet/river#769). Its
 durable marker is `RoomData::rekey_merge` (`RekeyMerge::owed`), deliberately
 separate from `previous_contract_key` (which older builds set on every re-key
-and never cleared). A room whose `previous_contract_key` is the immediate
-predecessor generation owes one merge from it even when nothing else was
-recorded, which recovers devices that re-keyed on a build without the merge
+and never cleared). A room whose `previous_contract_key` is a registry
+generation owes one merge from it even when nothing else was recorded, which
+recovers devices that re-keyed on a build without the merge
 (freenet/river#771).
 
 ## Upgrade Workflow
