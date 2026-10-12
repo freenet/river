@@ -839,6 +839,17 @@ async function parkPastTheCeiling(page: Page) {
   return row!;
 }
 
+/// The view is at the end of the history with `text`'s message entirely
+/// above the composer.
+async function expectAtEndShowing(page: Page, text: string, why: string) {
+  await expectSettledAtBottom(page, why);
+  await expectMessageInView(page, text, why);
+}
+
+async function expectNewestRow(page: Page, text: string) {
+  await expect(page.locator("[data-item-key]").last(), "the expected message is not the newest row").toContainText(text);
+}
+
 test.describe("Render ceiling and trimming (A04, A05)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -870,6 +881,30 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     // reader at the end follows them.
     await deliver(page, "arrival after paging to the newest");
     await expectFollowed(page, "arrival after paging to the newest", "an arrival after paging to the newest was not followed");
+  });
+
+  // Latest from a held range takes the latest range, lands at the end once, and the next arrival follows.
+  test("Latest from a held range selects the latest range and goes to the end", async ({ page }) => {
+    await parkPastTheCeiling(page);
+    await callRiverTest(page, "appendMessage", "newest before Latest");
+    await expect.poll(() => withheld(page), { message: "premise: newer messages are held back" }).toBeGreaterThan(0);
+    await expect(
+      page.getByText("newest before Latest", { exact: false }),
+      "premise: the newest message is outside the held range",
+    ).toHaveCount(0);
+
+    await page.getByTestId("scroll-to-bottom").click();
+
+    await expectNewestRow(page, "newest before Latest");
+    await expectAtEndShowing(page, "newest before Latest", "Latest from a held range did not go to the end");
+    expect(await withheld(page), "the range after Latest still withholds newer items").toBe(0);
+    await expect(page.getByTestId("scroll-to-bottom"), "Latest stayed shown at the newest message").toHaveCount(0);
+    await deliver(page, "arrival after Latest from a held range");
+    await expectFollowed(
+      page,
+      "arrival after Latest from a held range",
+      "the arrival after Latest from a held range was not followed",
+    );
   });
 
   // A newer page trims ~6,000px above the reader (#747's last review round)
@@ -1122,17 +1157,6 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     await input.fill(text);
     await input.press("Enter");
     await expect(input, "the draft was not cleared").toHaveValue("");
-  }
-
-  /// The view is at the end of the history with `text`'s message entirely
-  /// above the composer.
-  async function expectAtEndShowing(page: Page, text: string, why: string) {
-    await expectSettledAtBottom(page, why);
-    await expectMessageInView(page, text, why);
-  }
-
-  async function expectNewestRow(page: Page, text: string) {
-    await expect(page.locator("[data-item-key]").last(), "the sent message is not the newest row").toContainText(text);
   }
 
   test("sending from the top of the history submits, clears the draft and goes to the latest message once", async ({
