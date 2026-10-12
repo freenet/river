@@ -1132,6 +1132,32 @@ pub(crate) fn on_current_delegate_missing() {
     }
 }
 
+/// Whether an error from the node is the CURRENT delegate refusing this
+/// attempt's room listing (freenet/river#768 round 3, S1). The node passes a
+/// delegate's error text to the client inside an untyped error that names no
+/// key, so it is recognised by the delegate's [`LIST_REFUSED_MARKER`], and only
+/// while this attempt's listing is outstanding: the listing is the first
+/// request of a load, and predecessors are not listed before it is answered.
+pub(crate) fn is_current_list_refusal(err_text: &str, list_outstanding: bool) -> bool {
+    list_outstanding && err_text.contains(river_core::chat_delegate::LIST_REFUSED_MARKER)
+}
+
+/// The current delegate refused this attempt's room listing (an index it
+/// cannot read). No `ListResponse` will start the load, so fail the attempt
+/// now and show Retry rather than wait out the backstop and show "no rooms".
+/// Returns whether the error was such a refusal.
+pub(crate) fn on_current_list_refused(err_text: &str) -> bool {
+    if !is_current_list_refusal(err_text, list_outstanding_this_attempt()) {
+        return false;
+    }
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    let _ = claim_outstanding_list(&LIST_OUTSTANDING, attempt);
+    warn!("The chat delegate refused the room listing; showing Retry (freenet/river#592)");
+    mark_fetch_failure_if_current(attempt);
+    resolve_load_failed_if_empty(attempt);
+    true
+}
+
 /// What a current-delegate "missing" answer does to load attempt `attempt`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MissingAction {
@@ -1257,6 +1283,25 @@ pub(crate) fn reset_ensure_subscription_dedup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #768 round 3, S1: the current delegate's refused listing (its marker
+    /// inside the node's untyped error text) fails the load only while this
+    /// attempt's listing is outstanding; any other error, or the same text
+    /// once the listing was answered, is not taken for it.
+    #[test]
+    fn a_refused_current_listing_is_recognised_only_while_outstanding() {
+        let text = format!(
+            "error while executing operation in the network: execution error, cause {}: \
+             the key index read back absent",
+            river_core::chat_delegate::LIST_REFUSED_MARKER
+        );
+        assert!(is_current_list_refusal(&text, true));
+        assert!(!is_current_list_refusal(&text, false));
+        assert!(!is_current_list_refusal(
+            "error while executing operation in the network: execution error: runtime: trap",
+            true
+        ));
+    }
     use ed25519_dalek::SigningKey;
 
     fn register_test_key(b: u8) -> DelegateKey {

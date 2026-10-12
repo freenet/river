@@ -261,6 +261,19 @@ fn put_secret(
     }
 }
 
+/// Remove `key` and confirm it is gone. The host's `remove_secret` answers
+/// `false` both for "did not exist" and for a failed removal, so the value is
+/// read back instead.
+fn remove_value(ctx: &mut impl SecretStore, key: &[u8]) -> Result<(), DelegateError> {
+    ctx.remove_secret(key);
+    if ctx.get_secret(key).is_some() {
+        return Err(DelegateError::Other(
+            "Failed to remove a value via host function".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn record_intent(
     ctx: &mut impl SecretStore,
     origin: &Origin,
@@ -277,11 +290,30 @@ fn record_intent(
     )
 }
 
-/// Open the key-value store for an operation: read (or first create) the key
+/// Open the key-value store for a write: read (or first create) the key
 /// index, and finish any operation a crash interrupted. Returns the index.
 fn open_kv(ctx: &mut impl SecretStore, origin: &Origin) -> Result<KeyIndex, DelegateError> {
+    open_kv_with(ctx, origin, CreateIndex::Yes)
+}
+
+/// Whether opening the store may create a missing (empty) index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreateIndex {
+    /// A write path: the index must exist before any value is written.
+    Yes,
+    /// The read path (`ListRequest`): a fresh delegate answers an empty list
+    /// and writes nothing (freenet/river#768 round 3, S4). Crash recovery
+    /// still runs, so a listing includes every value that landed.
+    No,
+}
+
+fn open_kv_with(
+    ctx: &mut impl SecretStore,
+    origin: &Origin,
+    create: CreateIndex,
+) -> Result<KeyIndex, DelegateError> {
     let index_key = create_index_key(origin);
-    let mut index = get_key_index(ctx, origin, &index_key)?;
+    let mut index = get_key_index(ctx, origin, &index_key, create)?;
     let intent_key = create_intent_key(origin);
     if let Some(bytes) = ctx.get_secret(&intent_key) {
         match ciborium::from_reader::<KvIntent, _>(bytes.as_slice()) {
@@ -299,7 +331,18 @@ fn open_kv(ctx: &mut impl SecretStore, origin: &Origin) -> Result<KeyIndex, Dele
                     index.keys.retain(|k| k != &key);
                     set_key_index(ctx, &index_key, &index)?;
                 }
-                ctx.remove_secret(&create_origin_key(origin, &key));
+                // Keep the intent until the value is gone, so the next
+                // operation retries the removal. A listing goes ahead (the
+                // index no longer lists the key); a write does not, because
+                // its own intent record would replace this one and strand the
+                // value unlisted.
+                if let Err(e) = remove_value(ctx, &create_origin_key(origin, &key)) {
+                    logging::info("A deleted value could not be removed yet; retrying later");
+                    return match create {
+                        CreateIndex::No => Ok(index),
+                        CreateIndex::Yes => Err(e),
+                    };
+                }
             }
             Err(e) => logging::info(&format!(
                 "Dropping an undecodable key-value intent record: {e}"
@@ -415,7 +458,10 @@ fn handle_delete_request(
         record_intent(ctx, origin, &KvIntent::Delete(key.clone()))?;
         key_index.keys.retain(|k| k != &key);
         set_key_index(ctx, &index_key, &key_index)?;
-        ctx.remove_secret(&secret_key);
+        // A removal that did not take leaves the intent in place: the next
+        // operation finishes the delete ([`open_kv`]) instead of keeping an
+        // unlisted value nothing would ever remove.
+        remove_value(ctx, &secret_key)?;
         ctx.remove_secret(&create_intent_key(origin));
         logging::info(&format!(
             "Removed key from index, now has {} keys",
@@ -445,7 +491,8 @@ fn handle_list_request(
     // migration reading this delegate as a predecessor would otherwise certify
     // a short export as everything it holds. An interrupted write is finished
     // first, so the listing includes every value that landed.
-    let key_index = open_kv(ctx, origin)?;
+    let key_index = open_kv_with(ctx, origin, CreateIndex::No)
+        .map_err(|e| DelegateError::Other(format!("{LIST_REFUSED_MARKER}: {e}")))?;
     logging::info(&format!(
         "Returning list with {} keys",
         key_index.keys.len()
@@ -686,8 +733,15 @@ fn handle_sign_request(
 /// read that failed (freenet/freenet-core#5857 reports a failed secret read as
 /// "not found"). Every store adds its key to the index, so one of these being
 /// present while the index reads absent can only be a read fault. (The UI's
-/// `ROOMS_META_KEY`, `ROOMS_STORAGE_KEY` and `OUTBOUND_DMS_STORAGE_KEY`.)
-const INDEX_WITNESS_KEYS: [&[u8]; 3] = [b"rooms_meta", b"rooms_data", b"outbound_dms"];
+/// `ROOMS_META_KEY`, `ROOMS_STORAGE_KEY` and `OUTBOUND_DMS_STORAGE_KEY`, plus
+/// the freenet-migrate completeness journal, `freenet_migrate::MIGRATION_JOURNAL_KEY`,
+/// which the UI stores on its first load.)
+const INDEX_WITNESS_KEYS: [&[u8]; 4] = [
+    b"rooms_meta",
+    b"rooms_data",
+    b"outbound_dms",
+    b"\0freenet-migrate-journal/v1",
+];
 
 /// Get the key index from secrets: empty when none is stored, an error when
 /// one is stored but does not decode (freenet/river#592), and an error when
@@ -697,6 +751,7 @@ fn get_key_index(
     ctx: &mut impl SecretStore,
     origin: &Origin,
     index_key: &[u8],
+    create: CreateIndex,
 ) -> Result<KeyIndex, DelegateError> {
     let stored = ctx.get_secret(index_key);
     if stored.is_none() {
@@ -710,11 +765,14 @@ fn get_key_index(
                 )));
             }
         }
-        // Genuinely fresh: create the (empty) index now, before any value is
-        // written, so no stored key can ever exist without one. A crash before
-        // this write leaves nothing stored; one after it leaves an empty index.
+        // Genuinely fresh. On a write path, create the (empty) index now,
+        // before any value is written, so no stored key can ever exist without
+        // one. A crash before this write leaves nothing stored; one after it
+        // leaves an empty index. The read path writes nothing.
         let empty = KeyIndex::default();
-        set_key_index(ctx, index_key, &empty)?;
+        if create == CreateIndex::Yes {
+            set_key_index(ctx, index_key, &empty)?;
+        }
         return Ok(empty);
     }
     decode_key_index(stored.as_deref())
@@ -1258,6 +1316,9 @@ mod tests {
         /// had died between two writes.
         crash_after: Option<usize>,
         mutations: usize,
+        /// Removing this key "succeeds" without removing it (a host removal
+        /// that did not take).
+        sticky: Option<Vec<u8>>,
     }
 
     impl FakeSecrets {
@@ -1284,7 +1345,9 @@ mod tests {
                 return;
             }
             self.log.push(("remove", key.to_vec()));
-            self.map.remove(key);
+            if self.sticky.as_deref() != Some(key) {
+                self.map.remove(key);
+            }
         }
     }
 
@@ -1627,8 +1690,8 @@ mod tests {
         );
     }
 
-    /// The first load of a fresh delegate: list creates the empty index, then
-    /// the first store writes a witness key (`rooms_meta`). A crash at any
+    /// The first load of a fresh delegate: list (which writes nothing), then
+    /// the first store creates the index and writes a witness key (`rooms_meta`). A crash at any
     /// write of that sequence never leaves a witness without an index (the
     /// refusal that used to lock the user out for good).
     #[test]
@@ -1663,5 +1726,149 @@ mod tests {
         assert!(handle_list_request(&mut f, &origin()).is_err());
         assert!(handle_store_request(&mut f, &origin(), ck("room:b"), b"x".to_vec()).is_err());
         assert_eq!(f.map, before);
+    }
+    /// #768 round 3, S4: a `ListRequest` on a fresh delegate answers an empty
+    /// list and writes nothing; the first STORE creates the index.
+    #[test]
+    fn listing_a_fresh_delegate_writes_nothing() {
+        let mut f = FakeSecrets::default();
+        assert!(listed(&mut f).is_empty());
+        assert_eq!(f.mutations, 0, "the read path wrote: {:?}", f.log);
+        assert!(f.map.is_empty());
+        handle_store_request(&mut f, &origin(), ck("rooms_meta"), b"m".to_vec()).unwrap();
+        assert!(f.map.contains_key(&create_index_key(&origin())));
+    }
+
+    /// #768 round 3, S4: the migration journal is a witness too. An index that
+    /// reads back absent beside a stored journal is a read fault, refused.
+    #[test]
+    fn an_absent_index_beside_a_stored_journal_is_refused() {
+        let mut f = store_with(&["\0freenet-migrate-journal/v1"]);
+        f.map.remove(&create_index_key(&origin()));
+        let before = f.map.clone();
+        assert!(handle_list_request(&mut f, &origin()).is_err());
+        assert_eq!(f.map, before);
+    }
+
+    /// #768 round 3, S1: a refused listing carries the marker the UI keys on.
+    #[test]
+    fn a_refused_listing_carries_the_list_refused_marker() {
+        let mut f = store_with(&["rooms_meta"]);
+        f.map.remove(&create_index_key(&origin()));
+        let err = handle_list_request(&mut f, &origin()).unwrap_err();
+        assert!(
+            format!("{err}").contains(LIST_REFUSED_MARKER),
+            "the UI cannot recognise this refusal: {err}"
+        );
+    }
+
+    /// #768 round 3 nit: a delete whose value removal did not take fails and
+    /// keeps the intent, so the next operation finishes it; it never leaves an
+    /// unlisted value behind with the intent cleared.
+    #[test]
+    fn a_delete_whose_removal_does_not_take_is_finished_later() {
+        let mut f = store_with(&["room:a", "rooms_meta"]);
+        let raw = create_origin_key(&origin(), &ck("room:a"));
+        f.sticky = Some(raw.clone());
+        assert!(handle_delete_request(&mut f, &origin(), ck("room:a")).is_err());
+        assert!(
+            f.map.contains_key(&create_intent_key(&origin())),
+            "intent kept"
+        );
+        assert!(
+            !listed(&mut f).contains(&ck("room:a")),
+            "the listing goes ahead"
+        );
+        assert!(
+            f.map.contains_key(&raw),
+            "a recovery that cannot remove keeps trying"
+        );
+        assert!(
+            f.map.contains_key(&create_intent_key(&origin())),
+            "intent still kept"
+        );
+        assert!(
+            handle_store_request(&mut f, &origin(), ck("room:c"), b"c".to_vec()).is_err(),
+            "a write must not replace the pending delete's intent"
+        );
+        assert!(
+            f.map.contains_key(&create_intent_key(&origin())),
+            "intent still kept"
+        );
+        f.sticky = None;
+        assert_recovers(f, &["rooms_meta"], "removal fixed");
+    }
+
+    /// #768 round 3, CF5: a crash DURING crash recovery. Crash the original
+    /// operation at every write, then crash the recovering operation at every
+    /// write of its own, then recover again: nothing is wedged or lost.
+    fn crash_during_recovery(
+        start: FakeSecrets,
+        op: &dyn Fn(&mut FakeSecrets),
+        recover: &dyn Fn(&mut FakeSecrets),
+        keep: &[&str],
+        what: &str,
+    ) -> usize {
+        let mut cases = 0;
+        let n = writes_of(&start, op);
+        for first in 0..n {
+            let mut crashed = FakeSecrets {
+                map: start.map.clone(),
+                crash_after: Some(first),
+                ..Default::default()
+            };
+            op(&mut crashed);
+            let m = writes_of(&crashed, recover);
+            for second in 0..m {
+                let mut f = FakeSecrets {
+                    map: crashed.map.clone(),
+                    crash_after: Some(second),
+                    ..Default::default()
+                };
+                recover(&mut f);
+                cases += 1;
+                assert_recovers(
+                    f,
+                    keep,
+                    &format!("{what}: crash after write {first} of {n}, then after recovery write {second} of {m}"),
+                );
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn a_crash_during_recovery_wedges_nothing() {
+        let list = |f: &mut FakeSecrets| {
+            let _ = handle_list_request(f, &origin());
+        };
+        let store = |f: &mut FakeSecrets| {
+            let _ = handle_store_request(f, &origin(), ck("room:z"), b"z".to_vec());
+        };
+        let add = |f: &mut FakeSecrets| {
+            let _ = handle_store_request(f, &origin(), ck("room:b"), b"b".to_vec());
+        };
+        let delete = |f: &mut FakeSecrets| {
+            let _ = handle_delete_request(f, &origin(), ck("room:a"));
+        };
+        let mut cases = 0;
+        for (op, keep, what) in [
+            (&add as &dyn Fn(&mut FakeSecrets), &["room:a"][..], "add"),
+            (&delete, &["rooms_meta"][..], "delete"),
+        ] {
+            for (recover, rname) in [
+                (&list as &dyn Fn(&mut FakeSecrets), "list"),
+                (&store, "store"),
+            ] {
+                cases += crash_during_recovery(
+                    store_with(&["room:a", "rooms_meta"]),
+                    op,
+                    recover,
+                    keep,
+                    &format!("{what}, recovered by {rname}"),
+                );
+            }
+        }
+        assert!(cases > 0, "no crash-during-recovery case ran");
     }
 }

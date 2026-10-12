@@ -7,7 +7,8 @@ use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
     current_delegate_key, is_legacy_delegate_key, note_register_error_for_register_ack,
-    on_current_delegate_missing, reset_ensure_subscription_dedup, set_up_chat_delegate,
+    on_current_delegate_missing, on_current_list_refused, reset_ensure_subscription_dedup,
+    set_up_chat_delegate,
 };
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
@@ -842,6 +843,10 @@ impl FreenetSynchronizer {
                                 } else if names_current_missing(&e, &current) {
                                     warn!("The CURRENT chat delegate was reported missing; registering it (freenet/river#707, #757)");
                                     on_current_delegate_missing();
+                                } else {
+                                    // A refused room listing fails the load
+                                    // now (Retry), not after the backstop.
+                                    on_current_list_refused(&e.to_string());
                                 }
 
                                 // Special handling for "not supported" errors
@@ -1107,6 +1112,15 @@ mod tests {
                 .unwrap()
                 .contains("on_current_delegate_missing();"),
             "the current-key Missing branch must call on_current_delegate_missing"
+        );
+        // A refused current listing must reach the load's failure path too
+        // (#768 round 3, S1), on the arm that is neither legacy nor Missing.
+        let refused = production
+            .find("on_current_list_refused(&e.to_string());")
+            .expect("the error arm must route a refused listing");
+        assert!(
+            branch < refused && refused < branch + 700,
+            "the refused-listing route must sit in the Missing branch's else"
         );
         // And a typed RegisterError must end the register wait.
         let arm = production

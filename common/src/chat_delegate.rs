@@ -14,6 +14,14 @@ pub type RoomKey = [u8; 32];
 /// freenet/river#256.
 pub const OUTBOUND_DMS_STORAGE_KEY: &[u8] = b"outbound_dms";
 
+/// Prefix of the error text the chat delegate returns when it refuses a
+/// `ListRequest` (an undecodable key index, or one that reads back absent
+/// beside a stored key: freenet/river#592). The node passes the delegate's
+/// error text to the client inside an untyped error that names no delegate
+/// key, so the UI recognises its CURRENT delegate's refused room listing by
+/// this text while that listing is outstanding (freenet/river#768 round 3, S1).
+pub const LIST_REFUSED_MARKER: &str = "river chat delegate refused ListRequest";
+
 /// Persistent cache of outbound DM plaintext, keyed by
 /// `(room_owner_vk, recipient, purge_token)` inside each entry.
 ///
