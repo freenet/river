@@ -487,6 +487,7 @@ fn create_room(
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
+            rekey_merge_owed: None,
             invitation_secrets: std::collections::BTreeMap::new(),
         },
     }

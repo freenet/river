@@ -478,6 +478,7 @@ pub async fn handle_get_response(
                             self_member_info: None,
                             self_nickname: None,
                             previous_contract_key: None,
+                            rekey_merge_owed: None,
                             invitation_secrets: std::collections::BTreeMap::new(),
                         }
                     });
@@ -1336,7 +1337,7 @@ pub(crate) fn request_seed_put(owner_vk: ed25519_dalek::VerifyingKey) {
 /// * A backward-probe hop: the legacy generation answered that it holds
 ///   nothing, so the walk advances now instead of after its watchdog.
 /// * A room whose code-free subscribe GET is outstanding re-seeds with a PUT.
-///   If the room still owes a re-key merge (`previous_contract_key` is set,
+///   If the room still owes a re-key merge (`rekey_merge_owed` is set,
 ///   freenet/river#769), the older keys are merged in first, so the seed is
 ///   not just this device's snapshot.
 /// * An imported room still holding its placeholder probes the older
@@ -1356,13 +1357,23 @@ pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
         info!("NotFound for unrecognised contract {}", instance_id);
         return;
     };
-    let room = ROOMS.read().map.get(&owner_vk).map(|rd| {
-        (
-            rd.room_state.clone(),
-            rd.previous_contract_key.map(|k| *k.id()),
-            rd.is_awaiting_initial_sync(),
-        )
-    });
+    // Fallible: a contended ROOMS must not panic this handler. Unreadable,
+    // the room is treated as owing nothing, which seeds what this device holds
+    // (the pre-#769 behaviour); a merge still owed stays marked and runs from
+    // the subscribe sweep.
+    let room = match ROOMS.try_read() {
+        Ok(rooms) => rooms.map.get(&owner_vk).map(|rd| {
+            (
+                rd.room_state.clone(),
+                crate::components::app::freenet_api::room_synchronizer::owed_rekey_merge(rd),
+                rd.is_awaiting_initial_sync(),
+            )
+        }),
+        Err(_) => {
+            warn!("ROOMS busy while handling a NotFound — treating the room as owing no merge");
+            None
+        }
+    };
     let answers_subscribe_get =
         SYNC_INFO.with_mut(|sync_info| sync_info.subscribe_get_found_nothing(&owner_vk));
     let (snapshot, owed_merge, placeholder) = match room {
@@ -1381,11 +1392,19 @@ pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
         }
         NotFoundAction::Seed => request_seed_put(owner_vk),
         NotFoundAction::ProbePlaceholder => {
-            info!(
-                "NotFound for imported room {:?} — probing older room-contract generations",
-                MemberId::from(owner_vk)
-            );
-            start_backward_probe(owner_vk, snapshot).await;
+            // Once per load: the #290 retries re-GET the room up to ten times,
+            // and walking every generation on each would stretch them out.
+            let first = PLACEHOLDER_PROBED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(owner_vk);
+            if first {
+                info!(
+                    "NotFound for imported room {:?} — probing older room-contract generations",
+                    MemberId::from(owner_vk)
+                );
+                start_backward_probe(owner_vk, snapshot).await;
+            }
         }
         NotFoundAction::Ignore => info!(
             "NotFound for room {:?} with no subscribe GET outstanding — ignoring",
@@ -1393,6 +1412,12 @@ pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
         ),
     }
 }
+
+/// Imported rooms whose `NotFound` has already started a probe of the older
+/// generations on this page load.
+static PLACEHOLDER_PROBED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<ed25519_dalek::VerifyingKey>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// What a `NotFound` for a room's current key leads to.
 #[derive(Debug, PartialEq, Eq)]
@@ -2624,6 +2649,10 @@ mod tests {
             NotFoundAction::Ignore
         );
         assert_eq!(not_found_action(false, None, false), NotFoundAction::Ignore);
+        // A placeholder never takes the subscribe-GET route (it GETs first),
+        // and owes no merge (`owed_rekey_merge` excludes it); if one ever did
+        // answer a subscribe GET, it seeds like any room, as before.
+        assert_eq!(not_found_action(true, None, true), NotFoundAction::Seed);
     }
 
     /// freenet/river#757 safety net, source pin: a `NotFound` for a room whose

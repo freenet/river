@@ -84,12 +84,11 @@
 //! (above) stops a stale watchdog from claiming a later probe's re-registered
 //! route.
 //!
-//! A typed `NotFound` for a probe GET is an ANSWER, not silence: it advances
-//! the walk at once instead of waiting out the watchdog. Only the watchdog (and
-//! a failed send, which it covers) leaves a generation **unresolved**. The 0.5
-//! driver counts both as a miss, so the adapter keeps that distinction itself
-//! ([`ProbeEntry::unresolved`]); it decides whether a re-key merge may be
-//! recorded as finished.
+//! A typed `NotFound` for a probe GET advances the walk at once instead of
+//! waiting out the watchdog. It is not proof the generation is empty: on
+//! Freenet a `NotFound` is routinely a routing dead-end. The #292 recovery
+//! treats it as a miss, as it always treated a timeout; a re-key merge never
+//! takes it as grounds to stop retrying (below).
 //!
 //! ## Re-key merge (freenet/river#769)
 //!
@@ -97,13 +96,14 @@
 //! new key starts empty. The device's local snapshot is not the whole room:
 //! messages that reached the OLD key after this device last saved exist only
 //! there. So for a room whose stored contract key is from an older generation,
-//! [`start_rekey_merge`] walks the same driver over the generations from the
-//! newest legacy one down to the one this device last synced under, merges what
-//! it finds into `ROOMS` (CRDT merge, never a replace), and only then lets the
-//! room's seed PUT go out, carrying the merged state. The room's
-//! `previous_contract_key` is the durable "merge still owed" marker: it is
-//! cleared only once every candidate answered, so a timed-out old key is
-//! retried on a later load.
+//! [`start_rekey_merge`] walks the generations from the newest legacy one down
+//! to the one this device last synced under, folds every one that has state,
+//! merges the result into `ROOMS` (CRDT merge, never a replace), and only then
+//! lets the room's seed PUT go out, carrying the merged state. The room's
+//! `rekey_merge_owed` is the durable "merge still owed" marker. It is cleared
+//! only once the generation it names has answered with the room's state and
+//! that state has merged in, so an old key that is slow, unreachable or
+//! answers `NotFound` is asked again on a later load.
 
 use crate::components::app::freenet_api::constants::REPUT_DELAY_MS;
 use crate::components::app::freenet_api::response_handler::get_response::{
@@ -116,15 +116,17 @@ use crate::util::{owner_vk_to_legacy_contract_keys, safe_spawn_local, sleep, try
 use dioxus::logger::tracing::{info, warn};
 use ed25519_dalek::VerifyingKey;
 use freenet_migrate::{
-    NewestFirst, Outcome, ProbeDriver, ProbeStateOps, SelectionPolicy, Step, DEFAULT_MAX_PROBE_HOPS,
+    FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeStateOps, SelectionPolicy, Step,
+    DEFAULT_MAX_PROBE_HOPS,
 };
+use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// River caps a probe walk at 64 legacy generations (defence-in-depth against a
@@ -158,6 +160,18 @@ const _: () = assert!(
 struct RiverProbeOps {
     /// The owner whose stranded room this probe is recovering.
     owner_vk: VerifyingKey,
+    /// Set if folding two generations together failed, so the fold dropped
+    /// one of them (re-key merges fold every generation, freenet/river#769).
+    fold_failed: Arc<AtomicBool>,
+}
+
+impl RiverProbeOps {
+    fn new(owner_vk: VerifyingKey) -> Self {
+        Self {
+            owner_vk,
+            fold_failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl ProbeStateOps for RiverProbeOps {
@@ -192,6 +206,24 @@ impl ProbeStateOps for RiverProbeOps {
             owner: self.owner_vk,
         };
         merge_room_states(recovered, local, &params)
+    }
+
+    fn merge_generations(&self, newer: ChatRoomStateV1, older: ChatRoomStateV1) -> ChatRoomStateV1 {
+        // Only a re-key merge folds (`SelectionPolicy::FoldAll`). CRDT-merge
+        // the older generation in; if that fails, keep the newer and say so,
+        // so the walk is not recorded as finished on a fold that lost a side.
+        let params = ChatRoomParametersV1 {
+            owner: self.owner_vk,
+        };
+        let mut merged = newer.clone();
+        match merged.merge(&newer, &params, &older) {
+            Ok(()) => merged,
+            Err(e) => {
+                warn!("Re-key merge: folding an older generation failed ({e}); keeping the newer");
+                self.fold_failed.store(true, Ordering::Relaxed);
+                newer
+            }
+        }
     }
 
     // `prepare_forward` stays the driver default (identity) on purpose: River
@@ -239,12 +271,83 @@ enum ProbePurpose {
 /// One owner's in-flight probe.
 struct ProbeEntry {
     driver: ProbeDriver<RiverProbeOps>,
-    /// Candidates whose GET was never answered (watchdog fired; a failed send
-    /// lands here too). Their state is unknown, which the 0.5 driver cannot
-    /// express: it treats a timeout as a miss. Kept here so a re-key merge
-    /// that heard nothing from a generation is never recorded as finished.
-    unresolved: Vec<ContractInstanceId>,
+    /// Candidates that answered with real state. A re-key merge is recorded
+    /// as finished only once the generation it owes a merge from is among
+    /// them: a `NotFound`, or silence, from that key is never proof it is
+    /// empty, since this device synced the room under it.
+    hits: Vec<ContractInstanceId>,
+    /// Shared with the driver's [`RiverProbeOps`].
+    fold_failed: Arc<AtomicBool>,
     purpose: ProbePurpose,
+}
+
+impl ProbeEntry {
+    fn new(
+        owner_vk: VerifyingKey,
+        local: ChatRoomStateV1,
+        candidates: Vec<ContractInstanceId>,
+        purpose: ProbePurpose,
+    ) -> Self {
+        let ops = RiverProbeOps::new(owner_vk);
+        let fold_failed = ops.fold_failed.clone();
+        // A re-key merge folds every generation it asks into the room: the
+        // result is CRDT-merged into ROOMS, never adopted in place of it, so
+        // the anti-rollback reason for stopping at the newest hit does not
+        // apply, and stopping there would skip the very generation this device
+        // last synced under. River's merge re-applies the caps and the
+        // membership/ban cleanup, so an older generation's messages cannot
+        // outlive them. The #292 recovery adopts exactly one generation.
+        let policy = match purpose {
+            ProbePurpose::Recover => SelectionPolicy::NewestFirstWins,
+            ProbePurpose::RekeyMerge { .. } => SelectionPolicy::FoldAll(
+                FoldAllAck::i_understand_fold_all_resurrects_without_tombstones(),
+            ),
+        };
+        // Candidates are newest-first by construction (see the callers).
+        let driver = ProbeDriver::new(ops, local, NewestFirst::assume_ordered(candidates), policy);
+        Self {
+            driver,
+            hits: Vec::new(),
+            fold_failed,
+            purpose,
+        }
+    }
+
+    /// Blocking probes hold their room out of the subscription sweep; a
+    /// background re-key merge must not, or it would also stretch the timeout
+    /// of the room's own subscribe GET.
+    fn holds_subscription(&self) -> bool {
+        !matches!(self.purpose, ProbePurpose::RekeyMerge { seed: false, .. })
+    }
+}
+
+/// Legacy ids whose probe GET the watchdog gave up on while it may still be
+/// in flight at the node, with how many such fires are outstanding. A
+/// `NotFound` carries no fire token, so one arriving for such an id may belong
+/// to the abandoned fire rather than a later probe that re-registered the id:
+/// it is consumed here and ignored, and the later fire falls back to its own
+/// watchdog (slower, never wrong).
+static ORPHANED_FIRES: LazyLock<Mutex<HashMap<ContractInstanceId, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn orphaned_fires() -> MutexGuard<'static, HashMap<ContractInstanceId, u32>> {
+    ORPHANED_FIRES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Consume one orphaned fire for `id`, if any. Returns whether one was.
+fn take_orphaned_fire(id: &ContractInstanceId) -> bool {
+    let mut orphans = orphaned_fires();
+    match orphans.get_mut(id) {
+        Some(n) if *n > 1 => {
+            *n -= 1;
+            true
+        }
+        Some(_) => {
+            orphans.remove(id);
+            true
+        }
+        None => false,
+    }
 }
 
 /// One in-flight probe per owner. The driver owns the sans-IO probe decision
@@ -323,26 +426,32 @@ pub(crate) fn rekey_candidates(
 pub(crate) struct RekeyFinish {
     /// Older-generation state to CRDT-merge into the room, if any was found.
     pub recovered: Option<ChatRoomStateV1>,
-    /// Every candidate answered, so the marker may be cleared (once any
-    /// recovered state has actually merged).
+    /// The owed generation itself answered with the room's state and the fold
+    /// kept it, so the marker may be cleared once the merge has landed.
     pub complete: bool,
 }
 
+/// `previous_hit`: the generation the merge is owed from answered with real
+/// state. Nothing else completes a merge. That generation held this room (the
+/// device synced under it), so a `NotFound` or silence from it means "could
+/// not read it", never "it is empty"; a `NotFound` on Freenet is routinely a
+/// routing dead-end. Such a walk still merges what it found and seeds, but
+/// keeps the marker, and the next load asks again.
 pub(crate) fn plan_rekey_finish(
     outcome: Outcome<ChatRoomStateV1>,
-    unresolved: &[ContractInstanceId],
+    previous_hit: bool,
+    fold_failed: bool,
 ) -> RekeyFinish {
-    let complete = unresolved.is_empty();
+    let complete = previous_hit && !fold_failed;
     match outcome {
         Outcome::Recovered { merged, .. } => RekeyFinish {
             recovered: Some(merged),
             complete,
         },
-        // Every generation answered without real state. The device's own
-        // snapshot is already in ROOMS, so there is nothing to merge.
+        // No generation had real state, so the owed one cannot have either.
         Outcome::SeedLocal { .. } | Outcome::NoLegacy { .. } => RekeyFinish {
             recovered: None,
-            complete,
+            complete: false,
         },
     }
 }
@@ -404,21 +513,15 @@ pub async fn start_rekey_merge(
             "merging in the background"
         }
     );
-    // `rekey_candidates` keeps the registry's newest-first order (see
-    // `start_backward_probe` for why that order is the anti-rollback guarantee).
-    let driver = ProbeDriver::new(
-        RiverProbeOps { owner_vk },
-        local_snapshot,
-        NewestFirst::assume_ordered(candidates),
-        SelectionPolicy::NewestFirstWins,
-    );
+    // `rekey_candidates` keeps the registry's newest-first order.
     drivers().insert(
         owner_vk,
-        ProbeEntry {
-            driver,
-            unresolved: Vec::new(),
-            purpose: ProbePurpose::RekeyMerge { previous, seed },
-        },
+        ProbeEntry::new(
+            owner_vk,
+            local_snapshot,
+            candidates,
+            ProbePurpose::RekeyMerge { previous, seed },
+        ),
     );
     pump_probe(owner_vk).await;
     RekeyStart::Started
@@ -443,15 +546,6 @@ pub fn is_probe_instance(instance_id: &ContractInstanceId) -> bool {
 /// generations at all, in which case the caller falls back to seeding the
 /// current key itself.
 pub async fn start_backward_probe(owner_vk: VerifyingKey, local_snapshot: ChatRoomStateV1) -> bool {
-    let legacy_keys = owner_vk_to_legacy_contract_keys(&owner_vk);
-    if legacy_keys.is_empty() {
-        info!(
-            "No legacy room-contract generations — skipping backward probe for {:?}",
-            MemberId::from(owner_vk)
-        );
-        return false;
-    }
-
     // Don't start a second probe for an owner that already has one running.
     // Return `true` so the caller still treats recovery as in-flight. A probe's
     // driver entry lives from here until its terminal Outcome (removed in
@@ -471,6 +565,15 @@ pub async fn start_backward_probe(owner_vk: VerifyingKey, local_snapshot: ChatRo
         return true;
     }
 
+    let legacy_keys = owner_vk_to_legacy_contract_keys(&owner_vk);
+    if legacy_keys.is_empty() {
+        info!(
+            "No legacy room-contract generations — skipping backward probe for {:?}",
+            MemberId::from(owner_vk)
+        );
+        return false;
+    }
+
     info!(
         "Starting backward probe for {:?}: {} legacy generation(s) to try",
         MemberId::from(owner_vk),
@@ -482,61 +585,47 @@ pub async fn start_backward_probe(owner_vk: VerifyingKey, local_snapshot: ChatRo
     // — so `assume_ordered` is sound. The whole anti-rollback guarantee rests
     // on this order: probing newest-first and stopping at the first real state
     // means an older generation can never shadow a newer one.
-    let candidates = NewestFirst::assume_ordered(legacy_keys.iter().map(|k| *k.id()).collect());
-    let driver = ProbeDriver::new(
-        RiverProbeOps { owner_vk },
-        local_snapshot,
-        candidates,
-        // River adopts exactly one generation (the newest real one) and never
-        // reads older ones — safe for delete-by-absence state (pruned messages
-        // stay pruned). The 64-hop cap is the driver default (asserted above).
-        SelectionPolicy::NewestFirstWins,
-    );
+    // River adopts exactly one generation (the newest real one) and never
+    // reads older ones — safe for delete-by-absence state (pruned messages
+    // stay pruned). The 64-hop cap is the driver default (asserted above).
     drivers().insert(
         owner_vk,
-        ProbeEntry {
-            driver,
-            unresolved: Vec::new(),
-            purpose: ProbePurpose::Recover,
-        },
+        ProbeEntry::new(
+            owner_vk,
+            local_snapshot,
+            legacy_keys.iter().map(|k| *k.id()).collect(),
+            ProbePurpose::Recover,
+        ),
     );
     pump_probe(owner_vk).await;
     true
 }
 
-/// Deliver a typed `NotFound` for a legacy-key probe GET: the node answered
-/// that it holds nothing under that key. That is an answer, so the walk
-/// advances now rather than after the watchdog, and the generation is NOT
-/// recorded as unresolved. (The 0.5 driver's `on_timeout` is its only "miss"
-/// event; the unknown-vs-absent distinction lives in `ProbeEntry::unresolved`.)
+/// Deliver a typed `NotFound` for a legacy-key probe GET. The walk moves on
+/// now rather than after the watchdog. It is not evidence the generation is
+/// empty (see [`plan_rekey_finish`]); it only stops the walk waiting on it.
 pub(crate) async fn deliver_probe_absent(id: ContractInstanceId) {
-    let Some((owner_vk, _token)) = routes().remove(&id) else {
-        return;
-    };
+    if let Some(owner_vk) = take_probe_absent(id) {
+        pump_probe(owner_vk).await;
+    }
+}
+
+/// The synchronous half of [`deliver_probe_absent`]: claim `id`'s route and
+/// advance its walk past `id`. Returns the owner to pump, or `None` if the
+/// `NotFound` may belong to a fire the watchdog already gave up on
+/// ([`ORPHANED_FIRES`]) or no probe is waiting on `id`.
+fn take_probe_absent(id: ContractInstanceId) -> Option<VerifyingKey> {
+    if take_orphaned_fire(&id) {
+        info!("NotFound for {id} may answer an abandoned probe GET — leaving it to the watchdog");
+        return None;
+    }
+    let (owner_vk, _token) = routes().remove(&id)?;
     info!("Legacy contract {id} answered NotFound — advancing to older generation");
-    record_probe_answer(owner_vk, id, ProbeAnswer::Absent);
-    pump_probe(owner_vk).await;
-}
-
-/// How a probe GET ended, when it ended without state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProbeAnswer {
-    /// The node answered `NotFound`.
-    Absent,
-    /// No answer before the watchdog fired.
-    Silent,
-}
-
-/// Feed a stateless end of `owner_vk`'s probe GET for `id` into its entry. Both
-/// advance the walk (the 0.5 driver's `on_timeout` is its only miss event);
-/// only silence marks the generation unresolved.
-fn record_probe_answer(owner_vk: VerifyingKey, id: ContractInstanceId, answer: ProbeAnswer) {
     if let Some(entry) = drivers().get_mut(&owner_vk) {
-        if answer == ProbeAnswer::Silent && !entry.unresolved.contains(&id) {
-            entry.unresolved.push(id);
-        }
+        // The 0.5 driver's only "miss" event.
         entry.driver.on_timeout(id);
     }
+    Some(owner_vk)
 }
 
 /// Deliver a legacy-key GET response into its owner's probe driver, then pump.
@@ -544,38 +633,52 @@ fn record_probe_answer(owner_vk: VerifyingKey, id: ContractInstanceId, answer: P
 /// FIRST of {this response, the watchdog} to remove the route owns the hop
 /// (single-shot). Unknown ids are the race-loser and no-op.
 pub(crate) async fn deliver_probe_response(id: ContractInstanceId, bytes: Vec<u8>) {
+    if let Some(owner_vk) = take_probe_response(id, &bytes) {
+        pump_probe(owner_vk).await;
+    }
+}
+
+/// The synchronous half of [`deliver_probe_response`]: claim `id`'s route and
+/// feed the bytes to its driver. Returns the owner to pump.
+fn take_probe_response(id: ContractInstanceId, bytes: &[u8]) -> Option<VerifyingKey> {
     // The per-fire token is deliberately IGNORED here (unlike the watchdog): a
     // GET response for `id` is a valid response for whatever fire currently owns
     // `id`'s route, and the driver is single-shot on its own outstanding
     // candidate — if the owning driver has already advanced past `id`, its
     // `on_response(id, ..)` is a no-op. So routing by the current owner is
     // always correct; only the stale-timeout case needs the token.
+    // One reply consumed for `id`, whichever fire sent it.
+    take_orphaned_fire(&id);
     let Some((owner_vk, _token)) = routes().remove(&id) else {
         // The route was already consumed — e.g. the timeout watchdog fired
         // first. Whichever ran first owns the outcome; the loser lands here.
         warn!("Probe GET response for {id} had no matching probe entry — ignoring");
-        return;
+        return None;
     };
     {
         let mut drivers = drivers();
-        if let Some(ProbeEntry { driver, .. }) = drivers.get_mut(&owner_vk) {
+        if let Some(ProbeEntry { driver, hits, .. }) = drivers.get_mut(&owner_vk) {
             // Observability only — the driver makes the actual decision. This
             // re-classifies the bytes purely to keep the pre-driver era's
             // per-candidate logs (once per probe hop, cost negligible).
-            let ops = RiverProbeOps { owner_vk };
-            match ops.decode(&bytes) {
+            let ops = RiverProbeOps::new(owner_vk);
+            match ops.decode(bytes) {
                 None => warn!(
                     "Legacy contract {id} returned undeserializable state — skipping generation"
                 ),
                 Some(state) if !ops.is_real(&state) => {
                     info!("Legacy contract {id} is empty — advancing to older generation")
                 }
-                Some(_) => {}
+                Some(_) => {
+                    if !hits.contains(&id) {
+                        hits.push(id);
+                    }
+                }
             }
-            driver.on_response(id, &bytes);
+            driver.on_response(id, bytes);
         }
     }
-    pump_probe(owner_vk).await;
+    Some(owner_vk)
 }
 
 /// Drive the probe for `owner_vk` one decision forward: ask the driver what to
@@ -602,7 +705,12 @@ async fn pump_probe(owner_vk: VerifyingKey) {
             let outcome = entry.driver.take_outcome();
             if let ProbePurpose::RekeyMerge { previous, seed } = entry.purpose {
                 if let Some(outcome) = outcome {
-                    finish_rekey_merge(owner_vk, previous, seed, outcome, &entry.unresolved);
+                    let plan = plan_rekey_finish(
+                        outcome,
+                        entry.hits.contains(&previous),
+                        entry.fold_failed.load(Ordering::Relaxed),
+                    );
+                    finish_rekey_merge(owner_vk, previous, seed, plan);
                 }
                 return;
             }
@@ -657,10 +765,8 @@ fn finish_rekey_merge(
     owner_vk: VerifyingKey,
     previous: ContractInstanceId,
     seed: bool,
-    outcome: Outcome<ChatRoomStateV1>,
-    unresolved: &[ContractInstanceId],
+    plan: RekeyFinish,
 ) {
-    let plan = plan_rekey_finish(outcome, unresolved);
     if plan.complete {
         info!(
             "Re-key merge for room {:?} finished ({})",
@@ -673,10 +779,9 @@ fn finish_rekey_merge(
         );
     } else {
         warn!(
-            "Re-key merge for room {:?}: {} older generation(s) did not answer — keeping \
-             what this device has and retrying on the next load",
-            MemberId::from(owner_vk),
-            unresolved.len()
+            "Re-key merge for room {:?}: the older key it last synced under did not return \
+             the room — keeping what was found and asking again on the next load",
+            MemberId::from(owner_vk)
         );
     }
     let RekeyFinish {
@@ -704,10 +809,10 @@ fn finish_rekey_merge(
             if merged
                 && complete
                 && room_data
-                    .previous_contract_key
+                    .rekey_merge_owed
                     .is_some_and(|k| *k.id() == previous)
             {
-                room_data.previous_contract_key = None;
+                room_data.rekey_merge_owed = None;
             }
         });
     });
@@ -725,6 +830,25 @@ fn finish_rekey_merge(
             request_seed_put(owner_vk);
         });
     }
+}
+
+/// The synchronous half of a probe GET's watchdog: if this fire still owns
+/// `id`'s route, give up on it and advance the walk. Returns whether it did.
+fn take_probe_timeout(id: ContractInstanceId, owner_vk: VerifyingKey, token: u64) -> bool {
+    if !claim_route_if_current(id, owner_vk, token) {
+        return false;
+    }
+    warn!(
+        "Backward-probe GET for {id} timed out after {}s — advancing past the legacy \
+         generation (its state is unknown)",
+        PROBE_GET_TIMEOUT.as_secs()
+    );
+    // The GET may still be in flight; see `ORPHANED_FIRES`.
+    *orphaned_fires().entry(id).or_insert(0) += 1;
+    if let Some(entry) = drivers().get_mut(&owner_vk) {
+        entry.driver.on_timeout(id);
+    }
+    true
 }
 
 /// Register `id` as the outstanding probe GET for `owner_vk`, send the GET, and
@@ -749,11 +873,16 @@ fn fire_probe_get(owner_vk: VerifyingKey, id: ContractInstanceId) {
     // `touch_subscribing_since` only refreshes the timestamp — it does not force
     // the status — so it no-ops harmlessly if the room is absent from SYNC_INFO
     // or has genuinely already reached `Subscribed`.
-    crate::util::defer(move || {
-        SYNC_INFO.with_mut(|sync_info| {
-            sync_info.touch_subscribing_since(&owner_vk);
+    if drivers()
+        .get(&owner_vk)
+        .is_some_and(ProbeEntry::holds_subscription)
+    {
+        crate::util::defer(move || {
+            SYNC_INFO.with_mut(|sync_info| {
+                sync_info.touch_subscribing_since(&owner_vk);
+            });
         });
-    });
+    }
 
     info!(
         "Backward probe for {:?}: GET legacy contract {}",
@@ -794,15 +923,7 @@ fn fire_probe_get(owner_vk: VerifyingKey, id: ContractInstanceId) {
     // per-fire epoch counter used to provide.
     safe_spawn_local(async move {
         sleep(PROBE_GET_TIMEOUT).await;
-        if claim_route_if_current(id, owner_vk, token) {
-            warn!(
-                "Backward-probe GET for {id} timed out after {}s — advancing past the \
-                 legacy generation (its state is unknown)",
-                PROBE_GET_TIMEOUT.as_secs()
-            );
-            // Silence, not absence: the walk moves on, but this generation's
-            // state stays unknown.
-            record_probe_answer(owner_vk, id, ProbeAnswer::Silent);
+        if take_probe_timeout(id, owner_vk, token) {
             // Box the recursive pump: `pump_probe` arms this watchdog, so an
             // un-boxed self-call would make the async fn's future infinitely
             // sized. The box breaks the type cycle.
@@ -848,7 +969,7 @@ mod tests {
     #[test]
     fn river_probe_ops_classifies_real_decodable_and_garbage() {
         let (sk, vk) = owner(1);
-        let ops = RiverProbeOps { owner_vk: vk };
+        let ops = RiverProbeOps::new(vk);
 
         let real = signed_state(&sk);
         assert!(
@@ -882,7 +1003,7 @@ mod tests {
         use river_core::room_state::upgrade::{AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1};
 
         let (sk, vk) = owner(2);
-        let ops = RiverProbeOps { owner_vk: vk };
+        let ops = RiverProbeOps::new(vk);
 
         let upgrade = UpgradeV1 {
             owner_member_id: MemberId::from(&vk),
@@ -907,7 +1028,7 @@ mod tests {
     #[test]
     fn river_probe_ops_merge_preserves_recovered_configuration() {
         let (sk, vk) = owner(3);
-        let ops = RiverProbeOps { owner_vk: vk };
+        let ops = RiverProbeOps::new(vk);
         let recovered = signed_state(&sk);
         let merged = ops.merge_with_local(recovered, &ChatRoomStateV1::default());
         assert!(
@@ -924,7 +1045,7 @@ mod tests {
     fn driver_adopts_newest_real_generation_with_river_ops() {
         let (sk, vk) = owner(4);
         let mut driver = ProbeDriver::new(
-            RiverProbeOps { owner_vk: vk },
+            RiverProbeOps::new(vk),
             ChatRoomStateV1::default(),
             NewestFirst::assume_ordered(vec![id(9), id(5)]),
             SelectionPolicy::NewestFirstWins,
@@ -954,7 +1075,7 @@ mod tests {
         let (sk, vk) = owner(5);
         let local = signed_state(&sk);
         let mut driver = ProbeDriver::new(
-            RiverProbeOps { owner_vk: vk },
+            RiverProbeOps::new(vk),
             local,
             NewestFirst::assume_ordered(vec![id(2), id(1)]),
             SelectionPolicy::NewestFirstWins,
@@ -986,7 +1107,7 @@ mod tests {
     fn driver_ignores_late_response_after_timeout_with_river_ops() {
         let (sk, vk) = owner(6);
         let mut driver = ProbeDriver::new(
-            RiverProbeOps { owner_vk: vk },
+            RiverProbeOps::new(vk),
             ChatRoomStateV1::default(),
             NewestFirst::assume_ordered(vec![id(2), id(1)]),
             SelectionPolicy::NewestFirstWins,
@@ -1055,25 +1176,18 @@ mod tests {
         // t2); its driver is live in PROBE_DRIVERS, sitting on `newest`. ---
         let t2 = next_fire_token();
         routes().insert(newest, (vk, t2));
-        let mut probe2 = ProbeDriver::new(
-            RiverProbeOps { owner_vk: vk },
+        let mut probe2 = ProbeEntry::new(
+            vk,
             ChatRoomStateV1::default(),
-            NewestFirst::assume_ordered(vec![newest, older]),
-            SelectionPolicy::NewestFirstWins,
+            vec![newest, older],
+            ProbePurpose::Recover,
         );
         assert_eq!(
-            probe2.next_action(),
+            probe2.driver.next_action(),
             Step::Get(newest),
             "probe 2 starts on its newest candidate"
         );
-        drivers().insert(
-            vk,
-            ProbeEntry {
-                driver: probe2,
-                unresolved: Vec::new(),
-                purpose: ProbePurpose::Recover,
-            },
-        );
+        drivers().insert(vk, probe2);
 
         // --- W1 fires LATE. Run the watchdog's EXACT gate: it advances
         // (on_timeout + pump) ONLY if `claim_route_if_current` returns true. ---
@@ -1186,63 +1300,67 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
+            rekey_merge_owed: None,
             invitation_secrets: std::collections::BTreeMap::new(),
         }
     }
 
-    /// Run a re-key merge walk to completion through the REAL adapter state
-    /// (the shared `PROBE_DRIVERS` entry and `record_probe_answer`, the same
-    /// calls the NotFound handler and the watchdog make), answering each GET
-    /// from `answers` in order. Returns what the merge would apply.
+    /// How one probe GET of the walk ends, in [`walk_rekey`].
+    enum Reply {
+        State(ChatRoomStateV1),
+        NotFound,
+        Silent,
+    }
+
+    /// Run a re-key merge walk to completion through the REAL adapter: the
+    /// shared `PROBE_DRIVERS` entry and route table, and the synchronous halves
+    /// of the response, `NotFound` and watchdog handlers (everything but the
+    /// network send and the pump's async tail). Returns what the merge would
+    /// apply.
     fn walk_rekey(
         owner_sk: &SigningKey,
         local: ChatRoomStateV1,
         candidates: Vec<ContractInstanceId>,
-        answers: Vec<Option<Result<ChatRoomStateV1, ProbeAnswer>>>,
+        replies: Vec<Reply>,
     ) -> RekeyFinish {
         let vk = owner_sk.verifying_key();
         let previous = *candidates.last().unwrap();
-        drivers().insert(
-            vk,
-            ProbeEntry {
-                driver: ProbeDriver::new(
-                    RiverProbeOps { owner_vk: vk },
-                    local,
-                    NewestFirst::assume_ordered(candidates.clone()),
-                    SelectionPolicy::NewestFirstWins,
-                ),
-                unresolved: Vec::new(),
-                purpose: ProbePurpose::RekeyMerge {
-                    previous,
-                    seed: true,
-                },
-            },
-        );
-        let mut answers = answers.into_iter();
+        let purpose = ProbePurpose::RekeyMerge {
+            previous,
+            seed: true,
+        };
+        drivers().insert(vk, ProbeEntry::new(vk, local, candidates.clone(), purpose));
+        let mut replies = replies.into_iter();
         loop {
             let step = drivers().get_mut(&vk).unwrap().driver.next_action();
-            match step {
-                Step::Get(id) => match answers.next().expect("an answer per GET") {
-                    Some(Ok(state)) => drivers()
-                        .get_mut(&vk)
-                        .unwrap()
-                        .driver
-                        .on_response(id, &encode(&state)),
-                    Some(Err(answer)) => record_probe_answer(vk, id, answer),
-                    None => panic!("walk asked for {id}, which the test did not expect"),
-                },
-                Step::Done => break,
-            }
+            let Step::Get(id) = step else { break };
+            let token = next_fire_token();
+            routes().insert(id, (vk, token));
+            let owner = match replies.next().expect("a reply per GET") {
+                Reply::State(state) => take_probe_response(id, &encode(&state)),
+                Reply::NotFound => take_probe_absent(id),
+                Reply::Silent => take_probe_timeout(id, vk, token).then_some(vk),
+            };
+            assert_eq!(owner, Some(vk), "each reply claims its probe's route");
         }
         let mut entry = drivers().remove(&vk).unwrap();
-        assert_eq!(
-            entry.purpose,
-            ProbePurpose::RekeyMerge {
-                previous,
-                seed: true
-            }
-        );
-        plan_rekey_finish(entry.driver.take_outcome().unwrap(), &entry.unresolved)
+        assert_eq!(entry.purpose, purpose);
+        // Late replies to the GETs the watchdog abandoned would arrive after
+        // the walk; consume this walk's (only) so no other test sees them.
+        for id in &candidates {
+            while take_orphaned_fire(id) {}
+        }
+        plan_rekey_finish(
+            entry.driver.take_outcome().unwrap(),
+            entry.hits.contains(&previous),
+            entry.fold_failed.load(Ordering::Relaxed),
+        )
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> = v.iter().map(|s| s.to_string()).collect();
+        out.sort();
+        out
     }
 
     /// Only the generations from the newest legacy one down to the one the
@@ -1263,7 +1381,7 @@ mod tests {
 
     /// The rehearsal's failure: 16 messages on the old key, 10 in this
     /// device's snapshot. Every one of the 16 must reach the state the seed PUT
-    /// carries, and the walk counts as finished.
+    /// carries, and the merge counts as finished.
     #[test]
     fn rekey_merge_brings_over_messages_only_on_the_old_key() {
         let sk = SigningKey::from_bytes(&[81u8; 32]);
@@ -1277,9 +1395,9 @@ mod tests {
             &sk,
             local_state.clone(),
             vec![id(81)],
-            vec![Some(Ok(room_with_messages(&sk, &old_refs)))],
+            vec![Reply::State(room_with_messages(&sk, &old_refs))],
         );
-        assert!(finish.complete, "the old key answered: the merge is done");
+        assert!(finish.complete, "the old key returned the room: done");
         let recovered = finish.recovered.expect("the old key's state is merged");
 
         let mut room = room_data(&sk, local_state);
@@ -1309,59 +1427,43 @@ mod tests {
             old,
             sk.verifying_key()
         ));
-        let mut expected: Vec<String> = ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m20"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        expected.sort();
-        assert_eq!(texts(&room.room_state), expected);
+        assert_eq!(
+            texts(&room.room_state),
+            strs(&["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m20"])
+        );
     }
 
-    /// The old key never answers: nothing is merged, the local state is left
-    /// as it is (it seeds the new key on its own), and the walk is NOT finished,
-    /// so the marker stays for the next load. A typed NotFound, by contrast, is
-    /// an answer.
+    /// The owed old key does not return the room, whether it stays silent or
+    /// answers `NotFound`: nothing is merged, the local state seeds on its own,
+    /// and the merge is NOT finished, so the marker stays for the next load.
+    /// The device synced the room under that key, so neither answer can mean
+    /// it is empty; a `NotFound` on Freenet is routinely a dead-end.
     #[test]
-    fn rekey_merge_with_an_unreachable_old_key_keeps_local_and_retries() {
+    fn rekey_merge_without_the_old_keys_state_keeps_local_and_retries() {
         let sk = SigningKey::from_bytes(&[83u8; 32]);
         let local = room_with_messages(&sk, &["m1", "m2"]);
-
-        let silent = walk_rekey(
-            &sk,
-            local.clone(),
-            vec![id(83)],
-            vec![Some(Err(ProbeAnswer::Silent))],
-        );
-        assert!(
-            silent.recovered.is_none(),
-            "no state arrived, none is merged"
-        );
-        assert!(
-            !silent.complete,
-            "silence is not absence: the merge must be retried, so the marker stays"
-        );
-
-        let absent = walk_rekey(
-            &sk,
-            local,
-            vec![id(84)],
-            vec![Some(Err(ProbeAnswer::Absent))],
-        );
-        assert!(absent.recovered.is_none());
-        assert!(
-            absent.complete,
-            "a NotFound answered: the old key holds nothing more"
-        );
+        for (n, reply) in [(83u8, Reply::Silent), (84, Reply::NotFound)] {
+            let finish = walk_rekey(&sk, local.clone(), vec![id(n)], vec![reply]);
+            assert!(
+                finish.recovered.is_none(),
+                "no state arrived, none is merged"
+            );
+            assert!(
+                !finish.complete,
+                "the owed key never returned the room: the marker must stay"
+            );
+        }
     }
 
-    /// A device that skipped releases: the two newer generations it never ran
-    /// answer NotFound, and the one it last synced under holds the messages.
+    /// A device that skipped releases, where the newer generations hold state
+    /// too (members who upgraded earlier seeded them). Every generation down
+    /// to the one this device last synced under is folded in, so messages only
+    /// that one holds are not shadowed by a newer generation that has state.
     #[test]
-    fn rekey_merge_walks_down_skipped_generations() {
+    fn rekey_merge_folds_every_generation_down_to_the_owed_one() {
         let sk = SigningKey::from_bytes(&[85u8; 32]);
         let local = room_with_messages(&sk, &["m1"]);
-        let legacy = vec![id(90), id(89), id(88), id(87)];
-        let candidates = rekey_candidates(&legacy, id(88));
+        let candidates = rekey_candidates(&[id(90), id(89), id(88), id(87)], id(88));
         assert_eq!(candidates, vec![id(90), id(89), id(88)]);
 
         let finish = walk_rekey(
@@ -1369,34 +1471,98 @@ mod tests {
             local.clone(),
             candidates.clone(),
             vec![
-                Some(Err(ProbeAnswer::Absent)),
-                Some(Err(ProbeAnswer::Absent)),
-                Some(Ok(room_with_messages(&sk, &["m1", "m2", "m3"]))),
+                Reply::State(room_with_messages(&sk, &["m1", "m2"])),
+                Reply::NotFound,
+                Reply::State(room_with_messages(&sk, &["m1", "m3", "m4"])),
             ],
         );
-        assert!(finish.complete);
+        assert!(finish.complete, "the owed generation returned the room");
         assert_eq!(
-            texts(&finish.recovered.expect("the device's own generation hit")),
-            vec!["m1", "m2", "m3"]
+            texts(&finish.recovered.expect("state was found")),
+            strs(&["m1", "m2", "m3", "m4"]),
+            "the newest generation's state did not shadow the owed one's"
         );
 
-        // The newest generation never answered: what was found is merged
-        // (a merge cannot lose anything), but the walk is not finished.
+        // The owed generation never answered: what the newer ones had is still
+        // merged (a merge cannot lose anything), but the merge stays open.
         let finish = walk_rekey(
             &sk,
             local,
             candidates,
             vec![
-                Some(Err(ProbeAnswer::Silent)),
-                Some(Err(ProbeAnswer::Absent)),
-                Some(Ok(room_with_messages(&sk, &["m1", "m2", "m3"]))),
+                Reply::State(room_with_messages(&sk, &["m1", "m2"])),
+                Reply::Silent,
+                Reply::Silent,
             ],
         );
-        assert!(finish.recovered.is_some());
-        assert!(
-            !finish.complete,
-            "a newer generation that never answered keeps the merge open"
+        assert_eq!(
+            texts(&finish.recovered.expect("the newest generation's state")),
+            strs(&["m1", "m2"])
         );
+        assert!(!finish.complete);
+    }
+
+    /// A `NotFound` carries no fire token. One arriving for a legacy id whose
+    /// earlier GET the watchdog abandoned may be that abandoned fire's answer,
+    /// so it must not advance a later probe that re-registered the id; that
+    /// probe falls back to its own watchdog. A `NotFound` with no orphan
+    /// outstanding advances as normal.
+    #[test]
+    fn a_not_found_that_may_answer_an_abandoned_fire_is_not_trusted() {
+        let sk = SigningKey::from_bytes(&[87u8; 32]);
+        let vk = sk.verifying_key();
+        let gen = id(110);
+        let t1 = next_fire_token();
+        routes().insert(gen, (vk, t1));
+        drivers().insert(
+            vk,
+            ProbeEntry::new(
+                vk,
+                ChatRoomStateV1::default(),
+                vec![gen],
+                ProbePurpose::Recover,
+            ),
+        );
+        assert_eq!(
+            drivers().get_mut(&vk).unwrap().driver.next_action(),
+            Step::Get(gen)
+        );
+        // Fire 1 times out: the GET may still be in flight.
+        assert!(take_probe_timeout(gen, vk, t1));
+        drivers().remove(&vk);
+
+        // A later probe re-fires the same id.
+        let t2 = next_fire_token();
+        routes().insert(gen, (vk, t2));
+        drivers().insert(
+            vk,
+            ProbeEntry::new(
+                vk,
+                ChatRoomStateV1::default(),
+                vec![gen],
+                ProbePurpose::Recover,
+            ),
+        );
+        assert_eq!(
+            drivers().get_mut(&vk).unwrap().driver.next_action(),
+            Step::Get(gen)
+        );
+
+        // The first NotFound may be fire 1's: ignored, the route survives.
+        assert_eq!(take_probe_absent(gen), None);
+        assert_eq!(routes().get(&gen), Some(&(vk, t2)));
+        assert_eq!(
+            drivers().get_mut(&vk).unwrap().driver.next_action(),
+            Step::Get(gen)
+        );
+        // The next one is fire 2's: it advances the walk.
+        assert_eq!(take_probe_absent(gen), Some(vk));
+        assert!(routes().get(&gen).is_none());
+        assert_eq!(
+            drivers().get_mut(&vk).unwrap().driver.next_action(),
+            Step::Done
+        );
+        drivers().remove(&vk);
     }
 
     /// A walk already running in the background for an owner is told to seed
@@ -1406,34 +1572,33 @@ mod tests {
     fn an_empty_current_key_makes_a_background_merge_seed() {
         let sk = SigningKey::from_bytes(&[86u8; 32]);
         let vk = sk.verifying_key();
-        drivers().insert(
+        let background = ProbeEntry::new(
             vk,
-            ProbeEntry {
-                driver: ProbeDriver::new(
-                    RiverProbeOps { owner_vk: vk },
-                    ChatRoomStateV1::default(),
-                    NewestFirst::assume_ordered(vec![id(86)]),
-                    SelectionPolicy::NewestFirstWins,
-                ),
-                unresolved: Vec::new(),
-                purpose: ProbePurpose::RekeyMerge {
-                    previous: id(86),
-                    seed: false,
-                },
+            ChatRoomStateV1::default(),
+            vec![id(86)],
+            ProbePurpose::RekeyMerge {
+                previous: id(86),
+                seed: false,
             },
         );
+        assert!(
+            !background.holds_subscription(),
+            "a background merge must not stretch the room's own subscribe timeout"
+        );
+        drivers().insert(vk, background);
         assert!(futures::executor::block_on(start_backward_probe(
             vk,
             ChatRoomStateV1::default()
         )));
+        let entry = drivers().remove(&vk).unwrap();
         assert_eq!(
-            drivers().get(&vk).unwrap().purpose,
+            entry.purpose,
             ProbePurpose::RekeyMerge {
                 previous: id(86),
                 seed: true
             }
         );
-        drivers().remove(&vk);
+        assert!(entry.holds_subscription(), "a seeding merge holds the room");
     }
 
     /// freenet/river#769 wiring, source pin: `finish_rekey_merge` acts on the
@@ -1457,7 +1622,7 @@ mod tests {
         let body = &body[..body.find("fnfire_probe_get(").expect("next fn")];
         assert!(
             body.contains(
-                "ifmerged&&complete&&room_data.previous_contract_key.is_some_and(|k|*k.id()==previous){room_data.previous_contract_key=None;}"
+                "ifmerged&&complete&&room_data.rekey_merge_owed.is_some_and(|k|*k.id()==previous){room_data.rekey_merge_owed=None;}"
             ),
             "clear the marker only after a merge that landed and a complete walk"
         );
