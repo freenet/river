@@ -3615,6 +3615,42 @@ mod tests {
         );
     }
 
+    /// #768 round 2 item 3: a concurrent tab's identity provenance for a room
+    /// THIS tab does not represent survives this tab's `rooms_meta` save; for a
+    /// room this tab does represent, its own view wins (including "no entry").
+    #[test]
+    fn reconcile_meta_keeps_another_tabs_identity_sources() {
+        let mine = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+        let theirs = SigningKey::from_bytes(&[2u8; 32]).verifying_key();
+        let stale = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let remote = RoomsMeta {
+            identity_sources: vec![(theirs, [9u8; 32]), (stale, [8u8; 32])],
+            ..Default::default()
+        };
+        let mut rb = Vec::new();
+        ciborium::ser::into_writer(&remote, &mut rb).unwrap();
+        let local = RoomsMeta {
+            identity_sources: vec![(mine, [7u8; 32])],
+            ..Default::default()
+        };
+        // This tab holds `mine` and `stale` (the latter at a current or chosen
+        // rank, so no entry), not `theirs`.
+        let represents = std::collections::HashSet::from([mine, stale]);
+        let out = reconcile_meta(Some(&rb), &local, &represents)
+            .unwrap()
+            .unwrap();
+        let merged: RoomsMeta = ciborium::from_reader(out.as_slice()).unwrap();
+        assert!(merged.identity_sources.contains(&(mine, [7u8; 32])));
+        assert!(
+            merged.identity_sources.contains(&(theirs, [9u8; 32])),
+            "another tab's provenance for a room this tab does not hold is kept"
+        );
+        assert!(
+            !merged.identity_sources.iter().any(|(v, _)| *v == stale),
+            "for a room this tab holds, its own view wins"
+        );
+    }
+
     /// `reconcile_meta`: this tab's prefs win, but a remote notification-mode
     /// for a room we don't track is absorbed (not lost on a concurrent write).
     #[test]
@@ -3635,7 +3671,7 @@ mod tests {
         let mut rb = Vec::new();
         ciborium::ser::into_writer(&remote, &mut rb).unwrap();
 
-        let out = reconcile_meta(Some(&rb), &local)
+        let out = reconcile_meta(Some(&rb), &local, &Default::default())
             .unwrap()
             .expect("stores merged meta");
         let merged: RoomsMeta = ciborium::from_reader(out.as_slice()).unwrap();
@@ -7990,13 +8026,31 @@ fn reconcile_room_tombstone(current: Option<&[u8]>) -> Result<Option<Vec<u8>>, S
 /// Reconcile the `rooms_meta` save: this tab's view-prefs are authoritative;
 /// absorb notification prefs the delegate has for rooms we don't track so a
 /// concurrent tab's setting isn't lost.
-fn reconcile_meta(current: Option<&[u8]>, local: &RoomsMeta) -> Result<Option<Vec<u8>>, String> {
+///
+/// Identity sources (#768 review B3) likewise: this tab speaks for the rooms
+/// it `represents` (present or tombstoned in its own `Rooms`); for any other
+/// room the stored entry is kept, so a concurrent tab that just migrated a room
+/// this tab never loaded does not lose that room's identity provenance
+/// (#768 round 2 item 3).
+fn reconcile_meta(
+    current: Option<&[u8]>,
+    local: &RoomsMeta,
+    represents: &std::collections::HashSet<VerifyingKey>,
+) -> Result<Option<Vec<u8>>, String> {
     let mut merged = local.clone();
     if let Some(bytes) = current {
         if let Ok(remote) = ciborium::from_reader::<RoomsMeta, _>(bytes) {
             for (vk, mode) in remote.notification_modes {
                 merged.notification_modes.entry(vk).or_insert(mode);
             }
+            for (vk, source) in remote.identity_sources {
+                if !represents.contains(&vk)
+                    && !merged.identity_sources.iter().any(|(v, _)| *v == vk)
+                {
+                    merged.identity_sources.push((vk, source));
+                }
+            }
+            merged.identity_sources.sort_by_key(|(vk, _)| vk.to_bytes());
         }
     }
     let mut out = Vec::new();
@@ -8133,8 +8187,14 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
         Ok(()) => {
             let mh = content_hash(&meta_buf);
             if META_SLOT_HASH.with(|c| *c.borrow()) != Some(mh) {
+                let represents: std::collections::HashSet<VerifyingKey> = rooms
+                    .map
+                    .keys()
+                    .chain(rooms.removed_rooms.iter())
+                    .copied()
+                    .collect();
                 match cas_write_delegate_key(ROOMS_META_KEY.to_vec(), move |current| {
-                    reconcile_meta(current, &meta)
+                    reconcile_meta(current, &meta, &represents)
                 })
                 .await
                 {
