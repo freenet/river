@@ -1278,38 +1278,115 @@ mod tests {
     /// gate let the walk through, before the walk itself.
     #[test]
     fn start_journal_load_acts_only_on_the_load_plan() {
-        let src = include_str!("migration_journal.rs");
+        // Brace-scoped (#768 round 4): each call must sit INSIDE the block of
+        // the condition that guards it, not merely after it in the text.
+        // Comments are stripped and string literals skipped when matching
+        // braces, so neither can satisfy or confuse the pin.
+        let src = crate::util::strip_comments(include_str!("migration_journal.rs"));
+        let src = src.as_str();
         let start = src
             .find("pub(crate) fn start_journal_load()")
             .expect("start_journal_load");
-        let end = start
-            + src[start..]
-                .find("\n}\n")
-                .expect("end of start_journal_load");
-        let body = &src[start..end];
+        let body = block(src, start);
         assert!(
             body.contains("let plan = load_plan("),
             "the decision goes through load_plan"
         );
-        let walk_if = body
-            .find("if plan.walk {")
-            .expect("walk only under plan.walk");
-        let poke = body.find("poke_walk();").expect("poke_walk");
-        assert!(walk_if < poke && body.matches("poke_walk();").count() == 1);
+        let walk_block = block(body, body.find("if plan.walk {").expect("plan.walk"));
+        assert!(walk_block.contains("poke_walk();"));
+        assert!(walk_block.contains("RESET_CADENCE_ON_WALK.store(plan.reset_cadence_on_walk"));
+        assert_eq!(
+            body.matches("poke_walk();").count(),
+            1,
+            "poke_walk only under plan.walk"
+        );
+        let topup_block = block(
+            body,
+            body.find("} else if plan.topup {").expect("plan.topup") + 2,
+        );
+        assert!(topup_block.contains("poke_topup();"));
+        assert_eq!(body.matches("poke_topup();").count(), 1);
         assert!(
-            !body.contains("store_walk_cadence(&channel, &successor, 0, &[])"),
+            !body.contains("store_walk_cadence(&channel, &successor, 0)"),
             "the cadence reset must not be written before the walk runs"
         );
-        let run = src
-            .find("async fn run_work_locked(")
-            .expect("run_work_locked");
-        let run_body = &src[run..];
-        let gate = run_body.find("if !work.walk {").expect("walk gate");
-        let reset = run_body
+        // In the driver: the reset happens at the function's own level, after
+        // the early return of a run without a walk, and before the walk.
+        let run = block(
+            src,
+            src.find("async fn run_work_locked(")
+                .expect("run_work_locked"),
+        );
+        let gate_at = run.find("if !work.walk {").expect("walk gate");
+        let gate = block(run, gate_at);
+        assert!(gate.contains("return;"));
+        let reset = run
             .find("RESET_CADENCE_ON_WALK.swap(false")
             .expect("reset at walk time");
-        let walk = run_body.find("walk_with(").expect("walk");
-        assert!(gate < reset && reset < walk);
+        let walk = run.find("walk_with(").expect("walk");
+        assert!(gate_at + gate.len() < reset && reset < walk);
+        assert_eq!(
+            depth_at(run, reset),
+            1,
+            "the reset is not inside another block"
+        );
+    }
+
+    /// The `{ ... }` block opened by the first `{` at or after `from`, string
+    /// literals skipped.
+    fn block(src: &str, from: usize) -> &str {
+        let open = from + src[from..].find('{').expect("a block");
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        for (i, c) in src[open..].char_indices() {
+            if in_str {
+                match (escaped, c) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated block");
+    }
+
+    /// Brace depth at `pos` inside `block_src` (1 = the block's own level).
+    fn depth_at(block_src: &str, pos: usize) -> i32 {
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        for c in block_src[..pos].chars() {
+            if in_str {
+                match (escaped, c) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        depth
     }
 
     /// freenet/river#595: never walk over a room set that failed to load.

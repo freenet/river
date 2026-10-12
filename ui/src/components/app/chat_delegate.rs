@@ -1138,6 +1138,11 @@ pub(crate) fn on_current_delegate_missing() {
 /// key, so it is recognised by the delegate's [`LIST_REFUSED_MARKER`], and only
 /// while this attempt's listing is outstanding: the listing is the first
 /// request of a load, and predecessors are not listed before it is answered.
+///
+/// The error carries no delegate key, so this attribution is by timing only.
+/// Once this build's delegate is itself a predecessor, a refusal it returns
+/// inside the NEXT build's listing window would read as that build's own
+/// listing failing: the load shows Retry, and nothing is lost.
 pub(crate) fn is_current_list_refusal(err_text: &str, list_outstanding: bool) -> bool {
     list_outstanding && err_text.contains(river_core::chat_delegate::LIST_REFUSED_MARKER)
 }

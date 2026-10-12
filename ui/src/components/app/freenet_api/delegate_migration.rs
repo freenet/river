@@ -2131,11 +2131,10 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     lineage: &[DelegateLineageEntry],
 ) -> (JournaledMigrationReport, S) {
     let mut reader = RiverPredecessorIo::new(channel);
-    // Unreadable: refuse short indexes the slow way this walk (cost only).
-    let refused = read_short_index_record(channel, &successor)
-        .await
-        .unwrap_or_default();
-    reader.short_index_refused = refused.clone();
+    // Unreadable: refuse short indexes the slow way this walk (cost only), and
+    // write no record back (it would replace other predecessors' digests).
+    let refused = read_short_index_record(channel, &successor).await.ok();
+    reader.short_index_refused = refused.clone().unwrap_or_default();
     reader.prewarm(lineage).await;
     let mut writer = RiverSuccessorIo::new(channel, seam, successor.clone()).with_lineage(lineage);
     let report = migrate_delegate_secrets_journaled(
@@ -2166,9 +2165,11 @@ async fn salvage_short_index_rooms<C: RiverDelegateChannel, S: RiverImportSeam>(
     seam: &mut S,
     successor: &DelegateKey,
     lineage: &[DelegateLineageEntry],
-    mut record: ShortIndexRecord,
+    record: Option<ShortIndexRecord>,
     salvage: Vec<(DelegateKey, [u8; 32], Vec<SecretPair>)>,
 ) {
+    let readable = record.is_some();
+    let mut record = record.unwrap_or_default();
     let before = record.len();
     for (pred, digest, pairs) in salvage {
         let Some(entry) = lineage
@@ -2195,7 +2196,9 @@ async fn salvage_short_index_rooms<C: RiverDelegateChannel, S: RiverImportSeam>(
             record.push((entry.delegate_key, digest));
         }
     }
-    if record.len() != before || !record.is_empty() {
+    if !readable {
+        warn!("short-index salvage: the stored record was unreadable; not replacing it");
+    } else if record.len() != before || !record.is_empty() {
         if let Err(e) = store_short_index_record(channel, successor, &record).await {
             warn!("short-index salvage: could not record the refusal ({e})");
         }
@@ -5441,6 +5444,51 @@ mod tests {
         assert!(
             seam.dm_merges[0].hidden_threads.is_empty(),
             "hidden threads are never re-merged by the top-up"
+        );
+    }
+
+    /// #768 round 4 nit: when the stored short-index record cannot be read,
+    /// a salvage does not write one back over it (other predecessors' digests
+    /// would be lost).
+    #[test]
+    fn an_unreadable_short_index_record_is_not_overwritten() {
+        let (a, b) = (vk(1), vk(2));
+        let slot = |r, seed| cbor(&RoomSlot::Present(Box::new(room_with_identity(r, seed))));
+        let mut gen0 = DelegateSim::default();
+        gen0.store
+            .insert(chat_delegate::room_storage_key(&a), slot(a, 3));
+        gen0.store
+            .insert(chat_delegate::room_storage_key(&b), slot(b, 4));
+        gen0.store.insert(
+            ROOMS_META_KEY.to_vec(),
+            cbor(&RoomsMeta {
+                room_order: vec![b, a],
+                ..Default::default()
+            }),
+        );
+        gen0.listed = Some(vec![
+            chat_delegate::room_storage_key(&b),
+            ROOMS_META_KEY.to_vec(),
+        ]);
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), gen0)
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), DelegateSim::default())
+            .with_delegate(&successor_key(), {
+                let mut succ = DelegateSim::default();
+                succ.silent_get_keys = vec![SHORT_INDEX_KEY.to_vec()];
+                succ
+            });
+        let prior: ShortIndexRecord = vec![([9u8; 32], [8u8; 32])];
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&prior, &mut bytes).unwrap();
+        channel.put(&successor_key(), SHORT_INDEX_KEY, &bytes);
+        let (_, seam) = walk(&channel, MemorySeam::new());
+        assert!(seam.rooms.map.contains_key(&a), "the salvage still runs");
+        assert_eq!(
+            channel.stored(&successor_key(), SHORT_INDEX_KEY),
+            Some(bytes),
+            "the unreadable record must not be replaced"
         );
     }
 
