@@ -1,5 +1,6 @@
 use crate::components::app::freenet_api::backward_probe::{
-    deliver_probe_response, start_backward_probe,
+    deliver_probe_absent, deliver_probe_response, start_backward_probe, start_rekey_merge,
+    RekeyStart,
 };
 use crate::components::app::freenet_api::error::SynchronizerError;
 use crate::components::app::freenet_api::response_handler::update_notification::{
@@ -1310,7 +1311,7 @@ pub(crate) fn local_state_ahead(
 /// `needs_seed_put`; resetting it to `Disconnected` and running `ProcessRooms`
 /// now sends that PUT through the one path that owns it, instead of waiting
 /// for the subscription timeout.
-fn request_seed_put(owner_vk: ed25519_dalek::VerifyingKey) {
+pub(crate) fn request_seed_put(owner_vk: ed25519_dalek::VerifyingKey) {
     info!(
         "Room {:?} not found on the network — re-seeding it with a PUT",
         MemberId::from(owner_vk)
@@ -1332,26 +1333,93 @@ fn request_seed_put(owner_vk: ed25519_dalek::VerifyingKey) {
 /// A GET came back `NotFound`: no peer holds the contract
 /// (freenet/river#757).
 ///
-/// Only a room whose code-free subscribe GET is outstanding acts on it, by
-/// re-seeding with a PUT. Every other GET (a pending invitation, an imported
-/// room, a refresh, a backward-probe hop) keeps its existing behaviour, which
-/// was to ignore a `NotFound` and let its own timeout handle it.
+/// * A backward-probe hop: the legacy generation answered that it holds
+///   nothing, so the walk advances now instead of after its watchdog.
+/// * A room whose code-free subscribe GET is outstanding re-seeds with a PUT.
+///   If the room still owes a re-key merge (`previous_contract_key` is set,
+///   freenet/river#769), the older keys are merged in first, so the seed is
+///   not just this device's snapshot.
+/// * An imported room still holding its placeholder probes the older
+///   generations (freenet/river#292), as an empty `GetResponse` already did:
+///   a room imported after a re-key may live only under an older key.
+///
+/// Every other GET (a pending invitation, a refresh) keeps its existing
+/// behaviour, which is to ignore a `NotFound` and let its own timeout handle
+/// it.
 pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
     if crate::components::app::freenet_api::backward_probe::is_probe_instance(&instance_id) {
         info!("NotFound for backward-probe contract {}", instance_id);
+        deliver_probe_absent(instance_id).await;
         return;
     }
     let Some(owner_vk) = SYNC_INFO.read().get_owner_vk_for_instance_id(&instance_id) else {
         info!("NotFound for unrecognised contract {}", instance_id);
         return;
     };
-    if SYNC_INFO.with_mut(|sync_info| sync_info.subscribe_get_found_nothing(&owner_vk)) {
-        request_seed_put(owner_vk);
-    } else {
-        info!(
+    let room = ROOMS.read().map.get(&owner_vk).map(|rd| {
+        (
+            rd.room_state.clone(),
+            rd.previous_contract_key.map(|k| *k.id()),
+            rd.is_awaiting_initial_sync(),
+        )
+    });
+    let answers_subscribe_get =
+        SYNC_INFO.with_mut(|sync_info| sync_info.subscribe_get_found_nothing(&owner_vk));
+    let (snapshot, owed_merge, placeholder) = match room {
+        Some((state, owed, placeholder)) => (state, owed, placeholder),
+        None => (ChatRoomStateV1::default(), None, false),
+    };
+    match not_found_action(answers_subscribe_get, owed_merge, placeholder) {
+        NotFoundAction::MergeThenSeed(previous) => {
+            // The merge seeds the room once it has folded the older keys in.
+            // If it already ran on this load, seed what we hold.
+            if start_rekey_merge(owner_vk, previous, snapshot, true).await
+                == RekeyStart::AlreadyAttempted
+            {
+                request_seed_put(owner_vk);
+            }
+        }
+        NotFoundAction::Seed => request_seed_put(owner_vk),
+        NotFoundAction::ProbePlaceholder => {
+            info!(
+                "NotFound for imported room {:?} — probing older room-contract generations",
+                MemberId::from(owner_vk)
+            );
+            start_backward_probe(owner_vk, snapshot).await;
+        }
+        NotFoundAction::Ignore => info!(
             "NotFound for room {:?} with no subscribe GET outstanding — ignoring",
             MemberId::from(owner_vk)
-        );
+        ),
+    }
+}
+
+/// What a `NotFound` for a room's current key leads to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NotFoundAction {
+    /// The answered subscribe GET's room still owes a re-key merge from this
+    /// older generation: merge it in, then seed (freenet/river#769).
+    MergeThenSeed(ContractInstanceId),
+    /// The answered subscribe GET's room owes nothing: seed it with what this
+    /// device holds (freenet/river#757).
+    Seed,
+    /// An imported room still holding its placeholder: probe the older
+    /// generations, where it may be all there is (freenet/river#292).
+    ProbePlaceholder,
+    /// Any other GET: its own timeout handles it.
+    Ignore,
+}
+
+pub(crate) fn not_found_action(
+    answers_subscribe_get: bool,
+    owed_merge: Option<ContractInstanceId>,
+    placeholder: bool,
+) -> NotFoundAction {
+    match (answers_subscribe_get, owed_merge, placeholder) {
+        (true, Some(previous), _) => NotFoundAction::MergeThenSeed(previous),
+        (true, None, _) => NotFoundAction::Seed,
+        (false, _, true) => NotFoundAction::ProbePlaceholder,
+        (false, _, false) => NotFoundAction::Ignore,
     }
 }
 
@@ -1377,31 +1445,7 @@ pub(crate) async fn adopt_recovered_probe_state(
     crate::util::defer(move || {
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
-                let params = ChatRoomParametersV1 { owner: owner_vk };
-                if room_data.is_awaiting_initial_sync() {
-                    room_data.room_state = rooms_state;
-                    room_data.capture_self_membership_data(&params);
-                    let _ = room_data.repopulate_secrets_from_state();
-                } else {
-                    let current_state = room_data.room_state.clone();
-                    match room_data
-                        .room_state
-                        .merge(&current_state, &params, &rooms_state)
-                    {
-                        Ok(_) => {
-                            room_data.capture_self_membership_data(&params);
-                            let _ = room_data.repopulate_secrets_from_state();
-                        }
-                        Err(e) => {
-                            error!(
-                                "Backward probe: failed to merge recovered state \
-                                 for room {:?}: {}",
-                                MemberId::from(owner_vk),
-                                e
-                            );
-                        }
-                    }
-                }
+                merge_recovered_into_room(room_data, rooms_state, owner_vk);
             } else {
                 warn!(
                     "Backward probe recovered state for room {:?} but it is no \
@@ -1427,6 +1471,37 @@ pub(crate) async fn adopt_recovered_probe_state(
         mark_initial_sync_complete(&owner_vk);
     });
     crate::components::app::mark_needs_sync(owner_vk);
+}
+
+/// Fold older-generation state recovered by a probe into `room_data`. A
+/// placeholder (an imported room not yet synced) is replaced wholesale, because
+/// its `owner_member_id` differs and `merge` would reject it; anything else is
+/// CRDT-merged, never replaced. Returns whether the state landed.
+pub(crate) fn merge_recovered_into_room(
+    room_data: &mut RoomData,
+    recovered: ChatRoomStateV1,
+    owner_vk: ed25519_dalek::VerifyingKey,
+) -> bool {
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+    if room_data.is_awaiting_initial_sync() {
+        room_data.room_state = recovered;
+    } else {
+        let current_state = room_data.room_state.clone();
+        if let Err(e) = room_data
+            .room_state
+            .merge(&current_state, &params, &recovered)
+        {
+            error!(
+                "Backward probe: failed to merge recovered state for room {:?}: {}",
+                MemberId::from(owner_vk),
+                e
+            );
+            return false;
+        }
+    }
+    room_data.capture_self_membership_data(&params);
+    let _ = room_data.repopulate_secrets_from_state();
+    true
 }
 
 /// Seed the CURRENT contract key with the device's local snapshot as the
@@ -2523,6 +2598,34 @@ mod tests {
         );
     }
 
+    /// What a `NotFound` for a room's current key does (freenet/river#757,
+    /// #769, #292). An answered subscribe GET always ends in a seed: through
+    /// the re-key merge when one is owed, directly otherwise (an unchanged
+    /// hash, a first load, a new device). Anything else is left to its own
+    /// timeout, except an imported placeholder, which probes the older keys.
+    #[test]
+    fn not_found_action_covers_every_case() {
+        let prev = ContractInstanceId::new([7u8; 32]);
+        assert_eq!(
+            not_found_action(true, Some(prev), false),
+            NotFoundAction::MergeThenSeed(prev)
+        );
+        assert_eq!(not_found_action(true, None, false), NotFoundAction::Seed);
+        assert_eq!(
+            not_found_action(false, None, true),
+            NotFoundAction::ProbePlaceholder
+        );
+        assert_eq!(
+            not_found_action(false, Some(prev), true),
+            NotFoundAction::ProbePlaceholder
+        );
+        assert_eq!(
+            not_found_action(false, Some(prev), false),
+            NotFoundAction::Ignore
+        );
+        assert_eq!(not_found_action(false, None, false), NotFoundAction::Ignore);
+    }
+
     /// freenet/river#757 safety net, source pin: a `NotFound` for a room whose
     /// code-free subscribe GET is outstanding must re-seed it with a PUT. The
     /// state machine is unit-tested in `sync_info.rs`; this pins the wiring
@@ -2556,10 +2659,21 @@ mod tests {
         );
         assert!(
             not_found.contains(
-                "ifSYNC_INFO.with_mut(|sync_info|sync_info.subscribe_get_found_nothing(&owner_vk)){request_seed_put(owner_vk);"
-            ),
+                "letanswers_subscribe_get=SYNC_INFO.with_mut(|sync_info|sync_info.subscribe_get_found_nothing(&owner_vk));"
+            ) && not_found.contains(
+                "matchnot_found_action(answers_subscribe_get,owed_merge,placeholder){"
+            ) && not_found.contains("NotFoundAction::Seed=>request_seed_put(owner_vk),"),
             "handle_get_not_found must request the seed PUT exactly when the \
              NotFound answers an outstanding subscribe GET"
+        );
+        // freenet/river#769: a room that still owes a re-key merge folds the
+        // older keys in before that seed, and seeds anyway if the merge already
+        // ran on this load.
+        assert!(
+            not_found.contains(
+                "NotFoundAction::MergeThenSeed(previous)=>{ifstart_rekey_merge(owner_vk,previous,snapshot,true).await==RekeyStart::AlreadyAttempted{request_seed_put(owner_vk);}}"
+            ),
+            "a NotFound for a room owing a re-key merge must merge, then seed"
         );
 
         let reseed = between("fnrequest_seed_put(", "pubasyncfnhandle_get_not_found(");

@@ -6604,17 +6604,17 @@ mod tests {
                 "ui/src/components/app/freenet_api/response_handler/get_response.rs",
                 // re-accept refresh (freenet/river#367) + pending-invite branch
                 // + existing-room (replace) + existing-room (merge)
-                // + backward-probe handler (replace) + backward-probe handler (merge).
+                // + `merge_recovered_into_room`.
                 // The #367 path is the structural re-accept backstop: when a GET
                 // for a pending invite arrives for a room the user is ALREADY in
                 // under their held self_sk, the handler short-circuits to a no-op
                 // refresh (merge + repopulate secrets) instead of a duplicate join.
-                // The last two are the freenet/river#292 recovery path: when a
-                // backward probe recovers stranded state from a legacy contract
-                // generation, the recovered state is adopted into RoomData and
-                // its private-room secrets must be repopulated, exactly like the
-                // normal existing-room GET path.
-                6,
+                // The last is the freenet/river#292 recovery path and the #769
+                // re-key merge: state recovered from an older contract generation
+                // is adopted into RoomData (placeholder replace or CRDT merge,
+                // one call after either) and its private-room secrets must be
+                // repopulated, exactly like the normal existing-room GET path.
+                5,
                 include_str!("components/app/freenet_api/response_handler/get_response.rs"),
             ),
         ];
@@ -8430,5 +8430,59 @@ mod tests {
 
         assert_eq!(room.can_send_message(), Err(SendMessageError::UserBanned));
         assert_eq!(room.can_participate(), Err(SendMessageError::UserBanned));
+    }
+
+    /// freenet/river#769: a room whose stored contract key came from an older
+    /// room-contract WASM is reported as re-keyed exactly once, with that old
+    /// key kept as its durable "merge owed" marker; a room stored under the
+    /// current key is not. That split is the whole of "no extra operations on
+    /// an unchanged hash": nothing else starts a re-key merge.
+    #[test]
+    fn rekey_is_detected_only_when_the_stored_contract_key_moved() {
+        use crate::components::app::freenet_api::room_synchronizer::owes_rekey_merge;
+        let owner_sk = SigningKey::from_bytes(&[71u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+
+        // Unchanged hash: stored under the current key.
+        let current = make_rejoin_test_room(&owner_sk, &owner_sk, false);
+        let current_key = current.contract_key;
+        let mut live = empty_rooms_for_merge();
+        let mut incoming = empty_rooms_for_merge();
+        incoming.map.insert(owner_vk, current.clone());
+        live.merge(incoming).unwrap();
+        assert!(live.migrated_rooms.is_empty(), "no re-key, no migration");
+        assert_eq!(live.map[&owner_vk].previous_contract_key, None);
+
+        // Re-keyed: stored under an older generation's key.
+        let old_key = ContractKey::from_params_and_code(
+            Parameters::from(to_cbor_vec(&ChatRoomParametersV1 { owner: owner_vk })),
+            &ContractCode::from(b"an older room-contract build".to_vec()),
+        );
+        let mut stale = current.clone();
+        stale.contract_key = old_key;
+        let mut live = empty_rooms_for_merge();
+        let mut incoming = empty_rooms_for_merge();
+        incoming.map.insert(owner_vk, stale);
+        live.merge(incoming).unwrap();
+        assert_eq!(live.migrated_rooms, vec![(owner_vk, old_key)]);
+        let room = &live.map[&owner_vk];
+        assert_eq!(room.contract_key, current_key, "moved to the current key");
+        assert_eq!(room.previous_contract_key, Some(old_key), "marker recorded");
+        assert!(
+            owes_rekey_merge(room, &old_key),
+            "a fresh re-key merges first"
+        );
+
+        // A stale copy whose old key is NOT the room's marker (another
+        // delegate generation's copy of an already-migrated room) does not.
+        let mut migrated = current.clone();
+        migrated.previous_contract_key = None;
+        assert!(!owes_rekey_merge(&migrated, &old_key));
+
+        // A placeholder (an imported room, never synced) has nothing to seed.
+        let mut placeholder = room.clone();
+        placeholder.room_state = ChatRoomStateV1::default();
+        assert!(placeholder.is_awaiting_initial_sync());
+        assert!(!owes_rekey_merge(&placeholder, &old_key));
     }
 }

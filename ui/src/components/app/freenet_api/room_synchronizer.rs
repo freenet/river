@@ -5,7 +5,9 @@ use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::{
     mark_current_room_as_read, update_document_title, DOCUMENT_VISIBLE,
 };
+use crate::components::app::freenet_api::backward_probe::{start_rekey_merge, RekeyStart};
 use crate::components::app::freenet_api::constants::INVITATION_TIMEOUT_MS;
+use crate::components::app::freenet_api::response_handler::get_response::request_seed_put;
 use crate::components::app::notifications::{
     mark_initial_sync_complete, notify_new_messages, INITIAL_SYNC_COMPLETE,
 };
@@ -642,6 +644,23 @@ pub(crate) fn seed_put_request(
     }
 }
 
+/// Whether a room `merge_from_source` reported as re-keyed (its stored
+/// contract key was `old_contract_key`) must merge that older key into its
+/// state before its seed PUT (freenet/river#769).
+///
+/// Only a fresh re-key of a room with real state does. The room's marker must
+/// name THIS old key: a stale copy from a legacy delegate also lands in
+/// `migrated_rooms`, while the copy in `ROOMS` was already migrated. And a
+/// placeholder (an imported room not yet synced) has nothing of its own to
+/// seed; it takes the GET path, whose empty or missing answer probes the
+/// older generations itself.
+pub(crate) fn owes_rekey_merge(
+    room: &crate::room_data::RoomData,
+    old_contract_key: &freenet_stdlib::prelude::ContractKey,
+) -> bool {
+    room.previous_contract_key == Some(*old_contract_key) && !room.is_awaiting_initial_sync()
+}
+
 /// The code-free subscribe for a room the network should already hold
 /// (freenet/river#757).
 ///
@@ -816,6 +835,196 @@ impl RoomSynchronizer {
             }
         }
 
+        // Handle migrated rooms (freenet/river#292, Task 2; freenet/river#769).
+        //
+        // The bundled room-contract WASM changed since this device last saved
+        // the room, so its key moved and the new key is empty on the network
+        // until someone seeds it. Seeding it with the local snapshot alone
+        // loses every message that reached the OLD key after this device last
+        // saved, so the room is held out of the subscribe sweep below while
+        // `start_rekey_merge` reads the older key(s), merges them into ROOMS,
+        // and then seeds the new key with the merged state, once. A PUT onto a
+        // key another member already seeded merges, so it never clobbers.
+        //
+        // This runs BEFORE the subscribe sweep: a re-keyed room must not go
+        // out as a code-free GET (whose NotFound would seed the snapshot alone).
+        //
+        // The owner still sends the `OptionalUpgradeV1` pointer on the
+        // OLD contract so old clients can find the new key.
+        if web_api_available {
+            let migrated_rooms: Vec<(VerifyingKey, freenet_stdlib::prelude::ContractKey)> =
+                ROOMS.with_mut(|rooms| std::mem::take(&mut rooms.migrated_rooms));
+
+            for (owner_vk, old_contract_key) in &migrated_rooms {
+                let (new_contract_key, is_owner, owes_merge, room_state) = {
+                    let rooms = ROOMS.read();
+                    if let Some(room_data) = rooms.map.get(owner_vk) {
+                        let is_owner = room_data.self_verifying_key() == Some(*owner_vk);
+                        (
+                            room_data.contract_key,
+                            is_owner,
+                            owes_rekey_merge(room_data, old_contract_key),
+                            room_data.room_state.clone(),
+                        )
+                    } else {
+                        continue;
+                    }
+                };
+
+                info!(
+                    "Migrating room {:?} from old contract {} to new contract {}",
+                    MemberId::from(*owner_vk),
+                    old_contract_key.id(),
+                    new_contract_key.id()
+                );
+
+                // Register the new contract id so responses resolve back to
+                // this owner, with the same baseline the subscribe sweep's own
+                // registration would have recorded.
+                SYNC_INFO.with_mut(|sync_info| {
+                    if sync_info.get_sync_status(owner_vk).is_none() {
+                        sync_info.register_new_room(*owner_vk);
+                        sync_info.update_last_synced_state(owner_vk, &room_state);
+                    }
+                });
+
+                let merging = owes_merge && {
+                    // `Subscribing` keeps the sweep away; each probe hop
+                    // refreshes it, and the merge's seed PUT takes it from there.
+                    SYNC_INFO.with_mut(|sync_info| {
+                        sync_info.update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
+                    });
+                    match start_rekey_merge(*owner_vk, *old_contract_key.id(), room_state, true)
+                        .await
+                    {
+                        RekeyStart::Started | RekeyStart::AlreadyRunning => true,
+                        RekeyStart::AlreadyAttempted => {
+                            // Not reachable on a fresh re-key; seed what we hold.
+                            SYNC_INFO.with_mut(|sync_info| sync_info.require_seed_put(owner_vk));
+                            request_seed_put(*owner_vk);
+                            true
+                        }
+                    }
+                };
+
+                if !merging {
+                    // GET+subscribe the new contract key. The GET response
+                    // handler merges network state and, when the new key is
+                    // empty, fans out to the backward probe.
+                    let get_request = ContractRequest::Get {
+                        key: *new_contract_key.id(),
+                        return_contract_code: true,
+                        subscribe: true,
+                        blocking_subscribe: false,
+                    };
+
+                    if let Some(web_api) = WEB_API.write().as_mut() {
+                        match web_api.send(ClientRequest::ContractOp(get_request)).await {
+                            Ok(_) => {
+                                info!(
+                                    "Sent GET+subscribe to new contract for migrated room {:?}",
+                                    MemberId::from(*owner_vk)
+                                );
+                                SYNC_INFO.with_mut(|sync_info| {
+                                    sync_info
+                                        .update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
+                                });
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to GET new contract for migrated room {:?}: {}",
+                                    MemberId::from(*owner_vk),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Owner only: send upgrade pointer to old contract for old-client compat.
+                // `is_owner` guarantees the local identity IS the owner, so the
+                // `AuthorizedUpgradeV1` signature validates against the old contract's
+                // `parameters.owner`. It does NOT guarantee the private key is held —
+                // `is_owner` is decided from the public half — so the signing step
+                // below still has to check (and skips the pointer if it can't sign;
+                // the pointer is a courtesy for stragglers, not correctness-critical).
+                if is_owner {
+                    use river_core::room_state::upgrade::{AuthorizedUpgradeV1, UpgradeV1};
+
+                    let upgrade_delta = {
+                        let rooms = ROOMS.read();
+                        if let Some(room_data) = rooms.map.get(owner_vk) {
+                            let new_contract_id = room_data.contract_key.id();
+                            let mut id_bytes = [0u8; 32];
+                            id_bytes.copy_from_slice(new_contract_id.as_bytes());
+                            let new_address = blake3::Hash::from(id_bytes);
+                            let upgrade = UpgradeV1 {
+                                owner_member_id: room_data.owner_id(),
+                                version: 1,
+                                new_chatroom_address: new_address,
+                            };
+                            let Some(self_sk) = room_data.signing_key() else {
+                                warn!(
+                                    "Skipping upgrade pointer for room {:?}: no local \
+                                     signing key to sign it with",
+                                    MemberId::from(*owner_vk)
+                                );
+                                continue;
+                            };
+                            let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade, self_sk);
+
+                            // Send a minimal delta carrying ONLY the upgrade
+                            // pointer — not a full `UpdateData::State`. A full
+                            // state UPDATE is run through the old contract's
+                            // `validate_state` -> `ChatRoomStateV1::verify`; the
+                            // previous `..Default::default()` state failed that
+                            // with "Invalid signature" because its default
+                            // `configuration` is unsigned (issue #127). A delta
+                            // is applied via `apply_delta`, which validates only
+                            // the upgrade signature against the contract's owner
+                            // parameter — so the payload is just the signed
+                            // upgrade pointer (~100 bytes), no unsigned default
+                            // `configuration` is ever substituted, and
+                            // full-state verification is never tripped.
+                            ChatRoomStateV1Delta {
+                                upgrade: Some(authorized_upgrade),
+                                ..Default::default()
+                            }
+                        } else {
+                            continue;
+                        }
+                    };
+
+                    let update_request = ContractRequest::Update {
+                        key: *old_contract_key,
+                        data: UpdateData::Delta(to_cbor_vec(&upgrade_delta).into()),
+                    };
+
+                    if let Some(web_api) = WEB_API.write().as_mut() {
+                        match web_api
+                            .send(ClientRequest::ContractOp(update_request))
+                            .await
+                        {
+                            Ok(_) => {
+                                info!(
+                                    "Sent upgrade pointer for room {:?} to old contract {}",
+                                    MemberId::from(*owner_vk),
+                                    old_contract_key.id()
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to send upgrade pointer for room {:?}: {}",
+                                    MemberId::from(*owner_vk),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         info!("Checking for rooms that need to be subscribed");
 
         // Only check rooms_awaiting_subscription if WebAPI is available
@@ -886,6 +1095,20 @@ impl RoomSynchronizer {
                         }
                     }
                     continue;
+                }
+
+                // A re-key merge still owed from an earlier load (its older key
+                // did not answer then, freenet/river#769): retry it alongside
+                // the subscribe. Once per load; the room already has state
+                // under its current key, so nothing waits on it.
+                let owed_merge = ROOMS
+                    .read()
+                    .map
+                    .get(owner_vk)
+                    .and_then(|rd| rd.previous_contract_key)
+                    .map(|k| *k.id());
+                if let Some(previous) = owed_merge {
+                    start_rekey_merge(*owner_vk, previous, state.clone(), false).await;
                 }
 
                 // A room the network should already hold subscribes with a
@@ -972,166 +1195,6 @@ impl RoomSynchronizer {
                 } else {
                     // This shouldn't happen since we checked at the start
                     warn!("WebAPI became unavailable during processing");
-                }
-            }
-        }
-
-        // Handle migrated rooms (freenet/river#292, Task 2).
-        //
-        // Previously this block force-PUT the device's *local* `room_state`
-        // snapshot onto the new contract key. That re-introduced stale
-        // state — old member IDs, pruned members — whenever the new key
-        // already carried fresher state from the network. Instead we now
-        // route the migrated room through the normal GET+subscribe path:
-        // GET the new contract key, and let `handle_get_response` CRDT-
-        // merge whatever the network has. If the new key turns out to be
-        // empty, `handle_get_response` itself triggers the backward
-        // probe (Task 3), which recovers the room's last-active state
-        // from an older generation and only seeds the new key with the
-        // local snapshot as a genuine last resort.
-        //
-        // The owner still sends the `OptionalUpgradeV1` pointer on the
-        // OLD contract so old clients can find the new key.
-        if web_api_available {
-            let migrated_rooms: Vec<(VerifyingKey, freenet_stdlib::prelude::ContractKey)> =
-                ROOMS.with_mut(|rooms| std::mem::take(&mut rooms.migrated_rooms));
-
-            for (owner_vk, old_contract_key) in &migrated_rooms {
-                let (new_contract_key, is_owner) = {
-                    let rooms = ROOMS.read();
-                    if let Some(room_data) = rooms.map.get(owner_vk) {
-                        let is_owner = room_data.self_verifying_key() == Some(*owner_vk);
-                        (room_data.contract_key, is_owner)
-                    } else {
-                        continue;
-                    }
-                };
-
-                info!(
-                    "Migrating room {:?} from old contract {} to new contract {} \
-                     (GET+subscribe — network state is authoritative)",
-                    MemberId::from(*owner_vk),
-                    old_contract_key.id(),
-                    new_contract_key.id()
-                );
-
-                // Register the new contract id so the GET response
-                // resolves back to this owner.
-                SYNC_INFO.with_mut(|sync_info| {
-                    sync_info.register_new_room(*owner_vk);
-                });
-
-                // Any client: GET+subscribe the new contract key. The
-                // GET response handler merges network state and, when
-                // the new key is empty, fans out to the backward probe.
-                let get_request = ContractRequest::Get {
-                    key: *new_contract_key.id(),
-                    return_contract_code: true,
-                    subscribe: true,
-                    blocking_subscribe: false,
-                };
-
-                if let Some(web_api) = WEB_API.write().as_mut() {
-                    match web_api.send(ClientRequest::ContractOp(get_request)).await {
-                        Ok(_) => {
-                            info!(
-                                "Sent GET+subscribe to new contract for migrated room {:?}",
-                                MemberId::from(*owner_vk)
-                            );
-                            SYNC_INFO.with_mut(|sync_info| {
-                                sync_info.update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
-                            });
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to GET new contract for migrated room {:?}: {}",
-                                MemberId::from(*owner_vk),
-                                e
-                            );
-                        }
-                    }
-                }
-
-                // Owner only: send upgrade pointer to old contract for old-client compat.
-                // `is_owner` guarantees the local identity IS the owner, so the
-                // `AuthorizedUpgradeV1` signature validates against the old contract's
-                // `parameters.owner`. It does NOT guarantee the private key is held —
-                // `is_owner` is decided from the public half — so the signing step
-                // below still has to check (and skips the pointer if it can't sign;
-                // the pointer is a courtesy for stragglers, not correctness-critical).
-                if is_owner {
-                    use river_core::room_state::upgrade::{AuthorizedUpgradeV1, UpgradeV1};
-
-                    let upgrade_delta = {
-                        let rooms = ROOMS.read();
-                        if let Some(room_data) = rooms.map.get(owner_vk) {
-                            let new_contract_id = room_data.contract_key.id();
-                            let mut id_bytes = [0u8; 32];
-                            id_bytes.copy_from_slice(new_contract_id.as_bytes());
-                            let new_address = blake3::Hash::from(id_bytes);
-                            let upgrade = UpgradeV1 {
-                                owner_member_id: room_data.owner_id(),
-                                version: 1,
-                                new_chatroom_address: new_address,
-                            };
-                            let Some(self_sk) = room_data.signing_key() else {
-                                warn!(
-                                    "Skipping upgrade pointer for room {:?}: no local \
-                                     signing key to sign it with",
-                                    MemberId::from(*owner_vk)
-                                );
-                                continue;
-                            };
-                            let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade, self_sk);
-
-                            // Send a minimal delta carrying ONLY the upgrade
-                            // pointer — not a full `UpdateData::State`. A full
-                            // state UPDATE is run through the old contract's
-                            // `validate_state` -> `ChatRoomStateV1::verify`; the
-                            // previous `..Default::default()` state failed that
-                            // with "Invalid signature" because its default
-                            // `configuration` is unsigned (issue #127). A delta
-                            // is applied via `apply_delta`, which validates only
-                            // the upgrade signature against the contract's owner
-                            // parameter — so the payload is just the signed
-                            // upgrade pointer (~100 bytes), no unsigned default
-                            // `configuration` is ever substituted, and
-                            // full-state verification is never tripped.
-                            ChatRoomStateV1Delta {
-                                upgrade: Some(authorized_upgrade),
-                                ..Default::default()
-                            }
-                        } else {
-                            continue;
-                        }
-                    };
-
-                    let update_request = ContractRequest::Update {
-                        key: *old_contract_key,
-                        data: UpdateData::Delta(to_cbor_vec(&upgrade_delta).into()),
-                    };
-
-                    if let Some(web_api) = WEB_API.write().as_mut() {
-                        match web_api
-                            .send(ClientRequest::ContractOp(update_request))
-                            .await
-                        {
-                            Ok(_) => {
-                                info!(
-                                    "Sent upgrade pointer for room {:?} to old contract {}",
-                                    MemberId::from(*owner_vk),
-                                    old_contract_key.id()
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to send upgrade pointer for room {:?}: {}",
-                                    MemberId::from(*owner_vk),
-                                    e
-                                );
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -2258,6 +2321,37 @@ mod tests {
         assert!(
             put > route + get_arm.len(),
             "the seed PUT must be the fallthrough after the GET arm"
+        );
+    }
+
+    /// freenet/river#769 wiring. A re-keyed room is taken out of the
+    /// subscribe sweep (`Subscribing`) and handed to the re-key merge, which
+    /// seeds it, BEFORE the sweep runs: otherwise the sweep sends a code-free
+    /// GET whose NotFound seeds this device's snapshot alone. A merge still
+    /// owed from an earlier load is retried in the background from the sweep.
+    #[test]
+    fn process_rooms_merges_a_rekeyed_room_before_the_subscribe_sweep() {
+        let body = process_rooms_source();
+        let subscribing = body
+            .find("sync_info.update_sync_status(owner_vk,RoomSyncStatus::Subscribing);});matchstart_rekey_merge(*owner_vk,*old_contract_key.id(),room_state,true).await")
+            .expect("a re-keyed room is held Subscribing, then merged with seed");
+        let sweep = body
+            .find("sync_info.rooms_awaiting_subscription()")
+            .expect("process_rooms runs the subscribe sweep");
+        assert!(
+            subscribing < sweep,
+            "the re-key merge starts before the sweep"
+        );
+        assert!(
+            body[..subscribing].contains("owes_rekey_merge(room_data,old_contract_key)"),
+            "only a room whose marker names this old key merges"
+        );
+        let retry = body
+            .find("start_rekey_merge(*owner_vk,previous,state.clone(),false)")
+            .expect("an owed merge is retried in the background");
+        assert!(
+            retry > sweep,
+            "the retry rides the sweep, it does not block it"
         );
     }
 
