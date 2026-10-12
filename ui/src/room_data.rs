@@ -227,8 +227,7 @@ pub struct RekeyMerge {
     /// one merge from the key it re-keyed off instead.
     #[serde(default)]
     pub previous_queued: Option<ContractKey>,
-    /// When (ms since the Unix epoch) the room last went from owing nothing
-    /// to owing a merge. Keys are given up only after both enough loads and
+    /// When (ms since the Unix epoch) a key was last newly owed. Keys are given up only after both enough loads and
     /// enough time, so tabs, reloads and loads before the node has peers
     /// cannot give up a live key within minutes.
     #[serde(default)]
@@ -243,12 +242,13 @@ pub struct RekeyMerge {
 
 impl RekeyMerge {
     /// Owe a merge from `key` (no-op if already owed). A newly owed key gets a
-    /// fresh run of attempts; the clock starts when the room first owes one.
+    /// fresh run of attempts and a fresh give-up clock, so it cannot inherit
+    /// an older key's elapsed time and be given up within minutes.
     fn owe(&mut self, key: ContractKey, now_ms: u64) {
         if !self.owed.contains(&key) {
             self.owed.push(key);
             self.unfinished_loads = 0;
-            self.first_owed_at.get_or_insert(now_ms);
+            self.first_owed_at = Some(now_ms);
         }
     }
 }
@@ -8725,6 +8725,35 @@ mod tests {
             "fixture: the newer identity was adopted"
         );
         assert_eq!(live.map[&owner_vk].rekey_merge.owed, vec![owed]);
+    }
+
+    /// A newly owed key restarts the give-up clock rather than inheriting the
+    /// elapsed time of a key owed days earlier; a key already owed does not.
+    #[test]
+    fn a_newly_owed_key_restarts_the_give_up_clock() {
+        let owner_vk = SigningKey::from_bytes(&[77u8; 32]).verifying_key();
+        let key = |tag: &[u8]| {
+            ContractKey::from_params_and_code(
+                Parameters::from(to_cbor_vec(&ChatRoomParametersV1 { owner: owner_vk })),
+                &ContractCode::from(tag.to_vec()),
+            )
+        };
+        let (k1, k2) = (key(b"k1"), key(b"k2"));
+        let mut marker = RekeyMerge::default();
+        marker.owe(k1, 1_000);
+        assert_eq!(marker.first_owed_at, Some(1_000));
+        marker.owe(k2, 5_000);
+        assert_eq!(
+            marker.first_owed_at,
+            Some(5_000),
+            "the new key starts its own clock"
+        );
+        marker.owe(k2, 9_000);
+        assert_eq!(
+            marker.first_owed_at,
+            Some(5_000),
+            "an already-owed key does not"
+        );
     }
 
     /// freenet/river#771 review, must-fix A: a device that re-keyed on a build
