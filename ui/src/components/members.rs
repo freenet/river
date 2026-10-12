@@ -2443,6 +2443,11 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
     // `ROOMS_LOAD_STATE == Loaded` throughout). `saw_fetch_failure()` and
     // `rooms_recovery_in_progress()` are read alongside (non-signal sources).
     let _ = ROOMS.try_read(); // subscribe: re-render when recovery hydrates rooms
+                              // ...and when the migration journal's answer changes (freenet/river#763):
+                              // its gate is not a signal, so this version counter is.
+    let _ = crate::components::app::freenet_api::migration_journal::JOURNAL_GATE_VERSION.try_read();
+    let journal_gate =
+        crate::components::app::freenet_api::migration_journal::current_import_gate();
     let saw_fetch_failure = crate::components::app::chat_delegate::saw_fetch_failure();
     let rooms_hydrated = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
         .try_read()
@@ -2667,6 +2672,33 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                                         crate::components::app::chat_delegate::retry_rooms_load();
                                     },
                                     "Retry loading rooms"
+                                }
+                            }
+                        } else if journal_gate
+                            == crate::components::app::freenet_api::migration_journal::ImportGate::Blocked
+                        {
+                            // The migration journal cannot confirm every room
+                            // moved over from an earlier River version (an
+                            // interrupted move, items it could not read, or the
+                            // record itself unreadable), and that can last if an
+                            // old copy is unreachable on this node. The user may
+                            // go ahead knowingly; this ignores the journal's
+                            // answer for this session and resolves nothing
+                            // (freenet/river#763; a real way to give up on an
+                            // entry is freenet-migrate#39).
+                            div {
+                                "data-testid": "import-identity-migration-incomplete",
+                                class: "mt-3 text-sm text-amber-400",
+                                "Some rooms from an earlier version of River may not have finished moving over. Importing now could overwrite one of them. River keeps trying on each load; import anyway only if you know the room is not one of them."
+                            }
+                            div { class: "flex justify-end mt-2",
+                                button {
+                                    "data-testid": "import-identity-override-migration",
+                                    class: "px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-xs rounded-lg transition-colors border border-border",
+                                    onclick: move |_| {
+                                        crate::components::app::freenet_api::migration_journal::override_import_gate();
+                                    },
+                                    "Import anyway"
                                 }
                             }
                         } else {

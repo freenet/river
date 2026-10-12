@@ -1,4 +1,5 @@
-//! Delegate secret migration on `freenet-migrate` 0.5 (freenet/river#398 phase 3).
+//! Delegate secret migration on `freenet-migrate` 0.7 (freenet/river#398 phase 3),
+//! with the crate's durable completeness journal (freenet/river#763).
 //!
 //! A delegate's address is `BLAKE3(BLAKE3(wasm) ‖ params)`, so any rebuild
 //! re-keys it and the successor starts with an EMPTY secret store. River's
@@ -11,16 +12,30 @@
 //! per-predecessor classification come from one place. Retiring the hand-rolled
 //! sweep is release 2, after field validation — nothing here removes it.
 //!
-//! # This is a UI-side adoption — the delegate WASM does NOT change
+//! # A UI-side adapter over River's existing delegate protocol
 //!
-//! The delegate WASM is byte-identical before and after this module was added
-//! (pinned by `chat_delegate_wasm_is_byte_identical` in `chat_delegate.rs`), and
-//! that is load-bearing: changing it would re-key the delegate and create
-//! exactly the data-loss event the module exists to prevent. It is possible
-//! because River's delegate protocol already has both halves of the writer
-//! seam: `GetRequest`/`ListRequest` read a predecessor, and the current
-//! delegate's Store/CAS paths (via `save_rooms_to_delegate`'s per-room CAS
-//! `reconcile_room_present`) are the app's own import path.
+//! Nothing here needs a delegate-side change: River's delegate protocol already
+//! has both halves of the writer seam. `GetRequest`/`ListRequest` read a
+//! predecessor, and the current delegate's Store/CAS paths (via
+//! `save_rooms_to_delegate`'s per-room CAS `reconcile_room_present`) are the
+//! app's own import path. The journal and the markers are ordinary KV entries in
+//! the current delegate. (The re-key that ships with the journal, #757/#592,
+//! changes the delegate for its own reasons.)
+//!
+//! # The completeness journal (freenet/river#763)
+//!
+//! An interrupted migration used to strand rooms: a tab closed after the first
+//! per-room write left 1 of 4 rooms on every later load (freenet/river#760),
+//! because the next load saw a non-empty successor and treated it as
+//! authoritative, and the in-progress flag meant to catch that lived in
+//! `localStorage`, which the gateway's sandboxed iframe does not have. The
+//! journal (`freenet_migrate::MigrationJournal`, stored in the CURRENT delegate
+//! under [`freenet_migrate::MIGRATION_JOURNAL_KEY`]) replaces every in-session
+//! guess with durable arithmetic: each predecessor is pending until the walk
+//! resolves it, and an import the walk or the sweep started is flagged before
+//! its first write. `migration_journal.rs` drives it: `begin` on every load, the
+//! journaled walk while the status is incomplete, `note_app_import_started`
+//! before each sweep merge, and the identity-import gate.
 //!
 //! # The four constraints this adapter is built around
 //!
@@ -32,14 +47,21 @@
 //!    and failure NEVER classify a key as absent: a probe that gets silence is
 //!    `Unresponsive`, a fetch/marker round-trip that gets silence is an `Err`
 //!    that aborts the predecessor, and the walk retries next page load.
-//! 2. **Never trust the legacy List alone.** The legacy WASM's `get_key_index`
-//!    swallows decode errors into an empty list
-//!    (`delegates/chat-delegate/src/handlers.rs`, frozen — cannot be fixed), so
-//!    an empty/short index is not proof of absence. [`fetch_secrets`] unions
-//!    the listed keys with the FIXED probes `rooms_data` + `outbound_dms`, so
-//!    the single-blob era is recovered even through a corrupt index. (Per-room
-//!    `room:<vk>` keys are dynamic and unguessable, so a corrupt index still
-//!    strands those — the union is a floor, not a fix for the frozen WASM.)
+//! 2. **Never return a short export** (freenet/river#592, #763). The journal
+//!    believes a short export as permanently as a `Done` marker, so
+//!    [`RiverPredecessorIo::fetch_secrets`] fails loudly rather than return a
+//!    partial set. The legacy WASM's `get_key_index` swallows a decode error into
+//!    an empty list (frozen, cannot be fixed there), and freenet-core reports a
+//!    failed secret read as "not found" (freenet/freenet-core#5857), so the
+//!    listing alone proves nothing. `fetch_secrets` therefore reads the RAW index
+//!    twice (`GetRequest` on the index's own storage key), refuses one that does
+//!    not decode or whose two reads disagree, refuses a listing that disagrees
+//!    with it, refuses an absent index while a fixed key (`rooms_data`,
+//!    `outbound_dms`) is present (every registered generation writes the index
+//!    on every store), and refuses a listed key that answers "no value" (River
+//!    has never sent a `DeleteRequest` in production, and the re-keyed delegate
+//!    updates the index before removing a value, so a listed key with no value
+//!    can only be a read fault). The fixed keys are still probed directly.
 //! 3. **Never invent a second merge.** The writer routes every recovered room
 //!    through `Rooms::merge_from_source` at the generation's source rank with
 //!    the SHARED identity/tombstone rank registry — the same machinery the
@@ -49,7 +71,9 @@
 //!    (`reconcile_room_present`). This is stronger than the never-clobber the
 //!    crate's Union policy rests on: precedence comes from generation RANK,
 //!    not arrival order.
-//! 4. **Markers are durable, in the CURRENT delegate's KV store.** ghostkeys
+//! 4. **Markers are durable, in the CURRENT delegate's KV store**, and follow
+//!    the crate's three-rule marker contract (see
+//!    [`RiverSuccessorIo::migration_marker`] / `record_marker`). ghostkeys
 //!    deliberately went the opposite way (in-memory, page-lifetime) because
 //!    sealing a predecessor there can strand late-arriving data. River's case
 //!    is different: a legacy delegate's data is FROZEN after the re-key (only
@@ -80,20 +104,39 @@
 //! * `LegacyBridge` is ignored: River's successor store was never written by
 //!   the crate's older generation-keyed `import_secrets_once` API, so there are
 //!   no legacy generation-keyed markers to bridge.
+//! * **Union shadowing (freenet-migrate#42) is bounded by the ranked merge
+//!   within a session, not across one.** Under Union a newest generation that
+//!   is refused (silent, or an empty answer after data) does not stop the walk,
+//!   so an older generation's copy of a room can be imported first. Within the
+//!   session, the newer generation's later answer still wins: precedence is
+//!   generation RANK, not arrival order (pinned by
+//!   `a_refused_newest_generation_does_not_shadow_it_within_the_session`). Once
+//!   the older copy has been saved, though, the next load reads it back from the
+//!   CURRENT delegate at the current delegate's rank, so a newer generation that
+//!   only answers on a later load loses an identity conflict to it and its
+//!   tombstone does not remove the room. Nothing is lost (rooms are only added,
+//!   messages CRDT-merge); the residual is an older `self_sk` kept for a room
+//!   the newer generation held under another identity, or a left room coming
+//!   back. In practice the newest generation is the delegate the user was
+//!   running until the upgrade, which is installed and answers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 
-use dioxus::logger::tracing::{info, warn};
+use dioxus::logger::tracing::{error, info, warn};
 use freenet_migrate::{
-    DelegateLineageEntry, DelegateMigrationReport, ItemWrite, MarkerQuery, MigrationAuthorization,
-    MigrationMarker, PredecessorSecretsIo, RecoveredSecret, SecretPair, SecretSelectionPolicy,
-    SuccessorSecretsIo, UnionAck, PRED_DONE_MARKER_VALUE_DATA, PRED_DONE_MARKER_VALUE_EMPTY,
+    begin_migration_journal, is_reserved_key, migrate_delegate_secrets_journaled,
+    note_app_import_started, AppImport, DelegateLineageEntry, ItemWrite, JournalError,
+    JournalStatus, JournaledMigrationReport, JournaledSuccessorIo, MarkerQuery,
+    MigrationAuthorization, MigrationMarker, PredecessorSecretsIo, ProbeVerdict, RecoveredSecret,
+    SecretPair, SecretSelectionPolicy, SuccessorSecretsIo, UnionAck, MIGRATION_JOURNAL_KEY,
+    PRED_DONE_MARKER_VALUE_DATA, PRED_DONE_MARKER_VALUE_EMPTY,
 };
 use freenet_stdlib::prelude::{CodeHash, DelegateKey};
 use river_core::chat_delegate::{
-    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, OutboundDmStore,
+    CasStoreResult, ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg,
+    OutboundDmStore,
 };
 
 use crate::components::app::chat_delegate::{
@@ -152,6 +195,38 @@ pub(crate) fn pred_wip_marker_key(predecessor: &DelegateKey) -> Vec<u8> {
 /// crate cannot know to filter them.)
 pub(crate) fn is_migration_marker_key(key: &[u8]) -> bool {
     key.starts_with(MIGRATE_PRED_DONE_PREFIX) || key.starts_with(MIGRATE_PRED_WIP_PREFIX)
+}
+
+/// The current delegate's count of loads that skipped the walk under the
+/// freenet/river#761 cadence (see `migration_journal::walk_decision`). River's
+/// own bookkeeping, never migrated.
+pub(crate) const WALK_CADENCE_KEY: &[u8] = b"__river_migration_walk_skips__";
+
+/// The chat delegate's key index, as a plain `GetRequest` key. Every generation
+/// stores the index under `<origin>:` + `::key_index`, and a `GetRequest` for
+/// `key` reads `<origin>:` + `key`, so this reads the index's raw bytes
+/// (`delegates/chat-delegate/src/{utils,models}.rs`). The index is CBOR, never
+/// a versioning envelope, so no generation's `read_versioned` alters it.
+pub(crate) const KEY_INDEX_STORAGE_KEY: &[u8] = b"::key_index";
+
+/// Mirror of the delegate's stored `KeyIndex`
+/// (`delegates/chat-delegate/src/context.rs`, unchanged since 2025-04).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct RawKeyIndex {
+    pub(crate) keys: Vec<ChatDelegateKey>,
+}
+
+/// Whether `key` is migration bookkeeping rather than user data: this module's
+/// markers, the crate's reserved namespaces (the completeness journal is one,
+/// [`is_reserved_key`]), the walk-cadence counter, or the index itself. Never
+/// fetched from a predecessor, never imported, never counted as its data, and
+/// never part of a room load. The hand-rolled sweep reads only room and fixed
+/// keys, so it cannot copy these either (freenet/river#763).
+pub(crate) fn is_migration_bookkeeping_key(key: &[u8]) -> bool {
+    is_migration_marker_key(key)
+        || is_reserved_key(key)
+        || key == WALK_CADENCE_KEY
+        || key == KEY_INDEX_STORAGE_KEY
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +298,7 @@ pub(crate) trait RiverDelegateChannel {
 /// target delegate). Both facts are pinned by
 /// `walk_is_sequential_and_prewarm_keys_are_distinct` below. The hand-rolled
 /// sweep can still collide with the walk on the same (delegate, key) — which is
-/// why [`run_crate_delegate_migration`] waits for the load to settle first —
+/// why the walk driver (`migration_journal::walk_driver`) waits for the load to settle first —
 /// and a collision degrades safely: the dropped waiter resolves `Err`
 /// (cancelled), classifying the predecessor `Unresponsive`, and the durable
 /// markers make the next page load retry it.
@@ -368,6 +443,48 @@ enum Prewarmed {
     Executed,
     /// No reply within the bound.
     Silent,
+    /// No reply within the bound, and the node answered a request to it with a
+    /// TYPED "missing delegate" (`DelegateError::Missing`, core 0.2.137+). Still
+    /// not proof it holds nothing (core unregisters without deleting secrets);
+    /// the walk treats it exactly like silence, and the journal counts it in the
+    /// absent streak that drives the freenet/river#761 cadence.
+    NotInstalled,
+}
+
+/// Legacy delegates the node has answered with a TYPED "missing delegate"
+/// (`SynchronizerError::DelegateMissing`) since the last pre-warm began. Fed by
+/// `freenet_synchronizer.rs`'s error arm; read when a probe times out.
+///
+/// Only the typed answer counts. An empty reply (core 0.2.136 and earlier) or a
+/// timeout is silence, never "not installed", and the untyped "not found in
+/// store" wording is not used either: the error channel carries no request id,
+/// and only the typed variant names the delegate unambiguously.
+static NOT_INSTALLED: LazyLock<Mutex<HashSet<[u8; 32]>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn not_installed() -> std::sync::MutexGuard<'static, HashSet<[u8; 32]>> {
+    NOT_INSTALLED.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Record that the node answered a request to the legacy delegate `key` with a
+/// typed "missing delegate" error.
+pub(crate) fn note_legacy_delegate_not_installed(key: &DelegateKey) {
+    if let Ok(bytes) = <[u8; 32]>::try_from(key.bytes()) {
+        not_installed().insert(bytes);
+    }
+}
+
+/// Classify a probe that got no reply: not installed if the node said so (typed)
+/// since the pre-warm began, else plain silence.
+fn silent_verdict(predecessor: &DelegateKey) -> Prewarmed {
+    let typed_missing = <[u8; 32]>::try_from(predecessor.bytes())
+        .map(|k| not_installed().contains(&k))
+        .unwrap_or(false);
+    if typed_missing {
+        Prewarmed::NotInstalled
+    } else {
+        Prewarmed::Silent
+    }
 }
 
 /// Reads predecessors through River's own delegate protocol.
@@ -417,6 +534,14 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
             .iter()
             .map(|entry| DelegateKey::new(entry.delegate_key, CodeHash::new(entry.code_hash)))
             .collect();
+        // Only a "missing delegate" answered to THIS burst classifies a
+        // predecessor `NotInstalled`, so forget older evidence for its targets.
+        {
+            let mut seen = not_installed();
+            for entry in predecessors {
+                seen.remove(&entry.delegate_key);
+            }
+        }
         // `request_all`, NOT a `join_all` of `request` — on the production
         // transport the latter can poll a second probe into its send while the
         // first still holds the `WEB_API` write borrow across `send().await`,
@@ -454,7 +579,7 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
             let learned = match outcome {
                 Ok(Some(ChatDelegateResponseMsg::ListResponse { keys })) => Prewarmed::Listed(keys),
                 Ok(Some(_)) => Prewarmed::Executed,
-                Ok(None) => Prewarmed::Silent,
+                Ok(None) => silent_verdict(key),
                 // Not cached: the live probe retries and reports the error.
                 Err(_) => continue,
             };
@@ -482,6 +607,26 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
             Some(ChatDelegateResponseMsg::ListResponse { keys }) => Ok(keys),
             Some(other) => Err(format!("unexpected reply to legacy ListRequest: {other:?}")),
             None => Err("legacy ListRequest timed out after a positive probe".to_string()),
+        }
+    }
+
+    /// The predecessor's RAW key index: `Ok(None)` when none is stored, `Err`
+    /// when the read did not establish an answer or the stored bytes do not
+    /// decode (freenet/river#592: the predecessor's own `ListResponse` turns an
+    /// undecodable index into an empty list).
+    async fn raw_key_index(
+        &mut self,
+        predecessor: &DelegateKey,
+    ) -> Result<Option<(Vec<u8>, Vec<ChatDelegateKey>)>, String> {
+        match self.get_key(predecessor, KEY_INDEX_STORAGE_KEY).await? {
+            None => Ok(None),
+            Some(bytes) => match ciborium::from_reader::<RawKeyIndex, _>(bytes.as_slice()) {
+                Ok(index) => Ok(Some((bytes, index.keys))),
+                Err(e) => Err(format!(
+                    "the predecessor's stored key index does not decode ({e}); refusing a \
+                     short export (freenet/river#592)"
+                )),
+            },
         }
     }
 
@@ -521,18 +666,19 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
 }
 
 /// The candidate storage keys to fetch from a predecessor, given its key
-/// index: the listed keys UNIONED with the fixed probes, minus this module's
-/// own markers, ordered so `rooms_meta` comes LAST (its `room_order` merge
-/// only retains rooms already present, so the rooms must merge first).
+/// index: the listed keys UNIONED with the fixed probes, minus migration
+/// bookkeeping ([`is_migration_bookkeeping_key`]: this module's markers, the
+/// crate's reserved journal namespace, the cadence counter), ordered so
+/// `rooms_meta` comes LAST (its `room_order` merge only retains rooms already
+/// present, so the rooms must merge first).
 ///
-/// Pure, so the union rule — the "never trust List alone" constraint — is
-/// unit-testable and mutation-testable on its own.
+/// Pure, so the union rule is unit-testable and mutation-testable on its own.
 pub(crate) fn candidate_keys(listed: &[ChatDelegateKey]) -> Vec<Vec<u8>> {
     let mut keys: Vec<Vec<u8>> = Vec::new();
     let mut meta = false;
     for k in listed {
         let b = k.as_bytes();
-        if is_migration_marker_key(b) {
+        if is_migration_bookkeeping_key(b) {
             continue;
         }
         if b == ROOMS_META_KEY {
@@ -561,10 +707,23 @@ impl<C: RiverDelegateChannel> PredecessorSecretsIo for RiverPredecessorIo<'_, C>
 
     /// Executability preflight, answered from the pre-warm cache when
     /// available. Any reply counts as executed; only silence is `Ok(false)`.
+    /// (The walk asks [`probe_verdict`](Self::probe_verdict); this stays
+    /// consistent with it.)
     async fn probe_executable(&mut self, predecessor: &DelegateKey) -> Result<bool, Self::Error> {
-        match self.prewarmed.get(predecessor.bytes()) {
-            Some(Prewarmed::Listed(_)) | Some(Prewarmed::Executed) => Ok(true),
-            Some(Prewarmed::Silent) => Ok(false),
+        Ok(self.probe_verdict(predecessor).await? == ProbeVerdict::Executable)
+    }
+
+    /// The preflight with its third answer (freenet-migrate 0.7):
+    /// [`ProbeVerdict::NotInstalled`] only for a TYPED "missing delegate" the
+    /// node answered (see [`NOT_INSTALLED`]); an empty reply or a timeout is
+    /// [`ProbeVerdict::NoReply`]. The walk treats both alike; the journal
+    /// counts the first in the absent streak.
+    async fn probe_verdict(
+        &mut self,
+        predecessor: &DelegateKey,
+    ) -> Result<ProbeVerdict, Self::Error> {
+        let learned = match self.prewarmed.get(predecessor.bytes()) {
+            Some(cached) => cached.clone(),
             None => {
                 // Cache miss (not pre-warmed, or the pre-warm probe errored):
                 // live probe, so a transport error surfaces to the driver.
@@ -575,32 +734,86 @@ impl<C: RiverDelegateChannel> PredecessorSecretsIo for RiverPredecessorIo<'_, C>
                 let learned = match outcome {
                     Some(ChatDelegateResponseMsg::ListResponse { keys }) => Prewarmed::Listed(keys),
                     Some(_) => Prewarmed::Executed,
-                    None => Prewarmed::Silent,
+                    None => silent_verdict(predecessor),
                 };
-                let executable = learned != Prewarmed::Silent;
-                self.prewarmed.insert(predecessor.bytes().to_vec(), learned);
-                Ok(executable)
+                self.prewarmed
+                    .insert(predecessor.bytes().to_vec(), learned.clone());
+                learned
             }
-        }
+        };
+        Ok(match learned {
+            Prewarmed::Listed(_) | Prewarmed::Executed => ProbeVerdict::Executable,
+            Prewarmed::Silent => ProbeVerdict::NoReply,
+            Prewarmed::NotInstalled => ProbeVerdict::NotInstalled,
+        })
     }
 
-    /// Enumerate `predecessor`'s secrets: key index ∪ fixed probes, each key
-    /// GET'd individually. A key the delegate DEFINITIVELY reports absent
-    /// (`value: None`) is skipped; any unknown outcome aborts the predecessor
-    /// (`Err` → `Unresponsive`) rather than under-reporting its data.
+    /// Enumerate `predecessor`'s secrets, or fail: never a short list
+    /// (freenet/river#592, #763; see the module docs, constraint 2).
+    ///
+    /// 1. The listing (pre-warm cache, else a live `ListRequest`).
+    /// 2. The RAW index, read twice: `Err` if it does not decode, if the two
+    ///    reads disagree, or if the listing disagrees with it. The predecessor
+    ///    builds its listing from the same bytes, so a frozen predecessor
+    ///    answers all three identically; a difference is a read fault
+    ///    (freenet/freenet-core#5857 reports one as "not found").
+    /// 3. Every listed key plus the fixed keys, each GET'd. A listed key that
+    ///    answers "no value" is `Err`, and so is an absent index while a fixed
+    ///    key is present: every registered generation adds a key to its index
+    ///    when it stores it, so both can only be read faults.
+    ///
+    /// The cost of a wrong `Err` is a retry on the next load, and an
+    /// interrupted import stays flagged so the identity-import gate holds; the
+    /// cost of a wrong short `Ok` is the user's data, certified complete.
     async fn fetch_secrets(
         &mut self,
         predecessor: &DelegateKey,
     ) -> Result<Vec<SecretPair>, Self::Error> {
         let listed = self.key_index(predecessor).await?;
+        let first = self.raw_key_index(predecessor).await?;
+        let second = self.raw_key_index(predecessor).await?;
+        if first.as_ref().map(|(bytes, _)| bytes) != second.as_ref().map(|(bytes, _)| bytes) {
+            return Err(
+                "two reads of the predecessor's key index disagree; a frozen predecessor \
+                 does not change, so one read failed (freenet-core#5857)"
+                    .to_string(),
+            );
+        }
+        let index_absent = first.is_none();
+        let indexed: Vec<ChatDelegateKey> = first.map(|(_, keys)| keys).unwrap_or_default();
+        if indexed != listed {
+            return Err(format!(
+                "the predecessor listed {} key(s) but its stored index holds {}; refusing \
+                 a short export (freenet/river#592)",
+                listed.len(),
+                indexed.len()
+            ));
+        }
         let mut pairs: Vec<SecretPair> = Vec::new();
         for storage_key in candidate_keys(&listed) {
-            // A `None` here is definitive absence — the delegate executed and
-            // said "no value" — a legitimate skip, mirroring the sweep's
-            // `GetResponse { value: None }` arm. Anything unknown already
-            // aborted via the `?`.
-            if let Some(value) = self.get_key(predecessor, &storage_key).await? {
-                pairs.push((storage_key, value));
+            let is_listed = listed
+                .iter()
+                .any(|k| k.as_bytes() == storage_key.as_slice());
+            match self.get_key(predecessor, &storage_key).await? {
+                Some(value) => {
+                    if index_absent {
+                        return Err(format!(
+                            "{:?} is stored but the predecessor has no key index; every \
+                             generation indexes what it stores, so the index read failed",
+                            String::from_utf8_lossy(&storage_key)
+                        ));
+                    }
+                    pairs.push((storage_key, value));
+                }
+                // An unlisted fixed probe that is not there: genuinely absent.
+                None if !is_listed => {}
+                None => {
+                    return Err(format!(
+                        "listed key {:?} answered \"no value\": a read fault, never a \
+                         skip (freenet/river#763)",
+                        String::from_utf8_lossy(&storage_key)
+                    ));
+                }
             }
         }
         Ok(pairs)
@@ -624,8 +837,9 @@ pub(crate) enum RecoveredItem {
     Meta(RoomsMeta),
     /// The outbound-DM plaintext cache.
     OutboundDms(Box<OutboundDmStore>),
-    /// One of this module's own migration markers (a future predecessor's
-    /// store carries them) — never imported, never a failure.
+    /// Migration bookkeeping (this module's markers, the crate's journal, the
+    /// cadence counter: a future predecessor's store carries them) — never
+    /// imported, never a failure. `fetch_secrets` already withholds them.
     MigrationMarker,
     /// A key this version of River does not understand — not ours to copy;
     /// the successor's state stands.
@@ -637,7 +851,7 @@ pub(crate) enum RecoveredItem {
 
 /// Decode one recovered `(key, value)` pair into a [`RecoveredItem`].
 pub(crate) fn classify_recovered(key: &[u8], value: &[u8]) -> RecoveredItem {
-    if is_migration_marker_key(key) {
+    if is_migration_bookkeeping_key(key) {
         return RecoveredItem::MigrationMarker;
     }
     if key == ROOMS_STORAGE_KEY {
@@ -907,23 +1121,193 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
         }
     }
 
-    /// Store a marker on the CURRENT delegate, awaiting the delegate's ack so
-    /// the marker is durable when this returns (the crate's record_marker
-    /// contract — markers are never batched with items).
-    async fn put_marker(&mut self, storage_key: Vec<u8>, value: &[u8]) -> Result<(), String> {
-        let request = ChatDelegateRequestMsg::StoreRequest {
-            key: ChatDelegateKey::new(storage_key),
-            value: value.to_vec(),
-        };
-        match self.channel.request(&self.successor, request).await? {
-            Some(ChatDelegateResponseMsg::StoreResponse { result, .. }) => {
-                result.map_err(|e| format!("delegate refused marker store: {e}"))
-            }
-            Some(other) => Err(format!(
-                "unexpected reply to marker StoreRequest: {other:?}"
-            )),
-            None => Err("marker StoreRequest timed out".to_string()),
+    /// `predecessor`'s marker pair, read per rule 1 ([`read_marker_pair`]):
+    /// the wip marker is read whenever the done marker is absent or empty.
+    pub(crate) async fn read_marker(
+        &mut self,
+        predecessor: &DelegateKey,
+    ) -> Result<Option<MigrationMarker>, String> {
+        let done = self.get_marker(pred_done_marker_key(predecessor)).await?;
+        if done
+            .as_deref()
+            .is_some_and(|v| v != PRED_DONE_MARKER_VALUE_EMPTY)
+        {
+            return Ok(read_marker_pair(done.as_deref(), None));
         }
+        let wip = self.get_marker(pred_wip_marker_key(predecessor)).await?;
+        Ok(read_marker_pair(done.as_deref(), wip.as_deref()))
+    }
+
+    /// Store a value on the CURRENT delegate, awaiting the delegate's ack so it
+    /// is durable when this returns (the crate's record_marker and
+    /// store_journal contracts — never batched with items).
+    async fn put_marker(&mut self, storage_key: Vec<u8>, value: &[u8]) -> Result<(), String> {
+        put_current(self.channel, &self.successor, storage_key, value).await
+    }
+
+    /// Record the in-progress marker without ever downgrading a stored
+    /// `InProgress { saw_data: true }` (marker-contract rule 3), including one
+    /// another session records between our read and our write: the check and
+    /// the write are one compare-and-swap message to the delegate
+    /// (`GetVersionedRequest` + `CasStoreRequest`), retried on a conflict.
+    async fn put_wip_marker(
+        &mut self,
+        predecessor: &DelegateKey,
+        saw_data: bool,
+    ) -> Result<(), String> {
+        let key = ChatDelegateKey::new(pred_wip_marker_key(predecessor));
+        let (mut current, mut generation) = match self
+            .channel
+            .request(
+                &self.successor,
+                ChatDelegateRequestMsg::GetVersionedRequest { key: key.clone() },
+            )
+            .await?
+        {
+            Some(ChatDelegateResponseMsg::GetVersionedResponse {
+                key: reply_key,
+                value,
+                generation,
+            }) if reply_key == key => (value, generation),
+            Some(other) => {
+                return Err(format!(
+                    "unexpected reply to wip-marker GetVersionedRequest: {other:?}"
+                ))
+            }
+            None => return Err("wip-marker GetVersionedRequest timed out".to_string()),
+        };
+        for _ in 0..WIP_MARKER_CAS_ATTEMPTS {
+            let Some(value) = wip_marker_write(current.as_deref(), saw_data) else {
+                // Already says what we would write, or says MORE (data): done.
+                return Ok(());
+            };
+            match self
+                .channel
+                .request(
+                    &self.successor,
+                    ChatDelegateRequestMsg::CasStoreRequest {
+                        key: key.clone(),
+                        value: value.to_vec(),
+                        expected_generation: generation,
+                    },
+                )
+                .await?
+            {
+                Some(ChatDelegateResponseMsg::CasStoreResponse {
+                    key: reply_key,
+                    result,
+                }) if reply_key == key => match result {
+                    CasStoreResult::Stored { .. } => return Ok(()),
+                    CasStoreResult::Conflict {
+                        current_generation,
+                        current_value,
+                    } => {
+                        current = current_value;
+                        generation = current_generation;
+                    }
+                    CasStoreResult::Failed(e) => {
+                        return Err(format!("delegate refused wip-marker store: {e}"))
+                    }
+                },
+                Some(other) => {
+                    return Err(format!(
+                        "unexpected reply to wip-marker CasStoreRequest: {other:?}"
+                    ))
+                }
+                None => return Err("wip-marker CasStoreRequest timed out".to_string()),
+            }
+        }
+        Err("wip-marker store kept conflicting".to_string())
+    }
+}
+
+/// Compare-and-swap attempts for one in-progress marker write. Each conflict
+/// means another session wrote it in between; a handful is plenty.
+const WIP_MARKER_CAS_ATTEMPTS: u32 = 5;
+
+/// What to write over a stored in-progress marker value when recording
+/// `InProgress { saw_data }`: `None` when nothing must be written, because the
+/// stored value already says it or says MORE (data over empty). Pure, so marker
+/// rule 3 ("never downgrade a data wip marker") is unit-testable.
+pub(crate) fn wip_marker_write(stored: Option<&[u8]>, saw_data: bool) -> Option<&'static [u8]> {
+    let stored_data = stored.is_some_and(|v| v != PRED_DONE_MARKER_VALUE_EMPTY);
+    match (stored, saw_data) {
+        // Never downgrade data to empty (rule 3).
+        (Some(_), false) if stored_data => None,
+        (Some(v), false) if v == PRED_DONE_MARKER_VALUE_EMPTY => None,
+        (Some(_), true) if stored_data => None,
+        (_, true) => Some(PRED_DONE_MARKER_VALUE_DATA),
+        (_, false) => Some(PRED_DONE_MARKER_VALUE_EMPTY),
+    }
+}
+
+/// How a pair of stored marker values reads back (marker-contract rule 1):
+/// `Done` wins, EXCEPT that a data in-progress marker beside an EMPTY `Done`
+/// reads as `InProgress { saw_data: true }` — an import started after the empty
+/// seal (the sweep's `note_app_import_started`, or a walk re-asking a
+/// predecessor the journal knows holds data), so the empty seal is wrong.
+/// Reading it as done would let a lost journal seal that import's missing items
+/// away. Pure, so the rule is unit-testable.
+pub(crate) fn read_marker_pair(done: Option<&[u8]>, wip: Option<&[u8]>) -> Option<MigrationMarker> {
+    let wip_marker = wip.map(|v| MigrationMarker::InProgress {
+        saw_data: v != PRED_DONE_MARKER_VALUE_EMPTY,
+    });
+    match done {
+        Some(v) if v != PRED_DONE_MARKER_VALUE_EMPTY => {
+            Some(MigrationMarker::Done { had_data: true })
+        }
+        Some(_) => match wip_marker {
+            Some(MigrationMarker::InProgress { saw_data: true }) => wip_marker,
+            _ => Some(MigrationMarker::Done { had_data: false }),
+        },
+        None => wip_marker,
+    }
+}
+
+/// Store `value` under `key` on the CURRENT delegate (`successor`) and await the
+/// delegate's acknowledgement. `Err` on a refusal, a mismatched reply, or
+/// silence: a store is durable only once the delegate says so.
+async fn put_current<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+    key: Vec<u8>,
+    value: &[u8],
+) -> Result<(), String> {
+    let request = ChatDelegateRequestMsg::StoreRequest {
+        key: ChatDelegateKey::new(key.clone()),
+        value: value.to_vec(),
+    };
+    match channel.request(successor, request).await? {
+        Some(ChatDelegateResponseMsg::StoreResponse {
+            key: reply_key,
+            result,
+            ..
+        }) if reply_key.as_bytes() == key.as_slice() => {
+            result.map_err(|e| format!("delegate refused store: {e}"))
+        }
+        Some(other) => Err(format!("unexpected reply to StoreRequest: {other:?}")),
+        None => Err("StoreRequest timed out (an unacknowledged store is not durable)".to_string()),
+    }
+}
+
+/// GET `key` from the CURRENT delegate. Three-way: the value, a definitive
+/// absence, or `Err` for silence, a transport fault or a mismatched reply —
+/// never `Ok(None)` for a read that did not establish an answer.
+async fn get_current<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+    key: Vec<u8>,
+) -> Result<Option<Vec<u8>>, String> {
+    let request = ChatDelegateRequestMsg::GetRequest {
+        key: ChatDelegateKey::new(key.clone()),
+    };
+    match channel.request(successor, request).await? {
+        Some(ChatDelegateResponseMsg::GetResponse {
+            key: reply_key,
+            value,
+        }) if reply_key.as_bytes() == key.as_slice() => Ok(value),
+        Some(other) => Err(format!("unexpected reply to GetRequest: {other:?}")),
+        None => Err("GetRequest timed out (silence is not absence)".to_string()),
     }
 }
 
@@ -932,48 +1316,43 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
 {
     type Error = String;
 
+    /// The marker contract (freenet-migrate 0.7), rule 1: a data in-progress
+    /// marker beside an EMPTY done marker reads as in progress
+    /// ([`read_marker_pair`]). Done and in-progress are separate keys, so the
+    /// wip marker is read whenever the done marker is absent or empty.
     async fn migration_marker(
         &mut self,
         query: &MarkerQuery<'_>,
     ) -> Result<Option<MigrationMarker>, Self::Error> {
         // `query.legacy_bridge` is ignored: River never used the crate's older
         // generation-keyed `import_secrets_once` markers (module docs).
-        if let Some(value) = self
-            .get_marker(pred_done_marker_key(query.predecessor))
-            .await?
-        {
-            return Ok(Some(MigrationMarker::Done {
-                had_data: value != PRED_DONE_MARKER_VALUE_EMPTY,
-            }));
-        }
-        match self
-            .get_marker(pred_wip_marker_key(query.predecessor))
-            .await?
-        {
-            Some(value) => Ok(Some(MigrationMarker::InProgress {
-                saw_data: value != PRED_DONE_MARKER_VALUE_EMPTY,
-            })),
-            None => Ok(None),
-        }
+        self.read_marker(query.predecessor).await
     }
 
+    /// The marker contract, rules 2 and 3: `InProgress` and `Done` are separate
+    /// keys, so recording one never erases the other; and an `InProgress {
+    /// saw_data: false }` never downgrades a stored data marker, even one
+    /// another session writes concurrently (one compare-and-swap message,
+    /// [`RiverSuccessorIo::put_wip_marker`]).
     async fn record_marker(
         &mut self,
         predecessor: &DelegateKey,
         marker: MigrationMarker,
     ) -> Result<(), Self::Error> {
-        let (key, data) = match marker {
+        match marker {
             MigrationMarker::InProgress { saw_data } => {
-                (pred_wip_marker_key(predecessor), saw_data)
+                self.put_wip_marker(predecessor, saw_data).await
             }
-            MigrationMarker::Done { had_data } => (pred_done_marker_key(predecessor), had_data),
-        };
-        let value = if data {
-            PRED_DONE_MARKER_VALUE_DATA
-        } else {
-            PRED_DONE_MARKER_VALUE_EMPTY
-        };
-        self.put_marker(key, value).await
+            MigrationMarker::Done { had_data } => {
+                let value = if had_data {
+                    PRED_DONE_MARKER_VALUE_DATA
+                } else {
+                    PRED_DONE_MARKER_VALUE_EMPTY
+                };
+                self.put_marker(pred_done_marker_key(predecessor), value)
+                    .await
+            }
+        }
     }
 
     async fn write_secret(&mut self, item: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
@@ -1011,87 +1390,225 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
-/// Page-load-scoped latch for the crate walk. A `static` is per-WASM-instance
-/// state, and a WASM instance lives exactly one page load — so "once per
-/// `static`" IS "once per page load". Deliberately NOT persisted anywhere:
-/// cross-load once-ness comes from the durable per-predecessor markers, and
-/// this latch only stops WebSocket reconnects within one load from stacking
-/// concurrent walks (Delta ships the same latch, untested; this one is
-/// exercised by `arm_walk_latch_fires_exactly_once`).
-static CRATE_WALK_ARMED: AtomicBool = AtomicBool::new(false);
-
-/// Arm the once-per-page-load crate walk. `true` exactly once per page load;
-/// every later call (reconnects, retry paths) gets `false` and must not spawn
-/// a second walk.
-pub(crate) fn arm_crate_walk_once() -> bool {
-    arm_walk_latch(&CRATE_WALK_ARMED)
-}
-
-/// Testable core of [`arm_crate_walk_once`] (the production latch is a global
-/// `static`, which a test cannot reset).
-fn arm_walk_latch(latch: &AtomicBool) -> bool {
-    !latch.swap(true, Ordering::Relaxed)
-}
-
-/// How long the walk will wait for the initial load (the hand-rolled sweep
-/// included) to settle before starting, so its round-trips don't contend with
-/// the sweep's single-waiter correlation slots. Bounded: after this it starts
-/// anyway — a collision degrades to `Unresponsive` + retry-next-load, never to
-/// a wrong write.
-const WALK_QUIESCENCE_MAX_MS: u64 = 60_000;
-const WALK_QUIESCENCE_POLL_MS: u64 = 500;
-
-/// Run the crate's delegate-secret migration walk once.
+/// River's import revision (freenet/river#763). A predecessor the journal
+/// resolved with permanently rejected items under a LOWER revision reopens, so a
+/// fixed decoder retries it. Raise it with any change to how the import path
+/// decodes items.
 ///
-/// Spawned from `fire_legacy_migration_request` behind the once-per-page-load
-/// latch (`arm_crate_walk_once`), so it inherits the freenet/river#253 gate:
-/// it only ever starts when the current delegate was observed empty or a prior
-/// migration was interrupted. Runs ALONGSIDE the hand-rolled sweep (release 1);
-/// its durable per-predecessor markers make subsequent page loads cheap
-/// (marker reads short-circuit to `AlreadyMigrated`) even in the gateway
-/// iframe, where the sweep's own localStorage latch cannot persist.
-pub(crate) async fn run_crate_delegate_migration() -> DelegateMigrationReport {
-    // Let the sweep's burst finish first (see `NodeDelegateChannel` on why).
-    let mut waited = 0u64;
-    while chat_delegate::pending_load_workers() != 0 && waited < WALK_QUIESCENCE_MAX_MS {
-        crate::util::sleep(std::time::Duration::from_millis(WALK_QUIESCENCE_POLL_MS)).await;
-        waited += WALK_QUIESCENCE_POLL_MS;
+/// 1: the delegate-message byte-string decoder (freenet/river#757), which ships
+/// with the journal. No River journal existed under revision 0, but a rehearsal
+/// build of the crate may have written one.
+pub(crate) const RIVER_IMPORT_REVISION: u32 = 1;
+
+impl<C: RiverDelegateChannel, S: RiverImportSeam> JournaledSuccessorIo
+    for RiverSuccessorIo<'_, C, S>
+{
+    /// `Err` for a read that did not establish an answer (silence, a fault, a
+    /// mismatched reply): `None` would make a later store start the journal
+    /// afresh over a stored one.
+    async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        get_current(
+            self.channel,
+            &self.successor,
+            MIGRATION_JOURNAL_KEY.to_vec(),
+        )
+        .await
     }
 
-    let lineage = river_delegate_lineage(chat_delegate::legacy_delegate_pairs());
-    let channel = NodeDelegateChannel;
-    let (report, _seam) = walk_with(
-        &channel,
-        LiveImportSeam::new(),
-        chat_delegate::current_delegate_key(),
-        &lineage,
-    )
-    .await;
+    /// Durable on return: waits for the delegate's acknowledgement.
+    async fn store_journal(&mut self, journal: &[u8]) -> Result<(), Self::Error> {
+        put_current(
+            self.channel,
+            &self.successor,
+            MIGRATION_JOURNAL_KEY.to_vec(),
+            journal,
+        )
+        .await
+    }
 
-    log_migration_report(&report);
-    report
+    // `journal_key` keeps the default (`MIGRATION_JOURNAL_KEY`), which every
+    // walk and export withholds.
+
+    fn import_revision(&self) -> u32 {
+        RIVER_IMPORT_REVISION
+    }
 }
 
-/// The transport/seam-generic core of [`run_crate_delegate_migration`]:
-/// pre-warm the predecessors, then drive the crate's walk with River's reader
-/// and writer adapters. Production supplies [`NodeDelegateChannel`] +
-/// [`LiveImportSeam`]; the tests below supply mocks — everything in between
-/// (probe semantics, the union fetch, classification, ranked merge routing,
-/// marker bookkeeping) is EXACTLY the code production runs.
+/// A seam for journal operations that never import an item (`begin` and the
+/// sweep's `note_app_import_started`). Any call is a bug, reported as a
+/// retryable failure rather than a write.
+pub(crate) struct NoImports;
+
+impl RiverImportSeam for NoImports {
+    async fn merge_rooms(&mut self, _rooms: Rooms, _source_rank: u32) -> Result<(), String> {
+        Err("a journal-only operation tried to import rooms".to_string())
+    }
+    async fn merge_outbound_dms(&mut self, _store: OutboundDmStore) -> Result<(), String> {
+        Err("a journal-only operation tried to import outbound DMs".to_string())
+    }
+    async fn flush(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Journal operations (driven, one at a time, by `migration_journal.rs`)
+// ---------------------------------------------------------------------------
+
+/// `begin_migration_journal` against the current delegate `successor`: start
+/// the journal (read off the markers) the first time, reopen a resolution a
+/// lost flag left wrong, and return the status to decide the walk from.
+pub(crate) async fn begin_with<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: DelegateKey,
+    lineage: &[DelegateLineageEntry],
+) -> Result<JournalStatus, JournalError> {
+    let mut writer = RiverSuccessorIo::new(channel, NoImports, successor);
+    begin_migration_journal(&mut writer, lineage, &river_secret_policy()).await
+}
+
+/// What the hand-rolled sweep does with the data it read from one predecessor,
+/// decided by `note_app_import_started` (freenet/river#763).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepWrite {
+    /// The import is flagged (journal + in-progress marker): merge.
+    Merge,
+    /// The journal says the walk already imported it, and nothing was
+    /// recorded. Merge anyway, through the ranked, tombstone-safe
+    /// `merge_from_source` path, unflagged: it fills a completed import that
+    /// was partial (a short export, freenet-migrate#44 / river#592, or an old
+    /// tab's writes during the rollout), and River's ranked tombstones keep a
+    /// room deleted since from coming back.
+    MergeUnflagged,
+    /// Do not write: the journal could not record the import, or refused it.
+    /// The predecessor is retried on a later load.
+    Skip,
+}
+
+/// Map `note_app_import_started`'s answer to the sweep's action. Pure.
+///
+/// * `Flagged` → merge; `AlreadyImported` → merge unflagged (see
+///   [`SweepWrite::MergeUnflagged`]).
+/// * any `Err` → skip this predecessor on this load; it is retried on the
+///   next. `NotImportable` is treated the same, never as permanent. (River
+///   migrates under Union, so "skip every older one too", the snapshot-policy
+///   rule, does not apply.)
+/// * a variant this build does not know → do not write (`AppImport` is
+///   `#[non_exhaustive]`).
+pub(crate) fn sweep_write_for(result: &Result<AppImport, JournalError>) -> SweepWrite {
+    match result {
+        Ok(AppImport::Flagged) => SweepWrite::Merge,
+        Ok(AppImport::AlreadyImported) => SweepWrite::MergeUnflagged,
+        Ok(_) => SweepWrite::Skip,
+        Err(_) => SweepWrite::Skip,
+    }
+}
+
+/// `note_app_import_started` for the sweep's read of the legacy delegate whose
+/// key bytes are `responding`, after the data is read and before it is merged.
+///
+/// The predecessor's `DelegateKey` is rebuilt from the LINEAGE entry, never
+/// taken from the node's response, so it always matches the crate's
+/// `lineage_key()` (a mismatch would be refused as "not in the lineage", which
+/// is permanent). `items` counts in the walk's unit; see
+/// `response_handler.rs::migrate_legacy_per_room`.
+pub(crate) async fn note_sweep_import_with<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: DelegateKey,
+    lineage: &[DelegateLineageEntry],
+    responding: &[u8],
+    items: Option<u32>,
+) -> SweepWrite {
+    let Some(entry) = lineage
+        .iter()
+        .find(|e| e.delegate_key.as_slice() == responding)
+    else {
+        warn!("sweep: a delegate outside the legacy lineage answered; not merging its data");
+        return SweepWrite::Skip;
+    };
+    let predecessor = DelegateKey::new(entry.delegate_key, CodeHash::new(entry.code_hash));
+    let mut writer = RiverSuccessorIo::new(channel, NoImports, successor);
+    let result = note_app_import_started(
+        &mut writer,
+        lineage,
+        &predecessor,
+        &river_secret_policy(),
+        items,
+    )
+    .await;
+    match &result {
+        Ok(AppImport::Flagged) => info!(
+            "sweep: import from legacy gen {} flagged in the migration journal",
+            entry.generation
+        ),
+        Ok(AppImport::AlreadyImported) => info!(
+            "sweep: legacy gen {} is already imported; merging unflagged through the ranked merge",
+            entry.generation
+        ),
+        Ok(other) => warn!(
+            "sweep: unknown journal answer {other:?} for legacy gen {}; not merging",
+            entry.generation
+        ),
+        Err(JournalError::NotImportable(why)) => error!(
+            "sweep: legacy gen {} refused as not importable ({why}); not merging. \
+             River migrates under Union, so this should be unreachable: check that \
+             the sweep's lineage matches the walk's",
+            entry.generation
+        ),
+        Err(e) => warn!(
+            "sweep: the migration journal could not flag legacy gen {} ({e}); not merging \
+             it on this load",
+            entry.generation
+        ),
+    }
+    sweep_write_for(&result)
+}
+
+/// Read the freenet/river#761 walk-cadence counter from the current delegate.
+/// `Err` when the read did not establish an answer.
+pub(crate) async fn read_walk_cadence<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+) -> Result<u32, String> {
+    match get_current(channel, successor, WALK_CADENCE_KEY.to_vec()).await? {
+        None => Ok(0),
+        Some(bytes) => <[u8; 4]>::try_from(bytes.as_slice())
+            .map(u32::from_le_bytes)
+            .map_err(|_| "walk-cadence counter is not 4 bytes".to_string()),
+    }
+}
+
+/// Store the walk-cadence counter, awaiting the delegate's ack.
+pub(crate) async fn store_walk_cadence<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+    skips: u32,
+) -> Result<(), String> {
+    put_current(
+        channel,
+        successor,
+        WALK_CADENCE_KEY.to_vec(),
+        &skips.to_le_bytes(),
+    )
+    .await
+}
+
+/// The transport/seam-generic journaled walk: pre-warm the predecessors, then
+/// drive `migrate_delegate_secrets_journaled` with River's reader and writer.
+/// Production supplies [`NodeDelegateChannel`] + [`LiveImportSeam`]; the tests
+/// supply mocks — everything in between (probe semantics, the loud fetch,
+/// classification, ranked merge routing, markers, the journal) is EXACTLY the
+/// code production runs.
 pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     channel: &C,
     seam: S,
     successor: DelegateKey,
     lineage: &[DelegateLineageEntry],
-) -> (DelegateMigrationReport, S) {
+) -> (JournaledMigrationReport, S) {
     let mut reader = RiverPredecessorIo::new(channel);
     reader.prewarm(lineage).await;
     let mut writer = RiverSuccessorIo::new(channel, seam, successor);
-    let report = freenet_migrate::migrate_delegate_secrets(
+    let report = migrate_delegate_secrets_journaled(
         &mut writer,
         &mut reader,
         lineage,
@@ -1104,104 +1621,78 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
 
 /// Log the walk's outcome. The report is METADATA ONLY and is never rendered
 /// to the user as counts (`imported_total` legitimately reads 0 for a fully
-/// successful recovery — freenet-migrate#16); the freenet/river#204 gate
-/// (`any_unresponsive`) is surfaced as a warning so a stranded generation is
-/// visible in diagnostics. The hand-rolled sweep owns the user-facing load
-/// states in release 1.
-fn log_migration_report(report: &DelegateMigrationReport) {
+/// successful recovery — freenet-migrate#16). A short retry after an
+/// interrupted import (freenet-migrate#47) and permanently rejected items are
+/// surfaced as warnings: that is River's telemetry for both.
+pub(crate) fn log_migration_report(journaled: &JournaledMigrationReport) {
+    let report = &journaled.report;
     for p in &report.predecessors {
         info!(
             "crate-migration predecessor gen {}: {:?}",
             p.generation(),
             p
         );
+        if p.exported_fewer_after_data() || p.exported_nothing_after_data() {
+            warn!(
+                "crate-migration: legacy gen {} exported fewer items than an interrupted \
+                 import saw; not believed, retried next load (freenet-migrate#44)",
+                p.generation()
+            );
+        }
     }
     if report.any_unresponsive() {
-        warn!(
-            "crate-migration: {} predecessor generation(s) could not be confirmed executable — \
-             their data (if any) may exist but cannot auto-migrate; the walk retries next load",
+        info!(
+            "crate-migration: {} predecessor generation(s) did not answer; they stay \
+             pending in the journal and are retried",
             report.unresponsive().count()
         );
     }
-    if report.is_complete() {
-        info!("crate-migration: walk complete");
-    } else if report.retry_may_help() {
-        info!("crate-migration: walk incomplete; a later run may make progress");
-    } else {
-        warn!("crate-migration: walk incomplete with non-retryable rejections");
+    if let Some(e) = &journaled.journal_error {
+        warn!("crate-migration: migration journal error: {e}");
+    }
+    match &journaled.status {
+        Some(status) => {
+            let rejected = status.rejected_items();
+            if rejected > 0 {
+                warn!(
+                    "crate-migration: {rejected} item(s) were permanently rejected by the \
+                     import path and are NOT in the current delegate (they reopen when \
+                     RIVER_IMPORT_REVISION rises)"
+                );
+            }
+            info!(
+                "crate-migration: journal {} (interrupted import: {})",
+                if status.is_complete() {
+                    "complete"
+                } else {
+                    "incomplete"
+                },
+                status.interrupted_import()
+            );
+        }
+        None => warn!("crate-migration: journal status unknown after the walk"),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests (native). The scenario tests drive the REAL `freenet_migrate` driver
-// through `walk_with` with a scripted transport and an in-memory seam, so
-// everything between the transport and the signals — probe semantics, the
-// union fetch, classification, ranked-merge routing, marker bookkeeping — is
-// exactly the code production runs.
-// ---------------------------------------------------------------------------
+/// Test doubles shared by this module's tests and by `migration_journal.rs`'s.
+///
+/// `MockChannel` models per-delegate key-value stores (with CAS generations and
+/// the delegate's raw key index); it has NO correlation map and cannot model
+/// displacement — `chat_delegate.rs`'s `two_driver_interleaving` tests drive the
+/// real registry for that layer.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_support {
     use super::*;
-    use ed25519_dalek::{SigningKey, VerifyingKey};
-    use freenet_migrate::{PredecessorMigration, WriterFailure, WriterStage};
-    use futures::executor::block_on;
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    // ---------------- fixtures ----------------
-
-    fn vk(seed: u8) -> VerifyingKey {
-        SigningKey::from_bytes(&[seed; 32]).verifying_key()
-    }
-
-    fn cbor<T: serde::Serialize>(v: &T) -> Vec<u8> {
-        let mut out = Vec::new();
-        ciborium::ser::into_writer(v, &mut out).expect("serialize fixture");
-        out
-    }
-
-    fn room_with_identity(owner: VerifyingKey, sk_seed: u8) -> crate::room_data::RoomData {
-        let mut rd = crate::room_data::test_minimal_room_data(owner);
-        rd.self_sk = Some(SigningKey::from_bytes(&[sk_seed; 32]));
-        rd
-    }
-
-    fn rooms_blob_with(owner: VerifyingKey, sk_seed: u8) -> Vec<u8> {
-        let mut rooms = empty_rooms();
-        rooms.map.insert(owner, room_with_identity(owner, sk_seed));
-        cbor(&rooms)
-    }
-
-    /// A 3-generation lineage over a synthetic registry. Delegate key bytes
-    /// `[10;32]`/`[11;32]`/`[12;32]` are generations 0/1/2.
-    fn table3() -> [([u8; 32], [u8; 32]); 3] {
-        [
-            ([10u8; 32], [110u8; 32]),
-            ([11u8; 32], [111u8; 32]),
-            ([12u8; 32], [112u8; 32]),
-        ]
-    }
-
-    fn lineage3() -> Vec<DelegateLineageEntry> {
-        river_delegate_lineage(&table3())
-    }
-
-    fn pred_key(gen_index: usize) -> DelegateKey {
-        let (k, ch) = table3()[gen_index];
-        DelegateKey::new(k, CodeHash::new(ch))
-    }
-
-    fn successor_key() -> DelegateKey {
-        DelegateKey::new([0xAA; 32], CodeHash::new([0xAB; 32]))
-    }
-
     // ---------------- scripted transport ----------------
 
     /// Yields once (waking itself) so concurrent mock requests genuinely
     /// overlap under `join_all`, making `max_in_flight` a real measurement.
-    struct YieldOnce(bool);
+    pub(crate) struct YieldOnce(pub(crate) bool);
     impl std::future::Future for YieldOnce {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -1217,50 +1708,107 @@ mod tests {
 
     /// Scripted behaviour of one delegate on the mock node.
     #[derive(Default)]
-    struct DelegateSim {
+    pub(crate) struct DelegateSim {
         /// KV store; GETs answer from it, Stores land in it.
-        store: BTreeMap<Vec<u8>, Vec<u8>>,
+        pub(crate) store: BTreeMap<Vec<u8>, Vec<u8>>,
         /// Override what `ListRequest` reports (None = the store's keys).
         /// `Some(vec![])` models the frozen legacy WASM's corrupt-index
         /// behaviour: an empty list even though the store holds data.
-        listed: Option<Vec<Vec<u8>>>,
+        pub(crate) listed: Option<Vec<Vec<u8>>>,
         /// The whole delegate never answers (not installed / cannot execute).
-        silent: bool,
+        pub(crate) silent: bool,
         /// GETs for these keys never answer (per-key silence).
-        silent_get_keys: Vec<Vec<u8>>,
+        pub(crate) silent_get_keys: Vec<Vec<u8>>,
         /// When a GET asks for `.0`, reply names key `.1` with value `.2` —
         /// a mis-correlated answer.
-        wrong_key_reply: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+        pub(crate) wrong_key_reply: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+        /// What a GET of the raw key index (`KEY_INDEX_STORAGE_KEY`) answers.
+        /// `None` = derived like the real delegate: the listing's keys encoded as
+        /// a `KeyIndex`, or no index at all when the listing is empty.
+        /// `Some(bytes)` overrides it (`Some(None)`: no index stored).
+        pub(crate) raw_index: Option<Option<Vec<u8>>>,
+        /// If set, the SECOND and later raw-index reads answer this instead (a
+        /// read fault on a re-read).
+        pub(crate) raw_index_reread: Option<Option<Vec<u8>>>,
+        /// Raw-index reads answered so far.
+        pub(crate) raw_index_reads: u32,
+        /// The node answers every request to this delegate with a TYPED "missing
+        /// delegate" (recorded as production's error arm records it) and no reply.
+        pub(crate) not_installed: bool,
+        /// Per-key CAS generation, bumped by every store (the delegate's
+        /// versioning envelope, modelled).
+        pub(crate) generations: BTreeMap<Vec<u8>, u64>,
+        /// Another session's write landing between a reader's
+        /// `GetVersionedRequest` and its `CasStoreRequest` for `.0`: applied
+        /// (once) just before the first CAS for that key.
+        pub(crate) cas_interleave: Option<(Vec<u8>, Vec<u8>)>,
+    }
+
+    impl DelegateSim {
+        /// The raw index the delegate holds: see [`DelegateSim::raw_index`].
+        fn derived_raw_index(&self) -> Option<Vec<u8>> {
+            let keys: Vec<Vec<u8>> = self
+                .listed
+                .clone()
+                .unwrap_or_else(|| self.store.keys().cloned().collect());
+            if keys.is_empty() {
+                return None;
+            }
+            let mut out = Vec::new();
+            ciborium::ser::into_writer(
+                &RawKeyIndex {
+                    keys: keys.into_iter().map(ChatDelegateKey::new).collect(),
+                },
+                &mut out,
+            )
+            .expect("encode index");
+            Some(out)
+        }
+    }
+
+    /// The successor (current delegate) every fixture uses.
+    pub(crate) fn successor_key() -> DelegateKey {
+        DelegateKey::new([0xAA; 32], CodeHash::new([0xAB; 32]))
     }
 
     #[derive(Default)]
-    struct MockChannel {
-        delegates: RefCell<HashMap<Vec<u8>, DelegateSim>>,
-        in_flight: Cell<usize>,
-        max_in_flight: Cell<usize>,
+    pub(crate) struct MockChannel {
+        pub(crate) delegates: RefCell<HashMap<Vec<u8>, DelegateSim>>,
+        pub(crate) in_flight: Cell<usize>,
+        pub(crate) max_in_flight: Cell<usize>,
         /// `(target delegate key bytes, "list" | "get:<key>" | "store:<key>")`
-        log: RefCell<Vec<(Vec<u8>, String)>>,
+        pub(crate) log: RefCell<Vec<(Vec<u8>, String)>>,
     }
 
     impl MockChannel {
-        fn with_delegate(self, key: &DelegateKey, sim: DelegateSim) -> Self {
+        pub(crate) fn with_delegate(self, key: &DelegateKey, sim: DelegateSim) -> Self {
             self.delegates
                 .borrow_mut()
                 .insert(key.bytes().to_vec(), sim);
             self
         }
-        fn reset_counters(&self) {
+        /// Store `value` under `key` on `delegate` directly (fixture setup),
+        /// creating the delegate if needed.
+        pub(crate) fn put(&self, delegate: &DelegateKey, key: &[u8], value: &[u8]) {
+            self.delegates
+                .borrow_mut()
+                .entry(delegate.bytes().to_vec())
+                .or_default()
+                .store
+                .insert(key.to_vec(), value.to_vec());
+        }
+        pub(crate) fn reset_counters(&self) {
             self.in_flight.set(0);
             self.max_in_flight.set(0);
             self.log.borrow_mut().clear();
         }
-        fn stored(&self, delegate: &DelegateKey, key: &[u8]) -> Option<Vec<u8>> {
+        pub(crate) fn stored(&self, delegate: &DelegateKey, key: &[u8]) -> Option<Vec<u8>> {
             self.delegates
                 .borrow()
                 .get(delegate.bytes())
                 .and_then(|sim| sim.store.get(key).cloned())
         }
-        fn requests_to_predecessors(&self, kind: &str) -> usize {
+        pub(crate) fn requests_to_predecessors(&self, kind: &str) -> usize {
             let succ = successor_key().bytes().to_vec();
             self.log
                 .borrow()
@@ -1268,7 +1816,7 @@ mod tests {
                 .filter(|(target, what)| *target != succ && what.starts_with(kind))
                 .count()
         }
-        fn answer(
+        pub(crate) fn answer(
             &self,
             target: &DelegateKey,
             request: ChatDelegateRequestMsg,
@@ -1281,6 +1829,13 @@ mod tests {
                     .push((target.bytes().to_vec(), "unknown".into()));
                 return Ok(None);
             };
+            if sim.not_installed {
+                self.log
+                    .borrow_mut()
+                    .push((target.bytes().to_vec(), "not-installed".into()));
+                note_legacy_delegate_not_installed(target);
+                return Ok(None);
+            }
             match request {
                 ChatDelegateRequestMsg::ListRequest => {
                     self.log
@@ -1303,7 +1858,7 @@ mod tests {
                         target.bytes().to_vec(),
                         format!("get:{}", String::from_utf8_lossy(&kb)),
                     ));
-                    if sim.silent || sim.silent_get_keys.iter().any(|k| *k == kb) {
+                    if sim.silent || sim.silent_get_keys.contains(&kb) {
                         return Ok(None);
                     }
                     if let Some((asked, reply_key, reply_value)) = &sim.wrong_key_reply {
@@ -1313,6 +1868,17 @@ mod tests {
                                 value: Some(reply_value.clone()),
                             }));
                         }
+                    }
+                    if kb == KEY_INDEX_STORAGE_KEY {
+                        sim.raw_index_reads += 1;
+                        let value = match (&sim.raw_index_reread, sim.raw_index_reads) {
+                            (Some(reread), n) if n > 1 => reread.clone(),
+                            _ => sim
+                                .raw_index
+                                .clone()
+                                .unwrap_or_else(|| sim.derived_raw_index()),
+                        };
+                        return Ok(Some(ChatDelegateResponseMsg::GetResponse { key, value }));
                     }
                     Ok(Some(ChatDelegateResponseMsg::GetResponse {
                         key,
@@ -1329,11 +1895,63 @@ mod tests {
                         return Ok(None);
                     }
                     let value_size = value.len();
+                    *sim.generations.entry(kb.clone()).or_default() += 1;
                     sim.store.insert(kb, value);
                     Ok(Some(ChatDelegateResponseMsg::StoreResponse {
                         key,
                         value_size,
                         result: Ok(()),
+                    }))
+                }
+                ChatDelegateRequestMsg::GetVersionedRequest { key } => {
+                    let kb = key.as_bytes().to_vec();
+                    self.log.borrow_mut().push((
+                        target.bytes().to_vec(),
+                        format!("getv:{}", String::from_utf8_lossy(&kb)),
+                    ));
+                    if sim.silent {
+                        return Ok(None);
+                    }
+                    Ok(Some(ChatDelegateResponseMsg::GetVersionedResponse {
+                        value: sim.store.get(&kb).cloned(),
+                        generation: sim.generations.get(&kb).copied().unwrap_or(0),
+                        key,
+                    }))
+                }
+                ChatDelegateRequestMsg::CasStoreRequest {
+                    key,
+                    value,
+                    expected_generation,
+                } => {
+                    let kb = key.as_bytes().to_vec();
+                    self.log.borrow_mut().push((
+                        target.bytes().to_vec(),
+                        format!("cas:{}", String::from_utf8_lossy(&kb)),
+                    ));
+                    if sim.silent {
+                        return Ok(None);
+                    }
+                    if sim.cas_interleave.as_ref().is_some_and(|(k, _)| *k == kb) {
+                        let (k, v) = sim.cas_interleave.take().expect("checked");
+                        *sim.generations.entry(k.clone()).or_default() += 1;
+                        sim.store.insert(k, v);
+                    }
+                    let current = sim.generations.get(&kb).copied().unwrap_or(0);
+                    let result = if current == expected_generation {
+                        sim.store.insert(kb.clone(), value);
+                        sim.generations.insert(kb, current + 1);
+                        CasStoreResult::Stored {
+                            generation: current + 1,
+                        }
+                    } else {
+                        CasStoreResult::Conflict {
+                            current_generation: current,
+                            current_value: sim.store.get(&kb).cloned(),
+                        }
+                    };
+                    Ok(Some(ChatDelegateResponseMsg::CasStoreResponse {
+                        key,
+                        result,
                     }))
                 }
                 other => Err(format!("mock: unsupported request {other:?}")),
@@ -1376,6 +1994,96 @@ mod tests {
             )
             .await
         }
+    }
+
+    /// A real journal status in which every pending predecessor answered "not
+    /// installed" on `streak` consecutive journaled walks and nothing started:
+    /// what `pending_all_absent` needs, reachable only through walks.
+    pub(crate) fn all_absent_status(streak: u32) -> JournalStatus {
+        // Keys no other test uses: `NOT_INSTALLED` is process-global.
+        let table = [([0xA1u8; 32], [0xB1u8; 32]), ([0xA2u8; 32], [0xB2u8; 32])];
+        let lineage = river_delegate_lineage(&table);
+        let mut channel = MockChannel::default();
+        for (key, code) in table {
+            let sim = DelegateSim {
+                not_installed: true,
+                ..Default::default()
+            };
+            channel = channel.with_delegate(&DelegateKey::new(key, CodeHash::new(code)), sim);
+        }
+        channel = channel.with_delegate(&successor_key(), DelegateSim::default());
+        let mut status = None;
+        for _ in 0..streak {
+            let (report, _) = futures::executor::block_on(walk_with(
+                &channel,
+                NoImports,
+                successor_key(),
+                &lineage,
+            ));
+            status = report.status;
+        }
+        status.expect("journaled walk status")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests (native). The scenario tests drive the REAL `freenet_migrate` driver
+// through `walk_with` with a scripted transport and an in-memory seam, so
+// everything between the transport and the signals — probe semantics, the
+// union fetch, classification, ranked-merge routing, marker bookkeeping — is
+// exactly the code production runs.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::tests_support::*;
+    use super::*;
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use freenet_migrate::{
+        DelegateMigrationReport, PredecessorMigration, WriterFailure, WriterStage,
+    };
+    use futures::executor::block_on;
+
+    // ---------------- fixtures ----------------
+
+    fn vk(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    fn cbor<T: serde::Serialize>(v: &T) -> Vec<u8> {
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(v, &mut out).expect("serialize fixture");
+        out
+    }
+
+    fn room_with_identity(owner: VerifyingKey, sk_seed: u8) -> crate::room_data::RoomData {
+        let mut rd = crate::room_data::test_minimal_room_data(owner);
+        rd.self_sk = Some(SigningKey::from_bytes(&[sk_seed; 32]));
+        rd
+    }
+
+    fn rooms_blob_with(owner: VerifyingKey, sk_seed: u8) -> Vec<u8> {
+        let mut rooms = empty_rooms();
+        rooms.map.insert(owner, room_with_identity(owner, sk_seed));
+        cbor(&rooms)
+    }
+
+    /// A 3-generation lineage over a synthetic registry. Delegate key bytes
+    /// `[10;32]`/`[11;32]`/`[12;32]` are generations 0/1/2.
+    fn table3() -> [([u8; 32], [u8; 32]); 3] {
+        [
+            ([10u8; 32], [110u8; 32]),
+            ([11u8; 32], [111u8; 32]),
+            ([12u8; 32], [112u8; 32]),
+        ]
+    }
+
+    fn lineage3() -> Vec<DelegateLineageEntry> {
+        river_delegate_lineage(&table3())
+    }
+
+    fn pred_key(gen_index: usize) -> DelegateKey {
+        let (k, ch) = table3()[gen_index];
+        DelegateKey::new(k, CodeHash::new(ch))
     }
 
     // ---------------- in-memory seam ----------------
@@ -1421,94 +2129,15 @@ mod tests {
         }
     }
 
+    /// One journaled walk; the plain walk report.
     fn walk(channel: &MockChannel, seam: MemorySeam) -> (DelegateMigrationReport, MemorySeam) {
+        let (journaled, seam) = walk_j(channel, seam);
+        (journaled.report, seam)
+    }
+
+    /// One journaled walk, with the journal's status.
+    fn walk_j(channel: &MockChannel, seam: MemorySeam) -> (JournaledMigrationReport, MemorySeam) {
         block_on(walk_with(channel, seam, successor_key(), &lineage3()))
-    }
-
-    // ---------------- the once-per-page-load latch ----------------
-
-    /// The latch arms exactly once. Mutating `arm_walk_latch` to always
-    /// return `true` (removing the latch) makes every reconnect spawn a
-    /// concurrent walk — this is the test that goes red.
-    #[test]
-    fn arm_walk_latch_fires_exactly_once() {
-        let latch = AtomicBool::new(false);
-        assert!(arm_walk_latch(&latch), "first arm must fire");
-        assert!(!arm_walk_latch(&latch), "second arm must NOT fire");
-        assert!(!arm_walk_latch(&latch), "later arms must NOT fire");
-    }
-
-    /// Source pin: the production spawn is gated on the latch, inside
-    /// `fire_legacy_migration_request` AFTER its #253-inherited done-gate and
-    /// per-session guard — deleting the latch call or hoisting the spawn above
-    /// the guards fails here.
-    #[test]
-    fn crate_walk_is_wired_behind_the_latch_and_the_253_gate() {
-        let src = include_str!("../chat_delegate.rs");
-        assert_eq!(
-            src.matches("run_crate_delegate_migration").count(),
-            1,
-            "exactly one call site for the walk in chat_delegate.rs"
-        );
-        // rfind: the signature also appears as a string literal inside
-        // chat_delegate.rs's own mid-file test module; the real definition is
-        // the last fn in that file.
-        let fn_start = src
-            .rfind("pub(crate) async fn fire_legacy_migration_request() -> bool {")
-            .expect("fire_legacy_migration_request must exist");
-        let body = &src[fn_start..];
-        let done_gate = body
-            .find("is_legacy_migration_done()")
-            .expect("the #253-inherited done-gate must exist");
-        let session_guard = body
-            .find("LEGACY_MIGRATION_ATTEMPTED.swap(true")
-            .expect("the per-session guard must exist");
-        let latch = body
-            .find("arm_crate_walk_once() {")
-            .expect("the spawn must be gated on arm_crate_walk_once()");
-        let spawn = body
-            .find("run_crate_delegate_migration")
-            .expect("the walk must be spawned in this function");
-        assert!(
-            done_gate < latch && session_guard < latch,
-            "the latch check must come after BOTH guards (inheriting the #253 gate)"
-        );
-        assert!(
-            latch < spawn,
-            "the spawn must be inside the latch-gated block"
-        );
-
-        // ...and on `any_dispatched`, so a page load whose every send failed
-        // (connection down) does not burn the once-per-page-load latch on a
-        // dead transport. The sweep resets its own per-session guard in that
-        // case so a reconnect re-probes; if the latch were already armed, that
-        // re-probe would never run the walk for the rest of the page load.
-        // Whitespace-stripped, per the repo's source-pin convention, so a
-        // rustfmt wrap does not fail this with a message about `any_dispatched`
-        // that misdescribes the real change. Note the limit: stripping
-        // whitespace does nothing for the fully-qualified path, so importing
-        // `arm_crate_walk_once` and calling it unqualified WOULD fail this with
-        // that same misdescribing message. Fix the pin, not the import, if that
-        // ever happens. (The old
-        // `body[latch..].starts_with(..)` conjunct was true by construction of
-        // `latch` and asserted nothing.)
-        let before: String = body[..latch]
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            before.ends_with("if any_dispatched && super::freenet_api::delegate_migration::"),
-            "the walk spawn must be gated on `any_dispatched &&` — arming it on a \
-             page load where no probe dispatched wastes the latch on a dead transport"
-        );
-        let dispatch_reset = body
-            .find("if !any_dispatched && load_attempt_is_current(attempt)")
-            .expect("the sweep's transport-failure guard reset must exist");
-        assert!(
-            dispatch_reset < latch,
-            "the walk must be armed AFTER any_dispatched is final, or the gate \
-             reads a value that later sends can still change"
-        );
     }
 
     // ---------------- marker keys ----------------
@@ -1925,28 +2554,141 @@ mod tests {
         assert!(!report.is_complete());
     }
 
-    /// The corrupt-index floor: the frozen legacy WASM reports a decode
-    /// failure as an EMPTY list, so the fixed probes must fire even when the
-    /// index lists nothing. Removing the union in `candidate_keys` turns this
-    /// red.
-    #[test]
-    fn a_corrupt_empty_index_still_recovers_the_single_blob_era() {
-        let room_a = vk(1);
+    /// The predecessor gen0 is `Unresponsive` with an error, NOT sealed, and
+    /// nothing of it was imported: the shape every "short export" fault must
+    /// take (freenet/river#592, #763).
+    fn assert_gen0_refused(
+        report: &DelegateMigrationReport,
+        channel: &MockChannel,
+        seam: &MemorySeam,
+    ) {
+        assert!(
+            report.predecessors.iter().any(|p| matches!(
+                p,
+                PredecessorMigration::Unresponsive {
+                    generation: 0,
+                    error: Some(_),
+                    ..
+                }
+            )),
+            "a short export must be a fault, never data: {report:?}"
+        );
+        assert_eq!(
+            channel.stored(&successor_key(), &pred_done_marker_key(&pred_key(0))),
+            None,
+            "a refused predecessor must not be sealed"
+        );
+        assert!(seam.rooms.map.is_empty(), "nothing of it may be imported");
+        assert!(!report.is_complete());
+    }
+
+    fn gen0_with_blob() -> DelegateSim {
         let mut gen0 = DelegateSim::default();
         gen0.store
-            .insert(ROOMS_STORAGE_KEY.to_vec(), rooms_blob_with(room_a, 3));
-        gen0.listed = Some(vec![]); // corrupt index: data present, list empty
-        let channel = MockChannel::default()
+            .insert(ROOMS_STORAGE_KEY.to_vec(), rooms_blob_with(vk(1), 3));
+        gen0
+    }
+
+    fn channel_with_gen0(gen0: DelegateSim) -> MockChannel {
+        MockChannel::default()
             .with_delegate(&pred_key(0), gen0)
             .with_delegate(&pred_key(1), DelegateSim::default())
             .with_delegate(&pred_key(2), DelegateSim::default())
-            .with_delegate(&successor_key(), DelegateSim::default());
+            .with_delegate(&successor_key(), DelegateSim::default())
+    }
 
+    /// freenet/river#592: the frozen legacy WASM turns an index it cannot
+    /// decode into an EMPTY listing. The raw index read sees the undecodable
+    /// bytes, and the export is refused rather than certified as the fixed
+    /// keys alone (which would strand every per-room key for good once the
+    /// journal believes it). The sweep still reads the fixed keys itself.
+    #[test]
+    fn a_corrupt_index_is_a_fault_not_a_short_export() {
+        let mut gen0 = gen0_with_blob();
+        gen0.listed = Some(vec![]); // the frozen WASM's answer
+        gen0.raw_index = Some(Some(vec![0xFF, 0x00, 0x13])); // what is stored
+        let channel = channel_with_gen0(gen0);
         let (report, seam) = walk(&channel, MemorySeam::new());
-        assert!(report.is_complete());
-        assert!(
-            seam.rooms.map.contains_key(&room_a),
-            "rooms_data must be recovered through a corrupt (empty) index"
+        assert_gen0_refused(&report, &channel, &seam);
+    }
+
+    /// Every registered generation indexes what it stores, so an ABSENT index
+    /// beside a stored fixed key is a read fault (freenet-core#5857 reports a
+    /// failed read as "not found"), not an empty delegate.
+    #[test]
+    fn an_absent_index_beside_a_stored_fixed_key_is_a_fault() {
+        let mut gen0 = gen0_with_blob();
+        gen0.listed = Some(vec![]);
+        gen0.raw_index = Some(None);
+        let channel = channel_with_gen0(gen0);
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert_gen0_refused(&report, &channel, &seam);
+    }
+
+    /// A frozen predecessor does not change, so two reads of its index that
+    /// disagree mean one of them failed.
+    #[test]
+    fn two_disagreeing_index_reads_are_a_fault() {
+        let mut gen0 = gen0_with_blob();
+        gen0.raw_index_reread = Some(None);
+        let channel = channel_with_gen0(gen0);
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert_gen0_refused(&report, &channel, &seam);
+    }
+
+    /// The predecessor builds its listing from the same stored index, so a
+    /// listing that disagrees with it is a read fault on one side.
+    #[test]
+    fn a_listing_that_disagrees_with_the_stored_index_is_a_fault() {
+        let room_b = vk(2);
+        let mut gen0 = gen0_with_blob();
+        gen0.listed = Some(vec![ROOMS_STORAGE_KEY.to_vec()]);
+        let index = RawKeyIndex {
+            keys: vec![
+                ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
+                ChatDelegateKey::new(chat_delegate::room_storage_key(&room_b)),
+            ],
+        };
+        gen0.raw_index = Some(Some(cbor(&index)));
+        let channel = channel_with_gen0(gen0);
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert_gen0_refused(&report, &channel, &seam);
+    }
+
+    /// A listed key answering "no value" is a read fault, never a skip
+    /// (freenet/river#763's decision on a stale index entry): River has never
+    /// sent a `DeleteRequest` in production, and the re-keyed delegate updates
+    /// the index before removing a value, so no deployed or future generation
+    /// can hold a stale entry. Skipping it would let a failed read of one room
+    /// certify the rest as everything the predecessor held.
+    #[test]
+    fn a_listed_key_answering_no_value_is_a_fault_not_a_skip() {
+        let room_b = vk(2);
+        let mut gen0 = gen0_with_blob();
+        gen0.listed = Some(vec![
+            ROOMS_STORAGE_KEY.to_vec(),
+            chat_delegate::room_storage_key(&room_b), // listed, value unreadable
+        ]);
+        let channel = channel_with_gen0(gen0);
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert_gen0_refused(&report, &channel, &seam);
+    }
+
+    /// The happy path still recovers through the loud fetch: listing, raw
+    /// index (twice) and values all agree.
+    #[test]
+    fn a_consistent_predecessor_still_imports_through_the_loud_fetch() {
+        let channel = channel_with_gen0(gen0_with_blob());
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert!(report.is_complete(), "{report:?}");
+        assert!(seam.rooms.map.contains_key(&vk(1)));
+        assert_eq!(
+            channel.requests_to_predecessors(&format!(
+                "get:{}",
+                String::from_utf8_lossy(KEY_INDEX_STORAGE_KEY)
+            )),
+            6,
+            "the raw index is read exactly twice per executable predecessor (3 here)"
         );
     }
 
@@ -2458,5 +3200,464 @@ mod tests {
         let k1 = chat_delegate::legacy_scoped_correlation(&pred_key(1), &base);
         let k2 = chat_delegate::legacy_scoped_correlation(&pred_key(2), &base);
         assert!(k0 != k1 && k1 != k2 && k0 != k2);
+    }
+
+    // ---------------- the marker contract (freenet-migrate 0.7) ----------------
+
+    /// Rule 1: a data in-progress marker beside an EMPTY done marker reads as
+    /// in progress (an import started after the empty seal); a data done marker
+    /// always wins; otherwise done wins, else in progress.
+    #[test]
+    fn marker_pair_reads_follow_rule_1() {
+        let d = Some(PRED_DONE_MARKER_VALUE_DATA);
+        let e = Some(PRED_DONE_MARKER_VALUE_EMPTY);
+        use MigrationMarker::{Done, InProgress};
+        assert_eq!(read_marker_pair(None, None), None);
+        assert_eq!(
+            read_marker_pair(None, e),
+            Some(InProgress { saw_data: false })
+        );
+        assert_eq!(
+            read_marker_pair(None, d),
+            Some(InProgress { saw_data: true })
+        );
+        assert_eq!(read_marker_pair(e, None), Some(Done { had_data: false }));
+        assert_eq!(read_marker_pair(e, e), Some(Done { had_data: false }));
+        assert_eq!(
+            read_marker_pair(e, d),
+            Some(InProgress { saw_data: true }),
+            "rule 1: the empty seal is contradicted by a started import"
+        );
+        assert_eq!(read_marker_pair(d, None), Some(Done { had_data: true }));
+        assert_eq!(read_marker_pair(d, e), Some(Done { had_data: true }));
+        assert_eq!(read_marker_pair(d, d), Some(Done { had_data: true }));
+    }
+
+    /// Rule 3: an in-progress marker never downgrades data to empty.
+    #[test]
+    fn wip_marker_writes_follow_rule_3() {
+        let d = PRED_DONE_MARKER_VALUE_DATA;
+        let e = PRED_DONE_MARKER_VALUE_EMPTY;
+        assert_eq!(wip_marker_write(None, false), Some(e));
+        assert_eq!(wip_marker_write(None, true), Some(d));
+        assert_eq!(
+            wip_marker_write(Some(e), true),
+            Some(d),
+            "upgrade empty to data"
+        );
+        assert_eq!(wip_marker_write(Some(e), false), None, "already says it");
+        assert_eq!(wip_marker_write(Some(d), true), None, "already says it");
+        assert_eq!(
+            wip_marker_write(Some(d), false),
+            None,
+            "never downgrade (rule 3)"
+        );
+    }
+
+    fn writer(channel: &MockChannel) -> RiverSuccessorIo<'_, MockChannel, NoImports> {
+        RiverSuccessorIo::new(channel, NoImports, successor_key())
+    }
+
+    /// Rules 2 and 3 through River's real store: recording `InProgress` never
+    /// erases a `Done`, the pair then reads per rule 1, and an empty in-progress
+    /// record never downgrades a data one — including one ANOTHER session
+    /// records between this writer's read and its write (the CAS conflict
+    /// path: without the compare-and-swap, the empty write would land).
+    #[test]
+    fn the_marker_store_follows_rules_2_and_3_against_a_concurrent_writer() {
+        let pred = pred_key(0);
+        let channel = channel_with_gen0(DelegateSim::default());
+        let mut w = writer(&channel);
+
+        block_on(w.record_marker(&pred, MigrationMarker::Done { had_data: false })).unwrap();
+        block_on(w.record_marker(&pred, MigrationMarker::InProgress { saw_data: true })).unwrap();
+        assert!(
+            channel
+                .stored(&successor_key(), &pred_done_marker_key(&pred))
+                .is_some(),
+            "rule 2: recording InProgress must not erase Done"
+        );
+        assert_eq!(
+            block_on(w.read_marker(&pred)).unwrap(),
+            Some(MigrationMarker::InProgress { saw_data: true }),
+            "rule 1 through the real reads"
+        );
+
+        // Rule 3, sequential.
+        block_on(w.record_marker(&pred, MigrationMarker::InProgress { saw_data: false })).unwrap();
+        assert_eq!(
+            channel.stored(&successor_key(), &pred_wip_marker_key(&pred)),
+            Some(PRED_DONE_MARKER_VALUE_DATA.to_vec())
+        );
+
+        // Rule 3 against a concurrent writer: a fresh predecessor, another
+        // session writes the data marker between our read and our write.
+        let pred1 = pred_key(1);
+        channel
+            .delegates
+            .borrow_mut()
+            .get_mut(successor_key().bytes())
+            .unwrap()
+            .cas_interleave = Some((
+            pred_wip_marker_key(&pred1),
+            PRED_DONE_MARKER_VALUE_DATA.to_vec(),
+        ));
+        block_on(w.record_marker(&pred1, MigrationMarker::InProgress { saw_data: false })).unwrap();
+        assert_eq!(
+            channel.stored(&successor_key(), &pred_wip_marker_key(&pred1)),
+            Some(PRED_DONE_MARKER_VALUE_DATA.to_vec()),
+            "rule 3: a concurrent session's data marker must survive our empty write"
+        );
+    }
+
+    // ---------------- the journal's storage ----------------
+
+    /// `load_journal` is `Err` on silence (never `None`, which would make a
+    /// later store start the journal afresh over a stored one), and
+    /// `store_journal` is `Err` until the delegate acknowledges.
+    #[test]
+    fn journal_io_is_loud_on_silence() {
+        let successor = DelegateSim {
+            silent: true,
+            ..Default::default()
+        };
+        let channel = MockChannel::default().with_delegate(&successor_key(), successor);
+        let mut w = writer(&channel);
+        assert!(block_on(w.load_journal()).is_err());
+        assert!(block_on(w.store_journal(b"x")).is_err());
+
+        let channel = channel_with_gen0(DelegateSim::default());
+        let mut w = writer(&channel);
+        assert_eq!(
+            block_on(w.load_journal()).unwrap(),
+            None,
+            "answered absence"
+        );
+        block_on(w.store_journal(b"journal-bytes")).unwrap();
+        assert_eq!(
+            channel.stored(&successor_key(), MIGRATION_JOURNAL_KEY),
+            Some(b"journal-bytes".to_vec()),
+            "stored under the crate's reserved key"
+        );
+        assert_eq!(
+            block_on(w.load_journal()).unwrap(),
+            Some(b"journal-bytes".to_vec())
+        );
+        assert_eq!(w.import_revision(), RIVER_IMPORT_REVISION);
+        const {
+            assert!(
+                RIVER_IMPORT_REVISION >= 1,
+                "raised with the byte-string decoder change (freenet/river#757)"
+            )
+        };
+    }
+
+    /// The journaled walk stores the journal and resolves what it imported;
+    /// a second run's status is the same and re-fetches nothing.
+    #[test]
+    fn the_journaled_walk_resolves_and_stores_the_journal() {
+        let channel = channel_with_gen0(gen0_with_blob());
+        let (first, _) = walk_j(&channel, MemorySeam::new());
+        let status = first.status.expect("journal stored");
+        assert!(status.is_complete(), "{status:?}");
+        assert!(!status.interrupted_import());
+        assert!(channel
+            .stored(&successor_key(), MIGRATION_JOURNAL_KEY)
+            .is_some());
+
+        channel.reset_counters();
+        let (second, seam) = walk_j(&channel, MemorySeam::new());
+        assert_eq!(second.status, Some(status));
+        assert_eq!(channel.requests_to_predecessors("get:"), 0);
+        assert!(seam.rooms.map.is_empty());
+    }
+
+    /// A predecessor's own migration bookkeeping (its journal, its markers, its
+    /// cadence counter: what this delegate will hold once it is a predecessor)
+    /// is never fetched, imported or counted.
+    #[test]
+    fn a_predecessors_bookkeeping_is_never_fetched_or_imported() {
+        let mut gen0 = gen0_with_blob();
+        for key in [
+            MIGRATION_JOURNAL_KEY.to_vec(),
+            WALK_CADENCE_KEY.to_vec(),
+            pred_done_marker_key(&DelegateKey::new([9; 32], CodeHash::new([9; 32]))),
+        ] {
+            gen0.store.insert(key, b"bookkeeping".to_vec());
+        }
+        let channel = channel_with_gen0(gen0);
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert!(report.is_complete(), "{report:?}");
+        assert!(seam.rooms.map.contains_key(&vk(1)));
+        let log = channel.log.borrow();
+        for key in [MIGRATION_JOURNAL_KEY, WALK_CADENCE_KEY] {
+            let asked = format!("get:{}", String::from_utf8_lossy(key));
+            assert!(
+                !log.iter()
+                    .any(|(target, what)| *target == pred_key(0).bytes() && *what == asked),
+                "{asked} must never be fetched from a predecessor"
+            );
+        }
+    }
+
+    // ---------------- the sweep's journal gate ----------------
+
+    #[test]
+    fn sweep_write_mapping() {
+        assert_eq!(sweep_write_for(&Ok(AppImport::Flagged)), SweepWrite::Merge);
+        assert_eq!(
+            sweep_write_for(&Ok(AppImport::AlreadyImported)),
+            SweepWrite::MergeUnflagged
+        );
+        assert_eq!(
+            sweep_write_for(&Err(JournalError::NotImportable("x".into()))),
+            SweepWrite::Skip,
+            "never permanent: skip this load only"
+        );
+        assert_eq!(
+            sweep_write_for(&Err(JournalError::Successor("x".into()))),
+            SweepWrite::Skip
+        );
+    }
+
+    fn note(channel: &MockChannel, gen: usize, items: Option<u32>) -> SweepWrite {
+        block_on(note_sweep_import_with(
+            channel,
+            successor_key(),
+            &lineage3(),
+            pred_key(gen).bytes(),
+            items,
+        ))
+    }
+
+    /// The sweep's whole journal cycle: refused before `begin`; flagged (journal
+    /// + in-progress marker) once begun, so a kill now leaves an interrupted
+    /// import; resolved by the walk; then merged unflagged (the backstop for a
+    /// completed import that was partial). The predecessor key comes from the
+    /// lineage, so the crate never sees a key "not in the lineage".
+    #[test]
+    fn the_sweep_flags_before_merging_and_the_walk_resolves_it() {
+        let channel = channel_with_gen0(gen0_with_blob());
+        assert_eq!(
+            note(&channel, 0, None),
+            SweepWrite::Skip,
+            "no journal yet: begin must come first"
+        );
+        let begun = block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
+        assert!(!begun.interrupted_import());
+
+        assert_eq!(note(&channel, 0, None), SweepWrite::Merge);
+        assert_eq!(
+            channel.stored(&successor_key(), &pred_wip_marker_key(&pred_key(0))),
+            Some(PRED_DONE_MARKER_VALUE_DATA.to_vec()),
+            "the flag is also the predecessor's in-progress marker"
+        );
+        // A kill here: the next load's begin reports the interrupted import.
+        let next_load = block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
+        assert!(next_load.interrupted_import());
+
+        let (walked, seam) = walk_j(&channel, MemorySeam::new());
+        let status = walked.status.expect("status");
+        assert!(!status.interrupted_import(), "{status:?}");
+        assert!(seam.rooms.map.contains_key(&vk(1)), "the walk imported it");
+
+        assert_eq!(
+            note(&channel, 0, None),
+            SweepWrite::MergeUnflagged,
+            "a completed import is still merged, unflagged, through the ranked merge"
+        );
+
+        // A delegate outside the lineage is never merged.
+        assert_eq!(
+            block_on(note_sweep_import_with(
+                &channel,
+                successor_key(),
+                &lineage3(),
+                &[0x77; 32],
+                None
+            )),
+            SweepWrite::Skip
+        );
+    }
+
+    /// freenet-migrate#47: an interrupted sweep import counted 2 items; the
+    /// walk's retry then sees the predecessor export only 1 (a truncated
+    /// index). It must report `exported_fewer_after_data` and stay pending —
+    /// never resolve `Imported` over a partial copy.
+    #[test]
+    fn an_interrupted_sweep_then_a_short_retry_is_not_believed() {
+        let room_a = vk(1);
+        let room_b = vk(2);
+        let mut gen0 = DelegateSim::default();
+        for (room, seed) in [(room_a, 3), (room_b, 4)] {
+            gen0.store.insert(
+                chat_delegate::room_storage_key(&room),
+                cbor(&RoomSlot::Present(Box::new(room_with_identity(room, seed)))),
+            );
+        }
+        let channel = channel_with_gen0(gen0);
+        block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
+        assert_eq!(note(&channel, 0, Some(2)), SweepWrite::Merge);
+
+        // The retry: room_b's index entry is gone (a truncated index).
+        {
+            let mut delegates = channel.delegates.borrow_mut();
+            let sim = delegates.get_mut(pred_key(0).bytes()).unwrap();
+            sim.listed = Some(vec![chat_delegate::room_storage_key(&room_a)]);
+        }
+        let (walked, _seam) = walk_j(&channel, MemorySeam::new());
+        assert!(
+            walked
+                .report
+                .predecessors
+                .iter()
+                .any(|p| p.generation() == 0 && p.exported_fewer_after_data()),
+            "the short retry must be reported: {:?}",
+            walked.report
+        );
+        let status = walked.status.expect("status");
+        assert!(
+            status.interrupted_import(),
+            "still pending with its import flagged, never Imported: {status:?}"
+        );
+        assert_eq!(
+            channel.stored(&successor_key(), &pred_done_marker_key(&pred_key(0))),
+            None
+        );
+    }
+
+    /// The headline residual (freenet/river#763): an interrupted import, then
+    /// the predecessor's index secret is gone on the retry. With a fixed key
+    /// stored, `fetch_secrets` itself refuses (an absent index beside stored
+    /// data). With only per-room keys an absent index looks exactly like an
+    /// empty delegate, and the crate's "nothing after data" rule refuses it.
+    /// Either way the predecessor never resolves `Imported`.
+    #[test]
+    fn an_interrupted_import_then_a_lost_index_never_resolves_imported() {
+        for with_fixed_key in [true, false] {
+            let mut gen0 = DelegateSim::default();
+            gen0.store.insert(
+                chat_delegate::room_storage_key(&vk(2)),
+                cbor(&RoomSlot::Present(Box::new(room_with_identity(vk(2), 4)))),
+            );
+            if with_fixed_key {
+                gen0.store.insert(
+                    OUTBOUND_DMS_STORAGE_KEY.to_vec(),
+                    cbor(&OutboundDmStore::default()),
+                );
+            }
+            let channel = channel_with_gen0(gen0);
+            block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
+            assert_eq!(note(&channel, 0, Some(1)), SweepWrite::Merge);
+            {
+                let mut delegates = channel.delegates.borrow_mut();
+                let sim = delegates.get_mut(pred_key(0).bytes()).unwrap();
+                sim.listed = Some(vec![]);
+                sim.raw_index = Some(None);
+            }
+            let (walked, _) = walk_j(&channel, MemorySeam::new());
+            let status = walked.status.expect("status");
+            assert!(
+                status.interrupted_import(),
+                "with_fixed_key={with_fixed_key}: must stay an interrupted import: {status:?}"
+            );
+            assert_eq!(
+                channel.stored(&successor_key(), &pred_done_marker_key(&pred_key(0))),
+                None,
+                "with_fixed_key={with_fixed_key}"
+            );
+        }
+    }
+
+    // ---------------- ranked merge: deletions, and Union shadowing ----------
+
+    /// "A room deleted after migration is not resurrected" (freenet/river#763's
+    /// gate for merging an already-imported predecessor again): the current
+    /// delegate's tombstone (no rank recorded = authoritative) outranks every
+    /// legacy generation's `Present`.
+    #[test]
+    fn a_room_deleted_after_migration_is_not_resurrected() {
+        let left = vk(1);
+        let channel = channel_with_gen0(gen0_with_blob()); // gen0 holds `left` Present
+        let mut seam = MemorySeam::new();
+        seam.rooms.removed_rooms.insert(left);
+        let (_report, seam) = walk(&channel, seam);
+        assert!(
+            !seam.rooms.map.contains_key(&left),
+            "a legacy copy must not bring back a room the user left"
+        );
+        assert!(seam.rooms.removed_rooms.contains(&left));
+    }
+
+    /// freenet-migrate#42 under Union: a refused newest generation (silent on
+    /// the first walk) lets an older generation's copy of a room be imported
+    /// first. Within the session River's ranked merge still lets the newer
+    /// generation win when it answers: precedence is generation RANK, not
+    /// arrival. (Across a page load the older copy reloads at the current
+    /// delegate's rank; that residual is documented in the module docs.)
+    #[test]
+    fn a_refused_newest_generation_does_not_shadow_it_within_the_session() {
+        let room = vk(5);
+        let mut gen0 = DelegateSim::default();
+        gen0.store
+            .insert(ROOMS_STORAGE_KEY.to_vec(), rooms_blob_with(room, 50));
+        let mut gen2 = DelegateSim::default();
+        gen2.store
+            .insert(ROOMS_STORAGE_KEY.to_vec(), rooms_blob_with(room, 52));
+        gen2.silent = true;
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), gen0)
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+
+        let (_first, seam) = walk(&channel, MemorySeam::new());
+        assert_eq!(
+            seam.rooms.map[&room].self_verifying_key().unwrap(),
+            SigningKey::from_bytes(&[50; 32]).verifying_key(),
+            "gen0's copy lands first while gen2 is silent"
+        );
+
+        channel
+            .delegates
+            .borrow_mut()
+            .get_mut(pred_key(2).bytes())
+            .unwrap()
+            .silent = false;
+        let (_second, seam) = walk(&channel, seam);
+        assert_eq!(
+            seam.rooms.map[&room].self_verifying_key().unwrap(),
+            SigningKey::from_bytes(&[52; 32]).verifying_key(),
+            "the newer generation's identity must win once it answers (rank, not arrival)"
+        );
+    }
+
+    // ---------------- "not installed" ----------------
+
+    /// A typed "missing delegate" makes the probe `NotInstalled`, which the
+    /// journal counts in the absent streak the freenet/river#761 cadence reads;
+    /// plain silence never does.
+    #[test]
+    fn a_typed_missing_delegate_counts_toward_the_absent_streak() {
+        let status = all_absent_status(3);
+        assert!(status.pending_all_absent(3), "{status:?}");
+
+        let gen0 = DelegateSim {
+            silent: true,
+            ..Default::default()
+        };
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), gen0)
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let lineage = river_delegate_lineage(&table3()[..1]);
+        let mut last = None;
+        for _ in 0..3 {
+            let (report, _) = block_on(walk_with(&channel, NoImports, successor_key(), &lineage));
+            last = report.status;
+        }
+        assert!(
+            !last.expect("status").pending_all_absent(1),
+            "silence is never 'not installed'"
+        );
     }
 }

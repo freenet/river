@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
 use super::connection_manager::ConnectionManager;
+use super::delegate_migration::note_legacy_delegate_not_installed;
 use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
     current_delegate_key, is_legacy_delegate_key, note_register_error_for_register_ack,
-    on_current_delegate_missing, request_legacy_seal_on_quiescence,
-    reset_ensure_subscription_dedup, set_up_chat_delegate,
+    on_current_delegate_missing, reset_ensure_subscription_dedup, set_up_chat_delegate,
 };
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
@@ -27,8 +27,8 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
-/// Returns true when an API-response error's message indicates the delegate
-/// a legacy-migration probe targeted does not exist on this node.
+/// Returns true when an API-response error's message indicates a delegate
+/// does not exist on this node.
 ///
 /// freenet/river#705: this used to require BOTH "delegate" and "not found",
 /// which matches freenet-core's internal `wasm_runtime::Error` wording
@@ -37,34 +37,32 @@ use wasm_bindgen_futures::spawn_local;
 /// delegate {0}"). `freenet local` already answers a probe of a
 /// never-registered delegate with `DelegateError::Missing`, and
 /// freenet/freenet-core#5729 makes network-mode nodes do the same (they used
-/// to answer with an empty success instead) — so this branch must also
-/// recognize that wording, or the migration probe is retried forever instead
-/// of being sealed (see `request_legacy_seal_on_quiescence` below).
+/// to answer with an empty success instead), so both wordings count.
 fn is_missing_delegate_error(message: &str) -> bool {
     (message.contains("delegate") && message.contains("not found"))
         || message.contains("missing delegate")
 }
 
-/// Whether an API error means a probed LEGACY delegate is absent, so the
-/// legacy migration may be sealed once the load is quiet.
+/// The LEGACY delegate an API error says is not installed on this node, if it
+/// is a TYPED `DelegateError::Missing` naming a known legacy generation.
 ///
-/// freenet/river#707: the error channel carries no request id, so an error
-/// alone does not say which request failed. The current delegate can also be
-/// reported missing (routinely since freenet/river#757: the load lists before
-/// registering, so the first load after a re-key gets `Missing` and registers
-/// then; also a request the node runs before a `RegisterDelegate` ahead of it,
-/// freenet/river#709), and treating
-/// that as a legacy probe result would seal the migration for good. So a typed
-/// `Missing` seals only when it names a known LEGACY generation, and an untyped
-/// message that names `current` never seals.
-fn should_request_legacy_seal(error: &SynchronizerError, current: &DelegateKey) -> bool {
-    match error.missing_delegate_key() {
-        Some(key) => is_legacy_delegate_key(key.bytes()),
-        None => {
-            let message = error.to_string();
-            is_missing_delegate_error(&message) && !message.contains(&current.to_string())
-        }
-    }
+/// It feeds the migration journal's "not installed" verdict
+/// (`delegate_migration::note_legacy_delegate_not_installed`), which only
+/// counts toward the freenet/river#761 walk cadence and never resolves
+/// anything: "not installed" is not proof a predecessor holds nothing. (It used
+/// to seal the whole legacy migration, the `localStorage` seal the journal
+/// replaced, freenet/river#763.)
+///
+/// Typed only. freenet/river#707: the error channel carries no request id, so
+/// only the key a typed `Missing` carries says which delegate the node meant;
+/// the current delegate is reported missing routinely (freenet/river#757: the
+/// load lists before registering), and an untyped "not found in store" message
+/// or an empty reply (core 0.2.136 and earlier) is silence, never "not
+/// installed".
+fn legacy_not_installed_key(error: &SynchronizerError) -> Option<&DelegateKey> {
+    error
+        .missing_delegate_key()
+        .filter(|key| is_legacy_delegate_key(key.bytes()))
 }
 
 /// Whether an API error reports the CURRENT chat delegate missing: typed
@@ -834,29 +832,15 @@ impl FreenetSynchronizer {
                                     note_register_error_for_register_ack(&current);
                                 }
 
-                                // Errors indicating a probed legacy delegate does not exist
-                                // on this node (see `is_missing_delegate_error`) should
-                                // permanently mark migration as done. The old delegate WASM
-                                // was never installed on this node, so retrying across
-                                // sessions will never succeed.
-                                if should_request_legacy_seal(&e, &current) {
-                                    info!("Delegate not found error (likely legacy migration) - requesting migration seal on quiescence");
-                                    // Quiescence-gated, NOT immediate
-                                    // (freenet/river#527). The fan-out probes ~26
-                                    // generations at once and most are not
-                                    // installed on any given node, so this error
-                                    // arrives within milliseconds of the probes
-                                    // going out — long before any generation that
-                                    // DOES hold data has answered. Sealing here
-                                    // ends the migration for good: a later session
-                                    // whose current delegate is still empty takes
-                                    // the FireMigration branch, finds the seal
-                                    // already set, and probes nothing. One absent
-                                    // legacy delegate must not speak for the other
-                                    // twenty-five.
-                                    request_legacy_seal_on_quiescence();
+                                // A typed "missing delegate" for a LEGACY
+                                // generation: record it for the migration
+                                // journal's absent streak (it resolves
+                                // nothing; see `legacy_not_installed_key`).
+                                if let Some(key) = legacy_not_installed_key(&e) {
+                                    info!("A legacy delegate is not installed on this node; noted for the migration journal");
+                                    note_legacy_delegate_not_installed(key);
                                 } else if names_current_missing(&e, &current) {
-                                    warn!("The CURRENT chat delegate was reported missing; not a legacy probe, so not sealing (freenet/river#707)");
+                                    warn!("The CURRENT chat delegate was reported missing; registering it (freenet/river#707, #757)");
                                     on_current_delegate_missing();
                                 }
 
@@ -1050,11 +1034,12 @@ mod tests {
         assert!(!is_missing_delegate_error("contract abc123 not found"));
     }
 
-    /// freenet/river#707: a `missing delegate` error naming the CURRENT
-    /// delegate (the first-load race of freenet/river#709) must never request
-    /// the legacy-migration seal. A legacy key still does.
+    /// freenet/river#707, #763: a `missing delegate` error naming the CURRENT
+    /// delegate (the first-load race of freenet/river#709) is never recorded as
+    /// a legacy delegate "not installed"; a TYPED one naming a legacy key is,
+    /// and an untyped one never is (silence, not absence).
     #[test]
-    fn missing_current_delegate_never_requests_seal() {
+    fn only_a_typed_missing_legacy_delegate_counts_as_not_installed() {
         use freenet_stdlib::client_api::{ClientError, DelegateError, ErrorKind, RequestError};
         use freenet_stdlib::prelude::CodeHash;
 
@@ -1078,19 +1063,21 @@ mod tests {
             is_missing_delegate_error(&current_missing.to_string()),
             "the message still reads as a missing delegate; only the key tells them apart"
         );
-        assert!(!should_request_legacy_seal(&current_missing, &current));
-        assert!(should_request_legacy_seal(&missing(&legacy), &current));
-        assert!(
-            !should_request_legacy_seal(&missing(&stranger), &current),
-            "a typed Missing seals only for a known legacy generation"
+        assert_eq!(legacy_not_installed_key(&current_missing), None);
+        assert_eq!(legacy_not_installed_key(&missing(&legacy)), Some(&legacy));
+        assert_eq!(
+            legacy_not_installed_key(&missing(&stranger)),
+            None,
+            "a typed Missing counts only for a known legacy generation"
         );
 
-        // Untyped wording from older nodes: the key is only in the text.
+        // Untyped wording from older nodes: the key is only in the text, and
+        // the channel carries no request id, so it is silence, never absence.
         let untyped = |key: &DelegateKey| {
             SynchronizerError::WebSocketError(format!("delegate {key} not found in store"))
         };
-        assert!(!should_request_legacy_seal(&untyped(&current), &current));
-        assert!(should_request_legacy_seal(&untyped(&legacy), &current));
+        assert_eq!(legacy_not_installed_key(&untyped(&current)), None);
+        assert_eq!(legacy_not_installed_key(&untyped(&legacy)), None);
 
         // freenet/river#757: both forms naming the CURRENT delegate make the
         // list-first load register it; neither form naming another key does.
@@ -1151,13 +1138,15 @@ mod tests {
             &DelegateError::Missing(current.clone()).to_string(),
             &current
         ));
-        assert!(!should_request_legacy_seal(&register_failed, &current));
+        assert_eq!(legacy_not_installed_key(&register_failed), None);
 
-        // Unrelated errors never seal.
-        assert!(!should_request_legacy_seal(
-            &SynchronizerError::WebSocketError("contract abc123 not found".into()),
-            &current
-        ));
+        // Unrelated errors never count.
+        assert_eq!(
+            legacy_not_installed_key(&SynchronizerError::WebSocketError(
+                "contract abc123 not found".into()
+            )),
+            None
+        );
     }
 
     #[test]
