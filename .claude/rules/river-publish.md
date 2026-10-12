@@ -415,7 +415,11 @@ A generation with rooms but no DM store counts as holding none: archiving and
 un-archiving both save the store, so it holds no archive decision. A
 generation resolved data-bearing in an EARLIER load counts as holding one,
 because the journal does not record which items it held.
-Otherwise that generation's archives are skipped. The walk runs newest-first,
+Otherwise that generation's archives are skipped, permanently: the journal
+seals that generation in the same walk, so it is never imported again. On
+nodes before 0.2.137 a missing delegate answers with silence, so a newer
+generation that is not installed there makes older archives skip; that cost
+applies only when a newer generation is silent. The walk runs newest-first,
 so a newer answer is known first. Nothing is ever removed. The sweep and the
 top-up never merge archives; the walk does, and it imports every
 predecessor's DM store while the journal is incomplete. A wrong skip shows a

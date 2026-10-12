@@ -5814,6 +5814,122 @@ mod tests {
         );
     }
 
+    /// The pure #776 rule, one disjunct at a time. Journals come from real
+    /// walks over one 2-generation lineage (gen 0 the candidate, gen 1 newer),
+    /// each on its own mock node, on keys no other test uses (`NOT_INSTALLED`
+    /// is process-global).
+    #[test]
+    fn newest_archive_holder_table() {
+        use freenet_migrate::MigrationJournal;
+        let table = [([0x81u8; 32], [0x01u8; 32]), ([0x82; 32], [0x02; 32])];
+        let pairs = table.to_vec();
+        let lineage = river_delegate_lineage(&table);
+        let journal_after = |newer: DelegateSim| -> MigrationJournal {
+            let channel = MockChannel::default()
+                .with_delegate(
+                    &DelegateKey::new(table[0].0, CodeHash::new(table[0].1)),
+                    DelegateSim::default(),
+                )
+                .with_delegate(
+                    &DelegateKey::new(table[1].0, CodeHash::new(table[1].1)),
+                    newer,
+                )
+                .with_delegate(&successor_key(), DelegateSim::default());
+            let _ = block_on(walk_with(
+                &channel,
+                MemorySeam::new(),
+                successor_key(),
+                &lineage,
+            ));
+            let bytes = channel
+                .stored(&successor_key(), MIGRATION_JOURNAL_KEY)
+                .expect("journal stored");
+            MigrationJournal::decode(&bytes).expect("journal decodes")
+        };
+        let r = vk(9);
+        let mut with_room = DelegateSim::default();
+        with_room.store.insert(
+            chat_delegate::room_storage_key(&r),
+            cbor(&RoomSlot::Present(Box::new(room_with_identity(r, 5)))),
+        );
+        let data = journal_after(with_room);
+        let nodata = journal_after(DelegateSim::default());
+        let absent = journal_after(DelegateSim {
+            not_installed: true,
+            ..Default::default()
+        });
+        let silent = journal_after(DelegateSim {
+            silent: true,
+            ..Default::default()
+        });
+        let newer = DelegateKey::new(table[1].0, CodeHash::new(table[1].1));
+        let state = |j: &MigrationJournal| j.entry(&newer).map(|e| e.state);
+        assert!(
+            matches!(state(&data), Some(freenet_migrate::JournalState::Resolved(r)) if r.is_data_bearing()),
+            "fixture: {:?}",
+            state(&data)
+        );
+        assert!(
+            matches!(state(&nodata), Some(freenet_migrate::JournalState::Resolved(r)) if !r.is_data_bearing()),
+            "fixture: {:?}",
+            state(&nodata)
+        );
+        assert!(
+            matches!(state(&absent), Some(freenet_migrate::JournalState::Pending { absent_streak, .. }) if absent_streak > 0),
+            "fixture: {:?}",
+            state(&absent)
+        );
+        assert!(
+            matches!(
+                state(&silent),
+                Some(freenet_migrate::JournalState::Pending {
+                    absent_streak: 0,
+                    ..
+                })
+            ),
+            "fixture: {:?}",
+            state(&silent)
+        );
+        let none = |_: &[u8; 32]| None;
+        let held = |_: &[u8; 32]| Some(true);
+        let empty = |_: &[u8; 32]| Some(false);
+        let no = |_: &[u8; 32]| false;
+        let yes = |_: &[u8; 32]| true;
+        let holder = |j: Option<&MigrationJournal>,
+                      a: &dyn Fn(&[u8; 32]) -> Option<bool>,
+                      n: &dyn Fn(&[u8; 32]) -> bool| {
+            newest_archive_holder(0, &pairs, j, a, n)
+        };
+        // This walk's answer decides first, over the journal.
+        assert!(
+            holder(Some(&data), &empty, &no),
+            "answered without a DM store: defer"
+        );
+        assert!(
+            !holder(Some(&nodata), &held, &no),
+            "answered with a DM store: block"
+        );
+        // The journal's resolution.
+        assert!(
+            holder(Some(&nodata), &none, &no),
+            "resolved, not data-bearing: defer"
+        );
+        assert!(
+            !holder(Some(&data), &none, &no),
+            "resolved, data-bearing: block"
+        );
+        // Pending: typed not installed, by the streak or by this pre-warm.
+        assert!(holder(Some(&absent), &none, &no), "absent streak: defer");
+        assert!(
+            holder(Some(&silent), &none, &yes),
+            "pre-warm not installed: defer"
+        );
+        assert!(!holder(Some(&silent), &none, &no), "silent: block");
+        // No journal: block. The newest generation itself: nothing newer.
+        assert!(!holder(None, &none, &yes), "no journal entry: block");
+        assert!(newest_archive_holder(1, &pairs, None, &none, &no));
+    }
+
     /// #776: archive "data" means a DM store. A newer generation that holds
     /// rooms but no DM store never recorded an archive decision (archiving and
     /// un-archiving both save the DM store), so the older generation's archive
