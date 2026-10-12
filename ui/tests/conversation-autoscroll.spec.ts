@@ -1533,10 +1533,25 @@ test.describe("The end holds after an explicit request", () => {
   // reader stays where they are rather than being taken back to the end.
   const INCREMENTAL_STEPS = 20;
   const INCREMENTAL_GROWTH_PX = 80;
+  // A first growth the hold must absorb, so the steps start from a held end.
+  const HOLD_PROBE_PX = 10;
+  const growNewestRow = (page: Page, paddingBottom: number) =>
+    page.evaluate((padding) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const rows = c.querySelectorAll("[data-item-key]");
+      const before = c.scrollHeight;
+      (rows[rows.length - 1] as HTMLElement).style.paddingBottom = `${padding}px`;
+      return c.scrollHeight - before;
+    }, paddingBottom);
   async function leaveTheEndIncrementally(page: Page, scrollUpOnePixel: (page: Page) => Promise<void>) {
     await openRoomAtBottom(page, "Team Chat Room");
     const start = await scrollMetrics(page);
     expect(start.max, "premise: the history overflows").toBeGreaterThan(INCREMENTAL_STEPS + INCREMENTAL_GROWTH_PX);
+    const probed = await growNewestRow(page, HOLD_PROBE_PX);
+    expect(Math.abs(probed - HOLD_PROBE_PX), `premise: the newest row grew ${probed}px`).toBeLessThanOrEqual(1);
+    await expect
+      .poll(() => distanceFromBottom(page), { message: "premise: the opening holds the end through a growth" })
+      .toBeLessThanOrEqual(1);
     // Every scroll event the container sees from here, with where it put the view.
     await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
@@ -1563,13 +1578,7 @@ test.describe("The end holds after an explicit request", () => {
     const top = (await scrollMetrics(page)).top;
     const row = await expectReadingRow(page);
 
-    const grew = await page.evaluate((grow) => {
-      const c = document.getElementById("chat-scroll-container")!;
-      const rows = c.querySelectorAll("[data-item-key]");
-      const before = c.scrollHeight;
-      (rows[rows.length - 1] as HTMLElement).style.paddingBottom = `${grow}px`;
-      return c.scrollHeight - before;
-    }, INCREMENTAL_GROWTH_PX);
+    const grew = await growNewestRow(page, HOLD_PROBE_PX + INCREMENTAL_GROWTH_PX);
     expect(Math.abs(grew - INCREMENTAL_GROWTH_PX), `premise: the newest row grew ${grew}px`).toBeLessThanOrEqual(1);
 
     // Long enough for a late re-land to show.
@@ -1607,6 +1616,59 @@ test.describe("The end holds after an explicit request", () => {
       await nextFrames(page);
     });
   });
+
+  // The newest row growing in the same frame as a scroll inside the margin
+  // adds to the distance from the end but is not the reader's move, so a
+  // reader inside the margin stays held and is taken back to the end.
+  for (const { what, stepsUp, then } of [
+    { what: "4px up, then 1px down", stepsUp: 4, then: 1 },
+    { what: "3px up, then 1px up", stepsUp: 3, then: -1 },
+  ]) {
+    test(`a reader ${what} while the newest row grows 80px in the same frame keeps the end hold`, async ({
+      page,
+    }) => {
+      await openRoomAtBottom(page, "Team Chat Room");
+      for (let i = 0; i < stepsUp; i++) {
+        await page.evaluate(
+          () =>
+            new Promise<void>((resolve) =>
+              requestAnimationFrame(() => {
+                document.getElementById("chat-scroll-container")!.scrollTop -= 1;
+                requestAnimationFrame(() => resolve());
+              }),
+            ),
+        );
+      }
+      await settle(page);
+      expect(
+        Math.abs((await distanceFromBottom(page)) - stepsUp),
+        `premise: the reader is ${stepsUp}px up`,
+      ).toBeLessThanOrEqual(1);
+
+      // One task: the scroll and the growth land before the next frame's
+      // scroll event, which sees both.
+      const grew = await page.evaluate(
+        ({ by, grow }) => {
+          const c = document.getElementById("chat-scroll-container")!;
+          const rows = c.querySelectorAll("[data-item-key]");
+          const before = c.scrollHeight;
+          c.scrollTop += by;
+          (rows[rows.length - 1] as HTMLElement).style.paddingBottom = `${grow}px`;
+          return c.scrollHeight - before;
+        },
+        { by: then, grow: INCREMENTAL_GROWTH_PX },
+      );
+      expect(Math.abs(grew - INCREMENTAL_GROWTH_PX), `premise: the newest row grew ${grew}px`).toBeLessThanOrEqual(1);
+
+      await expect
+        .poll(() => distanceFromBottom(page), {
+          message: "a growth in the same frame as a move inside the margin released the end hold",
+        })
+        .toBeLessThanOrEqual(1);
+      await page.waitForTimeout(500);
+      expect(await distanceFromBottom(page), "the view left the end after the growth").toBeLessThanOrEqual(1);
+    });
+  }
 
   // Tall enough that the opening's tail sits inside the backfill lead, so the
   // opening backfills: same newest message, more rows.
