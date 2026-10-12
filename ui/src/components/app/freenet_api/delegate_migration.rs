@@ -121,9 +121,13 @@
 //!   conflict (`a_newer_generations_identity_wins_across_a_page_load`, #768
 //!   review B3). Before that, the older `self_sk` reloaded at the current
 //!   delegate's rank and the newer generation's signing key was lost for good.
-//!   What is NOT bounded across a load: a newer generation's TOMBSTONE for a
-//!   room an older generation still held present (the room comes back), and
-//!   an older build's tab saving `rooms_meta` without the field (it drops it).
+//!   The same restored rank lets a newer generation's TOMBSTONE, answering
+//!   on a later load, remove a room an older generation supplied
+//!   (`a_newer_generations_tombstone_wins_across_a_page_load`). What is NOT
+//!   bounded across a load: an older build's tab saving `rooms_meta` without
+//!   the field (it drops it), and the losing identity of a conflict, which is
+//!   discarded rather than archived (an older key the user had been posting
+//!   as is gone once the newer generation's key wins).
 //!   (The sweep no longer holds older generations back after a refusal: that
 //!   blocked the walk it meant to hand them to, #768 round 2.)
 
@@ -4702,6 +4706,64 @@ mod tests {
             unrestored.rooms.map[&room].self_verifying_key().unwrap(),
             SigningKey::from_bytes(&[50; 32]).verifying_key(),
             "control: reloaded at the current rank, the older key is kept"
+        );
+    }
+
+    /// #768 round 2 (Consider): the same restore lets a newer generation's
+    /// TOMBSTONE, answering on a later load, remove a room an older
+    /// generation supplied: the room's restored rank is the older one, and a
+    /// newer generation's tombstone outranks it. (A room the user touched in
+    /// the new build is stamped at the current rank and is not removed.)
+    #[test]
+    fn a_newer_generations_tombstone_wins_across_a_page_load() {
+        let room = vk(5);
+        let mut gen0 = DelegateSim::default();
+        gen0.store
+            .insert(ROOMS_STORAGE_KEY.to_vec(), rooms_blob_with(room, 50));
+        let mut gen2 = DelegateSim::default();
+        gen2.store.insert(
+            chat_delegate::room_storage_key(&room),
+            cbor(&RoomSlot::Tombstone),
+        );
+        gen2.silent = true;
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), gen0)
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let (_first, seam) = walk(&channel, MemorySeam::new());
+        assert!(seam.rooms.map.contains_key(&room));
+        let current_rank = table3().len() as u32;
+        let sources = crate::room_data::persisted_identity_sources(
+            &seam.rooms,
+            &seam.ranks.identity,
+            &table3(),
+            current_rank,
+        );
+        channel
+            .delegates
+            .borrow_mut()
+            .get_mut(pred_key(2).bytes())
+            .unwrap()
+            .silent = false;
+        let reload = |restore: bool| {
+            let mut s = MemorySeam::new();
+            s.rooms = seam.rooms.clone();
+            s.ranks.identity.insert(room.to_bytes(), current_rank);
+            if restore {
+                crate::room_data::restore_identity_ranks(
+                    &mut s.ranks.identity,
+                    &sources,
+                    &table3(),
+                    current_rank,
+                );
+            }
+            s
+        };
+        let (_second, restored) = walk(&channel, reload(true));
+        assert!(
+            !restored.rooms.map.contains_key(&room),
+            "V32's later tombstone removes the room gen0 supplied"
         );
     }
 
