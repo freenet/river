@@ -14,10 +14,9 @@ use super::{display_item_key, display_item_newest, DisplayItem, NewestKey};
 use crate::components::app::CURRENT_ROOM;
 #[cfg(target_arch = "wasm32")]
 use crate::components::foreground::has_layout;
+use crate::components::scroll_to_latest::NEWEST_IN_VIEW_SLACK_PX;
 #[cfg(target_arch = "wasm32")]
-use crate::components::scroll_to_latest::{
-    is_arrival, scroll_to_end, HistoryDom, NEWEST_IN_VIEW_SLACK_PX,
-};
+use crate::components::scroll_to_latest::{is_arrival, scroll_to_end, HistoryDom};
 #[cfg(target_arch = "wasm32")]
 use dioxus::prelude::*;
 use river_core::room_state::message::MessageId;
@@ -96,13 +95,13 @@ pub(super) struct ReaderPosition {
     /// settle, every render) schedules nothing.
     #[cfg(target_arch = "wasm32")]
     seen_noted: std::cell::RefCell<Option<(ed25519_dalek::VerifyingKey, MessageId)>>,
-    /// The end hold: `Some(scrollTop)` while the view sits at the end an
+    /// The end hold: `Some(view)` while the view sits at the end an
     /// explicit request put it at, or a scroll settled at. Rows changing
     /// height take it back there (the ResizeObserver). The reader's first
     /// scroll away, a change of newest message (the render), a room change and
     /// the panel hiding end it; an arrival that is followed lands a new
     /// request, which holds again.
-    end_hold: std::cell::Cell<Option<i32>>,
+    end_hold: std::cell::Cell<Option<HeldView>>,
     /// The room and newest message of the last render's range (`None` for an
     /// empty range). The next render tells a change of newest message from
     /// rows changing height by it. While the range reaches the room's latest
@@ -505,8 +504,34 @@ fn retained_tail_height(container: &web_sys::Element, retained: usize) -> Option
 /// rounds, so an exact comparison would report a 1px difference on a view that
 /// never moved. `conversation-autoscroll.spec.ts` is what catches this being
 /// too tight.
-#[cfg(target_arch = "wasm32")]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
+
+/// The view's top and bottom edges, in content pixels, as the end hold last
+/// saw them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeldView {
+    top: i32,
+    bottom: i32,
+}
+
+/// Does a scroll from `held` to `now`, ending `from_end` px from the
+/// scroller's absolute end, release the end hold? An upward move that ends
+/// more than 4px from the end.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn hold_released(held: HeldView, now: HeldView, from_end: i32) -> bool {
+    now.top < held.top && from_end as f64 > NEWEST_IN_VIEW_SLACK_PX
+}
+
+/// The view's edges as [`HeldView`] records them.
+#[cfg(target_arch = "wasm32")]
+fn view_of(container: &web_sys::Element) -> HeldView {
+    let top = container.scroll_top();
+    HeldView {
+        top,
+        bottom: top + container.client_height(),
+    }
+}
 
 /// Is the view within the end hold's release margin of the scroller's
 /// absolute end? Inside it a settle arms the hold; past it an upward scroll
@@ -521,7 +546,7 @@ fn at_end_within_release_margin(container: &web_sys::Element) -> bool {
 #[cfg(target_arch = "wasm32")]
 fn hold_end(reader: &ReaderPosition, container: &web_sys::Element) {
     scroll_to_end(container);
-    reader.end_hold.set(Some(container.scroll_top()));
+    reader.end_hold.set(Some(view_of(container)));
     // Now, not at the settle: the row read before the request would bound the
     // next render's range (`keep`) and pull a swapped-out range back in.
     remember_reading_position(reader);
@@ -837,20 +862,21 @@ pub(super) fn install_scroll_settle_listener(
     // lets this release while that message is visible and Latest stays hidden.
     // Returns at once unless a hold is on, keeping the scroll path light (#151).
     let release_hold = Closure::wrap(Box::new(move |_: web_sys::Event| {
-        let Some(held_top) = reader.end_hold.get() else {
+        let Some(held) = reader.end_hold.get() else {
             return;
         };
         let Some(container) = ROOM_HISTORY.container() else {
             return;
         };
-        let top = container.scroll_top();
+        let now = view_of(&container);
+        let from_end = container.scroll_height() - now.bottom;
         // Only a move UP counts. A row growing leaves `scrollTop` alone (the
         // ResizeObserver then takes the view back to the end), and a clamp
         // when the history shrinks lands on the end.
-        if top < held_top && !at_end_within_release_margin(&container) {
+        if hold_released(held, now, from_end) {
             reader.end_hold.set(None);
         } else {
-            reader.end_hold.set(Some(top));
+            reader.end_hold.set(Some(now));
         }
     }) as Box<dyn FnMut(web_sys::Event)>);
     let _ = container.add_event_listener_with_callback_and_add_event_listener_options(

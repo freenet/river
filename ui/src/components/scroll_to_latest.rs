@@ -11,7 +11,7 @@ use dioxus_free_icons::Icon;
 /// still count as on screen: fractional layout can leave a row that did scroll
 /// fully into view a pixel short. Past it the Latest button shows, and the
 /// read rule uses the same edge.
-#[cfg(target_arch = "wasm32")]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub const NEWEST_IN_VIEW_SLACK_PX: f64 = 4.0;
 
 /// How far below the visible area (in px) the newest item's bottom may sit
