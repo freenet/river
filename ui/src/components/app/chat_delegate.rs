@@ -6874,7 +6874,7 @@ mod tests {
             async fn merge_outbound_dms(
                 &mut self,
                 _store: OutboundDmStore,
-                _source_rank: u32,
+                _archive_rank: Option<u32>,
             ) -> Result<(), String> {
                 self.dm_merges += 1;
                 Ok(())
