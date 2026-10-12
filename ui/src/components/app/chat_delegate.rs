@@ -10064,8 +10064,9 @@ pub(crate) fn decide_per_room_load_action(migration_interrupted: bool) -> PerRoo
 ///
 /// True while the migration journal's gate is not open
 /// (`migration_journal::current_import_gate`: an import interrupted, a walk
-/// running, the journal not read yet or unreadable, or rejected items — the
-/// user may override the blocking ones) OR any awaited load worker is still in
+/// running, the journal not read yet or unreadable, rejected items, or a
+/// predecessor that may hold rooms not answered yet — the user may override
+/// all but the transient ones) OR any awaited load worker is still in
 /// flight (`PENDING_LOADS != 0`).
 pub(crate) fn rooms_recovery_in_progress() -> bool {
     recovery_in_progress(
