@@ -2439,6 +2439,39 @@ pub(crate) mod tests_support {
         }
         status.expect("journaled walk status")
     }
+
+    /// A status after `walks` journaled walks over a 2-generation lineage whose
+    /// generations are installed but never answer (untyped silence: a delegate
+    /// that cannot execute, or a node that predates typed absence).
+    pub(crate) fn silent_status(walks: u32) -> JournalStatus {
+        static NEXT_PAIR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0x10);
+        let n = NEXT_PAIR.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        let table = [
+            ([n; 32], [n.wrapping_add(0x80); 32]),
+            ([n + 1; 32], [n.wrapping_add(0x81); 32]),
+        ];
+        let lineage = river_delegate_lineage(&table);
+        let mut channel = MockChannel::default();
+        for (key, code) in table {
+            let sim = DelegateSim {
+                silent: true,
+                ..Default::default()
+            };
+            channel = channel.with_delegate(&DelegateKey::new(key, CodeHash::new(code)), sim);
+        }
+        channel = channel.with_delegate(&successor_key(), DelegateSim::default());
+        let mut status = None;
+        for _ in 0..walks {
+            let (report, _) = futures::executor::block_on(walk_with(
+                &channel,
+                NoImports,
+                successor_key(),
+                &lineage,
+            ));
+            status = report.status;
+        }
+        status.expect("journaled walk status")
+    }
 }
 
 // ---------------------------------------------------------------------------

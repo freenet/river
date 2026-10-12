@@ -268,6 +268,18 @@ pub(crate) const CADENCE_ABSENT_STREAK: u32 = 3;
 /// While every pending predecessor is consistently absent, walk on one load in
 /// this many.
 pub(crate) const WALK_EVERY_N_LOADS: u32 = 10;
+/// A pending predecessor that never answers typed-absent (it is installed but
+/// cannot execute, or the node predates typed absence: freenet-core before
+/// 0.2.137 answers a missing delegate with an empty success, and every core
+/// answers a delegate that fails to execute with an untyped error) counts as
+/// persistently silent after this many walks left it unresolved.
+pub(crate) const SILENT_MIN_ATTEMPTS: u32 = 6;
+/// While every pending predecessor is consistently absent or persistently
+/// silent, and at least one is silent, walk on one load in this many. Shorter
+/// than [`WALK_EVERY_N_LOADS`]: a silent predecessor may still hold data and
+/// answer later, so it is retried more often than one the node says it does not
+/// have.
+pub(crate) const SILENT_WALK_EVERY_N_LOADS: u32 = 4;
 
 /// Whether this load runs the walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,12 +297,37 @@ pub(crate) enum WalkDecision {
     },
 }
 
+/// The walk cadence for `status`: `None` when every load must walk, `Some(n)`
+/// to walk on one load in `n` (freenet/river#761).
+///
+/// A rate limit applies only while nothing is mid-import and every pending
+/// predecessor is either consistently absent ([`CADENCE_ABSENT_STREAK`] typed
+/// "not installed" walks in a row) or persistently silent (left unresolved by
+/// [`SILENT_MIN_ATTEMPTS`] walks). All absent: [`WALK_EVERY_N_LOADS`]. Any
+/// silent: [`SILENT_WALK_EVERY_N_LOADS`]. Neither is a seal: the walk keeps
+/// running on the cadence and resolves whatever answers.
+pub(crate) fn walk_cadence(status: &JournalStatus) -> Option<u32> {
+    if status.is_complete() || status.interrupted_import() {
+        return None;
+    }
+    if status.pending_all_absent(CADENCE_ABSENT_STREAK) {
+        return Some(WALK_EVERY_N_LOADS);
+    }
+    let JournalStatus::Incomplete { pending, .. } = status else {
+        return None;
+    };
+    let settled = !pending.is_empty()
+        && pending.iter().all(|p| {
+            p.import != freenet_migrate::ImportFlag::Started
+                && (p.absent_streak >= CADENCE_ABSENT_STREAK || p.attempts >= SILENT_MIN_ATTEMPTS)
+        });
+    settled.then_some(SILENT_WALK_EVERY_N_LOADS)
+}
+
 /// Whether the cadence counter must be read to decide the walk: only for a
 /// status the rate limit can apply to (see [`walk_decision`]).
 pub(crate) fn needs_cadence_counter(status: &JournalStatus) -> bool {
-    !status.is_complete()
-        && !status.interrupted_import()
-        && status.pending_all_absent(CADENCE_ABSENT_STREAK)
+    walk_cadence(status).is_some()
 }
 
 /// Whether a sweep write the journal allowed raises the "flagged since the
@@ -304,24 +341,49 @@ pub(crate) fn sweep_write_raises_flag(write: SweepWrite) -> bool {
 /// Decide the walk from the status `begin` returned (freenet/river#761).
 ///
 /// `Complete` is out of reach while generations this node never had stay
-/// pending, so the walk would otherwise re-probe all 29 generations on every
-/// load for good. `pending_all_absent` is a RATE LIMIT only: while every pending
-/// predecessor answered "not installed" on the last [`CADENCE_ABSENT_STREAK`]
-/// walks and none is mid-import, the walk runs on one load in
-/// [`WALK_EVERY_N_LOADS`], counted in River's own KV (`skips`: `None` when the
-/// counter could not be read, which runs the walk). An interrupted import, or a
-/// predecessor that is silent rather than typed-absent, always walks.
+/// pending, so the walk would otherwise re-probe every generation on every
+/// load for good. [`walk_cadence`] is a RATE LIMIT only: the walk runs on one
+/// load in the cadence it returns, counted in River's own KV (`skips`: `None`
+/// when the counter could not be read, which runs the walk). An interrupted
+/// import, or a predecessor that is neither consistently absent nor
+/// persistently silent yet, always walks.
 pub(crate) fn walk_decision(status: &JournalStatus, skips: Option<u32>) -> WalkDecision {
     if status.is_complete() {
         return WalkDecision::NotNeeded;
     }
-    if status.interrupted_import() || !status.pending_all_absent(CADENCE_ABSENT_STREAK) {
+    let Some(every) = walk_cadence(status) else {
         return WalkDecision::Run;
-    }
+    };
     match skips {
         None => WalkDecision::Run,
-        Some(n) if n.saturating_add(1) >= WALK_EVERY_N_LOADS => WalkDecision::RunResetCadence,
+        Some(n) if n.saturating_add(1) >= every => WalkDecision::RunResetCadence,
         Some(n) => WalkDecision::Skip { skips: n + 1 },
+    }
+}
+
+/// What a page load does once `begin` answered and the walk is decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoadPlan {
+    /// Ask the driver for a journaled walk.
+    pub(crate) walk: bool,
+    /// Run the post-resolve top-up on this load (with the walk when there is
+    /// one, else on its own: it never forces a walk).
+    pub(crate) topup: bool,
+    /// Restart the cadence count, but only once the walk actually runs
+    /// (#768 round 3 CF6): a walk the room-set gate refuses must not spend it.
+    pub(crate) reset_cadence_on_walk: bool,
+}
+
+/// The post-`begin` decision of [`start_journal_load`], as a pure function so
+/// the #761 wiring is pinned: a skipped or unneeded walk never pokes the
+/// driver for a walk, and the top-up follows only the newest predecessor's
+/// resolution.
+pub(crate) fn load_plan(decision: WalkDecision, newest_resolved: bool) -> LoadPlan {
+    let walk = matches!(decision, WalkDecision::Run | WalkDecision::RunResetCadence);
+    LoadPlan {
+        walk,
+        topup: newest_resolved,
+        reset_cadence_on_walk: decision == WalkDecision::RunResetCadence,
     }
 }
 
@@ -401,6 +463,9 @@ static TOPUP_PENDING: AtomicBool = AtomicBool::new(false);
 /// A walk is due on this load's next driver run (as opposed to a top-up only).
 static WALK_WANTED: AtomicBool = AtomicBool::new(false);
 
+/// The cadence count restarts when this load's walk actually runs.
+static RESET_CADENCE_ON_WALK: AtomicBool = AtomicBool::new(false);
+
 // ---------------------------------------------------------------------------
 // begin, on every page load
 // ---------------------------------------------------------------------------
@@ -440,10 +505,6 @@ pub(crate) fn start_journal_load() {
                         Err(_) => WalkDecision::Run,
                     }
                 }
-                WalkDecision::RunResetCadence => {
-                    let _ = store_walk_cadence(&channel, &successor, 0).await;
-                    decision
-                }
                 _ => decision,
             }
         };
@@ -451,16 +512,20 @@ pub(crate) fn start_journal_load() {
         // The post-resolve top-up (#768 review B1) once the newest
         // predecessor is resolved. It runs on its own: it never forces the
         // walk (which the #761 cadence may be skipping this load).
-        let topup = LINEAGE
-            .iter()
-            .max_by_key(|e| e.generation)
-            .is_some_and(|newest| newest_resolved(&status, newest));
-        if matches!(decision, WalkDecision::Run | WalkDecision::RunResetCadence) {
-            if topup {
+        let plan = load_plan(
+            decision,
+            LINEAGE
+                .iter()
+                .max_by_key(|e| e.generation)
+                .is_some_and(|newest| newest_resolved(&status, newest)),
+        );
+        if plan.walk {
+            if plan.topup {
                 TOPUP_PENDING.store(true, Ordering::Relaxed);
             }
+            RESET_CADENCE_ON_WALK.store(plan.reset_cadence_on_walk, Ordering::Relaxed);
             poke_walk();
-        } else if topup {
+        } else if plan.topup {
             poke_topup();
         }
     });
@@ -827,6 +892,14 @@ async fn run_work_locked(attempt: u32, work: DriverWork) {
     if !work.walk {
         return;
     }
+    if RESET_CADENCE_ON_WALK.swap(false, Ordering::Relaxed) {
+        let _ = store_walk_cadence(
+            &NodeDelegateChannel,
+            &chat_delegate::current_delegate_key(),
+            0,
+        )
+        .await;
+    }
     let (report, _seam) = walk_with(
         &NodeDelegateChannel,
         LiveImportSeam::new(attempt),
@@ -1060,6 +1133,130 @@ mod tests {
     /// streaks are only reachable through journaled walks).
     fn all_absent_status() -> JournalStatus {
         super::super::delegate_migration::tests_support::all_absent_status(CADENCE_ABSENT_STREAK)
+    }
+
+    /// freenet/river#768 round 3 (CF2, S5): a predecessor that is installed but
+    /// never answers (it cannot execute, or the node predates typed absence)
+    /// keeps the journal incomplete for good. It must not walk on every load:
+    /// after `SILENT_MIN_ATTEMPTS` walks it is rate-limited, more often than a
+    /// typed-absent one, and never before.
+    #[test]
+    fn a_persistently_silent_predecessor_is_rate_limited_but_retried() {
+        use super::super::delegate_migration::tests_support::silent_status;
+        let early = silent_status(SILENT_MIN_ATTEMPTS - 1);
+        assert_eq!(
+            walk_cadence(&early),
+            None,
+            "not before SILENT_MIN_ATTEMPTS walks"
+        );
+        assert_eq!(walk_decision(&early, Some(0)), WalkDecision::Run);
+        let settled = silent_status(SILENT_MIN_ATTEMPTS);
+        assert_eq!(walk_cadence(&settled), Some(SILENT_WALK_EVERY_N_LOADS));
+        assert!(needs_cadence_counter(&settled));
+        assert_eq!(
+            walk_decision(&settled, Some(0)),
+            WalkDecision::Skip { skips: 1 }
+        );
+        assert_eq!(
+            walk_decision(&settled, Some(SILENT_WALK_EVERY_N_LOADS - 1)),
+            WalkDecision::RunResetCadence
+        );
+        assert_eq!(
+            walk_decision(&settled, None),
+            WalkDecision::Run,
+            "an unreadable counter walks"
+        );
+        assert!(SILENT_WALK_EVERY_N_LOADS < WALK_EVERY_N_LOADS);
+        assert_eq!(walk_cadence(&all_absent_status()), Some(WALK_EVERY_N_LOADS));
+        assert_eq!(
+            walk_cadence(&interrupted_status()),
+            None,
+            "an interrupted import always walks"
+        );
+        assert_eq!(walk_cadence(&fresh_status()), None);
+    }
+
+    /// freenet/river#761 at the wiring (#768 round 3 CF1): only a Run or
+    /// RunResetCadence decision pokes a walk; Skip and NotNeeded never do; the
+    /// top-up follows the newest predecessor's resolution alone; and only
+    /// RunResetCadence restarts the count, and only once the walk runs (CF6).
+    #[test]
+    fn the_load_plan_walks_only_when_the_decision_says_so() {
+        for topup in [false, true] {
+            assert_eq!(
+                load_plan(WalkDecision::Run, topup),
+                LoadPlan {
+                    walk: true,
+                    topup,
+                    reset_cadence_on_walk: false
+                }
+            );
+            assert_eq!(
+                load_plan(WalkDecision::RunResetCadence, topup),
+                LoadPlan {
+                    walk: true,
+                    topup,
+                    reset_cadence_on_walk: true
+                }
+            );
+            assert_eq!(
+                load_plan(WalkDecision::Skip { skips: 3 }, topup),
+                LoadPlan {
+                    walk: false,
+                    topup,
+                    reset_cadence_on_walk: false
+                }
+            );
+            assert_eq!(
+                load_plan(WalkDecision::NotNeeded, topup),
+                LoadPlan {
+                    walk: false,
+                    topup,
+                    reset_cadence_on_walk: false
+                }
+            );
+        }
+    }
+
+    /// The wasm-only `start_journal_load` and driver act on the plan and
+    /// nothing else (source pin: they run only in the browser). The walk is
+    /// poked only under `plan.walk`; the cadence reset is no longer written at
+    /// decision time; and it is written in `run_work_locked` after the walk
+    /// gate let the walk through, before the walk itself.
+    #[test]
+    fn start_journal_load_acts_only_on_the_load_plan() {
+        let src = include_str!("migration_journal.rs");
+        let start = src
+            .find("pub(crate) fn start_journal_load()")
+            .expect("start_journal_load");
+        let end = start
+            + src[start..]
+                .find("\n}\n")
+                .expect("end of start_journal_load");
+        let body = &src[start..end];
+        assert!(
+            body.contains("let plan = load_plan("),
+            "the decision goes through load_plan"
+        );
+        let walk_if = body
+            .find("if plan.walk {")
+            .expect("walk only under plan.walk");
+        let poke = body.find("poke_walk();").expect("poke_walk");
+        assert!(walk_if < poke && body.matches("poke_walk();").count() == 1);
+        assert!(
+            !body.contains("store_walk_cadence(&channel, &successor, 0)"),
+            "the cadence reset must not be written before the walk runs"
+        );
+        let run = src
+            .find("async fn run_work_locked(")
+            .expect("run_work_locked");
+        let run_body = &src[run..];
+        let gate = run_body.find("if !work.walk {").expect("walk gate");
+        let reset = run_body
+            .find("RESET_CADENCE_ON_WALK.swap(false")
+            .expect("reset at walk time");
+        let walk = run_body.find("walk_with(").expect("walk");
+        assert!(gate < reset && reset < walk);
     }
 
     /// freenet/river#595: never walk over a room set that failed to load.
