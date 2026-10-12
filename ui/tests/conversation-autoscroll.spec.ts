@@ -34,6 +34,7 @@ import {
   releaseSettleEvents,
   rowOffset,
   scrollMetrics,
+  settle,
   withheld,
 } from "./history-geometry";
 import { DM_PEER, closeThread, newestHistoryDm, openThread } from "./dm-thread";
@@ -1525,6 +1526,87 @@ test.describe("The end holds after an explicit request", () => {
       }
     });
   }
+
+  // The release margin counts the reader's whole way up from the end, not
+  // each scroll event: twenty 1px events take the reader 20px up and release
+  // the hold, as one 20px scroll would. Then the newest row grows, and the
+  // reader stays where they are rather than being taken back to the end.
+  const INCREMENTAL_STEPS = 20;
+  const INCREMENTAL_GROWTH_PX = 80;
+  async function leaveTheEndIncrementally(page: Page, scrollUpOnePixel: (page: Page) => Promise<void>) {
+    await openRoomAtBottom(page, "Team Chat Room");
+    const start = await scrollMetrics(page);
+    expect(start.max, "premise: the history overflows").toBeGreaterThan(INCREMENTAL_STEPS + INCREMENTAL_GROWTH_PX);
+    // Every scroll event the container sees from here, with where it put the view.
+    await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const tops: number[] = [];
+      (window as any).__riverScrollTops = tops;
+      c.addEventListener("scroll", () => tops.push(c.scrollTop));
+    });
+
+    for (let i = 0; i < INCREMENTAL_STEPS; i++) {
+      await scrollUpOnePixel(page);
+    }
+
+    const tops: number[] = await page.evaluate(() => (window as any).__riverScrollTops);
+    expect(
+      new Set(tops.map(Math.round)).size,
+      `premise: each 1px step was its own scroll event (saw ${JSON.stringify(tops)})`,
+    ).toBeGreaterThanOrEqual(INCREMENTAL_STEPS);
+    const distance = await distanceFromBottom(page);
+    expect(
+      Math.abs(distance - INCREMENTAL_STEPS),
+      `premise: the steps took the reader ${INCREMENTAL_STEPS}px up (now ${distance}px)`,
+    ).toBeLessThanOrEqual(1);
+    await settle(page);
+    const top = (await scrollMetrics(page)).top;
+    const row = await expectReadingRow(page);
+
+    const grew = await page.evaluate((grow) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const rows = c.querySelectorAll("[data-item-key]");
+      const before = c.scrollHeight;
+      (rows[rows.length - 1] as HTMLElement).style.paddingBottom = `${grow}px`;
+      return c.scrollHeight - before;
+    }, INCREMENTAL_GROWTH_PX);
+    expect(Math.abs(grew - INCREMENTAL_GROWTH_PX), `premise: the newest row grew ${grew}px`).toBeLessThanOrEqual(1);
+
+    // Long enough for a late re-land to show.
+    await page.waitForTimeout(1_000);
+    expect(
+      (await scrollMetrics(page)).top,
+      "the newest row grew after the reader scrolled up in 1px steps and the view moved",
+    ).toBeCloseTo(top, 0);
+    await expectRowHeld(page, row.key, row.top, "the newest row grew and the reader's row moved");
+  }
+
+  test("a reader who leaves the end in 1px scroll events releases the end hold", async ({ page }) => {
+    await leaveTheEndIncrementally(page, (page) =>
+      // One step per frame, no gesture: each step is its own scroll event.
+      page.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => {
+              const c = document.getElementById("chat-scroll-container")!;
+              c.scrollTop -= 1;
+              requestAnimationFrame(() => resolve());
+            }),
+          ),
+      ),
+    );
+  });
+
+  test("a reader who leaves the end in 1px wheel steps releases the end hold", { tag: "@chromium-only" }, async ({
+    page,
+  }) => {
+    await leaveTheEndIncrementally(page, async (page) => {
+      const box = (await page.locator("#chat-scroll-container").boundingBox())!;
+      await page.mouse.move(box.x + 4, box.y + box.height / 2);
+      await page.mouse.wheel(0, -1);
+      await nextFrames(page);
+    });
+  });
 
   // Tall enough that the opening's tail sits inside the backfill lead, so the
   // opening backfills: same newest message, more rows.

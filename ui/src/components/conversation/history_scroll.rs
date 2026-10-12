@@ -98,10 +98,11 @@ pub(super) struct ReaderPosition {
     /// The end hold: `Some(view)` while the view sits at the end an
     /// explicit request put it at, or a scroll settled at. Rows changing
     /// height take it back there (the ResizeObserver). The reader's first
-    /// scroll away, a change of newest message (the render), a room change and
-    /// the panel hiding end it; an arrival that is followed lands a new
-    /// request, which holds again. A clamp from the chat area growing keeps
-    /// it.
+    /// scroll away (once it takes the view past the 4px margin, in one scroll
+    /// event or several), a change of newest message (the render), a room
+    /// change and the panel hiding end it; an arrival that is followed lands
+    /// a new request, which holds again. A clamp from the chat area growing
+    /// keeps it.
     end_hold: std::cell::Cell<Option<HeldView>>,
     /// The room and newest message of the last render's range (`None` for an
     /// empty range). The next render tells a change of newest message from
@@ -508,8 +509,9 @@ fn retained_tail_height(container: &web_sys::Element, retained: usize) -> Option
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
-/// The view's top and bottom edges, in content pixels, as the end hold last
-/// saw them.
+/// The view's top and bottom edges, in content pixels: where the end hold
+/// last placed the view, or where a scroll that kept it last left it (see
+/// [`end_hold_after_scroll`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HeldView {
     top: i32,
@@ -526,6 +528,32 @@ fn hold_released(held: HeldView, now: HeldView, from_end: i32) -> bool {
     now.top < held.top
         && now.bottom < held.bottom - SCROLL_TOP_SLACK_PX
         && from_end as f64 > NEWEST_IN_VIEW_SLACK_PX
+}
+
+/// The end hold after a scroll event moved the view from `held` to `now`,
+/// ending `from_end` px from the scroller's absolute end: released
+/// ([`hold_released`]), or the view the next event is measured against.
+///
+/// A reader's upward move that stays inside the margin keeps `held`, so the
+/// next one adds to it: twenty 1px scroll events release the hold as one 20px
+/// scroll would. Such a move adds its whole rise to the distance from the
+/// end. Anything else that keeps the hold moves the reference to `now`: a
+/// clamp from the chat area growing (the bottom edge stays), the content
+/// shrinking under a view at the end (both edges rise, but the view stays at
+/// the end), a move back down.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn end_hold_after_scroll(held: HeldView, now: HeldView, from_end: i32) -> Option<HeldView> {
+    if hold_released(held, now, from_end) {
+        return None;
+    }
+    let rise = held.bottom - now.bottom;
+    let reader_moved_up_inside_margin =
+        now.top < held.top && rise > 0 && rise <= from_end + SCROLL_TOP_SLACK_PX;
+    Some(if reader_moved_up_inside_margin {
+        held
+    } else {
+        now
+    })
 }
 
 /// The view's edges as [`HeldView`] records them.
@@ -864,10 +892,13 @@ pub(super) fn install_scroll_settle_listener(
 
     // Release the hold only on a move the reader made: an upward scroll that
     // raises both of the view's edges and ends more than 4px from the
-    // scroller's absolute end (`hold_released`). Accepted for now: the padding
-    // below the newest message lets this release while that message is
-    // visible and Latest stays hidden. Returns at once unless a hold is on,
-    // keeping the scroll path light (#151).
+    // scroller's absolute end (`hold_released`). Measured from the view the
+    // hold was last placed at or a clamp last left, not from the previous
+    // event, so small scroll events add up (`end_hold_after_scroll`): no
+    // gesture tracking, and nothing outlives the hold. Accepted for now: the
+    // padding below the newest message lets this release while that message
+    // is visible and Latest stays hidden. Returns at once unless a hold is
+    // on, keeping the scroll path light (#151).
     let release_hold = Closure::wrap(Box::new(move |_: web_sys::Event| {
         let Some(held) = reader.end_hold.get() else {
             return;
@@ -881,12 +912,11 @@ pub(super) fn install_scroll_settle_listener(
         // shrinks lands on the end. A clamp from the chat area growing (the
         // composer collapsing, the keyboard closing) raises only the top edge,
         // even when a row grows in the same frame. In each case the
-        // ResizeObserver then takes the view back to the end.
-        if hold_released(held, now, from_end) {
-            reader.end_hold.set(None);
-        } else {
-            reader.end_hold.set(Some(now));
-        }
+        // ResizeObserver then takes the view back to the end, and that
+        // placement is the reference the next event is measured from.
+        reader
+            .end_hold
+            .set(end_hold_after_scroll(held, now, from_end));
     }) as Box<dyn FnMut(web_sys::Event)>);
     let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
         "scroll",
@@ -1122,6 +1152,97 @@ mod tests {
         ] {
             if hold_released(held, now, from_end) != released {
                 wrong.push(format!("{what}: expected released = {released}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Scroll events add up: a reader who leaves the end in steps of a pixel
+    /// or two releases the hold once the steps together pass the 4px margin,
+    /// as one jump that far would. A clamp in between (the chat area growing,
+    /// the content shrinking under the view) starts the count again from
+    /// where it left the view, so neither an old count nor an old view
+    /// survives it. Each sequence starts held at the end and runs every
+    /// scroll event through the transition the scroll listener applies.
+    #[test]
+    fn the_end_hold_releases_once_small_upward_moves_add_up_past_the_margin() {
+        let view = |top: i32, bottom: i32| HeldView { top, bottom };
+        let held = view(1133, 1633);
+        // `count` scroll events of `step` px up from `from`, a view at the
+        // end, with the content unchanged.
+        let upward = |from: HeldView, step: i32, count: i32| {
+            (1..=count)
+                .map(|i| (view(from.top - i * step, from.bottom - i * step), i * step))
+                .collect::<Vec<_>>()
+        };
+        let then = |a: Vec<(HeldView, i32)>, b: Vec<(HeldView, i32)>| [a, b].concat();
+        let chat_area_clamp = view(871, 1633);
+        let shrink_clamp = view(1100, 1600);
+        let mut wrong = Vec::new();
+        // (scroll events, the event that releases the hold (0-based) or None, what)
+        for (events, expected, what) in [
+            (
+                upward(held, 1, 20),
+                Some(4),
+                "twenty 1px scroll events up from the end",
+            ),
+            (
+                upward(held, 2, 10),
+                Some(2),
+                "ten 2px scroll events up from the end",
+            ),
+            (upward(held, 1, 4), None, "four 1px scroll events up"),
+            (
+                (0..10)
+                    .flat_map(|_| [(view(1132, 1632), 1), (view(1133, 1633), 0)])
+                    .collect(),
+                None,
+                "1px up and back, ten times",
+            ),
+            (
+                then(vec![(chat_area_clamp, 0)], upward(chat_area_clamp, 1, 20)),
+                Some(5),
+                "a clamp from the chat area growing, then 1px scroll events up",
+            ),
+            (
+                then(vec![(shrink_clamp, 0)], upward(shrink_clamp, 1, 20)),
+                Some(5),
+                "the content shrinking under the view, then 1px scroll events up",
+            ),
+            (
+                then(
+                    upward(held, 1, 3),
+                    then(vec![(chat_area_clamp, 0)], upward(chat_area_clamp, 1, 3)),
+                ),
+                None,
+                "3px up, a clamp from the chat area growing, 3px up again",
+            ),
+            (
+                vec![(shrink_clamp, 0), (view(838, 1600), 80)],
+                None,
+                "the content shrinking under the view, then the composer collapsing \
+                 while the newest row grows 80px in the same frame",
+            ),
+            (
+                then(upward(held, 1, 3), vec![(view(871, 1633), 80)]),
+                None,
+                "3px up, then the composer collapsing while the newest row grows \
+                 80px in the same frame",
+            ),
+        ] {
+            let mut hold = Some(held);
+            let mut released = None;
+            for (i, (now, from_end)) in events.into_iter().enumerate() {
+                hold = end_hold_after_scroll(hold.expect("still held"), now, from_end);
+                if hold.is_none() {
+                    released = Some(i);
+                    break;
+                }
+            }
+            if released != expected {
+                wrong.push(format!(
+                    "{what}: released at event {released:?}, expected {expected:?}"
+                ));
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
