@@ -237,3 +237,10 @@ description = "Last chat-delegate generation before river-core 0.1.22 and its ro
 date = "2026-09-24"
 delegate_key = "c15cbbb7f850cc63e45faa4c05c82f174b0c8dc6a1670b938264b4b503f79b16"
 code_hash = "c2e6063899624b65715d683fbbba04637ba89b72dc17f5b1610343922356fc46"
+
+[[entry]]
+version = "V33"
+description = "Last chat-delegate generation whose ChatDelegateRequestMsg/ChatDelegateResponseMsg byte fields serialize as CBOR integer arrays, before the migration-journal adoption (river-core 0.1.22, freenet/river#772); the successor encodes them as CBOR byte strings (freenet/river#757) and stores the freenet-migrate completeness journal (freenet/river#763)"
+date = "2026-10-12"
+delegate_key = "e6d48cb3a7e605387466eb0db9fca7287987e3766f2b5005e81090c36685828b"
+code_hash = "81b562f82cecabdf8b9fabd74a77a94f6d885ae60cb0c306a49dbc027756c889"

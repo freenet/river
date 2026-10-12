@@ -181,6 +181,11 @@ fn handle_store_request(
     let secret_key = create_origin_key(origin, &key);
     let index_key = create_index_key(origin);
 
+    // Read the index FIRST: an index that exists but does not decode fails
+    // the request before anything is written (freenet/river#592), rather than
+    // being replaced by a one-key index that hides every other key.
+    let mut key_index = get_key_index(ctx, &index_key)?;
+
     // Wrap the value in a versioned envelope, bumping the generation, so
     // that plain (non-CAS) writers stay consistent with CAS readers and
     // never leave an un-versioned value behind (freenet/river#345).
@@ -202,8 +207,7 @@ fn handle_store_request(
         secret_key.len()
     ));
 
-    // Update the key index
-    let mut key_index = get_key_index(ctx, &index_key);
+    // Update the key index (read above, before the value was written).
     if !key_index.keys.contains(&key) {
         key_index.keys.push(key.clone());
         set_key_index(ctx, &index_key, &key_index)?;
@@ -253,6 +257,12 @@ fn handle_get_request(
 /// at 0/1). That is safe today because no CAS-tracked key is ever deleted;
 /// see the "generation resets on delete" section in `versioning.rs` before
 /// wiring a delete for a key that uses compare-and-swap.
+///
+/// The index is updated BEFORE the value is removed, and only when it lists
+/// the key (freenet/river#592). So a failed index write leaves the key listed
+/// AND present, never a listed key with no value (a "stale" entry a migration
+/// reader cannot tell from a failed read), and a delete of an unlisted key
+/// never rewrites the index at all.
 fn handle_delete_request(
     ctx: &mut DelegateCtx,
     origin: &Origin,
@@ -262,18 +272,21 @@ fn handle_delete_request(
     let secret_key = create_origin_key(origin, &key);
     let index_key = create_index_key(origin);
 
+    // Update the key index first, and only if it lists the key. An index that
+    // does not decode fails the request before anything is removed.
+    let mut key_index = get_key_index(ctx, &index_key)?;
+    if key_index.keys.contains(&key) {
+        key_index.keys.retain(|k| k != &key);
+        set_key_index(ctx, &index_key, &key_index)?;
+        logging::info(&format!(
+            "Removed key from index, now has {} keys",
+            key_index.keys.len()
+        ));
+    }
+
     // Remove the secret via host function
     ctx.remove_secret(&secret_key);
     logging::info("Removed secret");
-
-    // Update the key index
-    let mut key_index = get_key_index(ctx, &index_key);
-    key_index.keys.retain(|k| k != &key);
-    set_key_index(ctx, &index_key, &key_index)?;
-    logging::info(&format!(
-        "Removed key from index, now has {} keys",
-        key_index.keys.len()
-    ));
 
     // Create response for the client
     let response = ChatDelegateResponseMsg::DeleteResponse {
@@ -291,8 +304,11 @@ fn handle_list_request(
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let index_key = create_index_key(origin);
 
-    // Get the key index directly
-    let key_index = get_key_index(ctx, &index_key);
+    // Get the key index directly. An index that exists but does not decode
+    // is an error, never an empty list (freenet/river#592): a migration
+    // reading this delegate as a predecessor would otherwise certify a short
+    // export as everything it holds.
+    let key_index = get_key_index(ctx, &index_key)?;
     logging::info(&format!(
         "Returning list with {} keys",
         key_index.keys.len()
@@ -344,6 +360,8 @@ fn handle_cas_store_request(
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let secret_key = create_origin_key(origin, &key);
     let index_key = create_index_key(origin);
+    // Read the index before writing anything (see `handle_store_request`).
+    let mut key_index = get_key_index(ctx, &index_key)?;
 
     let result = match apply_cas_store(
         ctx.get_secret(&secret_key).as_deref(),
@@ -367,7 +385,6 @@ fn handle_cas_store_request(
             let _ = ctx.set_secret(&secret_key, &bytes);
 
             // Update the key index (same as the plain store path).
-            let mut key_index = get_key_index(ctx, &index_key);
             if !key_index.keys.contains(&key) {
                 key_index.keys.push(key.clone());
                 set_key_index(ctx, &index_key, &key_index)?;
@@ -540,11 +557,23 @@ fn handle_sign_request(
 // Helper Functions
 // ============================================================================
 
-/// Get the key index from secrets, or return empty if not found
-fn get_key_index(ctx: &mut DelegateCtx, index_key: &[u8]) -> KeyIndex {
-    ctx.get_secret(index_key)
-        .and_then(|data| ciborium::from_reader::<KeyIndex, _>(data.as_slice()).ok())
-        .unwrap_or_default()
+/// Get the key index from secrets: empty when none is stored, an error when
+/// one is stored but does not decode (freenet/river#592).
+fn get_key_index(ctx: &mut DelegateCtx, index_key: &[u8]) -> Result<KeyIndex, DelegateError> {
+    decode_key_index(ctx.get_secret(index_key).as_deref())
+}
+
+/// The stored index bytes as a [`KeyIndex`]. Absent is a legitimately empty
+/// index; present but undecodable is an error. Earlier generations turned the
+/// second into an empty index, which a `ListResponse` then reported as "no
+/// keys" and the next store wrote back over the real one: every key vanished
+/// from the listing with no error (freenet/river#592).
+fn decode_key_index(stored: Option<&[u8]>) -> Result<KeyIndex, DelegateError> {
+    match stored {
+        None => Ok(KeyIndex::default()),
+        Some(bytes) => ciborium::from_reader::<KeyIndex, _>(bytes)
+            .map_err(|e| DelegateError::Deser(format!("Stored key index does not decode: {e}"))),
+    }
 }
 
 /// Set the key index in secrets
@@ -1043,5 +1072,25 @@ mod tests {
             }
             _ => panic!("Expected SignResponse, got {:?}", response),
         }
+    }
+
+    /// freenet/river#592: an index that is stored but does not decode is an
+    /// error, never an empty index. An empty one was reported by
+    /// `ListResponse` as "no keys" and written back over the real index by
+    /// the next store.
+    #[test]
+    fn an_undecodable_index_is_an_error_not_an_empty_index() {
+        assert!(decode_key_index(None).unwrap().keys.is_empty());
+
+        let index = KeyIndex {
+            keys: vec![ChatDelegateKey::new(b"room:a".to_vec())],
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&index, &mut bytes).unwrap();
+        assert_eq!(decode_key_index(Some(&bytes)).unwrap().keys, index.keys);
+
+        assert!(decode_key_index(Some(&[0xFF, 0x00, 0x13])).is_err());
+        // Truncated: a valid prefix of a real index.
+        assert!(decode_key_index(Some(&bytes[..bytes.len() - 2])).is_err());
     }
 }

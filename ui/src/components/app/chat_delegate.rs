@@ -4588,7 +4588,7 @@ mod tests {
     /// (freenet/river#398 moved codegen to `freenet-migrate-build`) must
     /// reproduce it byte-identically, or every user silently re-runs legacy
     /// migration once. Pinned to the value computed from the current
-    /// `legacy_delegates.toml` (29 entries spanning V1..V32 — V4–V6 removed —
+    /// `legacy_delegates.toml` (30 entries spanning V1..V33 — V4–V6 removed —
     /// in file order). This value
     /// SHOULD change when a genuinely new legacy entry is added — update the
     /// constant then — but must NEVER change from a codegen/tooling swap.
@@ -4623,9 +4623,14 @@ mod tests {
     /// bound) change its WASM, as does the mandatory
     /// `river-core` 0.1.21 -> 0.1.22 bump. Measured at origin/main 1ce80050:
     /// main rebuilds to the V32 hash unchanged.
+    ///
+    /// Updated for V33 (freenet/river#768): the byte-string request/response
+    /// encoding (#757), the #592 key-index fixes and the crash-safe key-value
+    /// writes change the delegate. V33 is the river-core 0.1.22 delegate that
+    /// freenet/river#772 shipped (81b562f8...).
     #[test]
     fn legacy_set_fingerprint_is_stable_across_codegen_changes() {
-        assert_eq!(legacy_set_fingerprint(), "10f72d68c4c4ad91");
+        assert_eq!(legacy_set_fingerprint(), "643c7e4ed7054f8b");
     }
 
     /// The "migration in progress" and "migration done" localStorage keys MUST
@@ -6316,6 +6321,10 @@ mod tests {
     /// (`.claude/rules/delegate-migration.md`) INCLUDING a new
     /// `legacy_delegates.toml` entry, at which point this hash must be updated
     /// alongside that entry, never alone.
+    ///
+    /// Updated for V32 (freenet/river#757 + #763): the byte-string encoding of
+    /// the delegate's message byte fields and the freenet/river#592 key-index
+    /// fixes change the delegate WASM; V32 is the outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
