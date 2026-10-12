@@ -652,25 +652,47 @@ pub fn count_unread_in_room(
     })
 }
 
+/// The open room's unread count under its notification mode, and whether
+/// that mode is Mentions & replies
+/// ([`NotificationMode`](crate::room_data::NotificationMode)), which counts
+/// only mentions of the reader and replies to them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CurrentRoomUnread {
+    pub count: usize,
+    pub is_mentions: bool,
+}
+
 /// Count the open room's unread messages under its notification mode.
 ///
 /// Drives the badge on the members panel's mobile back arrow
 /// (`back_to_chat.rs`): while that panel replaces the chat, Latest is hidden
 /// with it and so is the room list, whose open-room row counts the same value
-/// behind the rooms panel (`room_list.rs`). Called as
-/// `use_memo(count_unread_in_current_room)`, so like
-/// [`count_unread_behind_rooms_panel`] it anchors and nudges itself; pinned by
-/// `unread_wrappers_anchor_and_nudge` below.
-pub fn count_unread_in_current_room() -> usize {
+/// with [`count_unread_in_room_data_with_mode`] behind the rooms panel
+/// (`room_list.rs`). Called as `use_memo(count_unread_in_current_room)`, so
+/// like [`count_unread_behind_rooms_panel`] it anchors and nudges itself;
+/// pinned by `unread_wrappers_anchor_and_nudge` below.
+pub fn count_unread_in_current_room() -> CurrentRoomUnread {
     crate::util::signal_guard::anchor();
-    let Some(current) = CURRENT_ROOM.read().owner_key else {
-        return 0;
+    let Ok(current) = CURRENT_ROOM.try_read() else {
+        crate::util::signal_guard::schedule_nudge();
+        return CurrentRoomUnread::default();
+    };
+    let Some(current) = current.owner_key else {
+        return CurrentRoomUnread::default();
     };
     let Ok(rooms) = ROOMS.try_read() else {
         crate::util::signal_guard::schedule_nudge();
-        return 0;
+        return CurrentRoomUnread::default();
     };
-    count_unread_in_room(&rooms.map, &rooms.notification_modes, &current)
+    CurrentRoomUnread {
+        count: count_unread_in_room(&rooms.map, &rooms.notification_modes, &current),
+        is_mentions: rooms
+            .notification_modes
+            .get(&current)
+            .copied()
+            .unwrap_or_default()
+            == crate::room_data::NotificationMode::MentionsAndReplies,
+    }
 }
 
 /// Count unread messages waiting *behind* the mobile rooms panel: rooms
@@ -1108,7 +1130,7 @@ mod tests {
             "count_unread_behind_rooms_panel",
             "count_unread_in_current_room",
         ] {
-            let marker = format!("pubfn{name}()->usize{{");
+            let marker = format!("pubfn{name}()->");
             let start = squashed.find(&marker).unwrap_or_else(|| {
                 panic!("{name}'s signature changed shape — re-anchor this pin, do not delete it")
             });

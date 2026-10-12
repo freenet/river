@@ -95,7 +95,7 @@ pub(crate) fn room_list_display_state(
 /// one of their messages — so the copy must not claim "messages", and must
 /// name replies as well as mentions (freenet/river#500). Both variants are
 /// singular-aware so a count of 1 never reads "1 unread messages".
-fn unread_badge_label(unread: usize, is_mentions: bool) -> String {
+pub(crate) fn unread_badge_label(unread: usize, is_mentions: bool) -> String {
     match (is_mentions, unread) {
         (true, 1) => "1 unread mention or reply".to_string(),
         (true, n) => format!("{n} unread mentions or replies"),

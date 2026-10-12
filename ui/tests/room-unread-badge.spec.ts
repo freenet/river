@@ -395,11 +395,11 @@ test.describe("Members back arrow counts the open room's unread messages", () =>
 
     await deliverOffscreen(page, "first arrival behind the members panel");
     await expect(membersBadge(page), "the back arrow does not count the arrival").toHaveText("1");
-    await expect(backArrow(page)).toHaveAccessibleName("Back to chat, 1 unread");
+    await expect(backArrow(page)).toHaveAccessibleName("Back to chat, 1 unread message");
 
     await deliverOffscreen(page, "second arrival behind the members panel");
     await expect(membersBadge(page), "the back arrow does not count the second arrival").toHaveText("2");
-    await expect(backArrow(page)).toHaveAccessibleName("Back to chat, 2 unread");
+    await expect(backArrow(page)).toHaveAccessibleName("Back to chat, 2 unread messages");
   });
 
   test("with nothing unread the back arrow shows no badge", async ({ page }) => {
@@ -438,7 +438,7 @@ test.describe("Members back arrow counts the open room's unread messages", () =>
       timeout: 5_000,
     });
     await expect(membersBadge(page), "an arrival that mentions the reader was not counted").toHaveText("1");
-    await expect(backArrow(page)).toHaveAccessibleName("Back to chat, 1 unread");
+    await expect(backArrow(page)).toHaveAccessibleName("Back to chat, 1 unread mention or reply");
   });
 
   // A hidden chat has no layout, so the arrival is not followed: back in the
