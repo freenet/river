@@ -2042,6 +2042,29 @@ mod tests {
         );
     }
 
+    /// freenet/river#763 review A1: migrated data may be merged and saved only
+    /// for the CURRENT load attempt, once it read the whole current room set,
+    /// and while nothing it loaded failed.
+    #[test]
+    fn the_room_set_is_complete_only_for_the_current_clean_attempt() {
+        // latch = attempt + 1
+        assert!(
+            room_set_complete_core(1, 0, 0, false),
+            "first attempt, clean"
+        );
+        assert!(!room_set_complete_core(0, 0, 0, false), "never marked");
+        assert!(!room_set_complete_core(1, 0, 0, true), "a fetch failed");
+        assert!(
+            !room_set_complete_core(1, 0, 1, false),
+            "a newer attempt began"
+        );
+        assert!(
+            !room_set_complete_core(1, 1, 1, false),
+            "a mark for an older attempt does not vouch for the new one"
+        );
+        assert!(room_set_complete_core(8, 7, 7, false));
+    }
+
     /// freenet/river#763: the journal is the ONLY migration authority. The
     /// `localStorage` "done" seal and "in progress" flag it replaced never
     /// persisted in the gateway's sandboxed iframe (localStorage throws there),
@@ -10439,6 +10462,51 @@ fn schedule_idle_resolution(armed_gen: u32, armed_attempt: u32) {
 /// (`guard_drop_applies` / `backstop_should_apply`), so a worker or timer from a
 /// superseded attempt is a complete no-op.
 static LOAD_ATTEMPT_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// The current load attempt (see [`LOAD_ATTEMPT_GEN`]).
+pub(crate) fn current_load_attempt() -> u32 {
+    LOAD_ATTEMPT_GEN.load(Ordering::Relaxed)
+}
+
+/// `attempt + 1` once that load attempt has read the CURRENT delegate's whole
+/// room set: every listed slot and `rooms_meta` answered with a value that
+/// decoded, or there was nothing to read. `0`: no attempt has. (The `+ 1`
+/// keeps a fresh latch from vouching for attempt 0, the page load's first.)
+static ROOM_SET_COMPLETE: AtomicU32 = AtomicU32::new(0);
+
+/// Record that load attempt `attempt` read the current delegate's whole room
+/// set (freenet/river#763 review A1). A superseded attempt records nothing.
+pub(crate) fn mark_room_set_complete(attempt: u32) {
+    if load_attempt_is_current(attempt) {
+        ROOM_SET_COMPLETE.store(attempt.wrapping_add(1), Ordering::Relaxed);
+    }
+}
+
+/// Whether migrated data may be merged and saved now on behalf of load
+/// attempt `attempt`: it is still the current attempt, it read the whole
+/// current room set, and nothing it loaded failed. Merging older copies into a
+/// set this load could not fully read, then saving, lets the save keep the
+/// in-memory identity of a room whose stored slot failed to load and overwrite
+/// it (freenet/river#595's chain). The journaled walk checks it before it runs
+/// and again before every merge and its flush.
+pub(crate) fn room_set_complete(attempt: u32) -> bool {
+    room_set_complete_core(
+        ROOM_SET_COMPLETE.load(Ordering::Relaxed),
+        attempt,
+        LOAD_ATTEMPT_GEN.load(Ordering::Relaxed),
+        SAW_FETCH_FAILURE.load(Ordering::Relaxed),
+    )
+}
+
+/// The pure core of [`room_set_complete`].
+pub(crate) fn room_set_complete_core(
+    latch: u32,
+    attempt: u32,
+    current_attempt: u32,
+    saw_fetch_failure: bool,
+) -> bool {
+    attempt == current_attempt && latch == attempt.wrapping_add(1) && !saw_fetch_failure
+}
 
 /// Begin a FRESH load attempt (freenet/river#397 Codex review 8). Called at the
 /// TOP of every load entry point — `set_up_chat_delegate` (initial AND every

@@ -982,19 +982,42 @@ pub(crate) trait RiverImportSeam {
 pub(crate) struct LiveImportSeam {
     rooms_dirty: bool,
     dms_dirty: bool,
+    /// The load attempt this import runs on behalf of.
+    attempt: u32,
 }
 
 impl LiveImportSeam {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(attempt: u32) -> Self {
         Self {
             rooms_dirty: false,
             dms_dirty: false,
+            attempt,
+        }
+    }
+
+    /// Refuse (retryably) when the current room set is no longer known
+    /// complete for this import's load attempt: a reconnect or Retry began a
+    /// new attempt, or something this attempt loaded failed. Checked before
+    /// every merge and before the flush, so nothing is merged into, saved over,
+    /// or sealed on top of an incomplete set (freenet/river#763 review A1,
+    /// #595). A refusal is a retryable item or flush failure: the predecessor
+    /// stays pending and the next load retries.
+    fn ensure_room_set_complete(&self) -> Result<(), String> {
+        if chat_delegate::room_set_complete(self.attempt) {
+            Ok(())
+        } else {
+            Err(
+                "the current room set is not known complete for this load attempt; \
+                 not importing over it"
+                    .to_string(),
+            )
         }
     }
 }
 
 impl RiverImportSeam for LiveImportSeam {
     async fn merge_rooms(&mut self, rooms: Rooms, source_rank: u32) -> Result<(), String> {
+        self.ensure_room_set_complete()?;
         self.rooms_dirty = true;
         let (tx, rx) = futures::channel::oneshot::channel::<Result<(), String>>();
         crate::util::defer(move || {
@@ -1028,6 +1051,7 @@ impl RiverImportSeam for LiveImportSeam {
     }
 
     async fn merge_outbound_dms(&mut self, store: OutboundDmStore) -> Result<(), String> {
+        self.ensure_room_set_complete()?;
         self.dms_dirty = true;
         // Same helpers the sweep's legacy DM arm uses, and idempotent per entry
         // — but the PUBLIC forms defer their signal writes through
@@ -1060,6 +1084,7 @@ impl RiverImportSeam for LiveImportSeam {
     }
 
     async fn flush(&mut self) -> Result<(), String> {
+        self.ensure_room_set_complete()?;
         if self.rooms_dirty {
             // The coalesced save's per-room CAS (`reconcile_room_present`) is
             // River's own import path to the delegate; its returned result is
@@ -4037,5 +4062,37 @@ mod tests {
             !last.expect("status").pending_all_absent(1),
             "silence in this burst is silence, whatever an earlier burst heard"
         );
+    }
+
+    /// freenet/river#763 review A1: the live seam re-checks the room set
+    /// before every merge and before its flush, so a reconnect or a load
+    /// failure DURING a walk stops it merging into, saving over, or sealing on
+    /// top of an incomplete set. The seam touches Dioxus signals, so it is
+    /// pinned in source; `room_set_complete_core` is tested in chat_delegate.
+    #[test]
+    fn the_live_seam_rechecks_the_room_set_before_merging_and_flushing() {
+        let src = include_str!("delegate_migration.rs");
+        let production = src.split("mod tests_support {").next().expect("production");
+        let seam = production
+            .find("impl RiverImportSeam for LiveImportSeam {")
+            .expect("live seam");
+        let seam = &production[seam..];
+        let seam = &seam[..seam.find("\n}\n").expect("impl ends")];
+        for f in [
+            "async fn merge_rooms(",
+            "async fn merge_outbound_dms(",
+            "async fn flush(",
+        ] {
+            let at = seam.find(f).unwrap_or_else(|| panic!("{f}"));
+            let body = &seam[at..];
+            let first_stmt = body.find('{').expect("body") + 1;
+            assert!(
+                body[first_stmt..]
+                    .trim_start()
+                    .starts_with("self.ensure_room_set_complete()?;"),
+                "{f} must refuse before doing anything"
+            );
+        }
+        assert!(production.contains("chat_delegate::room_set_complete(self.attempt)"));
     }
 }

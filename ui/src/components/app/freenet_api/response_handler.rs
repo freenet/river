@@ -21,7 +21,7 @@ use crate::components::app::chat_delegate::{
     decide_legacy_migration_action, decide_per_room_load_action, enqueue_delegate_request,
     fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
     is_legacy_delegate_key, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_outbound_dms_hydrated, note_current_list_response,
+    mark_outbound_dms_hydrated, mark_room_set_complete, note_current_list_response,
     note_delegate_response_for_register_ack, parse_room_storage_key, per_room_terminal,
     prune_outbound_dms_for_purges, request_outbound_dms_once, response_correlation_base,
     room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate,
@@ -820,6 +820,9 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // probe was skipped (nothing is coming — the fast path for a returning
             // empty user). The universal backstop (armed in `set_up_chat_delegate`)
             // guarantees termination if the probe finds nothing.
+            // The current delegate lists no rooms: its room set is complete
+            // (empty), so nothing it holds can be overwritten by a migration.
+            mark_room_set_complete(worker.attempt());
             let fired = fire_legacy_migration_request().await;
             worker.set_load_state(load_state_after_probe_legacy(fired));
         }
@@ -936,9 +939,15 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                         }
                     },
                     Ok(ChatDelegateResponseMsg::GetResponse { value: None, .. }) => {
-                        // Listed in the index but the value is gone — a DEFINITIVE
-                        // "no value", a legitimate skip, NOT a fetch failure.
-                        warn!("Room key {:?} listed but value missing", vk);
+                        // Listed in the index but no value: a FETCH FAILURE
+                        // (freenet/river#763 review A1). River has never sent
+                        // a DeleteRequest, and the delegate indexes a key only
+                        // after storing it, so a listed key with no value is a
+                        // read fault (freenet-core#5857 reports one as "not
+                        // found"), never a deleted room.
+                        warn!("Room key {:?} listed but value missing (read fault)", vk);
+                        had_fetch_error = true;
+                        worker.mark_fetch_failure();
                     }
                     Ok(other) => {
                         error!("Unexpected response loading room {:?}: {:?}", vk, other);
@@ -964,12 +973,19 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                     }) => match from_reader::<RoomsMeta, _>(&bytes[..]) {
                         Ok(meta) => Some(meta),
                         Err(e) => {
+                            // An incomplete room set (#763 review A1): the
+                            // meta carries tombstone-independent view state a
+                            // migration would otherwise save over.
                             error!("Unparseable rooms_meta: {}", e);
+                            had_fetch_error = true;
+                            worker.mark_fetch_failure();
                             None
                         }
                     },
                     Ok(_) => {
-                        warn!("rooms_meta listed but value missing");
+                        warn!("rooms_meta listed but value missing (read fault)");
+                        had_fetch_error = true;
+                        worker.mark_fetch_failure();
                         None
                     }
                     Err(e) => {
@@ -979,6 +995,7 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                         // connection would fail too). Mark it so the load resolves
                         // to LoadFailed rather than a silent Empty.
                         error!("Failed to load rooms_meta: {}", e);
+                        had_fetch_error = true;
                         worker.mark_fetch_failure();
                         None
                     }
@@ -991,6 +1008,12 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // follows hydration skip any room hydration left unchanged instead
             // of re-reading every room's full value (freenet/river#757).
             seed_saved_slots_from_load(&slots, meta.as_ref());
+            // Every listed slot and `rooms_meta` answered and decoded: this
+            // attempt holds the whole current room set, so the journaled walk
+            // may merge into it and save (freenet/river#763 review A1).
+            if !had_fetch_error {
+                mark_room_set_complete(worker.attempt());
+            }
             let loaded = reconstruct_rooms(slots, meta);
             // Capture emptiness BEFORE `loaded` is moved into hydrate, for the
             // authoritative terminal decision below.
@@ -1183,6 +1206,12 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
             value: Some(bytes), ..
         }) => match from_reader::<Rooms, _>(&bytes[..]) {
             Ok(loaded) => {
+                // The current delegate's only room data is this blob, read
+                // whole: the set is complete (the recovery re-run is called
+                // from a per-room load, which records its own).
+                if !recovery {
+                    mark_room_set_complete(worker.attempt());
+                }
                 // A partial explosion is recovered on the next load: the blob
                 // stays beside the per-room keys it produced, and a per-room load
                 // that sees both re-runs it (`LoadPlan::PerRoom::has_blob`).
@@ -3470,8 +3499,10 @@ mod tests {
             "the PerRoom terminal must be worker.set_load_state(per_room_terminal(loaded_map_empty, listed_count, had_fetch_error))"
         );
 
-        // (b) the per-room fetch loop's three failure arms mark both signals; the
-        // value: None arm marks neither. Bound to the loop (marker → `let meta`).
+        // (b) the per-room fetch loop's FOUR failure arms mark both signals,
+        // the `value: None` arm included (freenet/river#763 review A1: a listed
+        // slot with no value is a read fault, so the room set is incomplete).
+        // Bound to the loop (marker → `let meta`).
         let loop_start = production
             .find("Loading {} per-room slot(s) from delegate")
             .expect("per-room fetch loop marker must exist");
@@ -3482,23 +3513,45 @@ mod tests {
         let loop_region = &production[loop_start..loop_end];
         assert_eq!(
             loop_region.matches("had_fetch_error = true;").count(),
-            3,
-            "the transport-Err, unexpected-response, and unparseable-slot arms must set had_fetch_error"
+            4,
+            "the transport-Err, unexpected-response, unparseable-slot and value: None arms \
+             must set had_fetch_error"
         );
         assert_eq!(
             loop_region.matches("mark_fetch_failure()").count(),
-            3,
-            "the same three arms must set the global SAW_FETCH_FAILURE"
+            4,
+            "the same four arms must set the global SAW_FETCH_FAILURE"
         );
         let value_none_pos = loop_region
             .find("listed but value missing")
             .expect("the value: None arm must exist");
         let after_none =
-            &loop_region[value_none_pos..(value_none_pos + 140).min(loop_region.len())];
+            &loop_region[value_none_pos..(value_none_pos + 160).min(loop_region.len())];
         assert!(
-            !after_none.contains("had_fetch_error = true;")
-                && !after_none.contains("mark_fetch_failure()"),
-            "a definitive `value: None` is a legitimate skip, not a fetch failure"
+            after_none.contains("had_fetch_error = true;")
+                && after_none.contains("mark_fetch_failure()"),
+            "a listed slot with no value is a read fault: the room set is incomplete"
+        );
+
+        // (c) every rooms_meta failure (decode, no value, transport) marks the
+        // set incomplete too, and the completion latch is set only after the
+        // meta load, only when nothing failed.
+        let meta_start = loop_end;
+        let meta_end = production[meta_start..]
+            .find("seed_saved_slots_from_load(&slots")
+            .map(|i| meta_start + i)
+            .expect("the meta load is followed by the baseline seed");
+        let meta_region = &production[meta_start..meta_end];
+        assert_eq!(
+            meta_region.matches("had_fetch_error = true;").count(),
+            3,
+            "rooms_meta decode, no-value and transport failures must set had_fetch_error"
+        );
+        let after = &production[meta_end..meta_end + 600];
+        let squeezed: String = after.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains("if!had_fetch_error{mark_room_set_complete(worker.attempt());}"),
+            "the room-set-complete latch must be set only for a load with no failure"
         );
     }
 

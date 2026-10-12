@@ -481,12 +481,17 @@ pub(crate) fn poke_walk() {
 pub(crate) trait WalkEnv {
     /// Load workers still in flight (the sweep and the room load).
     fn pending_load_workers(&self) -> u32;
-    /// Whether this load attempt saw a room fail to load.
-    fn saw_fetch_failure(&self) -> bool;
+    /// The current load attempt (a reconnect or Retry begins a new one).
+    fn load_attempt(&self) -> u32;
+    /// Whether load attempt `attempt` read the whole current room set and is
+    /// still current (`chat_delegate::room_set_complete`).
+    fn room_set_complete(&self, attempt: u32) -> bool;
     /// Wait `ms` milliseconds.
     fn sleep(&self, ms: u64) -> impl Future<Output = ()>;
-    /// Run one journaled walk to completion.
-    fn run_walk(&self) -> impl Future<Output = ()>;
+    /// Run one journaled walk to completion on behalf of load attempt
+    /// `attempt` (its seam re-checks the room set before every merge and its
+    /// flush).
+    fn run_walk(&self, attempt: u32) -> impl Future<Output = ()>;
 }
 
 struct LiveWalkEnv;
@@ -495,14 +500,17 @@ impl WalkEnv for LiveWalkEnv {
     fn pending_load_workers(&self) -> u32 {
         chat_delegate::pending_load_workers()
     }
-    fn saw_fetch_failure(&self) -> bool {
-        chat_delegate::saw_fetch_failure()
+    fn load_attempt(&self) -> u32 {
+        chat_delegate::current_load_attempt()
+    }
+    fn room_set_complete(&self, attempt: u32) -> bool {
+        chat_delegate::room_set_complete(attempt)
     }
     async fn sleep(&self, ms: u64) {
         crate::util::sleep(std::time::Duration::from_millis(ms)).await
     }
-    async fn run_walk(&self) {
-        run_walk_locked().await
+    async fn run_walk(&self, attempt: u32) {
+        run_walk_locked(attempt).await
     }
 }
 
@@ -513,29 +521,37 @@ async fn walk_driver() {
 async fn walk_driver_with<E: WalkEnv>(env: &E) {
     loop {
         while WALK_POKED.swap(false, Ordering::Relaxed) {
-            if WALKS_THIS_LOAD.fetch_add(1, Ordering::Relaxed) >= MAX_WALKS_PER_LOAD {
+            if WALKS_THIS_LOAD.load(Ordering::Relaxed) >= MAX_WALKS_PER_LOAD {
                 warn!(
                     "migration journal: {MAX_WALKS_PER_LOAD} walks this page load; the next \
                      load continues"
                 );
                 break;
             }
+            let attempt = env.load_attempt();
             let mut waited = 0u64;
             while env.pending_load_workers() != 0 && waited < WALK_QUIESCENCE_MAX_MS {
                 env.sleep(WALK_QUIESCENCE_POLL_MS).await;
                 waited += WALK_QUIESCENCE_POLL_MS;
             }
-            if !walk_may_run(env.saw_fetch_failure()) {
+            let check = WalkCheck {
+                settled: env.pending_load_workers() == 0,
+                same_attempt: env.load_attempt() == attempt,
+                room_set_complete: env.room_set_complete(attempt),
+            };
+            if !walk_may_run(check) {
                 warn!(
-                    "migration journal: a room failed to load on this attempt; not walking \
-                     over an incomplete room set (freenet/river#595). The next load attempt \
-                     retries."
+                    "migration journal: not walking on this load attempt ({check:?}): the \
+                     current room set is not known complete (freenet/river#595). The next \
+                     load attempt retries."
                 );
                 // Let the next load attempt (a reconnect, or Retry) start again.
+                // A gated attempt does not spend the per-load walk budget.
                 LOAD_ARMED.store(false, Ordering::Relaxed);
                 continue;
             }
-            env.run_walk().await;
+            WALKS_THIS_LOAD.fetch_add(1, Ordering::Relaxed);
+            env.run_walk(attempt).await;
         }
         WALK_DRIVER_RUNNING.store(false, Ordering::Relaxed);
         // A poke that landed after the last check found the driver still
@@ -550,23 +566,37 @@ async fn walk_driver_with<E: WalkEnv>(env: &E) {
     update_session(|s| s.walk_in_flight = false);
 }
 
-/// Whether a requested walk may run now. Not while this load attempt saw a
-/// room fail to load: the walk merges older copies into the in-memory set and
-/// re-saves it, and the save keeps the in-memory identity of a room whose
+/// What the driver established just before a walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WalkCheck {
+    /// No load worker is still in flight (it did not just hit the wait cap).
+    pub(crate) settled: bool,
+    /// No reconnect or Retry began a new load attempt during the wait (which
+    /// zeroes the worker count and the failure flag the wait relies on).
+    pub(crate) same_attempt: bool,
+    /// The attempt read the whole current room set and nothing failed
+    /// (`chat_delegate::room_set_complete`).
+    pub(crate) room_set_complete: bool,
+}
+
+/// Whether a requested walk may run now: only over a current room set this
+/// attempt read in full. The walk merges older copies into the in-memory set
+/// and re-saves it, and the save keeps the in-memory identity of a room whose
 /// stored slot this load could not read, overwriting that slot
 /// (freenet/river#595). Before #763 the walk ran only behind an empty current
 /// delegate; on every load it must not run over an incomplete set. The
 /// predecessors stay pending, so nothing is lost by waiting.
-pub(crate) fn walk_may_run(saw_fetch_failure: bool) -> bool {
-    !saw_fetch_failure
+pub(crate) fn walk_may_run(check: WalkCheck) -> bool {
+    check.settled && check.same_attempt && check.room_set_complete
 }
 
-/// One journaled walk under the journal lock, recording its status.
-async fn run_walk_locked() {
+/// One journaled walk under the journal lock, on behalf of load attempt
+/// `attempt`, recording its status.
+async fn run_walk_locked(attempt: u32) {
     let _ops = JOURNAL_OPS.lock().await;
     let (report, _seam) = walk_with(
         &NodeDelegateChannel,
-        LiveImportSeam::new(),
+        LiveImportSeam::new(attempt),
         chat_delegate::current_delegate_key(),
         &LINEAGE,
     )
@@ -772,20 +802,29 @@ mod tests {
     /// The driver must consult the gate before every walk; pinned in source
     /// because the driver is wasm-only.
     #[test]
-    fn the_walk_never_runs_over_a_failed_room_load() {
-        assert!(walk_may_run(false));
-        assert!(!walk_may_run(true));
-        let src = include_str!("migration_journal.rs");
-        let driver = src
-            .find(&["async fn walk", "_driver_with<"].concat())
-            .expect("walk driver");
-        let body = &src[driver..];
-        let body = &body[..body.find("\n}\n").expect("driver ends")];
-        let gate = body
-            .find("walk_may_run(env.saw_fetch_failure())")
-            .expect("the driver must gate on the load's fetch failures");
-        let run = body.find("env.run_walk().await").expect("the walk runs");
-        assert!(gate < run, "the gate must precede the walk");
+    fn the_walk_never_runs_over_an_incomplete_room_set() {
+        let ok = WalkCheck {
+            settled: true,
+            same_attempt: true,
+            room_set_complete: true,
+        };
+        assert!(walk_may_run(ok));
+        for bad in [
+            WalkCheck {
+                settled: false,
+                ..ok
+            },
+            WalkCheck {
+                same_attempt: false,
+                ..ok
+            },
+            WalkCheck {
+                room_set_complete: false,
+                ..ok
+            },
+        ] {
+            assert!(!walk_may_run(bad), "{bad:?}");
+        }
     }
 
     // ---------------- probes added by the testing review of PR #768 ----------------
@@ -908,7 +947,12 @@ mod tests {
         workers: RefCell<VecDeque<u32>>,
         /// `pending_load_workers` answers this forever when set.
         stuck_workers: Cell<Option<u32>>,
-        fetch_failure: Cell<bool>,
+        /// The room set is NOT complete for the attempt (a failed slot, a
+        /// failed `rooms_meta`, any fetch failure).
+        incomplete: Cell<bool>,
+        attempt: Cell<u32>,
+        /// A reconnect/Retry begins a new attempt during the wait.
+        new_attempt_during_wait: Cell<bool>,
         /// Called at the start of each walk (a sweep poking mid-walk, say).
         during_walk: RefCell<Option<Box<dyn Fn()>>>,
         log: RefCell<Vec<&'static str>>,
@@ -921,13 +965,19 @@ mod tests {
             }
             self.workers.borrow_mut().pop_front().unwrap_or(0)
         }
-        fn saw_fetch_failure(&self) -> bool {
-            self.fetch_failure.get()
+        fn load_attempt(&self) -> u32 {
+            self.attempt.get()
+        }
+        fn room_set_complete(&self, attempt: u32) -> bool {
+            attempt == self.attempt.get() && !self.incomplete.get()
         }
         async fn sleep(&self, _ms: u64) {
             self.log.borrow_mut().push("sleep");
+            if self.new_attempt_during_wait.get() {
+                self.attempt.set(self.attempt.get() + 1);
+            }
         }
-        async fn run_walk(&self) {
+        async fn run_walk(&self, _attempt: u32) {
             self.log.borrow_mut().push("walk");
             if let Some(f) = self.during_walk.borrow_mut().take() {
                 f();
@@ -970,7 +1020,7 @@ mod tests {
     fn the_driver_does_not_walk_over_a_failed_room_load_and_rearms_the_load() {
         let _g = fresh_load();
         let env = ScriptedEnv::default();
-        env.fetch_failure.set(true);
+        env.incomplete.set(true);
         poke_and_drive(&env);
         assert_eq!(walks(&env), 0, "no walk over an incomplete room set");
         assert!(
@@ -991,16 +1041,56 @@ mod tests {
         assert_eq!(*env.log.borrow(), vec!["sleep", "sleep", "walk"]);
     }
 
-    /// The wait is bounded: workers that never settle delay the walk by
-    /// `WALK_QUIESCENCE_MAX_MS`, not for good.
+    /// The wait is bounded, and a load still pending at the cap ABORTS the
+    /// walk (and re-arms the load) rather than walking over a room set still
+    /// being read (freenet/river#763 review A1, #595).
     #[test]
-    fn the_wait_for_the_load_workers_is_bounded() {
+    fn a_load_still_pending_at_the_wait_cap_aborts_the_walk() {
         let _g = fresh_load();
         let env = ScriptedEnv::default();
         env.stuck_workers.set(Some(1));
         poke_and_drive(&env);
         let sleeps = env.log.borrow().iter().filter(|e| **e == "sleep").count() as u64;
         assert_eq!(sleeps, WALK_QUIESCENCE_MAX_MS / WALK_QUIESCENCE_POLL_MS);
+        assert_eq!(walks(&env), 0, "no walk over a load still in flight");
+        assert!(
+            !LOAD_ARMED.load(Ordering::Relaxed),
+            "re-armed for the next attempt"
+        );
+        assert_eq!(
+            WALKS_THIS_LOAD.load(Ordering::Relaxed),
+            0,
+            "a gated attempt does not spend the walk budget"
+        );
+    }
+
+    /// A reconnect or Retry during the wait zeroes the worker count and the
+    /// failure flag the wait relied on: the walk must not run for the old
+    /// attempt (freenet/river#763 review A1).
+    #[test]
+    fn a_new_load_attempt_during_the_wait_aborts_the_walk() {
+        let _g = fresh_load();
+        let env = ScriptedEnv::default();
+        *env.workers.borrow_mut() = VecDeque::from([1]);
+        env.new_attempt_during_wait.set(true);
+        poke_and_drive(&env);
+        assert_eq!(walks(&env), 0);
+        assert!(!LOAD_ARMED.load(Ordering::Relaxed));
+    }
+
+    /// Gated attempts never burn the per-load walk budget: after any number
+    /// of them, a load whose room set is complete still walks.
+    #[test]
+    fn gated_attempts_do_not_burn_the_walk_budget() {
+        let _g = fresh_load();
+        let env = ScriptedEnv::default();
+        env.incomplete.set(true);
+        for _ in 0..(MAX_WALKS_PER_LOAD * 2) {
+            poke_and_drive(&env);
+        }
+        assert_eq!(walks(&env), 0);
+        env.incomplete.set(false);
+        poke_and_drive(&env);
         assert_eq!(walks(&env), 1);
     }
 
