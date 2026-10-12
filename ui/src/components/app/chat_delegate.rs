@@ -1092,7 +1092,8 @@ fn claim_outstanding_list(outstanding: &AtomicU32, attempt: u32) -> bool {
 }
 
 /// The node reported the CURRENT chat delegate missing (freenet/river#707).
-/// This is not a legacy probe result, so it must not seal the migration.
+/// This is not a legacy probe result: it is never recorded as a legacy
+/// delegate "not installed".
 ///
 /// The first time in an attempt, this is the list-first load meeting a node
 /// that lacks the delegate (freenet/river#757): register it and reload.
@@ -9913,8 +9914,10 @@ async fn send_delegate_request_inner(
 /// `rooms_data` has been observed. See `decide_legacy_migration_action`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyMigrationAction {
-    /// Current delegate has authoritative state (rooms or tombstones). Mark
-    /// legacy migration done so it never fires for this user.
+    /// Current delegate has authoritative state (rooms or tombstones): do not
+    /// fire the legacy fan-out (freenet/river#253). (There is no persistent
+    /// "done" seal any more: the migration journal decides whether the walk
+    /// runs, freenet/river#763.)
     MarkDone,
     /// Current delegate is empty (no record, or a placeholder serialization
     /// with no rooms and no tombstones). Fire the legacy probes — there is
@@ -10639,7 +10642,8 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
 /// destroying rooms the user created after the last legacy snapshot.
 ///
 /// Returns `true` if it actually dispatched legacy probes, `false` if it skipped
-/// (migration already done, or already attempted this session). The room-list
+/// (already attempted this session). The journaled walk is driven separately,
+/// on every load while the journal is incomplete (`migration_journal`). The room-list
 /// load path (freenet/river#397) uses this to decide whether to stay `Loading`
 /// (probes fired — a migration might still arrive) or resolve to `Loaded`
 /// (nothing more is coming) — see [`load_state_after_probe_legacy`].

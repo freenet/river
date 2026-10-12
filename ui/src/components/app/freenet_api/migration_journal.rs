@@ -1449,4 +1449,34 @@ mod tests {
             newest
         ));
     }
+
+    /// The "Import anyway" branch (#768 review A6): a journal that blocks the
+    /// identity import is overridden by the user's choice for this page load,
+    /// without resolving anything (the session still reports the interrupted
+    /// import), and the override never skips a walk that is about to answer.
+    #[test]
+    fn import_anyway_opens_a_blocked_gate_without_resolving_it() {
+        let _g = fresh_load();
+        GATE_OVERRIDE.store(false, Ordering::Relaxed);
+        *session() = known(interrupted_status());
+        assert_eq!(current_import_gate(), ImportGate::Blocked);
+        assert!(
+            crate::components::app::chat_delegate::recovery_in_progress(current_import_gate(), 0),
+            "the import dialog waits"
+        );
+
+        override_import_gate();
+        assert_eq!(current_import_gate(), ImportGate::Open);
+        assert!(
+            !crate::components::app::chat_delegate::recovery_in_progress(current_import_gate(), 0)
+        );
+        assert!(
+            session().status.as_ref().unwrap().interrupted_import(),
+            "the override resolves nothing"
+        );
+
+        session().walk_in_flight = true;
+        assert_eq!(current_import_gate(), ImportGate::Pending);
+        GATE_OVERRIDE.store(false, Ordering::Relaxed);
+    }
 }

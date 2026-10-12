@@ -2442,23 +2442,37 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
     // ALSO re-renders when #345 recovery hydrates a room (recovery leaves
     // `ROOMS_LOAD_STATE == Loaded` throughout). `saw_fetch_failure()` and
     // `rooms_recovery_in_progress()` are read alongside (non-signal sources).
-    let _ = ROOMS.try_read(); // subscribe: re-render when recovery hydrates rooms
-                              // ...and when the migration journal's answer changes (freenet/river#763):
-                              // its gate is not a signal, so this version counter is.
-    let _ = crate::components::app::freenet_api::migration_journal::JOURNAL_GATE_VERSION.try_read();
+    // Anchor FIRST, before any fallible read (dioxus-signal-safety.md,
+    // freenet/river#555): a contended `try_read` that returns `Err` registers
+    // no subscription, so without the anchor and a nudge this modal could stop
+    // re-rendering for good and keep Import disabled (#768 review A7).
+    crate::util::signal_guard::anchor();
+    if ROOMS.try_read().is_err() {
+        // subscribe: re-render when recovery hydrates rooms
+        crate::util::signal_guard::schedule_nudge();
+    }
+    // ...and when the migration journal's answer changes (freenet/river#763):
+    // its gate is not a signal, so this version counter is.
+    if crate::components::app::freenet_api::migration_journal::JOURNAL_GATE_VERSION
+        .try_read()
+        .is_err()
+    {
+        crate::util::signal_guard::schedule_nudge();
+    }
     let journal_gate =
         crate::components::app::freenet_api::migration_journal::current_import_gate();
     let saw_fetch_failure = crate::components::app::chat_delegate::saw_fetch_failure();
-    let rooms_hydrated = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
-        .try_read()
-        .map(|g| {
-            rooms_load_is_authoritative(
-                *g,
-                saw_fetch_failure,
-                crate::components::app::chat_delegate::rooms_recovery_in_progress(),
-            )
-        })
-        .unwrap_or(false);
+    let rooms_hydrated = match crate::components::app::chat_delegate::ROOMS_LOAD_STATE.try_read() {
+        Ok(g) => rooms_load_is_authoritative(
+            *g,
+            saw_fetch_failure,
+            crate::components::app::chat_delegate::rooms_recovery_in_progress(),
+        ),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            false
+        }
+    };
 
     // Reset-and-close, matching the deferred pattern in `join_with_code_modal`
     // and `.claude/rules/dioxus-signal-safety.md`: signal mutations from event
@@ -7346,6 +7360,28 @@ mod tests {
             modal.contains("\"data-testid\": \"member-info-impersonation-explanation\""),
             "the member-info modal no longer renders the warning's explanation \
              element"
+        );
+    }
+
+    /// #768 review A7: the import modal's fallible signal reads follow
+    /// dioxus-signal-safety.md: the anchor first, a nudge on every degraded
+    /// branch (ROOMS, the journal-gate version, the load state). Otherwise a
+    /// contended read leaves the modal unsubscribed and Import disabled.
+    #[test]
+    fn the_import_modal_anchors_and_nudges_its_fallible_reads() {
+        let src: String = crate::util::strip_comments(include_str!("members.rs"))
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let anchor = src
+            .find("crate::util::signal_guard::anchor();ifROOMS.try_read().is_err(){")
+            .expect("anchor before the ROOMS read");
+        let body = &src[anchor..anchor + 1200];
+        assert!(body.contains("JOURNAL_GATE_VERSION.try_read().is_err(){crate::util::signal_guard::schedule_nudge();}"));
+        assert!(body.contains("Err(_)=>{crate::util::signal_guard::schedule_nudge();false}"));
+        assert!(
+            body.matches("schedule_nudge();").count() >= 3,
+            "every fallible read nudges"
         );
     }
 }

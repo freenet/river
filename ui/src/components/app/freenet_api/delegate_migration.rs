@@ -6,21 +6,23 @@
 //! delegate holds each room's identity key (`RoomData::self_sk`), which cannot
 //! be re-derived from the network — losing it loses the user's identity in that
 //! room. River has hand-rolled the recovery sweep in `chat_delegate.rs` /
-//! `response_handler.rs` for 27 generations; this module runs the shared,
-//! reviewed library's walk ALONGSIDE that sweep (release 1, the shape Delta
-//! shipped), so the walk order, marker bookkeeping, withholding and
-//! per-predecessor classification come from one place. Retiring the hand-rolled
-//! sweep is release 2, after field validation — nothing here removes it.
+//! `response_handler.rs` for 29 generations; this module runs the shared,
+//! reviewed library's walk ALONGSIDE that sweep, so the walk order, marker
+//! bookkeeping, withholding and per-predecessor classification come from one
+//! place, and the crate's completeness journal is the only authority on
+//! whether a migration finished. Retiring the hand-rolled sweep is a later
+//! step, after field validation — nothing here removes it.
 //!
 //! # A UI-side adapter over River's existing delegate protocol
 //!
-//! Nothing here needs a delegate-side change: River's delegate protocol already
-//! has both halves of the writer seam. `GetRequest`/`ListRequest` read a
+//! The adapter needs nothing new from the delegate: River's delegate protocol
+//! already has both halves of the writer seam. `GetRequest`/`ListRequest` read a
 //! predecessor, and the current delegate's Store/CAS paths (via
 //! `save_rooms_to_delegate`'s per-room CAS `reconcile_room_present`) are the
 //! app's own import path. The journal and the markers are ordinary KV entries in
-//! the current delegate. (The re-key that ships with the journal, #757/#592,
-//! changes the delegate for its own reasons.)
+//! the current delegate. (The delegate re-key that ships with the journal
+//! changes the delegate for its own reasons: #757's byte strings and #592's
+//! loud key index.)
 //!
 //! # The completeness journal (freenet/river#763)
 //!
@@ -78,10 +80,13 @@
 //!    sealing a predecessor there can strand late-arriving data. River's case
 //!    is different: a legacy delegate's data is FROZEN after the re-key (only
 //!    the current delegate is ever written), so sealing is safe — and durable
-//!    markers are what stop the walk re-running on every load in the gateway
-//!    iframe, where `localStorage` is unavailable and the sweep's own
-//!    `is_legacy_migration_done` flag cannot persist. Do not copy either
-//!    choice into another app without re-deriving which case applies.
+//!    markers are what stop the walk re-importing a predecessor on every load
+//!    in the gateway iframe, where `localStorage` is unavailable (the
+//!    `localStorage` seal the journal replaced never persisted there). The one
+//!    exception, an old tab writing to the newest predecessor during a
+//!    rollout, is covered by the post-resolve top-up (`top_up_from_with`). Do
+//!    not copy either choice into another app without re-deriving which case
+//!    applies.
 //!    Marker keys HEX-ENCODE the predecessor delegate key: the delegate's
 //!    `create_origin_key` runs the storage key through
 //!    `String::from_utf8_lossy`, which maps every invalid byte to U+FFFD, so

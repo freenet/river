@@ -811,8 +811,8 @@ const _: () = assert!(ROOM_LOAD_CONCURRENCY > 0);
 /// the bytes are the raw `RoomSlot` / `RoomsMeta` CBOR.
 ///
 /// Three cases by what the List contains:
-/// * **per-room keys present** → current delegate is authoritative: mark legacy
-///   migration done, fetch every slot + meta, hydrate.
+/// * **per-room keys present** → fetch every slot + meta, hydrate; re-run the
+///   sweep only if the migration journal reports an interrupted import.
 /// * **no per-room keys, but a single `rooms_data` blob** → a pre-per-room
 ///   snapshot under the current delegate (defensive; normally the new delegate
 ///   key is empty on first upgrade): read it, hydrate, then re-save so it
