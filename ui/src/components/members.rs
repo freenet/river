@@ -762,10 +762,8 @@ pub(crate) fn relevant_appointers(
 /// approximated. (`cli/src/deputies.rs::invite_subtrees` is riverctl's mirror of
 /// the same thing.)
 ///
-/// One deliberate difference from the contract's version: a visited-set guard.
-/// The contract can rely on `verify` having rejected circular invite chains; the
-/// UI walks whatever state it currently holds and must not hang on a malformed
-/// one.
+/// Like the contract's version it carries a visited-set guard: the UI walks
+/// whatever state it currently holds and must not hang on a malformed one.
 pub(crate) fn ban_removal_set(members: &MembersV1, target: MemberId) -> HashSet<MemberId> {
     let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
     for m in &members.members {
@@ -4295,10 +4293,8 @@ mod tests {
         );
     }
 
-    /// The contract's `get_downstream_members` has no visited guard — it can
-    /// rely on `verify` having rejected circular invite chains. This mirror
-    /// walks whatever state the UI currently holds, including a half-applied
-    /// or hostile one, so it must terminate. (Test hangs rather than fails if
+    /// This mirror walks whatever state the UI currently holds, including a
+    /// half-applied or hostile one, so it must terminate. (Test hangs rather than fails if
     /// this regresses, which is still a loud CI signal.)
     #[test]
     fn ban_removal_set_terminates_on_a_cycle() {

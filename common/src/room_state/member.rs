@@ -458,14 +458,17 @@ impl MembersV1 {
         false
     }
 
-    /// Helper function to get all downstream members of a given member
+    /// Helper function to get all downstream members of a given member.
+    ///
+    /// Each member is visited once, so the walk terminates even if the
+    /// invite links form a cycle; for an acyclic member set the result is
+    /// the same either way.
     fn get_downstream_members(&self, member_id: MemberId) -> HashSet<MemberId> {
         let mut downstream = HashSet::new();
         let mut to_check = vec![member_id];
         while let Some(current) = to_check.pop() {
             for member in &self.members {
-                if member.member.invited_by == current {
-                    downstream.insert(member.member.id());
+                if member.member.invited_by == current && downstream.insert(member.member.id()) {
                     to_check.push(member.member.id());
                 }
             }
@@ -1090,6 +1093,60 @@ mod tests {
             assert!(result.is_err(), "max_members {max_members}");
             assert!(members.members.is_empty());
         }
+    }
+
+    #[test]
+    fn downstream_members_of_an_acyclic_tree() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        // owner -> a -> {b, c}, b -> d; e is invited by the owner.
+        let (a, a_sk) = create_test_member(owner_id, owner_id);
+        let (b, b_sk) = create_test_member(owner_id, a.id());
+        let (c, _) = create_test_member(owner_id, a.id());
+        let (d, _) = create_test_member(owner_id, b.id());
+        let (e, _) = create_test_member(owner_id, owner_id);
+        let members = MembersV1 {
+            members: vec![
+                AuthorizedMember::new(a.clone(), &owner_sk),
+                AuthorizedMember::new(b.clone(), &a_sk),
+                AuthorizedMember::new(c.clone(), &a_sk),
+                AuthorizedMember::new(d.clone(), &b_sk),
+                AuthorizedMember::new(e.clone(), &owner_sk),
+            ],
+        };
+        assert_eq!(
+            members.get_downstream_members(a.id()),
+            HashSet::from([b.id(), c.id(), d.id()])
+        );
+        assert_eq!(
+            members.get_downstream_members(b.id()),
+            HashSet::from([d.id()])
+        );
+        assert!(members.get_downstream_members(e.id()).is_empty());
+        assert_eq!(
+            members.get_downstream_members(owner_id),
+            HashSet::from([a.id(), b.id(), c.id(), d.id(), e.id()])
+        );
+    }
+
+    #[test]
+    fn downstream_members_of_a_cycle_terminates() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let (a, a_sk) = create_test_member(owner_id, owner_id);
+        let (b, _) = create_test_member(owner_id, a.id());
+        let mut a_record = AuthorizedMember::new(a.clone(), &owner_sk);
+        let b_record = AuthorizedMember::new(b.clone(), &a_sk);
+        // a and b each list the other as inviter. `verify` rejects this, so
+        // the record is edited after signing.
+        a_record.member.invited_by = b.id();
+        let members = MembersV1 {
+            members: vec![a_record, b_record],
+        };
+        assert_eq!(
+            members.get_downstream_members(a.id()),
+            HashSet::from([a.id(), b.id()])
+        );
     }
 
     #[test]

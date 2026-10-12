@@ -514,10 +514,9 @@ impl<'a> RoomDeputies<'a> {
 ///
 /// Computes the same set `MembersV1::get_downstream_members` does (which is
 /// private to the contract crate), so the reach reported here matches the
-/// subtree `is_ban_authorized` grants authority over. It additionally carries a
-/// visited-set guard that the contract's version omits: the contract can rely on
-/// `verify` having rejected circular invite chains, whereas this reads a fetched
-/// state directly and must not hang on a malformed one.
+/// subtree `is_ban_authorized` grants authority over. Like the contract's
+/// version it carries a visited-set guard, so it does not hang on a fetched
+/// state with circular invite chains.
 ///
 /// The owner gets an entry like anyone else (they are the `invited_by` of the
 /// members they invited), but [`RoomDeputies::reach_of`] does not consult it:
@@ -1290,10 +1289,8 @@ mod tests {
 
     #[test]
     fn invite_subtrees_survives_a_cycle_and_a_self_invite() {
-        // The contract's own `get_downstream_members` has NO visited guard (it
-        // relies on `verify` rejecting circular invite chains). This mirror
-        // reads a fetched state directly, so it must not hang on a malformed
-        // one.
+        // This mirror reads a fetched state directly, so it must not hang on
+        // a malformed one with circular invite chains.
         let owner = key(1);
         let alice = key(2);
         let bob = key(3);
