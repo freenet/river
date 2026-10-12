@@ -1768,6 +1768,16 @@ mod tests {
              applies fields in declaration order, and DirectMessagesV1::apply_delta sweeps \
              its held set against parent_state.members (freenet/river#671)"
         );
+        // `MessagesV1::apply_delta` calls `enforced_ban_set_of(parent_state)`,
+        // which equals post_apply_cleanup's step-0 set only if every field it
+        // reads is applied before `recent_messages`.
+        for input in ["configuration", "bans", "members", "member_info"] {
+            assert!(
+                index_of(input) < index_of("recent_messages"),
+                "`{input}` must be declared BEFORE `recent_messages`: \
+                 MessagesV1::apply_delta reads it through enforced_ban_set_of"
+            );
+        }
     }
 
     #[test]

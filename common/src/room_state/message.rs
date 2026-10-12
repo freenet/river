@@ -318,6 +318,22 @@ impl ComposableState for MessagesV1 {
             members_by_id.contains_key(&m.message.author) || m.message.author == owner_id
         });
 
+        // Drop messages whose authors `post_apply_cleanup` removes in this
+        // apply before applying the cap below; `enforced_ban_set_of` computes
+        // that set, as `DirectMessagesV1::apply_delta` does. When the held
+        // messages fit the cap, cleanup removes the same messages, so the set
+        // is computed only when they exceed it (in a room at its cap, on every
+        // delta that adds a message). The owner is never a member and so never
+        // in that set; the owner check is defence in depth, matching cleanup,
+        // which always keeps the owner's messages.
+        if self.messages.len() > max_recent_messages {
+            let enforced_banned =
+                crate::room_state::direct_messages::enforced_ban_set_of(parent_state, parameters);
+            self.messages.retain(|m| {
+                m.message.author == owner_id || !enforced_banned.contains(&m.message.author)
+            });
+        }
+
         // Sort messages by time, with MessageId as secondary sort for deterministic ordering
         // (CRDT convergence requirement - without this, ties produce non-deterministic order)
         self.messages.sort_by(|a, b| {
