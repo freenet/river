@@ -1293,8 +1293,7 @@ impl RiverImportSeam for LiveImportSeam {
                 ));
                 return;
             }
-            // Entries first, so the #776 repair rule sees this store's DMs
-            // when the archive entries are imported (ranked, #776).
+            // The archive entries are imported ranked (#776).
             chat_delegate::hydrate_outbound_dms_cache_now(store.entries);
             chat_delegate::import_legacy_hidden_threads_now(store.hidden_threads, source_rank);
             let _ = tx.send(Ok(()));

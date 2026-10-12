@@ -2284,8 +2284,7 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, legacy_rank: Option<
 
     match from_reader::<OutboundDmStore, _>(&bytes[..]) {
         Ok(store) => {
-            // Entries first, so the #776 repair rule sees this store's DMs
-            // when its archive entries land (both defers run FIFO).
+            // A predecessor's archive entries are imported ranked (#776).
             let count = hydrate_outbound_dms_cache(store.entries);
             let hidden_count = match legacy_rank {
                 Some(rank) => import_legacy_hidden_threads(store.hidden_threads, rank),

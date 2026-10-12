@@ -411,10 +411,10 @@ generation. A predecessor's archive set is imported RANKED: the newest
 predecessor whose set was applied is authoritative, an older one's set is
 ignored, and a newer one removes entries an older one supplied that it no
 longer holds (`apply_legacy_hidden_import`; the successor's own and the user's
-entries are never removed by it). And an archive entry is dropped whenever the
-outbound-DM cache holds a NEWER DM to that peer in that room (a reply
-un-archives), which also heals stores the #772 migration already wrote one into.
-The walk, the top-up and the sweep all go through it.
+entries are never removed by it). The walk, the top-up and the sweep all go
+through it. There is no "a newer outbound DM supersedes the entry" repair: an
+archive's `hidden_at_ts` is the newest INBOUND timestamp, not the archive time,
+so it would un-archive every thread the user replied to and then archived.
 
 **Migrated identities keep their source rank across loads** (#768 review
 B3): `rooms_meta.identity_sources` records which legacy generation supplied a
