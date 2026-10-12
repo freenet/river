@@ -176,6 +176,24 @@ pub(crate) enum ImportGate {
     /// interrupted, items were permanently rejected, or the journal could not be
     /// read or recorded. The user may override it.
     Blocked,
+    /// An earlier generation that may hold the user's rooms has not answered
+    /// yet (pending, and not last found "not installed"): an identity imported
+    /// now would take authoritative rank, and that generation's newer key would
+    /// lose for good when it does answer (#768 round 2 item 10, probe R4).
+    /// Waits like [`ImportGate::Pending`], but the user may override it,
+    /// because a generation this node can never run may never answer.
+    Unresolved,
+}
+
+/// Whether some pending predecessor may still bring data: it is unresolved
+/// and its last walk did not find it definitively not installed (it was silent,
+/// or it answered and its export was refused). A predecessor with an
+/// `absent_streak` is absent from this node and holds nothing here.
+pub(crate) fn a_pending_predecessor_may_hold_data(status: &JournalStatus) -> bool {
+    match status {
+        JournalStatus::Incomplete { pending, .. } => pending.iter().any(|p| p.absent_streak == 0),
+        _ => false,
+    }
 }
 
 /// The identity-import gate (freenet/river#414, #763), composed from:
@@ -188,10 +206,14 @@ pub(crate) enum ImportGate {
 /// * `rejected_items() > 0` → blocked: data the import path refused is not in
 ///   the successor until a fix raises `RIVER_IMPORT_REVISION`.
 ///
-/// A silent predecessor that never started an import does NOT block: it keeps
-/// the journal incomplete for as long as its generation is absent from this
-/// node (most generations, on most nodes), so gating on `!is_complete()` would
-/// block for good.
+/// * a pending predecessor that has not answered (or whose export was refused)
+///   and was not last found "not installed" → [`ImportGate::Unresolved`]:
+///   waits, overridable (#768 round 2 item 10).
+///
+/// A predecessor found definitively not installed (its `absent_streak`) does
+/// NOT gate: it keeps the journal incomplete for as long as its generation is
+/// absent from this node (most generations, on most nodes), so gating on
+/// `!is_complete()` would block for good.
 ///
 /// `override_on` (the user's "import anyway") ignores every blocking input but
 /// never resolves a journal entry: a predecessor whose marker can never be read
@@ -208,8 +230,17 @@ pub(crate) fn import_gate(s: &JournalSession, override_on: bool) -> ImportGate {
         || s.status
             .as_ref()
             .is_some_and(|st| st.interrupted_import() || st.rejected_items() > 0);
-    if blocked && !override_on {
+    if override_on {
+        return ImportGate::Open;
+    }
+    if blocked {
         ImportGate::Blocked
+    } else if s
+        .status
+        .as_ref()
+        .is_some_and(a_pending_predecessor_may_hold_data)
+    {
+        ImportGate::Unresolved
     } else {
         ImportGate::Open
     }
@@ -864,14 +895,45 @@ mod tests {
         );
     }
 
-    /// A journal kept incomplete only by predecessors that never started an
-    /// import (absent generations) must NOT block: that is most nodes, for good.
+    /// A journal kept incomplete only by predecessors found NOT INSTALLED
+    /// (absent generations) must not gate: that is most nodes, for good.
     #[test]
-    fn an_incomplete_journal_with_nothing_started_does_not_block() {
-        let status = fresh_status();
+    fn an_incomplete_journal_of_absent_generations_does_not_gate() {
+        let status = all_absent_status();
         assert!(!status.is_complete());
         assert!(!status.interrupted_import());
         assert_eq!(import_gate(&known(status), false), ImportGate::Open);
+    }
+
+    /// #768 round 2 item 10 (migration probe R4): while a predecessor that may
+    /// hold the user's rooms has not answered (the newest one silent, the
+    /// current delegate empty), an imported identity would take authoritative
+    /// rank and that generation's newer key would lose for good when it
+    /// answers. The gate waits (Unresolved), the user may override it, and a
+    /// generation found not installed stops gating.
+    #[test]
+    fn an_unanswered_predecessor_gates_the_import_until_overridden() {
+        let status = fresh_status();
+        assert!(a_pending_predecessor_may_hold_data(&status));
+        assert_eq!(
+            import_gate(&known(status.clone()), false),
+            ImportGate::Unresolved
+        );
+        assert_eq!(import_gate(&known(status), true), ImportGate::Open);
+        assert!(
+            crate::components::app::chat_delegate::recovery_in_progress(ImportGate::Unresolved, 0),
+            "the import waits while unresolved"
+        );
+        // Only one of several pending predecessors unanswered still gates.
+        let mut mixed = all_absent_status();
+        if let JournalStatus::Incomplete { pending, .. } = &mut mixed {
+            pending.last_mut().expect("pending").absent_streak = 0;
+        }
+        assert_eq!(import_gate(&known(mixed), false), ImportGate::Unresolved);
+        // A blocking input still reads Blocked (its message is the stronger).
+        let mut s = known(fresh_status());
+        s.walk_status_unknown = true;
+        assert_eq!(import_gate(&s, false), ImportGate::Blocked);
     }
 
     #[test]

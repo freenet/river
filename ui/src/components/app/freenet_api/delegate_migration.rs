@@ -4369,8 +4369,8 @@ mod tests {
         session.on_begin_ok(status);
         assert_eq!(
             import_gate(&session, false),
-            ImportGate::Open,
-            "nothing started: nothing to wait for"
+            ImportGate::Unresolved,
+            "no predecessor has answered yet: the import waits (overridably) for them"
         );
 
         let write = note(&channel, 0, None);

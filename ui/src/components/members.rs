@@ -2715,6 +2715,29 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                                     "Import anyway"
                                 }
                             }
+                        } else if journal_gate
+                            == crate::components::app::freenet_api::migration_journal::ImportGate::Unresolved
+                        {
+                            // An earlier River version's data on this node has
+                            // not answered yet: an identity imported now would
+                            // win over the one it brings later. It may never
+                            // answer (a version this node cannot run), so the
+                            // user may go ahead knowingly (#768).
+                            div {
+                                "data-testid": "import-identity-migration-unresolved",
+                                class: "mt-3 text-sm text-amber-400",
+                                "Rooms from an earlier version of River on this node haven't answered yet. Importing now could replace the identity one of them brings back. River keeps checking on each load; import anyway only if you know the room is not one of them."
+                            }
+                            div { class: "flex justify-end mt-2",
+                                button {
+                                    "data-testid": "import-identity-override-unresolved",
+                                    class: "px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-xs rounded-lg transition-colors border border-border",
+                                    onclick: move |_| {
+                                        crate::components::app::freenet_api::migration_journal::override_import_gate();
+                                    },
+                                    "Import anyway"
+                                }
+                            }
                         } else {
                             div {
                                 "data-testid": "import-identity-loading-rooms",
