@@ -4588,7 +4588,7 @@ mod tests {
     /// (freenet/river#398 moved codegen to `freenet-migrate-build`) must
     /// reproduce it byte-identically, or every user silently re-runs legacy
     /// migration once. Pinned to the value computed from the current
-    /// `legacy_delegates.toml` (27 entries spanning V1..V30 — V4–V6 removed —
+    /// `legacy_delegates.toml` (29 entries spanning V1..V32 — V4–V6 removed —
     /// in file order). This value
     /// SHOULD change when a genuinely new legacy entry is added — update the
     /// constant then — but must NEVER change from a codegen/tooling swap.
@@ -4615,9 +4615,17 @@ mod tests {
     /// from the registry). Either way the entry is required: the committed
     /// bytes are what users' delegate key is derived from, whatever moved
     /// them.
+    ///
+    /// Updated for V32 (the river-core 0.1.22 room-contract fixes). The
+    /// delegate links river-core's room-state code, and the fixes to
+    /// `BansV1::apply_delta` and `MessagesV1::apply_delta` (the in-delta
+    /// record dedupe, the message signature check and the message delta
+    /// bound) change its WASM, as does the mandatory
+    /// `river-core` 0.1.21 -> 0.1.22 bump. Measured at origin/main 1ce80050:
+    /// main rebuilds to the V32 hash unchanged.
     #[test]
     fn legacy_set_fingerprint_is_stable_across_codegen_changes() {
-        assert_eq!(legacy_set_fingerprint(), "c32c326c1328de9a");
+        assert_eq!(legacy_set_fingerprint(), "10f72d68c4c4ad91");
     }
 
     /// The "migration in progress" and "migration done" localStorage keys MUST
@@ -6313,7 +6321,7 @@ mod tests {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "c2e6063899624b65715d683fbbba04637ba89b72dc17f5b1610343922356fc46",
+            "81b562f82cecabdf8b9fabd74a77a94f6d885ae60cb0c306a49dbc027756c889",
             "chat_delegate.wasm changed — this branch must not alter the delegate WASM; \
              if the change is intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"

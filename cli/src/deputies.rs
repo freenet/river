@@ -375,12 +375,10 @@ impl<'a> RoomDeputies<'a> {
     ///
     /// The per-target decision is `MembersV1::is_ban_authorized`, the contract's
     /// OWN public predicate, never a local re-derivation of its rules. That
-    /// matters: the rules do not compose the way a summary would suggest. The
-    /// "you cannot ban the member who deputized you" guardrail is step 4,
-    /// checked AFTER the absolute grants, so a target who deputized this deputy
-    /// is still bannable when the deputy is that target's own invite ancestor,
-    /// or is an owner-appointed global moderator. An earlier version of this
-    /// function approximated the guardrail by hand and undercounted both cases.
+    /// matters: the rules do not compose the way a summary would suggest, and
+    /// an earlier version of this function approximated them by hand and
+    /// undercounted. Routing every target through the predicate keeps this
+    /// count identical to what the contract enforces.
     ///
     /// ONE local narrowing is applied on top: targets whose ban would remove the
     /// deputy themselves are not counted (see the filter below). Scope is the
@@ -516,10 +514,9 @@ impl<'a> RoomDeputies<'a> {
 ///
 /// Computes the same set `MembersV1::get_downstream_members` does (which is
 /// private to the contract crate), so the reach reported here matches the
-/// subtree `is_ban_authorized` grants authority over. It additionally carries a
-/// visited-set guard that the contract's version omits: the contract can rely on
-/// `verify` having rejected circular invite chains, whereas this reads a fetched
-/// state directly and must not hang on a malformed one.
+/// subtree `is_ban_authorized` grants authority over. Like the contract's
+/// version it carries a visited-set guard, so it does not hang on a fetched
+/// state with circular invite chains.
 ///
 /// The owner gets an entry like anyone else (they are the `invited_by` of the
 /// members they invited), but [`RoomDeputies::reach_of`] does not consult it:
@@ -1292,10 +1289,8 @@ mod tests {
 
     #[test]
     fn invite_subtrees_survives_a_cycle_and_a_self_invite() {
-        // The contract's own `get_downstream_members` has NO visited guard (it
-        // relies on `verify` rejecting circular invite chains). This mirror
-        // reads a fetched state directly, so it must not hang on a malformed
-        // one.
+        // This mirror reads a fetched state directly, so it must not hang on
+        // a malformed one with circular invite chains.
         let owner = key(1);
         let alice = key(2);
         let bob = key(3);
@@ -1533,11 +1528,10 @@ mod tests {
     }
 
     #[test]
-    fn reach_excludes_subtree_members_who_deputized_this_deputy() {
-        // `is_ban_authorized` step 4 denies a ban whose TARGET lists the banner
-        // in their own deputies ("you cannot ban the member who deputized
-        // you"). Those subtree members are not reachable, so counting them
-        // would overstate the authority the grant confers.
+    fn reach_counts_subtree_members_who_deputized_this_deputy() {
+        // The grant comes from Alice, a strict ancestor of both subtree
+        // members, so a target listing the deputy in their own deputies does
+        // not change whether the deputy can ban them: both are counted.
         let owner = key(1);
         let alice = key(2);
         let target = key(3);
@@ -1552,7 +1546,7 @@ mod tests {
 
         push_info(&mut state, &owner, 0, "Room Owner", vec![]);
         push_info(&mut state, &alice, 0, "Alice", vec![id(&deputy)]);
-        // `target` has ALSO deputized `deputy`, so `deputy` cannot ban them.
+        // `target` has ALSO deputized `deputy`; that does not remove Alice's grant.
         push_info(&mut state, &target, 0, "Target", vec![id(&deputy)]);
         push_info(&mut state, &other, 0, "Other", vec![]);
         push_info(&mut state, &deputy, 0, "Deputy", vec![]);
@@ -1562,23 +1556,21 @@ mod tests {
 
         let grant = d.grant(id(&alice), id(&deputy));
         assert_eq!(
-            grant.members_deputy_can_ban, 1,
-            "Alice's subtree is {{target, other}}, but target deputized this \
-             deputy so only `other` is reachable"
+            grant.members_deputy_can_ban, 2,
+            "Alice's subtree is {{target, other}}, and Alice's grant covers both"
         );
     }
 
     #[test]
-    fn the_guardrail_does_not_apply_where_an_absolute_grant_already_does() {
-        // The guardrail is `is_ban_authorized` step 4, checked AFTER the
-        // absolute grants, so it must NOT be applied as a blanket exclusion.
-        // Two cases where a target who deputized the deputy is STILL bannable:
+    fn a_target_who_deputized_the_deputy_is_counted_under_every_grant() {
+        // A target listing the deputy in their own deputies is still bannable
+        // wherever a grant covers them:
         //
         //   (a) the deputy is that target's own invite ancestor (step 2)
         //   (b) the owner has appointed the deputy globally (step 3)
         //
-        // Approximating step 4 by hand undercounted both. The reach now routes
-        // through the contract's own predicate, so it cannot drift from it.
+        // The reach routes through the contract's own predicate, so it cannot
+        // drift from it.
         let owner = key(1);
         let alice = key(2);
         let deputy = key(3);
@@ -1592,7 +1584,7 @@ mod tests {
         push_info(&mut state, &owner, 0, "Room Owner", vec![]);
         push_info(&mut state, &alice, 0, "Alice", vec![id(&deputy)]);
         push_info(&mut state, &deputy, 0, "Deputy", vec![]);
-        // The target deputized the deputy, which would trip a naive guardrail.
+        // The target also deputized the deputy.
         push_info(&mut state, &target, 0, "Target", vec![id(&deputy)]);
 
         let secrets = no_secrets();
@@ -1602,8 +1594,7 @@ mod tests {
             1,
             "Alice's subtree is {{deputy, target}}; the deputy does not count \
              themselves, and the target IS counted because the deputy is their \
-             own invite ancestor, so step 2 authorizes the ban despite the \
-             target having deputized them"
+             own invite ancestor, so step 2 authorizes the ban"
         );
 
         // (b) the same shape, but authority comes from the owner appointing the
@@ -1621,8 +1612,8 @@ mod tests {
         assert_eq!(
             d.grant(id(&alice), id(&deputy)).members_deputy_can_ban,
             1,
-            "Alice's subtree is {{target}}; the owner's global appointment is \
-             absolute (step 3), so the target's own grant cannot block it"
+            "Alice's subtree is {{target}}; the owner's global appointment \
+             (step 3) covers it"
         );
 
         // The owner's own grant reaches every member.
@@ -1645,7 +1636,7 @@ mod tests {
         // LOAD-BEARING: the deputizer has left, but still names a child via
         // that child's `invited_by`, so they still have a subtree, and the
         // deputy is a current member the contract would otherwise authorize
-        // (step 5, via the departed inviter as a strict ancestor). Without the
+        // (step 4, via the departed inviter as a strict ancestor). Without the
         // gate this reports 1. A fixture where the DEPUTY is the absent party
         // would report 0 either way and pin nothing.
         let owner = key(1);
@@ -1913,8 +1904,7 @@ mod tests {
     //
     // owner -> alpha -> beta -> deputy -> child, plus an unrelated stranger.
     // `deputy` is an OWNER-APPOINTED GLOBAL MODERATOR, which is the only grant
-    // in `is_ban_authorized` that reaches a member's own ancestors — and it is
-    // granted at step 3, ahead of the step-4 guardrail.
+    // in `is_ban_authorized` that reaches a member's own ancestors (step 3).
     // ------------------------------------------------------------------
 
     /// The chain above, with `deputy` deputized by the owner.

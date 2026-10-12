@@ -631,7 +631,7 @@ pub(crate) fn build_deputizers_of(
             // on their own messages for their whole subtree — the same
             // impersonation this file's badge exists to make trustworthy,
             // achieved with a real badge instead of an emoji. It also grants
-            // nothing: `is_ban_authorized` step 5 only consults a STRICT
+            // nothing: `is_ban_authorized` step 4 only consults a STRICT
             // ancestor's deputy list, so a self-grant is already inert for
             // authority. Ignore it for display too.
             if *deputy == appointer {
@@ -762,10 +762,8 @@ pub(crate) fn relevant_appointers(
 /// approximated. (`cli/src/deputies.rs::invite_subtrees` is riverctl's mirror of
 /// the same thing.)
 ///
-/// One deliberate difference from the contract's version: a visited-set guard.
-/// The contract can rely on `verify` having rejected circular invite chains; the
-/// UI walks whatever state it currently holds and must not hang on a malformed
-/// one.
+/// Like the contract's version it carries a visited-set guard: the UI walks
+/// whatever state it currently holds and must not hang on a malformed one.
 pub(crate) fn ban_removal_set(members: &MembersV1, target: MemberId) -> HashSet<MemberId> {
     let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
     for m in &members.members {
@@ -857,9 +855,9 @@ pub(crate) enum BanGate {
 ///
 /// Then the self-removal rule, applied to the OUTPUT of `is_ban_authorized`
 /// rather than inside it. That placement is load-bearing: `is_ban_authorized`
-/// grants owner-appointed global moderators authority at step 3, ahead of the
-/// step-4 guardrail, so a check wired into the wrong branch of that ladder would
-/// not fire for exactly the deputies who can reach the most members.
+/// grants owner-appointed global moderators authority at step 3, which reaches
+/// a member's own ancestors, so a check wired into only one branch of that
+/// ladder would not fire for exactly the deputies who can reach the most members.
 pub(crate) fn ban_gate(
     members: &MembersV1,
     member_info: &river_core::room_state::member_info::MemberInfoV1,
@@ -895,9 +893,10 @@ pub(crate) fn ban_gate(
 /// * `can_ban_viewer` decides only the **tooltip wording**, and is the real
 ///   contract-level answer from [`MembersV1::is_ban_authorized`] rather than an
 ///   approximation of it. The two can legitimately disagree: a deputy the
-///   viewer appointed themselves shows the shield but cannot ban the viewer
-///   (the "cannot ban the member who deputized you" guardrail in
-///   `is_ban_authorized` step 4).
+///   viewer appointed themselves shows the shield, but the viewer's grant
+///   covers only the viewer's own subtree, so it gives no authority over the
+///   viewer. They can ban the viewer only if another grant applies (a strict
+///   ancestor of the viewer, or the owner, also deputized them).
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct DeputyBadge {
     /// Viewer-relevant appointers. Never empty: an empty result means no badge
@@ -4060,9 +4059,8 @@ mod tests {
     /// owner → alpha → beta → deputy → child, plus an unrelated `stranger`
     /// invited by the owner. `deputy` is an OWNER-APPOINTED GLOBAL MODERATOR,
     /// which is the whole point: that is the only grant in `is_ban_authorized`
-    /// that reaches a member's own ancestors, and it is granted at step 3,
-    /// ahead of the step-4 guardrail. A guard wired into the wrong branch of
-    /// that ladder would not fire for this deputy.
+    /// that reaches a member's own ancestors (step 3). A guard wired into only
+    /// one branch of that ladder would not fire for this deputy.
     struct BanChain {
         members: MembersV1,
         member_info: river_core::room_state::member_info::MemberInfoV1,
@@ -4295,10 +4293,8 @@ mod tests {
         );
     }
 
-    /// The contract's `get_downstream_members` has no visited guard — it can
-    /// rely on `verify` having rejected circular invite chains. This mirror
-    /// walks whatever state the UI currently holds, including a half-applied
-    /// or hostile one, so it must terminate. (Test hangs rather than fails if
+    /// This mirror walks whatever state the UI currently holds, including a
+    /// half-applied or hostile one, so it must terminate. (Test hangs rather than fails if
     /// this regresses, which is still a loud CI signal.)
     #[test]
     fn ban_removal_set_terminates_on_a_cycle() {
@@ -4569,8 +4565,9 @@ mod tests {
             "a deputy of an unrelated subtree must not show the shield here"
         );
 
-        // 3. Viewer is immune (they appointed this deputy themselves, so
-        //    `is_ban_authorized` step 4 denies the ban) → the badge STILL
+        // 3. Viewer is immune (they appointed this deputy themselves, and no
+        //    strict ancestor of the viewer or the owner did, so no grant in
+        //    `is_ban_authorized` covers the viewer) → the badge STILL
         //    shows. This is the half Ian called out explicitly; only the
         //    tooltip reflects the immunity.
         let mine = badges
@@ -4580,7 +4577,7 @@ mod tests {
         assert_eq!(
             mine.can_ban_viewer,
             Some(false),
-            "a deputy cannot ban the member who deputized them"
+            "the viewer's own grant gives this deputy no authority over the viewer"
         );
         assert_eq!(mine.tooltip(), "Deputy (appointed by you). Cannot ban you.");
 
@@ -4711,18 +4708,13 @@ mod tests {
         assert!(!badges.contains_key(&id(&their_deputy_sk)));
     }
 
-    /// "Cannot ban you" must not lie. A ban cascades to the banned member's
-    /// whole invite subtree, so a deputy who cannot ban the viewer DIRECTLY but
-    /// can ban the viewer's inviter still gets the viewer removed.
-    ///
-    /// Room: `owner -> alpha -> parent -> viewer`. `alpha` deputizes `mod`, and
-    /// the viewer ALSO deputizes `mod` — which is exactly the configuration the
-    /// badge advertises as "you're protected". `is_ban_authorized(mod, viewer)`
-    /// denies (step 4 guardrail), but `is_ban_authorized(mod, parent)` grants
-    /// (step 5, alpha is parent's ancestor), and banning `parent` sweeps the
-    /// viewer out with them.
+    /// "Cannot ban you" must not lie. Room: `owner -> alpha -> parent ->
+    /// viewer`. `alpha` deputizes `mod`, and the viewer ALSO deputizes `mod`.
+    /// The viewer's own grant does not affect alpha's: `mod` can ban the
+    /// viewer directly (step 4, alpha is the viewer's ancestor) and can ban
+    /// `parent`, whose ban cascades to the viewer. The tooltip must say so.
     #[test]
-    fn can_ban_viewer_accounts_for_cascading_bans() {
+    fn viewer_deputizing_a_moderator_is_not_protected_from_them() {
         use river_core::room_state::member::MembersV1;
         use river_core::room_state::member_info::MemberInfoV1;
 
@@ -4750,8 +4742,7 @@ mod tests {
                 signed_member_info(&owner_sk, "Owner", vec![]),
                 signed_member_info(&alpha_sk, "Alpha", vec![id(&mod_sk)]),
                 signed_member_info(&parent_sk, "Parent", vec![]),
-                // The viewer deputizes the moderator, which under the contract
-                // makes a DIRECT ban of the viewer inert.
+                // The viewer also deputizes the moderator; alpha's grant stands.
                 signed_member_info(&viewer_sk, "Viewer", vec![id(&mod_sk)]),
                 signed_member_info(&mod_sk, "Mod", vec![]),
             ],
@@ -4759,19 +4750,18 @@ mod tests {
         let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
         let members_by_id = members.members_by_member_id();
 
-        // Precondition: the direct ban really is denied. Without this the test
-        // would pass for the wrong reason.
+        // The direct ban is authorized by alpha's grant...
         assert!(
-            !MembersV1::is_ban_authorized(
+            MembersV1::is_ban_authorized(
                 id(&mod_sk),
                 viewer_id,
                 &members_by_id,
                 &member_info,
                 owner_id
             ),
-            "precondition: a direct ban of the viewer must be denied here"
+            "the viewer listing mod does not void alpha's grant over the viewer"
         );
-        // ...but the ancestor ban is not.
+        // ...and so is the ban of the viewer's inviter, which cascades.
         assert!(MembersV1::is_ban_authorized(
             id(&mod_sk),
             id(&parent_sk),
@@ -4786,8 +4776,8 @@ mod tests {
         assert_eq!(
             badge.can_ban_viewer,
             Some(true),
-            "the tooltip must not promise safety from someone who can remove \
-             the viewer by banning their inviter"
+            "the tooltip must not promise safety from someone who can ban \
+             the viewer"
         );
     }
 
