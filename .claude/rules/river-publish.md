@@ -358,39 +358,69 @@ session downgrades data to empty.
 `fetch_secrets` never returns a short list (#592): it reads the predecessor's
 RAW key index twice and refuses one that does not decode, two reads that
 disagree, a listing that disagrees with it, an absent index beside a stored
-fixed key, and a listed key that answers "no value". A wrong refusal costs a
+fixed key, a probed fixed key or a room named by the predecessor's
+`rooms_meta` (order, notification modes, cursor) that is stored but unlisted
+(the common #592 shape: a short index rewritten by a later `rooms_meta`
+store), and a listed key that answers "no value". A wrong refusal costs a
 retry; a wrong short answer would be certified complete.
+
+**End state of a refused predecessor.** A FROZEN generation whose index is
+genuinely short is refused on every load: it stays pending (its
+`absent_streak` stays 0, so the #761 cadence never slows its walk), and its
+unlisted rooms do not migrate. The rooms its short index does list still
+arrive through the sweep. The user is told only when importing an identity:
+the gate reads `Unresolved` and offers "Import anyway". There is no general
+notice, and no repair path short of reading the delegate's storage directly
+(which the delegate API cannot do without `list_secrets`, a host import
+nodes before 0.2.81 lack).
 
 **The walk runs only over a complete current room set** (#768 review A1).
 A load attempt records `mark_room_set_complete` only when every listed slot
-and `rooms_meta` answered and decoded (a listed key with no value is a read
-fault, never a skip). The walk driver captures the attempt, waits for the load
+of the CURRENT delegate and its `rooms_meta` answered and decoded (a listed
+key with no value is a read fault, never a skip), from a `defer` queued after
+the hydration it vouches for. A legacy probe's failure does not gate the
+walk. A listed slot that stays unreadable gates the walk on every load (the
+rail shows Retry); that is deliberate, since walking over it is #595. The walk driver captures the attempt, waits for the load
 to settle, and aborts (re-arming the next attempt, without spending the walk
 budget) if the load is still pending at the cap, a reconnect began a new
 attempt, or the set is not complete; `LiveImportSeam` re-checks before every
-merge and its flush. Merging older copies into a set that failed to load, then
+merge, inside each deferred mutation, and before its flush. Merging older copies into a set that failed to load, then
 saving, is #595's identity-overwrite chain.
 
 **The sweep's journal gate** is retried with backoff; a final refusal marks
-the load's fetch failure (Retry, not a false "no rooms") and holds back every
-older generation for the page load.
+the load's fetch failure (Retry, not a false "no rooms") and leaves that
+generation to the walk, which is not gated by it.
 
 **Post-resolve top-up** (#768 review B1). An old tab on the previous build
-keeps writing to the newest predecessor (V32) until it is closed. For 14 days
-or 30 loads after the journal resolves it (state under
-`__river_migration_topup_window__`), each load re-lists it and merges rooms
-the current delegate does not know at all, plus its outbound DMs, through the
-ranked merge.
+keeps writing to the newest predecessor (V32) until it is closed. After the
+journal resolves it, each load reads V32's raw key index (one GET) and, within
+the window, re-lists it and merges rooms the current delegate does not know at
+all, plus its outbound-DM entries (never its hidden threads), through the
+ranked merge. The window (`__river_migration_topup_window__`) is 14 days or
+30 top-ups that actually ran, and restarts whenever V32's index digest
+changes. The top-up is its own driver request: it never forces a walk.
 
 **Migrated identities keep their source rank across loads** (#768 review
 B3): `rooms_meta.identity_sources` records which legacy generation supplied a
 room's `self_sk`, and the load restores it, so a newer generation answering
-later still wins the identity conflict.
+later still wins the identity conflict (and a newer generation's tombstone
+still removes the room). Another tab's entries survive this tab's save, and an
+imported predecessor's own entries are carried into the rank registry.
 
 The **identity-import gate** (#414) is composed from the journal: a walk in
 flight or a status not yet read waits; `begin` failing, a walk whose status is
-unknown, `interrupted_import()`, or permanently rejected items block, with a
+unknown, `interrupted_import()`, or permanently rejected items block; and a
+pending predecessor that has not been found "not installed" (silent, or
+refused) reads `Unresolved` and waits, because an identity imported then would
+outrank the newer one it brings later. Blocked and Unresolved both offer a
 user override ("Import anyway") that ignores, never resolves, the answer.
+
+**The chat delegate's key-value writes are crash-safe** (#768 round 2). The
+empty index is created before any value is ever written, so a stored key never
+exists without one; an absent index beside a stored key is a refused read
+fault. Adding a new key or deleting a listed one records an intent under
+`<origin>:::kv_intent` first, and every operation first rolls a recorded
+intent forward, so a node restart between any two writes wedges nothing.
 
 Because both importers probe the same legacy delegates with the same
 correlation keys, a legacy `ListResponse` is routed to `migrate_legacy_per_room`
