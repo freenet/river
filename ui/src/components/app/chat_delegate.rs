@@ -2987,8 +2987,8 @@ mod tests {
         // The claim above is only meaningful if ListRequest really is fed by the
         // index rather than by enumerating the secret store directly.
         assert!(
-            body("fn handle_list_request(").contains("open_kv(")
-                && body("fn open_kv(").contains("get_key_index("),
+            body("fn handle_list_request(").contains("open_kv_with(")
+                && body("fn open_kv_with(").contains("get_key_index("),
             "ListRequest must answer from the key_index — if it ever enumerates \
              secrets directly, un-indexed secrets would become discoverable and \
              the entire migration hazard in freenet/river#612 changes shape"

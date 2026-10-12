@@ -217,6 +217,25 @@ pub(crate) const WALK_CADENCE_KEY: &[u8] = b"__river_migration_walk_skips__";
 /// round 2 item 8): [`TopUpWindow`]. River's own bookkeeping, never migrated.
 pub(crate) const TOPUP_WINDOW_KEY: &[u8] = b"__river_migration_topup_window__";
 
+/// Predecessors refused for a short index whose provable rooms were salvaged
+/// (#768 round 3, S2/S3): CBOR `Vec<(predecessor delegate key, digest)>`, the
+/// digest being BLAKE3 of the raw index bytes and the `rooms_meta` bytes. A
+/// frozen predecessor whose digest is unchanged is refused again without its
+/// room slots being downloaded. River's own bookkeeping, never migrated.
+pub(crate) const SHORT_INDEX_KEY: &[u8] = b"__river_migration_short_index__";
+
+/// What [`SHORT_INDEX_KEY`] holds.
+pub(crate) type ShortIndexRecord = Vec<([u8; 32], [u8; 32])>;
+
+/// The digest a [`SHORT_INDEX_KEY`] entry records.
+pub(crate) fn short_index_digest(raw_index: &[u8], rooms_meta: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&(raw_index.len() as u64).to_le_bytes());
+    h.update(raw_index);
+    h.update(rooms_meta);
+    *h.finalize().as_bytes()
+}
+
 /// The chat delegate's key index, as a plain `GetRequest` key. Every generation
 /// stores the index under `<origin>:` + `::key_index`, and a `GetRequest` for
 /// `key` reads `<origin>:` + `key`, so this reads the index's raw bytes
@@ -242,6 +261,7 @@ pub(crate) fn is_migration_bookkeeping_key(key: &[u8]) -> bool {
         || is_reserved_key(key)
         || key == WALK_CADENCE_KEY
         || key == TOPUP_WINDOW_KEY
+        || key == SHORT_INDEX_KEY
         || key == KEY_INDEX_STORAGE_KEY
         || key == KV_INTENT_STORAGE_KEY
 }
@@ -530,6 +550,12 @@ fn silent_verdict(predecessor: &DelegateKey) -> Prewarmed {
 pub(crate) struct RiverPredecessorIo<'a, C: RiverDelegateChannel> {
     channel: &'a C,
     prewarmed: HashMap<Vec<u8>, Prewarmed>,
+    /// Predecessors already refused for a short index at this digest, whose
+    /// provable rooms were salvaged ([`SHORT_INDEX_KEY`]).
+    short_index_refused: ShortIndexRecord,
+    /// Room slots a short-index refusal proved exist, to merge after the walk:
+    /// `(predecessor, digest, [(storage key, value)])` (#768 round 3, S3).
+    salvage: Vec<(DelegateKey, [u8; 32], Vec<SecretPair>)>,
 }
 
 impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
@@ -537,6 +563,8 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
         Self {
             channel,
             prewarmed: HashMap::new(),
+            short_index_refused: Vec::new(),
+            salvage: Vec::new(),
         }
     }
 
@@ -801,6 +829,7 @@ impl<C: RiverDelegateChannel> PredecessorSecretsIo for RiverPredecessorIo<'_, C>
             );
         }
         let index_absent = first.is_none();
+        let first_bytes = first.as_ref().map(|(bytes, _)| bytes.clone());
         let indexed: Vec<ChatDelegateKey> = first.map(|(_, keys)| keys).unwrap_or_default();
         if indexed != listed {
             return Err(format!(
@@ -810,8 +839,90 @@ impl<C: RiverDelegateChannel> PredecessorSecretsIo for RiverPredecessorIo<'_, C>
                 indexed.len()
             ));
         }
+        let raw_index = first_bytes.unwrap_or_default();
+        // `rooms_meta` FIRST (#768 round 3, S2): it is what proves a short
+        // index, and proving one must not first download every listed room.
+        let meta_listed = listed.iter().any(|k| k.as_bytes() == ROOMS_META_KEY);
+        let meta_value = self.get_key(predecessor, ROOMS_META_KEY).await?;
+        match (&meta_value, meta_listed) {
+            (Some(_), _) if index_absent => {
+                return Err(format!(
+                    "{:?} is stored but the predecessor has no key index; every \
+                     generation indexes what it stores, so the index read failed",
+                    String::from_utf8_lossy(ROOMS_META_KEY)
+                ));
+            }
+            (Some(_), false) => {
+                return Err(format!(
+                    "{:?} is stored but its index does not list it; the index is \
+                     short (freenet/river#592)",
+                    String::from_utf8_lossy(ROOMS_META_KEY)
+                ));
+            }
+            (None, true) => {
+                return Err(format!(
+                    "listed key {:?} answered \"no value\": a read fault, never a \
+                     skip (freenet/river#763)",
+                    String::from_utf8_lossy(ROOMS_META_KEY)
+                ));
+            }
+            _ => {}
+        }
+        // The common #592 shape (#768 round 2 item 9): the short index was
+        // rewritten by a later `rooms_meta` store, so it lists `rooms_meta`
+        // and passes the checks above while room A's slot (and its `self_sk`)
+        // is stored but unlisted. `rooms_meta` names the rooms the generation
+        // held: probe each named room slot that is not listed.
+        if let Some(meta_bytes) = &meta_value {
+            let digest = short_index_digest(&raw_index, meta_bytes);
+            if self
+                .short_index_refused
+                .iter()
+                .any(|(k, d)| k[..] == predecessor.bytes()[..] && *d == digest)
+            {
+                // Unchanged since it was refused and its rooms salvaged: a
+                // frozen predecessor's short index stays short. Refuse
+                // without downloading anything more (S2).
+                return Err(
+                    "the predecessor's index is short, unchanged since it was refused; \
+                     its provable rooms were already recovered (freenet/river#592)"
+                        .to_string(),
+                );
+            }
+            let named = ciborium::from_reader::<RoomsMeta, _>(meta_bytes.as_slice())
+                .map(|meta| rooms_named_by_meta(&meta))
+                .unwrap_or_default();
+            let mut proven: Vec<SecretPair> = Vec::new();
+            for vk in named {
+                let slot_key = chat_delegate::room_storage_key(&vk);
+                if listed.iter().any(|k| k.as_bytes() == slot_key.as_slice()) {
+                    continue;
+                }
+                if let Some(value) = self.get_key(predecessor, &slot_key).await? {
+                    proven.push((slot_key, value));
+                }
+            }
+            if !proven.is_empty() {
+                let first_key = String::from_utf8_lossy(&proven[0].0).into_owned();
+                // S3: the rooms it proves exist are recovered after the walk,
+                // unflagged, through the ranked merge, while the generation
+                // itself stays pending.
+                self.salvage.push((predecessor.clone(), digest, proven));
+                return Err(format!(
+                    "{first_key:?} is named by rooms_meta and stored, but the index does \
+                     not list it; the index is short (freenet/river#592)"
+                ));
+            }
+        }
         let mut pairs: Vec<SecretPair> = Vec::new();
         for storage_key in candidate_keys(&listed) {
+            if storage_key.as_slice() == ROOMS_META_KEY {
+                // Read above; keep it last (its room order merges after rooms).
+                if let Some(value) = meta_value.clone() {
+                    pairs.push((storage_key, value));
+                }
+                continue;
+            }
             let is_listed = listed
                 .iter()
                 .any(|k| k.as_bytes() == storage_key.as_slice());
@@ -847,30 +958,6 @@ impl<C: RiverDelegateChannel> PredecessorSecretsIo for RiverPredecessorIo<'_, C>
                         String::from_utf8_lossy(&storage_key)
                     ));
                 }
-            }
-        }
-        // The common #592 shape (#768 round 2 item 9): the short index was
-        // rewritten by a later `rooms_meta` store, so it lists `rooms_meta`
-        // and passes the fixed-key check above while room A's slot (and its
-        // `self_sk`) is stored but unlisted. `rooms_meta` names the rooms the
-        // generation held: probe each named room slot that is not listed.
-        let named = pairs
-            .iter()
-            .find(|(k, _)| k.as_slice() == ROOMS_META_KEY)
-            .and_then(|(_, v)| ciborium::from_reader::<RoomsMeta, _>(v.as_slice()).ok())
-            .map(|meta| rooms_named_by_meta(&meta))
-            .unwrap_or_default();
-        for vk in named {
-            let slot_key = chat_delegate::room_storage_key(&vk);
-            if listed.iter().any(|k| k.as_bytes() == slot_key.as_slice()) {
-                continue;
-            }
-            if self.get_key(predecessor, &slot_key).await?.is_some() {
-                return Err(format!(
-                    "{:?} is named by rooms_meta and stored, but the index does not list \
-                     it; the index is short (freenet/river#592)",
-                    String::from_utf8_lossy(&slot_key)
-                ));
             }
         }
         Ok(pairs)
@@ -1985,8 +2072,13 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     lineage: &[DelegateLineageEntry],
 ) -> (JournaledMigrationReport, S) {
     let mut reader = RiverPredecessorIo::new(channel);
+    // Unreadable: refuse short indexes the slow way this walk (cost only).
+    let refused = read_short_index_record(channel, &successor)
+        .await
+        .unwrap_or_default();
+    reader.short_index_refused = refused.clone();
     reader.prewarm(lineage).await;
-    let mut writer = RiverSuccessorIo::new(channel, seam, successor).with_lineage(lineage);
+    let mut writer = RiverSuccessorIo::new(channel, seam, successor.clone()).with_lineage(lineage);
     let report = migrate_delegate_secrets_journaled(
         &mut writer,
         &mut reader,
@@ -1995,7 +2087,83 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
         river_secret_policy(),
     )
     .await;
-    (report, writer.seam)
+    let mut seam = writer.seam;
+    let salvage = std::mem::take(&mut reader.salvage);
+    if !salvage.is_empty() {
+        salvage_short_index_rooms(channel, &mut seam, &successor, lineage, refused, salvage).await;
+    }
+    (report, seam)
+}
+
+/// Recover the room slots a short-index refusal proved exist (#768 round 3,
+/// S3): merge each through the ranked merge at its generation's rank,
+/// unflagged (additive and idempotent, like the post-resolve top-up), while
+/// the generation itself stays pending. Once a predecessor's slots merged and
+/// flushed, record its digest ([`SHORT_INDEX_KEY`]) so later walks refuse it
+/// without downloading them again (S2). A failure records nothing: the next
+/// walk proves and salvages again.
+async fn salvage_short_index_rooms<C: RiverDelegateChannel, S: RiverImportSeam>(
+    channel: &C,
+    seam: &mut S,
+    successor: &DelegateKey,
+    lineage: &[DelegateLineageEntry],
+    mut record: ShortIndexRecord,
+    salvage: Vec<(DelegateKey, [u8; 32], Vec<SecretPair>)>,
+) {
+    let before = record.len();
+    for (pred, digest, pairs) in salvage {
+        let Some(entry) = lineage
+            .iter()
+            .find(|e| e.delegate_key[..] == pred.bytes()[..])
+        else {
+            continue;
+        };
+        let mut ok = true;
+        for (key, value) in pairs {
+            if let Some(rooms) = rooms_to_merge(&classify_recovered(&key, &value)) {
+                if let Err(e) = seam.merge_rooms(rooms, entry.generation).await {
+                    warn!("short-index salvage: merge failed ({e}); the next walk retries");
+                    ok = false;
+                }
+            }
+        }
+        if ok && seam.flush().await.is_ok() {
+            info!(
+                "short-index salvage: recovered the rooms legacy gen {} proves it holds",
+                entry.generation
+            );
+            record.retain(|(k, _)| k[..] != pred.bytes()[..]);
+            record.push((entry.delegate_key, digest));
+        }
+    }
+    if record.len() != before || !record.is_empty() {
+        if let Err(e) = store_short_index_record(channel, successor, &record).await {
+            warn!("short-index salvage: could not record the refusal ({e})");
+        }
+    }
+}
+
+/// Read [`SHORT_INDEX_KEY`] (`Ok(empty)` when none is stored).
+pub(crate) async fn read_short_index_record<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+) -> Result<ShortIndexRecord, String> {
+    match get_current(channel, successor, SHORT_INDEX_KEY.to_vec()).await? {
+        None => Ok(Vec::new()),
+        Some(bytes) => ciborium::from_reader(bytes.as_slice())
+            .map_err(|e| format!("short-index record does not decode: {e}")),
+    }
+}
+
+/// Store [`SHORT_INDEX_KEY`], awaiting the delegate's ack.
+pub(crate) async fn store_short_index_record<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+    record: &ShortIndexRecord,
+) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(record, &mut bytes).map_err(|e| e.to_string())?;
+    put_current(channel, successor, SHORT_INDEX_KEY.to_vec(), &bytes).await
 }
 
 /// Log the walk's outcome. The report is METADATA ONLY and is never rendered
@@ -3059,6 +3227,158 @@ mod tests {
         );
         assert!(seam.rooms.map.is_empty(), "nothing of it may be imported");
         assert!(!report.is_complete());
+    }
+
+    /// A short-index refusal (#768 round 3, S3): gen 0 stays pending and
+    /// unsealed, the rooms its `rooms_meta` proves exist (`salvaged`) are
+    /// recovered with their identity, and nothing else of it (`not_imported`)
+    /// is imported by the walk.
+    fn assert_gen0_refused_with_salvage(
+        report: &DelegateMigrationReport,
+        channel: &MockChannel,
+        seam: &MemorySeam,
+        salvaged: &[VerifyingKey],
+        not_imported: &[VerifyingKey],
+    ) {
+        assert!(
+            report.predecessors.iter().any(|p| matches!(
+                p,
+                PredecessorMigration::Unresponsive {
+                    generation: 0,
+                    error: Some(_),
+                    ..
+                }
+            )),
+            "a short export must be a fault, never data: {report:?}"
+        );
+        assert_eq!(
+            channel.stored(&successor_key(), &pred_done_marker_key(&pred_key(0))),
+            None,
+            "a refused predecessor must not be sealed"
+        );
+        assert!(!report.is_complete());
+        for vk in salvaged {
+            let room = seam.rooms.map.get(vk).expect("a proven room is recovered");
+            assert!(room.self_sk.is_some(), "with its signing key");
+        }
+        for vk in not_imported {
+            assert!(
+                !seam.rooms.map.contains_key(vk),
+                "the walk imports nothing else"
+            );
+        }
+    }
+
+    /// #768 round 3, S2 + S3: a short index is proven from `rooms_meta` FIRST,
+    /// without downloading the listed rooms; the proven room is recovered once;
+    /// and a later walk over the unchanged predecessor refuses it without
+    /// downloading any room slot, while a changed one is checked again.
+    #[test]
+    fn a_short_index_is_refused_cheaply_and_its_proven_rooms_recovered_once() {
+        let (a, b) = (vk(1), vk(2));
+        let slot = |r, seed| cbor(&RoomSlot::Present(Box::new(room_with_identity(r, seed))));
+        let mut gen0 = DelegateSim::default();
+        gen0.store
+            .insert(chat_delegate::room_storage_key(&a), slot(a, 3));
+        gen0.store
+            .insert(chat_delegate::room_storage_key(&b), slot(b, 4));
+        gen0.store.insert(
+            ROOMS_META_KEY.to_vec(),
+            cbor(&RoomsMeta {
+                room_order: vec![b, a],
+                ..Default::default()
+            }),
+        );
+        gen0.listed = Some(vec![
+            chat_delegate::room_storage_key(&b),
+            ROOMS_META_KEY.to_vec(),
+        ]);
+        let channel = channel_with_gen0(gen0);
+        let b_slot = format!(
+            "get:{}",
+            String::from_utf8_lossy(&chat_delegate::room_storage_key(&b))
+        );
+        let a_slot = format!(
+            "get:{}",
+            String::from_utf8_lossy(&chat_delegate::room_storage_key(&a))
+        );
+
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert_gen0_refused_with_salvage(&report, &channel, &seam, &[a], &[b]);
+        assert_eq!(
+            channel.requests_to_predecessors(&b_slot),
+            0,
+            "listed rooms are not downloaded to prove it"
+        );
+        assert_eq!(channel.requests_to_predecessors(&a_slot), 1);
+        let record = block_on(read_short_index_record(&channel, &successor_key())).unwrap();
+        assert_eq!(
+            record.len(),
+            1,
+            "the refusal is recorded once its rooms flushed"
+        );
+        assert_eq!(record[0].0, pred_key(0).bytes()[..]);
+
+        // Unchanged: refused again without any room slot downloaded.
+        channel.reset_counters();
+        assert!(seam.flushes > 0);
+        let (report, seam2) = walk(&channel, MemorySeam::new());
+        assert!(!report.is_complete());
+        assert_eq!(
+            channel.requests_to_predecessors(&a_slot),
+            0,
+            "{:?}",
+            channel.log.borrow()
+        );
+        assert_eq!(channel.requests_to_predecessors(&b_slot), 0);
+        assert!(seam2.rooms.map.is_empty(), "nothing re-merged");
+
+        // Changed (an old tab wrote): checked again.
+        channel.put(
+            &pred_key(0),
+            ROOMS_META_KEY,
+            &cbor(&RoomsMeta {
+                room_order: vec![a, b],
+                ..Default::default()
+            }),
+        );
+        channel.reset_counters();
+        let (_, seam3) = walk(&channel, MemorySeam::new());
+        assert_eq!(channel.requests_to_predecessors(&a_slot), 1);
+        assert!(seam3.rooms.map.contains_key(&a));
+    }
+
+    /// S2 + S3: a salvage that did not land (the flush failed) records no
+    /// refusal, so the next walk proves and salvages again.
+    #[test]
+    fn a_salvage_that_did_not_flush_is_not_recorded() {
+        let (a, b) = (vk(1), vk(2));
+        let slot = |r, seed| cbor(&RoomSlot::Present(Box::new(room_with_identity(r, seed))));
+        let mut gen0 = DelegateSim::default();
+        gen0.store
+            .insert(chat_delegate::room_storage_key(&a), slot(a, 3));
+        gen0.store
+            .insert(chat_delegate::room_storage_key(&b), slot(b, 4));
+        gen0.store.insert(
+            ROOMS_META_KEY.to_vec(),
+            cbor(&RoomsMeta {
+                room_order: vec![b, a],
+                ..Default::default()
+            }),
+        );
+        gen0.listed = Some(vec![
+            chat_delegate::room_storage_key(&b),
+            ROOMS_META_KEY.to_vec(),
+        ]);
+        let channel = channel_with_gen0(gen0);
+        let mut seam = MemorySeam::new();
+        seam.fail_flush = true;
+        let _ = walk(&channel, seam);
+        let record = block_on(read_short_index_record(&channel, &successor_key())).unwrap();
+        assert!(
+            record.is_empty(),
+            "a salvage that did not land must not be recorded"
+        );
     }
 
     fn gen0_with_blob() -> DelegateSim {
@@ -4612,7 +4932,7 @@ mod tests {
             ]);
             let channel = channel_with_gen0(gen0);
             let (report, seam) = walk(&channel, MemorySeam::new());
-            assert_gen0_refused(&report, &channel, &seam);
+            assert_gen0_refused_with_salvage(&report, &channel, &seam, &[a], &[b]);
         }
 
         // Control: rooms_meta names A, but A's slot is genuinely gone.
