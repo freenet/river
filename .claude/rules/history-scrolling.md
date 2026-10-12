@@ -38,9 +38,10 @@ reaches them.
 
 While another mobile panel replaces the chat, Latest is hidden with it, so
 the open room's unread count, under its notification mode, shows in one place
-per panel. Neither marks anything read, and both use the same per-room count
-(`count_unread_in_room`), so Muted shows nothing and Mentions & replies counts
-only arrivals that mention or reply to the reader.
+per panel. Neither marks anything read, and both count with
+`count_unread_in_room_data_with_mode` under the room's mode, so Muted shows
+nothing and Mentions & replies counts only arrivals that mention or reply to
+the reader.
 
 - **Rooms:** the open room's row in the room list shows its count as every
   other row does (`room_list.rs`, while `MOBILE_VIEW` is not `Chat`;
@@ -48,8 +49,9 @@ only arrivals that mention or reply to the reader.
   arrow has no badge.
 - **Members:** the room list is hidden too, so the panel's back arrow shows
   the count (`members-current-room-unread-badge`, opted into through
-  `BackToChatButton`'s `current_room_badge`) and its accessible label reads
-  "Back to chat, N unread".
+  `BackToChatButton`'s `current_room_badge`), and its accessible label and
+  tooltip word it as the room's row does ("Back to chat, 2 unread messages",
+  or "…mentions or replies").
 
 While the chat shows, the open room's row has no badge, and the hamburger,
 which shows only with the chat, always leaves the open room out.
@@ -112,16 +114,19 @@ Known limitations:
   including deleting the newest, so an arrival follows only by the rule
   above; a followed arrival lands a new request, which holds again. A
   backfill, a message inserted above the newest, a trim and rows changing
-  height keep it. A scroll the reader makes upward, raising both the view's
-  top and bottom edges and ending more than 4px from the scroller's absolute
-  end, releases it, as do hiding the panel, changing rooms and an empty range.
-  That distance is measured from where the hold last placed the view or a
-  clamp last left it, not from the previous scroll event, so a reader leaving
-  in steps of a pixel or two releases it as one larger scroll would
-  (`end_hold_after_scroll`). A clamp from the chat area growing (the composer
-  collapsing, the keyboard closing) raises only the top edge and keeps it,
-  even when a row grows in the same frame; the next scroll is measured from
-  where it left the view. Known limitations: padding below the newest message
+  height keep it. Hiding the panel, changing rooms and an empty range release
+  it, and so does a scroll the reader makes upward: one that raises both of
+  the view's edges, the top edge more than 4px above where the view sits at
+  the end, and ends more than 4px from the scroller's absolute end. Where the view
+  sits at the end is taken afresh on every scroll event that keeps the hold
+  (`end_hold_after_scroll`), so a reader leaving in steps of a pixel or two
+  releases it as one larger scroll would, and a clamp or trim counts from the
+  new end. The top edge is the reader's own move: content growing below the
+  view, or the chat area shrinking, in the same frame as a scroll adds to the
+  distance from the end but releases nobody inside the margin. A clamp from
+  the chat area growing (the composer collapsing, the keyboard closing)
+  raises only the top edge and keeps it, even when a row grows in the same
+  frame. Known limitations: padding below the newest message
   lets a small upward scroll release the hold while the message is still
   visible and Latest stays hidden ([#765](https://github.com/freenet/river/issues/765)); a reader who scrolls up in
   the same frame the chat area grows by at least as much keeps the hold for
