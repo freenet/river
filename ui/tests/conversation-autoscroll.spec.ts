@@ -1401,6 +1401,32 @@ test.describe("The end holds after an explicit request", () => {
     });
   }
 
+  // The opening's end hold keeps the end when a narrower window rewraps every row (removed in #753 as a follow test).
+  test("the opening's end hold keeps the end through a resize that reflows the history", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    const before = (await scrollMetrics(page)).height;
+
+    // Every row wraps onto more lines, so the history grows taller with no
+    // state change: only the ResizeObserver sees it. 1280 -> 380 also crosses
+    // the 768px breakpoint; a history that went zero-size on the way would
+    // drop the hold, and that is a defect, not a reason to pick another width.
+    await page.setViewportSize({ width: 380, height: 900 });
+
+    // How much a reflow grows the history depends on where the text wraps
+    // (1280 -> 700 grows this fixture by zero), so a flat reflow would leave
+    // the test passing without the end ever moving.
+    await expect
+      .poll(async () => (await scrollMetrics(page)).height, {
+        timeout: 5_000,
+        message:
+          "premise: narrowing the window did not make the history taller, so this test " +
+          "is not exercising a reflow at all",
+      })
+      .toBeGreaterThan(before + WELL_AWAY_FROM_END_PX);
+
+    await expectSettledAtBottom(page, "the history reflowed taller and the held end was lost");
+  });
+
   // Tall enough that the opening's tail sits inside the backfill lead, so the
   // opening backfills: same newest message, more rows.
   test.describe("with an opening backfill", () => {
