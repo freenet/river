@@ -1963,7 +1963,7 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
         // of minting a generated default (freenet/river#298).
         self_nickname: export.self_nickname,
         previous_contract_key: None,
-        rekey_merge_owed: None,
+        rekey_merge_owed: Vec::new(),
         // Restore the invitation-carried room secrets so a non-owner of a
         // private room keeps the secret across a device migration
         // (freenet/river#306). Folded into the `#[serde(skip)]` `secrets` map

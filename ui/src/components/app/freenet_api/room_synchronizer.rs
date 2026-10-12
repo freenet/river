@@ -655,11 +655,23 @@ pub(crate) fn seed_put_request(
 /// whose empty or missing answer probes the older generations itself.
 pub(crate) fn owed_rekey_merge(
     room: &crate::room_data::RoomData,
-) -> Option<freenet_stdlib::prelude::ContractInstanceId> {
-    if room.is_awaiting_initial_sync() {
+) -> Option<Vec<freenet_stdlib::prelude::ContractInstanceId>> {
+    if room.is_awaiting_initial_sync() || room.rekey_merge_owed.is_empty() {
         return None;
     }
-    room.rekey_merge_owed.map(|k| *k.id())
+    Some(room.rekey_merge_owed.iter().map(|k| *k.id()).collect())
+}
+
+/// The merge a room `merge_from_source` just reported as re-keyed off
+/// `old_contract_key` must run before its seed PUT (freenet/river#769): its
+/// owed keys, if the re-key is fresh, i.e. the room owes a merge from the very
+/// key just replaced. A stale copy from a legacy delegate also lands in
+/// `migrated_rooms` for a room whose copy in `ROOMS` moved on long ago.
+pub(crate) fn fresh_rekey_merge(
+    room: &crate::room_data::RoomData,
+    old_contract_key: &freenet_stdlib::prelude::ContractKey,
+) -> Option<Vec<freenet_stdlib::prelude::ContractInstanceId>> {
+    owed_rekey_merge(room).filter(|_| room.rekey_merge_owed.contains(old_contract_key))
 }
 
 /// The code-free subscribe for a room the network should already hold
@@ -864,7 +876,7 @@ impl RoomSynchronizer {
                         (
                             room_data.contract_key,
                             is_owner,
-                            owed_rekey_merge(room_data),
+                            fresh_rekey_merge(room_data, old_contract_key),
                             room_data.room_state.clone(),
                         )
                     } else {
@@ -882,12 +894,21 @@ impl RoomSynchronizer {
                 // Register the new contract id so responses resolve back to
                 // this owner, with the same baseline the subscribe sweep's own
                 // registration would have recorded.
-                SYNC_INFO.with_mut(|sync_info| {
-                    if sync_info.get_sync_status(owner_vk).is_none() {
+                let already_syncing = SYNC_INFO.with_mut(|sync_info| {
+                    let status = sync_info.get_sync_status(owner_vk).cloned();
+                    if status.is_none() {
                         sync_info.register_new_room(*owner_vk);
                         sync_info.update_last_synced_state(owner_vk, &room_state);
                     }
+                    matches!(
+                        status,
+                        Some(RoomSyncStatus::Subscribing | RoomSyncStatus::Subscribed)
+                    )
                 });
+                // A room already subscribing or subscribed this session (a
+                // second copy reporting the re-key late) is not pulled back:
+                // its merge runs in the background from the sweep instead.
+                let owed_merge = owed_merge.filter(|_| !already_syncing);
 
                 // Otherwise (no merge owed, or a placeholder) the room needs
                 // nothing special: the subscribe sweep below picks it up like
@@ -1070,8 +1091,8 @@ impl RoomSynchronizer {
                 // the subscribe. Once per load; the room already has state
                 // under its current key, so nothing waits on it.
                 let owed_merge = ROOMS.read().map.get(owner_vk).and_then(owed_rekey_merge);
-                if let Some(previous) = owed_merge {
-                    start_rekey_merge(*owner_vk, previous, state.clone(), false).await;
+                if let Some(owed) = owed_merge {
+                    start_rekey_merge(*owner_vk, owed, state.clone(), false).await;
                 }
 
                 // A room the network should already hold subscribes with a
@@ -2306,11 +2327,11 @@ mod tests {
             "the re-key merge starts before the sweep"
         );
         assert!(
-            body[..subscribing].contains("owed_rekey_merge(room_data)"),
-            "the room's own marker decides what is merged"
+            body[..subscribing].contains("fresh_rekey_merge(room_data,old_contract_key)"),
+            "only a fresh re-key blocks the room on its merge"
         );
         let retry = body
-            .find("start_rekey_merge(*owner_vk,previous,state.clone(),false)")
+            .find("start_rekey_merge(*owner_vk,owed,state.clone(),false)")
             .expect("an owed merge is retried in the background");
         assert!(
             retry > sweep,

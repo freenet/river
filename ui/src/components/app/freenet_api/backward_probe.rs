@@ -237,7 +237,7 @@ impl ProbeStateOps for RiverProbeOps {
 /// back to the `(owner_vk, per-fire token)` of the probe GET it belongs to.
 /// Plain `Mutex` map — see the module docs. The presence of an entry is what
 /// makes a legacy-key GET response route into the probe handler
-/// ([`is_probe_instance`]); the token lets a watchdog tell its own outstanding
+/// ([`take_probe_response`]); the token lets a watchdog tell its own outstanding
 /// fire apart from a later probe that reused the same deterministic id.
 static PROBE_ROUTES: LazyLock<Mutex<HashMap<ContractInstanceId, (VerifyingKey, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -258,14 +258,11 @@ enum ProbePurpose {
     /// freenet/river#292: the current key came back without real state.
     /// Recover-or-seed by PUTting the outcome straight onto the current key.
     Recover,
-    /// freenet/river#769: the room was last synced under the older
-    /// generation `previous`. Merge what the older keys hold into `ROOMS`;
-    /// then, if `seed`, re-seed the current key through the ordinary seed-PUT
-    /// path, so the PUT carries the merged state.
-    RekeyMerge {
-        previous: ContractInstanceId,
-        seed: bool,
-    },
+    /// freenet/river#769: the room owes merges from older generations it
+    /// was synced under ([`ProbeEntry::owed`]). Merge what the older keys hold
+    /// into `ROOMS`; then, if `seed`, re-seed the current key through the
+    /// ordinary seed-PUT path, so the PUT carries the merged state.
+    RekeyMerge { seed: bool },
 }
 
 /// One owner's in-flight probe.
@@ -278,6 +275,8 @@ struct ProbeEntry {
     hits: Vec<ContractInstanceId>,
     /// Shared with the driver's [`RiverProbeOps`].
     fold_failed: Arc<AtomicBool>,
+    /// For a re-key merge, the generations the room owes a merge from.
+    owed: Vec<ContractInstanceId>,
     purpose: ProbePurpose,
 }
 
@@ -287,6 +286,7 @@ impl ProbeEntry {
         local: ChatRoomStateV1,
         candidates: Vec<ContractInstanceId>,
         purpose: ProbePurpose,
+        owed: Vec<ContractInstanceId>,
     ) -> Self {
         let ops = RiverProbeOps::new(owner_vk);
         let fold_failed = ops.fold_failed.clone();
@@ -309,6 +309,7 @@ impl ProbeEntry {
             driver,
             hits: Vec::new(),
             fold_failed,
+            owed,
             purpose,
         }
     }
@@ -334,6 +335,14 @@ fn orphaned_fires() -> MutexGuard<'static, HashMap<ContractInstanceId, u32>> {
     ORPHANED_FIRES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Fire tokens whose GET was never sent (no WebAPI, or the send failed), so
+/// their watchdog does not count them as possibly in flight.
+static UNSENT_FIRES: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn unsent_fires() -> MutexGuard<'static, HashSet<u64>> {
+    UNSENT_FIRES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Consume one orphaned fire for `id`, if any. Returns whether one was.
 fn take_orphaned_fire(id: &ContractInstanceId) -> bool {
     let mut orphans = orphaned_fires();
@@ -356,10 +365,10 @@ fn take_orphaned_fire(id: &ContractInstanceId) -> bool {
 static PROBE_DRIVERS: LazyLock<Mutex<HashMap<VerifyingKey, ProbeEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// `(owner, previous generation)` pairs a re-key merge has been started for
-/// on this page load. A merge runs at most once per load; one that could not
-/// finish is retried on the NEXT load, from the persisted marker.
-static REKEY_ATTEMPTED: LazyLock<Mutex<HashSet<(VerifyingKey, ContractInstanceId)>>> =
+/// Owners a re-key merge has been started for on this page load. A merge
+/// runs at most once per load; one that could not finish is retried on the
+/// NEXT load, from the persisted marker.
+static REKEY_ATTEMPTED: LazyLock<Mutex<HashSet<VerifyingKey>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Lock the route table, recovering from a poisoned mutex (a panic while the
@@ -393,31 +402,40 @@ fn drivers() -> MutexGuard<'static, HashMap<VerifyingKey, ProbeEntry>> {
 }
 
 /// Lock the re-key attempt latch, recovering from a poisoned mutex.
-fn rekey_attempted() -> MutexGuard<'static, HashSet<(VerifyingKey, ContractInstanceId)>> {
+fn rekey_attempted() -> MutexGuard<'static, HashSet<VerifyingKey>> {
     REKEY_ATTEMPTED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The generations a re-key merge asks, newest first: every legacy generation
-/// from the newest down to and including `previous`, the one this device last
-/// synced the room under (freenet/river#769).
+/// from the newest down to and including the oldest one the room owes a merge
+/// from (freenet/river#769).
 ///
 /// Nothing older is asked. This device's snapshot already holds what it saw
-/// under `previous`, so an older key can only add what was written there
-/// before this device moved on, which is the #292 dormant-room recovery's job,
-/// not a re-key's. Bounding the list is what keeps the seed PUT prompt: one
-/// GET in the ordinary case, one per skipped release otherwise.
+/// under the keys it synced under, so an older key can only add what was
+/// written there before this device moved on, which is the #292 dormant-room
+/// recovery's job, not a re-key's. Bounding the list is what keeps the seed
+/// PUT prompt: one GET in the ordinary case, one per skipped release otherwise.
 ///
-/// If `previous` is not in the registry at all (a development build, say),
-/// only `previous` itself is asked: it is the one key known to hold this
-/// device's room.
+/// An owed key missing from the registry (a development build, say) is asked
+/// too, last: it is a key known to hold this device's room.
 pub(crate) fn rekey_candidates(
     legacy_newest_first: &[ContractInstanceId],
-    previous: ContractInstanceId,
+    owed: &[ContractInstanceId],
 ) -> Vec<ContractInstanceId> {
-    match legacy_newest_first.iter().position(|id| *id == previous) {
+    let deepest = owed
+        .iter()
+        .filter_map(|o| legacy_newest_first.iter().position(|id| id == o))
+        .max();
+    let mut out = match deepest {
         Some(pos) => legacy_newest_first[..=pos].to_vec(),
-        None => vec![previous],
+        None => Vec::new(),
+    };
+    for o in owed {
+        if !out.contains(o) {
+            out.push(*o);
+        }
     }
+    out
 }
 
 /// What a finished re-key merge does (freenet/river#769). Pure, so each arm is
@@ -426,33 +444,64 @@ pub(crate) fn rekey_candidates(
 pub(crate) struct RekeyFinish {
     /// Older-generation state to CRDT-merge into the room, if any was found.
     pub recovered: Option<ChatRoomStateV1>,
-    /// The owed generation itself answered with the room's state and the fold
-    /// kept it, so the marker may be cleared once the merge has landed.
+    /// Owed generations that answered with the room's state, which the fold
+    /// kept: these come off the marker once the merge has landed.
+    pub satisfied: Vec<ContractInstanceId>,
+    /// Every owed generation is satisfied.
     pub complete: bool,
 }
 
-/// `previous_hit`: the generation the merge is owed from answered with real
-/// state. Nothing else completes a merge. That generation held this room (the
-/// device synced under it), so a `NotFound` or silence from it means "could
-/// not read it", never "it is empty"; a `NotFound` on Freenet is routinely a
-/// routing dead-end. Such a walk still merges what it found and seeds, but
-/// keeps the marker, and the next load asks again.
+/// Only an owed generation that answered with real state is satisfied. Each
+/// held this room (the device synced under it), so a `NotFound` or silence
+/// from it means "could not read it", never "it is empty"; a `NotFound` on
+/// Freenet is routinely a routing dead-end. Nor does one owed key answering
+/// vouch for another: what reached a newer key is not on an older one. A walk
+/// that leaves any owed key unsatisfied still merges what it found and seeds,
+/// and the next load asks again. If folding two generations failed, nothing
+/// is satisfied.
 pub(crate) fn plan_rekey_finish(
     outcome: Outcome<ChatRoomStateV1>,
-    previous_hit: bool,
+    owed: &[ContractInstanceId],
+    hits: &[ContractInstanceId],
     fold_failed: bool,
 ) -> RekeyFinish {
-    let complete = previous_hit && !fold_failed;
-    match outcome {
-        Outcome::Recovered { merged, .. } => RekeyFinish {
-            recovered: Some(merged),
-            complete,
-        },
-        // No generation had real state, so the owed one cannot have either.
-        Outcome::SeedLocal { .. } | Outcome::NoLegacy { .. } => RekeyFinish {
-            recovered: None,
-            complete: false,
-        },
+    let recovered = match outcome {
+        Outcome::Recovered { merged, .. } => Some(merged),
+        // No generation had real state, so no owed one did either.
+        Outcome::SeedLocal { .. } | Outcome::NoLegacy { .. } => None,
+    };
+    let satisfied: Vec<ContractInstanceId> = if recovered.is_none() || fold_failed {
+        Vec::new()
+    } else {
+        owed.iter().filter(|o| hits.contains(o)).copied().collect()
+    };
+    RekeyFinish {
+        complete: !owed.is_empty() && satisfied.len() == owed.len(),
+        recovered,
+        satisfied,
+    }
+}
+
+/// Turn a background re-key merge into one that seeds the room when it ends.
+/// Returns whether it changed anything.
+fn upgrade_to_seed(entry: &mut ProbeEntry) -> bool {
+    match &mut entry.purpose {
+        ProbePurpose::RekeyMerge { seed } if !*seed => {
+            *seed = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// [`upgrade_to_seed`], and since the room is now held out of the subscribe
+/// sweep, refresh its timeout: the hop already in flight was fired without
+/// touching it.
+fn make_seed(entry: &mut ProbeEntry, owner_vk: VerifyingKey) {
+    if upgrade_to_seed(entry) {
+        crate::util::defer(move || {
+            SYNC_INFO.with_mut(|sync_info| sync_info.touch_subscribing_since(&owner_vk));
+        });
     }
 }
 
@@ -471,14 +520,15 @@ pub enum RekeyStart {
 /// Merge what the older room-contract generations hold for `owner_vk`'s room
 /// into `ROOMS` (freenet/river#769), then, if `seed`, re-seed the current key.
 ///
-/// `previous` is the contract id the room was last synced under (its persisted
-/// `previous_contract_key`). With `seed`, the caller must hold the room out of
+/// `owed` is the room's persisted `rekey_merge_owed`: the older contract ids
+/// it was synced under and still owes a merge from. With `seed`, the caller
+/// must hold the room out of
 /// the subscribe sweep (status `Subscribing`) until this finishes: the seed PUT
 /// is the merge's last step, so it carries the old key's messages rather than
 /// only this device's snapshot.
 pub async fn start_rekey_merge(
     owner_vk: VerifyingKey,
-    previous: ContractInstanceId,
+    owed: Vec<ContractInstanceId>,
     local_snapshot: ChatRoomStateV1,
     seed: bool,
 ) -> RekeyStart {
@@ -487,14 +537,12 @@ pub async fn start_rekey_merge(
         if let Some(entry) = drivers.get_mut(&owner_vk) {
             // A `Recover` probe seeds on its own; a background merge is told to.
             if seed {
-                if let ProbePurpose::RekeyMerge { seed: s, .. } = &mut entry.purpose {
-                    *s = true;
-                }
+                make_seed(entry, owner_vk);
             }
             return RekeyStart::AlreadyRunning;
         }
     }
-    if !rekey_attempted().insert((owner_vk, previous)) {
+    if owed.is_empty() || !rekey_attempted().insert(owner_vk) {
         return RekeyStart::AlreadyAttempted;
     }
 
@@ -502,7 +550,7 @@ pub async fn start_rekey_merge(
         .iter()
         .map(|k| *k.id())
         .collect();
-    let candidates = rekey_candidates(&legacy, previous);
+    let candidates = rekey_candidates(&legacy, &owed);
     info!(
         "Re-key merge for room {:?}: asking {} older generation(s) before {} (freenet/river#769)",
         MemberId::from(owner_vk),
@@ -520,17 +568,12 @@ pub async fn start_rekey_merge(
             owner_vk,
             local_snapshot,
             candidates,
-            ProbePurpose::RekeyMerge { previous, seed },
+            ProbePurpose::RekeyMerge { seed },
+            owed,
         ),
     );
     pump_probe(owner_vk).await;
     RekeyStart::Started
-}
-
-/// Whether `instance_id` is the contract id of an outstanding backward-probe
-/// GET. Used by `handle_get_response` to route legacy-key responses.
-pub fn is_probe_instance(instance_id: &ContractInstanceId) -> bool {
-    routes().contains_key(instance_id)
 }
 
 /// Start a backward probe for `owner_vk`'s room: build the driver over the
@@ -555,9 +598,7 @@ pub async fn start_backward_probe(owner_vk: VerifyingKey, local_snapshot: ChatRo
     // A running re-key merge (freenet/river#769) covers this room's newer
     // generations; the current key is empty, so it must now end in a seed.
     if let Some(entry) = drivers().get_mut(&owner_vk) {
-        if let ProbePurpose::RekeyMerge { seed, .. } = &mut entry.purpose {
-            *seed = true;
-        }
+        make_seed(entry, owner_vk);
         info!(
             "Backward probe already in progress for {:?}, not restarting",
             MemberId::from(owner_vk)
@@ -595,6 +636,7 @@ pub async fn start_backward_probe(owner_vk: VerifyingKey, local_snapshot: ChatRo
             local_snapshot,
             legacy_keys.iter().map(|k| *k.id()).collect(),
             ProbePurpose::Recover,
+            Vec::new(),
         ),
     );
     pump_probe(owner_vk).await;
@@ -604,43 +646,68 @@ pub async fn start_backward_probe(owner_vk: VerifyingKey, local_snapshot: ChatRo
 /// Deliver a typed `NotFound` for a legacy-key probe GET. The walk moves on
 /// now rather than after the watchdog. It is not evidence the generation is
 /// empty (see [`plan_rekey_finish`]); it only stops the walk waiting on it.
-pub(crate) async fn deliver_probe_absent(id: ContractInstanceId) {
-    if let Some(owner_vk) = take_probe_absent(id) {
-        pump_probe(owner_vk).await;
+pub(crate) async fn deliver_probe_absent(id: ContractInstanceId) -> bool {
+    match take_probe_absent(id) {
+        ProbeReply::Advance(owner_vk) => {
+            pump_probe(owner_vk).await;
+            true
+        }
+        ProbeReply::Consumed => true,
+        ProbeReply::NotOurs => false,
     }
 }
 
-/// The synchronous half of [`deliver_probe_absent`]: claim `id`'s route and
-/// advance its walk past `id`. Returns the owner to pump, or `None` if the
-/// `NotFound` may belong to a fire the watchdog already gave up on
-/// ([`ORPHANED_FIRES`]) or no probe is waiting on `id`.
-fn take_probe_absent(id: ContractInstanceId) -> Option<VerifyingKey> {
+/// What a reply for a contract id meant to the backward probe.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeReply {
+    /// A probe was waiting on it and has taken it; pump that owner's walk.
+    Advance(VerifyingKey),
+    /// A late answer to a probe GET the watchdog had given up on: nothing to
+    /// do, but it is the probe's, not some room's.
+    Consumed,
+    /// Not a probe reply.
+    NotOurs,
+}
+
+/// The synchronous half of [`deliver_probe_absent`]. A `NotFound` for an id
+/// with an abandoned fire outstanding ([`ORPHANED_FIRES`]) may be that fire's,
+/// so it consumes the orphan and is ignored, routed or not: a later fire that
+/// re-registered the id falls back to its own watchdog. Otherwise it claims
+/// `id`'s route and advances the walk past `id`.
+fn take_probe_absent(id: ContractInstanceId) -> ProbeReply {
     if take_orphaned_fire(&id) {
-        info!("NotFound for {id} may answer an abandoned probe GET — leaving it to the watchdog");
-        return None;
+        info!("NotFound for {id} may answer an abandoned probe GET — not trusting it");
+        return ProbeReply::Consumed;
     }
-    let (owner_vk, _token) = routes().remove(&id)?;
+    let Some((owner_vk, _token)) = routes().remove(&id) else {
+        return ProbeReply::NotOurs;
+    };
     info!("Legacy contract {id} answered NotFound — advancing to older generation");
     if let Some(entry) = drivers().get_mut(&owner_vk) {
         // The 0.5 driver's only "miss" event.
         entry.driver.on_timeout(id);
     }
-    Some(owner_vk)
+    ProbeReply::Advance(owner_vk)
 }
 
 /// Deliver a legacy-key GET response into its owner's probe driver, then pump.
 /// The response's contract id (`id`) was registered by [`fire_probe_get`]; the
 /// FIRST of {this response, the watchdog} to remove the route owns the hop
 /// (single-shot). Unknown ids are the race-loser and no-op.
-pub(crate) async fn deliver_probe_response(id: ContractInstanceId, bytes: Vec<u8>) {
-    if let Some(owner_vk) = take_probe_response(id, &bytes) {
-        pump_probe(owner_vk).await;
+pub(crate) async fn deliver_probe_response(id: ContractInstanceId, bytes: &[u8]) -> bool {
+    match take_probe_response(id, bytes) {
+        ProbeReply::Advance(owner_vk) => {
+            pump_probe(owner_vk).await;
+            true
+        }
+        ProbeReply::Consumed => true,
+        ProbeReply::NotOurs => false,
     }
 }
 
 /// The synchronous half of [`deliver_probe_response`]: claim `id`'s route and
 /// feed the bytes to its driver. Returns the owner to pump.
-fn take_probe_response(id: ContractInstanceId, bytes: &[u8]) -> Option<VerifyingKey> {
+fn take_probe_response(id: ContractInstanceId, bytes: &[u8]) -> ProbeReply {
     // The per-fire token is deliberately IGNORED here (unlike the watchdog): a
     // GET response for `id` is a valid response for whatever fire currently owns
     // `id`'s route, and the driver is single-shot on its own outstanding
@@ -648,12 +715,16 @@ fn take_probe_response(id: ContractInstanceId, bytes: &[u8]) -> Option<Verifying
     // `on_response(id, ..)` is a no-op. So routing by the current owner is
     // always correct; only the stale-timeout case needs the token.
     // One reply consumed for `id`, whichever fire sent it.
-    take_orphaned_fire(&id);
+    let orphan = take_orphaned_fire(&id);
     let Some((owner_vk, _token)) = routes().remove(&id) else {
         // The route was already consumed — e.g. the timeout watchdog fired
         // first. Whichever ran first owns the outcome; the loser lands here.
-        warn!("Probe GET response for {id} had no matching probe entry — ignoring");
-        return None;
+        return if orphan {
+            info!("Late probe GET response for {id} after its watchdog — ignoring");
+            ProbeReply::Consumed
+        } else {
+            ProbeReply::NotOurs
+        };
     };
     {
         let mut drivers = drivers();
@@ -678,7 +749,7 @@ fn take_probe_response(id: ContractInstanceId, bytes: &[u8]) -> Option<Verifying
             driver.on_response(id, bytes);
         }
     }
-    Some(owner_vk)
+    ProbeReply::Advance(owner_vk)
 }
 
 /// Drive the probe for `owner_vk` one decision forward: ask the driver what to
@@ -703,14 +774,15 @@ async fn pump_probe(owner_vk: VerifyingKey) {
                 return;
             };
             let outcome = entry.driver.take_outcome();
-            if let ProbePurpose::RekeyMerge { previous, seed } = entry.purpose {
+            if let ProbePurpose::RekeyMerge { seed } = entry.purpose {
                 if let Some(outcome) = outcome {
                     let plan = plan_rekey_finish(
                         outcome,
-                        entry.hits.contains(&previous),
+                        &entry.owed,
+                        &entry.hits,
                         entry.fold_failed.load(Ordering::Relaxed),
                     );
-                    finish_rekey_merge(owner_vk, previous, seed, plan);
+                    finish_rekey_merge(owner_vk, seed, plan);
                 }
                 return;
             }
@@ -761,65 +833,41 @@ async fn pump_probe(owner_vk: VerifyingKey) {
 /// Apply a finished re-key merge (freenet/river#769): fold what the older keys
 /// held into the room, clear the marker if the walk heard from every
 /// generation, and, if asked, re-seed the current key.
-fn finish_rekey_merge(
-    owner_vk: VerifyingKey,
-    previous: ContractInstanceId,
-    seed: bool,
-    plan: RekeyFinish,
-) {
+fn finish_rekey_merge(owner_vk: VerifyingKey, seed: bool, plan: RekeyFinish) {
     if plan.complete {
         info!(
-            "Re-key merge for room {:?} finished ({})",
-            MemberId::from(owner_vk),
-            if plan.recovered.is_some() {
-                "older generation merged"
-            } else {
-                "older generations hold nothing more"
-            }
+            "Re-key merge for room {:?} finished: every older key it owed returned the room",
+            MemberId::from(owner_vk)
         );
     } else {
         warn!(
-            "Re-key merge for room {:?}: the older key it last synced under did not return \
-             the room — keeping what was found and asking again on the next load",
-            MemberId::from(owner_vk)
+            "Re-key merge for room {:?}: {} of the older key(s) it last synced under did not \
+             return the room — merging what was found and asking again on the next load",
+            MemberId::from(owner_vk),
+            if plan.satisfied.is_empty() {
+                "all"
+            } else {
+                "some"
+            }
         );
     }
     let RekeyFinish {
         recovered,
-        complete,
+        satisfied,
+        ..
     } = plan;
-    let had_recovered = recovered.is_some();
+    let changes_room = recovered.is_some() || !satisfied.is_empty();
     crate::util::defer(move || {
         ROOMS.with_mut(|rooms| {
-            let Some(room_data) = rooms.map.get_mut(&owner_vk) else {
-                return;
-            };
-            // A merge that fails keeps the room as it was and keeps the
-            // marker, so the next load tries again. Never a replace. The old
-            // key's own upgrade pointer means nothing under the current key
-            // (freenet/river#427), so it stays out of the room.
-            let merged = match recovered {
-                Some(state) => merge_recovered_into_room(
-                    room_data,
-                    crate::util::strip_upgrade_pointer(&state),
-                    owner_vk,
-                ),
-                None => true,
-            };
-            if merged
-                && complete
-                && room_data
-                    .rekey_merge_owed
-                    .is_some_and(|k| *k.id() == previous)
-            {
-                room_data.rekey_merge_owed = None;
+            if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                apply_rekey_finish(room_data, recovered, &satisfied, owner_vk);
             }
         });
     });
-    // Save the merged room and the cleared marker together (one room slot), and
-    // let a subscribed room push the merged-in messages as a delta. FIFO
+    // Save the merged room and the updated marker together (one room slot),
+    // and let a subscribed room push the merged-in messages as a delta. FIFO
     // `defer` puts this after the merge above.
-    if had_recovered || complete {
+    if changes_room {
         crate::components::app::mark_needs_sync(owner_vk);
     }
     if seed {
@@ -830,6 +878,35 @@ fn finish_rekey_merge(
             request_seed_put(owner_vk);
         });
     }
+}
+
+/// Fold a finished re-key merge into the room: merge the recovered state (a
+/// CRDT merge, never a replace), then take the owed keys that answered off the
+/// marker, but only if that merge landed. A merge that fails leaves the room
+/// and the marker as they were, so the next load tries again. Returns whether
+/// the merge landed.
+pub(crate) fn apply_rekey_finish(
+    room_data: &mut crate::room_data::RoomData,
+    recovered: Option<ChatRoomStateV1>,
+    satisfied: &[ContractInstanceId],
+    owner_vk: VerifyingKey,
+) -> bool {
+    // The old key's own upgrade pointer means nothing under the current key
+    // (freenet/river#427), so it stays out of the room.
+    let merged = match recovered {
+        Some(state) => merge_recovered_into_room(
+            room_data,
+            crate::util::strip_upgrade_pointer(&state),
+            owner_vk,
+        ),
+        None => true,
+    };
+    if merged {
+        room_data
+            .rekey_merge_owed
+            .retain(|k| !satisfied.contains(k.id()));
+    }
+    merged
 }
 
 /// The synchronous half of a probe GET's watchdog: if this fire still owns
@@ -843,8 +920,11 @@ fn take_probe_timeout(id: ContractInstanceId, owner_vk: VerifyingKey, token: u64
          generation (its state is unknown)",
         PROBE_GET_TIMEOUT.as_secs()
     );
-    // The GET may still be in flight; see `ORPHANED_FIRES`.
-    *orphaned_fires().entry(id).or_insert(0) += 1;
+    // The GET may still be in flight; see `ORPHANED_FIRES`. One that was
+    // never sent cannot answer late.
+    if !unsent_fires().remove(&token) {
+        *orphaned_fires().entry(id).or_insert(0) += 1;
+    }
     if let Some(entry) = drivers().get_mut(&owner_vk) {
         entry.driver.on_timeout(id);
     }
@@ -860,7 +940,7 @@ fn fire_probe_get(owner_vk: VerifyingKey, id: ContractInstanceId) {
     let token = next_fire_token();
 
     // Register the route BEFORE sending the GET so the response handler can
-    // resolve the legacy key when the reply arrives (and so `is_probe_instance`
+    // resolve the legacy key when the reply arrives (and so `take_probe_response`
     // routes it into the probe handler). Plain mutex — synchronous, no defer,
     // no signal re-entrancy.
     routes().insert(id, (owner_vk, token));
@@ -899,17 +979,24 @@ fn fire_probe_get(owner_vk: VerifyingKey, id: ContractInstanceId) {
             subscribe: false,
             blocking_subscribe: false,
         };
-        let send_result = if let Some(web_api) = crate::components::app::WEB_API.write().as_mut() {
-            web_api.send(ClientRequest::ContractOp(get_request)).await
+        let sent = if let Some(web_api) = crate::components::app::WEB_API.write().as_mut() {
+            match web_api.send(ClientRequest::ContractOp(get_request)).await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("Failed to send backward-probe GET for {id}: {e}");
+                    false
+                }
+            }
         } else {
-            Ok(()) // WebAPI gone — let the watchdog drive the probe forward.
+            warn!("WebAPI unavailable — backward-probe GET for {id} not sent");
+            false
         };
-        if let Err(e) = send_result {
-            warn!("Failed to send backward-probe GET for {id}: {e}");
-            // Leave the route in place: the watchdog below treats the missing
-            // response as a miss and advances the probe, so a transient send
-            // failure still walks to the next generation rather than silently
-            // abandoning recovery.
+        if !sent {
+            // Leave the route in place: the watchdog below advances the probe,
+            // so a transient send failure still walks to the next generation
+            // rather than silently abandoning recovery. Nothing is in flight,
+            // so the watchdog must not expect a late reply.
+            unsent_fires().insert(token);
         }
     });
 
@@ -959,6 +1046,14 @@ mod tests {
 
     fn id(n: u8) -> ContractInstanceId {
         ContractInstanceId::new([n; 32])
+    }
+
+    /// A contract key whose instance id is `id(n)`, for a room's marker.
+    fn contract_key_with_id(n: u8) -> freenet_stdlib::prelude::ContractKey {
+        freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            id(n),
+            freenet_stdlib::prelude::CodeHash::new([n; 32]),
+        )
     }
 
     /// `RiverProbeOps` classification is exactly what the deleted
@@ -1181,6 +1276,7 @@ mod tests {
             ChatRoomStateV1::default(),
             vec![newest, older],
             ProbePurpose::Recover,
+            Vec::new(),
         );
         assert_eq!(
             probe2.driver.next_action(),
@@ -1300,7 +1396,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            rekey_merge_owed: None,
+            rekey_merge_owed: Vec::new(),
             invitation_secrets: std::collections::BTreeMap::new(),
         }
     }
@@ -1315,34 +1411,46 @@ mod tests {
     /// Run a re-key merge walk to completion through the REAL adapter: the
     /// shared `PROBE_DRIVERS` entry and route table, and the synchronous halves
     /// of the response, `NotFound` and watchdog handlers (everything but the
-    /// network send and the pump's async tail). Returns what the merge would
-    /// apply.
+    /// network send and the pump's async tail). `owed` are the keys the room
+    /// owes a merge from. Returns what the merge would apply.
     fn walk_rekey(
         owner_sk: &SigningKey,
         local: ChatRoomStateV1,
-        candidates: Vec<ContractInstanceId>,
+        legacy: &[ContractInstanceId],
+        owed: Vec<ContractInstanceId>,
         replies: Vec<Reply>,
     ) -> RekeyFinish {
         let vk = owner_sk.verifying_key();
-        let previous = *candidates.last().unwrap();
-        let purpose = ProbePurpose::RekeyMerge {
-            previous,
-            seed: true,
-        };
-        drivers().insert(vk, ProbeEntry::new(vk, local, candidates.clone(), purpose));
+        let candidates = rekey_candidates(legacy, &owed);
+        let purpose = ProbePurpose::RekeyMerge { seed: true };
+        drivers().insert(
+            vk,
+            ProbeEntry::new(vk, local, candidates.clone(), purpose, owed),
+        );
         let mut replies = replies.into_iter();
         loop {
             let step = drivers().get_mut(&vk).unwrap().driver.next_action();
             let Step::Get(id) = step else { break };
             let token = next_fire_token();
             routes().insert(id, (vk, token));
-            let owner = match replies.next().expect("a reply per GET") {
+            let taken = match replies.next().expect("a reply per GET") {
                 Reply::State(state) => take_probe_response(id, &encode(&state)),
                 Reply::NotFound => take_probe_absent(id),
-                Reply::Silent => take_probe_timeout(id, vk, token).then_some(vk),
+                Reply::Silent => {
+                    assert!(take_probe_timeout(id, vk, token));
+                    ProbeReply::Advance(vk)
+                }
             };
-            assert_eq!(owner, Some(vk), "each reply claims its probe's route");
+            assert_eq!(
+                taken,
+                ProbeReply::Advance(vk),
+                "each reply claims its route"
+            );
         }
+        assert!(
+            replies.next().is_none(),
+            "every scripted reply was asked for"
+        );
         let mut entry = drivers().remove(&vk).unwrap();
         assert_eq!(entry.purpose, purpose);
         // Late replies to the GETs the watchdog abandoned would arrive after
@@ -1352,7 +1460,8 @@ mod tests {
         }
         plan_rekey_finish(
             entry.driver.take_outcome().unwrap(),
-            entry.hits.contains(&previous),
+            &entry.owed,
+            &entry.hits,
             entry.fold_failed.load(Ordering::Relaxed),
         )
     }
@@ -1363,25 +1472,32 @@ mod tests {
         out
     }
 
-    /// Only the generations from the newest legacy one down to the one the
-    /// device last synced under are asked, newest first; an unregistered
-    /// generation is asked on its own.
+    /// Only the generations from the newest legacy one down to the oldest
+    /// owed one are asked, newest first; an unregistered owed key is asked too.
     #[test]
-    fn rekey_candidates_stop_at_the_generation_last_synced() {
+    fn rekey_candidates_stop_at_the_oldest_owed_generation() {
         let legacy = vec![id(30), id(29), id(28), id(27)];
-        assert_eq!(rekey_candidates(&legacy, id(30)), vec![id(30)]);
+        assert_eq!(rekey_candidates(&legacy, &[id(30)]), vec![id(30)]);
         assert_eq!(
-            rekey_candidates(&legacy, id(28)),
+            rekey_candidates(&legacy, &[id(28)]),
             vec![id(30), id(29), id(28)],
             "skipped releases are asked newest first, down to the device's own"
         );
-        assert_eq!(rekey_candidates(&legacy, id(99)), vec![id(99)]);
-        assert_eq!(rekey_candidates(&[], id(5)), vec![id(5)]);
+        assert_eq!(
+            rekey_candidates(&legacy, &[id(29), id(28)]),
+            vec![id(30), id(29), id(28)]
+        );
+        assert_eq!(rekey_candidates(&legacy, &[id(99)]), vec![id(99)]);
+        assert_eq!(
+            rekey_candidates(&legacy, &[id(29), id(99)]),
+            vec![id(30), id(29), id(99)]
+        );
+        assert_eq!(rekey_candidates(&[], &[id(5)]), vec![id(5)]);
     }
 
     /// The rehearsal's failure: 16 messages on the old key, 10 in this
     /// device's snapshot. Every one of the 16 must reach the state the seed PUT
-    /// carries, and the merge counts as finished.
+    /// carries, and the owed key comes off the marker.
     #[test]
     fn rekey_merge_brings_over_messages_only_on_the_old_key() {
         let sk = SigningKey::from_bytes(&[81u8; 32]);
@@ -1394,21 +1510,28 @@ mod tests {
         let finish = walk_rekey(
             &sk,
             local_state.clone(),
+            &[id(81)],
             vec![id(81)],
             vec![Reply::State(room_with_messages(&sk, &old_refs))],
         );
         assert!(finish.complete, "the old key returned the room: done");
-        let recovered = finish.recovered.expect("the old key's state is merged");
+        assert_eq!(finish.satisfied, vec![id(81)]);
 
         let mut room = room_data(&sk, local_state);
-        assert!(merge_recovered_into_room(
+        room.rekey_merge_owed = vec![contract_key_with_id(81)];
+        assert!(apply_rekey_finish(
             &mut room,
-            crate::util::strip_upgrade_pointer(&recovered),
+            finish.recovered,
+            &finish.satisfied,
             sk.verifying_key()
         ));
         let mut expected = old_key.clone();
         expected.sort();
         assert_eq!(texts(&room.room_state), expected, "all 16 messages survive");
+        assert!(
+            room.rekey_merge_owed.is_empty(),
+            "the merge is no longer owed"
+        );
     }
 
     /// A member who upgraded first already seeded the new key, and this device
@@ -1433,25 +1556,65 @@ mod tests {
         );
     }
 
+    /// A recovered state that does not merge leaves the room exactly as it
+    /// was AND keeps the marker, so the next load tries again.
+    #[test]
+    fn a_failed_rekey_merge_changes_nothing_and_stays_owed() {
+        let sk = SigningKey::from_bytes(&[88u8; 32]);
+        let before = room_with_messages(&sk, &["m1", "m2"]);
+        let mut room = room_data(&sk, before.clone());
+        room.rekey_merge_owed = vec![contract_key_with_id(88)];
+        // A newer configuration makes the room private while the recovered
+        // state still carries a public message: the merge applies the
+        // configuration, then rejects the message, part-way through.
+        let mut bad = room_with_messages(&sk, &["m1", "m9"]);
+        let mut config = bad.configuration.configuration.clone();
+        config.configuration_version += 1;
+        config.privacy_mode = river_core::room_state::privacy::PrivacyMode::Private;
+        bad.configuration = AuthorizedConfigurationV1::new(config, &sk);
+        let mut probe = before.clone();
+        assert!(
+            probe
+                .merge(
+                    &before,
+                    &ChatRoomParametersV1 {
+                        owner: sk.verifying_key()
+                    },
+                    &bad
+                )
+                .is_err(),
+            "fixture: this merge must fail"
+        );
+        assert!(!apply_rekey_finish(
+            &mut room,
+            Some(bad),
+            &[id(88)],
+            sk.verifying_key()
+        ));
+        assert_eq!(
+            room.room_state, before,
+            "no half-merged state is left behind"
+        );
+        assert_eq!(room.rekey_merge_owed, vec![contract_key_with_id(88)]);
+    }
+
     /// The owed old key does not return the room, whether it stays silent or
     /// answers `NotFound`: nothing is merged, the local state seeds on its own,
-    /// and the merge is NOT finished, so the marker stays for the next load.
-    /// The device synced the room under that key, so neither answer can mean
-    /// it is empty; a `NotFound` on Freenet is routinely a dead-end.
+    /// and the merge stays owed for the next load. The device synced the room
+    /// under that key, so neither answer can mean it is empty; a `NotFound` on
+    /// Freenet is routinely a dead-end.
     #[test]
     fn rekey_merge_without_the_old_keys_state_keeps_local_and_retries() {
         let sk = SigningKey::from_bytes(&[83u8; 32]);
         let local = room_with_messages(&sk, &["m1", "m2"]);
         for (n, reply) in [(83u8, Reply::Silent), (84, Reply::NotFound)] {
-            let finish = walk_rekey(&sk, local.clone(), vec![id(n)], vec![reply]);
+            let finish = walk_rekey(&sk, local.clone(), &[id(n)], vec![id(n)], vec![reply]);
             assert!(
                 finish.recovered.is_none(),
                 "no state arrived, none is merged"
             );
-            assert!(
-                !finish.complete,
-                "the owed key never returned the room: the marker must stay"
-            );
+            assert!(finish.satisfied.is_empty());
+            assert!(!finish.complete, "the merge must stay owed");
         }
     }
 
@@ -1463,13 +1626,13 @@ mod tests {
     fn rekey_merge_folds_every_generation_down_to_the_owed_one() {
         let sk = SigningKey::from_bytes(&[85u8; 32]);
         let local = room_with_messages(&sk, &["m1"]);
-        let candidates = rekey_candidates(&[id(90), id(89), id(88), id(87)], id(88));
-        assert_eq!(candidates, vec![id(90), id(89), id(88)]);
+        let legacy = [id(90), id(89), id(88), id(87)];
 
         let finish = walk_rekey(
             &sk,
             local.clone(),
-            candidates.clone(),
+            &legacy,
+            vec![id(88)],
             vec![
                 Reply::State(room_with_messages(&sk, &["m1", "m2"])),
                 Reply::NotFound,
@@ -1478,17 +1641,18 @@ mod tests {
         );
         assert!(finish.complete, "the owed generation returned the room");
         assert_eq!(
-            texts(&finish.recovered.expect("state was found")),
+            texts(finish.recovered.as_ref().expect("state was found")),
             strs(&["m1", "m2", "m3", "m4"]),
             "the newest generation's state did not shadow the owed one's"
         );
 
-        // The owed generation never answered: what the newer ones had is still
-        // merged (a merge cannot lose anything), but the merge stays open.
+        // The owed generation never answered: what the newer one had is still
+        // merged (a merge cannot lose anything), but the merge stays owed.
         let finish = walk_rekey(
             &sk,
             local,
-            candidates,
+            &legacy,
+            vec![id(88)],
             vec![
                 Reply::State(room_with_messages(&sk, &["m1", "m2"])),
                 Reply::Silent,
@@ -1496,109 +1660,177 @@ mod tests {
             ],
         );
         assert_eq!(
-            texts(&finish.recovered.expect("the newest generation's state")),
+            texts(
+                finish
+                    .recovered
+                    .as_ref()
+                    .expect("the newest generation's state")
+            ),
             strs(&["m1", "m2"])
         );
         assert!(!finish.complete);
+        assert!(finish.satisfied.is_empty());
+    }
+
+    /// Two re-keys, the first merge still owed: the device synced under BOTH
+    /// older keys, and each must answer on its own. The older one answering
+    /// does not vouch for the newer one (what reached the newer key is not on
+    /// the older), so only the older comes off the marker.
+    #[test]
+    fn each_owed_generation_must_answer_for_itself() {
+        let sk = SigningKey::from_bytes(&[91u8; 32]);
+        let local = room_with_messages(&sk, &["m1"]);
+        let legacy = [id(93), id(92), id(91)];
+        let finish = walk_rekey(
+            &sk,
+            local,
+            &legacy,
+            vec![id(91), id(92)],
+            vec![
+                Reply::State(room_with_messages(&sk, &["m1", "m5"])),
+                Reply::NotFound,
+                Reply::State(room_with_messages(&sk, &["m1", "m2"])),
+            ],
+        );
+        assert_eq!(finish.satisfied, vec![id(91)], "only the key that answered");
+        assert!(!finish.complete, "the newer owed key still owes");
+        assert_eq!(
+            texts(finish.recovered.as_ref().unwrap()),
+            strs(&["m1", "m2", "m5"])
+        );
     }
 
     /// A `NotFound` carries no fire token. One arriving for a legacy id whose
     /// earlier GET the watchdog abandoned may be that abandoned fire's answer,
-    /// so it must not advance a later probe that re-registered the id; that
-    /// probe falls back to its own watchdog. A `NotFound` with no orphan
-    /// outstanding advances as normal.
+    /// so it must not advance a later probe that re-registered the id (that
+    /// probe falls back to its own watchdog), and a late one with no route at
+    /// all is consumed, not mistaken for a room's. A fire that was never sent
+    /// leaves no orphan.
     #[test]
     fn a_not_found_that_may_answer_an_abandoned_fire_is_not_trusted() {
         let sk = SigningKey::from_bytes(&[87u8; 32]);
         let vk = sk.verifying_key();
         let gen = id(110);
-        let t1 = next_fire_token();
-        routes().insert(gen, (vk, t1));
-        drivers().insert(
-            vk,
-            ProbeEntry::new(
+        let fire = |token: u64| {
+            routes().insert(gen, (vk, token));
+            drivers().insert(
                 vk,
-                ChatRoomStateV1::default(),
-                vec![gen],
-                ProbePurpose::Recover,
-            ),
-        );
-        assert_eq!(
-            drivers().get_mut(&vk).unwrap().driver.next_action(),
-            Step::Get(gen)
-        );
-        // Fire 1 times out: the GET may still be in flight.
+                ProbeEntry::new(
+                    vk,
+                    ChatRoomStateV1::default(),
+                    vec![gen],
+                    ProbePurpose::Recover,
+                    Vec::new(),
+                ),
+            );
+            assert_eq!(
+                drivers().get_mut(&vk).unwrap().driver.next_action(),
+                Step::Get(gen)
+            );
+        };
+
+        // Fire 1 times out: its GET may still be in flight.
+        let t1 = next_fire_token();
+        fire(t1);
         assert!(take_probe_timeout(gen, vk, t1));
         drivers().remove(&vk);
+        // Its late NotFound arrives with no probe waiting: consumed.
+        assert_eq!(take_probe_absent(gen), ProbeReply::Consumed);
+        assert_eq!(take_probe_absent(gen), ProbeReply::NotOurs);
 
-        // A later probe re-fires the same id.
+        // Fire 2 times out too; fire 3 re-registers the id.
         let t2 = next_fire_token();
-        routes().insert(gen, (vk, t2));
-        drivers().insert(
-            vk,
-            ProbeEntry::new(
-                vk,
-                ChatRoomStateV1::default(),
-                vec![gen],
-                ProbePurpose::Recover,
-            ),
-        );
+        fire(t2);
+        assert!(take_probe_timeout(gen, vk, t2));
+        let t3 = next_fire_token();
+        fire(t3);
+        // The first NotFound may be fire 2's: ignored, the route survives.
+        assert_eq!(take_probe_absent(gen), ProbeReply::Consumed);
+        assert_eq!(routes().get(&gen), Some(&(vk, t3)));
         assert_eq!(
             drivers().get_mut(&vk).unwrap().driver.next_action(),
             Step::Get(gen)
         );
-
-        // The first NotFound may be fire 1's: ignored, the route survives.
-        assert_eq!(take_probe_absent(gen), None);
-        assert_eq!(routes().get(&gen), Some(&(vk, t2)));
-        assert_eq!(
-            drivers().get_mut(&vk).unwrap().driver.next_action(),
-            Step::Get(gen)
-        );
-        // The next one is fire 2's: it advances the walk.
-        assert_eq!(take_probe_absent(gen), Some(vk));
+        // The next one is fire 3's: it advances the walk.
+        assert_eq!(take_probe_absent(gen), ProbeReply::Advance(vk));
         assert!(routes().get(&gen).is_none());
         assert_eq!(
             drivers().get_mut(&vk).unwrap().driver.next_action(),
             Step::Done
         );
         drivers().remove(&vk);
+
+        // A fire that was never sent cannot answer late: no orphan.
+        let t4 = next_fire_token();
+        fire(t4);
+        unsent_fires().insert(t4);
+        assert!(take_probe_timeout(gen, vk, t4));
+        drivers().remove(&vk);
+        assert_eq!(take_probe_absent(gen), ProbeReply::NotOurs);
     }
 
     /// A walk already running in the background for an owner is told to seed
-    /// when that room's current key turns out to be empty, rather than a
-    /// second walk starting or the room going unseeded.
+    /// when that room's current key turns out to be empty or missing, rather
+    /// than a second walk starting or the room going unseeded. Both entry
+    /// points route through `make_seed` (pinned in the source check below);
+    /// `upgrade_to_seed` is its runtime-free half.
     #[test]
     fn an_empty_current_key_makes_a_background_merge_seed() {
-        let sk = SigningKey::from_bytes(&[86u8; 32]);
-        let vk = sk.verifying_key();
-        let background = ProbeEntry::new(
+        let vk = SigningKey::from_bytes(&[86u8; 32]).verifying_key();
+        let mut entry = ProbeEntry::new(
             vk,
             ChatRoomStateV1::default(),
             vec![id(86)],
-            ProbePurpose::RekeyMerge {
-                previous: id(86),
-                seed: false,
-            },
+            ProbePurpose::RekeyMerge { seed: false },
+            vec![id(86)],
         );
         assert!(
-            !background.holds_subscription(),
+            !entry.holds_subscription(),
             "a background merge must not stretch the room's own subscribe timeout"
         );
-        drivers().insert(vk, background);
-        assert!(futures::executor::block_on(start_backward_probe(
-            vk,
-            ChatRoomStateV1::default()
-        )));
-        let entry = drivers().remove(&vk).unwrap();
-        assert_eq!(
-            entry.purpose,
-            ProbePurpose::RekeyMerge {
-                previous: id(86),
-                seed: true
-            }
-        );
+        assert!(upgrade_to_seed(&mut entry));
+        assert_eq!(entry.purpose, ProbePurpose::RekeyMerge { seed: true });
         assert!(entry.holds_subscription(), "a seeding merge holds the room");
+        assert!(
+            !upgrade_to_seed(&mut entry),
+            "already seeding: no second touch"
+        );
+        let mut recover = ProbeEntry::new(
+            vk,
+            ChatRoomStateV1::default(),
+            vec![id(86)],
+            ProbePurpose::Recover,
+            Vec::new(),
+        );
+        assert!(
+            !upgrade_to_seed(&mut recover),
+            "a #292 probe seeds on its own"
+        );
+
+        let src: String = crate::util::strip_comments(
+            include_str!("backward_probe.rs")
+                .split("mod tests {")
+                .next()
+                .unwrap(),
+        )
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+        let section = |head: &str, next: &str| {
+            let start = src.find(head).expect(head);
+            src[start..start + src[start..].find(next).expect(next)].to_string()
+        };
+        assert!(
+            section("pubasyncfnstart_backward_probe(", "letlegacy_keys=").contains(
+                "ifletSome(entry)=drivers().get_mut(&owner_vk){make_seed(entry,owner_vk);"
+            ),
+            "an empty current key must make a running background merge seed"
+        );
+        assert!(
+            section("pubasyncfnstart_rekey_merge(", "ifowed.is_empty()")
+                .contains("ifseed{make_seed(entry,owner_vk);}"),
+            "a seeding request must make a running background merge seed"
+        );
     }
 
     /// freenet/river#769 wiring, source pin: `finish_rekey_merge` acts on the
@@ -1622,9 +1854,9 @@ mod tests {
         let body = &body[..body.find("fnfire_probe_get(").expect("next fn")];
         assert!(
             body.contains(
-                "ifmerged&&complete&&room_data.rekey_merge_owed.is_some_and(|k|*k.id()==previous){room_data.rekey_merge_owed=None;}"
+                "ifletSome(room_data)=rooms.map.get_mut(&owner_vk){apply_rekey_finish(room_data,recovered,&satisfied,owner_vk);}"
             ),
-            "clear the marker only after a merge that landed and a complete walk"
+            "the merge and the marker update run together, in the deferred ROOMS write"
         );
         let merge = body
             .find("crate::util::defer(move||{ROOMS.with_mut(")
