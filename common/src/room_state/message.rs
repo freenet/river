@@ -114,6 +114,10 @@ pub struct MessagesSummary {
     pub horizon: RetentionHorizon,
 }
 
+/// One delta may carry `max(max_recent_messages, MIN_MESSAGES_DELTA_BOUND)`
+/// messages. See `MessagesV1::apply_delta`.
+const MIN_MESSAGES_DELTA_BOUND: usize = 1_000;
+
 impl ComposableState for MessagesV1 {
     type ParentState = ChatRoomStateV1;
     type Summary = MessagesSummary;
@@ -234,7 +238,25 @@ impl ComposableState for MessagesV1 {
 
         // Validate message constraints before adding
         if let Some(delta) = delta {
-            for msg in delta.iter().filter(|msg| signed_by_author(msg)) {
+            // A bound on the compute work one delta can cause, not a room
+            // rule: each message costs a signature check. A delta derived
+            // from a peer's held messages never exceeds that peer's
+            // `max_recent_messages`. A peer still holding more from before a
+            // big `max_recent_messages` reduction offers only messages above
+            // this peer's retention horizon, and is refused at worst until it
+            // receives the new configuration and trims its own set.
+            let work_bound = max_recent_messages.max(MIN_MESSAGES_DELTA_BOUND);
+            if delta.len() > work_bound {
+                return Err(format!(
+                    "Messages delta of {} exceeds {}",
+                    delta.len(),
+                    work_bound
+                ));
+            }
+            let signed: Vec<&AuthorizedMessageV1> =
+                delta.iter().filter(|msg| signed_by_author(msg)).collect();
+
+            for msg in &signed {
                 let content = &msg.message.content;
 
                 match content {
@@ -320,11 +342,10 @@ impl ComposableState for MessagesV1 {
                 self.messages.iter().map(|m| m.id()).collect();
             let mut in_delta = std::collections::HashSet::new();
             self.messages.extend(
-                delta
-                    .iter()
+                signed
+                    .into_iter()
                     .filter(|msg| !existing_ids.contains(&msg.id()))
                     .filter(|msg| in_delta.insert(crate::util::record_digest(*msg)))
-                    .filter(|msg| signed_by_author(msg))
                     .cloned(),
             );
         }

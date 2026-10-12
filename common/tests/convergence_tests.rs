@@ -2927,3 +2927,151 @@ fn lowering_max_members_converges_with_a_stale_peer() {
 fn lowering_max_members_from_above_the_work_bound_converges() {
     assert_eq!(lower_max_members_with_a_stale_peer(1_003, 2), 1);
 }
+
+/// After the owner lowers `max_recent_messages`, a peer that has not yet seen
+/// the new configuration still holds the larger message set. Exchanging
+/// states in both directions converges both peers on the same state under the
+/// new limit. Returns how many merges were rejected along the way.
+fn lower_max_recent_messages_with_a_stale_peer(held: usize, new_max: usize) -> usize {
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_id: MemberId = owner_sk.verifying_key().into();
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+    let config = |version: u32, max_recent_messages: usize| {
+        AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: owner_id,
+                configuration_version: version,
+                max_members: 10,
+                max_recent_messages,
+                ..Default::default()
+            },
+            &owner_sk,
+        )
+    };
+    let (member, member_sk) = create_test_member(owner_id, owner_id);
+    let mut messages: Vec<AuthorizedMessageV1> = (0..held)
+        .map(|i| create_test_msg(owner_id, member.id(), &member_sk, i as u64))
+        .collect();
+    messages.sort_by(|a, b| {
+        a.message
+            .time
+            .cmp(&b.message.time)
+            .then_with(|| a.id().cmp(&b.id()))
+    });
+    let mut stale = ChatRoomStateV1 {
+        configuration: config(1, held),
+        members: MembersV1 {
+            members: vec![create_authorized_member(member, &owner_sk)],
+        },
+        recent_messages: MessagesV1 {
+            messages,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    stale.recent_messages.rebuild_actions_state();
+    stale
+        .verify(&stale, &parameters)
+        .expect("stale peer verifies");
+
+    let mut updated = stale.clone();
+    let lower = river_core::room_state::ChatRoomStateV1Delta {
+        configuration: Some(config(2, new_max)),
+        ..Default::default()
+    };
+    updated
+        .apply_delta(&stale, &parameters, &Some(lower))
+        .expect("the configuration delta applies");
+    assert_eq!(updated.recent_messages.messages.len(), new_max);
+
+    let ser = |s: &ChatRoomStateV1| {
+        let mut v = Vec::new();
+        ciborium::ser::into_writer(s, &mut v).unwrap();
+        v
+    };
+    let (mut a, mut b) = (stale, updated);
+    let mut rejected = 0;
+    for _ in 0..3 {
+        let mut next_b = b.clone();
+        match next_b.merge(&b, &parameters, &a) {
+            Ok(()) => b = next_b,
+            Err(_) => rejected += 1,
+        }
+        let mut next_a = a.clone();
+        match next_a.merge(&a, &parameters, &b) {
+            Ok(()) => a = next_a,
+            Err(_) => rejected += 1,
+        }
+    }
+    assert!(ser(&a) == ser(&b), "the peers converge");
+    assert_eq!(a.recent_messages.messages.len(), new_max);
+    a.verify(&a, &parameters).unwrap();
+    rejected
+}
+
+#[test]
+fn lowering_max_recent_messages_converges_with_a_stale_peer() {
+    assert_eq!(lower_max_recent_messages_with_a_stale_peer(6, 2), 0);
+}
+
+/// From above the work bound: the stale peer offers only messages newer than
+/// what the updated peer retains, so nothing is rejected.
+#[test]
+fn lowering_max_recent_messages_from_above_the_work_bound_converges() {
+    assert_eq!(lower_max_recent_messages_with_a_stale_peer(1_003, 2), 0);
+}
+
+/// One delta may carry `max(max_recent_messages, 1000)` messages; one more is
+/// rejected. The bound counts the delta as sent, so repeated copies of one
+/// message suffice.
+#[test]
+fn a_messages_delta_over_the_work_bound_is_rejected() {
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+
+    for max_recent_messages in [10usize, 1_500] {
+        let bound = max_recent_messages.max(1_000);
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_recent_messages,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        let message = create_test_msg(owner_id, owner_id, &owner_sk, 1);
+        let apply = |n: usize| {
+            let mut after = state.clone();
+            after
+                .apply_delta(
+                    &state,
+                    &parameters,
+                    &Some(river_core::room_state::ChatRoomStateV1Delta {
+                        recent_messages: Some(vec![message.clone(); n]),
+                        ..Default::default()
+                    }),
+                )
+                .map(|()| after.recent_messages.messages.len())
+        };
+        assert_eq!(
+            apply(bound),
+            Ok(1),
+            "max_recent_messages {max_recent_messages}"
+        );
+        assert!(
+            apply(bound + 1).is_err(),
+            "max_recent_messages {max_recent_messages}"
+        );
+    }
+}
