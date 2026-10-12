@@ -204,6 +204,11 @@ pub(crate) fn is_migration_marker_key(key: &[u8]) -> bool {
 /// own bookkeeping, never migrated.
 pub(crate) const WALK_CADENCE_KEY: &[u8] = b"__river_migration_walk_skips__";
 
+/// The post-resolve top-up window's state (freenet/river#768 review B1):
+/// when it began (ms since the epoch) and how many loads it has run. River's
+/// own bookkeeping, never migrated.
+pub(crate) const TOPUP_WINDOW_KEY: &[u8] = b"__river_migration_topup_window__";
+
 /// The chat delegate's key index, as a plain `GetRequest` key. Every generation
 /// stores the index under `<origin>:` + `::key_index`, and a `GetRequest` for
 /// `key` reads `<origin>:` + `key`, so this reads the index's raw bytes
@@ -228,6 +233,7 @@ pub(crate) fn is_migration_bookkeeping_key(key: &[u8]) -> bool {
     is_migration_marker_key(key)
         || is_reserved_key(key)
         || key == WALK_CADENCE_KEY
+        || key == TOPUP_WINDOW_KEY
         || key == KEY_INDEX_STORAGE_KEY
 }
 
@@ -983,6 +989,13 @@ pub(crate) trait RiverImportSeam {
     /// exists for — a failure here re-counts this predecessor's optimistic
     /// writes as failures and withholds its keys from older generations.
     fn flush(&mut self) -> impl Future<Output = Result<(), String>>;
+
+    /// The rooms the successor already knows: present or tombstoned (owner
+    /// key bytes). The post-resolve top-up fetches only rooms NOT in it. The
+    /// default (nothing known) fetches every listed room.
+    fn known_rooms(&mut self) -> impl Future<Output = HashSet<[u8; 32]>> {
+        std::future::ready(HashSet::new())
+    }
 }
 
 /// Production import seam: ranked merge into the `ROOMS` signal (inside
@@ -1094,6 +1107,25 @@ impl RiverImportSeam for LiveImportSeam {
         });
         rx.await
             .map_err(|_| "outbound-DM merge was dropped before running".to_string())
+    }
+
+    async fn known_rooms(&mut self) -> HashSet<[u8; 32]> {
+        // Read inside `defer`, per the signal-safety rules, like the merges.
+        let (tx, rx) = futures::channel::oneshot::channel::<HashSet<[u8; 32]>>();
+        crate::util::defer(move || {
+            let known: HashSet<[u8; 32]> = {
+                use dioxus::prelude::ReadableExt;
+                let rooms = crate::components::app::ROOMS.peek();
+                rooms
+                    .map
+                    .keys()
+                    .chain(rooms.removed_rooms.iter())
+                    .map(|vk| vk.to_bytes())
+                    .collect()
+            };
+            let _ = tx.send(known);
+        });
+        rx.await.unwrap_or_default()
     }
 
     async fn flush(&mut self) -> Result<(), String> {
@@ -1629,6 +1661,94 @@ pub(crate) async fn store_walk_cadence<C: RiverDelegateChannel>(
         &skips.to_le_bytes(),
     )
     .await
+}
+
+/// Read the post-resolve top-up window's state `(started_at_ms, loads)` from
+/// the current delegate; `Ok(None)` when it has not started.
+pub(crate) async fn read_topup_window<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+) -> Result<Option<(u64, u32)>, String> {
+    match get_current(channel, successor, TOPUP_WINDOW_KEY.to_vec()).await? {
+        None => Ok(None),
+        Some(bytes) if bytes.len() == 12 => {
+            let started = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+            let loads = u32::from_le_bytes(bytes[8..].try_into().expect("4 bytes"));
+            Ok(Some((started, loads)))
+        }
+        Some(_) => Err("top-up window state is not 12 bytes".to_string()),
+    }
+}
+
+/// Store the post-resolve top-up window's state, awaiting the delegate's ack.
+pub(crate) async fn store_topup_window<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+    state: (u64, u32),
+) -> Result<(), String> {
+    let mut bytes = state.0.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&state.1.to_le_bytes());
+    put_current(channel, successor, TOPUP_WINDOW_KEY.to_vec(), &bytes).await
+}
+
+/// Top up from `predecessor` after the journal resolved it
+/// (freenet/river#768 review B1): during the rollout an old tab keeps writing
+/// to what is now a predecessor (the newest one, V32), and once the journal
+/// resolves it nothing reads it again. This re-lists it and merges every room
+/// the successor does not know at all (neither present nor tombstoned), plus
+/// its outbound-DM cache, through the ranked, tombstone-safe merge, unflagged.
+/// A room the user deleted in the new build is known (tombstoned), so it is
+/// never fetched; and a ranked tombstone outranks it anyway.
+///
+/// Additive and idempotent, so it needs no journal flag: an interrupted top-up
+/// leaves the data in the predecessor, and the next load in the window reads
+/// it again. A silent predecessor tops up nothing this load. Returns the items
+/// merged.
+pub(crate) async fn top_up_from_with<C: RiverDelegateChannel, S: RiverImportSeam>(
+    channel: &C,
+    seam: &mut S,
+    predecessor: &DelegateLineageEntry,
+) -> Result<u32, String> {
+    let key = DelegateKey::new(
+        predecessor.delegate_key,
+        CodeHash::new(predecessor.code_hash),
+    );
+    let listed = match channel
+        .request(&key, ChatDelegateRequestMsg::ListRequest)
+        .await?
+    {
+        Some(ChatDelegateResponseMsg::ListResponse { keys }) => keys,
+        Some(other) => return Err(format!("unexpected reply to top-up ListRequest: {other:?}")),
+        None => return Ok(0),
+    };
+    let known = seam.known_rooms().await;
+    let mut reader = RiverPredecessorIo::new(channel);
+    let mut merged = 0u32;
+    for k in listed {
+        let b = k.as_bytes();
+        let wanted = match parse_room_storage_key(b) {
+            Some(vk) => !known.contains(&vk.to_bytes()),
+            None => b == OUTBOUND_DMS_STORAGE_KEY,
+        };
+        if !wanted || is_migration_bookkeeping_key(b) {
+            continue;
+        }
+        let Some(value) = reader.get_key(&key, b).await? else {
+            continue;
+        };
+        let item = classify_recovered(b, &value);
+        if let RecoveredItem::OutboundDms(store) = item {
+            seam.merge_outbound_dms(*store).await?;
+            merged += 1;
+        } else if let Some(rooms) = rooms_to_merge(&item) {
+            seam.merge_rooms(rooms, predecessor.generation).await?;
+            merged += 1;
+        }
+    }
+    if merged > 0 {
+        seam.flush().await?;
+    }
+    Ok(merged)
 }
 
 /// The transport/seam-generic journaled walk: pre-warm the predecessors, then
@@ -2191,6 +2311,14 @@ mod tests {
             }
             self.dm_merges.push(store);
             Ok(())
+        }
+        async fn known_rooms(&mut self) -> HashSet<[u8; 32]> {
+            self.rooms
+                .map
+                .keys()
+                .chain(self.rooms.removed_rooms.iter())
+                .map(|vk| vk.to_bytes())
+                .collect()
         }
         async fn flush(&mut self) -> Result<(), String> {
             self.flushes += 1;
@@ -3457,6 +3585,7 @@ mod tests {
         for key in [
             MIGRATION_JOURNAL_KEY.to_vec(),
             WALK_CADENCE_KEY.to_vec(),
+            TOPUP_WINDOW_KEY.to_vec(),
             pred_done_marker_key(&DelegateKey::new([9; 32], CodeHash::new([9; 32]))),
         ] {
             gen0.store.insert(key, b"bookkeeping".to_vec());
@@ -3466,7 +3595,7 @@ mod tests {
         assert!(report.is_complete(), "{report:?}");
         assert!(seam.rooms.map.contains_key(&vk(1)));
         let log = channel.log.borrow();
-        for key in [MIGRATION_JOURNAL_KEY, WALK_CADENCE_KEY] {
+        for key in [MIGRATION_JOURNAL_KEY, WALK_CADENCE_KEY, TOPUP_WINDOW_KEY] {
             let asked = format!("get:{}", String::from_utf8_lossy(key));
             assert!(
                 !log.iter()
@@ -4253,5 +4382,98 @@ mod tests {
             SigningKey::from_bytes(&[50; 32]).verifying_key(),
             "control: reloaded at the current rank, the older key is kept"
         );
+    }
+
+    // ---------------- the post-resolve top-up (review B1) ----------------
+
+    /// An old tab still on the previous build creates a room in V32 (gen 2)
+    /// AFTER the journal resolved V32. The walk never reads V32 again; the
+    /// top-up does, and imports it through the ranked merge. A room the user
+    /// deleted in the new build is NOT brought back (migration probe P3).
+    #[test]
+    fn the_topup_imports_an_old_tabs_room_and_never_resurrects_a_deleted_one() {
+        let (a, c, d) = (vk(1), vk(3), vk(4));
+        let slot = |r, seed| cbor(&RoomSlot::Present(Box::new(room_with_identity(r, seed))));
+        let mut gen2 = DelegateSim::default();
+        gen2.store
+            .insert(chat_delegate::room_storage_key(&a), slot(a, 3));
+        gen2.store
+            .insert(chat_delegate::room_storage_key(&d), slot(d, 6));
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let (first, mut seam) = walk_j(&channel, MemorySeam::new());
+        assert!(first.status.expect("status").is_complete());
+        assert!(seam.rooms.map.contains_key(&a) && seam.rooms.map.contains_key(&d));
+
+        // The user leaves room D in the new build.
+        seam.rooms.map.remove(&d);
+        seam.rooms.removed_rooms.insert(d);
+        // An old tab creates room C in V32, and writes D again.
+        channel.put(
+            &pred_key(2),
+            &chat_delegate::room_storage_key(&c),
+            &slot(c, 9),
+        );
+        channel.put(
+            &pred_key(2),
+            &chat_delegate::room_storage_key(&d),
+            &slot(d, 7),
+        );
+
+        // The walk does not see it: V32 is resolved.
+        let (_again, seam) = walk_j(&channel, seam);
+        assert!(!seam.rooms.map.contains_key(&c));
+
+        // The top-up does.
+        let mut seam = seam;
+        let merged = block_on(top_up_from_with(&channel, &mut seam, &lineage3()[2])).unwrap();
+        assert_eq!(merged, 1, "only the room the successor does not know");
+        assert!(
+            seam.rooms.map.contains_key(&c),
+            "the old tab's room is imported"
+        );
+        assert!(
+            !seam.rooms.map.contains_key(&d) && seam.rooms.removed_rooms.contains(&d),
+            "a room deleted in the new build stays deleted"
+        );
+        assert!(seam.flushes > 0, "the top-up persists what it merged");
+
+        // Idempotent: a second top-up finds nothing new.
+        let again = block_on(top_up_from_with(&channel, &mut seam, &lineage3()[2])).unwrap();
+        assert_eq!(again, 0);
+    }
+
+    /// Even when a deleted room IS offered (a seam that knows nothing), the
+    /// ranked merge keeps the current delegate's tombstone.
+    #[test]
+    fn a_topped_up_copy_never_outranks_a_current_tombstone() {
+        let d = vk(4);
+        let channel = MockChannel::default().with_delegate(&pred_key(2), {
+            let mut g = DelegateSim::default();
+            g.store.insert(
+                chat_delegate::room_storage_key(&d),
+                cbor(&RoomSlot::Present(Box::new(room_with_identity(d, 6)))),
+            );
+            g
+        });
+        struct Blind(MemorySeam);
+        impl RiverImportSeam for Blind {
+            async fn merge_rooms(&mut self, r: Rooms, rank: u32) -> Result<(), String> {
+                self.0.merge_rooms(r, rank).await
+            }
+            async fn merge_outbound_dms(&mut self, s: OutboundDmStore) -> Result<(), String> {
+                self.0.merge_outbound_dms(s).await
+            }
+            async fn flush(&mut self) -> Result<(), String> {
+                self.0.flush().await
+            }
+        }
+        let mut seam = Blind(MemorySeam::new());
+        seam.0.rooms.removed_rooms.insert(d);
+        block_on(top_up_from_with(&channel, &mut seam, &lineage3()[2])).unwrap();
+        assert!(!seam.0.rooms.map.contains_key(&d));
     }
 }

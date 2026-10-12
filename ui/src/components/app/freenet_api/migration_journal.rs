@@ -45,9 +45,9 @@ use freenet_migrate::{DelegateLineageEntry, JournalStatus};
 use freenet_stdlib::prelude::DelegateKey;
 
 use super::delegate_migration::{
-    begin_with, log_migration_report, note_sweep_import_with, read_walk_cadence,
-    river_delegate_lineage, store_walk_cadence, walk_with, LiveImportSeam, NodeDelegateChannel,
-    SweepWrite,
+    begin_with, log_migration_report, note_sweep_import_with, read_topup_window, read_walk_cadence,
+    river_delegate_lineage, store_topup_window, store_walk_cadence, top_up_from_with, walk_with,
+    LiveImportSeam, NodeDelegateChannel, SweepWrite,
 };
 use crate::components::app::chat_delegate;
 
@@ -295,6 +295,82 @@ pub(crate) fn walk_decision(status: &JournalStatus, skips: Option<u32>) -> WalkD
 }
 
 // ---------------------------------------------------------------------------
+// The post-resolve top-up window (freenet/river#768 review B1)
+// ---------------------------------------------------------------------------
+
+/// How long, and for how many loads, the newest predecessor is re-read after
+/// the journal resolves it. An old tab still running the previous build keeps
+/// writing to it until it is closed; this covers a rollout, not for ever.
+pub(crate) const TOPUP_WINDOW_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+pub(crate) const TOPUP_WINDOW_LOADS: u32 = 30;
+
+/// What this load does about the top-up window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TopUp {
+    /// The newest predecessor is not resolved yet: the walk still imports it.
+    NotYet,
+    /// Top up on this load, recording `next` as the window's state.
+    Run {
+        /// `(started_at_ms, loads)` after this load.
+        next: (u64, u32),
+    },
+    /// The window is over (by time or by loads).
+    Ended,
+}
+
+/// Decide the top-up from the persisted window state (`None`: not started),
+/// the time, and whether the newest predecessor is resolved. Pure.
+pub(crate) fn topup_decision(
+    state: Option<(u64, u32)>,
+    now_ms: u64,
+    newest_resolved: bool,
+) -> TopUp {
+    if !newest_resolved {
+        return TopUp::NotYet;
+    }
+    match state {
+        None => TopUp::Run { next: (now_ms, 1) },
+        Some((started, loads))
+            if loads >= TOPUP_WINDOW_LOADS || now_ms.saturating_sub(started) >= TOPUP_WINDOW_MS =>
+        {
+            TopUp::Ended
+        }
+        Some((started, loads)) => TopUp::Run {
+            next: (started, loads + 1),
+        },
+    }
+}
+
+/// Whether the journal resolves `newest` (the newest generation in the
+/// lineage) in `status`.
+pub(crate) fn newest_resolved(status: &JournalStatus, newest: &DelegateLineageEntry) -> bool {
+    match status {
+        JournalStatus::Complete { .. } => true,
+        JournalStatus::Incomplete { pending, .. } => pending
+            .iter()
+            .all(|p| p.key.bytes() != newest.delegate_key.as_slice()),
+        _ => false,
+    }
+}
+
+fn now_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// A top-up is due on this load's next walk run.
+static TOPUP_PENDING: AtomicBool = AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
 // begin, on every page load
 // ---------------------------------------------------------------------------
 
@@ -341,10 +417,48 @@ pub(crate) fn start_journal_load() {
             }
         };
         info!("migration journal: walk decision for this load: {decision:?}");
-        if matches!(decision, WalkDecision::Run | WalkDecision::RunResetCadence) {
+        let topup = {
+            let _ops = JOURNAL_OPS.lock().await;
+            topup_for_load(&status).await
+        };
+        if matches!(decision, WalkDecision::Run | WalkDecision::RunResetCadence) || topup {
             poke_walk();
         }
     });
+}
+
+/// Decide (and record) the post-resolve top-up for this load; `true` when one
+/// is due. With the journal lock held. A window state that cannot be read or
+/// stored tops up nothing this load (it is a backstop, not the import).
+async fn topup_for_load(status: &JournalStatus) -> bool {
+    let Some(newest) = LINEAGE.iter().max_by_key(|e| e.generation) else {
+        return false;
+    };
+    if !newest_resolved(status, newest) {
+        return false;
+    }
+    let channel = NodeDelegateChannel;
+    let successor = chat_delegate::current_delegate_key();
+    let Ok(state) = read_topup_window(&channel, &successor).await else {
+        return false;
+    };
+    match topup_decision(state, now_ms(), true) {
+        TopUp::Run { next } => {
+            if store_topup_window(&channel, &successor, next)
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            info!(
+                "migration journal: post-resolve top-up, load {} of the window",
+                next.1
+            );
+            TOPUP_PENDING.store(true, Ordering::Relaxed);
+            true
+        }
+        TopUp::NotYet | TopUp::Ended => false,
+    }
 }
 
 /// Run `begin` under the journal lock and record its answer. `None` on failure.
@@ -676,6 +790,26 @@ pub(crate) fn walk_may_run(check: WalkCheck) -> bool {
 /// `attempt`, recording its status.
 async fn run_walk_locked(attempt: u32) {
     let _ops = JOURNAL_OPS.lock().await;
+    // The post-resolve top-up shares the walk's gate (a complete room set for
+    // this attempt) and its seam's re-checks.
+    if TOPUP_PENDING.swap(false, Ordering::Relaxed) {
+        if let Some(newest) = LINEAGE.iter().max_by_key(|e| e.generation) {
+            match top_up_from_with(
+                &NodeDelegateChannel,
+                &mut LiveImportSeam::new(attempt),
+                newest,
+            )
+            .await
+            {
+                Ok(n) => info!(
+                    "migration journal: top-up merged {n} item(s) from the newest predecessor"
+                ),
+                Err(e) => warn!(
+                    "migration journal: top-up failed ({e}); the next load in the window retries"
+                ),
+            }
+        }
+    }
     let (report, _seam) = walk_with(
         &NodeDelegateChannel,
         LiveImportSeam::new(attempt),
@@ -1269,5 +1403,50 @@ mod tests {
             "itself: retried on its own"
         );
         assert!(!older_than_a_skipped_newer(29, skipped_28), "newer");
+    }
+
+    // ---------------- the post-resolve top-up window (review B1) ----------------
+
+    #[test]
+    fn the_topup_window_runs_then_ends_by_loads_or_time() {
+        let t0 = 1_000_000;
+        assert_eq!(topup_decision(None, t0, false), TopUp::NotYet);
+        assert_eq!(topup_decision(Some((t0, 3)), t0, false), TopUp::NotYet);
+        assert_eq!(topup_decision(None, t0, true), TopUp::Run { next: (t0, 1) });
+        let mut state = (t0, 1);
+        let mut runs = 1;
+        loop {
+            match topup_decision(Some(state), t0 + 1, true) {
+                TopUp::Run { next } => {
+                    state = next;
+                    runs += 1;
+                }
+                TopUp::Ended => break,
+                TopUp::NotYet => unreachable!(),
+            }
+            assert!(runs <= TOPUP_WINDOW_LOADS, "bounded by loads");
+        }
+        assert_eq!(runs, TOPUP_WINDOW_LOADS);
+        assert_eq!(
+            topup_decision(Some((t0, 1)), t0 + TOPUP_WINDOW_MS, true),
+            TopUp::Ended,
+            "bounded by time"
+        );
+        assert_eq!(
+            topup_decision(Some((t0, 1)), t0.saturating_sub(5), true),
+            TopUp::Run { next: (t0, 2) },
+            "a clock that went back does not end or extend it"
+        );
+    }
+
+    #[test]
+    fn the_newest_generation_is_resolved_only_when_not_pending() {
+        let lineage = river_delegate_lineage(&[([1u8; 32], [2u8; 32]), ([3u8; 32], [4u8; 32])]);
+        let newest = &lineage[1];
+        assert!(!newest_resolved(&fresh_status(), newest), "both pending");
+        assert!(newest_resolved(
+            &JournalStatus::Complete { rejected_items: 0 },
+            newest
+        ));
     }
 }
