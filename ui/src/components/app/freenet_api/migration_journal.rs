@@ -45,9 +45,9 @@ use freenet_migrate::{DelegateLineageEntry, JournalStatus};
 use freenet_stdlib::prelude::DelegateKey;
 
 use super::delegate_migration::{
-    begin_with, log_migration_report, note_sweep_import_with, read_topup_window, read_walk_cadence,
-    river_delegate_lineage, store_topup_window, store_walk_cadence, top_up_from_with, walk_with,
-    LiveImportSeam, NodeDelegateChannel, SweepWrite,
+    begin_with, log_migration_report, note_sweep_import_with, read_walk_cadence,
+    river_delegate_lineage, store_walk_cadence, top_up_in_window_with, walk_with, LiveImportSeam,
+    NodeDelegateChannel, SweepWrite, TopUpOutcome, TopUpWindow,
 };
 use crate::components::app::chat_delegate;
 
@@ -298,46 +298,43 @@ pub(crate) fn walk_decision(status: &JournalStatus, skips: Option<u32>) -> WalkD
 // The post-resolve top-up window (freenet/river#768 review B1)
 // ---------------------------------------------------------------------------
 
-/// How long, and for how many loads, the newest predecessor is re-read after
-/// the journal resolves it. An old tab still running the previous build keeps
-/// writing to it until it is closed; this covers a rollout, not for ever.
+/// How long, and for how many top-ups, the newest predecessor is re-read
+/// after the journal resolves it. An old tab still running the previous build
+/// keeps writing to it until it is closed; this covers a rollout, not for
+/// ever. A change to the predecessor's key index restarts the window (#768
+/// round 2 item 8), so the window ends only after the old tab's last key
+/// change, not after a fixed count of page loads.
 pub(crate) const TOPUP_WINDOW_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 pub(crate) const TOPUP_WINDOW_LOADS: u32 = 30;
 
 /// What this load does about the top-up window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TopUp {
-    /// The newest predecessor is not resolved yet: the walk still imports it.
-    NotYet,
-    /// Top up on this load, recording `next` as the window's state.
-    Run {
-        /// `(started_at_ms, loads)` after this load.
-        next: (u64, u32),
-    },
-    /// The window is over (by time or by loads).
+    /// Top up on this load from `window` (restarted if the index changed);
+    /// the caller counts the run only once it ran.
+    Run { window: TopUpWindow },
+    /// The window is over (by time or by runs) and the index is unchanged.
     Ended,
 }
 
-/// Decide the top-up from the persisted window state (`None`: not started),
-/// the time, and whether the newest predecessor is resolved. Pure.
-pub(crate) fn topup_decision(
-    state: Option<(u64, u32)>,
-    now_ms: u64,
-    newest_resolved: bool,
-) -> TopUp {
-    if !newest_resolved {
-        return TopUp::NotYet;
-    }
+/// Decide the top-up from the persisted window (`None`: not started), the
+/// time, and the digest of the predecessor's key index just read. Pure.
+pub(crate) fn topup_decision(state: Option<TopUpWindow>, now_ms: u64, digest: [u8; 32]) -> TopUp {
+    let restart = TopUpWindow {
+        started_ms: now_ms,
+        runs: 0,
+        index_digest: digest,
+    };
     match state {
-        None => TopUp::Run { next: (now_ms, 1) },
-        Some((started, loads))
-            if loads >= TOPUP_WINDOW_LOADS || now_ms.saturating_sub(started) >= TOPUP_WINDOW_MS =>
+        None => TopUp::Run { window: restart },
+        Some(w) if w.index_digest != digest => TopUp::Run { window: restart },
+        Some(w)
+            if w.runs >= TOPUP_WINDOW_LOADS
+                || now_ms.saturating_sub(w.started_ms) >= TOPUP_WINDOW_MS =>
         {
             TopUp::Ended
         }
-        Some((started, loads)) => TopUp::Run {
-            next: (started, loads + 1),
-        },
+        Some(w) => TopUp::Run { window: w },
     }
 }
 
@@ -367,8 +364,11 @@ fn now_ms() -> u64 {
     }
 }
 
-/// A top-up is due on this load's next walk run.
+/// A top-up is due on this load's next driver run.
 static TOPUP_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// A walk is due on this load's next driver run (as opposed to a top-up only).
+static WALK_WANTED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // begin, on every page load
@@ -417,48 +417,22 @@ pub(crate) fn start_journal_load() {
             }
         };
         info!("migration journal: walk decision for this load: {decision:?}");
-        let topup = {
-            let _ops = JOURNAL_OPS.lock().await;
-            topup_for_load(&status).await
-        };
-        if matches!(decision, WalkDecision::Run | WalkDecision::RunResetCadence) || topup {
+        // The post-resolve top-up (#768 review B1) once the newest
+        // predecessor is resolved. It runs on its own: it never forces the
+        // walk (which the #761 cadence may be skipping this load).
+        let topup = LINEAGE
+            .iter()
+            .max_by_key(|e| e.generation)
+            .is_some_and(|newest| newest_resolved(&status, newest));
+        if matches!(decision, WalkDecision::Run | WalkDecision::RunResetCadence) {
+            if topup {
+                TOPUP_PENDING.store(true, Ordering::Relaxed);
+            }
             poke_walk();
+        } else if topup {
+            poke_topup();
         }
     });
-}
-
-/// Decide (and record) the post-resolve top-up for this load; `true` when one
-/// is due. With the journal lock held. A window state that cannot be read or
-/// stored tops up nothing this load (it is a backstop, not the import).
-async fn topup_for_load(status: &JournalStatus) -> bool {
-    let Some(newest) = LINEAGE.iter().max_by_key(|e| e.generation) else {
-        return false;
-    };
-    if !newest_resolved(status, newest) {
-        return false;
-    }
-    let channel = NodeDelegateChannel;
-    let successor = chat_delegate::current_delegate_key();
-    let Ok(state) = read_topup_window(&channel, &successor).await else {
-        return false;
-    };
-    match topup_decision(state, now_ms(), true) {
-        TopUp::Run { next } => {
-            if store_topup_window(&channel, &successor, next)
-                .await
-                .is_err()
-            {
-                return false;
-            }
-            info!(
-                "migration journal: post-resolve top-up, load {} of the window",
-                next.1
-            );
-            TOPUP_PENDING.store(true, Ordering::Relaxed);
-            true
-        }
-        TopUp::NotYet | TopUp::Ended => false,
-    }
 }
 
 /// Run `begin` under the journal lock and record its answer. `None` on failure.
@@ -631,12 +605,33 @@ const WALK_QUIESCENCE_POLL_MS: u64 = 500;
 /// asked, so a reconnect or a burst of sweep flags never stacks concurrent
 /// walks.
 pub(crate) fn poke_walk() {
-    WALK_POKED.store(true, Ordering::Relaxed);
+    WALK_WANTED.store(true, Ordering::Relaxed);
     update_session(|s| s.walk_in_flight = true);
+    poke_driver();
+}
+
+/// Ask for the post-resolve top-up alone (no walk, so the import gate is not
+/// held Pending for it).
+pub(crate) fn poke_topup() {
+    TOPUP_PENDING.store(true, Ordering::Relaxed);
+    poke_driver();
+}
+
+fn poke_driver() {
+    WALK_POKED.store(true, Ordering::Relaxed);
     if WALK_DRIVER_RUNNING.swap(true, Ordering::Relaxed) {
         return;
     }
     crate::util::safe_spawn_local(walk_driver());
+}
+
+/// What one driver run does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DriverWork {
+    /// A journaled walk (counted against the per-load budget).
+    pub(crate) walk: bool,
+    /// The post-resolve top-up (not counted).
+    pub(crate) topup: bool,
 }
 
 /// What the walk driver reads from and does to its environment. The live
@@ -655,10 +650,9 @@ pub(crate) trait WalkEnv {
     fn room_set_complete(&self, attempt: u32) -> bool;
     /// Wait `ms` milliseconds.
     fn sleep(&self, ms: u64) -> impl Future<Output = ()>;
-    /// Run one journaled walk to completion on behalf of load attempt
-    /// `attempt` (its seam re-checks the room set before every merge and its
-    /// flush).
-    fn run_walk(&self, attempt: u32) -> impl Future<Output = ()>;
+    /// Run `work` to completion on behalf of load attempt `attempt` (its
+    /// seams re-check the room set before every merge and their flush).
+    fn run_work(&self, attempt: u32, work: DriverWork) -> impl Future<Output = ()>;
 }
 
 struct LiveWalkEnv;
@@ -676,8 +670,8 @@ impl WalkEnv for LiveWalkEnv {
     async fn sleep(&self, ms: u64) {
         crate::util::sleep(std::time::Duration::from_millis(ms)).await
     }
-    async fn run_walk(&self, attempt: u32) {
-        run_walk_locked(attempt).await
+    async fn run_work(&self, attempt: u32, work: DriverWork) {
+        run_work_locked(attempt, work).await
     }
 }
 
@@ -688,12 +682,17 @@ async fn walk_driver() {
 async fn walk_driver_with<E: WalkEnv>(env: &E) {
     loop {
         while WALK_POKED.swap(false, Ordering::Relaxed) {
-            if WALKS_THIS_LOAD.load(Ordering::Relaxed) >= MAX_WALKS_PER_LOAD {
+            if WALK_WANTED.load(Ordering::Relaxed)
+                && WALKS_THIS_LOAD.load(Ordering::Relaxed) >= MAX_WALKS_PER_LOAD
+            {
                 warn!(
                     "migration journal: {MAX_WALKS_PER_LOAD} walks this page load; the next \
                      load continues"
                 );
-                break;
+                WALK_WANTED.store(false, Ordering::Relaxed);
+            }
+            if !WALK_WANTED.load(Ordering::Relaxed) && !TOPUP_PENDING.load(Ordering::Relaxed) {
+                continue;
             }
             let attempt = env.load_attempt();
             let mut waited = 0u64;
@@ -712,19 +711,27 @@ async fn walk_driver_with<E: WalkEnv>(env: &E) {
                      current room set is not known complete (freenet/river#595). The next \
                      load attempt retries."
                 );
-                // Let the next load attempt (a reconnect, or Retry) start again.
-                // A gated attempt does not spend the per-load walk budget.
+                // Let the next load attempt (a reconnect, or Retry) start again;
+                // it decides the walk and the top-up afresh. A gated attempt
+                // spends neither the walk budget nor a top-up run.
+                WALK_WANTED.store(false, Ordering::Relaxed);
+                TOPUP_PENDING.store(false, Ordering::Relaxed);
                 LOAD_ARMED.store(false, Ordering::Relaxed);
                 continue;
             }
-            WALKS_THIS_LOAD.fetch_add(1, Ordering::Relaxed);
-            env.run_walk(attempt).await;
+            let work = DriverWork {
+                walk: WALK_WANTED.swap(false, Ordering::Relaxed),
+                topup: TOPUP_PENDING.swap(false, Ordering::Relaxed),
+            };
+            if work.walk {
+                WALKS_THIS_LOAD.fetch_add(1, Ordering::Relaxed);
+            }
+            env.run_work(attempt, work).await;
         }
         WALK_DRIVER_RUNNING.store(false, Ordering::Relaxed);
         // A poke that landed after the last check found the driver still
         // running and spawned nothing: pick it up here.
         let resume = WALK_POKED.load(Ordering::Relaxed)
-            && WALKS_THIS_LOAD.load(Ordering::Relaxed) < MAX_WALKS_PER_LOAD
             && !WALK_DRIVER_RUNNING.swap(true, Ordering::Relaxed);
         if !resume {
             break;
@@ -757,29 +764,37 @@ pub(crate) fn walk_may_run(check: WalkCheck) -> bool {
     check.settled && check.same_attempt && check.room_set_complete
 }
 
-/// One journaled walk under the journal lock, on behalf of load attempt
-/// `attempt`, recording its status.
-async fn run_walk_locked(attempt: u32) {
+/// One driver run under the journal lock, on behalf of load attempt
+/// `attempt`: the post-resolve top-up and/or a journaled walk (recording its
+/// status). The top-up shares the walk's gate (a complete room set for this
+/// attempt) and its seam's re-checks.
+async fn run_work_locked(attempt: u32, work: DriverWork) {
     let _ops = JOURNAL_OPS.lock().await;
-    // The post-resolve top-up shares the walk's gate (a complete room set for
-    // this attempt) and its seam's re-checks.
-    if TOPUP_PENDING.swap(false, Ordering::Relaxed) {
+    if work.topup {
         if let Some(newest) = LINEAGE.iter().max_by_key(|e| e.generation) {
-            match top_up_from_with(
+            match top_up_in_window_with(
                 &NodeDelegateChannel,
                 &mut LiveImportSeam::new(attempt),
+                &chat_delegate::current_delegate_key(),
                 newest,
+                now_ms(),
             )
             .await
             {
-                Ok(n) => info!(
-                    "migration journal: top-up merged {n} item(s) from the newest predecessor"
+                Ok(TopUpOutcome::Ran { merged, window }) => info!(
+                    "migration journal: top-up merged {merged} item(s) from the newest \
+                     predecessor (run {} of the window)",
+                    window.runs
                 ),
-                Err(e) => warn!(
-                    "migration journal: top-up failed ({e}); the next load in the window retries"
-                ),
+                Ok(TopUpOutcome::Ended) => {}
+                Err(e) => {
+                    warn!("migration journal: top-up did not run ({e}); the next load retries")
+                }
             }
         }
+    }
+    if !work.walk {
+        return;
     }
     let (report, _seam) = walk_with(
         &NodeDelegateChannel,
@@ -1121,6 +1136,8 @@ mod tests {
     fn fresh_load() -> std::sync::MutexGuard<'static, ()> {
         let guard = DRIVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         WALK_POKED.store(false, Ordering::Relaxed);
+        WALK_WANTED.store(false, Ordering::Relaxed);
+        TOPUP_PENDING.store(false, Ordering::Relaxed);
         WALK_DRIVER_RUNNING.store(false, Ordering::Relaxed);
         WALKS_THIS_LOAD.store(0, Ordering::Relaxed);
         LOAD_ARMED.store(true, Ordering::Relaxed);
@@ -1164,8 +1181,13 @@ mod tests {
                 self.attempt.set(self.attempt.get() + 1);
             }
         }
-        async fn run_walk(&self, _attempt: u32) {
-            self.log.borrow_mut().push("walk");
+        async fn run_work(&self, _attempt: u32, work: DriverWork) {
+            if work.topup {
+                self.log.borrow_mut().push("topup");
+            }
+            if work.walk {
+                self.log.borrow_mut().push("walk");
+            }
             if let Some(f) = self.during_walk.borrow_mut().take() {
                 f();
             }
@@ -1302,6 +1324,53 @@ mod tests {
         assert!(!session().walk_in_flight);
     }
 
+    fn topups(env: &ScriptedEnv) -> usize {
+        env.log.borrow().iter().filter(|e| **e == "topup").count()
+    }
+
+    /// #768 round 2 (Consider): the post-resolve top-up runs on its own. It
+    /// never forces a walk (the #761 cadence may be skipping this load), never
+    /// spends the walk budget, and never holds the import gate Pending.
+    #[test]
+    fn a_topup_alone_runs_without_a_walk() {
+        let _g = fresh_load();
+        let env = ScriptedEnv::default();
+        poke_topup();
+        assert!(!session().walk_in_flight, "a top-up does not hold the gate");
+        futures::executor::block_on(walk_driver_with(&env));
+        assert_eq!((topups(&env), walks(&env)), (1, 0));
+        assert_eq!(WALKS_THIS_LOAD.load(Ordering::Relaxed), 0);
+        // Even with the walk budget spent, a top-up still runs.
+        WALKS_THIS_LOAD.store(MAX_WALKS_PER_LOAD, Ordering::Relaxed);
+        poke_topup();
+        futures::executor::block_on(walk_driver_with(&env));
+        assert_eq!(topups(&env), 2);
+    }
+
+    /// A walk and a top-up requested together run once each, together.
+    #[test]
+    fn a_walk_and_a_topup_run_together() {
+        let _g = fresh_load();
+        let env = ScriptedEnv::default();
+        poke_topup();
+        poke_and_drive(&env);
+        assert_eq!(*env.log.borrow(), vec!["topup", "walk"]);
+    }
+
+    /// A gated attempt runs no top-up and clears the request, so the next
+    /// load attempt decides it afresh (and nothing is counted).
+    #[test]
+    fn a_gated_attempt_runs_no_topup() {
+        let _g = fresh_load();
+        let env = ScriptedEnv::default();
+        env.incomplete.set(true);
+        poke_topup();
+        futures::executor::block_on(walk_driver_with(&env));
+        assert_eq!(topups(&env), 0);
+        assert!(!TOPUP_PENDING.load(Ordering::Relaxed));
+        assert!(!LOAD_ARMED.load(Ordering::Relaxed));
+    }
+
     // ---------------- the sweep gate's retries (review A2) ----------------
 
     fn scripted_gate(
@@ -1363,34 +1432,62 @@ mod tests {
     // ---------------- the post-resolve top-up window (review B1) ----------------
 
     #[test]
-    fn the_topup_window_runs_then_ends_by_loads_or_time() {
+    fn the_topup_window_runs_then_ends_by_runs_or_time_and_restarts_on_change() {
         let t0 = 1_000_000;
-        assert_eq!(topup_decision(None, t0, false), TopUp::NotYet);
-        assert_eq!(topup_decision(Some((t0, 3)), t0, false), TopUp::NotYet);
-        assert_eq!(topup_decision(None, t0, true), TopUp::Run { next: (t0, 1) });
-        let mut state = (t0, 1);
-        let mut runs = 1;
-        loop {
-            match topup_decision(Some(state), t0 + 1, true) {
-                TopUp::Run { next } => {
-                    state = next;
-                    runs += 1;
-                }
-                TopUp::Ended => break,
-                TopUp::NotYet => unreachable!(),
-            }
-            assert!(runs <= TOPUP_WINDOW_LOADS, "bounded by loads");
+        let d = [1u8; 32];
+        let fresh = |t| TopUpWindow {
+            started_ms: t,
+            runs: 0,
+            index_digest: d,
+        };
+        assert_eq!(
+            topup_decision(None, t0, d),
+            TopUp::Run { window: fresh(t0) }
+        );
+        // Count only what ran (the caller adds the run): bounded by runs.
+        let mut w = fresh(t0);
+        let mut runs = 0;
+        while let TopUp::Run { window } = topup_decision(Some(w), t0 + 1, d) {
+            w = TopUpWindow {
+                runs: window.runs + 1,
+                ..window
+            };
+            runs += 1;
+            assert!(runs <= TOPUP_WINDOW_LOADS, "bounded by runs");
         }
         assert_eq!(runs, TOPUP_WINDOW_LOADS);
+        // A load that did not run records nothing, so it cannot end the window.
+        let one = TopUpWindow {
+            runs: 1,
+            ..fresh(t0)
+        };
         assert_eq!(
-            topup_decision(Some((t0, 1)), t0 + TOPUP_WINDOW_MS, true),
+            topup_decision(Some(one), t0 + 1, d),
+            TopUp::Run { window: one }
+        );
+        assert_eq!(
+            topup_decision(Some(one), t0 + TOPUP_WINDOW_MS, d),
             TopUp::Ended,
             "bounded by time"
         );
         assert_eq!(
-            topup_decision(Some((t0, 1)), t0.saturating_sub(5), true),
-            TopUp::Run { next: (t0, 2) },
+            topup_decision(Some(one), t0.saturating_sub(5), d),
+            TopUp::Run { window: one },
             "a clock that went back does not end or extend it"
+        );
+        // The predecessor's index changed (an old tab wrote a new key): the
+        // window restarts, even after it had ended.
+        let changed = [2u8; 32];
+        let t1 = t0 + TOPUP_WINDOW_MS * 3;
+        assert_eq!(
+            topup_decision(Some(w), t1, changed),
+            TopUp::Run {
+                window: TopUpWindow {
+                    started_ms: t1,
+                    runs: 0,
+                    index_digest: changed
+                }
+            }
         );
     }
 

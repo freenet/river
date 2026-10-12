@@ -209,9 +209,8 @@ pub(crate) fn is_migration_marker_key(key: &[u8]) -> bool {
 /// own bookkeeping, never migrated.
 pub(crate) const WALK_CADENCE_KEY: &[u8] = b"__river_migration_walk_skips__";
 
-/// The post-resolve top-up window's state (freenet/river#768 review B1):
-/// when it began (ms since the epoch) and how many loads it has run. River's
-/// own bookkeeping, never migrated.
+/// The post-resolve top-up window's state (freenet/river#768 review B1,
+/// round 2 item 8): [`TopUpWindow`]. River's own bookkeeping, never migrated.
 pub(crate) const TOPUP_WINDOW_KEY: &[u8] = b"__river_migration_topup_window__";
 
 /// The chat delegate's key index, as a plain `GetRequest` key. Every generation
@@ -1753,32 +1752,109 @@ pub(crate) async fn store_walk_cadence<C: RiverDelegateChannel>(
     .await
 }
 
-/// Read the post-resolve top-up window's state `(started_at_ms, loads)` from
-/// the current delegate; `Ok(None)` when it has not started.
+/// The post-resolve top-up window (#768 review B1, round 2 item 8): when it
+/// began, how many top-ups have RUN in it (a load whose top-up did not run,
+/// silent predecessor, error or gated attempt, is not counted), and the
+/// BLAKE3 digest of the predecessor's raw key index when it was last read. A
+/// changed index (an old tab added or removed a key) restarts the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TopUpWindow {
+    pub(crate) started_ms: u64,
+    pub(crate) runs: u32,
+    pub(crate) index_digest: [u8; 32],
+}
+
+const TOPUP_WINDOW_LEN: usize = 8 + 4 + 32;
+
+/// Read the top-up window from the current delegate; `Ok(None)` when it has
+/// not started.
 pub(crate) async fn read_topup_window<C: RiverDelegateChannel>(
     channel: &C,
     successor: &DelegateKey,
-) -> Result<Option<(u64, u32)>, String> {
+) -> Result<Option<TopUpWindow>, String> {
     match get_current(channel, successor, TOPUP_WINDOW_KEY.to_vec()).await? {
         None => Ok(None),
-        Some(bytes) if bytes.len() == 12 => {
-            let started = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
-            let loads = u32::from_le_bytes(bytes[8..].try_into().expect("4 bytes"));
-            Ok(Some((started, loads)))
-        }
-        Some(_) => Err("top-up window state is not 12 bytes".to_string()),
+        Some(bytes) if bytes.len() == TOPUP_WINDOW_LEN => Ok(Some(TopUpWindow {
+            started_ms: u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")),
+            runs: u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")),
+            index_digest: bytes[12..].try_into().expect("32 bytes"),
+        })),
+        Some(_) => Err(format!(
+            "top-up window state is not {TOPUP_WINDOW_LEN} bytes"
+        )),
     }
 }
 
-/// Store the post-resolve top-up window's state, awaiting the delegate's ack.
+/// Store the top-up window, awaiting the delegate's ack.
 pub(crate) async fn store_topup_window<C: RiverDelegateChannel>(
     channel: &C,
     successor: &DelegateKey,
-    state: (u64, u32),
+    window: TopUpWindow,
 ) -> Result<(), String> {
-    let mut bytes = state.0.to_le_bytes().to_vec();
-    bytes.extend_from_slice(&state.1.to_le_bytes());
+    let mut bytes = Vec::with_capacity(TOPUP_WINDOW_LEN);
+    bytes.extend_from_slice(&window.started_ms.to_le_bytes());
+    bytes.extend_from_slice(&window.runs.to_le_bytes());
+    bytes.extend_from_slice(&window.index_digest);
     put_current(channel, successor, TOPUP_WINDOW_KEY.to_vec(), &bytes).await
+}
+
+/// BLAKE3 of `predecessor`'s raw stored key index (one `GetRequest`): what
+/// changes when an old tab adds or removes a key there. `Err` when the read
+/// established no answer (silence is not "unchanged").
+pub(crate) async fn predecessor_index_digest<C: RiverDelegateChannel>(
+    channel: &C,
+    predecessor: &DelegateKey,
+) -> Result<[u8; 32], String> {
+    let raw = RiverPredecessorIo::new(channel)
+        .get_key(predecessor, KEY_INDEX_STORAGE_KEY)
+        .await?;
+    let mut hasher = blake3::Hasher::new();
+    match raw {
+        None => hasher.update(&[0]),
+        Some(bytes) => hasher.update(&[1]).update(&bytes),
+    };
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// What one load's top-up did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TopUpOutcome {
+    /// It ran, merging `merged` items; `window` is the recorded state after it.
+    Ran { merged: u32, window: TopUpWindow },
+    /// The window is over and the predecessor's index has not changed.
+    Ended,
+}
+
+/// One load's post-resolve top-up from `predecessor` (the newest generation,
+/// already resolved by the journal), driven by the persisted window:
+/// read the predecessor's index digest, restart the window if it changed,
+/// stop if the window is over, else top up and count the run. Any `Err`
+/// (a silent predecessor, a failed merge, a failed write) counts nothing: the
+/// next load retries.
+pub(crate) async fn top_up_in_window_with<C: RiverDelegateChannel, S: RiverImportSeam>(
+    channel: &C,
+    seam: &mut S,
+    successor: &DelegateKey,
+    predecessor: &DelegateLineageEntry,
+    now_ms: u64,
+) -> Result<TopUpOutcome, String> {
+    let key = DelegateKey::new(
+        predecessor.delegate_key,
+        CodeHash::new(predecessor.code_hash),
+    );
+    let digest = predecessor_index_digest(channel, &key).await?;
+    let state = read_topup_window(channel, successor).await?;
+    let window = match super::migration_journal::topup_decision(state, now_ms, digest) {
+        super::migration_journal::TopUp::Ended => return Ok(TopUpOutcome::Ended),
+        super::migration_journal::TopUp::Run { window } => window,
+    };
+    let merged = top_up_from_with(channel, seam, predecessor).await?;
+    let window = TopUpWindow {
+        runs: window.runs.saturating_add(1),
+        ..window
+    };
+    store_topup_window(channel, successor, window).await?;
+    Ok(TopUpOutcome::Ran { merged, window })
 }
 
 /// Top up from `predecessor` after the journal resolved it
@@ -1792,8 +1868,8 @@ pub(crate) async fn store_topup_window<C: RiverDelegateChannel>(
 ///
 /// Additive and idempotent, so it needs no journal flag: an interrupted top-up
 /// leaves the data in the predecessor, and the next load in the window reads
-/// it again. A silent predecessor tops up nothing this load. Returns the items
-/// merged.
+/// it again. A silent predecessor is an `Err` (not a run). Returns the items
+/// merged. [`top_up_in_window_with`] bounds it.
 pub(crate) async fn top_up_from_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     channel: &C,
     seam: &mut S,
@@ -1809,7 +1885,7 @@ pub(crate) async fn top_up_from_with<C: RiverDelegateChannel, S: RiverImportSeam
     {
         Some(ChatDelegateResponseMsg::ListResponse { keys }) => keys,
         Some(other) => return Err(format!("unexpected reply to top-up ListRequest: {other:?}")),
-        None => return Ok(0),
+        None => return Err("the predecessor did not answer the top-up ListRequest".to_string()),
     };
     let known = seam.known_rooms().await;
     let mut reader = RiverPredecessorIo::new(channel);
@@ -2051,6 +2127,14 @@ pub(crate) mod tests_support {
         }
         /// Store `value` under `key` on `delegate` directly (fixture setup),
         /// creating the delegate if needed.
+        /// Make `delegate` go silent (or answer again).
+        pub(crate) fn silence(&self, delegate: &DelegateKey, silent: bool) {
+            self.delegates
+                .borrow_mut()
+                .entry(delegate.bytes().to_vec())
+                .or_default()
+                .silent = silent;
+        }
         pub(crate) fn put(&self, delegate: &DelegateKey, key: &[u8], value: &[u8]) {
             self.delegates
                 .borrow_mut()
@@ -4579,6 +4663,72 @@ mod tests {
         // Idempotent: a second top-up finds nothing new.
         let again = block_on(top_up_from_with(&channel, &mut seam, &lineage3()[2])).unwrap();
         assert_eq!(again, 0);
+    }
+
+    /// #768 round 2 item 8: the window counts only top-ups that RAN, ends
+    /// after `TOPUP_WINDOW_LOADS` of them, and restarts when the predecessor's
+    /// index changes, so an old tab's room created after the window "ended"
+    /// is still imported. A silent predecessor counts nothing.
+    #[test]
+    fn the_topup_window_counts_runs_and_restarts_when_the_index_changes() {
+        use super::super::migration_journal::{TOPUP_WINDOW_LOADS, TOPUP_WINDOW_MS};
+        let slot = |r, seed| cbor(&RoomSlot::Present(Box::new(room_with_identity(r, seed))));
+        let (a, c) = (vk(1), vk(3));
+        let mut gen2 = DelegateSim::default();
+        gen2.store
+            .insert(chat_delegate::room_storage_key(&a), slot(a, 3));
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let newest = &lineage3()[2];
+        let t0 = 5_000_000u64;
+        let run = |seam: &mut MemorySeam, now| {
+            block_on(top_up_in_window_with(
+                &channel,
+                seam,
+                &successor_key(),
+                newest,
+                now,
+            ))
+        };
+
+        // A silent predecessor: an error, and nothing recorded.
+        channel.silence(&pred_key(2), true);
+        let mut seam = MemorySeam::new();
+        assert!(run(&mut seam, t0).is_err());
+        assert_eq!(
+            block_on(read_topup_window(&channel, &successor_key())).unwrap(),
+            None,
+            "a top-up that did not run is not counted"
+        );
+        channel.silence(&pred_key(2), false);
+
+        // Runs are counted until the window ends.
+        for i in 1..=TOPUP_WINDOW_LOADS {
+            match run(&mut seam, t0 + u64::from(i)).unwrap() {
+                TopUpOutcome::Ran { window, .. } => assert_eq!(window.runs, i),
+                TopUpOutcome::Ended => panic!("ended early at run {i}"),
+            }
+        }
+        assert!(seam.rooms.map.contains_key(&a));
+        assert_eq!(run(&mut seam, t0 + 100).unwrap(), TopUpOutcome::Ended);
+
+        // Long after, an old tab creates room C: the index changed, so the
+        // window restarts and C is imported.
+        let later = t0 + TOPUP_WINDOW_MS * 2;
+        channel.put(
+            &pred_key(2),
+            &chat_delegate::room_storage_key(&c),
+            &slot(c, 9),
+        );
+        match run(&mut seam, later).unwrap() {
+            TopUpOutcome::Ran { merged, window } => {
+                assert_eq!(merged, 1);
+                assert_eq!((window.started_ms, window.runs), (later, 1));
+            }
+            TopUpOutcome::Ended => panic!("a changed index must restart the window"),
+        }
+        assert!(seam.rooms.map.contains_key(&c));
     }
 
     /// #768 round 2 item 6: the top-up merges the predecessor's DM entries,
