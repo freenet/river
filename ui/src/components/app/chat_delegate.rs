@@ -6146,15 +6146,17 @@ mod tests {
     /// `legacy_delegates.toml` entry, at which point this hash must be updated
     /// alongside that entry, never alone.
     ///
-    /// Updated for V32 (freenet/river#757 + #763): the byte-string encoding of
-    /// the delegate's message byte fields and the freenet/river#592 key-index
-    /// fixes change the delegate WASM; V32 is the outgoing generation.
+    /// Updated for V33 (freenet/river#757 + #763): the byte-string encoding of
+    /// the delegate's message byte fields, the freenet/river#592 key-index
+    /// fixes and the crash-safe key-value writes change the delegate WASM;
+    /// V33 (the river-core 0.1.22 delegate from freenet/river#772) is the
+    /// outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "81b562f82cecabdf8b9fabd74a77a94f6d885ae60cb0c306a49dbc027756c889",
+            "aca9f6b590ece888052da69c5fa539521a8f19992dd1282e1eaa49d4a4823e88",
             "chat_delegate.wasm changed — this branch must not alter the delegate WASM; \
              if the change is intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"

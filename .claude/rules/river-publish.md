@@ -392,12 +392,12 @@ the load's fetch failure (Retry, not a false "no rooms") and leaves that
 generation to the walk, which is not gated by it.
 
 **Post-resolve top-up** (#768 review B1). An old tab on the previous build
-keeps writing to the newest predecessor (V32) until it is closed. After the
-journal resolves it, each load reads V32's raw key index (one GET) and, within
+keeps writing to the newest predecessor (V33) until it is closed. After the
+journal resolves it, each load reads V33's raw key index (one GET) and, within
 the window, re-lists it and merges rooms the current delegate does not know at
 all, plus its outbound-DM entries (never its hidden threads), through the
 ranked merge. The window (`__river_migration_topup_window__`) is 14 days or
-30 top-ups that actually ran, and restarts whenever V32's index digest
+30 top-ups that actually ran, and restarts whenever V33's index digest
 changes. The top-up is its own driver request: it never forces a walk.
 
 **Migrated identities keep their source rank across loads** (#768 review

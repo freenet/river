@@ -1905,7 +1905,7 @@ pub(crate) async fn top_up_in_window_with<C: RiverDelegateChannel, S: RiverImpor
 
 /// Top up from `predecessor` after the journal resolved it
 /// (freenet/river#768 review B1): during the rollout an old tab keeps writing
-/// to what is now a predecessor (the newest one, V32), and once the journal
+/// to what is now a predecessor (the newest one, V33), and once the journal
 /// resolves it nothing reads it again. This re-lists it and merges every room
 /// the successor does not know at all (neither present nor tombstoned), plus
 /// its outbound-DM cache, through the ranked, tombstone-safe merge, unflagged.
@@ -4627,9 +4627,9 @@ mod tests {
     }
 
     /// freenet/river#768 review B3 (migration probe P5), ACROSS a page load:
-    /// V32 (gen 2) is silent on the first burst and an older generation's
+    /// V33 (gen 2) is silent on the first burst and an older generation's
     /// identity for a room is imported and saved; on the next load the room
-    /// reloads from the current delegate, and V32 then answers with its newer
+    /// reloads from the current delegate, and V33 then answers with its newer
     /// identity. With the persisted identity source restored, the newer key
     /// wins. The control (no restore: what reloading at the current rank did
     /// before) keeps the older key, which is the bug.
@@ -4660,7 +4660,7 @@ mod tests {
         );
         assert_eq!(sources, vec![(room, table3()[0].0)]);
 
-        // Load 2: V32 answers now.
+        // Load 2: V33 answers now.
         channel
             .delegates
             .borrow_mut()
@@ -4686,7 +4686,7 @@ mod tests {
         assert_eq!(
             restored.rooms.map[&room].self_verifying_key().unwrap(),
             SigningKey::from_bytes(&[52; 32]).verifying_key(),
-            "V32's newer identity must win on the later load"
+            "V33's newer identity must win on the later load"
         );
 
         // Control: without the persisted source (the pre-B3 reload), the older
@@ -4763,14 +4763,14 @@ mod tests {
         let (_second, restored) = walk(&channel, reload(true));
         assert!(
             !restored.rooms.map.contains_key(&room),
-            "V32's later tombstone removes the room gen0 supplied"
+            "V33's later tombstone removes the room gen0 supplied"
         );
     }
 
     // ---------------- the post-resolve top-up (review B1) ----------------
 
-    /// An old tab still on the previous build creates a room in V32 (gen 2)
-    /// AFTER the journal resolved V32. The walk never reads V32 again; the
+    /// An old tab still on the previous build creates a room in V33 (gen 2)
+    /// AFTER the journal resolved V33. The walk never reads V33 again; the
     /// top-up does, and imports it through the ranked merge. A room the user
     /// deleted in the new build is NOT brought back (migration probe P3).
     #[test]
@@ -4794,7 +4794,7 @@ mod tests {
         // The user leaves room D in the new build.
         seam.rooms.map.remove(&d);
         seam.rooms.removed_rooms.insert(d);
-        // An old tab creates room C in V32, and writes D again.
+        // An old tab creates room C in V33, and writes D again.
         channel.put(
             &pred_key(2),
             &chat_delegate::room_storage_key(&c),
@@ -4806,7 +4806,7 @@ mod tests {
             &slot(d, 7),
         );
 
-        // The walk does not see it: V32 is resolved.
+        // The walk does not see it: V33 is resolved.
         let (_again, seam) = walk_j(&channel, seam);
         assert!(!seam.rooms.map.contains_key(&c));
 
