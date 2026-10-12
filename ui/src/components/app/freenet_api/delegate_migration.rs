@@ -5470,6 +5470,42 @@ mod tests {
         );
     }
 
+    /// #776 heal through the real walk: the newest predecessor (gen 2) holds
+    /// an archive a union migration resurrected into it. Gen 1 had deleted it
+    /// (it answers with no entry), and gen 0 still holds it at the same cutoff.
+    /// The walk drops it.
+    #[test]
+    fn the_walk_heals_an_archive_a_union_migration_resurrected() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::room_state::member::MemberId;
+        let room = vk(1);
+        let entry = river_core::chat_delegate::HiddenDmThreadEntry {
+            room_owner_vk: room.to_bytes(),
+            peer: MemberId(FastHash(2)),
+            hidden_at_ts: 10,
+        };
+        let with_dms = |hidden: Vec<river_core::chat_delegate::HiddenDmThreadEntry>| {
+            let mut g = DelegateSim::default();
+            g.store.insert(
+                OUTBOUND_DMS_STORAGE_KEY.to_vec(),
+                cbor(&OutboundDmStore {
+                    entries: Vec::new(),
+                    hidden_threads: hidden,
+                }),
+            );
+            g
+        };
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), with_dms(vec![entry.clone()]))
+            .with_delegate(&pred_key(1), with_dms(vec![]))
+            .with_delegate(&pred_key(2), with_dms(vec![entry.clone()]))
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert!(report.is_complete(), "{report:?}");
+        assert_eq!(seam.dm_merges.len(), 3);
+        assert!(seam.hidden.is_empty(), "{:?}", seam.hidden);
+    }
+
     /// Even when a deleted room IS offered (a seam that knows nothing), the
     /// ranked merge keeps the current delegate's tombstone.
     #[test]
