@@ -438,6 +438,16 @@ async fn walk_driver() {
                 crate::util::sleep(std::time::Duration::from_millis(WALK_QUIESCENCE_POLL_MS)).await;
                 waited += WALK_QUIESCENCE_POLL_MS;
             }
+            if !walk_may_run(chat_delegate::saw_fetch_failure()) {
+                warn!(
+                    "migration journal: a room failed to load on this attempt; not walking \
+                     over an incomplete room set (freenet/river#595). The next load attempt \
+                     retries."
+                );
+                // Let the next load attempt (a reconnect, or Retry) start again.
+                LOAD_ARMED.store(false, Ordering::Relaxed);
+                continue;
+            }
             run_walk_locked().await;
         }
         WALK_DRIVER_RUNNING.store(false, Ordering::Relaxed);
@@ -451,6 +461,17 @@ async fn walk_driver() {
         }
     }
     update_session(|s| s.walk_in_flight = false);
+}
+
+/// Whether a requested walk may run now. Not while this load attempt saw a
+/// room fail to load: the walk merges older copies into the in-memory set and
+/// re-saves it, and the save keeps the in-memory identity of a room whose
+/// stored slot this load could not read, overwriting that slot
+/// (freenet/river#595). Before #763 the walk ran only behind an empty current
+/// delegate; on every load it must not run over an incomplete set. The
+/// predecessors stay pending, so nothing is lost by waiting.
+pub(crate) fn walk_may_run(saw_fetch_failure: bool) -> bool {
+    !saw_fetch_failure
 }
 
 /// One journaled walk under the journal lock, recording its status.
@@ -668,5 +689,25 @@ mod tests {
     /// streaks are only reachable through journaled walks).
     fn all_absent_status() -> JournalStatus {
         super::super::delegate_migration::tests_support::all_absent_status(CADENCE_ABSENT_STREAK)
+    }
+
+    /// freenet/river#595: never walk over a room set that failed to load.
+    /// The driver must consult the gate before every walk; pinned in source
+    /// because the driver is wasm-only.
+    #[test]
+    fn the_walk_never_runs_over_a_failed_room_load() {
+        assert!(walk_may_run(false));
+        assert!(!walk_may_run(true));
+        let src = include_str!("migration_journal.rs");
+        let driver = src
+            .find(&["async fn walk", "_driver()"].concat())
+            .expect("walk driver");
+        let body = &src[driver..];
+        let body = &body[..body.find("\n}\n").expect("driver ends")];
+        let gate = body
+            .find("walk_may_run(chat_delegate::saw_fetch_failure())")
+            .expect("the driver must gate on the load's fetch failures");
+        let run = body.find("run_walk_locked().await").expect("the walk runs");
+        assert!(gate < run, "the gate must precede the walk");
     }
 }

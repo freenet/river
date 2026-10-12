@@ -1027,8 +1027,14 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // explosion may have been cut short too (only possible for a
             // pre-per-room current delegate). Decided AFTER the load resolved
             // its display state, so waiting for `begin` delays nothing visible.
-            let action =
-                decide_per_room_load_action(has_blob || interrupted_import_for_recovery().await);
+            //
+            // Never over a room set that failed to load: a re-run merges older
+            // copies and re-saves, and the save keeps the in-memory identity of
+            // a room whose stored slot this load could not read, overwriting it
+            // (freenet/river#595's chain). The journal keeps the import flagged,
+            // so a later load recovers.
+            let interrupted = has_blob || interrupted_import_for_recovery().await;
+            let action = decide_per_room_load_action(interrupted && !had_fetch_error);
 
             // Recover from an interrupted migration by re-running it to pick up
             // any room whose per-room key wasn't written before the previous
@@ -2959,9 +2965,10 @@ mod tests {
         let squeezed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
             squeezed.contains(
-                "letaction=decide_per_room_load_action(has_blob||interrupted_import_for_recovery().await);"
+                "letinterrupted=has_blob||interrupted_import_for_recovery().await;letaction=decide_per_room_load_action(interrupted&&!had_fetch_error);"
             ),
-            "per-room load must derive its action from the migration journal"
+            "per-room load must derive its action from the migration journal, and \
+             never re-run over a room set that failed to load (freenet/river#595)"
         );
         let recover_idx = production
             .find("if action.recover")
