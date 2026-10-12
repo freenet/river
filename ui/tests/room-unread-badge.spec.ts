@@ -9,15 +9,21 @@ import {
 } from "./example-room";
 import {
   NEWEST_IN_VIEW_SLACK_PX,
+  backToChatFromMembers,
   deliverOffscreen,
   expectParkedAwayFromEnd,
+  expectReadingRow,
+  expectRowHeld,
+  expectSettledAtBottom,
   fillHistory,
+  hideChatBehindMembers,
   newestRowFromViewBottom,
   nextFrames,
   openRoomAtBottom,
   readerReturnsToEnd,
   readerScrollsWithoutGesture,
   scrollMetrics,
+  settle,
 } from "./history-geometry";
 import { DM_PEER, closeThread, newestHistoryDm, openThread } from "./dm-thread";
 
@@ -350,5 +356,128 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
       await selectListedRoom(page, "Public Discussion Room");
       await expect(teamChatBadge(page), "closing the DM thread left an arrival on screen unread").toHaveCount(0);
     });
+  });
+});
+
+// While the members panel replaces the chat on a phone, Latest is hidden with
+// the chat and so is the room list, so the members panel's back arrow counts
+// the open room's unread messages under its notification mode: the same count
+// the open room's row shows behind the rooms panel. The rooms panel's back
+// arrow has no badge, since that row is on screen beside it.
+test.describe("Members back arrow counts the open room's unread messages", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  const backArrow = (page: Page) => page.getByTestId("members-back-to-chat-button");
+  const membersBadge = (page: Page) => backArrow(page).getByTestId("members-current-room-unread-badge");
+
+  /// Pick the open room's notification mode from the bell in its header.
+  async function setNotificationMode(page: Page, option: "Muted" | "Mentions & replies only") {
+    await page.getByTestId("notification-bell-button").click();
+    const modal = page.getByTestId("notification-modal");
+    await expect(modal).toBeVisible({ timeout: 5_000 });
+    await modal.getByTestId("notification-mode-option").filter({ hasText: option }).click();
+    await expect(modal).toHaveCount(0, { timeout: 5_000 });
+  }
+
+  /// The local user's member id label, as a mention token references it.
+  async function selfMemberId(page: Page): Promise<string> {
+    const row = page.getByTestId("member-list").locator('li:has([data-testid="member-list-self"])');
+    await expect(row, "premise: the member list shows the local user").toHaveCount(1);
+    const testid = await row.getAttribute("data-testid");
+    expect(testid, "premise: the local user's row carries its member id").toMatch(/^member-item-/);
+    return testid!.slice("member-item-".length);
+  }
+
+  test("an arrival while the members panel shows counts on its back arrow", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await hideChatBehindMembers(page);
+    await expect(membersBadge(page), "premise: nothing unread yet").toHaveCount(0);
+
+    await deliverOffscreen(page, "first arrival behind the members panel");
+    await expect(membersBadge(page), "the back arrow does not count the arrival").toHaveText("1");
+    await expect(backArrow(page)).toHaveAccessibleName("Back to chat, 1 unread");
+
+    await deliverOffscreen(page, "second arrival behind the members panel");
+    await expect(membersBadge(page), "the back arrow does not count the second arrival").toHaveText("2");
+    await expect(backArrow(page)).toHaveAccessibleName("Back to chat, 2 unread");
+  });
+
+  test("with nothing unread the back arrow shows no badge", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await hideChatBehindMembers(page);
+    await settle(page);
+
+    await expect(membersBadge(page), "a badge with nothing unread").toHaveCount(0);
+    await expect(backArrow(page)).toHaveAccessibleName("Back to chat");
+  });
+
+  test("a muted room shows no badge on the back arrow", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await setNotificationMode(page, "Muted");
+    await hideChatBehindMembers(page);
+
+    await deliverOffscreen(page, "arrival in a muted room");
+    await settle(page);
+    await expect(membersBadge(page), "a muted room badged its arrival").toHaveCount(0);
+    await expect(backArrow(page)).toHaveAccessibleName("Back to chat");
+  });
+
+  test("a mentions-and-replies room counts only arrivals that mention the reader", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await setNotificationMode(page, "Mentions & replies only");
+    await hideChatBehindMembers(page);
+    const me = await selfMemberId(page);
+
+    await deliverOffscreen(page, "arrival that mentions nobody");
+    await settle(page);
+    await expect(membersBadge(page), "an arrival that mentions nobody was counted").toHaveCount(0);
+
+    // The token renders as a mention chip, so wait on the plain text after it.
+    await callRiverTest(page, "appendMessage", `@[Me](rv:${me}) arrival that mentions the reader`);
+    await expect(page.getByText("arrival that mentions the reader", { exact: false })).toHaveCount(1, {
+      timeout: 5_000,
+    });
+    await expect(membersBadge(page), "an arrival that mentions the reader was not counted").toHaveText("1");
+    await expect(backArrow(page)).toHaveAccessibleName("Back to chat, 1 unread");
+  });
+
+  // A hidden chat has no layout, so the arrival is not followed: back in the
+  // chat it sits below the reader's restored row, Latest offers it, and it
+  // stays unread until the reader reaches it.
+  test("returning to the chat leaves the counted arrival below and unread until reached", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    const row = await expectReadingRow(page);
+
+    await hideChatBehindMembers(page);
+    await deliverOffscreen(page, `tall arrival behind members ${"word ".repeat(300)}`);
+    await expect(membersBadge(page), "premise: the back arrow counts the arrival").toHaveText("1");
+    await backToChatFromMembers(page);
+
+    await expectRowHeld(page, row.key, row.top, "an arrival behind the members panel moved a reader at the end");
+    await expect(page.getByTestId("scroll-to-bottom"), "Latest should offer the hidden arrival").toBeVisible();
+
+    // The open room's row behind the rooms panel shows the same count, and
+    // that panel's own back arrow has no badge.
+    await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).click();
+    await expect(roomUnreadBadge(page, "Team Chat Room"), "the open room's row disagrees with the back arrow").toHaveText(
+      "1",
+    );
+    await expect(page.getByTestId("rooms-back-to-chat-button").locator("span[aria-hidden]")).toHaveCount(0);
+    await expect(page.getByTestId("rooms-back-to-chat-button")).toHaveAccessibleName("Back to chat");
+    await page.getByTestId("rooms-back-to-chat-button").click();
+    await expect(page.locator("#chat-scroll-container")).toBeVisible();
+    await nextFrames(page);
+
+    // Still unread after two returns that did not reach it.
+    await hideChatBehindMembers(page);
+    await settle(page);
+    await expect(membersBadge(page), "returning to the chat marked an unreached arrival read").toHaveText("1");
+    await backToChatFromMembers(page);
+
+    await page.getByTestId("scroll-to-bottom").click();
+    await expectSettledAtBottom(page, "Latest did not reach the arrival");
+    await settle(page);
+    await hideChatBehindMembers(page);
+    await expect(membersBadge(page), "reaching the arrival left it unread").toHaveCount(0);
   });
 });

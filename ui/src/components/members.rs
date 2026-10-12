@@ -1591,6 +1591,7 @@ pub fn MemberList() -> Element {
                         class: "md:hidden p-1",
                         icon_size: 14,
                         testid: "members-back-to-chat-button",
+                        current_room_badge: "members-current-room-unread-badge",
                     }
                     h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",
                         Icon { icon: FaUsers, width: 16, height: 16 }

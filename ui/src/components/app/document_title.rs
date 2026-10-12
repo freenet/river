@@ -629,13 +629,48 @@ pub fn count_unread_excluding_room(
     modes: &NotificationModes,
     exclude: Option<&ed25519_dalek::VerifyingKey>,
 ) -> usize {
-    map.iter()
-        .filter(|(owner_key, _)| Some(*owner_key) != exclude)
-        .map(|(owner_key, room_data)| {
-            let mode = modes.get(owner_key).copied().unwrap_or_default();
-            count_unread_in_room_data_with_mode(room_data, mode)
-        })
+    map.keys()
+        .filter(|owner_key| Some(*owner_key) != exclude)
+        .map(|owner_key| count_unread_in_room(map, modes, owner_key))
         .sum()
+}
+
+/// One room's mode-aware unread count: [`count_unread_in_room_data_with_mode`]
+/// under its entry in `modes` (absent = `All`), the per-room value every total
+/// above sums. 0 for a key not in `map`. Same caveat about the mention memo as
+/// [`count_unread_excluding_room`].
+///
+/// The signal-reading wrapper is [`count_unread_in_current_room`].
+pub fn count_unread_in_room(
+    map: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
+    modes: &NotificationModes,
+    owner_key: &ed25519_dalek::VerifyingKey,
+) -> usize {
+    map.get(owner_key).map_or(0, |room_data| {
+        let mode = modes.get(owner_key).copied().unwrap_or_default();
+        count_unread_in_room_data_with_mode(room_data, mode)
+    })
+}
+
+/// Count the open room's unread messages under its notification mode.
+///
+/// Drives the badge on the members panel's mobile back arrow
+/// (`back_to_chat.rs`): while that panel replaces the chat, Latest is hidden
+/// with it and so is the room list, whose open-room row counts the same value
+/// behind the rooms panel (`room_list.rs`). Called as
+/// `use_memo(count_unread_in_current_room)`, so like
+/// [`count_unread_behind_rooms_panel`] it anchors and nudges itself; pinned by
+/// `unread_wrappers_anchor_and_nudge` below.
+pub fn count_unread_in_current_room() -> usize {
+    crate::util::signal_guard::anchor();
+    let Some(current) = CURRENT_ROOM.read().owner_key else {
+        return 0;
+    };
+    let Ok(rooms) = ROOMS.try_read() else {
+        crate::util::signal_guard::schedule_nudge();
+        return 0;
+    };
+    count_unread_in_room(&rooms.map, &rooms.notification_modes, &current)
 }
 
 /// Count unread messages waiting *behind* the mobile rooms panel: rooms
@@ -646,7 +681,8 @@ pub fn count_unread_excluding_room(
 /// header, which show only with the chat. The current room is excluded by
 /// design: there its Latest button offers that room's unread messages, and
 /// while another mobile panel replaces the chat, the open room's row in the
-/// room list counts them (`room_list.rs`).
+/// room list (`room_list.rs`) or the members panel's back arrow
+/// ([`count_unread_in_current_room`]) counts them.
 pub fn count_unread_behind_rooms_panel() -> usize {
     // CURRENT_ROOM is read (infallibly) BEFORE the fallible ROOMS read:
     // `try_read() -> Err` registers no subscription (dioxus-signal-safety
@@ -663,7 +699,7 @@ pub fn count_unread_behind_rooms_panel() -> usize {
     // and nudge here anyway (freenet/river#559): CURRENT_ROOM already
     // degrades safely, but nudging lets a contended pass retry promptly
     // instead of waiting on an unrelated CURRENT_ROOM change. See
-    // `count_unread_behind_rooms_panel_anchors_and_nudges` below for the pin.
+    // `unread_wrappers_anchor_and_nudge` below for the pin.
     crate::util::signal_guard::anchor();
     let current = CURRENT_ROOM.read().owner_key;
     let Ok(rooms) = ROOMS.try_read() else {
@@ -1046,16 +1082,17 @@ mod tests {
         }
     }
 
-    /// freenet/river#559: `count_unread_behind_rooms_panel` is called as
-    /// `use_memo(count_unread_behind_rooms_panel)` in `conversation.rs`'s
-    /// `panel_unread` — the fallible `ROOMS.try_read()` lives in THIS
-    /// function, outside the `use_memo(...)` body text, so
-    /// `signal_guard`'s pin (which only scans inside `use_memo(...)`
-    /// parens) cannot see it. Pin it here instead: a contended pass that
-    /// drops the anchor/nudge would leave `panel_unread` degraded, only
-    /// re-evaluating on an unrelated `CURRENT_ROOM` change.
+    /// freenet/river#559: the unread wrappers are called as
+    /// `use_memo(count_unread_behind_rooms_panel)` (`conversation.rs`'s
+    /// `panel_unread`) and `use_memo(count_unread_in_current_room)`
+    /// (`back_to_chat.rs`) — the fallible `ROOMS.try_read()` lives in THESE
+    /// functions, outside the `use_memo(...)` body text, so `signal_guard`'s
+    /// pin (which only scans inside `use_memo(...)` parens) cannot see it.
+    /// Pin it here instead: a contended pass that drops the anchor/nudge would
+    /// leave the badge degraded, only re-evaluating on an unrelated
+    /// `CURRENT_ROOM` change.
     #[test]
-    fn count_unread_behind_rooms_panel_anchors_and_nudges() {
+    fn unread_wrappers_anchor_and_nudge() {
         let source = include_str!("document_title.rs");
         let prod = &source[..source
             .find("#[cfg(test)]\nmod tests {")
@@ -1067,42 +1104,42 @@ mod tests {
             .join("\n");
         let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
-        let marker = "pubfncount_unread_behind_rooms_panel()->usize{";
-        let start = squashed.find(marker).unwrap_or_else(|| {
-            panic!(
-                "count_unread_behind_rooms_panel's signature changed shape — \
-                 re-anchor this pin, do not delete it"
-            )
-        });
-        let body = &squashed[start..];
-        let end = body[marker.len()..]
-            .find("pubfn")
-            .map(|i| i + marker.len())
-            .unwrap_or(body.len());
-        let body = &body[..end];
+        for name in [
+            "count_unread_behind_rooms_panel",
+            "count_unread_in_current_room",
+        ] {
+            let marker = format!("pubfn{name}()->usize{{");
+            let start = squashed.find(&marker).unwrap_or_else(|| {
+                panic!("{name}'s signature changed shape — re-anchor this pin, do not delete it")
+            });
+            let body = &squashed[start..];
+            let end = body[marker.len()..]
+                .find("pubfn")
+                .map(|i| i + marker.len())
+                .unwrap_or(body.len());
+            let body = &body[..end];
 
-        let anchor = body.find("signal_guard::anchor()").unwrap_or_else(|| {
-            panic!(
-                "count_unread_behind_rooms_panel reads ROOMS with try_read() but \
-                 never calls signal_guard::anchor() before it. Called as \
-                 `use_memo(count_unread_behind_rooms_panel)` in conversation.rs, \
-                 a contended pass can leave that memo without the guard \
-                 (freenet/river#559)."
-            )
-        });
-        let first_try = body
-            .find("try_read(")
-            .expect("count_unread_behind_rooms_panel should still call ROOMS.try_read()");
-        assert!(
-            anchor < first_try,
-            "signal_guard::anchor() must be called BEFORE the first try_read() \
-             in count_unread_behind_rooms_panel"
-        );
-        assert!(
-            body.contains("signal_guard::schedule_nudge()"),
-            "count_unread_behind_rooms_panel must call schedule_nudge() on the \
-             ROOMS.try_read() Err branch (freenet/river#559)"
-        );
+            let anchor = body.find("signal_guard::anchor()").unwrap_or_else(|| {
+                panic!(
+                    "{name} reads ROOMS with try_read() but never calls \
+                     signal_guard::anchor() before it. Called as \
+                     `use_memo({name})`, a contended pass can leave that memo \
+                     without the guard (freenet/river#559)."
+                )
+            });
+            let first_try = body
+                .find("try_read(")
+                .unwrap_or_else(|| panic!("{name} should still call ROOMS.try_read()"));
+            assert!(
+                anchor < first_try,
+                "signal_guard::anchor() must be called BEFORE the first try_read() in {name}"
+            );
+            assert!(
+                body.contains("signal_guard::schedule_nudge()"),
+                "{name} must call schedule_nudge() on the ROOMS.try_read() Err branch \
+                 (freenet/river#559)"
+            );
+        }
     }
 
     use crate::constants::ROOM_CONTRACT_WASM;
@@ -2010,6 +2047,14 @@ mod tests {
         // Room A has no entry → defaults to All, like the notification gate.
         modes.insert(owner_b_vk, NotificationMode::MentionsAndReplies);
         modes.insert(owner_c_vk, NotificationMode::Muted);
+
+        // The per-room values: what the open room's row and the members
+        // panel's back arrow show. A key with no room counts nothing.
+        assert_eq!(count_unread_in_room(&map, &modes, &owner_a_vk), 2);
+        assert_eq!(count_unread_in_room(&map, &modes, &owner_b_vk), 1);
+        assert_eq!(count_unread_in_room(&map, &modes, &owner_c_vk), 0);
+        let (_, absent_vk) = keypair();
+        assert_eq!(count_unread_in_room(&map, &modes, &absent_vk), 0);
 
         // Title total (no exclusion): 2 (All) + 1 (mention) + 0 (muted).
         assert_eq!(count_unread_excluding_room(&map, &modes, None), 3);
