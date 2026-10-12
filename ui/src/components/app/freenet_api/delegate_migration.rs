@@ -5444,6 +5444,69 @@ mod tests {
         );
     }
 
+    /// #768 round 4, S-C: a short-index predecessor the sweep flagged stays
+    /// mid-import for good. Once its refusal is recorded (and its rooms
+    /// salvaged), it counts toward the silent cadence instead of forcing a walk
+    /// on every load; before SILENT_MIN_ATTEMPTS walks, or unrecorded, it walks.
+    #[test]
+    fn a_recorded_short_index_refusal_counts_toward_the_cadence() {
+        use super::super::migration_journal::{
+            walk_cadence, SILENT_MIN_ATTEMPTS, SILENT_WALK_EVERY_N_LOADS,
+        };
+        let (a, b) = (vk(1), vk(2));
+        let slot = |r, seed| cbor(&RoomSlot::Present(Box::new(room_with_identity(r, seed))));
+        let mut gen0 = DelegateSim::default();
+        gen0.store
+            .insert(chat_delegate::room_storage_key(&a), slot(a, 3));
+        gen0.store
+            .insert(chat_delegate::room_storage_key(&b), slot(b, 4));
+        gen0.store.insert(
+            ROOMS_META_KEY.to_vec(),
+            cbor(&RoomsMeta {
+                room_order: vec![b, a],
+                ..Default::default()
+            }),
+        );
+        gen0.listed = Some(vec![
+            chat_delegate::room_storage_key(&b),
+            ROOMS_META_KEY.to_vec(),
+        ]);
+        let channel = channel_with_gen0(gen0);
+        // The sweep flagged an import from gen 0 (its marker is data).
+        channel.put(
+            &successor_key(),
+            &pred_wip_marker_key(&pred_key(0)),
+            freenet_migrate::PRED_DONE_MARKER_VALUE_DATA,
+        );
+        let mut status = None;
+        for walk_no in 1..=SILENT_MIN_ATTEMPTS {
+            let (journaled, _) = walk_j(&channel, MemorySeam::new());
+            let st = journaled.status.expect("status");
+            assert!(st.interrupted_import(), "it stays mid-import");
+            let recorded: Vec<[u8; 32]> =
+                block_on(read_short_index_record(&channel, &successor_key()))
+                    .unwrap()
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect();
+            assert_eq!(recorded.len(), 1, "the refusal is recorded");
+            assert_eq!(walk_cadence(&st, &[]), None, "unrecorded: walk every load");
+            if walk_no < SILENT_MIN_ATTEMPTS {
+                assert_eq!(
+                    walk_cadence(&st, &recorded),
+                    None,
+                    "walk {walk_no}: not yet"
+                );
+            }
+            status = Some((st, recorded));
+        }
+        let (st, recorded) = status.unwrap();
+        assert_eq!(
+            walk_cadence(&st, &recorded),
+            Some(SILENT_WALK_EVERY_N_LOADS)
+        );
+    }
+
     /// #768 round 4, S1: the #776 ranked rule holds ACROSS page loads, in both
     /// orders. Each load starts a new session whose ranks come only from the
     /// persisted record (stored and read through the production functions),

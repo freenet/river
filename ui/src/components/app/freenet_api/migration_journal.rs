@@ -306,28 +306,42 @@ pub(crate) enum WalkDecision {
 /// [`SILENT_MIN_ATTEMPTS`] walks). All absent: [`WALK_EVERY_N_LOADS`]. Any
 /// silent: [`SILENT_WALK_EVERY_N_LOADS`]. Neither is a seal: the walk keeps
 /// running on the cadence and resolves whatever answers.
-pub(crate) fn walk_cadence(status: &JournalStatus) -> Option<u32> {
-    if status.is_complete() || status.interrupted_import() {
+///
+/// `short_refused` lists the predecessors refused for a short index whose
+/// provable rooms were recovered (`SHORT_INDEX_KEY`). Such a predecessor stays
+/// mid-import for good once the sweep flagged it, yet nothing a walk does can
+/// change its answer while its index is unchanged, so it counts toward the
+/// silent cadence like a refusal (#768 round 4, S-C). Any other mid-import
+/// predecessor walks on every load.
+pub(crate) fn walk_cadence(status: &JournalStatus, short_refused: &[[u8; 32]]) -> Option<u32> {
+    if status.is_complete() {
+        return None;
+    }
+    let JournalStatus::Incomplete { pending, .. } = status else {
+        return None;
+    };
+    let started =
+        |p: &freenet_migrate::PendingPredecessor| p.import == freenet_migrate::ImportFlag::Started;
+    let refused = |p: &freenet_migrate::PendingPredecessor| {
+        short_refused.iter().any(|k| k[..] == p.key.bytes()[..])
+    };
+    if pending.iter().any(|p| started(p) && !refused(p)) {
         return None;
     }
     if status.pending_all_absent(CADENCE_ABSENT_STREAK) {
         return Some(WALK_EVERY_N_LOADS);
     }
-    let JournalStatus::Incomplete { pending, .. } = status else {
-        return None;
-    };
     let settled = !pending.is_empty()
-        && pending.iter().all(|p| {
-            p.import != freenet_migrate::ImportFlag::Started
-                && (p.absent_streak >= CADENCE_ABSENT_STREAK || p.attempts >= SILENT_MIN_ATTEMPTS)
-        });
+        && pending
+            .iter()
+            .all(|p| p.absent_streak >= CADENCE_ABSENT_STREAK || p.attempts >= SILENT_MIN_ATTEMPTS);
     settled.then_some(SILENT_WALK_EVERY_N_LOADS)
 }
 
 /// Whether the cadence counter must be read to decide the walk: only for a
 /// status the rate limit can apply to (see [`walk_decision`]).
-pub(crate) fn needs_cadence_counter(status: &JournalStatus) -> bool {
-    walk_cadence(status).is_some()
+pub(crate) fn needs_cadence_counter(status: &JournalStatus, short_refused: &[[u8; 32]]) -> bool {
+    walk_cadence(status, short_refused).is_some()
 }
 
 /// Whether a sweep write the journal allowed raises the "flagged since the
@@ -347,11 +361,15 @@ pub(crate) fn sweep_write_raises_flag(write: SweepWrite) -> bool {
 /// when the counter could not be read, which runs the walk). An interrupted
 /// import, or a predecessor that is neither consistently absent nor
 /// persistently silent yet, always walks.
-pub(crate) fn walk_decision(status: &JournalStatus, skips: Option<u32>) -> WalkDecision {
+pub(crate) fn walk_decision(
+    status: &JournalStatus,
+    short_refused: &[[u8; 32]],
+    skips: Option<u32>,
+) -> WalkDecision {
     if status.is_complete() {
         return WalkDecision::NotNeeded;
     }
-    let Some(every) = walk_cadence(status) else {
+    let Some(every) = walk_cadence(status, short_refused) else {
         return WalkDecision::Run;
     };
     match skips {
@@ -494,12 +512,22 @@ pub(crate) fn start_journal_load() {
             let _ops = JOURNAL_OPS.lock().await;
             let channel = NodeDelegateChannel;
             let successor = chat_delegate::current_delegate_key();
-            let skips = if needs_cadence_counter(&status) {
+            // The predecessors refused for a short index (S-C). Unreadable:
+            // none, which only walks more often.
+            let short_refused: Vec<[u8; 32]> = if status.is_complete() {
+                Vec::new()
+            } else {
+                super::delegate_migration::read_short_index_record(&channel, &successor)
+                    .await
+                    .map(|r| r.into_iter().map(|(k, _)| k).collect())
+                    .unwrap_or_default()
+            };
+            let skips = if needs_cadence_counter(&status, &short_refused) {
                 read_walk_cadence(&channel, &successor).await.ok()
             } else {
                 None
             };
-            let decision = walk_decision(&status, skips);
+            let decision = walk_decision(&status, &short_refused, skips);
             match decision {
                 WalkDecision::Skip { skips } => {
                     match store_walk_cadence(&channel, &successor, skips).await {
@@ -1109,13 +1137,16 @@ mod tests {
     #[test]
     fn walk_decision_runs_unless_complete_or_rate_limited() {
         assert_eq!(
-            walk_decision(&JournalStatus::Complete { rejected_items: 0 }, None),
+            walk_decision(&JournalStatus::Complete { rejected_items: 0 }, &[], None),
             WalkDecision::NotNeeded
         );
         // Nothing typed-absent yet: always walk, never read the counter.
-        assert_eq!(walk_decision(&fresh_status(), Some(3)), WalkDecision::Run);
         assert_eq!(
-            walk_decision(&interrupted_status(), Some(3)),
+            walk_decision(&fresh_status(), &[], Some(3)),
+            WalkDecision::Run
+        );
+        assert_eq!(
+            walk_decision(&interrupted_status(), &[], Some(3)),
             WalkDecision::Run,
             "an interrupted import always walks"
         );
@@ -1128,11 +1159,11 @@ mod tests {
     fn walk_decision_cadence_counts_to_n_then_walks() {
         let status = all_absent_status();
         assert!(status.pending_all_absent(CADENCE_ABSENT_STREAK));
-        assert_eq!(walk_decision(&status, None), WalkDecision::Run);
+        assert_eq!(walk_decision(&status, &[], None), WalkDecision::Run);
         let mut skips = 0;
         let mut walked_at = None;
         for load in 1..=WALK_EVERY_N_LOADS {
-            match walk_decision(&status, Some(skips)) {
+            match walk_decision(&status, &[], Some(skips)) {
                 WalkDecision::Skip { skips: n } => {
                     assert_eq!(n, skips + 1);
                     skips = n;
@@ -1164,35 +1195,38 @@ mod tests {
         use super::super::delegate_migration::tests_support::silent_status;
         let early = silent_status(SILENT_MIN_ATTEMPTS - 1);
         assert_eq!(
-            walk_cadence(&early),
+            walk_cadence(&early, &[]),
             None,
             "not before SILENT_MIN_ATTEMPTS walks"
         );
-        assert_eq!(walk_decision(&early, Some(0)), WalkDecision::Run);
+        assert_eq!(walk_decision(&early, &[], Some(0)), WalkDecision::Run);
         let settled = silent_status(SILENT_MIN_ATTEMPTS);
-        assert_eq!(walk_cadence(&settled), Some(SILENT_WALK_EVERY_N_LOADS));
-        assert!(needs_cadence_counter(&settled));
+        assert_eq!(walk_cadence(&settled, &[]), Some(SILENT_WALK_EVERY_N_LOADS));
+        assert!(needs_cadence_counter(&settled, &[]));
         assert_eq!(
-            walk_decision(&settled, Some(0)),
+            walk_decision(&settled, &[], Some(0)),
             WalkDecision::Skip { skips: 1 }
         );
         assert_eq!(
-            walk_decision(&settled, Some(SILENT_WALK_EVERY_N_LOADS - 1)),
+            walk_decision(&settled, &[], Some(SILENT_WALK_EVERY_N_LOADS - 1)),
             WalkDecision::RunResetCadence
         );
         assert_eq!(
-            walk_decision(&settled, None),
+            walk_decision(&settled, &[], None),
             WalkDecision::Run,
             "an unreadable counter walks"
         );
         assert!(SILENT_WALK_EVERY_N_LOADS < WALK_EVERY_N_LOADS);
-        assert_eq!(walk_cadence(&all_absent_status()), Some(WALK_EVERY_N_LOADS));
         assert_eq!(
-            walk_cadence(&interrupted_status()),
+            walk_cadence(&all_absent_status(), &[]),
+            Some(WALK_EVERY_N_LOADS)
+        );
+        assert_eq!(
+            walk_cadence(&interrupted_status(), &[]),
             None,
             "an interrupted import always walks"
         );
-        assert_eq!(walk_cadence(&fresh_status()), None);
+        assert_eq!(walk_cadence(&fresh_status(), &[]), None);
     }
 
     /// freenet/river#761 at the wiring (#768 round 3 CF1): only a Run or
@@ -1263,7 +1297,7 @@ mod tests {
         let poke = body.find("poke_walk();").expect("poke_walk");
         assert!(walk_if < poke && body.matches("poke_walk();").count() == 1);
         assert!(
-            !body.contains("store_walk_cadence(&channel, &successor, 0)"),
+            !body.contains("store_walk_cadence(&channel, &successor, 0, &[])"),
             "the cadence reset must not be written before the walk runs"
         );
         let run = src
@@ -1391,15 +1425,16 @@ mod tests {
     /// The counter is read only for a status the rate limit can apply to.
     #[test]
     fn the_cadence_counter_is_read_only_when_it_can_apply() {
-        assert!(needs_cadence_counter(&all_absent_status()));
-        assert!(!needs_cadence_counter(&JournalStatus::Complete {
-            rejected_items: 0
-        }));
+        assert!(needs_cadence_counter(&all_absent_status(), &[]));
+        assert!(!needs_cadence_counter(
+            &JournalStatus::Complete { rejected_items: 0 },
+            &[]
+        ));
         assert!(
-            !needs_cadence_counter(&fresh_status()),
+            !needs_cadence_counter(&fresh_status(), &[]),
             "nothing typed-absent yet"
         );
-        assert!(!needs_cadence_counter(&interrupted_status()));
+        assert!(!needs_cadence_counter(&interrupted_status(), &[]));
     }
 
     // ---------------- the walk driver, against a scripted environment ----------------
