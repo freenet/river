@@ -36,12 +36,23 @@ mobile panel revealing the chat never scrolls: messages that arrived in the
 meantime stay below, Latest appears, and they stay unread until the reader
 reaches them.
 
-While another mobile panel (Rooms or Members) replaces the chat, Latest is
-hidden with it, so the open room's row in the room list shows its unread
-count, under its notification mode, as every other row does (`room_list.rs`,
-while `MOBILE_VIEW` is not `Chat`; `md:hidden`, since on desktop the chat
-always shows). While the chat shows, that row has no badge, and the
-hamburger, which shows only with the chat, always leaves the open room out.
+While another mobile panel replaces the chat, Latest is hidden with it, so
+the open room's unread count, under its notification mode, shows in one place
+per panel. Neither marks anything read, and both use the same per-room count
+(`count_unread_in_room`), so Muted shows nothing and Mentions & replies counts
+only arrivals that mention or reply to the reader.
+
+- **Rooms:** the open room's row in the room list shows its count as every
+  other row does (`room_list.rs`, while `MOBILE_VIEW` is not `Chat`;
+  `md:hidden`, since on desktop the chat always shows). That panel's back
+  arrow has no badge.
+- **Members:** the room list is hidden too, so the panel's back arrow shows
+  the count (`members-current-room-unread-badge`, opted into through
+  `BackToChatButton`'s `current_room_badge`) and its accessible label reads
+  "Back to chat, N unread".
+
+While the chat shows, the open room's row has no badge, and the hamburger,
+which shows only with the chat, always leaves the open room out.
 
 The check is **stateless and measured before the patch.** It reads the DOM in
 the render that brings the arrival, while the DOM still shows the previous
@@ -65,20 +76,25 @@ inserted above it, and a join folding into the trailing event summary (which
 raises the key) are told apart by it. The 60s clock-skew clamp only affects
 grouping and the timestamp shown.
 
-Accepted trade-offs:
+Current behavior, by design:
 
 - A reader dragging within the band when an arrival lands is taken to the
-  end. The pre-#753 code fought this with `reader_moved_up_since`, the latch
-  behind #508.
+  end. There is no gesture guard: remembering that the reader had moved up
+  (`reader_moved_up_since`) is the latch that caused #508.
 - The history follows, and is read, under every dialog and popover except a
   DM thread over the room: member info, room settings, invite and ban
   dialogs, the message action menu and the reaction picker. The reader is at
   the end anyway when the dialog closes, but those arrivals count as read
   without having been on screen unobstructed.
+
+Known limitations:
+
 - A same-millisecond (room) or same-second (DM) arrival whose id or token
-  sorts lower than the previous newest is not followed.
+  sorts lower than the previous newest is not followed
+  ([#764](https://github.com/freenet/river/issues/764)).
 - A room message stamped far ahead stays the last row until real time passes
-  it, and messages posted meanwhile land above it and are not followed.
+  it, and messages posted meanwhile land above it and are not followed
+  ([#70](https://github.com/freenet/river/issues/70), appending inbound messages regardless of timestamp).
 
 ## Room history
 
@@ -99,14 +115,18 @@ Accepted trade-offs:
   height keep it. A scroll the reader makes upward, raising both the view's
   top and bottom edges and ending more than 4px from the scroller's absolute
   end, releases it, as do hiding the panel, changing rooms and an empty range.
-  A clamp from the chat area growing (the composer collapsing, the keyboard
-  closing) raises only the top edge and keeps it, even when a row grows in
-  the same frame. Accepted for
-  now: padding below the newest message lets a small upward scroll release
-  the hold while the message is still visible and Latest stays hidden.
-  Known limitation: a reader who scrolls up in the same frame the chat area
-  grows by at least as much keeps the hold for that frame and is taken back
-  to the end once; their next scroll releases it.
+  That distance is measured from where the hold last placed the view or a
+  clamp last left it, not from the previous scroll event, so a reader leaving
+  in steps of a pixel or two releases it as one larger scroll would
+  (`end_hold_after_scroll`). A clamp from the chat area growing (the composer
+  collapsing, the keyboard closing) raises only the top edge and keeps it,
+  even when a row grows in the same frame; the next scroll is measured from
+  where it left the view. Known limitations: padding below the newest message
+  lets a small upward scroll release the hold while the message is still
+  visible and Latest stays hidden ([#765](https://github.com/freenet/river/issues/765)); a reader who scrolls up in
+  the same frame the chat area grows by at least as much keeps the hold for
+  that frame and is taken back to the end once, and their next scroll
+  releases it ([#766](https://github.com/freenet/river/issues/766)).
 - Outside that hold, a size change gets no correction: when the composer
   grows or the phone keyboard opens, the browser keeps the view's top edge,
   so the bottom of the view is covered. Paging and panel reveals retain their
@@ -126,10 +146,10 @@ Accepted trade-offs:
   through a partial range does not advance it. Every mark-read path is
   bounded by the message published in `NEWEST_SEEN`.
 
-Browser scroll anchoring remains disabled on the room scroller. Custom
-position corrections remain in place; the two known
-[#507](https://github.com/freenet/river/issues/507) cases for late images and
-bulk removal above a parked reader remain follow-up work.
+Browser scroll anchoring is disabled on the room scroller, and a browser test
+asserts the computed `overflow-anchor: none`. Custom position corrections
+remain in place. Known limitation: late images and bulk removal above a parked
+reader are not corrected ([#507](https://github.com/freenet/river/issues/507)).
 
 ## DM threads
 
@@ -158,6 +178,9 @@ observer, which is disconnected with the thread. A read the witness already
 granted may still commit after a close.
 
 This shared policy does not imply identical position correction machinery.
-DM threads do not currently have the room history's end hold, so a composer
-or keyboard resize gets no correction there at all. Their timestamp cutoff and its
-limitations are described in [direct-messages.md](direct-messages.md).
+Known limitations: DM threads do not have the room history's end hold, so a
+composer or keyboard resize gets no correction there at all
+([#767](https://github.com/freenet/river/issues/767)); and the read cutoff is a whole second, so DMs from one peer
+in the same second are read together, even if one arrived later or is still
+below the fold ([#764](https://github.com/freenet/river/issues/764)). The thread's read rule is described in
+[direct-messages.md](direct-messages.md).

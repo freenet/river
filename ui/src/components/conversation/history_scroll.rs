@@ -895,10 +895,10 @@ pub(super) fn install_scroll_settle_listener(
     // scroller's absolute end (`hold_released`). Measured from the view the
     // hold was last placed at or a clamp last left, not from the previous
     // event, so small scroll events add up (`end_hold_after_scroll`): no
-    // gesture tracking, and nothing outlives the hold. Accepted for now: the
+    // gesture tracking, and nothing outlives the hold. Known limitation: the
     // padding below the newest message lets this release while that message
-    // is visible and Latest stays hidden. Returns at once unless a hold is
-    // on, keeping the scroll path light (#151).
+    // is visible and Latest stays hidden (#765). Returns at once unless a
+    // hold is on, keeping the scroll path light (#151).
     let release_hold = Closure::wrap(Box::new(move |_: web_sys::Event| {
         let Some(held) = reader.end_hold.get() else {
             return;

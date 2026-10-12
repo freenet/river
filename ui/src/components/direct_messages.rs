@@ -39,8 +39,8 @@ pub static OPEN_DM_THREAD: GlobalSignal<Option<(VerifyingKey, MemberId)>> = Glob
 /// user has actually viewed in [`DmThreadModal`]. Anything in
 /// `room.direct_messages.messages` addressed to the local user with
 /// `timestamp > last_seen` counts as unread.
-/// Accepted limitation: DMs from the same peer in the same Unix second
-/// are read together, even if one arrives later or remains below the fold.
+/// Known limitation: DMs from the same peer in the same Unix second are
+/// read together, even if one arrives later or remains below the fold (#764).
 pub static DM_LAST_SEEN: GlobalSignal<HashMap<(VerifyingKey, MemberId), u64>> =
     Global::new(HashMap::new);
 
