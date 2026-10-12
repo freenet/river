@@ -2442,18 +2442,37 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
     // ALSO re-renders when #345 recovery hydrates a room (recovery leaves
     // `ROOMS_LOAD_STATE == Loaded` throughout). `saw_fetch_failure()` and
     // `rooms_recovery_in_progress()` are read alongside (non-signal sources).
-    let _ = ROOMS.try_read(); // subscribe: re-render when recovery hydrates rooms
-    let saw_fetch_failure = crate::components::app::chat_delegate::saw_fetch_failure();
-    let rooms_hydrated = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
+    // Anchor FIRST, before any fallible read (dioxus-signal-safety.md,
+    // freenet/river#555): a contended `try_read` that returns `Err` registers
+    // no subscription, so without the anchor and a nudge this modal could stop
+    // re-rendering for good and keep Import disabled (#768 review A7).
+    crate::util::signal_guard::anchor();
+    if ROOMS.try_read().is_err() {
+        // subscribe: re-render when recovery hydrates rooms
+        crate::util::signal_guard::schedule_nudge();
+    }
+    // ...and when the migration journal's answer changes (freenet/river#763):
+    // its gate is not a signal, so this version counter is.
+    if crate::components::app::freenet_api::migration_journal::JOURNAL_GATE_VERSION
         .try_read()
-        .map(|g| {
-            rooms_load_is_authoritative(
-                *g,
-                saw_fetch_failure,
-                crate::components::app::chat_delegate::rooms_recovery_in_progress(),
-            )
-        })
-        .unwrap_or(false);
+        .is_err()
+    {
+        crate::util::signal_guard::schedule_nudge();
+    }
+    let journal_gate =
+        crate::components::app::freenet_api::migration_journal::current_import_gate();
+    let saw_fetch_failure = crate::components::app::chat_delegate::saw_fetch_failure();
+    let rooms_hydrated = match crate::components::app::chat_delegate::ROOMS_LOAD_STATE.try_read() {
+        Ok(g) => rooms_load_is_authoritative(
+            *g,
+            saw_fetch_failure,
+            crate::components::app::chat_delegate::rooms_recovery_in_progress(),
+        ),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            false
+        }
+    };
 
     // Reset-and-close, matching the deferred pattern in `join_with_code_modal`
     // and `.claude/rules/dioxus-signal-safety.md`: signal mutations from event
@@ -2667,6 +2686,56 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                                         crate::components::app::chat_delegate::retry_rooms_load();
                                     },
                                     "Retry loading rooms"
+                                }
+                            }
+                        } else if journal_gate
+                            == crate::components::app::freenet_api::migration_journal::ImportGate::Blocked
+                        {
+                            // The migration journal cannot confirm every room
+                            // moved over from an earlier River version (an
+                            // interrupted move, items it could not read, or the
+                            // record itself unreadable), and that can last if an
+                            // old copy is unreachable on this node. The user may
+                            // go ahead knowingly; this ignores the journal's
+                            // answer for this session and resolves nothing
+                            // (freenet/river#763; a real way to give up on an
+                            // entry is freenet-migrate#39).
+                            div {
+                                "data-testid": "import-identity-migration-incomplete",
+                                class: "mt-3 text-sm text-amber-400",
+                                "Some rooms from an earlier version of River may not have finished moving over. Importing now could overwrite one of them. River keeps trying on each load; import anyway only if you know the room is not one of them."
+                            }
+                            div { class: "flex justify-end mt-2",
+                                button {
+                                    "data-testid": "import-identity-override-migration",
+                                    class: "px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-xs rounded-lg transition-colors border border-border",
+                                    onclick: move |_| {
+                                        crate::components::app::freenet_api::migration_journal::override_import_gate();
+                                    },
+                                    "Import anyway"
+                                }
+                            }
+                        } else if journal_gate
+                            == crate::components::app::freenet_api::migration_journal::ImportGate::Unresolved
+                        {
+                            // An earlier River version's data on this node has
+                            // not answered yet: an identity imported now would
+                            // win over the one it brings later. It may never
+                            // answer (a version this node cannot run), so the
+                            // user may go ahead knowingly (#768).
+                            div {
+                                "data-testid": "import-identity-migration-unresolved",
+                                class: "mt-3 text-sm text-amber-400",
+                                "Rooms from an earlier version of River on this node haven't answered yet. Importing now could replace the identity one of them brings back. River keeps checking on each load; import anyway only if you know the room is not one of them."
+                            }
+                            div { class: "flex justify-end mt-2",
+                                button {
+                                    "data-testid": "import-identity-override-unresolved",
+                                    class: "px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-xs rounded-lg transition-colors border border-border",
+                                    onclick: move |_| {
+                                        crate::components::app::freenet_api::migration_journal::override_import_gate();
+                                    },
+                                    "Import anyway"
                                 }
                             }
                         } else {
@@ -7314,6 +7383,28 @@ mod tests {
             modal.contains("\"data-testid\": \"member-info-impersonation-explanation\""),
             "the member-info modal no longer renders the warning's explanation \
              element"
+        );
+    }
+
+    /// #768 review A7: the import modal's fallible signal reads follow
+    /// dioxus-signal-safety.md: the anchor first, a nudge on every degraded
+    /// branch (ROOMS, the journal-gate version, the load state). Otherwise a
+    /// contended read leaves the modal unsubscribed and Import disabled.
+    #[test]
+    fn the_import_modal_anchors_and_nudges_its_fallible_reads() {
+        let src: String = crate::util::strip_comments(include_str!("members.rs"))
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let anchor = src
+            .find("crate::util::signal_guard::anchor();ifROOMS.try_read().is_err(){")
+            .expect("anchor before the ROOMS read");
+        let body = &src[anchor..anchor + 1200];
+        assert!(body.contains("JOURNAL_GATE_VERSION.try_read().is_err(){crate::util::signal_guard::schedule_nudge();}"));
+        assert!(body.contains("Err(_)=>{crate::util::signal_guard::schedule_nudge();false}"));
+        assert!(
+            body.matches("schedule_nudge();").count() >= 3,
+            "every fallible read nudges"
         );
     }
 }

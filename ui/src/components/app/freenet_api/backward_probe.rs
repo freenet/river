@@ -124,8 +124,8 @@ use crate::util::{owner_vk_to_legacy_contract_keys, safe_spawn_local, sleep, try
 use dioxus::logger::tracing::{info, warn};
 use ed25519_dalek::VerifyingKey;
 use freenet_migrate::{
-    FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeStateOps, SelectionPolicy, Step,
-    DEFAULT_MAX_PROBE_HOPS,
+    FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeStateOps, RollbackRiskAck, SelectionPolicy,
+    Step, DEFAULT_MAX_PROBE_HOPS,
 };
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
@@ -311,6 +311,73 @@ struct ProbeEntry {
     walk: u64,
 }
 
+/// Build a backward-probe driver, in ONE place, so production and every test
+/// run the same configuration (riverctl does the same:
+/// `cli/src/api.rs::new_probe_driver`).
+///
+/// `continue_past_unknown` (freenet-migrate 0.6) on `NewestFirstWins`: a typed
+/// `NotFound` reaches the driver as `on_absent` ([`take_probe_absent`]), but a
+/// GET that times out is `on_unknown`, and 0.6 made `NewestFirstWins` STOP at
+/// the first unknown. A room lives on ONE of the registry's generations, so
+/// stopping at the first silent one would end the probe before it reached the
+/// generation holding the room. The rollback the ack names is the one the 0.5
+/// driver already accepted (it walked on past every timeout);
+/// `NewestFirstWins` still stops at the first generation with real state.
+/// `FoldAll` continues past an unknown anyway.
+fn new_probe_driver(
+    ops: RiverProbeOps,
+    local: ChatRoomStateV1,
+    candidates_newest_first: Vec<ContractInstanceId>,
+    policy: SelectionPolicy,
+) -> ProbeDriver<RiverProbeOps> {
+    let walk_past_silence = matches!(policy, SelectionPolicy::NewestFirstWins);
+    let driver = ProbeDriver::new(
+        ops,
+        local,
+        NewestFirst::assume_ordered(candidates_newest_first),
+        policy,
+    );
+    if walk_past_silence {
+        driver.continue_past_unknown(
+            RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+        )
+    } else {
+        driver
+    }
+}
+
+/// What a finished #292 recovery probe does with its [`Outcome`].
+#[derive(Debug)]
+enum ProbeFinish {
+    /// A legacy generation had real state: adopt `merged` and PUT it forward.
+    Adopt(ChatRoomStateV1, ContractInstanceId),
+    /// Nothing was recovered: seed the current key with the local snapshot.
+    SeedLocal(ChatRoomStateV1),
+    /// An outcome this build has not reasoned about, or one already taken: do
+    /// nothing (the next load probes again).
+    Nothing,
+}
+
+/// Map a finished recovery probe's [`Outcome`] to what River does with it.
+/// Pure, so the 0.6 `Indeterminate` arm is unit-testable.
+///
+/// `Indeterminate` (freenet-migrate 0.6) is "at least one candidate never
+/// answered" and nothing real was found. The 0.5 driver ended the same answers
+/// in `SeedLocal`, so it seeds the local snapshot just the same. Not a seal:
+/// the seed is an idempotent PUT of the device's own snapshot, and a later
+/// probe that finds real state still adopts it.
+fn probe_finish(outcome: Option<Outcome<ChatRoomStateV1>>) -> ProbeFinish {
+    match outcome {
+        Some(Outcome::Recovered { merged, source, .. }) => ProbeFinish::Adopt(merged, source),
+        Some(Outcome::SeedLocal { local })
+        | Some(Outcome::NoLegacy { local })
+        | Some(Outcome::Indeterminate { local, .. }) => ProbeFinish::SeedLocal(local),
+        // `Outcome` is `#[non_exhaustive]`: an arm this build has not reasoned
+        // about must not adopt or seed anything.
+        Some(_) | None => ProbeFinish::Nothing,
+    }
+}
+
 impl ProbeEntry {
     fn new(
         owner_vk: VerifyingKey,
@@ -335,7 +402,7 @@ impl ProbeEntry {
             ),
         };
         // Candidates are newest-first by construction (see the callers).
-        let driver = ProbeDriver::new(ops, local, NewestFirst::assume_ordered(candidates), policy);
+        let driver = new_probe_driver(ops, local, candidates, policy);
         Self {
             driver,
             hits: Vec::new(),
@@ -531,7 +598,13 @@ pub(crate) fn plan_rekey_finish(
     let recovered = match outcome {
         Outcome::Recovered { merged, .. } => Some(merged),
         // No generation had real state, so no owed one did either.
-        Outcome::SeedLocal { .. } | Outcome::NoLegacy { .. } => None,
+        // `Indeterminate` (freenet-migrate 0.6) is the same with some
+        // generation silent; `Outcome` is `#[non_exhaustive]`, and an arm this
+        // build has not reasoned about recovers and satisfies nothing.
+        Outcome::SeedLocal { .. } | Outcome::NoLegacy { .. } | Outcome::Indeterminate { .. } => {
+            None
+        }
+        _ => None,
     };
     let satisfied: Vec<ContractInstanceId> = if recovered.is_none() || fold_failed {
         Vec::new()
@@ -796,8 +869,9 @@ fn take_probe_absent(id: ContractInstanceId) -> ProbeReply {
     };
     info!("Legacy contract {id} answered NotFound — advancing to older generation");
     if let Some(entry) = drivers().get_mut(&owner_vk) {
-        // The 0.5 driver's only "miss" event.
-        entry.driver.on_timeout(id);
+        // A typed answer from the node: `on_absent` (freenet-migrate 0.6). It
+        // advances the walk and is recorded as no state, never as a hit.
+        entry.driver.on_absent(id);
     }
     ProbeReply::Advance(owner_vk)
 }
@@ -898,8 +972,8 @@ async fn pump_probe(owner_vk: VerifyingKey) {
                 }
                 return;
             }
-            match outcome {
-                Some(Outcome::Recovered { merged, source, .. }) => {
+            match probe_finish(outcome) {
+                ProbeFinish::Adopt(merged, source) => {
                     info!(
                         "Backward probe for room {:?} recovered real state from legacy contract \
                          {} — adopting and PUTting forward onto the current key",
@@ -908,12 +982,13 @@ async fn pump_probe(owner_vk: VerifyingKey) {
                     );
                     adopt_recovered_probe_state(owner_vk, merged).await;
                 }
-                // Exhaustion (SeedLocal) and the no-legacy edge (NoLegacy, which
-                // `start_backward_probe` guards against but the driver can still
-                // produce) both PUT the device's local snapshot forward as the
-                // genuine last resort — the only path on which local state is
-                // seeded onto the network (the core design principle of #292).
-                Some(Outcome::SeedLocal { local }) | Some(Outcome::NoLegacy { local })
+                // Exhaustion (SeedLocal, or Indeterminate: see `probe_finish`)
+                // and the no-legacy edge (NoLegacy, which `start_backward_probe`
+                // guards against but the driver can still produce) all PUT the
+                // device's local snapshot forward as the genuine last resort —
+                // the only path on which local state is seeded onto the network
+                // (the core design principle of #292).
+                ProbeFinish::SeedLocal(local)
                     if local.configuration.verify_signature(&owner_vk).is_err() =>
                 {
                     // A placeholder (an imported room not yet synced) has no
@@ -926,7 +1001,7 @@ async fn pump_probe(owner_vk: VerifyingKey) {
                         MemberId::from(owner_vk)
                     );
                 }
-                Some(Outcome::SeedLocal { local }) | Some(Outcome::NoLegacy { local }) => {
+                ProbeFinish::SeedLocal(local) => {
                     info!(
                         "Backward probe for room {:?} exhausted — seeding current contract key \
                          with the local snapshot (last resort)",
@@ -934,8 +1009,9 @@ async fn pump_probe(owner_vk: VerifyingKey) {
                     );
                     seed_current_key_with_local(owner_vk, local).await;
                 }
-                None => {
-                    // Outcome already taken (a duplicate pump) — nothing to do.
+                ProbeFinish::Nothing => {
+                    // Outcome already taken (a duplicate pump), or a variant
+                    // this build does not know — nothing to do.
                 }
             }
         }
@@ -1070,7 +1146,9 @@ fn take_probe_timeout(id: ContractInstanceId, owner_vk: VerifyingKey, token: u64
         *orphaned_fires().entry(id).or_insert(0) += 1;
     }
     if let Some(entry) = drivers().get_mut(&owner_vk) {
-        entry.driver.on_timeout(id);
+        // `on_unknown`, never `on_absent`: a timeout is silence, not an
+        // answered NotFound (freenet-migrate#19).
+        entry.driver.on_unknown(id);
     }
     true
 }
@@ -1283,10 +1361,10 @@ mod tests {
     #[test]
     fn driver_adopts_newest_real_generation_with_river_ops() {
         let (sk, vk) = owner(4);
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverProbeOps::new(vk),
             ChatRoomStateV1::default(),
-            NewestFirst::assume_ordered(vec![id(9), id(5)]),
+            vec![id(9), id(5)],
             SelectionPolicy::NewestFirstWins,
         );
         let Step::Get(newest) = driver.next_action() else {
@@ -1308,27 +1386,34 @@ mod tests {
 
     /// End-to-end: every generation misses (a timeout then an empty state), so
     /// the driver seeds the device's local snapshot forward — the
-    /// no-silent-data-loss guarantee on exhaustion.
+    /// no-silent-data-loss guarantee on exhaustion. Under freenet-migrate 0.6
+    /// the timeout makes the outcome `Indeterminate`, which River maps to the
+    /// same seed (`probe_finish`).
     #[test]
     fn driver_exhausts_to_seed_local_with_river_ops() {
         let (sk, vk) = owner(5);
         let local = signed_state(&sk);
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverProbeOps::new(vk),
             local,
-            NewestFirst::assume_ordered(vec![id(2), id(1)]),
+            vec![id(2), id(1)],
             SelectionPolicy::NewestFirstWins,
         );
         let Step::Get(a) = driver.next_action() else {
             panic!()
         };
-        driver.on_timeout(a); // absent generation (watchdog)
+        driver.on_unknown(a); // silent generation (watchdog)
         let Step::Get(b) = driver.next_action() else {
-            panic!()
+            panic!("an unknown newest generation must not halt the walk (continue_past_unknown)")
         };
         driver.on_response(b, &encode(&ChatRoomStateV1::default())); // empty → miss
         assert_eq!(driver.next_action(), Step::Done);
-        let Some(Outcome::SeedLocal { local: seeded }) = driver.take_outcome() else {
+        let outcome = driver.take_outcome();
+        assert!(
+            matches!(outcome, Some(Outcome::Indeterminate { .. })),
+            "a timed-out candidate leaves the outcome indeterminate, never SeedLocal"
+        );
+        let ProbeFinish::SeedLocal(seeded) = probe_finish(outcome) else {
             panic!("exhaustion must seed the local snapshot");
         };
         assert!(
@@ -1345,16 +1430,16 @@ mod tests {
     #[test]
     fn driver_ignores_late_response_after_timeout_with_river_ops() {
         let (sk, vk) = owner(6);
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverProbeOps::new(vk),
             ChatRoomStateV1::default(),
-            NewestFirst::assume_ordered(vec![id(2), id(1)]),
+            vec![id(2), id(1)],
             SelectionPolicy::NewestFirstWins,
         );
         let Step::Get(a) = driver.next_action() else {
             panic!()
         };
-        driver.on_timeout(a);
+        driver.on_unknown(a);
         let Step::Get(b) = driver.next_action() else {
             panic!()
         };
@@ -1368,7 +1453,7 @@ mod tests {
         driver.on_response(b, &encode(&ChatRoomStateV1::default()));
         assert_eq!(driver.next_action(), Step::Done);
         assert!(
-            matches!(driver.take_outcome(), Some(Outcome::SeedLocal { .. })),
+            matches!(driver.take_outcome(), Some(Outcome::Indeterminate { .. })),
             "the late hit must not have been adopted"
         );
     }
@@ -1430,12 +1515,12 @@ mod tests {
         drivers().insert(vk, probe2);
 
         // --- W1 fires LATE. Run the watchdog's EXACT gate: it advances
-        // (on_timeout + pump) ONLY if `claim_route_if_current` returns true. ---
+        // (on_unknown + pump) ONLY if `claim_route_if_current` returns true. ---
         let w1_claimed = claim_route_if_current(newest, vk, t1);
         if w1_claimed {
             // The buggy path this guards: this would advance probe 2 past its
             // newest candidate onto `older` — a silent rollback.
-            drivers().get_mut(&vk).unwrap().driver.on_timeout(newest);
+            drivers().get_mut(&vk).unwrap().driver.on_unknown(newest);
         }
 
         assert!(
@@ -2330,5 +2415,67 @@ mod tests {
             ),
             "the re-key finish must be planned from this walk's entry and applied"
         );
+    }
+    /// freenet-migrate 0.6: an unknown newest generation does NOT halt River's
+    /// recovery probe (`continue_past_unknown`), and the walk still stops at
+    /// the first generation with real state.
+    #[test]
+    fn an_unknown_newest_generation_is_walked_past_to_real_state() {
+        let (sk, vk) = owner(8);
+        let mut driver = new_probe_driver(
+            RiverProbeOps::new(vk),
+            ChatRoomStateV1::default(),
+            vec![id(30), id(29), id(28)],
+            SelectionPolicy::NewestFirstWins,
+        );
+        let Step::Get(a) = driver.next_action() else {
+            panic!()
+        };
+        driver.on_unknown(a);
+        let Step::Get(b) = driver.next_action() else {
+            panic!("the probe must walk past an unknown generation")
+        };
+        assert_eq!(b, id(29));
+        driver.on_response(b, &encode(&signed_state(&sk)));
+        assert_eq!(
+            driver.next_action(),
+            Step::Done,
+            "the first generation with real state ends the walk; older ones are never read"
+        );
+        let ProbeFinish::Adopt(merged, source) = probe_finish(driver.take_outcome()) else {
+            panic!("real state must be adopted");
+        };
+        assert_eq!(source, id(29));
+        assert!(merged.configuration.verify_signature(&vk).is_ok());
+    }
+
+    /// A typed `NotFound` is a positive absence (`on_absent`): an all-absent
+    /// walk ends in a clean `SeedLocal`, not `Indeterminate`.
+    #[test]
+    fn an_all_absent_recovery_walk_seeds_cleanly() {
+        let (sk, vk) = owner(9);
+        let mut driver = new_probe_driver(
+            RiverProbeOps::new(vk),
+            signed_state(&sk),
+            vec![id(41), id(40)],
+            SelectionPolicy::NewestFirstWins,
+        );
+        for _ in 0..2 {
+            let Step::Get(x) = driver.next_action() else {
+                panic!()
+            };
+            driver.on_absent(x);
+        }
+        assert_eq!(driver.next_action(), Step::Done);
+        assert!(matches!(
+            driver.take_outcome(),
+            Some(Outcome::SeedLocal { .. })
+        ));
+    }
+
+    /// A taken outcome does nothing (a duplicate pump).
+    #[test]
+    fn a_taken_outcome_neither_adopts_nor_seeds() {
+        assert!(matches!(probe_finish(None), ProbeFinish::Nothing));
     }
 }
