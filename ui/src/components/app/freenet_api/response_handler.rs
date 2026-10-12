@@ -1527,14 +1527,31 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     // is_legacy_delegate = true: skip legacy cursor restore, and trigger the
     // re-save to the CURRENT delegate (which resolves the load state to
     // `Loaded` on the re-save's success/`Err` arms).
+    let identity_sources = meta
+        .as_ref()
+        .map(|m| m.identity_sources.clone())
+        .unwrap_or_default();
+    let source_rank = source_rank_for_delegate_key(legacy_key.bytes());
     let loaded = reconstruct_rooms(slots, meta);
-    if hydrate_loaded_rooms(
-        loaded,
-        true,
-        source_rank_for_delegate_key(legacy_key.bytes()),
-        worker.attempt(),
-    ) {
+    if hydrate_loaded_rooms(loaded, true, source_rank, worker.attempt()) {
         schedule_subscription_timeout_check();
+    }
+    // The predecessor's own provenance for the identities it supplied: lower
+    // them to the older generation that really supplied them, after hydrate's
+    // deferred merge (FIFO), as the walk does (#768 round 2 item 4).
+    if !identity_sources.is_empty() {
+        crate::util::defer(move || {
+            crate::components::app::chat_delegate::with_identity_source_ranks(|ranks| {
+                crate::room_data::lower_identity_ranks(
+                    &mut ranks.identity,
+                    &crate::room_data::identity_source_ranks(
+                        &identity_sources,
+                        crate::components::app::chat_delegate::legacy_delegate_pairs(),
+                    ),
+                    source_rank,
+                )
+            });
+        });
     }
 }
 

@@ -1001,6 +1001,19 @@ pub(crate) trait RiverImportSeam {
     /// writes as failures and withholds its keys from older generations.
     fn flush(&mut self) -> impl Future<Output = Result<(), String>>;
 
+    /// Lower the identity rank of rooms `from_rank` just supplied to the older
+    /// rank their imported provenance records (`RoomsMeta::identity_sources`
+    /// of the predecessor being imported; #768 round 2 item 4). Called after
+    /// the predecessor's rooms merged. Default: nothing (a seam without ranks).
+    fn lower_identity_ranks(
+        &mut self,
+        provenance: Vec<(ed25519_dalek::VerifyingKey, u32)>,
+        from_rank: u32,
+    ) -> impl Future<Output = ()> {
+        let _ = (provenance, from_rank);
+        std::future::ready(())
+    }
+
     /// The rooms the successor already knows: present or tombstoned (owner
     /// key bytes). The post-resolve top-up fetches only rooms NOT in it. The
     /// default (nothing known) fetches every listed room.
@@ -1138,6 +1151,22 @@ impl RiverImportSeam for LiveImportSeam {
             .map_err(|_| "outbound-DM merge was dropped before running".to_string())?
     }
 
+    async fn lower_identity_ranks(
+        &mut self,
+        provenance: Vec<(ed25519_dalek::VerifyingKey, u32)>,
+        from_rank: u32,
+    ) {
+        // Inside `defer`, after the merge's own (awaited) defer, like the merges.
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        crate::util::defer(move || {
+            chat_delegate::with_identity_source_ranks(|ranks| {
+                crate::room_data::lower_identity_ranks(&mut ranks.identity, &provenance, from_rank)
+            });
+            let _ = tx.send(());
+        });
+        let _ = rx.await;
+    }
+
     async fn known_rooms(&mut self) -> HashSet<[u8; 32]> {
         // Read inside `defer`, per the signal-safety rules, like the merges.
         let (tx, rx) = futures::channel::oneshot::channel::<HashSet<[u8; 32]>>();
@@ -1188,6 +1217,9 @@ pub(crate) struct RiverSuccessorIo<'a, C: RiverDelegateChannel, S: RiverImportSe
     seam: S,
     /// The CURRENT delegate — where markers live.
     successor: DelegateKey,
+    /// The lineage as `(delegate key, code hash)` in generation order, to read
+    /// an imported `rooms_meta`'s identity provenance (#768 round 2 item 4).
+    lineage_pairs: Vec<([u8; 32], [u8; 32])>,
 }
 
 impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S> {
@@ -1196,7 +1228,20 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
             channel,
             seam,
             successor,
+            lineage_pairs: Vec::new(),
         }
+    }
+
+    /// Know the lineage, so an imported `rooms_meta`'s identity provenance can
+    /// be carried into the rank registry.
+    pub(crate) fn with_lineage(mut self, lineage: &[DelegateLineageEntry]) -> Self {
+        let mut entries: Vec<&DelegateLineageEntry> = lineage.iter().collect();
+        entries.sort_by_key(|e| e.generation);
+        self.lineage_pairs = entries
+            .into_iter()
+            .map(|e| (e.delegate_key, e.code_hash))
+            .collect();
+        self
     }
 
     /// GET a marker key from the CURRENT delegate. Three-way: value / definitive
@@ -1463,10 +1508,26 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
                 // `item.generation` is the lineage index, which is the SAME
                 // scale `source_rank_for_delegate_key` ranks the sweep's
                 // merges on (see `river_delegate_lineage`).
-                match self.seam.merge_rooms(rooms, item.generation).await {
-                    Ok(()) => ItemWrite::Written,
-                    Err(e) => ItemWrite::retryable(e),
+                if let Err(e) = self.seam.merge_rooms(rooms, item.generation).await {
+                    return ItemWrite::retryable(e);
                 }
+                // A predecessor's `rooms_meta` (merged after its rooms) says
+                // which OLDER generation supplied each room's identity: carry
+                // that into the rank registry, or every room it holds would be
+                // re-stamped at its own rank and a generation newer than the
+                // provenance would lose (#768 round 2 item 4).
+                if let RecoveredItem::Meta(meta) = &decoded {
+                    let provenance = crate::room_data::identity_source_ranks(
+                        &meta.identity_sources,
+                        &self.lineage_pairs,
+                    );
+                    if !provenance.is_empty() {
+                        self.seam
+                            .lower_identity_ranks(provenance, item.generation)
+                            .await;
+                    }
+                }
+                ItemWrite::Written
             }
             RecoveredItem::OutboundDms(store) => match self.seam.merge_outbound_dms(*store).await {
                 Ok(()) => ItemWrite::Written,
@@ -1794,7 +1855,7 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
 ) -> (JournaledMigrationReport, S) {
     let mut reader = RiverPredecessorIo::new(channel);
     reader.prewarm(lineage).await;
-    let mut writer = RiverSuccessorIo::new(channel, seam, successor);
+    let mut writer = RiverSuccessorIo::new(channel, seam, successor).with_lineage(lineage);
     let report = migrate_delegate_secrets_journaled(
         &mut writer,
         &mut reader,
@@ -2340,6 +2401,17 @@ mod tests {
             }
             self.dm_merges.push(store);
             Ok(())
+        }
+        async fn lower_identity_ranks(
+            &mut self,
+            provenance: Vec<(VerifyingKey, u32)>,
+            from_rank: u32,
+        ) {
+            crate::room_data::lower_identity_ranks(
+                &mut self.ranks.identity,
+                &provenance,
+                from_rank,
+            );
         }
         async fn known_rooms(&mut self) -> HashSet<[u8; 32]> {
             self.rooms
@@ -4529,5 +4601,49 @@ mod tests {
         seam.0.rooms.removed_rooms.insert(d);
         block_on(top_up_from_with(&channel, &mut seam, &lineage3()[2])).unwrap();
         assert!(!seam.0.rooms.map.contains_key(&d));
+    }
+
+    /// #768 round 2 item 4: when a predecessor's own `rooms_meta` records that a
+    /// room's identity came from an OLDER generation, the import carries that
+    /// provenance into the rank registry, so a generation newer than the
+    /// provenance (but older than the predecessor) still wins. Without it the
+    /// identity is re-stamped at the predecessor's rank and the newer one is
+    /// lost when this delegate itself becomes a predecessor.
+    #[test]
+    fn an_imported_rooms_meta_carries_its_identity_provenance() {
+        let room = vk(5);
+        // gen2 holds the room with gen0's identity (50), and says so.
+        let mut gen2 = DelegateSim::default();
+        gen2.store.insert(
+            chat_delegate::room_storage_key(&room),
+            cbor(&RoomSlot::Present(Box::new(room_with_identity(room, 50)))),
+        );
+        gen2.store.insert(
+            ROOMS_META_KEY.to_vec(),
+            cbor(&RoomsMeta {
+                current_room_key: None,
+                notification_modes: HashMap::new(),
+                room_order: vec![room],
+                identity_sources: vec![(room, table3()[0].0)],
+            }),
+        );
+        // gen1 holds the room with a NEWER identity (51) than gen0's.
+        let mut gen1 = DelegateSim::default();
+        gen1.store.insert(
+            chat_delegate::room_storage_key(&room),
+            cbor(&RoomSlot::Present(Box::new(room_with_identity(room, 51)))),
+        );
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), gen1)
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert!(report.is_complete(), "{report:?}");
+        assert_eq!(
+            seam.rooms.map[&room].self_verifying_key().unwrap(),
+            SigningKey::from_bytes(&[51; 32]).verifying_key(),
+            "gen1's identity is newer than the gen0 identity gen2 carried"
+        );
     }
 }

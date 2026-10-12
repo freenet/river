@@ -2069,13 +2069,43 @@ pub fn restore_identity_ranks(
     legacy: &[([u8; 32], [u8; 32])],
     current_rank: u32,
 ) {
-    for (vk, delegate_key) in sources {
-        let Some(rank) = legacy.iter().position(|(dk, _)| dk == delegate_key) else {
-            continue;
-        };
+    lower_identity_ranks(
+        identity_ranks,
+        &identity_source_ranks(sources, legacy),
+        current_rank,
+    );
+}
+
+/// Persisted identity sources as `(room, generation rank)`, dropping a
+/// delegate key no longer in the registry.
+pub fn identity_source_ranks(
+    sources: &[(VerifyingKey, [u8; 32])],
+    legacy: &[([u8; 32], [u8; 32])],
+) -> Vec<(VerifyingKey, u32)> {
+    sources
+        .iter()
+        .filter_map(|(vk, dk)| {
+            legacy
+                .iter()
+                .position(|(k, _)| k == dk)
+                .map(|rank| (*vk, rank as u32))
+        })
+        .collect()
+}
+
+/// Lower each room's identity rank from `from_rank` (the source that just
+/// supplied it) to the OLDER rank its provenance records, so a generation
+/// newer than that provenance still wins later (#768 review B3, round 2 item
+/// 4). Only a rank equal to `from_rank` is touched, and only lowered.
+pub fn lower_identity_ranks(
+    identity_ranks: &mut HashMap<RoomKey, u32>,
+    provenance: &[(VerifyingKey, u32)],
+    from_rank: u32,
+) {
+    for (vk, rank) in provenance {
         let key = vk.to_bytes();
-        if identity_ranks.get(&key) == Some(&current_rank) {
-            identity_ranks.insert(key, rank as u32);
+        if *rank < from_rank && identity_ranks.get(&key) == Some(&from_rank) {
+            identity_ranks.insert(key, *rank);
         }
     }
 }
