@@ -4,6 +4,29 @@ use ed25519_dalek::{Signer, SigningKey};
 use freenet_stdlib::prelude::DelegateCtx;
 use river_core::chat_delegate::{CasStoreResult, RequestId, RoomKey};
 
+/// The secret-store operations the key-value handlers use. In the delegate
+/// this is the host `DelegateCtx`; natively that context has no storage at all
+/// (`get_secret` is always `None`, `set_secret` always `false`), so the
+/// handlers' write ORDER and their refusal of an undecodable index
+/// (freenet/river#592) could not be tested. A fake store can.
+pub(crate) trait SecretStore {
+    fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>>;
+    fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool;
+    fn remove_secret(&mut self, key: &[u8]);
+}
+
+impl SecretStore for DelegateCtx {
+    fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
+        DelegateCtx::get_secret(self, key)
+    }
+    fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
+        DelegateCtx::set_secret(self, key, value)
+    }
+    fn remove_secret(&mut self, key: &[u8]) {
+        let _ = DelegateCtx::remove_secret(self, key);
+    }
+}
+
 /// Handle an application message using the host function API for direct secret access.
 pub(crate) fn handle_application_message(
     ctx: &mut DelegateCtx,
@@ -172,7 +195,7 @@ pub(crate) fn handle_application_message(
 
 /// Handle a store request - stores value and updates the index
 fn handle_store_request(
-    ctx: &mut DelegateCtx,
+    ctx: &mut impl SecretStore,
     origin: &Origin,
     key: ChatDelegateKey,
     value: Vec<u8>,
@@ -184,7 +207,7 @@ fn handle_store_request(
     // Read the index FIRST: an index that exists but does not decode fails
     // the request before anything is written (freenet/river#592), rather than
     // being replaced by a one-key index that hides every other key.
-    let mut key_index = get_key_index(ctx, &index_key)?;
+    let mut key_index = get_key_index(ctx, origin, &index_key)?;
 
     // Wrap the value in a versioned envelope, bumping the generation, so
     // that plain (non-CAS) writers stay consistent with CAS readers and
@@ -264,7 +287,7 @@ fn handle_get_request(
 /// reader cannot tell from a failed read), and a delete of an unlisted key
 /// never rewrites the index at all.
 fn handle_delete_request(
-    ctx: &mut DelegateCtx,
+    ctx: &mut impl SecretStore,
     origin: &Origin,
     key: ChatDelegateKey,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
@@ -274,7 +297,7 @@ fn handle_delete_request(
 
     // Update the key index first, and only if it lists the key. An index that
     // does not decode fails the request before anything is removed.
-    let mut key_index = get_key_index(ctx, &index_key)?;
+    let mut key_index = get_key_index(ctx, origin, &index_key)?;
     if key_index.keys.contains(&key) {
         key_index.keys.retain(|k| k != &key);
         set_key_index(ctx, &index_key, &key_index)?;
@@ -299,7 +322,7 @@ fn handle_delete_request(
 
 /// Handle a list request - returns all keys for this origin
 fn handle_list_request(
-    ctx: &mut DelegateCtx,
+    ctx: &mut impl SecretStore,
     origin: &Origin,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let index_key = create_index_key(origin);
@@ -308,7 +331,7 @@ fn handle_list_request(
     // is an error, never an empty list (freenet/river#592): a migration
     // reading this delegate as a predecessor would otherwise certify a short
     // export as everything it holds.
-    let key_index = get_key_index(ctx, &index_key)?;
+    let key_index = get_key_index(ctx, origin, &index_key)?;
     logging::info(&format!(
         "Returning list with {} keys",
         key_index.keys.len()
@@ -352,7 +375,7 @@ fn handle_get_versioned_request(
 /// the caller can merge and retry. Concurrent tabs can therefore no longer
 /// silently overwrite each other's writes.
 fn handle_cas_store_request(
-    ctx: &mut DelegateCtx,
+    ctx: &mut impl SecretStore,
     origin: &Origin,
     key: ChatDelegateKey,
     value: Vec<u8>,
@@ -361,7 +384,7 @@ fn handle_cas_store_request(
     let secret_key = create_origin_key(origin, &key);
     let index_key = create_index_key(origin);
     // Read the index before writing anything (see `handle_store_request`).
-    let mut key_index = get_key_index(ctx, &index_key)?;
+    let mut key_index = get_key_index(ctx, origin, &index_key)?;
 
     let result = match apply_cas_store(
         ctx.get_secret(&secret_key).as_deref(),
@@ -557,10 +580,37 @@ fn handle_sign_request(
 // Helper Functions
 // ============================================================================
 
+/// Keys River's UI stores early and keeps, read to tell an index that is
+/// genuinely absent (a delegate nothing was ever stored in) from an index
+/// read that failed (freenet/freenet-core#5857 reports a failed secret read as
+/// "not found"). Every store adds its key to the index, so one of these being
+/// present while the index reads absent can only be a read fault. (The UI's
+/// `ROOMS_META_KEY`, `ROOMS_STORAGE_KEY` and `OUTBOUND_DMS_STORAGE_KEY`.)
+const INDEX_WITNESS_KEYS: [&[u8]; 3] = [b"rooms_meta", b"rooms_data", b"outbound_dms"];
+
 /// Get the key index from secrets: empty when none is stored, an error when
-/// one is stored but does not decode (freenet/river#592).
-fn get_key_index(ctx: &mut DelegateCtx, index_key: &[u8]) -> Result<KeyIndex, DelegateError> {
-    decode_key_index(ctx.get_secret(index_key).as_deref())
+/// one is stored but does not decode (freenet/river#592), and an error when
+/// none reads back although a key it must list is stored (a failed read, which
+/// would otherwise be rewritten as a one-key index, or listed as empty).
+fn get_key_index(
+    ctx: &mut impl SecretStore,
+    origin: &Origin,
+    index_key: &[u8],
+) -> Result<KeyIndex, DelegateError> {
+    let stored = ctx.get_secret(index_key);
+    if stored.is_none() {
+        for witness in INDEX_WITNESS_KEYS {
+            let key = create_origin_key(origin, &ChatDelegateKey::new(witness.to_vec()));
+            if ctx.get_secret(&key).is_some() {
+                return Err(DelegateError::Other(format!(
+                    "the key index read back absent although {:?} is stored; refusing to \
+                     treat it as empty (freenet/river#592, freenet-core#5857)",
+                    String::from_utf8_lossy(witness)
+                )));
+            }
+        }
+    }
+    decode_key_index(stored.as_deref())
 }
 
 /// The stored index bytes as a [`KeyIndex`]. Absent is a legitimately empty
@@ -578,7 +628,7 @@ fn decode_key_index(stored: Option<&[u8]>) -> Result<KeyIndex, DelegateError> {
 
 /// Set the key index in secrets
 fn set_key_index(
-    ctx: &mut DelegateCtx,
+    ctx: &mut impl SecretStore,
     index_key: &[u8],
     key_index: &KeyIndex,
 ) -> Result<(), DelegateError> {
@@ -1092,5 +1142,207 @@ mod tests {
         assert!(decode_key_index(Some(&[0xFF, 0x00, 0x13])).is_err());
         // Truncated: a valid prefix of a real index.
         assert!(decode_key_index(Some(&bytes[..bytes.len() - 2])).is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Probes added by the testing review of PR #768: the key-value handlers
+    // against a fake secret store (the native `DelegateCtx` stores nothing).
+    // ---------------------------------------------------------------------
+
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct FakeSecrets {
+        map: BTreeMap<Vec<u8>, Vec<u8>>,
+        /// Every mutation, in order: ("set" | "remove", key).
+        log: Vec<(&'static str, Vec<u8>)>,
+    }
+
+    impl SecretStore for FakeSecrets {
+        fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.map.get(key).cloned()
+        }
+        fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
+            self.log.push(("set", key.to_vec()));
+            self.map.insert(key.to_vec(), value.to_vec());
+            true
+        }
+        fn remove_secret(&mut self, key: &[u8]) {
+            self.log.push(("remove", key.to_vec()));
+            self.map.remove(key);
+        }
+    }
+
+    fn origin() -> Origin {
+        Origin(vec![7u8; 32])
+    }
+
+    fn ck(k: &str) -> ChatDelegateKey {
+        river_core::chat_delegate::ChatDelegateKey(k.as_bytes().to_vec())
+    }
+
+    /// A store holding `keys` (each with a value) and a decodable index over them.
+    fn store_with(keys: &[&str]) -> FakeSecrets {
+        let mut f = FakeSecrets::default();
+        for k in keys {
+            f.map
+                .insert(create_origin_key(&origin(), &ck(k)), b"v".to_vec());
+        }
+        let index = KeyIndex {
+            keys: keys.iter().map(|k| ck(k)).collect(),
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&index, &mut bytes).unwrap();
+        f.map.insert(create_index_key(&origin()), bytes);
+        f
+    }
+
+    /// A store whose index is present but undecodable, beside `room:a`.
+    fn store_with_corrupt_index() -> FakeSecrets {
+        let mut f = store_with(&["room:a"]);
+        f.map
+            .insert(create_index_key(&origin()), vec![0xFF, 0x00, 0x13]);
+        f
+    }
+
+    fn index_of(f: &FakeSecrets) -> Vec<ChatDelegateKey> {
+        decode_key_index(
+            f.map
+                .get(&create_index_key(&origin()))
+                .map(|v| v.as_slice()),
+        )
+        .unwrap()
+        .keys
+    }
+
+    #[test]
+    fn a_store_over_an_undecodable_index_fails_before_writing_anything() {
+        let mut f = store_with_corrupt_index();
+        let before = f.map.clone();
+        assert!(handle_store_request(&mut f, &origin(), ck("room:b"), b"x".to_vec()).is_err());
+        assert!(f.log.is_empty(), "nothing may be written: {:?}", f.log);
+        assert_eq!(
+            f.map, before,
+            "the corrupt index must not be replaced by a one-key index"
+        );
+    }
+
+    #[test]
+    fn a_cas_store_over_an_undecodable_index_fails_before_writing_anything() {
+        let mut f = store_with_corrupt_index();
+        let before = f.map.clone();
+        assert!(
+            handle_cas_store_request(&mut f, &origin(), ck("room:b"), b"x".to_vec(), 0).is_err()
+        );
+        assert!(f.log.is_empty(), "nothing may be written: {:?}", f.log);
+        assert_eq!(f.map, before);
+    }
+
+    #[test]
+    fn a_delete_over_an_undecodable_index_removes_nothing() {
+        let mut f = store_with_corrupt_index();
+        let before = f.map.clone();
+        assert!(handle_delete_request(&mut f, &origin(), ck("room:a")).is_err());
+        assert!(
+            f.log.is_empty(),
+            "nothing may be removed or written: {:?}",
+            f.log
+        );
+        assert_eq!(f.map, before);
+    }
+
+    #[test]
+    fn a_list_over_an_undecodable_index_is_an_error_not_an_empty_list() {
+        let mut f = store_with_corrupt_index();
+        assert!(handle_list_request(&mut f, &origin()).is_err());
+        // And over a decodable one it lists what is indexed.
+        let mut ok = store_with(&["room:a", "room:b"]);
+        let resp = extract_response(handle_list_request(&mut ok, &origin()).unwrap()).unwrap();
+        match resp {
+            ChatDelegateResponseMsg::ListResponse { keys } => {
+                assert_eq!(keys, vec![ck("room:a"), ck("room:b")])
+            }
+            other => panic!("expected ListResponse, got {other:?}"),
+        }
+    }
+
+    /// The index is rewritten BEFORE the value is removed, so a failed index
+    /// write leaves the key listed AND present, never listed with no value.
+    #[test]
+    fn a_delete_updates_the_index_before_removing_the_value() {
+        let mut f = store_with(&["room:a", "room:b"]);
+        handle_delete_request(&mut f, &origin(), ck("room:a")).unwrap();
+        assert_eq!(index_of(&f), vec![ck("room:b")]);
+        let order: Vec<_> = f.log.iter().map(|(op, _)| *op).collect();
+        assert_eq!(order, vec!["set", "remove"], "index first, then the value");
+
+        // (The failed-index-write half, "the value stays", cannot run natively:
+        // the `set_secret` failure checks are `#[cfg(target_family = "wasm")]`.)
+    }
+
+    #[test]
+    fn deleting_an_unlisted_key_never_rewrites_the_index() {
+        let mut f = store_with(&["room:a"]);
+        f.map.insert(
+            create_origin_key(&origin(), &ck("room:ghost")),
+            b"v".to_vec(),
+        );
+        handle_delete_request(&mut f, &origin(), ck("room:ghost")).unwrap();
+        assert!(
+            !f.log
+                .iter()
+                .any(|(op, k)| *op == "set" && *k == create_index_key(&origin())),
+            "{:?}",
+            f.log
+        );
+        assert_eq!(index_of(&f), vec![ck("room:a")]);
+    }
+
+    #[test]
+    fn a_store_lists_the_key_and_both_store_paths_agree() {
+        let mut f = store_with(&["room:a"]);
+        handle_store_request(&mut f, &origin(), ck("room:b"), b"x".to_vec()).unwrap();
+        assert_eq!(index_of(&f), vec![ck("room:a"), ck("room:b")]);
+        let mut g = store_with(&["room:a"]);
+        handle_cas_store_request(&mut g, &origin(), ck("room:b"), b"x".to_vec(), 0).unwrap();
+        assert_eq!(index_of(&g), vec![ck("room:a"), ck("room:b")]);
+        // A CAS conflict writes nothing, not even the index.
+        let mut h = store_with(&["room:a"]);
+        let key_a = create_origin_key(&origin(), &ck("room:a"));
+        let _ = key_a;
+        handle_cas_store_request(&mut h, &origin(), ck("room:a"), b"y".to_vec(), 99).unwrap();
+        assert!(
+            h.log.is_empty(),
+            "a conflicting CAS must write nothing: {:?}",
+            h.log
+        );
+    }
+
+    /// A `None` index read beside a stored witness key is a read fault
+    /// (freenet-core#5857): store, CAS, delete and list must refuse, never
+    /// rewrite a one-key index or list nothing (#592 residual, #595 route 2).
+    #[test]
+    fn an_absent_index_beside_a_stored_witness_key_refuses_every_index_path() {
+        let lost_index = || {
+            let mut f = store_with(&["rooms_meta", "room:a"]);
+            f.map.remove(&create_index_key(&origin()));
+            f.log.clear();
+            f
+        };
+        let mut f = lost_index();
+        let before = f.map.clone();
+        assert!(handle_store_request(&mut f, &origin(), ck("room:b"), b"x".to_vec()).is_err());
+        assert!(
+            handle_cas_store_request(&mut f, &origin(), ck("room:b"), b"x".to_vec(), 0).is_err()
+        );
+        assert!(handle_delete_request(&mut f, &origin(), ck("room:a")).is_err());
+        assert!(handle_list_request(&mut f, &origin()).is_err());
+        assert!(f.log.is_empty(), "nothing may be written: {:?}", f.log);
+        assert_eq!(f.map, before);
+
+        // A genuinely fresh delegate (no index, no witness) still stores.
+        let mut fresh = FakeSecrets::default();
+        handle_store_request(&mut fresh, &origin(), ck("rooms_meta"), b"m".to_vec()).unwrap();
+        assert_eq!(index_of(&fresh), vec![ck("rooms_meta")]);
     }
 }
