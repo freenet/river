@@ -2352,7 +2352,7 @@ dependencies = [
 [[package]]
 name = "freenet-migrate"
 version = "0.7.0"
-source = "git+https://github.com/freenet/freenet-migrate?rev=4a5c4f10a7c72aa6a0fcec8947bbd5dc15fe93c1#4a5c4f10a7c72aa6a0fcec8947bbd5dc15fe93c1"
+source = "git+https://github.com/freenet/freenet-migrate?rev=ff457290ed4cefd9ea5dc5c4aec67f5a0f484098#ff457290ed4cefd9ea5dc5c4aec67f5a0f484098"
 dependencies = [
  "blake3",
  "bs58",

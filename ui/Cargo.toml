@@ -104,11 +104,11 @@ freenet-stdlib = { workspace = true, features = ["net"] }
 # completeness journal (freenet/river#763). The `ui` default profile exposes
 # the probe/driver surface; its stdlib dep unifies with the workspace's 0.8.x.
 #
-# TEMPORARY git pin to freenet/freenet-migrate main (the merged #47, 0.7.0 in
+# TEMPORARY git pin to freenet/freenet-migrate main (after #49, 0.7.0 in
 # its Cargo.toml). 0.7.0 is unpublished: its publish is gated on River's
 # real-node rehearsal of THIS branch (freenet/freenet-migrate#43). Switch to
 # `freenet-migrate = "0.7"` from crates.io before this merges.
-freenet-migrate = { git = "https://github.com/freenet/freenet-migrate", rev = "4a5c4f10a7c72aa6a0fcec8947bbd5dc15fe93c1" }
+freenet-migrate = { git = "https://github.com/freenet/freenet-migrate", rev = "ff457290ed4cefd9ea5dc5c4aec67f5a0f484098" }
 
 futures = "0.3.30"
 futures-timer = "3.0.3"
