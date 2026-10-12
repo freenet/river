@@ -3879,9 +3879,9 @@ mod tests {
         ))
     }
 
-    /// The sweep's whole journal cycle: refused before `begin`; flagged (journal
-    /// + in-progress marker) once begun, so a kill now leaves an interrupted
-    /// import; resolved by the walk; then merged unflagged (the backstop for a
+    /// The sweep's whole journal cycle: refused before `begin`; flagged (the
+    /// journal and the in-progress marker) once begun, so a kill now leaves an
+    /// interrupted import; resolved by the walk; then merged unflagged (the backstop for a
     /// completed import that was partial). The predecessor key comes from the
     /// lineage, so the crate never sees a key "not in the lineage".
     #[test]
