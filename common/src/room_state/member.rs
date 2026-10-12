@@ -54,6 +54,7 @@ impl ComposableState for MembersV1 {
 
         let owner_id = parameters.owner_id();
         let members_by_id = self.members_by_member_id();
+        let mut verified = HashSet::new();
 
         for member in &self.members {
             if member.member.id() == owner_id {
@@ -68,8 +69,9 @@ impl ComposableState for MembersV1 {
                 return Err("Self-invitation detected".to_string());
             }
 
-            // Verify the full invite chain with Ed25519 signature checks
-            self.get_invite_chain_with_lookup(member, parameters, &members_by_id)?;
+            // Verify the full invite chain with Ed25519 signature checks;
+            // see `verify_invite_chain` for which walks stop early.
+            Self::verify_invite_chain(member, parameters, &members_by_id, &mut verified)?;
         }
         Ok(())
     }
@@ -193,72 +195,87 @@ const MIN_MEMBERS_DELTA_BOUND: usize = 1_000;
 impl MembersV1 {
     /// Verify the invite chain of every member in `added` against a lookup
     /// map that includes both existing members AND the delta's members, so
-    /// inviters in the same delta can be found.
-    ///
-    /// A walk starting from the record `members_by_id` holds for its id stops
-    /// at a record (compared in full, signature included) whose chain an
-    /// earlier walk already verified: every record past the first is a lookup
-    /// result, so the walks meet on the same records and stopping there gives
-    /// the result the full walk would. Each such record's signature is
-    /// checked at most once per call. A walk starting from another record
-    /// with the same id is done in full, as before, since the full walk also
-    /// fails when its own id reappears further up the chain.
+    /// inviters in the same delta can be found. Each record's signature is
+    /// checked at most once per call.
     fn verify_invite_chains<'a>(
         added: &[&'a AuthorizedMember],
         parameters: &ChatRoomParametersV1,
         members_by_id: &HashMap<MemberId, &'a AuthorizedMember>,
     ) -> Result<(), String> {
-        let owner_id = parameters.owner_id();
-        let mut verified: HashSet<&'a AuthorizedMember> = HashSet::new();
+        let mut verified = HashSet::new();
         for member in added {
-            let use_memo = members_by_id
-                .get(&member.member.id())
-                .is_some_and(|held| *held == *member);
-            let mut path_ids = HashSet::new();
-            let mut path: Vec<&'a AuthorizedMember> = Vec::new();
-            let mut current: &'a AuthorizedMember = member;
-            loop {
-                if use_memo && verified.contains(current) {
-                    break;
-                }
-                let id = current.member.id();
-                if !path_ids.insert(id) {
-                    return Err(format!(
-                        "Circular invite chain detected for member {:?}",
-                        id
-                    ));
-                }
-                if current.member.invited_by == id {
-                    return Err(format!("Self-invitation detected for member {:?}", id));
-                }
-                path.push(current);
-                #[cfg(test)]
-                tests::count_invite_signature_check();
-                if current.member.invited_by == owner_id {
-                    current.verify_signature(&parameters.owner).map_err(|e| {
-                        format!(
-                            "Invalid signature for member {:?} invited by owner: {}",
-                            id, e
-                        )
-                    })?;
-                    break;
-                }
-                let inviter: &'a AuthorizedMember = members_by_id
-                    .get(&current.member.invited_by)
-                    .ok_or_else(|| {
+            Self::verify_invite_chain(member, parameters, members_by_id, &mut verified)?;
+        }
+        Ok(())
+    }
+
+    /// Verify `member`'s invite chain up to the owner, with the same checks
+    /// and errors as [`Self::get_invite_chain_with_lookup`].
+    ///
+    /// When `member` is the record `members_by_id` holds for its id, the walk
+    /// stops at a record in `verified` (compared in full, signature included)
+    /// whose chain an earlier call already verified against the same lookup
+    /// map, and on success adds every record on the walk to `verified`. Every
+    /// record past the first is a lookup result, so the walk and the earlier
+    /// one meet on the same records, and stopping there gives the result the
+    /// full walk would. Another record with the same id is not the lookup
+    /// result: it is walked in full, as before, since the full walk also fails
+    /// when its own id reappears further up the chain. Across calls sharing
+    /// `verified`, each lookup record's signature is checked once.
+    fn verify_invite_chain<'a>(
+        member: &'a AuthorizedMember,
+        parameters: &ChatRoomParametersV1,
+        members_by_id: &HashMap<MemberId, &'a AuthorizedMember>,
+        verified: &mut HashSet<&'a AuthorizedMember>,
+    ) -> Result<(), String> {
+        let owner_id = parameters.owner_id();
+        let use_memo = members_by_id
+            .get(&member.member.id())
+            .is_some_and(|held| *held == member);
+        let mut path_ids = HashSet::new();
+        let mut path: Vec<&'a AuthorizedMember> = Vec::new();
+        let mut current: &'a AuthorizedMember = member;
+        loop {
+            if use_memo && verified.contains(current) {
+                break;
+            }
+            let id = current.member.id();
+            if !path_ids.insert(id) {
+                return Err(format!(
+                    "Circular invite chain detected for member {:?}",
+                    id
+                ));
+            }
+            if current.member.invited_by == id {
+                return Err(format!("Self-invitation detected for member {:?}", id));
+            }
+            path.push(current);
+            #[cfg(test)]
+            tests::count_invite_signature_check();
+            if current.member.invited_by == owner_id {
+                current.verify_signature(&parameters.owner).map_err(|e| {
+                    format!(
+                        "Invalid signature for member {:?} invited by owner: {}",
+                        id, e
+                    )
+                })?;
+                break;
+            }
+            let inviter: &'a AuthorizedMember = members_by_id
+                .get(&current.member.invited_by)
+                .ok_or_else(|| {
                     format!(
                         "Inviter {:?} not found for member {:?}",
                         current.member.invited_by, id
                     )
                 })?;
-                current
-                    .verify_signature(&inviter.member.member_vk)
-                    .map_err(|e| format!("Invalid signature for member {:?}: {}", id, e))?;
-                current = inviter;
-            }
-            if use_memo {
-                verified.extend(path);
-            }
+            current
+                .verify_signature(&inviter.member.member_vk)
+                .map_err(|e| format!("Invalid signature for member {:?}: {}", id, e))?;
+            current = inviter;
+        }
+        if use_memo {
+            verified.extend(path);
         }
         Ok(())
     }
@@ -901,6 +918,191 @@ mod tests {
             assert_eq!(invite_signature_checks() - before, n);
             assert_eq!(members.members.len(), n);
         }
+    }
+
+    /// `MembersV1::verify` as it was before invite links were memoized: every
+    /// member's full chain is walked. Kept to check the two accept and reject
+    /// the same member lists with the same errors.
+    fn verify_walking_every_chain(
+        members: &MembersV1,
+        parent_state: &ChatRoomStateV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> Result<(), String> {
+        if members.members.is_empty() {
+            return Ok(());
+        }
+        if members.members.len() > parent_state.configuration.configuration.max_members {
+            return Err(format!(
+                "Too many members: {} > {}",
+                members.members.len(),
+                parent_state.configuration.configuration.max_members
+            ));
+        }
+        let owner_id = parameters.owner_id();
+        let members_by_id = members.members_by_member_id();
+        for member in &members.members {
+            if member.member.id() == owner_id {
+                return Err("Owner should not be included in the members list".to_string());
+            }
+            if member.member.member_vk == parameters.owner {
+                return Err(
+                    "Member cannot have the same verifying key as the room owner".to_string(),
+                );
+            }
+            if member.member.invited_by == member.member.id() {
+                return Err("Self-invitation detected".to_string());
+            }
+            members.get_invite_chain_with_lookup(member, parameters, &members_by_id)?;
+        }
+        Ok(())
+    }
+
+    /// A random invite tree of `n` members under the owner, with signing keys.
+    fn random_tree(
+        rng: &mut rand::rngs::StdRng,
+        owner_sk: &SigningKey,
+        n: usize,
+    ) -> (Vec<AuthorizedMember>, Vec<SigningKey>) {
+        use rand::Rng;
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let mut records: Vec<AuthorizedMember> = Vec::new();
+        let mut keys: Vec<SigningKey> = Vec::new();
+        for _ in 0..n {
+            let sk = SigningKey::generate(rng);
+            // Invited by the owner or by an earlier member, biased deep.
+            let pick = rng.gen_range(0..=records.len());
+            let (inviter_id, inviter_sk) = if pick == records.len() && rng.gen_bool(0.2) {
+                (owner_id, owner_sk.clone())
+            } else if records.is_empty() {
+                (owner_id, owner_sk.clone())
+            } else {
+                let i = rng.gen_range(0..records.len());
+                (records[i].member.id(), keys[i].clone())
+            };
+            let member = Member {
+                owner_member_id: owner_id,
+                invited_by: inviter_id,
+                member_vk: sk.verifying_key(),
+            };
+            records.push(AuthorizedMember::new(member, &inviter_sk));
+            keys.push(sk);
+        }
+        (records, keys)
+    }
+
+    /// The memoized `verify` gives the same result, error text included, as
+    /// walking every member's full chain, on valid trees and on trees with one
+    /// defect: a bad signature, a missing inviter, a self-invitation, a cycle,
+    /// a record with the owner's id or key, too many members, or a second
+    /// record for one member's key naming another inviter (with a signature
+    /// that does or does not verify). Each list is checked shuffled and
+    /// reversed, since memoization depends on which chains were walked first.
+    /// (Two different keys with the same id cannot be built here: the id is
+    /// derived from the key.)
+    #[test]
+    fn verify_matches_walking_every_chain() {
+        use rand::seq::SliceRandom;
+        use rand::{Rng, SeedableRng};
+        let mut rejected = 0;
+        for seed in 0..160u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let owner_sk = SigningKey::generate(&mut rng);
+            let owner_id: MemberId = owner_sk.verifying_key().into();
+            let parameters = ChatRoomParametersV1 {
+                owner: owner_sk.verifying_key(),
+            };
+            let n = rng.gen_range(1..16);
+            let (mut records, keys) = random_tree(&mut rng, &owner_sk, n);
+            let mut max_members = 100;
+            let i = rng.gen_range(0..records.len());
+            let j = rng.gen_range(0..records.len());
+            match seed % 10 {
+                0 => {}
+                1 => records[i].signature = records[j].signature,
+                2 => {
+                    let removed = records.remove(i);
+                    let _ = removed;
+                }
+                3 => records[i].member.invited_by = records[i].member.id(),
+                4 => {
+                    let target = records[j].member.id();
+                    records[i].member.invited_by = target;
+                    records[i] = AuthorizedMember::new(records[i].member.clone(), &keys[j]);
+                }
+                5 => records.push(AuthorizedMember::new(
+                    Member {
+                        owner_member_id: owner_id,
+                        invited_by: records[i].member.id(),
+                        member_vk: parameters.owner,
+                    },
+                    &keys[i],
+                )),
+                6 => max_members = records.len() - 1,
+                // A second record for member i's key naming another inviter.
+                // 8: it carries member i's signature, which does not verify
+                // for it. 9: it is signed by that inviter, so it verifies.
+                8 | 9 => {
+                    let (inviter_id, inviter_sk) = if j == i {
+                        (owner_id, owner_sk.clone())
+                    } else {
+                        (records[j].member.id(), keys[j].clone())
+                    };
+                    let member = Member {
+                        invited_by: inviter_id,
+                        ..records[i].member.clone()
+                    };
+                    let signature = if seed % 10 == 8 {
+                        records[i].signature
+                    } else {
+                        crate::util::sign_struct(&member, &inviter_sk)
+                    };
+                    records.push(AuthorizedMember { member, signature });
+                }
+                _ => {
+                    let other = SigningKey::generate(&mut rng);
+                    records[i].signature = crate::util::sign_struct(&records[i].member, &other);
+                }
+            }
+            records.shuffle(&mut rng);
+            let mut reversed = records.clone();
+            reversed.reverse();
+            for records in [records, reversed] {
+                let members = MembersV1 { members: records };
+                let parent_state = ChatRoomStateV1 {
+                    configuration: AuthorizedConfigurationV1::new(
+                        Configuration {
+                            owner_member_id: owner_id,
+                            max_members,
+                            ..Default::default()
+                        },
+                        &owner_sk,
+                    ),
+                    ..Default::default()
+                };
+                let expected = verify_walking_every_chain(&members, &parent_state, &parameters);
+                let actual = members.verify(&parent_state, &parameters);
+                assert_eq!(actual, expected, "seed {seed}");
+                if expected.is_err() {
+                    rejected += 1;
+                }
+            }
+        }
+        // Most defective trees are rejected; the comparison covers both outcomes.
+        assert!(rejected > 140, "only {rejected} rejected");
+    }
+
+    /// `verify` on an N-deep chain checks N signatures.
+    #[test]
+    fn verify_checks_each_link_of_a_deep_chain_once() {
+        let n = 200;
+        let (mut parent_state, parameters, chain, _) = invite_chain(n, n);
+        parent_state.members.members = chain;
+        let before = invite_signature_checks();
+        parent_state
+            .members
+            .verify(&parent_state, &parameters)
+            .unwrap();
+        assert_eq!(invite_signature_checks() - before, n);
     }
 
     /// A record carrying the owner's id is ignored wherever it sits in the
