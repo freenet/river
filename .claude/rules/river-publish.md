@@ -334,10 +334,15 @@ one durable authority over both:
 - **The walk while the status `begin` returned is incomplete**, whatever the
   load plan (after an interrupted per-room write the plan is `PerRoom`, so the
   walk can no longer hang off the `ProbeLegacy` sweep). Rate-limited
-  (freenet/river#761) only while every pending generation answered a TYPED
-  "missing delegate" on the last 3 walks and nothing is mid-import: then it
-  runs on one load in 10, counted under `__river_migration_walk_skips__` in
-  the current delegate. Silence never counts as "not installed".
+  (freenet/river#761, `walk_cadence`) only while nothing is mid-import
+  (except a predecessor whose short-index refusal is recorded) and every
+  pending generation either answered a TYPED "missing delegate" on the last 3
+  walks or stayed unresolved through 6 walks (silent or refused). It then
+  runs on one load in 10 if every pending generation is in the first group,
+  else one load in 4, counted under `__river_migration_walk_skips__` in the
+  current delegate. Silence never counts as "not installed". The empty
+  account's sweep is not rate-limited: it still probes every legacy
+  generation on every load (#761).
 - **The walk again after a sweep flag**, once the load is quiet, so the
   sweep's import is resolved in the same session.
 - All journal calls are **serialised** (the request registry holds one waiter
@@ -366,7 +371,8 @@ retry; a wrong short answer would be certified complete.
 
 **End state of a refused predecessor.** A FROZEN generation whose index is
 genuinely short is refused on every load: it stays pending (its
-`absent_streak` stays 0, so the #761 cadence never slows its walk), and its
+`absent_streak` stays 0; once it has 6 refused walks and every other pending
+generation is settled too, the #761 cadence walks on one load in 4), and its
 unlisted rooms do not migrate. The rooms its short index does list still
 arrive through the sweep. The user is told only when importing an identity:
 the gate reads `Unresolved` and offers "Import anyway". There is no general

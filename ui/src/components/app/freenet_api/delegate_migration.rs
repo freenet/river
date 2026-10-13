@@ -4557,6 +4557,195 @@ mod tests {
         }
     }
 
+    /// The predecessor of the #760 reproduction: four rooms as per-room slots.
+    fn gen0_with_four_rooms() -> (DelegateSim, [VerifyingKey; 4]) {
+        let rooms = [vk(1), vk(2), vk(3), vk(4)];
+        let mut gen0 = DelegateSim::default();
+        for (i, room) in rooms.iter().enumerate() {
+            gen0.store.insert(
+                chat_delegate::room_storage_key(room),
+                cbor(&RoomSlot::Present(Box::new(room_with_identity(
+                    *room,
+                    10 + i as u8,
+                )))),
+            );
+        }
+        (gen0, rooms)
+    }
+
+    /// The journal half of the load after an interrupted one, as the driver
+    /// runs it: `begin`, the #761 walk decision (with the cadence counter at
+    /// any value it could hold), and the walk when the decision says to.
+    fn next_load(channel: &MockChannel, seam: MemorySeam) -> (JournalStatus, MemorySeam) {
+        use super::super::migration_journal::{load_plan, walk_decision};
+        let begun = block_on(begin_with(channel, successor_key(), &lineage3())).unwrap();
+        assert!(
+            begun.interrupted_import(),
+            "the next load's begin must report the interrupted import: {begun:?}"
+        );
+        for skips in [None, Some(0), Some(1), Some(8), Some(u32::MAX)] {
+            let plan = load_plan(walk_decision(&begun, &[], skips), false);
+            assert!(
+                plan.walk,
+                "an interrupted import walks on every load (skips={skips:?})"
+            );
+        }
+        let (walked, seam) = walk_j(channel, seam);
+        (walked.status.expect("status"), seam)
+    }
+
+    /// freenet/river#760, as reproduced: four rooms in the predecessor, the
+    /// first load after the re-key killed right after the sweep's first
+    /// per-room write. The successor then lists one room, so the next load's
+    /// plan is `PerRoom` and the old recovery (a `localStorage` flag the
+    /// gateway's sandboxed iframe never stored) never ran. Here the flag is in
+    /// the successor's journal: the next load's `begin` reports it, the walk
+    /// runs whatever the cadence counter says, and every room arrives.
+    ///
+    /// This pins the mechanism (journal flag, walk decision, walk) on the mock
+    /// channel; the successor's one room is the reloaded seam. The load-plan
+    /// classification and the wasm-only drivers are pinned by source tests in
+    /// `response_handler.rs` and `migration_journal.rs`, and the end-to-end
+    /// interrupt runs were done on a real node for #768.
+    #[test]
+    fn a_tab_killed_after_the_first_room_write_strands_no_room() {
+        let (gen0, rooms) = gen0_with_four_rooms();
+        let channel = channel_with_gen0(gen0);
+
+        // Load 1: begin, then the sweep flags its import and writes one room
+        // before the tab dies.
+        block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
+        assert_eq!(note(&channel, 0, Some(4)), SweepWrite::Merge);
+        let mut reloaded = MemorySeam::new();
+        reloaded
+            .rooms
+            .map
+            .insert(rooms[0], room_with_identity(rooms[0], 10));
+
+        // Load 2 starts from that one room.
+        let (status, seam) = next_load(&channel, reloaded);
+        for room in rooms {
+            assert!(
+                seam.rooms.map.contains_key(&room),
+                "room {room:?} stranded in the predecessor"
+            );
+        }
+        assert!(!status.interrupted_import(), "{status:?}");
+        assert!(pred_resolved(&status, &pred_key(0)), "{status:?}");
+
+        // Load 3: nothing is interrupted any more.
+        let load3 = block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
+        assert!(!load3.interrupted_import(), "{load3:?}");
+    }
+
+    /// The same, with the kill during the walk's own import: its merges were
+    /// made but its save never landed (the tab died before the flush). The
+    /// crate flagged the import before its first write, so the next load
+    /// walks again and imports every room into a successor that holds none.
+    #[test]
+    fn a_walk_killed_before_its_save_landed_strands_no_room() {
+        let (gen0, rooms) = gen0_with_four_rooms();
+        let channel = channel_with_gen0(gen0);
+
+        block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
+        let mut dying = MemorySeam::new();
+        dying.fail_flush = true;
+        let (first, lost) = walk_j(&channel, dying);
+        assert_eq!(lost.rooms.map.len(), 4, "the walk's merges were made");
+        assert!(
+            first
+                .status
+                .as_ref()
+                .is_some_and(|s| s.interrupted_import()),
+            "a walk whose save failed must not resolve the predecessor: {:?}",
+            first.status
+        );
+        assert_eq!(
+            channel.stored(&successor_key(), &pred_done_marker_key(&pred_key(0))),
+            None
+        );
+
+        let (status, seam) = next_load(&channel, MemorySeam::new());
+        for room in rooms {
+            assert!(
+                seam.rooms.map.contains_key(&room),
+                "room {room:?} stranded in the predecessor"
+            );
+        }
+        assert!(!status.interrupted_import(), "{status:?}");
+        assert!(pred_resolved(&status, &pred_key(0)), "{status:?}");
+    }
+
+    /// The #761 cadence never delays that recovery. Here every generation,
+    /// including the one holding the rooms, was silent for enough walks to be
+    /// rate-limited, so without the import flag the next load would skip the
+    /// walk. The sweep then reaches it, flags, and the tab dies after one room:
+    /// the next load must still walk. (Silence, not typed absence, for the
+    /// other generations: `NOT_INSTALLED` is process-global, and these are the
+    /// `table3` keys other tests share.)
+    #[test]
+    fn an_interrupted_import_walks_even_where_the_cadence_would_skip() {
+        use super::super::migration_journal::{walk_cadence, SILENT_MIN_ATTEMPTS};
+        let (gen0, rooms) = gen0_with_four_rooms();
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), gen0)
+            .with_delegate(
+                &pred_key(1),
+                DelegateSim {
+                    silent: true,
+                    ..Default::default()
+                },
+            )
+            .with_delegate(
+                &pred_key(2),
+                DelegateSim {
+                    silent: true,
+                    ..Default::default()
+                },
+            )
+            .with_delegate(&successor_key(), DelegateSim::default());
+
+        channel.silence(&pred_key(0), true);
+        for _ in 0..SILENT_MIN_ATTEMPTS {
+            block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
+            let _ = walk_j(&channel, MemorySeam::new());
+        }
+        let settled = block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
+        assert!(
+            walk_cadence(&settled, &[]).is_some(),
+            "fixture: the cadence must rate-limit this status: {settled:?}"
+        );
+
+        channel.silence(&pred_key(0), false);
+        assert_eq!(note(&channel, 0, Some(4)), SweepWrite::Merge);
+        let mut reloaded = MemorySeam::new();
+        reloaded
+            .rooms
+            .map
+            .insert(rooms[0], room_with_identity(rooms[0], 10));
+
+        let (status, seam) = next_load(&channel, reloaded);
+        for room in rooms {
+            assert!(
+                seam.rooms.map.contains_key(&room),
+                "room {room:?} stranded in the predecessor"
+            );
+        }
+        assert!(!status.interrupted_import(), "{status:?}");
+        assert!(pred_resolved(&status, &pred_key(0)), "{status:?}");
+    }
+
+    /// Whether `pred` is no longer pending in `status`.
+    fn pred_resolved(status: &JournalStatus, pred: &DelegateKey) -> bool {
+        match status {
+            JournalStatus::Complete { .. } => true,
+            JournalStatus::Incomplete { pending, .. } => {
+                pending.iter().all(|p| p.key.bytes() != pred.bytes())
+            }
+            _ => false,
+        }
+    }
+
     // ---------------- ranked merge: deletions, and Union shadowing ----------
 
     /// "A room deleted after migration is not resurrected" (freenet/river#763's
