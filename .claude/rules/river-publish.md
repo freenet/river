@@ -250,7 +250,8 @@ where stale legacy data overwrites newer state on the current delegate
    - **No per-room keys, only a legacy `rooms_data` blob** →
      `migrate_current_blob_to_per_room` reads it and re-saves as per-room keys
      (non-destructive — the blob is left as a rollback fallback).
-   - **Nothing** → `fire_legacy_migration_request()`.
+   - **Nothing** → `fire_legacy_migration_request()`, unless the #761 gate
+     skips it on this load (see the journal section below).
 
    There is **no "done" seal and no `localStorage` flag** any more
    (freenet/river#763). Both lived in `localStorage`, which throws in the
@@ -284,7 +285,7 @@ where stale legacy data overwrites newer state on the current delegate
 
 **The #253 ordering, now that the walk runs on every load.** The sweep's
 fixed probes still fire only when the current delegate is empty (or for an
-interrupted-migration recovery). The journaled walk, though, imports every
+interrupted-migration recovery), and not on a load the #761 gate skips. The journaled walk, though, imports every
 pending predecessor while the journal is incomplete, whatever the current
 delegate holds (#763). That cannot clobber newer state: the walk waits for the
 load's workers (the current delegate's own room load included) to settle
@@ -340,12 +341,16 @@ one durable authority over both:
   (silent or refused: one load in 4), counted under
   `__river_migration_walk_skips__` in the current delegate. Silence never
   counts as "not installed".
-- **The empty account's legacy sweep follows the walk** (#761):
+- **The empty account's legacy sweep is gated too** (#761):
   `fire_legacy_migration_request` (three requests to every registered
-  generation) is skipped on a load the cadence skips
-  (`migration_journal::legacy_sweep_wanted`, which waits for this load's walk
-  decision and fires when `begin` failed). Before, an account with no rooms
-  paid it on every load.
+  generation) is skipped on a load the cadence skips while every pending
+  generation was last found typed "not installed"
+  (`migration_journal::sweep_runs`), which blocks the sweep's reads as it
+  blocks the walk's. A silent or refused generation still sweeps on every
+  load, because the sweep can import what the walk refuses.
+  `legacy_sweep_wanted` waits (bounded, 10 s) for this load attempt's answer
+  and sweeps when it is unknown or `begin` failed. Before, an account with no
+  rooms paid the sweep on every load.
 - **The walk again after a sweep flag**, once the load is quiet, so the
   sweep's import is resolved in the same session.
 - All journal calls are **serialised** (the request registry holds one waiter
@@ -374,8 +379,9 @@ retry; a wrong short answer would be certified complete.
 
 **End state of a refused predecessor.** A FROZEN generation whose index is
 genuinely short is refused on every load: it stays pending (its
-`absent_streak` stays 0, so the #761 cadence never slows its walk), and its
-unlisted rooms do not migrate. The rooms its short index does list still
+`absent_streak` stays 0; after 6 refused walks the #761 cadence walks it on
+one load in 4, and an empty account's sweep still runs on every load), and
+its unlisted rooms do not migrate. The rooms its short index does list still
 arrive through the sweep. The user is told only when importing an identity:
 the gate reads `Unresolved` and offers "Import anyway". There is no general
 notice, and no repair path short of reading the delegate's storage directly

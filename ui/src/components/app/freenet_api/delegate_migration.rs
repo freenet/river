@@ -4666,11 +4666,13 @@ mod tests {
         assert!(pred_resolved(&status, &pred_key(0)), "{status:?}");
     }
 
-    /// The #761 cadence never delays that recovery. Here every other
-    /// generation is typed-absent and the one holding the rooms was silent for
-    /// enough walks to be rate-limited, so without the import flag the next
-    /// load would skip the walk. The sweep then reaches it, flags, and the tab
-    /// dies after one room: the next load must still walk.
+    /// The #761 cadence never delays that recovery. Here every generation,
+    /// including the one holding the rooms, was silent for enough walks to be
+    /// rate-limited, so without the import flag the next load would skip the
+    /// walk. The sweep then reaches it, flags, and the tab dies after one room:
+    /// the next load must still walk. (Silence, not typed absence, for the
+    /// other generations: `NOT_INSTALLED` is process-global, and these are the
+    /// `table3` keys other tests share.)
     #[test]
     fn an_interrupted_import_walks_even_where_the_cadence_would_skip() {
         use super::super::migration_journal::{walk_cadence, SILENT_MIN_ATTEMPTS};
@@ -4680,14 +4682,14 @@ mod tests {
             .with_delegate(
                 &pred_key(1),
                 DelegateSim {
-                    not_installed: true,
+                    silent: true,
                     ..Default::default()
                 },
             )
             .with_delegate(
                 &pred_key(2),
                 DelegateSim {
-                    not_installed: true,
+                    silent: true,
                     ..Default::default()
                 },
             )

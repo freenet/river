@@ -21,7 +21,8 @@
 //!   (freenet/river#761) only while every pending predecessor is consistently not
 //!   installed or persistently unresolved, and nothing is mid-import.
 //! * **The empty account's legacy sweep follows the walk** (#761): it is
-//!   skipped on a load the cadence skips ([`legacy_sweep_wanted`]).
+//!   skipped on a load the cadence skips while every pending predecessor is
+//!   typed "not installed" ([`sweep_runs`]).
 //! * **`note_app_import_started` before every sweep merge** (`response_handler`):
 //!   [`gate_sweep_import`] decides merge / merge unflagged / skip.
 //! * **The walk again after a sweep flag**, once the load is quiet, so the
@@ -75,8 +76,11 @@ pub(crate) struct JournalSession {
     /// The sweep flagged an import after `status` was computed, so `status`
     /// does not know about it yet.
     pub(crate) sweep_flagged_since_status: bool,
-    /// This page load's walk decision, once [`start_journal_load`] made it.
-    pub(crate) walk_decision: Option<WalkDecision>,
+    /// Whether the empty account's legacy sweep runs, once this load attempt's
+    /// [`start_journal_load`] decided it (freenet/river#761). Cleared whenever
+    /// `start_journal_load` is re-armed, so an earlier attempt's answer never
+    /// stands in for a later one's.
+    pub(crate) load_sweep: Option<bool>,
 }
 
 impl JournalSession {
@@ -108,18 +112,16 @@ impl JournalSession {
         }
     }
 
+    /// [`start_journal_load`] accepted a new load attempt: wait for its own
+    /// sweep answer.
+    pub(crate) fn on_load_armed(&mut self) {
+        self.load_sweep = None;
+    }
+
     /// What [`legacy_sweep_wanted`] can answer now; `None` keeps it waiting
-    /// for this load's walk decision. The empty account's legacy sweep follows
-    /// the walk (freenet/river#761): it is skipped only on a load the cadence
-    /// skips, and fires when `begin` failed.
+    /// for this attempt's decision. A failed `begin` sweeps, as before #761.
     pub(crate) fn sweep_answer(&self) -> Option<bool> {
-        if let Some(decision) = self.walk_decision {
-            return Some(!matches!(decision, WalkDecision::Skip { .. }));
-        }
-        if self.begin_failed {
-            return Some(true);
-        }
-        None
+        self.load_sweep.or(self.begin_failed.then_some(true))
     }
 
     /// What [`interrupted_import_for_recovery`] can answer now; `None` keeps it
@@ -520,10 +522,14 @@ pub(crate) fn start_journal_load() {
     if LOAD_ARMED.swap(true, Ordering::Relaxed) {
         return;
     }
+    // Synchronously, before the caller spawns the room load whose
+    // `ProbeLegacy` arm reads it.
+    update_session(JournalSession::on_load_armed);
     crate::util::safe_spawn_local(async {
         let Some(status) = begin_locked().await else {
             // Retry on the next load attempt (reconnect / Retry button).
             LOAD_ARMED.store(false, Ordering::Relaxed);
+            update_session(|s| s.load_sweep = Some(true));
             return;
         };
         let decision = {
@@ -558,7 +564,8 @@ pub(crate) fn start_journal_load() {
             }
         };
         info!("migration journal: walk decision for this load: {decision:?}");
-        update_session(move |s| s.walk_decision = Some(decision));
+        let sweep = sweep_runs(decision, &status);
+        update_session(move |s| s.load_sweep = Some(sweep));
         // The post-resolve top-up (#768 review B1) once the newest
         // predecessor is resolved. It runs on its own: it never forces the
         // walk (which the #761 cadence may be skipping this load).
@@ -640,24 +647,42 @@ pub(crate) async fn interrupted_import_for_recovery() -> bool {
     }
 }
 
-/// Whether the empty account's legacy sweep (`fire_legacy_migration_request`)
-/// runs on this load (freenet/river#761). The sweep sends three requests to
-/// every registered legacy generation, so an account with no rooms paid that
-/// on every load, on top of the walk. It now follows the walk's cadence: on a
-/// load the cadence skips, every pending generation is either typed "not
-/// installed" or has stayed unresolved through `SILENT_MIN_ATTEMPTS` walks,
-/// and nothing is mid-import, so the sweep has nothing to find that the next
-/// walk would not. Waits (bounded) for this load's walk decision; unknown
-/// fires, as before.
+/// Whether the empty account's legacy sweep (`fire_legacy_migration_request`,
+/// three requests to every registered legacy generation) runs on a load whose
+/// walk decision is `decision` over `status` (freenet/river#761). An account
+/// with no rooms used to pay it on every load, on top of the walk.
+///
+/// It is skipped only where it cannot find anything: the cadence skips the
+/// walk AND every pending predecessor was last found typed "not installed",
+/// which blocks the sweep's reads exactly as it blocks the walk's. A silent or
+/// refused predecessor still sweeps on every load: the sweep reads without
+/// the walk's completeness checks, so it can import what the walk refuses (a
+/// short or inconsistent index), and an empty account that saw "no rooms"
+/// and then created one would never reach the sweep again.
+pub(crate) fn sweep_runs(decision: WalkDecision, status: &JournalStatus) -> bool {
+    !matches!(decision, WalkDecision::Skip { .. }) || a_pending_predecessor_may_hold_data(status)
+}
+
+/// How long the `ProbeLegacy` arm waits for this load attempt's sweep answer
+/// before sweeping anyway.
+const SWEEP_ANSWER_WAIT_MS: u64 = 10_000;
+
+/// Whether the empty account's legacy sweep runs on this load attempt (see
+/// [`sweep_runs`]). Waits (bounded) for [`start_journal_load`]'s answer;
+/// unknown sweeps, as before.
 pub(crate) async fn legacy_sweep_wanted() -> bool {
+    wait_for_sweep_answer(|| session().sweep_answer(), SWEEP_ANSWER_WAIT_MS).await
+}
+
+/// Poll `answer` until it is known, or sweep after `max_ms`.
+async fn wait_for_sweep_answer(answer: impl Fn() -> Option<bool>, max_ms: u64) -> bool {
     const POLL_MS: u64 = 50;
-    const MAX_MS: u64 = 10_000;
     let mut waited = 0;
     loop {
-        if let Some(answer) = session().sweep_answer() {
+        if let Some(answer) = answer() {
             return answer;
         }
-        if waited >= MAX_MS {
+        if waited >= max_ms {
             return true;
         }
         crate::util::sleep(std::time::Duration::from_millis(POLL_MS)).await;
@@ -1367,81 +1392,115 @@ mod tests {
         );
     }
 
-    /// The `{ ... }` block opened by the first `{` at or after `from`, string
-    /// literals skipped.
-    /// freenet/river#761: the empty account's legacy sweep follows this load's
-    /// walk decision. It waits for the decision, fires when `begin` failed or
-    /// the walk runs (including a fresh journal, the first load after a
-    /// re-key, and an interrupted import), and is skipped only on a load the
-    /// cadence skips.
+    /// freenet/river#761: the empty account's legacy sweep is skipped only on a
+    /// load the cadence skips while every pending predecessor is typed "not
+    /// installed". A fresh journal (the first load after a re-key), an
+    /// interrupted import, a complete journal, the cadence's own load, and a
+    /// silent or refused predecessor all sweep.
     #[test]
-    fn the_empty_accounts_sweep_follows_the_walk_decision() {
-        let mut s = JournalSession::default();
-        assert_eq!(s.sweep_answer(), None, "waits for the decision");
-        s.on_begin_err();
-        assert_eq!(
-            s.sweep_answer(),
-            Some(true),
-            "begin failed: fire, as before"
-        );
-        let answer = |decision| {
-            JournalSession {
-                walk_decision: Some(decision),
-                ..Default::default()
-            }
-            .sweep_answer()
-        };
-        for (decision, fires) in [
-            (WalkDecision::Run, true),
-            (WalkDecision::RunResetCadence, true),
-            (WalkDecision::NotNeeded, true),
-            (WalkDecision::Skip { skips: 1 }, false),
-        ] {
-            assert_eq!(answer(decision), Some(fires), "{decision:?}");
-        }
-        // From the real crate's statuses.
-        assert_eq!(
-            answer(walk_decision(&fresh_status(), &[], Some(0))),
-            Some(true),
-            "the first load after a re-key sweeps"
-        );
-        assert_eq!(
-            answer(walk_decision(&interrupted_status(), &[], Some(0))),
-            Some(true)
-        );
+    fn the_empty_accounts_sweep_is_skipped_only_where_it_cannot_find_anything() {
+        use super::super::delegate_migration::tests_support::silent_status;
         let absent = all_absent_status();
-        assert_eq!(answer(walk_decision(&absent, &[], Some(0))), Some(false));
-        assert_eq!(
-            answer(walk_decision(&absent, &[], Some(WALK_EVERY_N_LOADS - 1))),
-            Some(true),
-            "the sweep runs with the walk on the cadence's load"
-        );
-        assert_eq!(
-            answer(walk_decision(&absent, &[], None)),
-            Some(true),
+        let skip = walk_decision(&absent, &[], Some(0));
+        assert!(matches!(skip, WalkDecision::Skip { .. }), "{skip:?}");
+        assert!(!sweep_runs(skip, &absent), "the #761 case: nothing to find");
+        assert!(sweep_runs(
+            walk_decision(&absent, &[], Some(WALK_EVERY_N_LOADS - 1)),
+            &absent
+        ));
+        assert!(
+            sweep_runs(walk_decision(&absent, &[], None), &absent),
             "an unreadable counter walks, and sweeps"
         );
+        for status in [fresh_status(), interrupted_status()] {
+            assert!(sweep_runs(walk_decision(&status, &[], Some(0)), &status));
+        }
+        let complete = JournalStatus::Complete { rejected_items: 0 };
+        assert!(sweep_runs(walk_decision(&complete, &[], None), &complete));
+        // The cadence skips a persistently silent (or refused) predecessor's
+        // walk, but the sweep may still import what the walk refuses.
+        let silent = silent_status(SILENT_MIN_ATTEMPTS);
+        let skip = walk_decision(&silent, &[], Some(0));
+        assert!(matches!(skip, WalkDecision::Skip { .. }), "{skip:?}");
+        assert!(sweep_runs(skip, &silent));
     }
 
-    /// The #761 wiring: `start_journal_load` records the FINAL decision (after
-    /// the uncounted-skip fallback) before acting on it, and the `ProbeLegacy`
-    /// arm fires the sweep only inside `legacy_sweep_wanted`'s branch.
+    /// The session answer: it waits for this attempt's decision, a failed
+    /// `begin` sweeps, and re-arming the load clears an earlier attempt's
+    /// answer so it never stands in for the new one's.
     #[test]
-    fn the_sweep_gate_is_wired_to_the_final_walk_decision() {
+    fn the_sweep_answer_is_this_attempts_own() {
+        let mut s = JournalSession::default();
+        assert_eq!(s.sweep_answer(), None, "waits for the decision");
+        s.load_sweep = Some(false);
+        assert_eq!(s.sweep_answer(), Some(false));
+        s.on_load_armed();
+        assert_eq!(s.sweep_answer(), None, "a re-armed load waits again");
+        s.on_begin_err();
+        assert_eq!(s.sweep_answer(), Some(true), "begin failed: sweep");
+    }
+
+    /// The wait: an unknown answer sweeps once the bound passes, and a known
+    /// one (even after a few polls) is returned as is.
+    #[test]
+    fn the_sweep_wait_returns_the_answer_or_sweeps_at_its_bound() {
+        use futures::executor::block_on;
+        assert!(block_on(wait_for_sweep_answer(|| None, 120)));
+        assert!(!block_on(wait_for_sweep_answer(|| Some(false), 120)));
+        let polls = std::cell::Cell::new(0);
+        let late = || {
+            polls.set(polls.get() + 1);
+            (polls.get() > 3).then_some(false)
+        };
+        assert!(!block_on(wait_for_sweep_answer(late, 10_000)));
+        assert_eq!(polls.get(), 4, "it waited for the answer");
+    }
+
+    /// The #761 wiring:
+    /// * `start_journal_load` clears the previous attempt's answer before it
+    ///   spawns anything, records "sweep" when `begin` fails, and records the
+    ///   answer for the FINAL decision (after the uncounted-skip fallback)
+    ///   before acting on it;
+    /// * `legacy_sweep_wanted` waits on the session's answer;
+    /// * the `ProbeLegacy` arm fires the sweep only inside its branch.
+    #[test]
+    fn the_sweep_gate_is_wired_to_this_attempts_final_decision() {
         let src = crate::util::strip_comments(include_str!("migration_journal.rs"));
         let src = src.as_str();
         let start = src
             .find("pub(crate) fn start_journal_load()")
             .expect("start_journal_load");
         let body = block(src, start);
+        let armed = body
+            .find("update_session(JournalSession::on_load_armed);")
+            .expect("re-arm clears the answer");
+        let spawn = body.find("safe_spawn_local(").expect("spawn");
+        assert!(armed < spawn && depth_at(body, armed) == 1);
+        let failed = block(
+            body,
+            body.find("let Some(status) = begin_locked().await else {")
+                .expect("begin failure")
+                + "let Some(status) = begin_locked().await".len(),
+        );
+        assert!(failed.contains("s.load_sweep = Some(true)"));
         let decided = body.find("let decision = {").expect("decision block");
         let decided_end = decided + block(body, decided).len();
-        let record = "update_session(move |s| s.walk_decision = Some(decision));";
+        let computed = body
+            .find("let sweep = sweep_runs(decision, &status);")
+            .expect("the answer comes from sweep_runs");
+        let record = "update_session(move |s| s.load_sweep = Some(sweep));";
         assert_eq!(body.matches(record).count(), 1);
-        let recorded = body.find(record).expect("the decision is recorded");
+        let recorded = body.find(record).expect("the answer is recorded");
         let plan = body.find("let plan = load_plan(").expect("plan");
-        assert!(decided_end < recorded && recorded < plan);
+        assert!(decided_end < computed && computed < recorded && recorded < plan);
         assert_eq!(depth_at(body, recorded), 2, "recorded unconditionally");
+
+        let wanted = block(
+            src,
+            src.find("pub(crate) async fn legacy_sweep_wanted()")
+                .expect("legacy_sweep_wanted"),
+        );
+        assert!(wanted.contains("session().sweep_answer()"));
 
         let rh = crate::util::strip_comments(include_str!("response_handler.rs"));
         let rh = rh.split("mod tests {").next().expect("production");
@@ -1458,6 +1517,8 @@ mod tests {
         );
     }
 
+    /// The `{ ... }` block opened by the first `{` at or after `from`, string
+    /// literals skipped.
     fn block(src: &str, from: usize) -> &str {
         let open = from + src[from..].find('{').expect("a block");
         let mut depth = 0i32;
