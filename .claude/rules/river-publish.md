@@ -285,9 +285,9 @@ where stale legacy data overwrites newer state on the current delegate
 
 **The #253 ordering, now that the walk runs on every load.** The sweep's
 fixed probes still fire only when the current delegate is empty (or for an
-interrupted-migration recovery), and not on a load the #761 gate skips. The journaled walk, though, imports every
-pending predecessor while the journal is incomplete, whatever the current
-delegate holds (#763). That cannot clobber newer state: the walk waits for the
+interrupted-migration recovery), and not on a load the #761 gate skips. The
+journaled walk, though, imports every pending predecessor while the journal
+is incomplete, whatever the current delegate holds (#763). That cannot clobber newer state: the walk waits for the
 load's workers (the current delegate's own room load included) to settle
 before it starts, every import goes through `Rooms::merge_from_source` at the
 predecessor's generation rank, below the current delegate's (so a current
@@ -344,13 +344,18 @@ one durable authority over both:
 - **The empty account's legacy sweep is gated too** (#761):
   `fire_legacy_migration_request` (three requests to every registered
   generation) is skipped on a load the cadence skips while every pending
-  generation was last found typed "not installed"
-  (`migration_journal::sweep_runs`), which blocks the sweep's reads as it
-  blocks the walk's. A silent or refused generation still sweeps on every
-  load, because the sweep can import what the walk refuses.
-  `legacy_sweep_wanted` waits (bounded, 10 s) for this load attempt's answer
-  and sweeps when it is unknown or `begin` failed. Before, an account with no
-  rooms paid the sweep on every load.
+  generation answered a typed "missing delegate" on each of the last 3 walks
+  (`migration_journal::sweep_runs`). Three, not one: a transient node fault
+  can come back as that same typed answer. A generation that was silent or
+  refused, or answered otherwise recently, keeps the sweep on every load,
+  because the sweep can import what the walk refuses; and an empty account
+  that saw "no rooms" and then created one would never reach the sweep again.
+  `legacy_sweep_wanted` waits (bounded, 10 s) for the answer
+  `start_journal_load` records (at once after `begin` when no decision could
+  skip, "sweep" when `begin` fails) and sweeps when it is unknown. Typed
+  absence needs freenet-core 0.2.137 or later; on older nodes the sweep runs
+  on every load, as before. The cost of a skip: a generation the node starts
+  answering for again waits for the cadence's next walk, up to 9 loads.
 - **The walk again after a sweep flag**, once the load is quiet, so the
   sweep's import is resolved in the same session.
 - All journal calls are **serialised** (the request registry holds one waiter

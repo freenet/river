@@ -2800,6 +2800,52 @@ pub(crate) mod tests_support {
         }
         status.expect("journaled walk status")
     }
+
+    /// A status after `silent` journaled walks in which both generations of a
+    /// 2-generation lineage never answered, then `absent` walks in which the
+    /// node answered a typed "missing delegate" for both.
+    pub(crate) fn silent_then_absent_status(silent: u32, absent: u32) -> JournalStatus {
+        // Keys of its own: `NOT_INSTALLED` is process-global.
+        static NEXT_PAIR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0xD0);
+        let n = NEXT_PAIR.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        let table = [
+            ([n; 32], [n.wrapping_add(0x20); 32]),
+            ([n + 1; 32], [n.wrapping_add(0x21); 32]),
+        ];
+        let lineage = river_delegate_lineage(&table);
+        let keys: Vec<DelegateKey> = table
+            .iter()
+            .map(|(key, code)| DelegateKey::new(*key, CodeHash::new(*code)))
+            .collect();
+        let mut channel = MockChannel::default();
+        for key in &keys {
+            let sim = DelegateSim {
+                silent: true,
+                ..Default::default()
+            };
+            channel = channel.with_delegate(key, sim);
+        }
+        channel = channel.with_delegate(&successor_key(), DelegateSim::default());
+        let mut status = None;
+        for walk in 0..silent + absent {
+            if walk == silent {
+                for key in &keys {
+                    let mut delegates = channel.delegates.borrow_mut();
+                    let sim = delegates.get_mut(key.bytes()).expect("fixture delegate");
+                    sim.silent = false;
+                    sim.not_installed = true;
+                }
+            }
+            let (report, _) = futures::executor::block_on(walk_with(
+                &channel,
+                NoImports,
+                successor_key(),
+                &lineage,
+            ));
+            status = report.status;
+        }
+        status.expect("journaled walk status")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4573,9 +4619,9 @@ mod tests {
         (gen0, rooms)
     }
 
-    /// The load after an interrupted one, as production runs it: `begin`, the
-    /// #761 walk decision (with the cadence counter at any value it could
-    /// hold), and the walk when the decision says to.
+    /// The journal half of the load after an interrupted one, as the driver
+    /// runs it: `begin`, the #761 walk decision (with the cadence counter at
+    /// any value it could hold), and the walk when the decision says to.
     fn next_load(channel: &MockChannel, seam: MemorySeam) -> (JournalStatus, MemorySeam) {
         use super::super::migration_journal::{load_plan, walk_decision};
         let begun = block_on(begin_with(channel, successor_key(), &lineage3())).unwrap();
@@ -4601,6 +4647,12 @@ mod tests {
     /// gateway's sandboxed iframe never stored) never ran. Here the flag is in
     /// the successor's journal: the next load's `begin` reports it, the walk
     /// runs whatever the cadence counter says, and every room arrives.
+    ///
+    /// This pins the mechanism (journal flag, walk decision, walk) on the mock
+    /// channel; the successor's one room is the reloaded seam. The load-plan
+    /// classification and the wasm-only drivers are pinned by source tests in
+    /// `response_handler.rs` and `migration_journal.rs`, and the end-to-end
+    /// interrupt runs were done on a real node for #768.
     #[test]
     fn a_tab_killed_after_the_first_room_write_strands_no_room() {
         let (gen0, rooms) = gen0_with_four_rooms();
