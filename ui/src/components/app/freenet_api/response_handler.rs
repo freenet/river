@@ -849,10 +849,9 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // The current delegate lists no rooms: its room set is complete
             // (empty), so nothing it holds can be overwritten by a migration.
             mark_room_set_complete(worker.attempt());
-            // freenet/river#761: not on a load the walk's cadence skips while
-            // every pending generation keeps answering "not installed"
-            // (`sweep_runs`), so an account with no rooms stops probing every
-            // legacy generation on every load.
+            // freenet/river#761: not on a load the walk's cadence skips on a
+            // node that never had any legacy generation (`sweep_runs`), so a
+            // new visitor stops probing every legacy generation on every load.
             let wanted = legacy_sweep_wanted().await;
             if !load_attempt_is_current(worker.attempt()) {
                 // A reconnect superseded this attempt during the wait: its own

@@ -341,21 +341,25 @@ one durable authority over both:
   (silent or refused: one load in 4), counted under
   `__river_migration_walk_skips__` in the current delegate. Silence never
   counts as "not installed".
-- **The empty account's legacy sweep is gated too** (#761):
-  `fire_legacy_migration_request` (three requests to every registered
-  generation) is skipped on a load the cadence skips while every pending
-  generation answered a typed "missing delegate" on each of the last 3 walks
-  (`migration_journal::sweep_runs`). Three, not one: a transient node fault
-  can come back as that same typed answer. A generation that was silent or
-  refused, or answered otherwise recently, keeps the sweep on every load,
-  because the sweep can import what the walk refuses; and an empty account
-  that saw "no rooms" and then created one would never reach the sweep again.
-  `legacy_sweep_wanted` waits (bounded, 10 s) for the answer
-  `start_journal_load` records (at once after `begin` when no decision could
-  skip, "sweep" when `begin` fails) and sweeps when it is unknown. Typed
-  absence needs freenet-core 0.2.137 or later; on older nodes the sweep runs
-  on every load, as before. The cost of a skip: a generation the node starts
-  answering for again waits for the cadence's next walk, up to 9 loads.
+- **The empty account's legacy sweep is gated too** (#761), for a node that
+  has never had any generation of the lineage: `fire_legacy_migration_request`
+  (three requests to every registered generation) is skipped on a load the
+  cadence skips while every generation is still pending and answered a typed
+  "missing delegate" on every walk that examined it, at least 3
+  (`migration_journal::sweep_runs`). Anything else sweeps on every load, as
+  before: a resolved generation (the sweep is the backstop for a completed
+  import that was partial), one that was ever silent or refused (the sweep can
+  import what the walk refuses, and an empty account that saw "no rooms" and
+  then created one would never reach the sweep again), and fewer than 3 typed
+  absences (a transient node fault can come back as that same typed answer).
+  `legacy_sweep_wanted` waits (about 10 s of polls) for the answer
+  `start_journal_load` records: at once after `begin` when no decision could
+  skip, "sweep" when `begin` fails, else from the final decision. It sweeps
+  when the answer is unknown. A reconnect or Retry that does not re-arm
+  `start_journal_load` reuses the page load's answer, as it reuses the walk
+  decision. Typed absence needs freenet-core 0.2.137 or later; on older nodes
+  the sweep runs on every load. The cost of a skip: a generation the node
+  starts answering for later waits for the cadence's next walk, up to 9 loads.
 - **The walk again after a sweep flag**, once the load is quiet, so the
   sweep's import is resolved in the same session.
 - All journal calls are **serialised** (the request registry holds one waiter

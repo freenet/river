@@ -489,7 +489,8 @@ enum Prewarmed {
     /// TYPED "missing delegate" (`DelegateError::Missing`, core 0.2.137+). Still
     /// not proof it holds nothing (core unregisters without deleting secrets);
     /// the walk treats it exactly like silence, and the journal counts it in the
-    /// absent streak that drives the freenet/river#761 cadence.
+    /// absent streak that drives the freenet/river#761 cadence and the empty
+    /// account's sweep gate (`migration_journal::sweep_runs`).
     NotInstalled,
 }
 

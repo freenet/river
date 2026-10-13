@@ -20,9 +20,9 @@
 //!   hang off the `ProbeLegacy` sweep. Rate-limited by [`walk_decision`]
 //!   (freenet/river#761) only while every pending predecessor is consistently not
 //!   installed or persistently unresolved, and nothing is mid-import.
-//! * **The empty account's legacy sweep follows the walk** (#761): it is
-//!   skipped on a load the cadence skips while every pending predecessor has
-//!   been typed "not installed" on the last 3 walks ([`sweep_runs`]).
+//! * **The empty account's legacy sweep follows the walk** (#761) where the
+//!   node has never had any generation of the lineage: it is skipped on a
+//!   load the cadence skips ([`sweep_runs`]).
 //! * **`note_app_import_started` before every sweep merge** (`response_handler`):
 //!   [`gate_sweep_import`] decides merge / merge unflagged / skip.
 //! * **The walk again after a sweep flag**, once the load is quiet, so the
@@ -537,7 +537,7 @@ pub(crate) fn start_journal_load() {
         // Answer at once when the decision below cannot skip the sweep, so the
         // first load after a re-key (a fresh journal) does not hold the sweep
         // for the short-index and cadence reads.
-        if !sweep_may_skip(&status) {
+        if !sweep_may_skip(&status, LINEAGE.len()) {
             update_session(|s| s.load_sweep = Some(true));
         }
         let decision = {
@@ -572,7 +572,7 @@ pub(crate) fn start_journal_load() {
             }
         };
         info!("migration journal: walk decision for this load: {decision:?}");
-        let sweep = sweep_runs(decision, &status);
+        let sweep = sweep_runs(decision, &status, LINEAGE.len());
         update_session(move |s| s.load_sweep = Some(sweep));
         // The post-resolve top-up (#768 review B1) once the newest
         // predecessor is resolved. It runs on its own: it never forces the
@@ -661,27 +661,47 @@ pub(crate) async fn interrupted_import_for_recovery() -> bool {
 /// with no rooms used to pay it on every load, on top of the walk.
 ///
 /// It is skipped only when the cadence skips the walk AND [`sweep_may_skip`]:
-/// every pending predecessor answered a typed "missing delegate" on each of
-/// the last [`CADENCE_ABSENT_STREAK`] walks, so the node had none of them on
-/// each. Three in a row, not one: a transient fault on the node can come back
-/// as that same typed answer (freenet-core#5857's shape) for a delegate that
-/// holds data. Any predecessor that was silent or refused, or answered
-/// otherwise on a recent walk, keeps the sweep on every load: the sweep reads
-/// without the walk's completeness checks, so it can import what the walk
-/// refuses (a short or inconsistent index), and an empty account that saw
-/// "no rooms" and then created one would never reach the sweep again.
+/// this node has never had any generation of the lineage. Every generation
+/// is still pending (none resolved, so no completed import whose
+/// "completed but partial" backstop is this sweep), and each answered a typed
+/// "missing delegate" on every walk that examined it, at least
+/// [`CADENCE_ABSENT_STREAK`] of them. That is the #761 case: a visitor whose
+/// node never ran an earlier River build.
 ///
-/// The cost of a skip: a generation the node starts answering for again (it
-/// was not installed, or a fault lasted three walks) waits for the cadence's
-/// next walk, up to [`WALK_EVERY_N_LOADS`] - 1 loads.
-pub(crate) fn sweep_runs(decision: WalkDecision, status: &JournalStatus) -> bool {
-    !matches!(decision, WalkDecision::Skip { .. }) || !sweep_may_skip(status)
+/// Anything else keeps the sweep on every load, as before #761:
+/// * a generation that was ever silent, refused or anything but typed
+///   absent. The sweep reads without the walk's completeness checks, so it
+///   can import what the walk refuses (a short or inconsistent index), and an
+///   empty account that saw "no rooms" and then created one would never
+///   reach the sweep again;
+/// * fewer than three typed absences: a transient fault on the node can come
+///   back as that same typed answer (freenet-core#5857's shape) for a delegate
+///   that holds data;
+/// * any resolved generation.
+///
+/// The cost of a skip: a generation the node starts answering for after
+/// that (it was installed later, or a fault lasted from the first walk on)
+/// waits for the cadence's next walk, up to [`WALK_EVERY_N_LOADS`] - 1 loads.
+pub(crate) fn sweep_runs(
+    decision: WalkDecision,
+    status: &JournalStatus,
+    lineage_len: usize,
+) -> bool {
+    !matches!(decision, WalkDecision::Skip { .. }) || !sweep_may_skip(status, lineage_len)
 }
 
 /// Whether any walk decision could skip the empty account's sweep for
-/// `status` (see [`sweep_runs`]). Nothing may be mid-import either.
-pub(crate) fn sweep_may_skip(status: &JournalStatus) -> bool {
-    status.pending_all_absent(CADENCE_ABSENT_STREAK)
+/// `status` over a lineage of `lineage_len` generations (see [`sweep_runs`]).
+pub(crate) fn sweep_may_skip(status: &JournalStatus, lineage_len: usize) -> bool {
+    let JournalStatus::Incomplete { pending, .. } = status else {
+        return false;
+    };
+    pending.len() == lineage_len
+        && pending.iter().all(|p| {
+            p.import != freenet_migrate::ImportFlag::Started
+                && p.absent_streak >= CADENCE_ABSENT_STREAK
+                && p.absent_streak == p.attempts
+        })
 }
 
 /// How long the `ProbeLegacy` arm waits for this load attempt's sweep answer
@@ -695,7 +715,9 @@ pub(crate) async fn legacy_sweep_wanted() -> bool {
     wait_for_sweep_answer(|| session().sweep_answer(), SWEEP_ANSWER_WAIT_MS).await
 }
 
-/// Poll `answer` until it is known, or sweep after `max_ms`.
+/// Poll `answer` until it is known, or sweep after `max_ms` worth of polls
+/// (a poll count, not wall time: a background tab's clamped timers stretch
+/// it, which only delays a sweep that would then run).
 async fn wait_for_sweep_answer(answer: impl Fn() -> Option<bool>, max_ms: u64) -> bool {
     const POLL_MS: u64 = 50;
     let mut waited = 0;
@@ -1414,54 +1436,86 @@ mod tests {
     }
 
     /// freenet/river#761: the empty account's legacy sweep is skipped only on a
-    /// load the cadence skips while every pending predecessor has been typed
-    /// "not installed" on the last 3 walks. A fresh journal (the first load
-    /// after a re-key), an interrupted import, a complete journal, the
-    /// cadence's own load, a silent or refused predecessor, and one typed
-    /// absent on its latest walk only all sweep.
+    /// load the cadence skips, on a node that has never had any generation:
+    /// every generation pending and typed "not installed" on every walk, 3 or
+    /// more. A fresh journal (the first load after a re-key), an interrupted
+    /// import, a complete journal, the cadence's own load, a resolved
+    /// generation, a silent or refused one, one typed absent only lately, and
+    /// one typed absent fewer than 3 times all sweep.
     #[test]
-    fn the_empty_accounts_sweep_is_skipped_only_where_it_cannot_find_anything() {
+    fn the_empty_accounts_sweep_is_skipped_only_on_a_node_that_never_had_river() {
         use super::super::delegate_migration::tests_support::{
             silent_status, silent_then_absent_status,
         };
+        // The fixtures' lineages have two generations.
+        const LINEAGE_LEN: usize = 2;
         let absent = all_absent_status();
-        assert!(sweep_may_skip(&absent));
+        assert!(sweep_may_skip(&absent, LINEAGE_LEN));
         let skip = walk_decision(&absent, &[], Some(0));
         assert!(matches!(skip, WalkDecision::Skip { .. }), "{skip:?}");
-        assert!(!sweep_runs(skip, &absent), "the #761 case: nothing to find");
+        assert!(!sweep_runs(skip, &absent, LINEAGE_LEN), "the #761 case");
         assert!(sweep_runs(
             walk_decision(&absent, &[], Some(WALK_EVERY_N_LOADS - 1)),
-            &absent
+            &absent,
+            LINEAGE_LEN
         ));
         assert!(
-            sweep_runs(walk_decision(&absent, &[], None), &absent),
+            sweep_runs(walk_decision(&absent, &[], None), &absent, LINEAGE_LEN),
             "an unreadable counter walks, and sweeps"
         );
+        assert!(
+            sweep_runs(skip, &absent, LINEAGE_LEN + 1),
+            "a generation the journal no longer lists as pending was resolved"
+        );
         for status in [fresh_status(), interrupted_status()] {
-            assert!(!sweep_may_skip(&status));
-            assert!(sweep_runs(walk_decision(&status, &[], Some(0)), &status));
+            assert!(!sweep_may_skip(&status, LINEAGE_LEN));
+            assert!(sweep_runs(
+                walk_decision(&status, &[], Some(0)),
+                &status,
+                LINEAGE_LEN
+            ));
         }
         let complete = JournalStatus::Complete { rejected_items: 0 };
-        assert!(!sweep_may_skip(&complete));
-        assert!(sweep_runs(walk_decision(&complete, &[], None), &complete));
-        // The cadence skips a persistently silent (or refused) predecessor's
-        // walk, but the sweep may still import what the walk refuses.
-        // Likewise one typed "not installed" answer after that: it may be a
-        // transient fault.
+        assert!(!sweep_may_skip(&complete, LINEAGE_LEN));
+        assert!(sweep_runs(
+            walk_decision(&complete, &[], None),
+            &complete,
+            LINEAGE_LEN
+        ));
+        // The cadence skips these walks, but each generation was once silent
+        // or refused (the sweep may import what the walk refuses), or was
+        // typed absent too few times (a transient fault).
         let once_absent = silent_then_absent_status(SILENT_MIN_ATTEMPTS, 1);
-        let JournalStatus::Incomplete { pending, .. } = &once_absent else {
-            panic!("{once_absent:?}");
-        };
+        let lately_absent = silent_then_absent_status(SILENT_MIN_ATTEMPTS, CADENCE_ABSENT_STREAK);
+        for (status, streak) in [(&once_absent, 1), (&lately_absent, CADENCE_ABSENT_STREAK)] {
+            let JournalStatus::Incomplete { pending, .. } = status else {
+                panic!("{status:?}");
+            };
+            assert!(
+                pending
+                    .iter()
+                    .all(|p| p.absent_streak == streak && p.attempts > streak),
+                "fixture: {status:?}"
+            );
+        }
         assert!(
-            pending.iter().all(|p| p.absent_streak == 1),
-            "fixture: typed absent on the latest walk only: {once_absent:?}"
+            lately_absent.pending_all_absent(CADENCE_ABSENT_STREAK),
+            "the cadence's own test would call it consistently absent"
         );
-        for status in [silent_status(SILENT_MIN_ATTEMPTS), once_absent] {
+        for status in [
+            silent_status(SILENT_MIN_ATTEMPTS),
+            once_absent,
+            lately_absent,
+        ] {
             let skip = walk_decision(&status, &[], Some(0));
             assert!(matches!(skip, WalkDecision::Skip { .. }), "{skip:?}");
-            assert!(!sweep_may_skip(&status), "{status:?}");
-            assert!(sweep_runs(skip, &status), "{status:?}");
+            assert!(!sweep_may_skip(&status, LINEAGE_LEN), "{status:?}");
+            assert!(sweep_runs(skip, &status, LINEAGE_LEN), "{status:?}");
         }
+        let twice = super::super::delegate_migration::tests_support::all_absent_status(
+            CADENCE_ABSENT_STREAK - 1,
+        );
+        assert!(!sweep_may_skip(&twice, LINEAGE_LEN), "{twice:?}");
     }
 
     /// The session answer: it waits for the current arming's answer, an
@@ -1549,14 +1603,14 @@ mod tests {
         );
         assert!(failed.contains("s.load_sweep = Some(true)"));
         let early_at = body
-            .find("if !sweep_may_skip(&status) {")
+            .find("if !sweep_may_skip(&status, LINEAGE.len()) {")
             .expect("early answer");
         assert!(block(body, early_at).contains("s.load_sweep = Some(true)"));
         let decided = body.find("let decision = {").expect("decision block");
         assert!(early_at < decided, "answered before the decision reads");
         let decided_end = decided + block(body, decided).len();
         let computed = body
-            .find("let sweep = sweep_runs(decision, &status);")
+            .find("let sweep = sweep_runs(decision, &status, LINEAGE.len());")
             .expect("the answer comes from sweep_runs");
         let record = "update_session(move |s| s.load_sweep = Some(sweep));";
         assert_eq!(body.matches(record).count(), 1);
