@@ -489,8 +489,7 @@ enum Prewarmed {
     /// TYPED "missing delegate" (`DelegateError::Missing`, core 0.2.137+). Still
     /// not proof it holds nothing (core unregisters without deleting secrets);
     /// the walk treats it exactly like silence, and the journal counts it in the
-    /// absent streak that drives the freenet/river#761 cadence and the empty
-    /// account's sweep gate (`migration_journal::sweep_runs`).
+    /// absent streak that drives the freenet/river#761 cadence.
     NotInstalled,
 }
 
@@ -2791,52 +2790,6 @@ pub(crate) mod tests_support {
         channel = channel.with_delegate(&successor_key(), DelegateSim::default());
         let mut status = None;
         for _ in 0..walks {
-            let (report, _) = futures::executor::block_on(walk_with(
-                &channel,
-                NoImports,
-                successor_key(),
-                &lineage,
-            ));
-            status = report.status;
-        }
-        status.expect("journaled walk status")
-    }
-
-    /// A status after `silent` journaled walks in which both generations of a
-    /// 2-generation lineage never answered, then `absent` walks in which the
-    /// node answered a typed "missing delegate" for both.
-    pub(crate) fn silent_then_absent_status(silent: u32, absent: u32) -> JournalStatus {
-        // Keys of its own: `NOT_INSTALLED` is process-global.
-        static NEXT_PAIR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0xD0);
-        let n = NEXT_PAIR.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
-        let table = [
-            ([n; 32], [n.wrapping_add(0x20); 32]),
-            ([n + 1; 32], [n.wrapping_add(0x21); 32]),
-        ];
-        let lineage = river_delegate_lineage(&table);
-        let keys: Vec<DelegateKey> = table
-            .iter()
-            .map(|(key, code)| DelegateKey::new(*key, CodeHash::new(*code)))
-            .collect();
-        let mut channel = MockChannel::default();
-        for key in &keys {
-            let sim = DelegateSim {
-                silent: true,
-                ..Default::default()
-            };
-            channel = channel.with_delegate(key, sim);
-        }
-        channel = channel.with_delegate(&successor_key(), DelegateSim::default());
-        let mut status = None;
-        for walk in 0..silent + absent {
-            if walk == silent {
-                for key in &keys {
-                    let mut delegates = channel.delegates.borrow_mut();
-                    let sim = delegates.get_mut(key.bytes()).expect("fixture delegate");
-                    sim.silent = false;
-                    sim.not_installed = true;
-                }
-            }
             let (report, _) = futures::executor::block_on(walk_with(
                 &channel,
                 NoImports,

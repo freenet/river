@@ -49,8 +49,8 @@ fn is_missing_delegate_error(message: &str) -> bool {
 ///
 /// It feeds the migration journal's "not installed" verdict
 /// (`delegate_migration::note_legacy_delegate_not_installed`), which only
-/// counts toward the freenet/river#761 walk cadence (and the empty account's
-/// sweep gate, `migration_journal::sweep_runs`) and never resolves anything: "not installed" is not proof a predecessor holds nothing. (It used
+/// counts toward the freenet/river#761 walk cadence and never resolves
+/// anything: "not installed" is not proof a predecessor holds nothing. (It used
 /// to seal the whole legacy migration, the `localStorage` seal the journal
 /// replaced, freenet/river#763.)
 ///

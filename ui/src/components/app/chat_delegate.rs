@@ -10249,11 +10249,9 @@ pub(crate) fn set_rooms_load_state(state: RoomsLoadState) {
 /// pick the load state. A pure decision so the "new user never gets stuck
 /// loading" invariant is unit-testable.
 ///
-/// - `fired_legacy_probes == false` — the probe was skipped (already attempted
-///   this session, or the #761 gate found every pending generation typed "not
-///   installed" on a load the walk's cadence skips), so nothing more is coming:
-///   the load is resolved (`Loaded`). This is the fast path for a returning
-///   empty user.
+/// - `fired_legacy_probes == false` — the probe was skipped (already migrated,
+///   or already attempted this session), so nothing more is coming: the load is
+///   resolved (`Loaded`). This is the fast path for a returning empty user.
 /// - `fired_legacy_probes == true` — probes were dispatched fire-and-forget. A
 ///   migration MIGHT still arrive (existing user with legacy-only data) OR
 ///   nothing will (brand-new user whose node has no legacy delegates). We cannot
