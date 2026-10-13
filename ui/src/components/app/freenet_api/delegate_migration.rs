@@ -4650,9 +4650,13 @@ mod tests {
         block_on(begin_with(&channel, successor_key(), &lineage3())).unwrap();
         let mut dying = MemorySeam::new();
         dying.fail_flush = true;
-        let (first, _lost) = walk_j(&channel, dying);
+        let (first, lost) = walk_j(&channel, dying);
+        assert_eq!(lost.rooms.map.len(), 4, "the walk's merges were made");
         assert!(
-            first.status.as_ref().is_none_or(|s| s.interrupted_import()),
+            first
+                .status
+                .as_ref()
+                .is_some_and(|s| s.interrupted_import()),
             "a walk whose save failed must not resolve the predecessor: {:?}",
             first.status
         );
