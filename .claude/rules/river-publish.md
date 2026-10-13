@@ -334,10 +334,18 @@ one durable authority over both:
 - **The walk while the status `begin` returned is incomplete**, whatever the
   load plan (after an interrupted per-room write the plan is `PerRoom`, so the
   walk can no longer hang off the `ProbeLegacy` sweep). Rate-limited
-  (freenet/river#761) only while every pending generation answered a TYPED
-  "missing delegate" on the last 3 walks and nothing is mid-import: then it
-  runs on one load in 10, counted under `__river_migration_walk_skips__` in
-  the current delegate. Silence never counts as "not installed".
+  (freenet/river#761) only while nothing is mid-import and every pending
+  generation either answered a TYPED "missing delegate" on the last 3 walks
+  (then it runs on one load in 10) or stayed unresolved through 6 walks
+  (silent or refused: one load in 4), counted under
+  `__river_migration_walk_skips__` in the current delegate. Silence never
+  counts as "not installed".
+- **The empty account's legacy sweep follows the walk** (#761):
+  `fire_legacy_migration_request` (three requests to every registered
+  generation) is skipped on a load the cadence skips
+  (`migration_journal::legacy_sweep_wanted`, which waits for this load's walk
+  decision and fires when `begin` failed). Before, an account with no rooms
+  paid it on every load.
 - **The walk again after a sweep flag**, once the load is quiet, so the
   sweep's import is resolved in the same session.
 - All journal calls are **serialised** (the request registry holds one waiter

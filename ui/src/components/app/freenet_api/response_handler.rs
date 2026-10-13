@@ -11,7 +11,8 @@ mod update_response;
 use super::delegate_migration::{is_migration_bookkeeping_key, SweepWrite};
 use super::error::SynchronizerError;
 use super::migration_journal::{
-    gate_sweep_import_retrying, interrupted_import_for_recovery, start_journal_load,
+    gate_sweep_import_retrying, interrupted_import_for_recovery, legacy_sweep_wanted,
+    start_journal_load,
 };
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
@@ -848,7 +849,15 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // The current delegate lists no rooms: its room set is complete
             // (empty), so nothing it holds can be overwritten by a migration.
             mark_room_set_complete(worker.attempt());
-            let fired = fire_legacy_migration_request().await;
+            // freenet/river#761: only on a load the walk's cadence does not
+            // skip, so an account with no rooms stops probing every legacy
+            // generation on every load.
+            let fired = if legacy_sweep_wanted().await {
+                fire_legacy_migration_request().await
+            } else {
+                info!("Legacy sweep skipped on this load: the walk's cadence skips it (#761)");
+                false
+            };
             worker.set_load_state(load_state_after_probe_legacy(fired));
         }
         LoadPlan::MigrateCurrentBlob => {
