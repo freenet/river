@@ -10,6 +10,7 @@ pub mod constants;
 pub mod delegate_migration;
 pub mod error;
 pub mod freenet_synchronizer;
+pub mod migration_journal;
 pub mod response_handler;
 pub mod room_synchronizer;
 

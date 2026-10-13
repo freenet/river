@@ -456,8 +456,18 @@ impl ComposableState for BansV1 {
 
             // Create a temporary BansV1 with the new bans and validate WITHOUT
             // the max-cap ceiling (deferred to post_apply_cleanup).
+            //
+            // A ban repeated identically inside one delta is stored once.
+            // Records that share an id but differ are all kept, so the checks
+            // below judge each of them.
+            let mut in_delta = std::collections::HashSet::new();
             let mut temp_bans = self.clone();
-            temp_bans.0.extend(delta.iter().cloned());
+            temp_bans.0.extend(
+                delta
+                    .iter()
+                    .filter(|ban| in_delta.insert(crate::util::record_digest(*ban)))
+                    .cloned(),
+            );
             if let Err(e) = temp_bans.verify_excluding_cap(parent_state, parameters) {
                 return Err(format!("Invalid delta: {}", e));
             }

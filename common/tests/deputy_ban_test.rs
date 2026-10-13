@@ -227,7 +227,9 @@ fn deputy_ban_outside_subtree_is_inert() {
         .expect("state must verify");
 }
 
-/// Guardrail: a deputy cannot ban the member who deputized them.
+/// A deputy has no authority over the member who deputized them when no strict
+/// ancestor of that member grants it: here A's only strict ancestor is the
+/// owner, who did not deputize B.
 #[test]
 fn deputy_cannot_ban_their_deputizer() {
     let owner = Peer::new();
@@ -259,15 +261,15 @@ fn deputy_cannot_ban_their_deputizer() {
 
     assert!(
         member_ids(&state).contains(&a.id),
-        "B cannot ban A because A currently deputizes B (guardrail)"
+        "B cannot ban A: no strict ancestor of A deputizes B"
     );
 }
 
-/// Guardrail across subtrees: B is a deputy of both A1 and A2, where A2 is
-/// inside A1's subtree. A1's scope would otherwise let B ban A2, but A2 also
-/// deputizes B, so B cannot ban A2.
+/// B is a deputy of both A1 and A2, where A2 is inside A1's subtree. B's
+/// authority over A2 comes from A1, a strict ancestor of A2, so A2 listing B in
+/// A2's own deputies does not affect it: the ban is enforced.
 #[test]
-fn deputy_cannot_ban_fellow_deputizer_across_subtrees() {
+fn deputy_ban_via_ancestor_holds_when_target_also_deputizes_banner() {
     let owner = Peer::new();
     let a1 = Peer::new();
     let a2 = Peer::new();
@@ -302,9 +304,12 @@ fn deputy_cannot_ban_fellow_deputizer_across_subtrees() {
     state.post_apply_cleanup(&params(&owner)).unwrap();
 
     assert!(
-        member_ids(&state).contains(&a2.id),
-        "B cannot ban A2 (a fellow deputizer) even via A1's subtree scope"
+        !member_ids(&state).contains(&a2.id),
+        "B's ban of A2 is authorized by A1's grant, whatever A2's own deputies list"
     );
+    state
+        .verify(&state, &params(&owner))
+        .expect("state must verify after enforcement");
 }
 
 /// Owner-deputized global moderator can ban any member — including their own
@@ -610,7 +615,7 @@ fn too_many_deputies_is_rejected() {
 }
 
 // ===================================================================
-// Self-immunization + reorder guardrail tests (review round 1, #410)
+// A target's own deputies list does not affect bans on the target (#410)
 // ===================================================================
 
 /// A genuine strict ancestor keeps ABSOLUTE ban authority even if the target
@@ -690,10 +695,10 @@ fn global_mod_immune_to_self_immunization() {
     assert!(member_ids(&state).contains(&b.id), "B remains");
 }
 
-/// The fellow-deputizer guardrail still holds (B cannot ban A2 who deputizes B),
-/// while B CAN still ban another member of A1's subtree (A3) via A1's grant.
+/// A1's grant lets B ban any member of A1's subtree: A2, who also deputizes B,
+/// and A3, who does not.
 #[test]
-fn fellow_deputizer_protected_but_other_subtree_member_bannable() {
+fn deputy_can_ban_any_member_of_the_deputizers_subtree() {
     let owner = Peer::new();
     let a1 = Peer::new();
     let a2 = Peer::new();
@@ -721,7 +726,7 @@ fn fellow_deputizer_protected_but_other_subtree_member_bannable() {
         join(&b, owner_id),
     ];
 
-    // B bans A2 (a fellow deputizer) -> guardrail denies, A2 stays.
+    // B bans A2, who also deputizes B -> authorized via A1's grant.
     let mut s1 = ChatRoomStateV1 {
         configuration: config(&owner),
         members: MembersV1 {
@@ -739,8 +744,8 @@ fn fellow_deputizer_protected_but_other_subtree_member_bannable() {
     };
     s1.post_apply_cleanup(&params(&owner)).unwrap();
     assert!(
-        member_ids(&s1).contains(&a2.id),
-        "B cannot ban A2 (A2 deputizes B — fellow-deputizer guardrail)"
+        !member_ids(&s1).contains(&a2.id),
+        "B CAN ban A2 via A1's deputy grant, whatever A2's own deputies list"
     );
 
     // B bans A3 (a non-deputizer in A1's subtree) -> authorized via A1's grant.
@@ -1892,4 +1897,63 @@ fn cap_eviction_reconciles_via_merge() {
     );
     peer1.verify(&peer1, &p).expect("converged peer1 verifies");
     peer2.verify(&peer2, &p).expect("converged peer2 verifies");
+}
+
+/// A subtree-deputy ban on X (D deputized by A, X invited by A) is enforced
+/// when X rejoins with a member-info record listing D in X's own deputies,
+/// whether that record is already held or arrives in the same delta.
+#[test]
+fn subtree_deputy_ban_ignores_the_targets_own_deputies() {
+    for same_delta in [false, true] {
+        let owner = Peer::new();
+        let a = Peer::new();
+        let d = Peer::new();
+        let x = Peer::new();
+        let owner_id = owner.id;
+        let p = params(&owner);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: config(&owner),
+            members: MembersV1 {
+                members: vec![
+                    member(&a, owner_id, &owner.sk, owner_id),
+                    member(&d, owner_id, &owner.sk, owner_id),
+                ],
+            },
+            member_info: MemberInfoV1 {
+                member_info: vec![info(&a, 1, vec![d.id]), info(&d, 0, vec![])],
+            },
+            bans: BansV1(vec![ban(x.id, &d, owner_id)]),
+            recent_messages: MessagesV1 {
+                messages: vec![join(&a, owner_id), join(&d, owner_id)],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.post_apply_cleanup(&p).unwrap();
+        state.verify(&state, &p).expect("baseline verifies");
+
+        let rejoin = |with_info: bool| river_core::room_state::ChatRoomStateV1Delta {
+            members: Some(river_core::room_state::member::MembersDelta::new(vec![
+                member(&x, a.id, &a.sk, owner_id),
+            ])),
+            member_info: with_info.then(|| vec![info(&x, 1, vec![d.id])]),
+            recent_messages: Some(vec![join(&x, owner_id)]),
+            ..Default::default()
+        };
+        let steps = if same_delta {
+            vec![rejoin(true)]
+        } else {
+            vec![rejoin(true), rejoin(false)]
+        };
+        for delta in steps {
+            let parent = state.clone();
+            state.apply_delta(&parent, &p, &Some(delta)).unwrap();
+            assert!(
+                !member_ids(&state).contains(&x.id),
+                "same_delta={same_delta}: the ban on X is enforced"
+            );
+            state.verify(&state, &p).unwrap();
+        }
+    }
 }

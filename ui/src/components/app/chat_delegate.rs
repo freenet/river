@@ -160,8 +160,8 @@ impl CoalesceState {
 /// `last_result` such a caller would return the synthetic `Ok(())`
 /// initialized at the top, even if the catch-up save that covered its
 /// mutation actually failed. That false-`Ok` would silently strand
-/// callers that gate on success (e.g. the legacy-migration
-/// `mark_legacy_migration_done` branch in `response_handler.rs`). The
+/// callers that gate on success (e.g. the migration walk's flush, which
+/// seals a predecessor `Done` on `Ok`). The
 /// store is updated after every save iteration; a zero-iteration
 /// caller returns the most recent stored result instead.
 ///
@@ -1092,7 +1092,8 @@ fn claim_outstanding_list(outstanding: &AtomicU32, attempt: u32) -> bool {
 }
 
 /// The node reported the CURRENT chat delegate missing (freenet/river#707).
-/// This is not a legacy probe result, so it must not seal the migration.
+/// This is not a legacy probe result: it is never recorded as a legacy
+/// delegate "not installed".
 ///
 /// The first time in an attempt, this is the list-first load meeting a node
 /// that lacks the delegate (freenet/river#757): register it and reload.
@@ -1129,6 +1130,37 @@ pub(crate) fn on_current_delegate_missing() {
         }
         MissingAction::Ignore => {}
     }
+}
+
+/// Whether an error from the node is the CURRENT delegate refusing this
+/// attempt's room listing (freenet/river#768 round 3, S1). The node passes a
+/// delegate's error text to the client inside an untyped error that names no
+/// key, so it is recognised by the delegate's [`LIST_REFUSED_MARKER`], and only
+/// while this attempt's listing is outstanding: the listing is the first
+/// request of a load, and predecessors are not listed before it is answered.
+///
+/// The error carries no delegate key, so this attribution is by timing only.
+/// Once this build's delegate is itself a predecessor, a refusal it returns
+/// inside the NEXT build's listing window would read as that build's own
+/// listing failing: the load shows Retry, and nothing is lost.
+pub(crate) fn is_current_list_refusal(err_text: &str, list_outstanding: bool) -> bool {
+    list_outstanding && err_text.contains(river_core::chat_delegate::LIST_REFUSED_MARKER)
+}
+
+/// The current delegate refused this attempt's room listing (an index it
+/// cannot read). No `ListResponse` will start the load, so fail the attempt
+/// now and show Retry rather than wait out the backstop and show "no rooms".
+/// Returns whether the error was such a refusal.
+pub(crate) fn on_current_list_refused(err_text: &str) -> bool {
+    if !is_current_list_refusal(err_text, list_outstanding_this_attempt()) {
+        return false;
+    }
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    let _ = claim_outstanding_list(&LIST_OUTSTANDING, attempt);
+    warn!("The chat delegate refused the room listing; showing Retry (freenet/river#592)");
+    mark_fetch_failure_if_current(attempt);
+    resolve_load_failed_if_empty(attempt);
+    true
 }
 
 /// What a current-delegate "missing" answer does to load attempt `attempt`.
@@ -1256,6 +1288,25 @@ pub(crate) fn reset_ensure_subscription_dedup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #768 round 3, S1: the current delegate's refused listing (its marker
+    /// inside the node's untyped error text) fails the load only while this
+    /// attempt's listing is outstanding; any other error, or the same text
+    /// once the listing was answered, is not taken for it.
+    #[test]
+    fn a_refused_current_listing_is_recognised_only_while_outstanding() {
+        let text = format!(
+            "error while executing operation in the network: execution error, cause {}: \
+             the key index read back absent",
+            river_core::chat_delegate::LIST_REFUSED_MARKER
+        );
+        assert!(is_current_list_refusal(&text, true));
+        assert!(!is_current_list_refusal(&text, false));
+        assert!(!is_current_list_refusal(
+            "error while executing operation in the network: execution error: runtime: trap",
+            true
+        ));
+    }
     use ed25519_dalek::SigningKey;
 
     fn register_test_key(b: u8) -> DelegateKey {
@@ -1662,6 +1713,18 @@ mod tests {
             .contains("claim_once_per_attempt(&REGISTERED_FOR_ATTEMPT, attempt)"));
     }
 
+    /// The page load's own attempt is `LOAD_ATTEMPT_GEN == 0` and every claim
+    /// slot starts at 0, so the marker is `attempt + 1`: a fresh slot must GRANT
+    /// attempt 0, or the first `ListResponse` of every page load is ignored as
+    /// "already claimed" and no room ever loads. `registration_is_claimed_once`
+    /// uses attempt 7, which hides this.
+    #[test]
+    fn a_fresh_slot_grants_the_first_attempt_of_a_page_load() {
+        let slot = AtomicU32::new(0);
+        assert!(claim_once_per_attempt(&slot, 0));
+        assert!(!claim_once_per_attempt(&slot, 0), "once per attempt");
+    }
+
     /// freenet/river#757: a normal setup lists rooms (and loads outbound DMs)
     /// WITHOUT registering the delegate first; only Retry registers up front.
     #[test]
@@ -2030,196 +2093,62 @@ mod tests {
         );
     }
 
-    /// freenet/river#527 (third cause): the seal must be DEBOUNCED, not merely
-    /// requested.
-    ///
-    /// The response-handler pin only asserts that the legacy re-save CALLS
-    /// `request_legacy_seal_on_quiescence()` instead of sealing inline. That
-    /// says nothing about when the seal actually lands: make this function
-    /// write the seal immediately and that pin stays green while the third
-    /// cause of #527 returns in full — the migration ends while newer delegate
-    /// generations are still answering, and a tab closed in that window leaves
-    /// the rollback permanent.
-    ///
-    /// So pin the property here: the seal is only ever written from inside the
-    /// idle-gated closure, after a `LOAD_IDLE_MS` wait.
+    /// freenet/river#763 review A1: migrated data may be merged and saved only
+    /// for the CURRENT load attempt, once it read the whole current room set,
+    /// and while nothing it loaded failed.
     #[test]
-    fn the_legacy_seal_is_written_only_behind_the_quiescence_debounce() {
-        // NOTE: this file's `mod tests` is MID-FILE, so the usual
-        // `split("mod tests {").next()` trick would slice away everything after
-        // it — including both functions under test — and every assertion below
-        // would fail (or, with `contains`, pass vacuously). Search the whole
-        // source with `rfind` instead, as the other pins in this file do: both
-        // definitions live AFTER this test module, so the last occurrence is
-        // the real definition rather than a needle in this test's own source.
-        let src = include_str!("chat_delegate.rs");
-
-        // The request path must NOT seal — it only sets the flag and pokes the
-        // settle check.
-        let req = src
-            .rfind("pub(crate) fn request_legacy_seal_on_quiescence() {")
-            .expect("request_legacy_seal_on_quiescence must exist");
-        let req_end = src[req..].find("\n}\n").expect("function must terminate");
-        let req_body = &src[req..req + req_end];
+    fn the_room_set_is_complete_only_for_the_current_clean_attempt() {
+        // latch = attempt + 1; a LEGACY probe's failure is not an input
+        // (#768 round 2 item 1).
+        assert!(room_set_complete_core(1, 0, 0), "first attempt, clean");
         assert!(
-            !req_body.contains("mark_legacy_migration_done("),
-            "requesting the seal must NOT write it — that is sealing inline by \
-             another name and re-opens the third cause of #527"
+            !room_set_complete_core(0, 0, 0),
+            "never marked (or the current read failed)"
         );
+        assert!(!room_set_complete_core(1, 0, 1), "a newer attempt began");
         assert!(
-            req_body.contains("LEGACY_SEAL_PENDING.store(true"),
-            "the request must record that a seal is owed"
+            !room_set_complete_core(1, 1, 1),
+            "a mark for an older attempt does not vouch for the new one"
         );
-
-        // The scheduler must wait, re-check quiescence, and only then seal.
-        let sched = src
-            .rfind("fn schedule_legacy_seal(")
-            .expect("schedule_legacy_seal must exist");
-        let sched_body = &src[sched..];
-        let sched_body = &sched_body[..sched_body.find("\n}\n").expect("function must terminate")];
-        assert!(
-            sched_body.contains("LOAD_IDLE_MS"),
-            "the seal must wait out the quiescence window"
-        );
-        assert!(
-            sched_body.contains("idle_should_apply("),
-            "the seal must re-check that no newer generation started answering — \
-             a later worker cancels it and re-arms on its own settle"
-        );
-        assert!(
-            sched_body.contains("mark_legacy_migration_done()"),
-            "the seal is written here, or nowhere"
-        );
-        // Ordering: the gate precedes the write.
-        let gate = sched_body
-            .find("idle_should_apply(")
-            .expect("gate must be present");
-        let write = sched_body
-            .find("mark_legacy_migration_done()")
-            .expect("write must be present");
-        assert!(
-            gate < write,
-            "the quiescence gate must run BEFORE the seal is written"
-        );
-
-        // The arming block must exist, or the seal simply never lands: every
-        // assertion above would still pass while nothing ever writes it.
-        let settled = src
-            .rfind("pub(crate) fn on_load_worker_settled() {")
-            .expect("on_load_worker_settled must exist");
-        let settled_body = &src[settled..];
-        let settled_body =
-            &settled_body[..settled_body.find("\n}\n").expect("function must terminate")];
-        assert!(
-            settled_body.contains("LEGACY_SEAL_PENDING.load(Ordering::Relaxed)")
-                && settled_body.contains("schedule_legacy_seal(armed_gen, armed_attempt)"),
-            "load settlement must ARM the debounced seal, or a requested seal is never written"
-        );
+        assert!(room_set_complete_core(8, 7, 7));
     }
 
-    /// freenet/river#527 — SINGLE WRITER for the legacy-migration seal.
-    ///
-    /// The seal is what ends legacy migration for good: once set, a later
-    /// session whose current delegate is still empty takes the FireMigration
-    /// branch, finds the seal, and probes nothing. Any code path that sets it
-    /// while the ~26-generation fan-out is still answering can permanently
-    /// strand rooms that live in a generation which had not replied yet.
-    ///
-    /// There were FOUR such doors, all sealing inline. The loudest was in
-    /// `freenet_synchronizer.rs`: it seals on any delegate-missing-shaped API
-    /// error (`is_missing_delegate_error` — freenet/river#705: it must match
-    /// both freenet-core's legacy "delegate ... not found" wording and
-    /// freenet-stdlib's `DelegateError::Missing` "missing delegate ..."
-    /// wording), which the fan-out itself provokes within milliseconds on
-    /// every node where some legacy delegate WASM was never installed — so
-    /// one absent generation spoke for all the others.
-    ///
-    /// They now all route through `request_legacy_seal_on_quiescence`, leaving
-    /// exactly ONE writer. This pin fails any future fifth door.
+    /// freenet/river#763: the journal is the ONLY migration authority. The
+    /// `localStorage` "done" seal and "in progress" flag it replaced never
+    /// persisted in the gateway's sandboxed iframe (localStorage throws there),
+    /// and outside it they were a second authority that could disagree with
+    /// the journal: a seal suppressing a walk the journal still needs. This
+    /// pins that neither comes back.
     #[test]
-    fn the_seal_has_exactly_one_writer() {
-        // This file's `mod tests` is MID-FILE, so a plain `split(...).next()`
-        // would cover only the ~700 lines ahead of it and miss the region where
-        // the seal machinery actually lives. Excise the test module instead —
-        // inside it every item's closing brace is indented, so the first
-        // column-0 `}` after the module header is the module's own.
-        let src = include_str!("chat_delegate.rs");
-        let tests_start = src
-            .find("#[cfg(test)]\nmod tests {")
-            .expect("test module must exist");
-        let tests_end = tests_start
-            + src[tests_start..]
-                .find("\n}\n")
-                .expect("test module must terminate")
-            + 3;
-        let production = format!("{}{}", &src[..tests_start], &src[tests_end..]);
-
-        // The CALL form carries a semicolon; the definition ends in `{` and the
-        // doc-comment mentions have neither, so this counts real writers only.
-        assert_eq!(
-            production.matches("mark_legacy_migration_done();").count(),
-            1,
-            "exactly ONE writer of the seal — the quiescence-gated write in \
-             schedule_legacy_seal. A second is a new door onto the third cause \
-             of freenet/river#527."
-        );
-        // Guard the excision itself: if the module bounds are ever computed
-        // wrongly, the count above could pass by looking at the wrong text.
-        assert!(
-            production.contains("fn schedule_legacy_seal(")
-                && !production.contains("fn the_seal_has_exactly_one_writer("),
-            "the excision must keep production and drop the test module"
-        );
-
-        // freenet_synchronizer.rs must NEVER seal inline. This is the door that
-        // caused the harm: it seals on any delegate-missing-shaped API error
-        // (is_missing_delegate_error), which the fan-out itself provokes within
-        // milliseconds on any node missing an old delegate WASM — so it could
-        // fire before any generation holding data had answered.
-        let sync_src = include_str!("freenet_api/freenet_synchronizer.rs");
-        let sync_production = sync_src
-            .split("mod tests {")
-            .next()
-            .expect("production code before `mod tests`");
-        assert!(
-            !sync_production.contains("mark_legacy_migration_done()"),
-            "freenet_synchronizer.rs must seal via request_legacy_seal_on_quiescence() — \
-             it fires on errors the fan-out itself provokes (freenet/river#527)"
-        );
-
-        // response_handler.rs MAY seal inline, but ONLY at the doors where the
-        // current delegate is authoritative and no fan-out is in flight, and
-        // only with the rationale recorded. Every inline seal must be paired
-        // with a "SYNCHRONOUS, deliberately" marker, so a new undocumented one
-        // fails here rather than silently re-opening the third cause.
-        let rh_src = include_str!("freenet_api/response_handler.rs");
-        let rh_production = rh_src
-            .split("mod tests {")
-            .next()
-            .expect("production code before `mod tests`");
-        let inline_seals = rh_production
-            .matches("mark_legacy_migration_done()")
-            .count();
-        let documented = rh_production.matches("SYNCHRONOUS, deliberately").count();
-        assert_eq!(
-            inline_seals, documented,
-            "every inline seal in response_handler.rs must carry the \
-             'SYNCHRONOUS, deliberately' rationale explaining why no fan-out is \
-             in flight at that door (freenet/river#527)"
-        );
-        assert_eq!(
-            inline_seals, 2,
-            "expected exactly the two current-delegate-authoritative doors to seal \
-             inline; a change here needs a deliberate decision about fan-out overlap"
-        );
-        assert!(
-            rh_production
-                .matches("request_legacy_seal_on_quiescence()")
-                .count()
-                >= 2,
-            "the legacy re-save and the blob-explosion save must both request a \
-             quiescence-gated seal"
-        );
+    fn no_localstorage_migration_authority_remains() {
+        let files = [
+            ("chat_delegate.rs", include_str!("chat_delegate.rs")),
+            (
+                "freenet_api/response_handler.rs",
+                include_str!("freenet_api/response_handler.rs"),
+            ),
+            (
+                "freenet_api/freenet_synchronizer.rs",
+                include_str!("freenet_api/freenet_synchronizer.rs"),
+            ),
+        ];
+        // Built from parts so this test's own source cannot match itself.
+        let needles = [
+            ["mark_legacy_migration", "_done("].concat(),
+            ["is_legacy_migration", "_done("].concat(),
+            ["legacy_migration", "_in_progress("].concat(),
+            ["LEGACY_SEAL", "_PENDING"].concat(),
+            ["river_legacy_migration", "_done:"].concat(),
+        ];
+        for (name, src) in files {
+            for needle in &needles {
+                assert!(
+                    !src.contains(needle.as_str()),
+                    "{name} still mentions `{needle}`: the migration journal must be the \
+                     only authority (freenet/river#763)"
+                );
+            }
+        }
     }
 
     /// A deliberate identity choice must outrank every delegate generation, so
@@ -3031,9 +2960,15 @@ mod tests {
         // The generic, indexed paths — the ones a `room:<vk>` blob is written
         // through. These MUST keep registering their keys, or every room stops
         // migrating, not just its identity key.
+        // Both go through `write_value` (the crash-safe intent/value/index
+        // sequence, #768 review), which is what indexes the key.
+        assert!(
+            body("fn write_value(").contains("set_key_index("),
+            "write_value must add the key to the delegate's key_index (freenet/river#612)"
+        );
         for anchor in ["fn handle_store_request(", "fn handle_cas_store_request("] {
             assert!(
-                body(anchor).contains("set_key_index("),
+                body(anchor).contains("write_value("),
                 "{anchor} must add its key to the delegate's key_index — that \
                  index is what the migration probe's ListRequest enumerates, so \
                  a write that skips it is a write that never migrates \
@@ -3057,7 +2992,8 @@ mod tests {
         // The claim above is only meaningful if ListRequest really is fed by the
         // index rather than by enumerating the secret store directly.
         assert!(
-            body("fn handle_list_request(").contains("get_key_index("),
+            body("fn handle_list_request(").contains("open_kv_with(")
+                && body("fn open_kv_with(").contains("get_key_index("),
             "ListRequest must answer from the key_index — if it ever enumerates \
              secrets directly, un-indexed secrets would become discoverable and \
              the entire migration hazard in freenet/river#612 changes shape"
@@ -3729,6 +3665,42 @@ mod tests {
         );
     }
 
+    /// #768 round 2 item 3: a concurrent tab's identity provenance for a room
+    /// THIS tab does not represent survives this tab's `rooms_meta` save; for a
+    /// room this tab does represent, its own view wins (including "no entry").
+    #[test]
+    fn reconcile_meta_keeps_another_tabs_identity_sources() {
+        let mine = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+        let theirs = SigningKey::from_bytes(&[2u8; 32]).verifying_key();
+        let stale = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let remote = RoomsMeta {
+            identity_sources: vec![(theirs, [9u8; 32]), (stale, [8u8; 32])],
+            ..Default::default()
+        };
+        let mut rb = Vec::new();
+        ciborium::ser::into_writer(&remote, &mut rb).unwrap();
+        let local = RoomsMeta {
+            identity_sources: vec![(mine, [7u8; 32])],
+            ..Default::default()
+        };
+        // This tab holds `mine` and `stale` (the latter at a current or chosen
+        // rank, so no entry), not `theirs`.
+        let represents = std::collections::HashSet::from([mine, stale]);
+        let out = reconcile_meta(Some(&rb), &local, &represents)
+            .unwrap()
+            .unwrap();
+        let merged: RoomsMeta = ciborium::from_reader(out.as_slice()).unwrap();
+        assert!(merged.identity_sources.contains(&(mine, [7u8; 32])));
+        assert!(
+            merged.identity_sources.contains(&(theirs, [9u8; 32])),
+            "another tab's provenance for a room this tab does not hold is kept"
+        );
+        assert!(
+            !merged.identity_sources.iter().any(|(v, _)| *v == stale),
+            "for a room this tab holds, its own view wins"
+        );
+    }
+
     /// `reconcile_meta`: this tab's prefs win, but a remote notification-mode
     /// for a room we don't track is absorbed (not lost on a concurrent write).
     #[test]
@@ -3749,7 +3721,7 @@ mod tests {
         let mut rb = Vec::new();
         ciborium::ser::into_writer(&remote, &mut rb).unwrap();
 
-        let out = reconcile_meta(Some(&rb), &local)
+        let out = reconcile_meta(Some(&rb), &local, &Default::default())
             .unwrap()
             .expect("stores merged meta");
         let merged: RoomsMeta = ciborium::from_reader(out.as_slice()).unwrap();
@@ -3881,29 +3853,19 @@ mod tests {
         );
     }
 
-    /// Per-room load gating (freenet/river#345 follow-up — interrupted-migration
-    /// recovery). A clean per-room set is authoritative: seal migration, never
-    /// probe legacy. An interrupted one must NOT be sealed and must re-run the
-    /// migration to recover rooms a partial migration failed to write.
+    /// Per-room load gating (freenet/river#345 follow-up, #760, #763). A
+    /// per-room set with no interrupted import is the user's data: no sweep
+    /// re-run. An interrupted import (the journal's `interrupted_import()`)
+    /// must re-run the sweep to recover rooms a partial migration failed to
+    /// write.
     #[test]
     fn per_room_load_action_gates_on_interrupted_flag() {
-        let clean = decide_per_room_load_action(false);
         assert!(
-            clean.mark_done,
-            "a clean per-room set must seal migration (#253)"
+            !decide_per_room_load_action(false).recover,
+            "a per-room set with no interrupted import must not re-probe legacy"
         );
         assert!(
-            !clean.recover,
-            "a clean per-room set must not re-probe legacy"
-        );
-
-        let interrupted = decide_per_room_load_action(true);
-        assert!(
-            !interrupted.mark_done,
-            "an interrupted migration must NOT be sealed, or stranded rooms are lost forever"
-        );
-        assert!(
-            interrupted.recover,
+            decide_per_room_load_action(true).recover,
             "an interrupted migration must re-run to recover stranded rooms"
         );
     }
@@ -4562,81 +4524,6 @@ mod tests {
         );
     }
 
-    /// Codex P1 finding on PR #259: the legacy-migration-done
-    /// localStorage flag MUST be scoped to the current
-    /// `LEGACY_DELEGATES` set, otherwise every WASM bump that adds
-    /// a new legacy entry is silently blocked for any user who
-    /// already migrated under the previous set. Pinning behaviour:
-    /// the fingerprint must be a non-empty hex string and the full
-    /// key must carry the prefix so the storage namespace stays
-    /// recognizable. If `LEGACY_DELEGATES` ever changes shape, the
-    /// fingerprint will change too — which is exactly the property
-    /// this whole scheme depends on.
-    #[test]
-    fn legacy_migration_flag_is_scoped_to_set() {
-        let fp = legacy_set_fingerprint();
-        assert_eq!(fp.len(), 16);
-        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
-        let key = legacy_migration_flag_key();
-        assert!(key.starts_with(LEGACY_MIGRATION_FLAG_PREFIX));
-        assert!(key.ends_with(&fp));
-    }
-
-    /// The legacy-set fingerprint is derived from `LEGACY_DELEGATES`'s exact
-    /// contents AND order, and it keys the per-user "migration done"
-    /// localStorage flag — so any change to how the const is GENERATED
-    /// (freenet/river#398 moved codegen to `freenet-migrate-build`) must
-    /// reproduce it byte-identically, or every user silently re-runs legacy
-    /// migration once. Pinned to the value computed from the current
-    /// `legacy_delegates.toml` (27 entries spanning V1..V30 — V4–V6 removed —
-    /// in file order). This value
-    /// SHOULD change when a genuinely new legacy entry is added — update the
-    /// constant then — but must NEVER change from a codegen/tooling swap.
-    ///
-    /// Updated for V30 (freenet/river#571, the member_info summary digest).
-    /// Note WHY the delegate moves here, because it is not the obvious reason:
-    /// the summary change itself is dead-code-eliminated from the delegate
-    /// (verified — rebuilding with it left chat_delegate.wasm byte-identical).
-    /// What moves the delegate is the river-core version bump 0.1.18 -> 0.1.19,
-    /// which is itself mandatory: the V31 room-contract registry is compiled
-    /// into river-core, riverctl pins it as `=<version>`, and 0.1.18 is already
-    /// published, so without the bump `cargo install riverctl` would resolve a
-    /// river-core WITHOUT the new entry. So a version bump alone re-keys the
-    /// delegate, and that is enough to require an entry.
-    ///
-    /// Updated for V31 (the freenet/river#671 release). Note the #671 fix
-    /// itself does NOT move the delegate WASM: rebuilding `origin/main`
-    /// unchanged on the same toolchain already produced a different hash from
-    /// the committed one, so that generation was stale before this branch
-    /// touched anything. What moves it here is that drift plus the mandatory
-    /// `river-core` 0.1.20 -> 0.1.21 bump (0.1.20 is already published, and
-    /// `release-riverctl.yml` skips publishing a version crates.io already
-    /// has — so without the bump riverctl would resolve the OLD river-core
-    /// from the registry). Either way the entry is required: the committed
-    /// bytes are what users' delegate key is derived from, whatever moved
-    /// them.
-    #[test]
-    fn legacy_set_fingerprint_is_stable_across_codegen_changes() {
-        assert_eq!(legacy_set_fingerprint(), "c32c326c1328de9a");
-    }
-
-    /// The "migration in progress" and "migration done" localStorage keys MUST
-    /// be distinct — they're set/cleared independently, and a shared key would
-    /// make clearing one corrupt the other (freenet/river#345 follow-up: the
-    /// in-progress flag drives interrupted-migration recovery).
-    #[test]
-    fn migration_in_progress_key_distinct_from_done_key() {
-        let fp = legacy_set_fingerprint();
-        let in_progress = legacy_migration_in_progress_key();
-        let done = legacy_migration_flag_key();
-        assert_ne!(in_progress, done);
-        assert!(in_progress.starts_with(LEGACY_MIGRATION_IN_PROGRESS_PREFIX));
-        assert!(
-            in_progress.ends_with(&fp),
-            "in-progress flag must be per-set too"
-        );
-    }
-
     // ===== resolve_hidden_thread_hydration tests (#261 Codex P3) =====
     use freenet_scaffold::util::FastHash;
 
@@ -4654,6 +4541,30 @@ mod tests {
             peer,
             hidden_at_ts: ts,
         }
+    }
+
+    /// #768 round 3, N2: the top-up merges only DM entries the cache does not
+    /// already hold at least as fresh.
+    #[test]
+    fn only_entries_the_cache_does_not_hold_are_topped_up() {
+        use crate::components::direct_messages::OutboundDmsCache;
+        let room = sk(5).verifying_key();
+        let e = |tok: u8, ts: u64| OutboundDmEntry {
+            room_owner_vk: room.to_bytes(),
+            sender: MemberId(FastHash(1)),
+            recipient: MemberId(FastHash(2)),
+            purge_token: river_core::room_state::direct_messages::PurgeToken([tok; 16]),
+            timestamp: ts,
+            plaintext: "x".into(),
+        };
+        let mut cache = OutboundDmsCache::default();
+        let held = e(1, 10);
+        cache
+            .by_token
+            .insert((room, held.recipient, held.purge_token), held.clone());
+        let fresh = entries_not_held(vec![held.clone(), e(1, 11), e(2, 5)], &cache);
+        assert_eq!(fresh, vec![e(1, 11), e(2, 5)]);
+        assert!(entries_not_held(vec![held], &cache).is_empty());
     }
 
     /// Baseline: with no current entries and no suppression, every
@@ -5228,26 +5139,26 @@ mod tests {
         ));
     }
 
-    /// freenet/river#414 (Codex round-9 P1): the identity-import gate must ALSO
-    /// treat an in-flight load worker (`PENDING_LOADS != 0`) as "recovery in
-    /// progress" so an import can't be decided while the #345 recovery is still
-    /// restoring rooms. (`is_legacy_migration_in_progress()` is a localStorage read
-    /// that is always false off-WASM, so this pins the `PENDING_LOADS` branch.)
+    /// freenet/river#414 (Codex round-9 P1), #763: the identity-import gate
+    /// treats an in-flight load worker (`PENDING_LOADS != 0`) AND a migration
+    /// journal that is not open as "recovery in progress", so an import can't
+    /// be decided while a recovery may still be restoring rooms.
     #[test]
-    fn rooms_recovery_in_progress_tracks_pending_loads() {
-        use std::sync::atomic::Ordering;
-        PENDING_LOADS.store(0, Ordering::Relaxed);
+    fn rooms_recovery_in_progress_tracks_pending_loads_and_the_journal() {
+        use crate::components::app::freenet_api::migration_journal::ImportGate;
+        assert!(!recovery_in_progress(ImportGate::Open, 0));
         assert!(
-            !rooms_recovery_in_progress(),
-            "no legacy migration + no pending loads → not in recovery"
-        );
-        PENDING_LOADS.store(1, Ordering::Relaxed);
-        assert!(
-            rooms_recovery_in_progress(),
+            recovery_in_progress(ImportGate::Open, 1),
             "an in-flight load worker must gate imports (recovery/load pending)"
         );
-        PENDING_LOADS.store(0, Ordering::Relaxed);
-        assert!(!rooms_recovery_in_progress());
+        assert!(
+            recovery_in_progress(ImportGate::Pending, 0),
+            "a journal not read yet, or a walk running, must gate imports"
+        );
+        assert!(
+            recovery_in_progress(ImportGate::Blocked, 0),
+            "an interrupted import must gate imports"
+        );
     }
 
     /// freenet/river#414 (Codex round-8 P1): when a late DM-load response is
@@ -6115,7 +6026,7 @@ mod tests {
 
     /// When the last iteration's save errs, the helper must propagate
     /// that error (not the prior Ok). Pins the `last_result` contract
-    /// for the legacy-migration `mark_legacy_migration_done()` branch.
+    /// for callers that gate on a save's success (the migration walk's flush).
     #[test]
     fn coalesce_save_returns_err_from_last_iteration() {
         use std::sync::atomic::AtomicUsize;
@@ -6156,10 +6067,10 @@ mod tests {
     /// caller must see the actual save's result rather than synthetic
     /// `Ok(())`. This is the convergent-finding bug from Codex + the
     /// skeptical-reviewer pass on PR #311: without `state.last_result`,
-    /// `response_handler.rs:739`'s `mark_legacy_migration_done()` could
-    /// fire on a queued caller's false-`Ok` while the catch-up save
-    /// that covered the migration's snapshot had actually failed,
-    /// silently losing the migrated data.
+    /// a migration "done" decision (then the legacy seal, now the walk's
+    /// `Done` marker after its flush) could fire on a queued caller's
+    /// false-`Ok` while the catch-up save that covered the migration's
+    /// snapshot had actually failed, silently losing the migrated data.
     ///
     /// **Test-design note** (round-2 reviewers caught this empirically):
     /// the `save()` closure MUST yield via `futures::pending!()` after
@@ -6308,12 +6219,18 @@ mod tests {
     /// (`.claude/rules/delegate-migration.md`) INCLUDING a new
     /// `legacy_delegates.toml` entry, at which point this hash must be updated
     /// alongside that entry, never alone.
+    ///
+    /// Updated for V33 (freenet/river#757 + #763): the byte-string encoding of
+    /// the delegate's message byte fields, the freenet/river#592 key-index
+    /// fixes and the crash-safe key-value writes change the delegate WASM;
+    /// V33 (the river-core 0.1.22 delegate from freenet/river#772) is the
+    /// outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "c2e6063899624b65715d683fbbba04637ba89b72dc17f5b1610343922356fc46",
+            "cea989c88db1a0ebc3558f2c33f90ab491473388e3f80319d8a09450b13a5d81",
             "chat_delegate.wasm changed — this branch must not alter the delegate WASM; \
              if the change is intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
@@ -6367,8 +6284,8 @@ mod tests {
     mod two_driver_interleaving {
         use super::*;
         use crate::components::app::freenet_api::delegate_migration::{
-            pred_done_marker_key, river_delegate_lineage, walk_with, RiverDelegateChannel,
-            RiverImportSeam,
+            pred_done_marker_key, river_delegate_lineage, walk_with, RawKeyIndex,
+            RiverDelegateChannel, RiverImportSeam, KEY_INDEX_STORAGE_KEY,
         };
         use crate::room_data::Rooms;
         use futures::executor::block_on;
@@ -6462,6 +6379,8 @@ mod tests {
         // ---------------- the scripted node ----------------
 
         type Store = BTreeMap<Vec<u8>, Vec<u8>>;
+        /// `(delegate key bytes, storage key)` -> CAS generation.
+        type Generations = HashMap<(Vec<u8>, Vec<u8>), u64>;
 
         /// A request whose waiter is registered and which the node has not
         /// yet answered — i.e. genuinely in flight.
@@ -6492,6 +6411,9 @@ mod tests {
         #[derive(Default)]
         struct TestNode {
             stores: RefCell<HashMap<Vec<u8>, Store>>,
+            /// Per-(delegate, key) CAS generation, as the delegate's versioning
+            /// envelope keeps it.
+            generations: RefCell<Generations>,
             inbox: RefCell<VecDeque<Sent>>,
             hold: RefCell<Option<Hold>>,
             delivered: RefCell<Vec<Delivery>>,
@@ -6500,7 +6422,11 @@ mod tests {
         fn request_storage_key(request: &ChatDelegateRequestMsg) -> Option<Vec<u8>> {
             match request {
                 ChatDelegateRequestMsg::GetRequest { key }
-                | ChatDelegateRequestMsg::StoreRequest { key, .. } => Some(key.as_bytes().to_vec()),
+                | ChatDelegateRequestMsg::StoreRequest { key, .. }
+                | ChatDelegateRequestMsg::GetVersionedRequest { key }
+                | ChatDelegateRequestMsg::CasStoreRequest { key, .. } => {
+                    Some(key.as_bytes().to_vec())
+                }
                 _ => None,
             }
         }
@@ -6566,10 +6492,34 @@ mod tests {
             ) -> ChatDelegateResponseMsg {
                 let mut stores = self.stores.borrow_mut();
                 let store = stores.entry(target.bytes().to_vec()).or_default();
+                let mut generations = self.generations.borrow_mut();
+                let slot =
+                    |key: &ChatDelegateKey| (target.bytes().to_vec(), key.as_bytes().to_vec());
                 match request {
                     ChatDelegateRequestMsg::ListRequest => ChatDelegateResponseMsg::ListResponse {
                         keys: store.keys().cloned().map(ChatDelegateKey::new).collect(),
                     },
+                    // The raw key index, as every delegate generation stores it:
+                    // the listed keys, or none when nothing is stored.
+                    ChatDelegateRequestMsg::GetRequest { key }
+                        if key.as_bytes() == KEY_INDEX_STORAGE_KEY =>
+                    {
+                        let value = (!store.is_empty()).then(|| {
+                            let mut out = Vec::new();
+                            ciborium::ser::into_writer(
+                                &RawKeyIndex {
+                                    keys: store.keys().cloned().map(ChatDelegateKey::new).collect(),
+                                },
+                                &mut out,
+                            )
+                            .expect("encode index");
+                            out
+                        });
+                        ChatDelegateResponseMsg::GetResponse {
+                            key: key.clone(),
+                            value,
+                        }
+                    }
                     ChatDelegateRequestMsg::GetRequest { key } => {
                         ChatDelegateResponseMsg::GetResponse {
                             key: key.clone(),
@@ -6578,10 +6528,41 @@ mod tests {
                     }
                     ChatDelegateRequestMsg::StoreRequest { key, value } => {
                         store.insert(key.as_bytes().to_vec(), value.clone());
+                        *generations.entry(slot(key)).or_default() += 1;
                         ChatDelegateResponseMsg::StoreResponse {
                             key: key.clone(),
                             value_size: value.len(),
                             result: Ok(()),
+                        }
+                    }
+                    ChatDelegateRequestMsg::GetVersionedRequest { key } => {
+                        ChatDelegateResponseMsg::GetVersionedResponse {
+                            key: key.clone(),
+                            value: store.get(key.as_bytes()).cloned(),
+                            generation: generations.get(&slot(key)).copied().unwrap_or(0),
+                        }
+                    }
+                    ChatDelegateRequestMsg::CasStoreRequest {
+                        key,
+                        value,
+                        expected_generation,
+                    } => {
+                        let current = generations.get(&slot(key)).copied().unwrap_or(0);
+                        let result = if current == *expected_generation {
+                            store.insert(key.as_bytes().to_vec(), value.clone());
+                            generations.insert(slot(key), current + 1);
+                            CasStoreResult::Stored {
+                                generation: current + 1,
+                            }
+                        } else {
+                            CasStoreResult::Conflict {
+                                current_generation: current,
+                                current_value: store.get(key.as_bytes()).cloned(),
+                            }
+                        };
+                        ChatDelegateResponseMsg::CasStoreResponse {
+                            key: key.clone(),
+                            result,
                         }
                     }
                     other => panic!("test node: unsupported request {other:?}"),
@@ -6719,7 +6700,11 @@ mod tests {
                 self.room_merges.push(source_rank);
                 Ok(())
             }
-            async fn merge_outbound_dms(&mut self, _store: OutboundDmStore) -> Result<(), String> {
+            async fn merge_outbound_dms(
+                &mut self,
+                _store: OutboundDmStore,
+                _archive_rank: Option<u32>,
+            ) -> Result<(), String> {
                 self.dm_merges += 1;
                 Ok(())
             }
@@ -6894,7 +6879,7 @@ mod tests {
 
             // 3. The walk imported the LEGACY copy and sealed its marker.
             assert!(
-                !report.any_unresponsive(),
+                !report.report.any_unresponsive(),
                 "no predecessor should be unresponsive here: {report:?}"
             );
             assert!(
@@ -7041,7 +7026,7 @@ mod tests {
                 seam.room_merges
             );
             assert!(
-                report.any_unresponsive(),
+                report.report.any_unresponsive(),
                 "a displaced read must classify the predecessor Unresponsive: {report:?}"
             );
             assert_eq!(
@@ -8269,13 +8254,31 @@ fn reconcile_room_tombstone(current: Option<&[u8]>) -> Result<Option<Vec<u8>>, S
 /// Reconcile the `rooms_meta` save: this tab's view-prefs are authoritative;
 /// absorb notification prefs the delegate has for rooms we don't track so a
 /// concurrent tab's setting isn't lost.
-fn reconcile_meta(current: Option<&[u8]>, local: &RoomsMeta) -> Result<Option<Vec<u8>>, String> {
+///
+/// Identity sources (#768 review B3) likewise: this tab speaks for the rooms
+/// it `represents` (present or tombstoned in its own `Rooms`); for any other
+/// room the stored entry is kept, so a concurrent tab that just migrated a room
+/// this tab never loaded does not lose that room's identity provenance
+/// (#768 round 2 item 3).
+fn reconcile_meta(
+    current: Option<&[u8]>,
+    local: &RoomsMeta,
+    represents: &std::collections::HashSet<VerifyingKey>,
+) -> Result<Option<Vec<u8>>, String> {
     let mut merged = local.clone();
     if let Some(bytes) = current {
         if let Ok(remote) = ciborium::from_reader::<RoomsMeta, _>(bytes) {
             for (vk, mode) in remote.notification_modes {
                 merged.notification_modes.entry(vk).or_insert(mode);
             }
+            for (vk, source) in remote.identity_sources {
+                if !represents.contains(&vk)
+                    && !merged.identity_sources.iter().any(|(v, _)| *v == vk)
+                {
+                    merged.identity_sources.push((vk, source));
+                }
+            }
+            merged.identity_sources.sort_by_key(|(vk, _)| vk.to_bytes());
         }
     }
     let mut out = Vec::new();
@@ -8298,7 +8301,18 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
     let (rooms, meta) = {
         let mut rooms = ROOMS.read().clone();
         rooms.current_room_key = CURRENT_ROOM.read().owner_key;
-        let meta = rooms.to_meta();
+        let mut meta = rooms.to_meta();
+        // Persist which legacy generation supplied each migrated identity, so
+        // a newer generation answering on a later load still outranks it
+        // (freenet/river#768 review B3).
+        meta.identity_sources = with_identity_source_ranks(|ranks| {
+            crate::room_data::persisted_identity_sources(
+                &rooms,
+                &ranks.identity,
+                LEGACY_DELEGATES,
+                current_delegate_source_rank(),
+            )
+        });
         (rooms, meta)
     };
 
@@ -8401,8 +8415,14 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
         Ok(()) => {
             let mh = content_hash(&meta_buf);
             if META_SLOT_HASH.with(|c| *c.borrow()) != Some(mh) {
+                let represents: std::collections::HashSet<VerifyingKey> = rooms
+                    .map
+                    .keys()
+                    .chain(rooms.removed_rooms.iter())
+                    .copied()
+                    .collect();
                 match cas_write_delegate_key(ROOMS_META_KEY.to_vec(), move |current| {
-                    reconcile_meta(current, &meta)
+                    reconcile_meta(current, &meta, &represents)
                 })
                 .await
                 {
@@ -8695,6 +8715,36 @@ fn persist_sanitized_dm_store_after_tombstone_filter() {
             );
         }
     });
+}
+
+/// The entries of `entries` the outbound-DM cache does not already hold at
+/// least as fresh (#768 round 3, N2). A read, not a write: no `defer` needed.
+/// Unreadable: all of them (the merge itself keeps the fresher copy).
+pub(crate) fn outbound_entries_not_held(entries: Vec<OutboundDmEntry>) -> Vec<OutboundDmEntry> {
+    use crate::components::direct_messages::OUTBOUND_DMS;
+    let Ok(cache) = OUTBOUND_DMS.try_read() else {
+        return entries;
+    };
+    entries_not_held(entries, &cache)
+}
+
+/// The pure half of [`outbound_entries_not_held`].
+pub(crate) fn entries_not_held(
+    entries: Vec<OutboundDmEntry>,
+    cache: &crate::components::direct_messages::OutboundDmsCache,
+) -> Vec<OutboundDmEntry> {
+    entries
+        .into_iter()
+        .filter(|e| {
+            let Ok(room) = ed25519_dalek::VerifyingKey::from_bytes(&e.room_owner_vk) else {
+                return true;
+            };
+            !cache
+                .by_token
+                .get(&(room, e.recipient, e.purge_token))
+                .is_some_and(|held| held.timestamp >= e.timestamp)
+        })
+        .collect()
 }
 
 /// Session-scoped tombstone set for `(room, peer)` pairs the local
@@ -10191,8 +10241,10 @@ async fn send_delegate_request_inner(
 /// `rooms_data` has been observed. See `decide_legacy_migration_action`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyMigrationAction {
-    /// Current delegate has authoritative state (rooms or tombstones). Mark
-    /// legacy migration done so it never fires for this user.
+    /// Current delegate has authoritative state (rooms or tombstones): do not
+    /// fire the legacy fan-out (freenet/river#253). (There is no persistent
+    /// "done" seal any more: the migration journal decides whether the walk
+    /// runs, freenet/river#763.)
     MarkDone,
     /// Current delegate is empty (no record, or a placeholder serialization
     /// with no rooms and no tombstones). Fire the legacy probes — there is
@@ -10234,200 +10286,64 @@ pub(crate) fn decide_legacy_migration_action(
 /// runtime to drive in a test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PerRoomLoadAction {
-    /// Seal legacy migration as permanently done (the per-room set is
-    /// authoritative; legacy must never be probed again — freenet/river#253).
-    pub mark_done: bool,
-    /// Re-run the migration to recover any room a prior interrupted migration
-    /// failed to write before it was cut short.
+    /// Re-run the hand-rolled sweep to recover, with its full hydrate
+    /// orchestration, any room a prior interrupted migration failed to write.
     pub recover: bool,
 }
 
-/// Decide what a current-delegate per-room load should do, given whether a
-/// prior legacy migration was left in progress (interrupted).
+/// Decide what a current-delegate per-room load should do, given whether the
+/// migration journal reports an interrupted import (freenet/river#763: the
+/// status `begin` returned, `interrupted_import()`).
 ///
-/// - **Not interrupted** → the per-room set is authoritative: `mark_done` so
-///   legacy is never probed (freenet/river#253 — a stale legacy response could
-///   clobber newer state), and do not `recover`.
+/// - **Not interrupted** → the per-room set is the user's data: do not re-run
+///   the sweep. (The journaled walk still runs while the journal is incomplete;
+///   it is what resolves predecessors, not this.)
 /// - **Interrupted** → the set may be missing rooms a partial migration never
-///   wrote: do NOT seal it (`mark_done == false`) and `recover` (re-run the
-///   migration). The recovery re-save is a per-room CAS read-merge-write, so a
-///   room already present merges rather than being overwritten.
+///   wrote (freenet/river#760): `recover` (re-run the sweep). Every merge it
+///   makes is journal-gated, ranked and tombstone-safe, and its re-save is a
+///   per-room CAS read-merge-write, so a room already present merges rather
+///   than being overwritten (the freenet/river#253 guarantee).
+///
+/// There is no "done" seal any more: the journal is the only authority on
+/// whether a migration finished. The `localStorage` seal and in-progress flag
+/// this replaced never persisted in the gateway's sandboxed iframe.
 pub(crate) fn decide_per_room_load_action(migration_interrupted: bool) -> PerRoomLoadAction {
-    if migration_interrupted {
-        PerRoomLoadAction {
-            mark_done: false,
-            recover: true,
-        }
-    } else {
-        PerRoomLoadAction {
-            mark_done: true,
-            recover: false,
-        }
+    PerRoomLoadAction {
+        recover: migration_interrupted,
     }
-}
-
-/// localStorage key PREFIX to track whether legacy migration has been
-/// attempted. The actual key is suffixed with the fingerprint of the
-/// current [`LEGACY_DELEGATES`] set so that adding a new legacy entry
-/// invalidates the old flag automatically — Codex P1 finding on PR
-/// #259: without per-set scoping, every delegate WASM bump (which
-/// adds a new entry to `legacy_delegates.toml`) is silently blocked
-/// for any user who already migrated under a previous set, making
-/// their delegate-backed rooms appear lost on every upgrade.
-#[allow(dead_code)]
-const LEGACY_MIGRATION_FLAG_PREFIX: &str = "river_legacy_migration_done:";
-
-/// BLAKE3 fingerprint (first 16 hex chars) of the current
-/// `LEGACY_DELEGATES` set. Used as the localStorage key suffix so the
-/// migration-done flag is per-set, not global.
-#[allow(dead_code)]
-fn legacy_set_fingerprint() -> String {
-    let mut hasher = blake3::Hasher::new();
-    for (key_bytes, code_hash) in LEGACY_DELEGATES {
-        hasher.update(key_bytes);
-        hasher.update(code_hash);
-    }
-    let hash = hasher.finalize();
-    let hex = hash.to_hex();
-    hex[..16].to_string()
-}
-
-#[allow(dead_code)]
-fn legacy_migration_flag_key() -> String {
-    format!(
-        "{}{}",
-        LEGACY_MIGRATION_FLAG_PREFIX,
-        legacy_set_fingerprint()
-    )
-}
-
-/// Check if legacy migration has already been done for the CURRENT
-/// legacy-delegate set (via localStorage). Per-set scoping means
-/// adding a new legacy entry on every WASM bump automatically
-/// invalidates the previous flag and re-enables migration.
-fn is_legacy_migration_done() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.local_storage() {
-                let key = legacy_migration_flag_key();
-                return storage.get_item(&key).ok().flatten().is_some();
-            }
-        }
-        false
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        // Non-WASM: assume migration not needed (testing environment)
-        true
-    }
-}
-
-/// Mark legacy migration as done for the current set in localStorage.
-pub fn mark_legacy_migration_done() {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.local_storage() {
-                let key = legacy_migration_flag_key();
-                if let Err(e) = storage.set_item(&key, "true") {
-                    warn!("Failed to set legacy migration flag: {:?}", e);
-                } else {
-                    info!("Legacy migration marked as done (key={})", key);
-                }
-            }
-        }
-    }
-}
-
-/// localStorage key prefix for the "legacy migration in progress" flag — set
-/// BEFORE a migration's per-room re-save and cleared only on full success. If a
-/// migration is interrupted (a per-room CAS write fails, or the tab is closed
-/// mid-migration), this flag stays set, so the next load's per-room path knows
-/// the per-room key set may be INCOMPLETE and re-runs the legacy fill to recover
-/// any stranded room (freenet/river#345 follow-up — Nacho's "Freenet Devs"
-/// disappeared-after-update report). New users never set it (no legacy data → no
-/// migration), so they incur no extra probing.
-#[allow(dead_code)]
-const LEGACY_MIGRATION_IN_PROGRESS_PREFIX: &str = "river_legacy_migration_in_progress:";
-
-#[allow(dead_code)]
-fn legacy_migration_in_progress_key() -> String {
-    format!(
-        "{}{}",
-        LEGACY_MIGRATION_IN_PROGRESS_PREFIX,
-        legacy_set_fingerprint()
-    )
 }
 
 /// Whether the room set is still being RECOVERED and is therefore NOT yet
-/// fully authoritative (freenet/river#414, Codex round-9 P1).
+/// authoritative for an identity import (freenet/river#414, #763).
 ///
-/// Distinct from `ROOMS_LOAD_STATE == Loaded`: during the freenet/river#345
-/// interrupted-legacy-migration RECOVERY, the per-room loader intentionally sets
-/// `Loaded` (so the partial room list renders instead of a spinner) BEFORE the
-/// background recovery workers restore rooms missing from the partial per-room
-/// index — and `SAW_FETCH_FAILURE` stays false. Importing an identity for one of
-/// those still-missing rooms in that window would misclassify it as new and
-/// overwrite its recovered persisted slot with empty state (DATA LOSS). The
-/// identity-import gate ANDs `!rooms_recovery_in_progress()` on top of
-/// `Loaded && !saw_fetch_failure`, so imports wait for recovery to finish.
+/// Distinct from `ROOMS_LOAD_STATE == Loaded`: during an interrupted-migration
+/// RECOVERY the per-room loader sets `Loaded` (so the partial room list renders
+/// instead of a spinner) BEFORE the recovery restores rooms missing from the
+/// partial per-room index — and `SAW_FETCH_FAILURE` stays false. Importing an
+/// identity for one of those still-missing rooms in that window would
+/// misclassify it as new and overwrite its recovered persisted slot with empty
+/// state (DATA LOSS). The identity-import gate ANDs
+/// `!rooms_recovery_in_progress()` on top of `Loaded && !saw_fetch_failure`.
 ///
-/// True while EITHER the interrupted-migration flag is set (recovery pending /
-/// running — cleared only on a full successful re-save) OR any awaited load
-/// worker is still in flight (`PENDING_LOADS != 0`). This does NOT weaken the
-/// recovery; it only makes imports wait for it.
+/// True while the migration journal's gate is not open
+/// (`migration_journal::current_import_gate`: an import interrupted, a walk
+/// running, the journal not read yet or unreadable, rejected items, or a
+/// predecessor that may hold rooms not answered yet — the user may override
+/// all but the transient ones) OR any awaited load worker is still in
+/// flight (`PENDING_LOADS != 0`).
 pub(crate) fn rooms_recovery_in_progress() -> bool {
-    is_legacy_migration_in_progress() || PENDING_LOADS.load(Ordering::Relaxed) != 0
+    recovery_in_progress(
+        super::freenet_api::migration_journal::current_import_gate(),
+        PENDING_LOADS.load(Ordering::Relaxed),
+    )
 }
 
-/// True if a legacy migration was started but not confirmed complete (see
-/// [`LEGACY_MIGRATION_IN_PROGRESS_PREFIX`]).
-pub fn is_legacy_migration_in_progress() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.local_storage() {
-                let key = legacy_migration_in_progress_key();
-                return storage.get_item(&key).ok().flatten().is_some();
-            }
-        }
-        false
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        // Non-WASM (tests): no migration is ever in progress.
-        false
-    }
-}
-
-/// Mark a legacy migration as in progress (call BEFORE the re-save).
-pub fn mark_legacy_migration_in_progress() {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.local_storage() {
-                let key = legacy_migration_in_progress_key();
-                if let Err(e) = storage.set_item(&key, "true") {
-                    warn!("Failed to set legacy-migration-in-progress flag: {:?}", e);
-                }
-            }
-        }
-    }
-}
-
-/// Clear the "legacy migration in progress" flag (call only after a FULL,
-/// successful re-save — alongside [`mark_legacy_migration_done`]).
-pub fn clear_legacy_migration_in_progress() {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.local_storage() {
-                let key = legacy_migration_in_progress_key();
-                let _ = storage.remove_item(&key);
-            }
-        }
-    }
+/// The pure core of [`rooms_recovery_in_progress`].
+pub(crate) fn recovery_in_progress(
+    journal_gate: super::freenet_api::migration_journal::ImportGate,
+    pending_loads: u32,
+) -> bool {
+    journal_gate != super::freenet_api::migration_journal::ImportGate::Open || pending_loads != 0
 }
 
 // =============================================================================
@@ -10465,10 +10381,9 @@ pub enum RoomsLoadState {
 
 /// Reactive room-list load state. Starts `Loading`; advanced to `Loaded` at the
 /// real completion points (see `set_rooms_load_state` call sites) and to
-/// `Migrating` when a legacy migration re-save starts. A reactive signal (not a
-/// bare localStorage read of `is_legacy_migration_in_progress()`) because the
-/// render must re-run when the state transitions, and a migration's start does
-/// not otherwise touch a signal `RoomList` subscribes to.
+/// `Migrating` when a legacy migration re-save starts. A reactive signal because
+/// the render must re-run when the state transitions, and a migration's start
+/// does not otherwise touch a signal `RoomList` subscribes to.
 pub static ROOMS_LOAD_STATE: GlobalSignal<RoomsLoadState> = Global::new(|| RoomsLoadState::Loading);
 
 /// Set the room-list load state, deferred per the Dioxus signal-safety rules
@@ -10851,62 +10766,6 @@ pub(crate) fn on_load_worker_settled() {
             None if room_count_zero => schedule_idle_resolution(armed_gen, armed_attempt),
             None => {} // rooms present → List renders, leave the state
         }
-        // A legacy migration that completed this session seals only after the
-        // fan-out is quiescent (freenet/river#527), so every generation that
-        // was going to answer has been merged first. Armed here rather than at
-        // the re-save because this is the point where "no load work is
-        // outstanding" is known. Runs for the rooms-present case too, which
-        // `settle_terminal` deliberately leaves alone.
-        if LEGACY_SEAL_PENDING.load(Ordering::Relaxed) {
-            schedule_legacy_seal(armed_gen, armed_attempt);
-        }
-    });
-}
-
-/// A legacy migration re-saved successfully; seal it once the load goes quiet.
-/// See [`schedule_legacy_seal`].
-pub(crate) fn request_legacy_seal_on_quiescence() {
-    LEGACY_SEAL_PENDING.store(true, Ordering::Relaxed);
-    // The re-save runs in its own spawned task, so the load may ALREADY be
-    // quiescent (every worker dropped while the save was in flight) and no
-    // further settle would fire. Drive one now; it no-ops if work is pending.
-    on_load_worker_settled();
-}
-
-/// Set when a legacy migration's re-save succeeds, cleared when the seal is
-/// written. See [`request_legacy_seal_on_quiescence`].
-static LEGACY_SEAL_PENDING: AtomicBool = AtomicBool::new(false);
-
-/// Write the legacy-migration seal after [`LOAD_IDLE_MS`] of quiescence, using
-/// the same debounce as the idle load resolution: any new worker (a later
-/// generation answering) bumps the activity gen and cancels this, and the seal
-/// is re-armed when THAT worker settles. So the seal lands only after the last
-/// responding delegate generation has been merged (freenet/river#527).
-fn schedule_legacy_seal(armed_gen: u32, armed_attempt: u32) {
-    crate::util::safe_spawn_local(async move {
-        crate::util::sleep(std::time::Duration::from_millis(LOAD_IDLE_MS)).await;
-        crate::util::defer(move || {
-            let cur_gen = LOAD_ACTIVITY_GEN.load(Ordering::Relaxed);
-            let cur_attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
-            let pending = PENDING_LOADS.load(Ordering::Relaxed);
-            if !idle_should_apply(armed_gen, cur_gen, armed_attempt, cur_attempt, pending) {
-                return; // a later generation is still answering — re-armed on its settle
-            }
-            // Never seal over a migration that is mid-flight or has FAILED.
-            // The legacy re-save holds no load-worker guard, so quiescence can
-            // be reached while it is still running; and the not-found door sets
-            // the pending flag unconditionally, saying nothing about success.
-            // Sealing either case would kill the freenet/river#345 recovery
-            // across sessions, since `fire_legacy_migration_request` checks the
-            // seal BEFORE the in-progress flag. Leaving it unsealed just means a
-            // harmless re-probe next session — the safe direction.
-            if is_legacy_migration_in_progress() {
-                return;
-            }
-            if LEGACY_SEAL_PENDING.swap(false, Ordering::Relaxed) {
-                mark_legacy_migration_done();
-            }
-        });
     });
 }
 
@@ -10945,6 +10804,49 @@ fn schedule_idle_resolution(armed_gen: u32, armed_attempt: u32) {
 /// (`guard_drop_applies` / `backstop_should_apply`), so a worker or timer from a
 /// superseded attempt is a complete no-op.
 static LOAD_ATTEMPT_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// The current load attempt (see [`LOAD_ATTEMPT_GEN`]).
+pub(crate) fn current_load_attempt() -> u32 {
+    LOAD_ATTEMPT_GEN.load(Ordering::Relaxed)
+}
+
+/// `attempt + 1` once that load attempt has read the CURRENT delegate's whole
+/// room set: every listed slot and `rooms_meta` answered with a value that
+/// decoded, or there was nothing to read. `0`: no attempt has. (The `+ 1`
+/// keeps a fresh latch from vouching for attempt 0, the page load's first.)
+static ROOM_SET_COMPLETE: AtomicU32 = AtomicU32::new(0);
+
+/// Record that load attempt `attempt` read the current delegate's whole room
+/// set (freenet/river#763 review A1). A superseded attempt records nothing.
+pub(crate) fn mark_room_set_complete(attempt: u32) {
+    if load_attempt_is_current(attempt) {
+        ROOM_SET_COMPLETE.store(attempt.wrapping_add(1), Ordering::Relaxed);
+    }
+}
+
+/// Whether migrated data may be merged and saved now on behalf of load
+/// attempt `attempt`: it is still the current attempt, and it read the whole
+/// CURRENT delegate's room set (the latch is set only by a clean read of the
+/// current delegate, after its hydration landed). A LEGACY probe's failure
+/// (the attempt-wide `SAW_FETCH_FAILURE`, which also drives the Retry UI) does
+/// not gate it: the walk must still import what the sweep could not
+/// (#768 round 2 item 1). Merging older copies into a
+/// set this load could not fully read, then saving, lets the save keep the
+/// in-memory identity of a room whose stored slot failed to load and overwrite
+/// it (freenet/river#595's chain). The journaled walk checks it before it runs
+/// and again before every merge and its flush.
+pub(crate) fn room_set_complete(attempt: u32) -> bool {
+    room_set_complete_core(
+        ROOM_SET_COMPLETE.load(Ordering::Relaxed),
+        attempt,
+        LOAD_ATTEMPT_GEN.load(Ordering::Relaxed),
+    )
+}
+
+/// The pure core of [`room_set_complete`].
+pub(crate) fn room_set_complete_core(latch: u32, attempt: u32, current_attempt: u32) -> bool {
+    attempt == current_attempt && latch == attempt.wrapping_add(1)
+}
 
 /// Begin a FRESH load attempt (freenet/river#397 Codex review 8). Called at the
 /// TOP of every load entry point — `set_up_chat_delegate` (initial AND every
@@ -11001,14 +10903,14 @@ fn schedule_rooms_load_backstop() {
 /// P2). `set_up_chat_delegate` calls `begin_load_attempt()` at its top, so we do
 /// NOT call it here (avoid a double attempt bump) — the re-setup owns the fresh
 /// attempt. Retry-only: re-enable the legacy probe so a legacy source that FAILED
-/// this session is re-probed (`is_legacy_migration_done` is left alone). If the
+/// this session is re-probed. If the
 /// delegate genuinely has no rooms this time the fast ProbeLegacy/PerRoom terminal
 /// resolves to `Loaded` (→ Empty); if it succeeds it renders the list; if setup or
 /// load fails again it returns to `LoadFailed`.
 pub(crate) fn retry_rooms_load() {
     // Retry-only (deliberately NOT in `begin_load_attempt`): re-enable the legacy
     // probe so a legacy source that failed THIS session is retried (P1b). A plain
-    // reconnect must not force this (it would defeat the #253 done-gate). Set
+    // reconnect must not force this (re-probe spam on every reconnect). Set
     // BEFORE the re-setup so `fire_legacy_migration_request` sees it cleared.
     LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     crate::util::safe_spawn_local(async {
@@ -11026,9 +10928,8 @@ pub(crate) fn retry_rooms_load() {
 /// Guard to prevent repeated legacy migration attempts within the same session.
 /// The migration is fire-and-forget: if the legacy delegates don't exist on the node,
 /// the node returns "delegate not found" errors that never reach the response handler's
-/// success path, so `mark_legacy_migration_done()` is never called. Without this guard,
-/// every WebSocket reconnect would re-fire all 3 legacy delegate requests, creating a
-/// tight error spam loop (~9 errors every 3 seconds).
+/// success path. Without this guard, every WebSocket reconnect would re-fire every
+/// legacy delegate request, creating a tight error spam loop.
 static LEGACY_MIGRATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 /// Per-session guard so interrupted-migration recovery re-fires the legacy
@@ -11067,17 +10968,12 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
 /// destroying rooms the user created after the last legacy snapshot.
 ///
 /// Returns `true` if it actually dispatched legacy probes, `false` if it skipped
-/// (migration already done, or already attempted this session). The room-list
+/// (already attempted this session). The journaled walk is driven separately,
+/// on every load while the journal is incomplete (`migration_journal`). The room-list
 /// load path (freenet/river#397) uses this to decide whether to stay `Loading`
 /// (probes fired — a migration might still arrive) or resolve to `Loaded`
 /// (nothing more is coming) — see [`load_state_after_probe_legacy`].
 pub(crate) async fn fire_legacy_migration_request() -> bool {
-    // Check if migration has already been done (persistent across sessions)
-    if is_legacy_migration_done() {
-        info!("Legacy migration already done, skipping");
-        return false;
-    }
-
     // Only attempt migration once per session to avoid error spam on reconnect.
     // If the legacy delegates aren't installed, retrying won't help.
     if LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
@@ -11234,37 +11130,10 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
         LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     }
 
-    // freenet/river#398 phase 3: run the shared `freenet-migrate` walk ALONGSIDE
-    // this hand-rolled sweep (release 1 — the sweep stays authoritative for the
-    // user-facing load states; the walk adds durable per-predecessor markers and
-    // the library's classification). Reaching HERE means we are past the
-    // #253-inherited done-gate and the per-session guard, which is what scopes
-    // the walk to "current delegate observed empty, or interrupted migration
-    // recovery" — the same conditions this probe fires under.
-    //
-    // Gated on `any_dispatched` for the same reason the guard reset above is:
-    // if EVERY send failed the connection is down, and arming the walk would
-    // burn its once-per-page-load shot on a dead transport. The sweep resets
-    // its own guard so a reconnect re-probes; without this gate the reconnect's
-    // re-probe would find the walk latch already armed and never run the walk
-    // at all for the rest of the page load.
-    //
-    // Still armed at most once per page load, so a reconnect can never stack a
-    // second concurrent walk — the property the latch exists for.
-    //
-    // Residual, deliberate: if every send failed AND a reconnect already bumped
-    // the attempt, neither the guard reset above (gated on still-current) nor
-    // this arming fires, so nothing retries for the rest of the page load. Not
-    // arming on a dead transport is the correct half — that is the whole point
-    // of the gate — and the durable markers make the next load retry. The
-    // guard-reset half is pre-existing behaviour, unchanged here. The walk
-    // itself then waits for the sweep's load workers to settle before its first
-    // round-trip (the quiescence loop in `delegate_migration.rs`).
-    if any_dispatched && super::freenet_api::delegate_migration::arm_crate_walk_once() {
-        crate::util::safe_spawn_local(async {
-            let _report =
-                super::freenet_api::delegate_migration::run_crate_delegate_migration().await;
-        });
-    }
+    // The `freenet-migrate` walk is no longer armed from here: it runs on EVERY
+    // load while the migration journal is incomplete
+    // (`migration_journal::start_journal_load`), whatever the load plan
+    // (freenet/river#763). Every merge this sweep's responses make is gated by
+    // the journal (`migration_journal::gate_sweep_import`).
     true
 }

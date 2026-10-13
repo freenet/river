@@ -630,7 +630,7 @@ pub(crate) fn build_deputizers_of(
             // on their own messages for their whole subtree — the same
             // impersonation this file's badge exists to make trustworthy,
             // achieved with a real badge instead of an emoji. It also grants
-            // nothing: `is_ban_authorized` step 5 only consults a STRICT
+            // nothing: `is_ban_authorized` step 4 only consults a STRICT
             // ancestor's deputy list, so a self-grant is already inert for
             // authority. Ignore it for display too.
             if *deputy == appointer {
@@ -761,10 +761,8 @@ pub(crate) fn relevant_appointers(
 /// approximated. (`cli/src/deputies.rs::invite_subtrees` is riverctl's mirror of
 /// the same thing.)
 ///
-/// One deliberate difference from the contract's version: a visited-set guard.
-/// The contract can rely on `verify` having rejected circular invite chains; the
-/// UI walks whatever state it currently holds and must not hang on a malformed
-/// one.
+/// Like the contract's version it carries a visited-set guard: the UI walks
+/// whatever state it currently holds and must not hang on a malformed one.
 pub(crate) fn ban_removal_set(members: &MembersV1, target: MemberId) -> HashSet<MemberId> {
     let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
     for m in &members.members {
@@ -856,9 +854,9 @@ pub(crate) enum BanGate {
 ///
 /// Then the self-removal rule, applied to the OUTPUT of `is_ban_authorized`
 /// rather than inside it. That placement is load-bearing: `is_ban_authorized`
-/// grants owner-appointed global moderators authority at step 3, ahead of the
-/// step-4 guardrail, so a check wired into the wrong branch of that ladder would
-/// not fire for exactly the deputies who can reach the most members.
+/// grants owner-appointed global moderators authority at step 3, which reaches
+/// a member's own ancestors, so a check wired into only one branch of that
+/// ladder would not fire for exactly the deputies who can reach the most members.
 pub(crate) fn ban_gate(
     members: &MembersV1,
     member_info: &river_core::room_state::member_info::MemberInfoV1,
@@ -894,9 +892,10 @@ pub(crate) fn ban_gate(
 /// * `can_ban_viewer` decides only the **tooltip wording**, and is the real
 ///   contract-level answer from [`MembersV1::is_ban_authorized`] rather than an
 ///   approximation of it. The two can legitimately disagree: a deputy the
-///   viewer appointed themselves shows the shield but cannot ban the viewer
-///   (the "cannot ban the member who deputized you" guardrail in
-///   `is_ban_authorized` step 4).
+///   viewer appointed themselves shows the shield, but the viewer's grant
+///   covers only the viewer's own subtree, so it gives no authority over the
+///   viewer. They can ban the viewer only if another grant applies (a strict
+///   ancestor of the viewer, or the owner, also deputized them).
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct DeputyBadge {
     /// Viewer-relevant appointers. Never empty: an empty result means no badge
@@ -1964,6 +1963,7 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
         // of minting a generated default (freenet/river#298).
         self_nickname: export.self_nickname,
         previous_contract_key: None,
+        rekey_merge: Default::default(),
         // Restore the invitation-carried room secrets so a non-owner of a
         // private room keeps the secret across a device migration
         // (freenet/river#306). Folded into the `#[serde(skip)]` `secrets` map
@@ -1996,6 +1996,7 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
 /// self_member_info        REPLACE different-key / MERGE-keep-newer same-key
 /// self_nickname           REPLACE different-key / MERGE-keep-if-absent same-key
 /// previous_contract_key   KEEP (room-scoped #292 migration pointer)
+/// rekey_merge             KEEP (room-scoped #769 re-key merge marker)
 /// invitation_secrets      REPLACE different-key / MERGE-union(existing wins) same-key
 /// ```
 #[allow(dead_code)]
@@ -2016,6 +2017,7 @@ fn _room_data_swap_classification(rd: crate::room_data::RoomData) {
         self_member_info: _,
         self_nickname: _,
         previous_contract_key: _,
+        rekey_merge: _,
         invitation_secrets: _,
     } = rd;
 }
@@ -2440,18 +2442,37 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
     // ALSO re-renders when #345 recovery hydrates a room (recovery leaves
     // `ROOMS_LOAD_STATE == Loaded` throughout). `saw_fetch_failure()` and
     // `rooms_recovery_in_progress()` are read alongside (non-signal sources).
-    let _ = ROOMS.try_read(); // subscribe: re-render when recovery hydrates rooms
-    let saw_fetch_failure = crate::components::app::chat_delegate::saw_fetch_failure();
-    let rooms_hydrated = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
+    // Anchor FIRST, before any fallible read (dioxus-signal-safety.md,
+    // freenet/river#555): a contended `try_read` that returns `Err` registers
+    // no subscription, so without the anchor and a nudge this modal could stop
+    // re-rendering for good and keep Import disabled (#768 review A7).
+    crate::util::signal_guard::anchor();
+    if ROOMS.try_read().is_err() {
+        // subscribe: re-render when recovery hydrates rooms
+        crate::util::signal_guard::schedule_nudge();
+    }
+    // ...and when the migration journal's answer changes (freenet/river#763):
+    // its gate is not a signal, so this version counter is.
+    if crate::components::app::freenet_api::migration_journal::JOURNAL_GATE_VERSION
         .try_read()
-        .map(|g| {
-            rooms_load_is_authoritative(
-                *g,
-                saw_fetch_failure,
-                crate::components::app::chat_delegate::rooms_recovery_in_progress(),
-            )
-        })
-        .unwrap_or(false);
+        .is_err()
+    {
+        crate::util::signal_guard::schedule_nudge();
+    }
+    let journal_gate =
+        crate::components::app::freenet_api::migration_journal::current_import_gate();
+    let saw_fetch_failure = crate::components::app::chat_delegate::saw_fetch_failure();
+    let rooms_hydrated = match crate::components::app::chat_delegate::ROOMS_LOAD_STATE.try_read() {
+        Ok(g) => rooms_load_is_authoritative(
+            *g,
+            saw_fetch_failure,
+            crate::components::app::chat_delegate::rooms_recovery_in_progress(),
+        ),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            false
+        }
+    };
 
     // Reset-and-close, matching the deferred pattern in `join_with_code_modal`
     // and `.claude/rules/dioxus-signal-safety.md`: signal mutations from event
@@ -2665,6 +2686,56 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                                         crate::components::app::chat_delegate::retry_rooms_load();
                                     },
                                     "Retry loading rooms"
+                                }
+                            }
+                        } else if journal_gate
+                            == crate::components::app::freenet_api::migration_journal::ImportGate::Blocked
+                        {
+                            // The migration journal cannot confirm every room
+                            // moved over from an earlier River version (an
+                            // interrupted move, items it could not read, or the
+                            // record itself unreadable), and that can last if an
+                            // old copy is unreachable on this node. The user may
+                            // go ahead knowingly; this ignores the journal's
+                            // answer for this session and resolves nothing
+                            // (freenet/river#763; a real way to give up on an
+                            // entry is freenet-migrate#39).
+                            div {
+                                "data-testid": "import-identity-migration-incomplete",
+                                class: "mt-3 text-sm text-amber-400",
+                                "Some rooms from an earlier version of River may not have finished moving over. Importing now could overwrite one of them. River keeps trying on each load; import anyway only if you know the room is not one of them."
+                            }
+                            div { class: "flex justify-end mt-2",
+                                button {
+                                    "data-testid": "import-identity-override-migration",
+                                    class: "px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-xs rounded-lg transition-colors border border-border",
+                                    onclick: move |_| {
+                                        crate::components::app::freenet_api::migration_journal::override_import_gate();
+                                    },
+                                    "Import anyway"
+                                }
+                            }
+                        } else if journal_gate
+                            == crate::components::app::freenet_api::migration_journal::ImportGate::Unresolved
+                        {
+                            // An earlier River version's data on this node has
+                            // not answered yet: an identity imported now would
+                            // win over the one it brings later. It may never
+                            // answer (a version this node cannot run), so the
+                            // user may go ahead knowingly (#768).
+                            div {
+                                "data-testid": "import-identity-migration-unresolved",
+                                class: "mt-3 text-sm text-amber-400",
+                                "Rooms from an earlier version of River on this node haven't answered yet. Importing now could replace the identity one of them brings back. River keeps checking on each load; import anyway only if you know the room is not one of them."
+                            }
+                            div { class: "flex justify-end mt-2",
+                                button {
+                                    "data-testid": "import-identity-override-unresolved",
+                                    class: "px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-xs rounded-lg transition-colors border border-border",
+                                    onclick: move |_| {
+                                        crate::components::app::freenet_api::migration_journal::override_import_gate();
+                                    },
+                                    "Import anyway"
                                 }
                             }
                         } else {
@@ -4060,9 +4131,8 @@ mod tests {
     /// owner → alpha → beta → deputy → child, plus an unrelated `stranger`
     /// invited by the owner. `deputy` is an OWNER-APPOINTED GLOBAL MODERATOR,
     /// which is the whole point: that is the only grant in `is_ban_authorized`
-    /// that reaches a member's own ancestors, and it is granted at step 3,
-    /// ahead of the step-4 guardrail. A guard wired into the wrong branch of
-    /// that ladder would not fire for this deputy.
+    /// that reaches a member's own ancestors (step 3). A guard wired into only
+    /// one branch of that ladder would not fire for this deputy.
     struct BanChain {
         members: MembersV1,
         member_info: river_core::room_state::member_info::MemberInfoV1,
@@ -4295,10 +4365,8 @@ mod tests {
         );
     }
 
-    /// The contract's `get_downstream_members` has no visited guard — it can
-    /// rely on `verify` having rejected circular invite chains. This mirror
-    /// walks whatever state the UI currently holds, including a half-applied
-    /// or hostile one, so it must terminate. (Test hangs rather than fails if
+    /// This mirror walks whatever state the UI currently holds, including a
+    /// half-applied or hostile one, so it must terminate. (Test hangs rather than fails if
     /// this regresses, which is still a loud CI signal.)
     #[test]
     fn ban_removal_set_terminates_on_a_cycle() {
@@ -4569,8 +4637,9 @@ mod tests {
             "a deputy of an unrelated subtree must not show the shield here"
         );
 
-        // 3. Viewer is immune (they appointed this deputy themselves, so
-        //    `is_ban_authorized` step 4 denies the ban) → the badge STILL
+        // 3. Viewer is immune (they appointed this deputy themselves, and no
+        //    strict ancestor of the viewer or the owner did, so no grant in
+        //    `is_ban_authorized` covers the viewer) → the badge STILL
         //    shows. This is the half Ian called out explicitly; only the
         //    tooltip reflects the immunity.
         let mine = badges
@@ -4580,7 +4649,7 @@ mod tests {
         assert_eq!(
             mine.can_ban_viewer,
             Some(false),
-            "a deputy cannot ban the member who deputized them"
+            "the viewer's own grant gives this deputy no authority over the viewer"
         );
         assert_eq!(mine.tooltip(), "Deputy (appointed by you). Cannot ban you.");
 
@@ -4711,18 +4780,13 @@ mod tests {
         assert!(!badges.contains_key(&id(&their_deputy_sk)));
     }
 
-    /// "Cannot ban you" must not lie. A ban cascades to the banned member's
-    /// whole invite subtree, so a deputy who cannot ban the viewer DIRECTLY but
-    /// can ban the viewer's inviter still gets the viewer removed.
-    ///
-    /// Room: `owner -> alpha -> parent -> viewer`. `alpha` deputizes `mod`, and
-    /// the viewer ALSO deputizes `mod` — which is exactly the configuration the
-    /// badge advertises as "you're protected". `is_ban_authorized(mod, viewer)`
-    /// denies (step 4 guardrail), but `is_ban_authorized(mod, parent)` grants
-    /// (step 5, alpha is parent's ancestor), and banning `parent` sweeps the
-    /// viewer out with them.
+    /// "Cannot ban you" must not lie. Room: `owner -> alpha -> parent ->
+    /// viewer`. `alpha` deputizes `mod`, and the viewer ALSO deputizes `mod`.
+    /// The viewer's own grant does not affect alpha's: `mod` can ban the
+    /// viewer directly (step 4, alpha is the viewer's ancestor) and can ban
+    /// `parent`, whose ban cascades to the viewer. The tooltip must say so.
     #[test]
-    fn can_ban_viewer_accounts_for_cascading_bans() {
+    fn viewer_deputizing_a_moderator_is_not_protected_from_them() {
         use river_core::room_state::member::MembersV1;
         use river_core::room_state::member_info::MemberInfoV1;
 
@@ -4750,8 +4814,7 @@ mod tests {
                 signed_member_info(&owner_sk, "Owner", vec![]),
                 signed_member_info(&alpha_sk, "Alpha", vec![id(&mod_sk)]),
                 signed_member_info(&parent_sk, "Parent", vec![]),
-                // The viewer deputizes the moderator, which under the contract
-                // makes a DIRECT ban of the viewer inert.
+                // The viewer also deputizes the moderator; alpha's grant stands.
                 signed_member_info(&viewer_sk, "Viewer", vec![id(&mod_sk)]),
                 signed_member_info(&mod_sk, "Mod", vec![]),
             ],
@@ -4759,19 +4822,18 @@ mod tests {
         let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
         let members_by_id = members.members_by_member_id();
 
-        // Precondition: the direct ban really is denied. Without this the test
-        // would pass for the wrong reason.
+        // The direct ban is authorized by alpha's grant...
         assert!(
-            !MembersV1::is_ban_authorized(
+            MembersV1::is_ban_authorized(
                 id(&mod_sk),
                 viewer_id,
                 &members_by_id,
                 &member_info,
                 owner_id
             ),
-            "precondition: a direct ban of the viewer must be denied here"
+            "the viewer listing mod does not void alpha's grant over the viewer"
         );
-        // ...but the ancestor ban is not.
+        // ...and so is the ban of the viewer's inviter, which cascades.
         assert!(MembersV1::is_ban_authorized(
             id(&mod_sk),
             id(&parent_sk),
@@ -4786,8 +4848,8 @@ mod tests {
         assert_eq!(
             badge.can_ban_viewer,
             Some(true),
-            "the tooltip must not promise safety from someone who can remove \
-             the viewer by banning their inviter"
+            "the tooltip must not promise safety from someone who can ban \
+             the viewer"
         );
     }
 
@@ -7321,6 +7383,28 @@ mod tests {
             modal.contains("\"data-testid\": \"member-info-impersonation-explanation\""),
             "the member-info modal no longer renders the warning's explanation \
              element"
+        );
+    }
+
+    /// #768 review A7: the import modal's fallible signal reads follow
+    /// dioxus-signal-safety.md: the anchor first, a nudge on every degraded
+    /// branch (ROOMS, the journal-gate version, the load state). Otherwise a
+    /// contended read leaves the modal unsubscribed and Import disabled.
+    #[test]
+    fn the_import_modal_anchors_and_nudges_its_fallible_reads() {
+        let src: String = crate::util::strip_comments(include_str!("members.rs"))
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let anchor = src
+            .find("crate::util::signal_guard::anchor();ifROOMS.try_read().is_err(){")
+            .expect("anchor before the ROOMS read");
+        let body = &src[anchor..anchor + 1200];
+        assert!(body.contains("JOURNAL_GATE_VERSION.try_read().is_err(){crate::util::signal_guard::schedule_nudge();}"));
+        assert!(body.contains("Err(_)=>{crate::util::signal_guard::schedule_nudge();false}"));
+        assert!(
+            body.matches("schedule_nudge();").count() >= 3,
+            "every fallible read nudges"
         );
     }
 }

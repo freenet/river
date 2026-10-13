@@ -79,7 +79,7 @@ cargo fmt
 ### Step 5: Commit, Build, and Publish
 
 ```bash
-git add legacy_delegates.toml ui/public/contracts/ cli/contracts/
+git add legacy_delegates.toml pointer-records.toml ui/public/contracts/ cli/contracts/
 git commit -m "fix: <description> with delegate migration"
 cargo make build
 cargo make compress-webapp
@@ -228,32 +228,35 @@ where stale legacy data overwrites newer state on the current delegate
 2. `LEGACY_DELEGATES` is generated at compile time from `legacy_delegates.toml`
    by `ui/build.rs`, which delegates the codegen itself to
    `freenet_migrate_build::codegen()`.
-3. The current delegate's `ListResponse` is classified by `plan_load_from_keys`:
+3. The current delegate's `ListResponse` is classified by `plan_load_from_keys`,
+   and the same listing starts this page load's **migration journal** work
+   (`migration_journal::start_journal_load`, below):
    - **Has `room:<vk>` keys** → `load_rooms_per_room` plain-GETs each slot
-     (+ `rooms_meta`), reconstructs `Rooms`, and hydrates. What it does about
-     legacy migration is gated by `decide_per_room_load_action` on the
-     **interrupted-migration flag** (`is_legacy_migration_in_progress()`):
-     - *Not interrupted* (the common case) → the per-room set is authoritative:
-       call `mark_legacy_migration_done()`; legacy probes never fire (#253).
-     - *Interrupted* (a prior legacy→per-room migration was cut short before it
-       wrote every key — freenet/river#345 follow-up, Nacho's "Freenet Devs"
-       disappeared-after-update) → do NOT mark done; after loading the partial
-       set, re-run `migrate_current_blob_to_per_room()` once (armed via
+     (+ `rooms_meta`), reconstructs `Rooms`, and hydrates. Then
+     `decide_per_room_load_action` decides whether to re-run the sweep to
+     recover stranded rooms, from the journal's answer
+     (`interrupted_import()` on the status this load's `begin` returned), or a
+     `rooms_data` blob still stored beside the per-room keys:
+     - *Not interrupted* (the common case) → no sweep re-run. Legacy probes
+       never fire from this plan (#253).
+     - *Interrupted* (a prior migration was cut short before it wrote every key
+       — freenet/river#345 follow-up, #760) → after loading the partial set,
+       re-run `migrate_current_blob_to_per_room()` once (armed via
        `arm_legacy_migration_recovery()`, which also clears the per-session
        attempt guard so same-session recovery isn't a no-op) to recover any
-       stranded room. The re-save is per-room CAS read-merge-write, so an
-       already-present room merges rather than being clobbered.
+       stranded room with the sweep's full hydrate. The re-save is per-room CAS
+       read-merge-write, so an already-present room merges rather than being
+       clobbered.
    - **No per-room keys, only a legacy `rooms_data` blob** →
      `migrate_current_blob_to_per_room` reads it and re-saves as per-room keys
      (non-destructive — the blob is left as a rollback fallback).
    - **Nothing** → `fire_legacy_migration_request()`.
 
-   The **interrupted-migration flag** is a per-legacy-set localStorage marker
-   (`river_legacy_migration_in_progress:<fingerprint>`, parallel to the
-   `…_done:` flag): set BEFORE any migration re-save (`hydrate_loaded_rooms`'s
-   legacy branch and the current-blob explosion alike) and cleared ONLY on a
-   FULL successful re-save. A partial/aborted re-save therefore leaves it set,
-   which is what drives the recovery above.
+   There is **no "done" seal and no `localStorage` flag** any more
+   (freenet/river#763). Both lived in `localStorage`, which throws in the
+   gateway's sandboxed iframe, so in production neither ever persisted, and an
+   interrupted migration stranded rooms for good (#760). The journal, stored
+   in the current delegate, is the only authority.
 4. `fire_legacy_migration_request` probes each legacy delegate TWO ways:
    (a) fixed `GetRequest` for `[ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY]`
    (the pre-#345 single-blob format + DM cache), and (b) a `ListRequest` to
@@ -269,18 +272,29 @@ where stale legacy data overwrites newer state on the current delegate
    the in-memory `OUTBOUND_DMS` signal — keeping whichever entry has the larger
    `timestamp` on collision so a later-arriving legacy response can't clobber a
    fresher current entry.
-6. On a legacy delegate returning data, `mark_legacy_migration_done()` is called
-   after the post-merge save succeeds; on a legacy delegate returning no data it
-   is called immediately.
+6. **Every legacy merge the sweep makes is journal-gated** (#763):
+   `sweep_may_merge` -> `migration_journal::gate_sweep_import` ->
+   `note_app_import_started` runs before the merge, so a tab killed mid-save
+   leaves an interrupted import that the next load's `begin` reports. `Flagged`
+   merges; `AlreadyImported` merges too, unflagged, through the same ranked,
+   tombstone-safe `merge_from_source` (a backstop for a completed import that
+   was partial; a room left since stays left); any error skips that
+   predecessor on this load. The per-room sweep passes an item count in the
+   walk's unit (keys that answered with a value); the fixed-key arms pass none.
 
-**Trade-off**: a user with data in both current and legacy delegates will
-NOT have the legacy `rooms_data` merged. This is intentional — the
-alternative race destroys newer data, which is much worse than failing to
-recover older data the user has effectively abandoned. The same applies
-to legacy `outbound_dms`: it is only probed when the gate above fires,
-i.e. when the current delegate's `rooms_data` is empty. A user with
-rooms on the current delegate but outbound DM plaintext only on a legacy
-delegate will not have those plaintexts migrated.
+**The #253 ordering, now that the walk runs on every load.** The sweep's
+fixed probes still fire only when the current delegate is empty (or for an
+interrupted-migration recovery). The journaled walk, though, imports every
+pending predecessor while the journal is incomplete, whatever the current
+delegate holds (#763). That cannot clobber newer state: the walk waits for the
+load's workers (the current delegate's own room load included) to settle
+before it starts, every import goes through `Rooms::merge_from_source` at the
+predecessor's generation rank, below the current delegate's (so a current
+identity wins a conflict and a current tombstone keeps a room left), messages
+CRDT-merge, and the save is a per-room CAS read-merge-write against what the
+delegate already holds. Pinned by the ranked-merge tests in
+`delegate_migration.rs` (`a_room_deleted_after_migration_is_not_resurrected`,
+`identity_conflicts_resolve_by_generation_rank_not_arrival`).
 
 **Adding new storage keys**: how to make a new top-level key survive a delegate
 rebuild depends on the key's shape. Note there are now **three** sites, not two —
@@ -302,39 +316,152 @@ Missing any of these leaves the new key orphaned across delegate rebuilds —
 exactly the bug the per-room `ListRequest` legacy probe (freenet/river#345) was
 added to prevent.
 
-## The crate walk (freenet-migrate) — the second, parallel recovery path
+## The crate walk and the completeness journal (freenet-migrate 0.7)
 
-Since freenet/river#398 phase 3 there are **two** migration mechanisms running
-side by side, and this file historically described only the first:
+There are **two** importers running side by side, and since freenet/river#763
+one durable authority over both:
 
-1. the hand-rolled sweep documented above, which stays authoritative for the
-   user-facing load states; and
-2. the shared `freenet-migrate` crate's **walk**, which adds durable
-   per-predecessor markers and the library's classification.
+1. the hand-rolled sweep documented above (fast, owns the user-facing load
+   states and the full hydrate); and
+2. the shared `freenet-migrate` crate's **journaled walk**
+   (`delegate_migration.rs`), which imports every predecessor through River's
+   own ranked merge and records what each one resolved to.
 
-The walk is armed once per page load from the end of
-`fire_legacy_migration_request`, after the `any_dispatched` determination and
-gated on it (arming it when every send failed would burn the once-per-load
-latch on a dead transport). It waits for the sweep's load workers to settle
-before its first round-trip.
+`migration_journal.rs` drives them:
 
-Its durable markers live in the CURRENT delegate's KV store under
-`__migrate_pred_done__:<hex>` and `__migrate_pred_wip__:<hex>`, hex-encoded
-because the delegate's own key handling is `String::from_utf8_lossy`, which
-would alias two predecessors whose raw keys differ only in invalid UTF-8. These
-markers are what make the walk idempotent across page loads: a predecessor with
-a Done marker is never re-fetched.
+- **`begin_migration_journal` on every page load**, from the current
+  delegate's room listing, and lazily before any sweep merge that comes first.
+- **The walk while the status `begin` returned is incomplete**, whatever the
+  load plan (after an interrupted per-room write the plan is `PerRoom`, so the
+  walk can no longer hang off the `ProbeLegacy` sweep). Rate-limited
+  (freenet/river#761) only while every pending generation answered a TYPED
+  "missing delegate" on the last 3 walks and nothing is mid-import: then it
+  runs on one load in 10, counted under `__river_migration_walk_skips__` in
+  the current delegate. Silence never counts as "not installed".
+- **The walk again after a sweep flag**, once the load is quiet, so the
+  sweep's import is resolved in the same session.
+- All journal calls are **serialised** (the request registry holds one waiter
+  per correlation key).
 
-Because both mechanisms probe the same legacy delegates with the same
+What lives in the CURRENT delegate's KV store: the journal under
+`\0freenet-migrate-journal/v1` (the crate's reserved namespace), the
+per-predecessor markers `__migrate_pred_done__:<hex>` / `__migrate_pred_wip__:<hex>`
+(hex because the delegate's key handling is `String::from_utf8_lossy`), and the
+cadence counter. None of them is ever fetched, imported or counted when this
+delegate later becomes a predecessor (`is_migration_bookkeeping_key`).
+
+The marker store follows the crate's three-rule contract: a data in-progress
+marker beside an empty done marker reads as in progress; done and in-progress
+are separate keys; the in-progress marker is written by compare-and-swap, so no
+session downgrades data to empty.
+
+`fetch_secrets` never returns a short list (#592): it reads the predecessor's
+RAW key index twice and refuses one that does not decode, two reads that
+disagree, a listing that disagrees with it, an absent index beside a stored
+fixed key, a probed fixed key or a room named by the predecessor's
+`rooms_meta` (order, notification modes, cursor) that is stored but unlisted
+(the common #592 shape: a short index rewritten by a later `rooms_meta`
+store), and a listed key that answers "no value". A wrong refusal costs a
+retry; a wrong short answer would be certified complete.
+
+**End state of a refused predecessor.** A FROZEN generation whose index is
+genuinely short is refused on every load: it stays pending (its
+`absent_streak` stays 0, so the #761 cadence never slows its walk), and its
+unlisted rooms do not migrate. The rooms its short index does list still
+arrive through the sweep. The user is told only when importing an identity:
+the gate reads `Unresolved` and offers "Import anyway". There is no general
+notice, and no repair path short of reading the delegate's storage directly
+(which the delegate API cannot do without `list_secrets`, a host import
+nodes before 0.2.81 lack).
+
+**The walk runs only over a complete current room set** (#768 review A1).
+A load attempt records `mark_room_set_complete` only when every listed slot
+of the CURRENT delegate and its `rooms_meta` answered and decoded (a listed
+key with no value is a read fault, never a skip), from a `defer` queued after
+the hydration it vouches for. A legacy probe's failure does not gate the
+walk. A listed slot that stays unreadable gates the walk on every load (the
+rail shows Retry); that is deliberate, since walking over it is #595. The walk driver captures the attempt, waits for the load
+to settle, and aborts (re-arming the next attempt, without spending the walk
+budget) if the load is still pending at the cap, a reconnect began a new
+attempt, or the set is not complete; `LiveImportSeam` re-checks before every
+merge, inside each deferred mutation, and before its flush. Merging older copies into a set that failed to load, then
+saving, is #595's identity-overwrite chain.
+
+**The sweep's journal gate** is retried with backoff; a final refusal marks
+the load's fetch failure (Retry, not a false "no rooms") and leaves that
+generation to the walk, which is not gated by it.
+
+**Post-resolve top-up** (#768 review B1). An old tab on the previous build
+keeps writing to the newest predecessor (V33) until it is closed. After the
+journal resolves it, each load reads V33's raw key index (one GET) and, within
+the window, re-lists it and merges rooms the current delegate does not know at
+all, plus its outbound-DM entries (never its hidden threads), through the
+ranked merge. The window (`__river_migration_topup_window__`) is 14 days or
+30 top-ups that actually ran, and restarts whenever V33's index digest
+changes. The top-up is its own driver request: it never forces a walk.
+Only DM entries the cache does not already hold are merged, so an unchanged
+predecessor costs no merge and no save. Only the NEWEST predecessor is topped
+up: a room a tab on an older build (V32) creates after the journal resolved V32
+stays in V32, not destroyed, and is not picked up.
+
+**Archive entries across generations** (freenet/river#776). Un-archiving a DM
+thread deletes its `hidden_threads` entry with no tombstone, so merging an
+older generation's archives can bring back one the user removed in a newer
+generation. Only the NEWEST predecessor holding archive data has its
+`hidden_threads` merged (`newest_archive_holder`): every newer generation must
+be known to hold no DM store (it exported none earlier in the same walk, or
+the journal resolved it as not data-bearing, or it is typed "not installed").
+A generation with rooms but no DM store counts as holding none: archiving and
+un-archiving both save the store, so it holds no archive decision. A
+generation resolved data-bearing in an EARLIER load counts as holding one,
+because the journal does not record which items it held.
+Otherwise that generation's archives are skipped, permanently: the journal
+seals that generation in the same walk, so it is never imported again. On
+nodes before 0.2.137 a missing delegate answers with silence, so a newer
+generation that is not installed there makes older archives skip; that cost
+applies only when a newer generation is silent. The walk runs newest-first,
+so a newer answer is known first. Nothing is ever removed. The sweep and the
+top-up never merge archives; the walk does, and it imports every
+predecessor's DM store while the journal is incomplete. A wrong skip shows a
+thread un-archived; it never loses a message. Accounts #772 already re-archived
+are not healed (see the follow-up issue linked from #776). There is no "a newer
+outbound DM supersedes the entry" repair: an archive's `hidden_at_ts` is the
+newest INBOUND timestamp, not the archive time, so it would un-archive every
+thread the user replied to and then archived.
+
+**Migrated identities keep their source rank across loads** (#768 review
+B3): `rooms_meta.identity_sources` records which legacy generation supplied a
+room's `self_sk`, and the load restores it, so a newer generation answering
+later still wins the identity conflict (and a newer generation's tombstone
+still removes the room). Another tab's entries survive this tab's save, and an
+imported predecessor's own entries are carried into the rank registry.
+
+The **identity-import gate** (#414) is composed from the journal: a walk in
+flight or a status not yet read waits; `begin` failing, a walk whose status is
+unknown, `interrupted_import()`, or permanently rejected items block; and a
+pending predecessor that has not been found "not installed" (silent, or
+refused) reads `Unresolved` and waits, because an identity imported then would
+outrank the newer one it brings later. Blocked and Unresolved both offer a
+user override ("Import anyway") that ignores, never resolves, the answer.
+
+**The chat delegate's key-value writes are crash-safe** (#768 round 2). The
+empty index is created before any value is ever written, so a stored key never
+exists without one; an absent index beside a stored key is a refused read
+fault. Adding a new key or deleting a listed one records an intent under
+`<origin>:::kv_intent` first, and every operation first rolls a recorded
+intent forward, so a node restart between any two writes wedges nothing.
+
+Because both importers probe the same legacy delegates with the same
 correlation keys, a legacy `ListResponse` is routed to `migrate_legacy_per_room`
 only when no waiter consumed it (`!completed`) — otherwise the walk is already
 importing that delegate and a second concurrent migration would displace its
 reads in the single-waiter registry. See the comment at that call site for the
 counting argument and its two exceptions.
 
-Release 2 retires the sweep; until then, treat the sweep as authoritative and
-the walk as additive. The `freenet-migrate-adoption` skill covers the
-call-site swap, the dual-running period and the parity test.
+**Raise `RIVER_IMPORT_REVISION`** (`delegate_migration.rs`) with any change to
+how the import path decodes items, or predecessors resolved with rejected items
+stay resolved and their items stay missing. The `freenet-migrate-adoption`
+skill covers the call-site swap, the dual-running period and the parity test.
 
 ## Migration Limitations
 
@@ -347,7 +474,7 @@ call-site swap, the dual-running period and the parity test.
 - **Wrong hash algorithm**: BLAKE3 not SHA256 for CodeHash
 - **Forgetting migration**: Users lose all room data
 - **Computing key AFTER changes**: Must run `add-migration` BEFORE changes alter the WASM
-- **Not republishing riverctl**: Use `cargo make publish-all` when WASM changes
+- **Not republishing riverctl**: Use `cargo make publish-all` when the room-contract WASM changes (riverctl does not embed the chat delegate)
 - **Parameters file**: Always use `published-contract/webapp.parameters` (committed) — determines contract ID
 
 ## Contract ID

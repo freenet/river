@@ -12,8 +12,9 @@ pub enum SynchronizerError {
     WebSocketError(String),
 
     /// The node's typed `DelegateError::Missing` for `key`. Kept structured so
-    /// the legacy-migration seal can tell WHICH delegate is missing
-    /// (freenet/river#707). Displays exactly like the `WebSocketError` it used
+    /// the error arm can tell WHICH delegate is missing (freenet/river#707): the
+    /// current one (register it) or a legacy one (the migration journal's "not
+    /// installed" verdict). Displays exactly like the `WebSocketError` it used
     /// to be mapped to.
     #[error("WebSocket connection error: {message}")]
     DelegateMissing { key: DelegateKey, message: String },

@@ -2335,9 +2335,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-migrate"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "866b434a07257c5bcda3b4e2a64c2c51e584ac7bc8664b91c0429352fb23e4fb"
+checksum = "099e0ac5fed5bdd30f35d1d10a881b292ac221f2880debc470c299983f343075"
 dependencies = [
  "blake3",
  "bs58",
@@ -2351,9 +2351,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-migrate"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "099e0ac5fed5bdd30f35d1d10a881b292ac221f2880debc470c299983f343075"
+checksum = "e9b6177524a7d4800bb8854fbfa6361ef81ac9c98919d03ed74174972f061b8c"
 dependencies = [
  "blake3",
  "bs58",
@@ -4843,7 +4843,7 @@ dependencies = [
 
 [[package]]
 name = "river-core"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -4870,7 +4870,7 @@ dependencies = [
 
 [[package]]
 name = "river-ui"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -4881,7 +4881,7 @@ dependencies = [
  "dioxus",
  "dioxus-free-icons",
  "ed25519-dalek",
- "freenet-migrate 0.5.0",
+ "freenet-migrate 0.7.0",
  "freenet-migrate-build",
  "freenet-scaffold",
  "freenet-stdlib 0.8.5",
@@ -4910,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "riverctl"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "assert_cmd",
