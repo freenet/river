@@ -9,32 +9,54 @@ use crate::components::app::{
     MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NOTIFICATION_MODAL,
     ROOMS,
 };
+use crate::components::back_to_chat::CountBadge;
 use crate::components::members::{
     deputy_badges_for_viewer, impersonation_checker_for_viewer, impersonation_warning_for_display,
     privilege_in_view, DeputyBadge,
 };
+#[cfg(test)]
+use crate::components::scroll_to_latest::is_arrival;
+#[cfg(target_arch = "wasm32")]
+use crate::components::scroll_to_latest::observe_newest;
+use crate::components::scroll_to_latest::LatestButton;
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
-use crate::util::display_name::{display_nickname, sanitize_display_name};
+use crate::util::display_name::display_nickname;
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_text_or_placeholder};
 use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
     get_current_system_time, local_message_date, local_today,
 };
 mod emoji_picker;
+mod history_scroll;
+mod history_window;
+mod markdown;
 mod mention;
 mod message_actions;
 mod message_input;
 mod not_member_notification;
 use self::emoji_picker::FREQUENT_EMOJIS;
+#[cfg(target_arch = "wasm32")]
+use self::history_scroll::{
+    complete_scroll_request, correct_view_after_patch, follow_arrival_at_end,
+    install_scroll_settle_listener, land_at_end, note_newest_seen, observe_history_resize,
+    ROOM_HISTORY,
+};
+use self::history_scroll::{remember_reading_position, resolve_rendered_range, ReaderPosition};
+use self::history_window::{grown_window, BACKFILL_LEAD_PX, INITIAL_WINDOW_ITEMS};
+pub(crate) use self::markdown::message_to_html;
+use self::markdown::{
+    clean_reply_preview, description_to_html, member_names_fingerprint, prune_message_html_cache,
+    render_message_html_cached, running_behind_freenet_gateway,
+};
 use self::not_member_notification::NotMemberNotification;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile,
-    FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
+    FaBars, FaBell, FaBellSlash, FaCircleInfo, FaEllipsisVertical, FaFaceSmile, FaPenToSquare,
+    FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -44,10 +66,7 @@ use river_core::room_state::message::{
     AuthorizedMessageV1, MessageId, MessageV1, MessagesV1, RoomMessageBody,
 };
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
-use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Duration;
 use wasm_bindgen::JsCast;
@@ -156,8 +175,11 @@ struct MessageGroup {
 struct GroupedMessage {
     content_text: String,
     content_html: String,
-    #[allow(dead_code)]
     time: DateTime<Utc>,
+    /// The sender's unclamped time, used for display ordering (see
+    /// [`NewestKey`]). The clamped `time` still controls presentation and
+    /// grouping.
+    sent_ms: i64,
     /// True if the sender's timestamp ran ahead of when we received this
     /// message and was clamped back to that arrival time. (It is clamped to
     /// ARRIVAL, not to "now": see [`MessageClock`] for why the render's wall
@@ -189,6 +211,13 @@ struct EventSummary {
     names: Vec<String>,
     id: String,
     last_time: DateTime<Utc>,
+    /// The sender's unclamped time, used for display ordering (see
+    /// [`NewestKey`]). The clamped `last_time` still controls presentation and
+    /// grouping.
+    last_sent_ms: i64,
+    /// The newest event folded in, for the follow and read rules (see
+    /// [`display_item_newest`]).
+    last_message_id: MessageId,
 }
 
 /// The representative timestamp (ms since epoch) for a display item, used to
@@ -209,6 +238,19 @@ fn display_item_time_ms(item: &DisplayItem) -> i64 {
     }
 }
 
+/// The newest display message `item` renders: what the follow rule compares,
+/// and what the read rule marks when the item is the newest one on screen.
+fn display_item_newest(item: &DisplayItem) -> Option<NewestKey> {
+    let (time_ms, id) = match item {
+        DisplayItem::Messages(group) => {
+            let message = group.messages.last()?;
+            (message.sent_ms, message.message_id.clone())
+        }
+        DisplayItem::Event(summary) => (summary.last_sent_ms, summary.last_message_id.clone()),
+    };
+    Some(NewestKey { time_ms, id })
+}
+
 /// The stable per-item key used on the item's rendered root, reused to derive
 /// a unique key for the date separator that precedes it.
 fn display_item_key(item: &DisplayItem) -> String {
@@ -224,7 +266,7 @@ fn display_item_key(item: &DisplayItem) -> String {
 /// renders as a SINGLE keyed node — otherwise Dioxus takes the list key from
 /// the fragment's first root, which would be the keyless separator expression,
 /// silently dropping the whole group list to positional diffing and leaking
-/// per-group component state on mid-list edits (freenet/river#326 review).
+/// per-group component state on mid-list edits (freenet/river#326).
 enum DisplayRow {
     DateSeparator { key: String, label: String },
     Item(DisplayItem),
@@ -570,6 +612,7 @@ fn group_messages(
         let author_id = message.message.author;
         let message_id = message.id();
         let raw_time = DateTime::<Utc>::from(message.message.time);
+        let sent_ms = raw_time.timestamp_millis();
         // Clamp target: when we first saw it, else the pass-wide "now".
         let clamp_to = clock.clamp_target(&message_id);
         // `checked_add_signed` rather than `+`: `clamp_to` can come from
@@ -591,12 +634,16 @@ fn group_messages(
                 if let Some(DisplayItem::Event(ref mut summary)) = items.last_mut() {
                     summary.names.push(author_name);
                     summary.last_time = message_time;
+                    summary.last_sent_ms = sent_ms;
+                    summary.last_message_id = message_id;
                 }
             } else {
                 items.push(DisplayItem::Event(EventSummary {
                     names: vec![author_name],
                     id: msg_id_str,
                     last_time: message_time,
+                    last_sent_ms: sent_ms,
+                    last_message_id: message_id,
                 }));
             }
             continue;
@@ -637,14 +684,13 @@ fn group_messages(
         );
 
         // Look up propagation delay (send time → receive time)
-        let send_time_ms = raw_time.timestamp_millis();
-        let receive_delay_secs =
-            get_delay_secs_from(clock.receive_times, &message_id, send_time_ms);
+        let receive_delay_secs = get_delay_secs_from(clock.receive_times, &message_id, sent_ms);
 
         let grouped_message = GroupedMessage {
             content_text: content_text.clone(),
             content_html,
             time: message_time,
+            sent_ms,
             time_clamped,
             id: format!("{:?}", message_id.0),
             message_id,
@@ -825,7 +871,7 @@ pub(crate) fn decrypt_message_content(
                 // (or the rotation fallback) will decrypt the actual
                 // content.
                 //
-                // Wording note (skeptical review M1 on PR #286): the
+                // Wording note (PR #286): the
                 // `secrets` map is `#[serde(skip)]`, so EVERY cold-start
                 // of an established private room transiently lands
                 // here until `repopulate_secrets_from_state` rehydrates
@@ -851,105 +897,6 @@ pub(crate) fn decrypt_message_content(
             }
         }
     }
-}
-
-/// Clean a quoted reply-preview snapshot for display: resolve `@[name](rv:id)`
-/// mention tokens to plain `@name` (using each member's *current* nickname, with
-/// the token snapshot as fallback) and strip markdown formatting, so the preview
-/// reads as plain text. Caller truncates the result.
-fn clean_reply_preview(text: &str, member_names: &HashMap<MemberId, String>) -> String {
-    use river_core::mention::{parse_segments, MentionSegment};
-
-    // Mirrors `river_core::mention::render_plaintext`, except the fallback
-    // display name — the `[name]` snapshot the SENDER embedded in the message
-    // — is sanitised. That snapshot is arbitrary attacker text, so an
-    // unsanitised fallback would let `@[Alice 🛡](rv:…)` paint a shield into a
-    // reply preview for a member id nobody in the room resolves. Names that DO
-    // resolve come from `member_names`, which is already sanitised at source.
-    let mut with_mentions = String::with_capacity(text.len());
-    for seg in parse_segments(text) {
-        match seg {
-            MentionSegment::Text(t) => with_mentions.push_str(&t),
-            MentionSegment::Mention(m) => {
-                let name = member_names
-                    .iter()
-                    .find(|(id, _)| m.member_ref.matches(**id))
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_else(|| sanitize_display_name(&m.display_name));
-                with_mentions.push('@');
-                with_mentions.push_str(&name);
-            }
-        }
-    }
-    strip_markdown(&with_mentions)
-}
-
-/// Reduce markdown to its plain-text content (emphasis/headings/code-fences
-/// removed, links rendered as their visible text). Used for the single-line
-/// reply-preview snapshot, never for the message body (which renders full
-/// markdown). Falls back to the input unchanged if parsing fails.
-fn strip_markdown(text: &str) -> String {
-    // The preview is truncated anyway, so parse at most a bounded prefix.
-    let text = truncate_to_char_boundary(text, MARKDOWN_MAX_SOURCE_BYTES);
-    if !markdown_cost_is_bounded(text) {
-        return text.to_string();
-    }
-    match markdown::to_mdast(text, &markdown::ParseOptions::gfm()) {
-        Ok(node) => {
-            let mut out = String::with_capacity(text.len());
-            collect_mdast_text(&node, &mut out);
-            drop_mdast(node);
-            out
-        }
-        Err(_) => text.to_string(),
-    }
-}
-
-/// Depth-first collection of the visible text from a markdown AST node.
-///
-/// Iterative, not recursive: nesting depth is chosen by whoever wrote the
-/// text, and a recursive walk of a deep tree overflows the stack.
-fn collect_mdast_text(root: &markdown::mdast::Node, out: &mut String) {
-    use markdown::mdast::Node;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        match node {
-            Node::Text(t) => out.push_str(&t.value),
-            Node::InlineCode(c) => out.push_str(&c.value),
-            Node::Code(c) => out.push_str(&c.value),
-            // A hard/soft break or thematic break becomes a space so words on
-            // separate lines don't run together in the single-line preview.
-            Node::Break(_) | Node::ThematicBreak(_) => out.push(' '),
-            _ => {}
-        }
-        if let Some(children) = node.children() {
-            stack.extend(children.iter().rev());
-        }
-    }
-}
-
-/// Drop a markdown AST without recursing: the tree's own `Drop` recurses once
-/// per nesting level, which overflows the stack on deeply nested text.
-fn drop_mdast(root: markdown::mdast::Node) {
-    let mut stack = vec![root];
-    while let Some(mut node) = stack.pop() {
-        if let Some(children) = node.children_mut() {
-            stack.append(children);
-        }
-    }
-}
-
-/// The longest prefix of `text` that is at most `max` bytes and ends on a
-/// char boundary.
-fn truncate_to_char_boundary(text: &str, max: usize) -> &str {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 /// The id of the message this reply quotes, or `None` if it is not a reply (or
@@ -992,2594 +939,40 @@ pub(crate) fn extract_reply_target_id(
     }
 }
 
-/// Convert message text to HTML with clickable links that open in new tabs.
-///
-/// Uses GFM autolink literals to linkify plain URLs while correctly
-/// skipping URLs inside code spans and other non-text contexts.
-/// Re-exported as `pub(crate)` so the DM thread renderer can share the
-/// same linkify + Freenet-URL-rewrite path as room messages.
-pub(crate) fn message_to_html(text: &str) -> String {
-    message_to_html_inner(text, running_behind_freenet_gateway())
+/// The room's newest display message, as the follow rule compares it. Ordered
+/// by the sender's unclamped time, then id: display order (the clamped time is
+/// for presentation and grouping only), so a later message, a message folding
+/// into the last author's group and a join folding into the trailing event
+/// summary all compare greater; a deletion of the newest compares less, and an edit equal.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct NewestKey {
+    time_ms: i64,
+    id: MessageId,
 }
 
-fn message_to_html_inner(text: &str, behind_gateway: bool) -> String {
-    if !markdown_cost_is_bounded(text) {
-        return plain_text_to_html(text);
-    }
-
-    // Convert single newlines to hard breaks (two spaces + newline)
-    // This preserves line breaks in chat messages as users expect
-    let with_hard_breaks = text.replace("\n", "  \n");
-
-    markdown_to_html(&with_hard_breaks, text, behind_gateway)
-}
-
-/// Longest text rendered as markdown.
-const MARKDOWN_MAX_SOURCE_BYTES: usize = 4096;
-
-/// Most block containers (`>`, `-`, `1.` ...) opened at the start of one line.
-const MARKDOWN_MAX_LINE_NESTING: usize = 16;
-
-/// Most `|` on one line, which bounds the columns of a table.
-const MARKDOWN_MAX_LINE_PIPES: usize = 32;
-
-/// Longest HTML kept from rendering markdown (see `markdown_to_html`).
-const MARKDOWN_MAX_HTML_BYTES: usize = 64 * 1024;
-
-/// Whether `text` is cheap enough to parse as markdown. The parser's time
-/// grows faster than linearly with nesting depth, and a table's output with
-/// columns times rows, so text past these limits is shown as plain text.
-/// Depth is counted per line. Nesting built up across lines needs growing
-/// indentation, which the size limit bounds to a few hundred levels (a few
-/// ms to parse at the default 1000-byte message size, tens of ms at the size
-/// limit). Only DMs and rooms that raised `max_message_size` above the
-/// default can carry text past the size limit, which is large enough for the
-/// longest valid share link (see `longest_valid_bare_link_still_converts`).
-fn markdown_cost_is_bounded(text: &str) -> bool {
-    if text.len() > MARKDOWN_MAX_SOURCE_BYTES {
-        return false;
-    }
-    // Characters that can hide a marker from the count below but not from
-    // the parser: a leading byte order mark, which the parser skips, and the
-    // sentinels `extract_bare_freenet_links` may drop before parsing.
-    let ignored = ['\u{feff}', BARE_LINK_OPEN, BARE_LINK_CLOSE];
-    let text: std::borrow::Cow<str> = if text.contains(ignored) {
-        text.replace(ignored, "").into()
-    } else {
-        text.into()
-    };
-    // `\r` alone also ends a line in markdown.
-    text.split(['\n', '\r']).all(|line| {
-        line_container_depth(line) <= MARKDOWN_MAX_LINE_NESTING
-            && line.bytes().filter(|&b| b == b'|').count() <= MARKDOWN_MAX_LINE_PIPES
-    })
-}
-
-/// How many block quote, list item or footnote definition markers open at
-/// the start of `line` (an over-count is fine: it only makes plain text more
-/// likely).
-fn line_container_depth(line: &str) -> usize {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let mut depth = 0;
-    loop {
-        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-            i += 1;
-        }
-        let marker_end = match bytes.get(i) {
-            Some(b'>') => i + 1,
-            // A GFM footnote definition, `[^label]: `.
-            Some(b'[') if bytes.get(i + 1) == Some(&b'^') => match line[i..].find("]:") {
-                Some(end) => {
-                    depth += 1;
-                    i += end + 2;
-                    continue;
-                }
-                None => return depth,
-            },
-            Some(b'-' | b'*' | b'+') => i + 1,
-            Some(b'0'..=b'9') => {
-                let mut j = i;
-                while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    j += 1;
-                }
-                match bytes.get(j) {
-                    Some(b'.' | b')') => j + 1,
-                    _ => return depth,
-                }
-            }
-            _ => return depth,
-        };
-        // A list marker must be followed by whitespace or the line's end.
-        let is_quote = bytes[i] == b'>';
-        if !is_quote && !matches!(bytes.get(marker_end), None | Some(b' ' | b'\t')) {
-            return depth;
-        }
-        depth += 1;
-        i = marker_end;
-    }
-}
-
-/// Render a room description: markdown, or plain text when
-/// [`markdown_cost_is_bounded`] says no.
-fn description_to_html(text: &str, behind_gateway: bool) -> String {
-    if !markdown_cost_is_bounded(text) {
-        plain_text_to_html(text)
-    } else {
-        markdown_to_html(text, text, behind_gateway)
-    }
-}
-
-/// Text not rendered as markdown: escaped, with each line break kept.
-fn plain_text_to_html(text: &str) -> String {
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    format!("<p>{}</p>", escape_html(&text).replace('\n', "<br />\n"))
-}
-
-/// Convert markdown text to HTML with clickable links that open in new tabs.
-///
-/// `plain` is what to show as plain text if the HTML comes out too long: the
-/// text as the user wrote it, before any markdown-specific rewriting.
-fn markdown_to_html(original_text: &str, plain: &str, behind_gateway: bool) -> String {
-    // GFM only autolinks http(s)/www text, so a bare `freenet:<id>` share link
-    // would stay plain text. Pull valid ones out BEFORE markdown runs, so
-    // emphasis/strikethrough syntax inside a link (`…/a*b*c`) cannot split it,
-    // and put them back as anchors afterwards; turning an anchor into a link to
-    // the reader's node is `finalize_anchors`' job, the same as for every other
-    // share link. Only behind a gateway, because without one there is no node
-    // to link to (see `finalize_anchors`).
-    let (text, bare_links) = if behind_gateway {
-        extract_bare_freenet_links(original_text)
-    } else {
-        (std::borrow::Cow::Borrowed(original_text), Vec::new())
-    };
-
-    // Some shapes (many references to a definition with a long title, a
-    // table with many rows) expand a short message into megabytes, so HTML
-    // past `MARKDOWN_MAX_HTML_BYTES` is dropped for plain text before any
-    // further work is done on it.
-    let too_long = |html: &String| html.len() > MARKDOWN_MAX_HTML_BYTES;
-    let rendered = render_gfm(&text);
-    if too_long(&rendered) {
-        return plain_text_to_html(plain);
-    }
-    let html = if bare_links.is_empty() {
-        rendered
-    } else {
-        // The source scan and the render parse slightly different text (a
-        // sentinel in place of each link), so in rare shapes they disagree
-        // about what is prose, e.g. a link's own `(` inside a link
-        // destination. If any link did not come back exactly once, in prose,
-        // or a sentinel survived anywhere, render the original text with no
-        // bare-link pass rather than show a mangled message.
-        match restore_bare_freenet_links(&rendered, &bare_links) {
-            Some(html) => html,
-            None => render_gfm(original_text),
-        }
-    };
-    if too_long(&html) {
-        return plain_text_to_html(plain);
-    }
-
-    let html = finalize_anchors(&html, behind_gateway);
-    if too_long(&html) {
-        return plain_text_to_html(plain);
-    }
-    html
-}
-
-/// Convert markdown to HTML using GFM mode, which includes autolink literals
-/// that correctly handle code spans, existing links, etc.
-fn render_gfm(text: &str) -> String {
-    markdown::to_html_with_options(text, &markdown::Options::gfm())
-        .unwrap_or_else(|_| markdown::to_html(text))
-}
-
-/// Render message text to HTML, turning `@[name](rv:id)` mention tokens into
-/// styled, clickable chips that show each member's *current* nickname.
-///
-/// Mentions are extracted *before* markdown runs — each is replaced by an inert
-/// private-use sentinel, markdown + anchor finalization run over the sentinel'd
-/// text, then the sentinels are swapped for chip HTML. This keeps mention
-/// rendering independent of markdown's link grammar (so a token can never be
-/// mangled by adjacent markdown, and a malicious `[..](javascript:..)` payload
-/// can't masquerade as a mention).
-///
-/// `member_names` maps each member id to their decrypted current nickname (the
-/// `[name]` snapshot in the token is only used as a fallback when the id is not
-/// in the map). `self_member_id` gets a distinct highlight (a mention of you);
-/// `None` (no locally-known identity) simply means no chip is self-highlighted.
-pub(crate) fn message_to_html_with_mentions(
-    text: &str,
-    member_names: &HashMap<MemberId, String>,
-    self_member_id: Option<MemberId>,
-) -> String {
-    use river_core::mention::{parse_segments, MentionSegment};
-
-    let segments = parse_segments(text);
-    // Fast path: no mentions -> byte-identical to the plain renderer.
-    if !segments
-        .iter()
-        .any(|s| matches!(s, MentionSegment::Mention(_)))
-    {
-        return message_to_html(text);
-    }
-
-    // Private-use sentinels that markdown passes through verbatim and that
-    // never legitimately appear in chat text. Strip any pre-existing
-    // occurrences from plain-text runs so a crafted message can't smuggle a
-    // sentinel and hijack the post-markdown substitution.
-    const OPEN: char = '\u{E000}';
-    const CLOSE: char = '\u{E001}';
-
-    let mut working = String::with_capacity(text.len());
-    let mut chips: Vec<String> = Vec::new();
-    for seg in segments {
-        match seg {
-            MentionSegment::Text(t) => {
-                working.extend(t.chars().filter(|c| *c != OPEN && *c != CLOSE));
-            }
-            MentionSegment::Mention(m) => {
-                let idx = chips.len();
-                // The token's reference is the member's short (truncated-base32)
-                // label; recover the full id by matching it against the room's
-                // known members so the chip stays clickable and self-highlighted.
-                // An unknown member yields `None` -> non-clickable snapshot chip.
-                let resolved = m.member_ref.resolve(member_names.keys().copied());
-                // The `[name]` snapshot is sender-controlled text, so an
-                // unresolved mention must be sanitised before it becomes a
-                // chip — otherwise `@[Admin 🛡](rv:…)` paints a shield inside
-                // a message. Resolved names come from `member_names`, which is
-                // already sanitised at source.
-                let name = resolved
-                    .and_then(|id| member_names.get(&id).cloned())
-                    .unwrap_or_else(|| sanitize_display_name(&m.display_name));
-                chips.push(render_mention_chip_html(
-                    resolved,
-                    &name,
-                    // `self_member_id.is_some_and(..)` rather than
-                    // `resolved == self_member_id`: the latter would call an
-                    // UNRESOLVED mention a mention of you when the local
-                    // identity is also unknown (`None == None`).
-                    self_member_id.is_some_and(|me| resolved == Some(me)),
-                ));
-                working.push(OPEN);
-                working.push_str(&idx.to_string());
-                working.push(CLOSE);
-            }
-        }
-    }
-
-    let mut html = message_to_html(&working);
-    // Markdown can move a placeholder into a tag (a link title) or copy it
-    // (a reference definition's title, used many times). Substituting there
-    // would put chip markup inside an attribute or multiply it, so unless
-    // every placeholder comes back exactly once, in text, show the message
-    // as plain text, where each one does.
-    if !mention_placeholders_are_sound(&html, chips.len(), OPEN, CLOSE) {
-        html = plain_text_to_html(&working);
-    }
-    // The CLOSE delimiter bounds each index, so `…0␁` never matches inside
-    // `…10␁` — replacement is unambiguous regardless of order.
-    for (idx, chip) in chips.iter().enumerate() {
-        html = html.replace(&format!("{OPEN}{idx}{CLOSE}"), chip);
-    }
-    html
-}
-
-/// Whether each of the `count` mention placeholders (`{open}{index}{close}`)
-/// appears exactly once in `html`, and only in text, never inside a tag. The
-/// markdown crate encodes `>` inside attributes, so the first `>` always ends
-/// a tag.
-fn mention_placeholders_are_sound(html: &str, count: usize, open: char, close: char) -> bool {
-    let mut seen = vec![0usize; count];
-    let mut in_tag = false;
-    for (i, c) in html.char_indices() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            c if c == open => {
-                if in_tag {
-                    return false;
-                }
-                let rest = &html[i + open.len_utf8()..];
-                let Some(end) = rest.find(close) else {
-                    return false;
-                };
-                match rest[..end].parse::<usize>() {
-                    Ok(idx) if idx < count => seen[idx] += 1,
-                    _ => return false,
-                }
-            }
-            _ => {}
-        }
-    }
-    seen.iter().all(|&n| n == 1)
-}
-
-thread_local! {
-    /// Per-message rendered-HTML cache for message bodies.
-    ///
-    /// The `message_groups` memo rebuilds the *entire* visible message list
-    /// whenever `ROOMS` changes — which is on every sync tick, incoming
-    /// message, reaction, and DM. Rendering one body runs a full markdown
-    /// parse + HTML serialize + mention/anchor rewrite (tens of µs natively,
-    /// several-fold more in WASM on a mobile CPU). Re-parsing all
-    /// `max_recent_messages` (default 100) bodies on every update was a major
-    /// source of the mobile jank users reported ("really slows down the mobile
-    /// browser").
-    ///
-    /// This cache keys each body's HTML by `MessageId` plus a fingerprint of
-    /// every input that affects the output, so steady-state message flow
-    /// re-parses only the one new/changed message instead of the whole
-    /// history. It is single-threaded (WASM) / per-thread (native tests) and
-    /// is pruned each render (`prune_message_html_cache`) to the currently
-    /// visible set, so it stays bounded to the current room's messages.
-    static MESSAGE_HTML_CACHE: RefCell<HashMap<MessageId, (u64, String)>> =
-        RefCell::new(HashMap::new());
-}
-
-/// Order-independent fingerprint of the member-name map (mention chips resolve
-/// to members' *current* nicknames, so a rename must invalidate any cached body
-/// that renders a chip). Combining per-entry hashes with `wrapping_add` makes
-/// the result independent of `HashMap` iteration order, so identical logical
-/// content always fingerprints identically. `len()` is folded in to
-/// distinguish an empty map from an all-zero-hash one.
-fn member_names_fingerprint(member_names: &HashMap<MemberId, String>) -> u64 {
-    let mut acc: u64 = member_names.len() as u64;
-    for (id, name) in member_names {
-        let mut h = DefaultHasher::new();
-        id.hash(&mut h);
-        name.hash(&mut h);
-        acc = acc.wrapping_add(h.finish());
-    }
-    acc
-}
-
-/// Fingerprint of every input that determines a message body's rendered HTML.
-///
-/// The body depends on the effective `text` always, and — only when the text
-/// can carry a mention (`rv:` reference scheme present) — on the member-name
-/// map (chip nicknames) and the local member id (self-mention highlight).
-/// `running_behind_freenet_gateway()` is constant per session, so it is not
-/// part of the key. Gating the member inputs on the presence of a mention
-/// means an ordinary (mention-free) message survives member joins/renames in
-/// the cache, while a message that renders a chip is invalidated by them.
-fn message_html_fingerprint(text: &str, members_fp: u64, self_member_id: Option<MemberId>) -> u64 {
-    let mut h = DefaultHasher::new();
-    text.hash(&mut h);
-    if text.contains(river_core::mention::REF_SCHEME) {
-        members_fp.hash(&mut h);
-        self_member_id.hash(&mut h);
-    }
-    h.finish()
-}
-
-/// Cached wrapper around [`message_to_html_with_mentions`]. Returns the cached
-/// HTML on a fingerprint match, otherwise renders it and stores it. The output
-/// is always byte-identical to calling `message_to_html_with_mentions` directly
-/// with the current inputs — the cache only skips redundant re-rendering.
-fn render_message_html_cached(
-    message_id: &MessageId,
-    text: &str,
-    member_names: &HashMap<MemberId, String>,
-    members_fp: u64,
-    self_member_id: Option<MemberId>,
-) -> String {
-    let fp = message_html_fingerprint(text, members_fp, self_member_id);
-    MESSAGE_HTML_CACHE.with(|cache| {
-        if let Some((cached_fp, html)) = cache.borrow().get(message_id) {
-            if *cached_fp == fp {
-                return html.clone();
-            }
-        }
-        let html = message_to_html_with_mentions(text, member_names, self_member_id);
-        cache
-            .borrow_mut()
-            .insert(message_id.clone(), (fp, html.clone()));
-        html
-    })
-}
-
-/// Drop cached entries for messages no longer visible (e.g. after a room
-/// switch or history trim), keeping the cache bounded to the current room's
-/// message set.
-fn prune_message_html_cache(seen: &std::collections::HashSet<MessageId>) {
-    MESSAGE_HTML_CACHE.with(|cache| {
-        cache.borrow_mut().retain(|id, _| seen.contains(id));
-    });
-}
-
-/// Test-only: reset the cache so each test observes a clean cache regardless of
-/// thread reuse across the test binary.
+/// The [`NewestKey`] of the last display item, if any.
 #[cfg(test)]
-fn clear_message_html_cache() {
-    MESSAGE_HTML_CACHE.with(|cache| cache.borrow_mut().clear());
-}
-
-/// Build the inline chip markup for one mention. `name` is the resolved current
-/// nickname (or snapshot fallback) and is HTML-escaped — nicknames are
-/// attacker-controlled and this string goes through `dangerous_inner_html`
-/// (freenet/river#227).
-///
-/// `id` is the resolved member id, or `None` when the token's short reference
-/// names a member this client doesn't know. When present, `data-member-id`
-/// carries the lossless hex id (an in-session, full-precision handoff — NOT the
-/// wire token) so the document-level click interceptor can open the member-info
-/// modal. When absent the chip still renders the `@name` but is inert (nothing
-/// to open), which is the correct degradation for an unknown member.
-fn render_mention_chip_html(id: Option<MemberId>, name: &str, is_self: bool) -> String {
-    let class = if is_self {
-        "river-mention river-mention-self"
-    } else {
-        "river-mention"
-    };
-    let data_member_id = match id {
-        Some(id) => format!(
-            " data-member-id=\"{}\"",
-            river_core::mention::member_id_to_hex(id)
-        ),
-        None => String::new(),
-    };
-    format!(
-        "<span class=\"{class}\" data-river-mention=\"1\"{data_member_id} \
-         role=\"button\" tabindex=\"0\" title=\"@{title}\">@{label}</span>",
-        title = escape_html_attr(name),
-        label = escape_html(name),
-    )
-}
-
-/// Escape `&<>` for HTML text content.
-fn escape_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Escape `&<>"'` for an HTML attribute value (double-quoted).
-fn escape_html_attr(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// True when River is currently being served from a path under
-/// `/v1/contract/web/` (or `/v2/…`), which is what gateway hosting looks like to the
-/// browser. Returning false here suppresses the host-stripping href rewrite
-/// for `dx serve`, `cargo make dev-example`, and the static-server flows
-/// documented in AGENTS.md, where rewriting `https://gw.example/v1/...` to
-/// `/v1/...` would only break the link (the dev server has no gateway
-/// behind it). Label beautification is unconditional — that's purely
-/// cosmetic and doesn't depend on the hosting environment.
-#[cfg(target_arch = "wasm32")]
-fn running_behind_freenet_gateway() -> bool {
-    web_sys::window()
-        .and_then(|w| w.location().pathname().ok())
-        .map(|p| p.starts_with("/v1/contract/web/") || p.starts_with("/v2/contract/web/"))
-        .unwrap_or(false)
-}
-
-/// Native test builds: default to true so existing tests verify the
-/// production (gateway-hosted) behavior. Tests covering the dev-mode path
-/// call `message_to_html_inner` with an explicit `false` flag.
-#[cfg(not(target_arch = "wasm32"))]
-fn running_behind_freenet_gateway() -> bool {
-    true
-}
-
-/// Walk anchor tags in HTML once and:
-///
-/// - Add `target="_blank" rel="noopener noreferrer"` to every anchor.
-/// - When `rewrite_freenet_hrefs` is true, rewrite Freenet web-contract URLs
-///   to a host/port-agnostic same-origin absolute path so the link works for
-///   any reader regardless of which gateway they're connected to. The flag
-///   is only true when River itself is hosted under `/v1/contract/web/...`
-///   (i.e. behind a gateway). In `dx serve` / dev-example / static-server
-///   modes there is no gateway to redirect to, so the original absolute URL
-///   is left in place — letting the user reach the embedded gateway directly.
-/// - For bare Freenet web URLs (where the visible text equals the original
-///   href), shorten the label to `freenet:<id-prefix>[/<path>]` regardless of
-///   hosting. User-supplied link text from `[label](url)` is left alone.
-///
-/// Assumes the markdown crate emits anchors as `<a href="...">...</a>` with
-/// `href` as the first attribute. If that ever changes, target/rel injection
-/// silently no-ops and href rewrite + label beautification are skipped.
-fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> String {
-    let mut out = String::with_capacity(html.len() + 32);
-    let mut rest = html;
-    while let Some(pos) = rest.find("<a ") {
-        out.push_str(&rest[..pos]);
-        let tag = &rest[pos..];
-        let Some(open_end) = tag.find('>') else {
-            out.push_str(tag);
-            return out;
-        };
-        let opening = &tag[..=open_end];
-        let after_open = &tag[open_end + 1..];
-        let Some(close_pos) = matching_anchor_close(after_open) else {
-            out.push_str(tag);
-            return out;
-        };
-        // The markdown crate still emits an anchor for an angle-bracket
-        // autolink inside a link label (`[<x:y>](url)`), i.e. a nested `<a>`.
-        // Browsers split those into two anchors, so the inner one would escape
-        // this function (no target/rel, and an empty href that reloads River
-        // in place). Flatten it to its text: the outer link is what is shown.
-        let flattened;
-        let inner = if after_open[..close_pos].contains("<a ") {
-            flattened = strip_anchor_tags(&after_open[..close_pos]);
-            flattened.as_str()
-        } else {
-            &after_open[..close_pos]
-        };
-        let tail = &after_open[close_pos + 4..];
-
-        let opening = opening.replacen(
-            "<a href=\"",
-            "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"",
-            1,
-        );
-        let original_href = extract_href(&opening);
-
-        // A share link (freenet.org/open or `freenet:`) opens the named webapp
-        // on the reader's own node. The destination is derived ONLY from the
-        // visible text, never from the hidden href, and the text is kept as
-        // it is (full contract id included): the link goes exactly where it
-        // says, so `[freenet:<A>](https://freenet.org/open#<B>)` opens A, and
-        // a share link hidden behind a label is left as a plain link to the
-        // freenet.org page, which shows the id before anything opens. (Pasted
-        // gateway URLs, `http://…/v1/contract/web/<id>/…`, are a separate,
-        // older rewrite below, which does apply to labelled links.)
-        if rewrite_freenet_hrefs {
-            if let Some(target) = share_link_in_anchor_text(inner) {
-                // Rebuilt from scratch rather than edited, so nothing else
-                // from the message survives on the anchor: a `title` naming
-                // some other link would otherwise show as its tooltip.
-                out.push_str(&format!(
-                    "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"{}\">",
-                    escape_html_attr(&target.local_path())
-                ));
-                out.push_str(inner);
-                out.push_str("</a>");
-                rest = tail;
-                continue;
-            }
-        }
-
-        // A link whose href opens a contract on the reader's node (a gateway
-        // URL, which the rewrite below makes same-origin, or a relative href,
-        // which already is) must not carry a label that visibly names a
-        // DIFFERENT contract: show such a label as plain text rather than as
-        // a link that is not what it says. A bare pasted link (its text is
-        // the URL) names its own destination and is exempt.
-        if rewrite_freenet_hrefs {
-            if let Some(dest_id) = node_destination(original_href.as_deref()) {
-                // A pasted absolute URL (its text IS the href) shows where it
-                // goes, host and contract id first, so its label is not
-                // checked (a River invite's long `?invitation=` code, or an
-                // app path holding other ids, is not a claim). Unless its
-                // destination is unknown AND something in it moves where it
-                // lands unreadably (a dot segment, a percent-escape).
-                let bare =
-                    original_href.as_deref() == Some(inner) && has_scheme_and_authority(inner);
-                // A tooltip is label text too.
-                let title = extract_attr(&opening, "title");
-                let unlink = if bare {
-                    (dest_id.is_none() && !plain_absolute_url(inner))
-                        || pasted_url_poses_before_its_path(inner)
-                        || title.as_deref().is_some_and(|t| {
-                            label_contradicts_destination(t, None, dest_id.clone())
-                        })
-                } else {
-                    label_contradicts_destination(inner, title.as_deref(), dest_id)
-                };
-                if unlink {
-                    out.push_str(inner);
-                    rest = tail;
-                    continue;
-                }
-            }
-        }
-        let opening = if rewrite_freenet_hrefs {
-            match original_href.as_deref().and_then(rewrite_freenet_href) {
-                Some(new_href) => {
-                    let orig = original_href.as_deref().unwrap();
-                    opening.replacen(
-                        &format!("href=\"{orig}\""),
-                        &format!("href=\"{new_href}\""),
-                        1,
-                    )
-                }
-                None => opening,
-            }
-        } else {
-            opening
-        };
-        let new_inner = match original_href.as_deref() {
-            Some(h) if h == inner => beautify_freenet_label(h).unwrap_or_else(|| inner.to_string()),
-            _ => inner.to_string(),
-        };
-
-        out.push_str(&opening);
-        out.push_str(&new_inner);
-        out.push_str("</a>");
-        rest = tail;
-    }
-    out.push_str(rest);
-    out
-}
-
-/// If an anchor's visible text is exactly a valid share link, return it.
-///
-/// `inner` is the anchor's inner HTML as the markdown crate emits it: text is
-/// entity-encoded (`&amp;`, `&lt;`, `&gt;`, `&quot;`), and any nested markup
-/// (emphasis, a mention sentinel's chip, ...) means it is not a bare link.
-fn share_link_in_anchor_text(inner: &str) -> Option<crate::util::share_link::ShareTarget> {
-    // Defense in depth: the validator refuses `<` and `>` anyway, but nested
-    // markup is never a bare link, so do not even decode it.
-    if inner.contains('<') {
-        return None;
-    }
-    crate::util::share_link::parse_share_link(&decode_html_text(inner))
-}
-
-/// The contract a link opens on the reader's node, if it opens one there:
-/// `Some(Some(id))` for a gateway URL on any host (the rewrite below makes it
-/// same-origin) or a relative `/v1|v2/contract/web/<id>` path; `Some(None)`
-/// for any other relative href (it resolves against River's own URL, e.g.
-/// `../<id>/`, so where it lands is not worth guessing); `None` for a link
-/// that goes elsewhere.
-fn node_destination(href: Option<&str>) -> Option<Option<String>> {
-    let href = href?;
-    // Protocol-relative `//host/…` takes the page's scheme.
-    let absolute = match href.strip_prefix("//") {
-        Some(rest) => Some(format!("http://{rest}")),
-        None => has_scheme_and_authority(href).then(|| href.to_string()),
-    };
-    if let Some(absolute) = absolute {
-        if let Some(parsed) = parse_freenet_web_url(&absolute) {
-            return Some(Some(parsed.contract_id.to_string()));
-        }
-        // A contract path that does not parse (a dot segment, an encoded id
-        // character, …) may still resolve to SOME contract on a node; which
-        // one is not worth guessing.
-        return absolute.contains("/contract/web/").then_some(None);
-    }
-    // `http:/path` and `http:../x` (a special scheme with no `//`) resolve
-    // against the page when it has that scheme, exactly like a relative href.
-    let relative = ["http:", "https:"]
-        .iter()
-        .find_map(|scheme| {
-            href.get(..scheme.len())
-                .filter(|p| p.eq_ignore_ascii_case(scheme))
-                .map(|_| &href[scheme.len()..])
-        })
-        .or_else(|| is_relative_href(href).then_some(href))?;
-    // A dot segment (literal or encoded) moves the path when the browser
-    // resolves it, so the first segment would not be the destination.
-    let path = relative.split(['?', '#']).next().unwrap_or("");
-    if path.split('/').any(crate::util::share_link::is_dot_segment) {
-        return Some(None);
-    }
-    let id = ["/v1/contract/web/", "/v2/contract/web/"]
-        .iter()
-        .find_map(|m| relative.strip_prefix(m))
-        .map(|after| {
-            after
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or("")
-                .to_string()
-        })
-        .filter(|id| !id.is_empty());
-    Some(id)
-}
-
-/// True if an anchor's visible text names a contract other than `dest_id`
-/// (or names any contract, when the destination is unknown).
-///
-/// Best effort, as defence in depth for links River did not write: what counts
-/// as naming a contract is judged on what the reader sees
-/// ([`crate::util::confusable::visual_ascii`] of the decoded text, tags
-/// dropped but image `alt` kept), so invisible characters, character
-/// references, fancy text and homoglyphs inside an id do not hide it. A claim
-/// is a run of 32+ ASCII letters/digits with an uppercase letter (a contract
-/// id is 43-44; a hex hash or an ordinary word is not), or an id-looking run
-/// of 8+ directly after a `freenet:` marker with no space (a shortened id
-/// such as `freenet:UDzGbcWr`). Each claim must be a prefix of the destination id,
-/// and the label's tooltip and any image tooltip inside it are read too. An id
-/// broken up by a visible ASCII space or punctuation is not recognised
-/// (freenet/river#736); a label naming no contract (`[River update](…)`)
-/// claims nothing, like any other link text.
-fn label_contradicts_destination(
-    inner: &str,
-    title: Option<&str>,
-    dest_id: Option<String>,
-) -> bool {
-    // The label, the link's tooltip, and any tooltip of an image inside it.
-    let mut claims = label_claimed_ids(inner);
-    let img_titles = inner
-        .split("<img")
-        .skip(1)
-        .filter_map(|rest| extract_attr(&format!("<img{}", rest.split('>').next()?), "title"));
-    for text in title.map(str::to_string).into_iter().chain(img_titles) {
-        claims.extend(label_claimed_ids(&text));
-    }
-    if claims.is_empty() {
-        return false;
-    }
-    let Some(dest_id) = dest_id else { return true };
-    claims
-        .iter()
-        .any(|claim| !dest_id.starts_with(claim.as_str()))
-}
-
-/// The contract-id claims in an anchor's visible text. See
-/// [`label_contradicts_destination`].
-fn label_claimed_ids(inner: &str) -> Vec<String> {
-    // Anything that can split an id without the reader seeing a break must
-    // not (the whitespace and joining rules below). This is a comparison, not
-    // rendering, so joining too much can only unlink more, never link
-    // something new.
-    let decoded = decode_html_text(&visible_text_with_alt(inner));
-    // Visible, full-width spaces separate, like an ASCII space. Every other
-    // whitespace character is dropped: line and paragraph breaks (an id
-    // wrapping looks the same), narrow and hair spaces, and controls a
-    // browser draws with no width.
-    let visible_space = |c: char| {
-        matches!(
-            c,
-            ' ' | '\t' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
-                ..='\u{2005}' | '\u{2007}' | '\u{2008}' | '\u{3000}'
-        )
-    };
-    let spaced: String = decoded
-        .chars()
-        .filter(|&c| !c.is_whitespace() || visible_space(c))
-        .collect();
-    // Colon look-alikes read as the `:` of a `freenet:` marker.
-    let folded: Vec<char> = crate::util::confusable::visual_ascii(&spaced)
-        .chars()
-        .map(|c| match c {
-            '\u{02D0}' | '\u{02F8}' | '\u{0589}' | '\u{05C3}' | '\u{0903}' | '\u{0A83}'
-            | '\u{1361}' | '\u{1804}' | '\u{205A}' | '\u{2236}' | '\u{A4FD}' | '\u{A789}'
-            | '\u{FE13}' | '\u{FE30}' | '\u{FE55}' => ':',
-            other => other,
-        })
-        .collect();
-    // A run of non-ASCII characters left between two ASCII letters/digits
-    // after the visual fold is kept IN the id run as one placeholder (which
-    // can never be a prefix of an ASCII id): an unfolded homoglyph, a lone
-    // symbol look-alike, or any number of zero-width marks stacked on a
-    // letter. It separates, as it looks, only if it holds a space,
-    // punctuation, an ellipsis, a full-width character (CJK, kana, Hangul,
-    // Yi, fullwidth forms, emoji), or a real word of a script written without
-    // spaces (Thai, Lao, Myanmar, Khmer). This errs towards joining: joining
-    // can only unlink more, never link something new.
-    const JOINED: char = '\u{FFFD}';
-    let separates = |c: char| {
-        // Combining marks inside the full-width blocks still stack, and a few
-        // characters there read as a Latin letter (`⸦`/`⸧` as C, `〇` and the
-        // Hangul compatibility jamo such as `ㅇ` as o; real Korean text uses
-        // syllables, U+AC00 on): these join like any look-alike.
-        let exempt = matches!(u32::from(c),
-            0x302A..=0x302F | 0x3099..=0x309A | 0x2E26 | 0x2E27 | 0x3007 | 0x3130..=0x318F);
-        c.is_whitespace()
-            || !exempt
-                && matches!(u32::from(c),
-                0x2000..=0x206F      // general punctuation
-                | 0x22EE..=0x22F1    // ellipses
-                | 0x2E00..=0x2E7F    // supplemental punctuation
-                | 0x2E80..=0x30FF    // CJK radicals, symbols, kana
-                | 0x3130..=0x9FFF    // Hangul compatibility, CJK unified
-                | 0xA000..=0xA4CF    // Yi
-                | 0xAC00..=0xD7FF    // Hangul
-                | 0xF900..=0xFAFF    // CJK compatibility
-                | 0xFE30..=0xFE4F    // CJK compatibility forms
-                | 0xFF00..=0xFFEF    // halfwidth / fullwidth forms left unfolded
-                | 0x1F000..=0x1FAFF  // emoji and pictographs
-                | 0x20000..=0x3FFFF) // CJK extensions
-    };
-    // Letters (not marks) of the scripts written without spaces.
-    let no_space_letter = |c: char| {
-        let cp = u32::from(c);
-        let block = matches!(cp, 0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1780..=0x17FF);
-        let mark = matches!(cp,
-            0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E              // Thai
-            | 0x0EB1 | 0x0EB4..=0x0EBC | 0x0EC8..=0x0ECE           // Lao
-            | 0x102B..=0x103E | 0x1056..=0x1059 | 0x105E..=0x1060  // Myanmar
-            | 0x1062..=0x1064 | 0x1067..=0x106D | 0x1071..=0x1074
-            | 0x1082..=0x108D | 0x108F | 0x109A..=0x109D
-            | 0x17B4..=0x17D3 | 0x17DD); // Khmer
-        block && !mark
-    };
-    let mut text = String::with_capacity(folded.len());
-    let mut k = 0;
-    while k < folded.len() {
-        let c = folded[k];
-        if c.is_ascii() {
-            text.push(c);
-            k += 1;
-            continue;
-        }
-        let run_end = (k..folded.len())
-            .find(|&e| folded[e].is_ascii())
-            .unwrap_or(folded.len());
-        let run = &folded[k..run_end];
-        let next_is_alnum = folded
-            .get(run_end)
-            .is_some_and(|n| n.is_ascii_alphanumeric());
-        // (Bopomofo, U+3100-312F, is deliberately not a separator: a lone
-        // `ㄚ` reads as Y.)
-        let joins = !run.iter().any(|&c| separates(c))
-            && run.iter().filter(|&&c| no_space_letter(c)).count() <= 3;
-        let flanked = k > 0 && folded[k - 1].is_ascii_alphanumeric() && next_is_alnum && joins;
-        // Marks sitting on a marker's `:` or `/` (`freenet:\u{05BC}<id>`)
-        // are dropped, so the marker still sits right before the id.
-        let on_marker = k > 0 && matches!(folded[k - 1], ':' | '/') && next_is_alnum && joins;
-        if flanked {
-            text.push(JOINED);
-        } else if !on_marker {
-            text.push(' ');
-        }
-        k = run_end;
-    }
-    let lower = text.to_ascii_lowercase();
-    // Runs are over ASCII letters and digits, not just base58: `O`, `0`, `I`
-    // and `l` read as part of an id, and a run containing one can never be a
-    // prefix of a real id.
-    let in_run = |c: char| c.is_ascii_alphanumeric() || c == JOINED;
-    let mut claims = Vec::new();
-    let flush = |start: usize, end: usize, claims: &mut Vec<String>| {
-        let run = &text[start..end];
-        let len = run.chars().count();
-        let has_upper = run.chars().any(|c| c.is_ascii_uppercase());
-        // A SHORT run counts only right after a `freenet:` marker with no
-        // space (`freenet:UDzGbcWr`, `freenet://…`, the shapes River itself
-        // displays), 8+ long and looking like an id (a digit, or a capital
-        // after the first character), so "Freenet: GitHub mirror" is prose.
-        let id_like_short = run.chars().any(|c| c.is_ascii_digit() || c == JOINED)
-            || run.chars().skip(1).any(|c| c.is_ascii_uppercase());
-        let after_marker = lower[..start].trim_end_matches('/').ends_with("freenet:");
-        if (len >= 32 && has_upper) || (len >= 8 && after_marker && id_like_short) {
-            claims.push(run.to_string());
-        }
-    };
-    let mut run_start: Option<usize> = None;
-    for (i, c) in text.char_indices() {
-        match (in_run(c), run_start) {
-            (true, None) => run_start = Some(i),
-            (false, Some(start)) => {
-                flush(start, i, &mut claims);
-                run_start = None;
-            }
-            _ => {}
-        }
-    }
-    if let Some(start) = run_start {
-        flush(start, text.len(), &mut claims);
-    }
-    claims
-}
-
-/// True for `scheme://…` (RFC 3986 scheme syntax), i.e. an absolute URL with
-/// an authority. A `://` later in the href (in a query or fragment) does not
-/// count, so `../x/#://` stays relative.
-fn has_scheme_and_authority(href: &str) -> bool {
-    let Some(colon) = href.find("://") else {
-        return false;
-    };
-    let scheme = &href[..colon];
-    scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-}
-
-/// True if a pasted URL's text before its contract path could be read as a
-/// different destination: any userinfo (`http://freenet:<A>@host/…`), or a
-/// contract id or `freenet:` claim in the host (`http://<A>.example/…`).
-/// What follows the contract path is the app's own business (a River
-/// invite's long code, an app path holding other ids) and is not read.
-fn pasted_url_poses_before_its_path(url: &str) -> bool {
-    let decoded = decode_html_text(url);
-    let Some((_, after_scheme)) = decoded.split_once("://") else {
-        return false;
-    };
-    let head_end = ["/v1/contract/web/", "/v2/contract/web/"]
-        .iter()
-        .filter_map(|m| after_scheme.find(m))
-        .min()
-        .unwrap_or_else(|| {
-            after_scheme
-                .find(['/', '?', '#'])
-                .unwrap_or(after_scheme.len())
-        });
-    let head = &after_scheme[..head_end];
-    head.contains('@') || !label_claimed_ids(head).is_empty()
-}
-
-/// True for an absolute `scheme://host/path` whose text is where it goes:
-/// no percent-escapes and no dot segments in the path.
-fn plain_absolute_url(url: &str) -> bool {
-    if !has_scheme_and_authority(url) || url.contains('%') {
-        return false;
-    }
-    let after_authority = url
-        .split_once("://")
-        .map(|(_, rest)| rest.find('/').map_or("", |p| &rest[p..]))
-        .unwrap_or("");
-    let path = after_authority.split(['?', '#']).next().unwrap_or("");
-    !path.split('/').any(crate::util::share_link::is_dot_segment)
-}
-
-/// The raw (still entity-encoded) value of attribute `name` in a tag emitted
-/// by the markdown crate, which always double-quotes values and encodes `"`
-/// inside them.
-fn extract_attr(tag: &str, name: &str) -> Option<String> {
-    let marker = format!(" {name}=\"");
-    let start = tag.find(&marker)? + marker.len();
-    let end = tag[start..].find('"')?;
-    Some(tag[start..start + end].to_string())
-}
-
-/// An anchor's inner HTML reduced to what a reader sees: tags dropped, except
-/// that an image contributes its `alt` text (which the browser shows when the
-/// image does not load).
-fn visible_text_with_alt(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(pos) = rest.find('<') {
-        out.push_str(&rest[..pos]);
-        let Some(end) = rest[pos..].find('>') else {
-            rest = "";
-            break;
-        };
-        let tag = &rest[pos..pos + end + 1];
-        // No padding: a broken image shows its alt inline, and an empty one
-        // shows nothing, so neither must split what the reader sees as one id.
-        if tag.starts_with("<img") {
-            if let Some(alt) = extract_attr(tag, "alt") {
-                out.push_str(&alt);
-            }
-        }
-        rest = &rest[pos + end + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// True for an href with no scheme and no authority, i.e. one the browser
-/// resolves against River's own URL (including the empty href the markdown
-/// crate emits for a scheme it does not allow).
-fn is_relative_href(href: &str) -> bool {
-    if href.starts_with("//") {
-        return false;
-    }
-    let first_delimiter = href.find(['/', '?', '#']).unwrap_or(href.len());
-    !href[..first_delimiter].contains(':')
-}
-
-/// Undo the markdown crate's text encoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`)
-/// in one pass, so `&amp;lt;` decodes to `&lt;`, not `<`. Anything else is
-/// left verbatim.
-fn decode_html_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(pos) = rest.find('&') {
-        out.push_str(&rest[..pos]);
-        let tail = &rest[pos..];
-        let (decoded, len) = [
-            ("&amp;", '&'),
-            ("&lt;", '<'),
-            ("&gt;", '>'),
-            ("&quot;", '"'),
-        ]
-        .iter()
-        .find(|(entity, _)| tail.starts_with(entity))
-        .map(|(entity, c)| (*c, entity.len()))
-        .unwrap_or(('&', 1));
-        out.push(decoded);
-        rest = &tail[len..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Encode text content the way the markdown crate does (`&"<>`), so a text run
-/// that is split around a new anchor re-encodes to exactly what it was.
-fn encode_html_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Private-use sentinels that stand in for a bare `freenet:` link while
-/// markdown runs (`{BARE_LINK_OPEN}<index>{BARE_LINK_CLOSE}`). Distinct from the
-/// mention sentinels (`U+E000`/`U+E001`), and stripped from the input before
-/// any are inserted, so a message cannot forge one.
-const BARE_LINK_OPEN: char = '\u{E002}';
-const BARE_LINK_CLOSE: char = '\u{E003}';
-
-/// Longest whitespace-free run examined as a bare `freenet:` link candidate:
-/// the longest link the validator can accept, plus slack for trailing
-/// punctuation that trimming would remove.
-const MAX_BARE_LINK_CANDIDATE_LEN: usize = crate::util::share_link::MAX_SHARE_LINK_LEN + 128;
-
-/// Find each bare, valid `freenet:` share link in the markdown SOURCE and
-/// replace it with a sentinel, returning the rewritten source and the links in
-/// sentinel order. Messages with no `freenet:` at all are returned untouched.
-///
-/// A candidate starts at `freenet:` (any case) that does not follow a letter
-/// or digit, runs to the next whitespace, and then loses trailing punctuation
-/// exactly as the markdown crate's GFM autolink does (`!"'),.:;?_~*`, with `)`
-/// only when unbalanced), so "see freenet:<id>." links the id without the full
-/// stop. A `.` that follows `/` or `.` is kept, so trimming can never turn a
-/// refused dot segment (`…/a/..`) into an accepted link (`…/a/`). Only a
-/// candidate that passes the shared share-link validation is taken.
-///
-/// A candidate inside any construct whose text is not rendered as plain prose
-/// (code, links and autolinks, images, raw HTML, definitions, footnote
-/// references) is left alone. Those are found by parsing the source once more
-/// to an mdast, which only happens when a valid candidate exists.
-fn extract_bare_freenet_links(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>) {
-    use std::borrow::Cow;
-    const SCHEME: &str = "freenet:";
-    if !text.to_ascii_lowercase().contains(SCHEME) {
-        return (Cow::Borrowed(text), Vec::new());
-    }
-    let clean: String = text
-        .chars()
-        .filter(|c| *c != BARE_LINK_OPEN && *c != BARE_LINK_CLOSE)
-        .collect();
-
-    // ASCII lowercasing keeps byte offsets identical to `clean`.
-    let lower = clean.to_ascii_lowercase();
-    let mut candidates: Vec<(usize, usize)> = Vec::new();
-    let mut search_from = 0;
-    // End of the whitespace-free run the current candidate sits in, cached so
-    // `freenet:freenet:…` does not rescan the same run once per occurrence.
-    let mut run_end = 0;
-    while let Some(rel) = lower[search_from..].find(SCHEME) {
-        let start = search_from + rel;
-        search_from = start + SCHEME.len();
-        if clean[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
-        {
-            continue;
-        }
-        if run_end <= start {
-            // A `|` ends it too: tables split cells on it before inline
-            // parsing, which this pass runs ahead of.
-            run_end = clean[start..]
-                .find(|c: char| c.is_whitespace() || c == '|')
-                .map_or(clean.len(), |p| start + p);
-        }
-        // Message text is attacker-controlled, so bound the work per
-        // candidate: anything longer than the longest valid link plus some
-        // trailing punctuation cannot validate, so it is not even trimmed.
-        if run_end - start > MAX_BARE_LINK_CANDIDATE_LEN {
-            continue;
-        }
-        let mut token = &clean[start..run_end];
-        let open_parens = token.matches('(').count();
-        let mut close_parens = token.matches(')').count();
-        while let Some(last) = token.chars().next_back() {
-            let unbalanced_paren = last == ')' && close_parens > open_parens;
-            let dot_in_segment = last == '.'
-                && matches!(
-                    token[..token.len() - 1].chars().next_back(),
-                    Some('/' | '.')
-                );
-            // Non-ASCII punctuation (`。`, `」`, …) can never be part of a
-            // valid link, so it is trimmed like ASCII sentence punctuation.
-            let foreign_punctuation = !last.is_ascii() && !last.is_alphanumeric();
-            if ("!\"',.:;?_~*".contains(last) && !dot_in_segment)
-                || unbalanced_paren
-                || foreign_punctuation
-            {
-                token = &token[..token.len() - last.len_utf8()];
-                if last == ')' {
-                    close_parens -= 1;
-                }
-            } else {
-                break;
-            }
-        }
-        if crate::util::share_link::parse_freenet_link(token).is_some() {
-            candidates.push((start, start + token.len()));
-            search_from = start + token.len();
-        }
-    }
-    if candidates.is_empty() {
-        return (Cow::Borrowed(text), Vec::new());
-    }
-
-    let mut excluded = non_prose_ranges(&clean);
-    excluded.sort_unstable();
-    let mut out = String::with_capacity(clean.len());
-    let mut links = Vec::new();
-    let mut cursor = 0;
-    // Both lists are in source order and the excluded ranges do not nest
-    // (the walk does not descend into an excluded node), so one sweep does.
-    let mut next_excluded = 0;
-    for (start, end) in candidates {
-        while next_excluded < excluded.len() && excluded[next_excluded].1 <= start {
-            next_excluded += 1;
-        }
-        if excluded.get(next_excluded).is_some_and(|&(s, _)| s < end) {
-            continue;
-        }
-        out.push_str(&clean[cursor..start]);
-        out.push(BARE_LINK_OPEN);
-        out.push_str(&links.len().to_string());
-        out.push(BARE_LINK_CLOSE);
-        links.push(clean[start..end].to_string());
-        cursor = end;
-    }
-    if links.is_empty() {
-        return (Cow::Borrowed(text), Vec::new());
-    }
-    out.push_str(&clean[cursor..]);
-    (Cow::Owned(out), links)
-}
-
-/// Byte ranges of the markdown source that are NOT rendered as plain prose.
-fn non_prose_ranges(source: &str) -> Vec<(usize, usize)> {
-    use markdown::mdast::Node;
-    // Iterative for the same reason as `collect_mdast_text`. Ranges come out
-    // in document order, as a recursive pre-order walk would give them.
-    fn walk(root: &Node, out: &mut Vec<(usize, usize)>) {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            let skip = matches!(
-                node,
-                Node::InlineCode(_)
-                    | Node::Code(_)
-                    | Node::Link(_)
-                    | Node::LinkReference(_)
-                    | Node::Image(_)
-                    | Node::ImageReference(_)
-                    | Node::Definition(_)
-                    | Node::Html(_)
-                    | Node::FootnoteReference(_)
-                    | Node::FootnoteDefinition(_)
-                    | Node::InlineMath(_)
-                    | Node::Math(_)
-            );
-            if skip {
-                if let Some(pos) = node.position() {
-                    out.push((pos.start.offset, pos.end.offset));
-                }
-                continue;
-            }
-            if let Some(children) = node.children() {
-                stack.extend(children.iter().rev());
-            }
-        }
-    }
-    let mut out = Vec::new();
-    match markdown::to_mdast(source, &markdown::ParseOptions::gfm()) {
-        Ok(root) => {
-            walk(&root, &mut out);
-            drop_mdast(root);
-        }
-        // Unparseable: treat everything as non-prose, so nothing is linked.
-        Err(_) => out.push((0, source.len())),
-    }
-    out
-}
-
-/// Put the links taken out by [`extract_bare_freenet_links`] back into the
-/// rendered HTML, each as `<a href="">…</a>`: the shape the markdown crate
-/// itself emits for an autolink with a scheme it does not allow
-/// (`<freenet:…>`). `finalize_anchors` then gives it its real href from the
-/// text.
-///
-/// Returns `None`, so the caller renders the message without the bare-link
-/// pass, unless every link comes back exactly once and in prose: a sentinel
-/// inside a tag (an attribute), inside `<a>`, `<code>` or `<pre>`, repeated,
-/// missing, or surviving percent-encoded in a URL means the source scan and
-/// the render disagreed about the message's structure, and guessing could
-/// nest an anchor or break an attribute. The markdown crate encodes `>` inside
-/// attributes, so the first `>` always ends a tag.
-fn restore_bare_freenet_links(html: &str, links: &[String]) -> Option<String> {
-    let has_sentinel = |s: &str| s.contains([BARE_LINK_OPEN, BARE_LINK_CLOSE]);
-    let mut restored = vec![0usize; links.len()];
-    let mut out = String::with_capacity(html.len() + links.len() * 64);
-    let mut skip_depth: usize = 0;
-    let mut rest = html;
-    while !rest.is_empty() {
-        if rest.starts_with('<') {
-            let end = rest.find('>')?;
-            let tag = &rest[..=end];
-            if has_sentinel(tag) {
-                return None;
-            }
-            let (closing, name) = match tag[1..].strip_prefix('/') {
-                Some(after) => (true, after),
-                None => (false, &tag[1..]),
-            };
-            let name_end = name
-                .find(|c: char| !c.is_ascii_alphanumeric())
-                .unwrap_or(name.len());
-            if matches!(
-                name[..name_end].to_ascii_lowercase().as_str(),
-                "a" | "code" | "pre"
-            ) {
-                if closing {
-                    skip_depth = skip_depth.saturating_sub(1);
-                } else if !tag.ends_with("/>") {
-                    skip_depth += 1;
-                }
-            }
-            out.push_str(tag);
-            rest = &rest[end + 1..];
-        } else {
-            let text_end = rest.find('<').unwrap_or(rest.len());
-            let text = &rest[..text_end];
-            if skip_depth > 0 {
-                if has_sentinel(text) {
-                    return None;
-                }
-                out.push_str(text);
-            } else {
-                out.push_str(&replace_bare_link_sentinels(text, links, &mut restored)?);
-            }
-            rest = &rest[text_end..];
-        }
-    }
-    let encoded_sentinel = ["%EE%80%82", "%EE%80%83"]
-        .iter()
-        .any(|e| out.to_ascii_uppercase().contains(e));
-    if restored.iter().any(|&n| n != 1) || has_sentinel(&out) || encoded_sentinel {
-        return None;
-    }
-    Some(out)
-}
-
-/// Replace every `{BARE_LINK_OPEN}<index>{BARE_LINK_CLOSE}` in one prose text
-/// run with its link's anchor, counting each restore in `restored`. `None` for
-/// anything that is not a well-formed sentinel for a known index.
-fn replace_bare_link_sentinels(
-    s: &str,
-    links: &[String],
-    restored: &mut [usize],
-) -> Option<String> {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(pos) = rest.find(BARE_LINK_OPEN) {
-        out.push_str(&rest[..pos]);
-        let after = &rest[pos + BARE_LINK_OPEN.len_utf8()..];
-        let close = after.find(BARE_LINK_CLOSE)?;
-        let idx: usize = after[..close].parse().ok()?;
-        let link = links.get(idx)?;
-        restored[idx] += 1;
-        out.push_str("<a href=\"\">");
-        out.push_str(&encode_html_text(link));
-        out.push_str("</a>");
-        rest = &after[close + BARE_LINK_CLOSE.len_utf8()..];
-    }
-    out.push_str(rest);
-    Some(out)
-}
-
-/// Offset of the `</a>` that closes an anchor whose content starts at the
-/// beginning of `after_open`, counting any nested `<a …>` opened inside it.
-fn matching_anchor_close(after_open: &str) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < after_open.len() {
-        let rest = &after_open[i..];
-        let next_open = rest.find("<a ");
-        let next_close = rest.find("</a>")?;
-        match next_open {
-            Some(o) if o < next_close => {
-                depth += 1;
-                i += o + 3;
-            }
-            _ => {
-                if depth == 0 {
-                    return Some(i + next_close);
-                }
-                depth -= 1;
-                i += next_close + 4;
-            }
-        }
-    }
-    None
-}
-
-/// Remove every `<a …>` and `</a>` tag from `html`, keeping their content.
-fn strip_anchor_tags(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    loop {
-        let open = rest.find("<a ");
-        let close = rest.find("</a>");
-        let (pos, is_open) = match (open, close) {
-            (Some(o), Some(c)) if o < c => (o, true),
-            (Some(o), None) => (o, true),
-            (_, Some(c)) => (c, false),
-            (None, None) => break,
-        };
-        out.push_str(&rest[..pos]);
-        rest = if is_open {
-            match rest[pos..].find('>') {
-                Some(end) => &rest[pos + end + 1..],
-                None => "",
-            }
-        } else {
-            &rest[pos + 4..]
-        };
-    }
-    out.push_str(rest);
-    out
-}
-
-fn extract_href(opening_tag: &str) -> Option<String> {
-    let start = opening_tag.find("href=\"")? + "href=\"".len();
-    let end = opening_tag[start..].find('"')?;
-    Some(opening_tag[start..start + end].to_string())
-}
-
-/// Parsed shape of a Freenet web-contract URL.
-struct FreenetWebUrl<'a> {
-    /// The contract ID — base58-encoded 32-byte BLAKE3 hash (43 or 44 chars).
-    contract_id: &'a str,
-    /// Anything after the contract ID: leading slash + path, query, fragment.
-    /// `""` for `/v1/contract/web/<id>` with nothing after.
-    suffix: &'a str,
-    /// Same-origin absolute path including the marker: `/v1/contract/web/<id><suffix>`.
-    /// Used as a host/port-agnostic href.
-    absolute_path: &'a str,
-}
-
-/// Parse a Freenet web-contract URL, validating the contract ID looks like a
-/// real base58-encoded 32-byte BLAKE3 hash. The hash shape is the reliable
-/// indicator: it rejects same-prefix paths whose ID segment is too short or
-/// uses characters outside the base58 alphabet (e.g. visual-confusion chars
-/// `0OIl`, which a real contract ID can never contain).
-///
-/// The URL must use `http` or `https` (defense in depth — `[label](url)`
-/// markdown can in theory carry other schemes; we don't want to rewrite a
-/// `javascript:`-flavored input even though the rewrite would defang it).
-///
-/// The suffix must not contain dot path segments, literal or percent-encoded
-/// (see `suffix_has_dotdot_segment`). Without this guard, a
-/// pasted `http://attacker/v1/contract/web/<valid-shape-id>/../../foo`
-/// would be rewritten to a same-origin path that the browser normalizes
-/// into `/foo` on the reader's local gateway — sending the click to a
-/// path the attacker chose on the *victim's* gateway, instead of to the
-/// attacker's host where it would have gone before the rewrite.
-fn parse_freenet_web_url(url: &str) -> Option<FreenetWebUrl<'_>> {
-    let scheme_end = url.find("://")?;
-    let scheme = &url[..scheme_end];
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return None;
-    }
-    let after_scheme = &url[scheme_end + 3..];
-    let path_offset = after_scheme.find('/')?;
-    let path = &after_scheme[path_offset..];
-    let after_marker = path
-        .strip_prefix("/v1/contract/web/")
-        .or_else(|| path.strip_prefix("/v2/contract/web/"))?;
-
-    let id_end = after_marker
-        .find(|c: char| !is_base58_char(c))
-        .unwrap_or(after_marker.len());
-    if !matches!(id_end, 43 | 44) {
-        return None;
-    }
-    let suffix = &after_marker[id_end..];
-    if suffix_has_dotdot_segment(suffix) {
-        return None;
-    }
-    Some(FreenetWebUrl {
-        contract_id: &after_marker[..id_end],
-        suffix,
-        absolute_path: path,
-    })
-}
-
-/// True if any path segment in `suffix` is a dot segment, literal or
-/// percent-encoded (`..`, `%2e%2e`, `.%2E`, `.`, ...), which a browser resolves
-/// the same way. Checking only a literal `..` let `…/<A>/%2e%2e/<B>/` open
-/// contract B, or climb out of `/v1/contract/web/` altogether. Path segments
-/// are the `/`-separated components before any `?` query or `#` fragment.
-fn suffix_has_dotdot_segment(suffix: &str) -> bool {
-    let path_only = suffix
-        .split_once(['?', '#'])
-        .map(|(p, _)| p)
-        .unwrap_or(suffix);
-    path_only
-        .split('/')
-        .any(crate::util::share_link::is_dot_segment)
-}
-
-/// Bitcoin-style base58 alphabet: digits and letters minus the visually
-/// ambiguous `0`, `O`, `I`, `l`. A base58 string never contains these four.
-fn is_base58_char(c: char) -> bool {
-    matches!(c,
-        '1'..='9'
-        | 'A'..='H' | 'J'..='N' | 'P'..='Z'
-        | 'a'..='k' | 'm'..='z'
-    )
-}
-
-/// Rewrite a Freenet web-contract URL's href to a same-origin absolute path,
-/// stripping the scheme + host + port. Returns None for non-Freenet URLs.
-///
-/// `http://127.0.0.1:7509/v1/contract/web/<id>/foo` → `/v1/contract/web/<id>/foo`
-/// `https://gw.example/v1/contract/web/<id>/#hash`  → `/v1/contract/web/<id>/#hash`
-///
-/// The browser resolves the absolute path against the current page's origin,
-/// so the rewritten link points at whichever gateway River is loaded from —
-/// fixing pasted links that hard-code the sender's local gateway address.
-fn rewrite_freenet_href(url: &str) -> Option<String> {
-    Some(parse_freenet_web_url(url)?.absolute_path.to_string())
-}
-
-/// If `url` is a Freenet web-contract URL, return a beautified label like
-/// `freenet:UDzGbcWr` or `freenet:UDzGbcWr/index.html`. Returns None for any
-/// other URL so the caller falls back to the original link text.
-fn beautify_freenet_label(url: &str) -> Option<String> {
-    let parsed = parse_freenet_web_url(url)?;
-    // Defense in depth: refuse to beautify if the suffix carries raw HTML
-    // metacharacters. The markdown crate URL-encodes these today, but the
-    // label is rendered via dangerous_inner_html with no further escaping,
-    // so we'd rather skip the rewrite than risk smuggling markup.
-    if parsed.suffix.contains(['<', '>', '"']) {
-        return None;
-    }
-    // The label shows only an 8-character id prefix, so the rest of it must
-    // not read as a Freenet link of its own: `…/web/<B>/freenet:<A>` would
-    // otherwise read as a link to A. Show such a URL in full instead.
-    let suffix_seen = crate::util::confusable::visual_ascii(parsed.suffix).to_ascii_lowercase();
-    let names_a_contract = parsed
-        .suffix
-        .split(|c: char| !is_base58_char(c))
-        .any(crate::util::share_link::is_valid_contract_id);
-    if suffix_seen.contains("freenet") || suffix_seen.contains("contract/web") || names_a_contract {
-        return None;
-    }
-    // A bare trailing slash adds no information; drop it.
-    let suffix = if parsed.suffix == "/" {
-        ""
-    } else {
-        parsed.suffix
-    };
-    let id_prefix = &parsed.contract_id[..8];
-    Some(format!("freenet:{id_prefix}{suffix}"))
-}
-
-/// How close to the end of the history (in px) still counts as "at the bottom".
-///
-/// Shared by the scroll-to-latest button's IntersectionObserver `rootMargin`
-/// and by the pin flag, so the two agree about where the bottom is.
-#[cfg(target_arch = "wasm32")]
-const BOTTOM_THRESHOLD_PX: f64 = 100.0;
-
-/// How many display items (message groups and event summaries) the conversation
-/// renders when a room is opened.
-///
-/// Rendering an entire room at once is what makes a busy room unusable.
-/// Profiling the live "Off Topic" room on 2026-07-26 (1133 messages, 136
-/// members) measured 24,305 DOM nodes and a 1.65 GB WASM heap — and WASM never
-/// returns linear memory to the OS, so that peak is permanent for the tab.
-/// Rendering the tail the reader actually lands on, and backfilling only when
-/// they scroll off the top of it, keeps both bounded by what has been looked at.
-///
-/// Counted in ITEMS, not messages: consecutive messages from one author share a
-/// group, so this is a floor on messages shown, never a cap. A room with fewer
-/// items than this renders exactly as it always did — no sentinel, no
-/// backfill — so the common case carries none of the windowing's behaviour.
-const INITIAL_WINDOW_ITEMS: usize = 60;
-
-/// How many more items each backfill reveals when the reader reaches the top of
-/// the current window. Matching [`INITIAL_WINDOW_ITEMS`] means a reader paging
-/// back through history grows the window at the rate they consume it.
-const WINDOW_GROWTH_ITEMS: usize = 60;
-
-/// Hard ceiling on how many display items arrival-growth can accumulate.
-///
-/// While the reader is pinned to the bottom (or parked mid-history), arrivals
-/// GROW the rendered window instead of sliding it — see
-/// [`HistoryWindow::resolve_held`] — so a long session in a busy room would
-/// otherwise re-accumulate exactly the unbounded render the window exists to
-/// prevent (freenet/river#498). Four initial windows is the chosen bound:
-/// deep enough that trims are rare (240 items is hours of a busy room, and the
-/// bottom-settle trim usually fires long before), shallow enough that the
-/// worst-case DOM stays ~4x the room-open cost rather than unbounded.
-///
-/// At the ceiling, a reader following the latest message has the start slide
-/// forward, which is invisible at the bottom. A parked reader's range stops at
-/// its end and holds newer items back (`HistoryWindow::has_newer`) instead.
-///
-/// The ceiling caps ARRIVAL growth only. A reader paging back through history
-/// raises `window_items` explicitly, and that requested size always wins over
-/// the ceiling — capping it would make the backfill sentinel a no-op past 240
-/// items and dead-end the history (see the cap in
-/// [`HistoryWindow::resolve_held`]).
-const WINDOW_ITEMS_CEILING: usize = INITIAL_WINDOW_ITEMS * 4;
-
-/// How far into the rendered history the backfill trigger REACHES, in px.
-///
-/// The sentinel is a strip spanning `[0, BACKFILL_LEAD_PX]` from the top of the
-/// history, not a marker at a point. Both halves of that matter:
-///
-/// * Not a 1px marker at the very top: it would only intersect at
-///   `scrollTop == 0`, so the reader hits the end of the rendered history and
-///   *then* watches it grow. Reaching a screenful in means the next page is
-///   already there by the time they get to it — what `BOTTOM_THRESHOLD_PX`
-///   does for the other end via an IntersectionObserver `rootMargin`.
-/// * Not a 1px marker at `top: BACKFILL_LEAD_PX` either. That was the first
-///   attempt and it is worse than doing nothing: on any viewport SHORTER than
-///   the lead, scrolling to the very top puts the marker BELOW the viewport, so
-///   the reader who scrolls straight to the top — the exact case this exists
-///   for — never triggers a backfill and the history dead-ends. A strip is
-///   intersecting for every scroll position in the band, including 0, on every
-///   viewport size.
-const BACKFILL_LEAD_PX: i32 = 800;
-
-/// Where the history's tail window starts, and whether anything is behind it.
-///
-/// Split out from the render so the arithmetic is testable: getting it wrong
-/// either renders an empty history (start past the end) or silently renders
-/// everything (the blow-up the window exists to prevent), and neither is
-/// visible in a unit test of the component.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct HistoryWindow {
-    /// Index of the first display item to render.
-    start: usize,
-    /// One past the last display item to render.
-    end: usize,
-    /// Whether older items are held back — drives the backfill sentinel.
-    has_older: bool,
-    /// Whether newer items are held back below a parked reader. Drives the
-    /// newer-history sentinel and the catch-up button.
-    has_newer: bool,
-}
-
-/// Inputs for the range's lower edge. `Default` follows the latest message.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-struct RangeHold {
-    /// The relocated end of last render's range, if it stopped short of the
-    /// newest item.
-    end: Option<usize>,
-    /// The reader is not following the latest message. At the ceiling, hold
-    /// the end instead of sliding the start past their row (#732 review).
-    parked: bool,
-    /// The start never moves past this index, even above the ceiling: the
-    /// reading item, less one for a group the view top cuts through.
-    keep: Option<usize>,
-}
-
-/// The last reading position measured while the history was visible. A hidden
-/// panel measures 0 everywhere, so the reveal restores from this instead.
-#[derive(Clone, PartialEq, Debug)]
-struct ReadingAnchor {
-    /// `(data-anchor-key, offset from the visible top)`, reading row first, then
-    /// its neighbours nearest first. A neighbour stands in if the reading row is
-    /// deleted. Keyed by message id because a group re-keys when its first
-    /// message is pruned.
-    rows: Vec<(String, i32)>,
-    /// Display-item index at capture time; a relocation hint.
-    item_hint: usize,
-}
-
-/// Rows a [`ReadingAnchor`] remembers, the reading row included.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-const READING_ANCHOR_ROWS: usize = 7;
-
-/// State shared by the render, its effects and the raw scroll and resize
-/// callbacks. Plain cells, so reads never subscribe; re-renders come from
-/// `window_items`. The render writes `has_newer` before the catch-up button
-/// reads it.
-#[derive(Default)]
-struct ReaderPosition {
-    /// See [`ReadingAnchor`].
-    anchor: std::cell::RefCell<Option<ReadingAnchor>>,
-    /// Seen without layout since the last restore; the next resize restores.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    hidden: std::cell::Cell<bool>,
-    /// First rendered display item, for the capture's index hint.
-    range_start: std::cell::Cell<usize>,
-    /// The last render's `HistoryWindow::has_newer`.
-    has_newer: std::cell::Cell<bool>,
-    /// The next render selects the latest range (manual jump to latest).
-    select_latest: std::cell::Cell<bool>,
-    /// After that render, take the view to the newest message.
-    snap_latest: std::cell::Cell<bool>,
-    /// The next render extends a held range by one page of newer items.
-    extend_newer: std::cell::Cell<bool>,
-    /// A render cleared `has_newer`; the `window_items` effect re-checks the pin.
-    newer_resolved: std::cell::Cell<bool>,
-    /// Bumped on every room change, so a deferred trim can detect one.
-    room_epoch: std::cell::Cell<u64>,
-}
-
-/// Does `item` render the row a [`ReadingAnchor`] key names?
-fn item_holds_anchor_key(item: &DisplayItem, key: &str) -> bool {
-    match item {
-        DisplayItem::Messages(group) => group.messages.iter().any(|m| m.id == key),
-        DisplayItem::Event(summary) => summary.id == key,
-    }
-}
-
-/// Index of the first remembered row still in the room.
-fn locate_reading_item(items: &[DisplayItem], anchor: &ReadingAnchor) -> Option<usize> {
-    anchor.rows.iter().find_map(|(key, _)| {
-        relocate_anchor(items.len(), anchor.item_hint, |i| {
-            item_holds_anchor_key(&items[i], key)
-        })
-    })
-}
-
-/// The scroll shift that puts the first surviving remembered row back at its
-/// offset. `None` when none is rendered.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn reading_anchor_shift(
-    anchor: &ReadingAnchor,
-    top_now: impl Fn(&str) -> Option<i32>,
-) -> Option<i32> {
-    anchor
-        .rows
-        .iter()
-        .find_map(|(key, saved)| top_now(key).map(|now| now - saved))
-}
-
-/// The identity of the window's head: which display item the last render
-/// started at, remembered by KEY, with the index it held as a relocation hint.
-///
-/// The anchor is by IDENTITY, not position, because positions are not stable:
-/// `MessagesV1::apply_delta` drains the oldest message once a room exceeds
-/// `max_recent_messages` (the steady state of every busy room), so an arrival
-/// shifts every index down by one. A positional anchor then renders a head one
-/// item LATER in identity — the top rendered row is removed in the same patch
-/// that appends the arrival, which is the #501 slide reproduced in content
-/// space, and with scroll anchoring disabled it crawls a parked reader upward
-/// one row per arrival. Anchoring on the head item's key holds the rendered
-/// set fixed in identity no matter how the indices shift underneath it.
-#[derive(Clone, PartialEq, Debug)]
-struct WindowAnchor {
-    /// `display_item_key` of the first [`WINDOW_ANCHOR_KEYS`] rendered items,
-    /// head first. The spares exist because the head key alone can vanish
-    /// while its NEIGHBORS survive: an at-cap drain that consumes the head
-    /// (or only its first message — a multi-message head group RE-KEYS, since
-    /// a group's key is its first message's id), or a batched delta draining
-    /// many items at once. The first spare still present tells us exactly
-    /// where the surviving remainder of the old window now sits.
-    keys: Vec<String>,
-    /// The index the head held last render — a hint so relocation is
-    /// O(shift), not O(total), in the common case.
-    index: usize,
-}
-
-/// How many leading item keys the anchor remembers (head + spares).
-///
-/// Bounds how large a head-consuming removal can be precisely relocated: a
-/// front drain that consumes the head and ALL spares falls back to index 0,
-/// which for a front-contiguous drain — the only mechanism that can remove
-/// this many contiguous leading items — is exactly the nearest surviving
-/// item anyway.
-const WINDOW_ANCHOR_KEYS: usize = 8;
-
-/// Where the anchored window starts after the item list changed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct RelocatedWindow {
-    /// Start index for the resolve: the head's new position when it survived,
-    /// otherwise derived from the first surviving spare (its position minus
-    /// its offset in the anchor), otherwise 0.
-    start: usize,
-    /// Whether the HEAD itself survived under its own key. False means the
-    /// pre-patch head row is gone or re-keyed, so rendered content above (or
-    /// at) the new head changed and a parked reader needs the measured
-    /// reposition.
-    head_survived: bool,
-}
-
-/// Search for one anchored key after the item list changed.
-///
-/// Front prunes shift every surviving index DOWN, so the hint is checked
-/// first, then the indices below it, then (for completeness — a merge can
-/// insert older history above the head) the indices above. `None` means this
-/// key is gone entirely.
-fn relocate_anchor(total: usize, hint: usize, is_anchor: impl Fn(usize) -> bool) -> Option<usize> {
-    if hint < total && is_anchor(hint) {
-        return Some(hint);
-    }
-    if let Some(i) = (0..hint.min(total)).rev().find(|&i| is_anchor(i)) {
-        return Some(i);
-    }
-    (hint.saturating_add(1)..total).find(|&i| is_anchor(i))
-}
-
-/// Re-locate the anchored window: the head by its own key, else by the first
-/// surviving spare, else index 0.
-///
-/// The index-0 fallback is exact for a front-contiguous drain that consumed
-/// the head and every spare — the oldest remaining item IS then the nearest
-/// survivor. It is a DEGRADED answer for the other way to lose that many
-/// contiguous leading items (a ban purge or bulk delete of >=
-/// [`WINDOW_ANCHOR_KEYS`] display items above the reader): the window jumps
-/// to the front of the room, bounded only by the ceiling, and the reposition
-/// probe finds nothing to measure against. Rare, and it fails toward
-/// rendering MORE history rather than losing the reader's place entirely.
-///
-/// The `head_reposition` effect measures and compensates a parked reader for
-/// the TOP-CONTIGUOUS removals this relocation deals in (at-cap drains,
-/// batched or not, including a re-keyed multi-message head group, and small
-/// leading deletes the spares still cover). It does NOT make every removal
-/// invisible: a bulk MID-window removal (a ban purge) or late-loading media
-/// above the viewport still shifts a parked reader — tracked as follow-up
-/// work, not covered here.
-fn relocate_window(
-    total: usize,
-    anchor: &WindowAnchor,
-    key_at: impl Fn(usize, &str) -> bool,
-) -> RelocatedWindow {
-    for (spare, key) in anchor.keys.iter().enumerate() {
-        let located = relocate_anchor(total, anchor.index + spare, |i| key_at(i, key));
-        if let Some(i) = located {
-            return RelocatedWindow {
-                start: i.saturating_sub(spare),
-                head_survived: spare == 0,
-            };
-        }
-    }
-    RelocatedWindow {
-        start: 0,
-        head_survived: false,
-    }
-}
-
-/// Re-locate a held range's end: one past its last item, or past the first
-/// surviving spare before it (keys newest first). A found spare is the last
-/// surviving item, so unlike the head it needs no offset. `None` when every
-/// key is gone.
-fn relocate_tail(
-    total: usize,
-    anchor: &WindowAnchor,
-    key_at: impl Fn(usize, &str) -> bool,
-) -> Option<usize> {
-    anchor.keys.iter().enumerate().find_map(|(spare, key)| {
-        relocate_anchor(total, anchor.index.saturating_sub(spare), |i| {
-            key_at(i, key)
-        })
-        .map(|i| i + 1)
-    })
-}
-
-/// How many rows past the window head the reposition capture will probe for a
-/// row that exists in the PRE-patch DOM.
-///
-/// The new head itself may have no pre-patch row to measure, for two reasons:
-///
-/// * a multi-message head group whose first message was drained RE-KEYS (a
-///   group's key is its first message's id), so its new key is in no
-///   pre-patch row (#505 re-review blocker);
-/// * relocation landing via SPARE `k` sets `start = i - k`, widening the
-///   window backward by `k` items that were not rendered pre-patch at all, so
-///   the first `k` candidates cannot have pre-patch rows either.
-///
-/// A head-only — or too-short — probe dead-fires, and the parked reader is
-/// left uncompensated. Sized to [`WINDOW_ANCHOR_KEYS`] so the walk covers the
-/// SPARE term exactly (`k <= WINDOW_ANCHOR_KEYS - 1`, needing `k + 1`
-/// candidates). The full count of leading candidates without pre-patch rows is
-/// `k + (relocated.start - history_window.start)`, and that second term is
-/// non-zero only when `resolve_held` pulls the start back below the relocated
-/// head — the bulk mid-window removal `relocate_window` already declares
-/// out of scope. For a top-contiguous removal every surviving row at or below
-/// the head shifts by the same amount, so whichever candidate lands measures
-/// the shift exactly.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-const REPOSITION_PROBE_ROWS: usize = WINDOW_ANCHOR_KEYS;
-
-/// Pick the row the reposition will measure: the first of the leading
-/// `REPOSITION_PROBE_ROWS` post-patch keys that has a PRE-patch row.
-///
-/// `pre_patch_offsets` is handed the whole candidate list at once so the DOM
-/// is scanned a single time (see `first_history_row_offset`) rather than once
-/// per candidate inside the render body.
-///
-/// Only the wasm render path calls this at runtime; natively it is exercised
-/// by the unit tests, hence the targeted allow rather than a cfg that would
-/// hide it from them.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn select_reposition_probe(
-    keys_from_head: impl Iterator<Item = String>,
-    pre_patch_offsets: impl Fn(&[String]) -> Option<(String, i32)>,
-) -> Option<(String, i32)> {
-    let candidates: Vec<String> = keys_from_head.take(REPOSITION_PROBE_ROWS).collect();
-    pre_patch_offsets(&candidates)
-}
-
-/// Does `key` identify `item`, without allocating a key `String`?
-///
-/// The relocation walk compares keys against up to every item on a miss;
-/// building a `String` per probe made that O(total) allocations per render at
-/// the at-cap steady state (#505 re-review).
-fn display_item_key_matches(item: &DisplayItem, key: &str) -> bool {
-    match item {
-        DisplayItem::Messages(group) => group.messages[0].id == key,
-        DisplayItem::Event(summary) => summary.id == key,
-    }
-}
-
-/// What the backfill sentinel captures just before growing the window, so the
-/// restore can put the reader back on the row they were looking at.
-///
-/// Only ever constructed on wasm (the capture reads the DOM), hence the
-/// native allow rather than a cfg that would also hide the type from the
-/// component's non-wasm compile.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-#[derive(Clone, PartialEq, Debug)]
-struct BackfillAnchor {
-    /// `data-item-key` of the head row at capture time. It survives the
-    /// backfill (revealed rows land ABOVE it), and its `offsetTop` shift
-    /// measures EXACTLY the height prepended above the viewport — unlike the
-    /// raw `scrollHeight` delta, which also counts content appended BELOW the
-    /// viewport when an arrival batches into the same patch, over-shifting
-    /// the reader by that content's height (#505 re-review).
-    probe_key: String,
-    /// The probe row's `offsetTop` at capture time.
-    probe_top: i32,
-    /// `scrollTop` at capture time.
-    scroll_top: i32,
-    /// `scrollHeight` at capture time — the fallback delta if the probe row
-    /// vanishes in the same patch (an at-cap drain re-keying it; rare).
-    scroll_height: i32,
-}
-
-/// Margin over the backfill strip's reach before a trim is allowed. Covers
-/// what the measurement leaves out: padding and the date separator the first
-/// retained item gains.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-const TRIM_HEADROOM_PX: f64 = 200.0;
-
-/// Would a trim leaving `retained_tail_px` of history put the backfill
-/// sentinel strip inside the bottom viewport?
-///
-/// At the bottom, the sentinel strip `[0, BACKFILL_LEAD_PX]` intersects the
-/// viewport iff `content_height < client_height + BACKFILL_LEAD_PX`. A tail
-/// short enough for that (browser zoom-out, a tall portrait monitor over a
-/// modest window) would re-fire the backfill the moment the trim lands:
-/// grow → snap → settle → trim → grow, a silent render loop at full speed
-/// (#505 re-review). The settle handler then skips the trim and the window
-/// stays grown, bounded by the ceiling.
-///
-/// The tail is measured. An average-row-height estimate looped on rooms whose
-/// older rows are much taller than the newest ones.
-///
-/// Only the wasm settle handler calls this at runtime; natively it is
-/// exercised by the unit tests, hence the targeted allow.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn trim_would_rearm_backfill(retained_tail_px: i32, client_height: i32) -> bool {
-    (retained_tail_px as f64) < client_height as f64 + BACKFILL_LEAD_PX as f64 + TRIM_HEADROOM_PX
-}
-
-/// The requested window size after one backfill growth step.
-///
-/// Grows from the RENDERED size, not the requested size. Arrivals grow an
-/// anchored window past what was requested (`rendered = total - start` exceeds
-/// `requested` by the number of arrivals), and a growth step computed from the
-/// stale requested size can resolve to a start the anchor already renders —
-/// zero new rows, no DOM change, so the sentinel's IntersectionObserver never
-/// re-fires and paging dead-ends (#505 review, blocker 2). Growing from the
-/// rendered size guarantees every step reveals `WINDOW_GROWTH_ITEMS` more
-/// items than are currently on screen.
-fn grown_window(requested: usize, rendered: usize) -> usize {
-    rendered.max(requested) + WINDOW_GROWTH_ITEMS
-}
-
-impl HistoryWindow {
-    /// Test shorthand for a following reader; see [`Self::resolve_held`].
-    #[cfg(test)]
-    fn resolve(total_items: usize, window: usize, anchor: Option<usize>) -> Self {
-        Self::resolve_held(total_items, window, anchor, RangeHold::default())
-    }
-
-    /// Resolve which display items the history renders.
-    ///
-    /// `anchor` is the start index the PREVIOUS render used (`None` when the
-    /// room was just opened, or after a trim). It is what keeps the window
-    /// from SLIDING on arrival: without it, every new message advanced `start`
-    /// by one, dropping the oldest rendered row in the same patch that
-    /// appended the new one at the bottom. Removing content above the viewport
-    /// while adding below it is what broke arrival auto-scroll in
-    /// freenet/river#501 — browser scroll anchoring rewrote `scrollTop`, and
-    /// `reader_moved_up_since` attributed the shift to the reader — and it
-    /// visibly shifts a reader parked mid-history now that scroll anchoring is
-    /// disabled on the container. So:
-    ///
-    /// * `start` NEVER moves forward from the anchor on an ordinary render:
-    ///   arrivals grow the rendered count instead (start fixed, new items
-    ///   appended below).
-    /// * `start` moves BACK (upward, revealing older items) when the reader
-    ///   backfills — `window` grew, so the plain tail start is earlier than
-    ///   the anchor.
-    /// * The one exception is [`WINDOW_ITEMS_CEILING`], which caps arrival
-    ///   growth. Past it, a following reader's start slides forward; a parked
-    ///   reader's end stops instead, and newer items are held back.
-    ///   `max(window, ...)` keeps the ceiling from ever capping a
-    ///   reader-requested backfill.
-    ///
-    /// `hold` adds the lower edge:
-    ///
-    /// * A held end moves only when the caller extends it (newer paging); the
-    ///   ceiling then slides the start.
-    /// * The start never passes `keep`, not even at the ceiling.
-    ///
-    /// `window` counts back from the end, so backfill works the same either way.
-    ///
-    /// Trimming back toward [`INITIAL_WINDOW_ITEMS`] is NOT done here — it is
-    /// an explicit event (the reader's own settle landing at the bottom, or a
-    /// room switch) that clears the anchor and resets `window`, because a trim
-    /// is only invisible when the view is at the bottom, where the browser's
-    /// scrollTop clamp keeps the tail glued in place.
-    fn resolve_held(
-        total_items: usize,
-        window: usize,
-        anchor: Option<usize>,
-        hold: RangeHold,
-    ) -> Self {
-        // A held end can never pass the newest item, and never empties the
-        // range: if every item it held is gone, fall back to the newest.
-        let mut end = match hold.end {
-            Some(e) if e > 0 => e.min(total_items),
-            _ => total_items,
-        };
-        // `max(1)` so an item is always on screen: a zero window would
-        // render an empty history that the reader has no way to scroll into.
-        let base = end.saturating_sub(window.max(1));
-        // Grow, never slide: keep the anchored start unless a backfill asked
-        // for an even earlier one. `min` also repairs an anchor past the end
-        // (messages pruned out from under it).
-        let mut start = match anchor {
-            None => base,
-            Some(prev) => prev.min(base),
-        };
-        // The ceiling on arrival growth; never on reader-requested backfill.
-        // One growth step of grace above the requested size, so a reader who
-        // parked right after backfilling to the ceiling is not hit with a
-        // ceiling slide on the first arrival — belt-and-braces on top of the
-        // `head_reposition` compensation (#505 review).
-        let cap = (window + WINDOW_GROWTH_ITEMS)
-            .max(WINDOW_ITEMS_CEILING)
-            .max(1);
-        if end - start > cap {
-            if hold.parked && hold.end.is_none() {
-                end = start + cap;
-            } else {
-                start = end - cap;
-            }
-        }
-        if let Some(keep) = hold.keep {
-            start = start.min(keep.min(end.saturating_sub(1)));
-        }
-        Self {
-            start,
-            end,
-            has_older: start > 0,
-            has_newer: end < total_items,
-        }
-    }
-}
-
-/// Trailing delay used to spot a scroll settling on browsers with no
-/// `scrollend` event (Safari before 17.4).
-#[cfg(target_arch = "wasm32")]
-const SCROLL_SETTLE_DEBOUNCE_MS: i32 = 120;
-
-/// Refresh the saved reading position, keeping the old one when nothing can be
-/// measured. Called at every settle, before a newer page, and when the Rooms or
-/// Members button hides the chat panel (afterwards there is no geometry to
-/// read). A breakpoint hide relies on the last settle.
-fn remember_reading_position(reader: &ReaderPosition) {
-    #[cfg(target_arch = "wasm32")]
-    if let Some(anchor) = capture_reading_anchor(reader.range_start.get()) {
-        *reader.anchor.borrow_mut() = Some(anchor);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = reader;
-}
-
-/// Read the chat history's scroll container, if it is currently in the DOM.
-#[cfg(target_arch = "wasm32")]
-fn chat_scroll_container() -> Option<web_sys::Element> {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("chat-scroll-container"))
-}
-
-/// Read the wrapper the history's rows are laid out in.
-#[cfg(target_arch = "wasm32")]
-fn chat_content_wrapper() -> Option<web_sys::Element> {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("chat-content"))
-}
-
-/// The furthest down `container` can be scrolled, in px.
-#[cfg(target_arch = "wasm32")]
-fn max_scroll_top(container: &web_sys::Element) -> i32 {
-    (container.scroll_height() - container.client_height()).max(0)
-}
-
-/// The `offsetTop` of the history row carrying `data-item-key == key`, if it
-/// is currently in the DOM.
-///
-/// Matched by comparing attributes rather than an attribute SELECTOR, so a key
-/// never needs CSS escaping. The scan is bounded by the rendered window (≤ a
-/// few hundred rows) and only runs on the rare head-swap paths.
-#[cfg(target_arch = "wasm32")]
-fn history_row_offset_top(key: &str) -> Option<i32> {
-    first_history_row_offset(&[key.to_string()]).map(|(_, top)| top)
-}
-
-/// The first of `keys` (in order) that has a row in the CURRENT DOM, as
-/// `(key, offsetTop)`.
-///
-/// One DOM pass for the whole candidate list rather than one pass per
-/// candidate: the walk can legitimately need to try [`REPOSITION_PROBE_ROWS`]
-/// of them, and the old shape re-ran `querySelectorAll` plus an attribute read
-/// per row for each — `candidates x rows` FFI calls. (Not repeated reflows:
-/// the DOM does not change between scans, so layout stayed cached after the
-/// first `offsetTop`.) Only CANDIDATE rows are measured, so a match on the
-/// first row costs a handful of string compares and a single `offsetTop`.
-#[cfg(target_arch = "wasm32")]
-fn first_history_row_offset(keys: &[String]) -> Option<(String, i32)> {
-    use wasm_bindgen::JsCast;
-    if keys.is_empty() {
-        return None;
-    }
-    let container = chat_scroll_container()?;
-    let rows = container.query_selector_all("[data-item-key]").ok()?;
-    // Candidate key -> offsetTop. Bounded by `keys.len()`, not by the rendered
-    // window: measuring every row cost an `offsetTop` and a map insert per row
-    // (up to the ceiling, 240) on a path that runs per arrival in an at-cap
-    // room. The `String` per row is NOT saved — `get_attribute` allocates one
-    // either way; what this avoids is the layout read and the insert.
-    let mut present: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-    for i in 0..rows.length() {
-        if present.len() == keys.len() {
-            break;
-        }
-        let Some(node) = rows.item(i) else { continue };
-        let Some(el) = node.dyn_ref::<web_sys::HtmlElement>() else {
-            continue;
-        };
-        if let Some(k) = el.get_attribute("data-item-key") {
-            if keys.iter().any(|c| c == &k) {
-                present.entry(k).or_insert_with(|| el.offset_top());
-            }
-        }
-    }
-    // Priority is the CANDIDATE order (nearest the head first), not DOM order.
-    keys.iter()
-        .find_map(|k| present.get(k).map(|top| (k.clone(), *top)))
-}
-
-/// The first history row carrying a `data-item-key` — the current window head
-/// item's row — as `(key, offsetTop)`. The backfill capture probes it.
-#[cfg(target_arch = "wasm32")]
-fn first_history_row_identity() -> Option<(String, i32)> {
-    use wasm_bindgen::JsCast;
-    let container = chat_scroll_container()?;
-    let el = container.query_selector("[data-item-key]").ok()??;
-    let key = el.get_attribute("data-item-key")?;
-    let html = el.dyn_ref::<web_sys::HtmlElement>()?;
-    Some((key, html.offset_top()))
-}
-
-/// Does the history have layout? On a phone the chat panel is `display:none`
-/// behind Rooms or Members, and every row then measures 0. `MOBILE_VIEW` can't
-/// tell: on desktop all panels show whatever it says.
-#[cfg(target_arch = "wasm32")]
-fn history_has_layout(container: &web_sys::Element) -> bool {
-    container.client_height() > 0
-}
-
-/// Measure the first message or event row that starts inside the view, with
-/// its nearest neighbours. A binary search over item rows keeps this to a
-/// handful of layout reads, cheap enough for every settle.
-#[cfg(target_arch = "wasm32")]
-fn capture_reading_anchor(range_start: usize) -> Option<ReadingAnchor> {
-    use wasm_bindgen::JsCast;
-    let container = chat_scroll_container()?;
-    if !history_has_layout(&container) {
-        return None;
-    }
-    let view_top = container.get_bounding_client_rect().top();
-    let rows = container.query_selector_all("[data-item-key]").ok()?;
-    let row = |i: u32| {
-        rows.item(i)
-            .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
-    };
-    let n = rows.length();
-    // The first item row whose bottom is below the visible top.
-    let (mut lo, mut hi) = (0u32, n);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let bottom = row(mid).map_or(f64::MAX, |r| r.get_bounding_client_rect().bottom());
-        if bottom <= view_top {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if lo == n {
-        return None;
-    }
-    // The anchor-keyed rows in that item and its neighbours, in page order.
-    let mut found: Vec<(String, f64, f64)> = Vec::new();
-    for i in lo.saturating_sub(1)..(lo + 3).min(n) {
-        let Some(item) = row(i) else { continue };
-        let mut push = |el: &web_sys::Element| {
-            if let Some(key) = el.get_attribute("data-anchor-key") {
-                let rect = el.get_bounding_client_rect();
-                found.push((key, rect.top(), rect.bottom()));
-            }
-        };
-        if item.has_attribute("data-anchor-key") {
-            push(&item);
-        } else if let Ok(inner) = item.query_selector_all("[data-anchor-key]") {
-            for j in 0..inner.length() {
-                if let Some(el) = inner
-                    .item(j)
-                    .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
-                {
-                    push(&el);
-                }
-            }
-        }
-    }
-    // The row being read: the first one whose top is in view, else the one
-    // the visible top cuts through.
-    let reading = found
-        .iter()
-        .position(|(_, top, _)| *top >= view_top - 0.5)
-        .or_else(|| found.iter().position(|(_, _, bottom)| *bottom > view_top))?;
-    let mut rows = Vec::with_capacity(READING_ANCHOR_ROWS);
-    let entry = |i: usize| (found[i].0.clone(), (found[i].1 - view_top).round() as i32);
-    rows.push(entry(reading));
-    for d in 1..found.len() {
-        if rows.len() >= READING_ANCHOR_ROWS {
-            break;
-        }
-        if reading + d < found.len() {
-            rows.push(entry(reading + d));
-        }
-        if d <= reading && rows.len() < READING_ANCHOR_ROWS {
-            rows.push(entry(reading - d));
-        }
-    }
-    Some(ReadingAnchor {
-        rows,
-        item_hint: range_start + lo as usize,
-    })
-}
-
-/// Scroll so `anchor`'s first surviving row is back at its saved offset, and
-/// record that position as ours. A no-op when none of its rows is rendered.
-#[cfg(target_arch = "wasm32")]
-fn restore_reading_anchor(anchor: &ReadingAnchor, last_top: &Rc<ScrollMark>) {
-    use wasm_bindgen::JsCast;
-    let Some(container) = chat_scroll_container() else {
-        return;
-    };
-    let view_top = container.get_bounding_client_rect().top();
-    let Ok(els) = container.query_selector_all("[data-anchor-key]") else {
-        return;
-    };
-    // One pass, keeping only the remembered keys. Rare (once per reveal).
-    let mut tops: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-    for i in 0..els.length() {
-        let Some(el) = els
-            .item(i)
-            .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
-        else {
-            continue;
-        };
-        if let Some(key) = el.get_attribute("data-anchor-key") {
-            if anchor.rows.iter().any(|(k, _)| *k == key) {
-                let top = (el.get_bounding_client_rect().top() - view_top).round() as i32;
-                tops.entry(key).or_insert(top);
-            }
-        }
-    }
-    let Some(shift) = reading_anchor_shift(anchor, |key| tops.get(key).copied()) else {
-        return;
-    };
-    if shift != 0 {
-        container.set_scroll_top(container.scroll_top() + shift);
-    }
-    last_top.record(container.scroll_top(), container.client_height());
-}
-
-/// Height a trim to the newest `retained` items would leave. `None` when no
-/// more than that many are rendered.
-#[cfg(target_arch = "wasm32")]
-fn retained_tail_height(container: &web_sys::Element, retained: usize) -> Option<i32> {
-    let rows = container.query_selector_all("[data-item-key]").ok()?;
-    let n = rows.length() as usize;
-    if n <= retained {
-        return None;
-    }
-    use wasm_bindgen::JsCast;
-    let first = rows
-        .item((n - retained) as u32)?
-        .dyn_into::<web_sys::Element>()
-        .ok()?;
-    // Content coordinates, from the same rects as the container's own.
-    let top_in_content = container.scroll_top() as f64 + first.get_bounding_client_rect().top()
-        - container.get_bounding_client_rect().top();
-    Some(container.scroll_height() - top_in_content.round() as i32)
-}
-
-/// Slack for comparing one scroll offset against another.
-///
-/// `scrollTop` is fractional in every engine while `Element::scroll_top`
-/// rounds, so an exact comparison would report a 1px difference on a view that
-/// never moved. `conversation-autoscroll.spec.ts` is what catches this being
-/// too tight.
-#[cfg(target_arch = "wasm32")]
-const SCROLL_TOP_SLACK_PX: i32 = 2;
-
-/// Both edges of the view as last accounted for; see `reader_moved_up_since`.
-#[cfg(target_arch = "wasm32")]
-#[derive(Default)]
-struct ScrollMark {
-    top: std::cell::Cell<i32>,
-    height: std::cell::Cell<i32>,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl ScrollMark {
-    fn top(&self) -> i32 {
-        self.top.get()
-    }
-    fn bottom(&self) -> i32 {
-        self.top.get() + self.height.get()
-    }
-    fn record(&self, top: i32, height: i32) {
-        self.top.set(top);
-        self.height.set(height);
-    }
-    /// Content above the view moved by `delta`, which moves both edges.
-    fn shift(&self, delta: i32) {
-        self.top.set(self.top.get() + delta);
-    }
-}
-
-/// Has the view moved up since `last_top` recorded it, at BOTH edges?
-///
-/// A reader scroll moves both edges; a resize moves only one (the composer
-/// collapsing clamps `scrollTop`, a growing one lifts the bottom).
-///
-/// `pinned_to_bottom` is only re-measured when a scroll SETTLES, so between the
-/// reader moving the view and their `scrollend` arriving it is stale by design.
-/// Everything that scrolls on the strength of that flag has to consult this
-/// too, or it drags the reader back down inside that window. The interleaving
-/// is ordinary rather than contrived — a message arriving, or a layout settling,
-/// while the reader is scrolling up — and it reproduced on Firefox, WebKit and
-/// mobile Safari, where the reader reached the top of the history and the view
-/// snapped back within a few milliseconds.
-///
-/// This is deliberately NOT a re-measurement of "is the end on screen": that
-/// question is what latched in the first place (#486). It only ever answers
-/// "has the position moved since we last knew what it was", which cannot latch,
-/// because every settle refreshes `last_top`.
-///
-/// Known limit: `last_top` records the offset a scroll ASKED for, so while the
-/// scroll-to-latest button's smooth scroll is animating this reports true and
-/// stands both follow paths down. A message arriving inside that ~300ms window
-/// therefore lands short, and past the render ceiling it holds the range's end
-/// as if the reader had parked. The next content change corrects both: the
-/// landing settles as ours, so the pin stays armed, and a following reader's
-/// range never keeps a held end (`prev_tail` in the history render). Only
-/// the button animates; every automatic scroll is instant and lands within the
-/// same task.
-#[cfg(target_arch = "wasm32")]
-fn reader_moved_up_since(last_top: &Rc<ScrollMark>) -> bool {
-    let Some(container) = chat_scroll_container() else {
-        return false;
-    };
-    let top = container.scroll_top();
-    let bottom = top + container.client_height();
-    // Never judge against an edge the container can no longer reach: if the
-    // history shrank, the browser clamped the position down on its own and that
-    // is not the reader moving.
-    let top_was = last_top.top().min(max_scroll_top(&container));
-    let bottom_was = last_top.bottom().min(container.scroll_height());
-    top + SCROLL_TOP_SLACK_PX < top_was && bottom + SCROLL_TOP_SLACK_PX < bottom_was
-}
-
-/// Snap the history to its newest message.
-///
-/// Every programmatic scroll goes through here so two things always happen
-/// together: the pin is re-armed (we are taking the reader to the bottom, so
-/// that is where they now are), and the position (both edges) we asked for is
-/// recorded. That position (both edges) is what the settle handler compares
-/// against to tell OUR scroll's settle from the reader's, and what a later
-/// resize compares against to tell "content grew underneath us" from "the
-/// reader has moved since".
-/// See [`install_scroll_pin_listeners`].
-#[cfg(target_arch = "wasm32")]
-fn scroll_history_to_bottom(
-    pinned: &Rc<std::cell::Cell<bool>>,
-    last_top: &Rc<ScrollMark>,
-    behavior: web_sys::ScrollBehavior,
-) {
-    let Some(container) = chat_scroll_container() else {
-        warn!("chat-scroll-container missing; skipping scroll-to-bottom");
-        return;
-    };
-    pinned.set(true);
-    // Hidden: keep the pin for the reveal's snap, record nothing.
-    if !history_has_layout(&container) {
-        return;
-    }
-    last_top.record(max_scroll_top(&container), container.client_height());
-    let opts = web_sys::ScrollToOptions::new();
-    opts.set_top(container.scroll_height() as f64);
-    opts.set_behavior(behavior);
-    container.scroll_to_with_scroll_to_options(&opts);
-}
-
-/// May a bottom-settle trim run now? Requires layout, the exact bottom of a
-/// range that reaches the latest message, an overgrown window, nothing
-/// pending, and a measured tail that clears the backfill strip.
-#[cfg(target_arch = "wasm32")]
-fn trim_is_due(container: &web_sys::Element, overgrown: bool, reader: &ReaderPosition) -> bool {
-    if !overgrown
-        || !history_has_layout(container)
-        || reader.has_newer.get()
-        || reader.hidden.get()
-        || reader.select_latest.get()
-        || reader.snap_latest.get()
-    {
-        return false;
-    }
-    let distance = container.scroll_height() - container.scroll_top() - container.client_height();
-    if distance > SCROLL_TOP_SLACK_PX {
-        return false;
-    }
-    retained_tail_height(container, INITIAL_WINDOW_ITEMS)
-        .is_some_and(|tail| !trim_would_rearm_backfill(tail, container.client_height()))
-}
-
-/// Wire up the "the reader is pinned to the newest message" flag.
-///
-/// This flag exists because the scroll-to-latest button's IntersectionObserver
-/// answers a different question: *is the end of the history on screen right
-/// now?* Gating auto-scroll on that answer is freenet/river#486 — anything that
-/// grew the gap past the observer's margin (a burst of arrivals, or merely
-/// growing the composer, which shrinks the container by more than the margin)
-/// switched auto-scroll off, and nothing turned it back on short of a manual
-/// scroll to the bottom or a room switch. The recorded failure ran 54 arrivals
-/// with the view frozen while the gap ratcheted out to roughly three screens.
-///
-/// `pinned` therefore tracks *intent*, and only a settle the reader caused can
-/// clear it. A settle WE caused must not: a smooth auto-scroll that lands short
-/// because more content arrived mid-flight would otherwise read as "the reader
-/// moved away".
-///
-/// Whose settle it is, is decided by POSITION, not by a flag. `last_top` holds
-/// the offset our last scroll asked for; a settle that lands there is ours, and
-/// a settle that lands anywhere else is the reader's. An earlier version raised
-/// a boolean instead, and it could not survive two settles being in flight at
-/// once: clearing a long draft grows the container, the browser clamps
-/// `scrollTop` down on its own, and that clamp's settle was consumed by the
-/// flag our previous scroll had raised. `last_top` then kept pointing at an
-/// offset the view had already left, `reader_moved_up_since` read that as the
-/// reader having scrolled up, and BOTH follow paths stood down — the view sat
-/// 62px short of the newest message and stayed there (observed on mobile
-/// Safari, 12s and counting). A position cannot go stale the way a flag can,
-/// because every settle rewrites it, and it needs no `wheel`/`pointerdown`
-/// listeners to guess at reader intent — which also removes the hole where
-/// Firefox dispatches no pointer event for a native scrollbar drag.
-///
-/// Returns whether the listener was installed; `false` means the container was
-/// not in the DOM yet and the caller should try again.
-#[cfg(target_arch = "wasm32")]
-#[must_use]
-fn install_scroll_pin_listeners(
-    pinned: Rc<std::cell::Cell<bool>>,
-    last_top: Rc<ScrollMark>,
-    window_items: Signal<usize>,
-    window_anchor: Rc<std::cell::RefCell<Option<WindowAnchor>>>,
-    window_overgrown: Rc<std::cell::Cell<bool>>,
-    trim_landed: Rc<std::cell::Cell<bool>>,
-    reader: Rc<ReaderPosition>,
-) -> bool {
-    use wasm_bindgen::prelude::*;
-
-    let Some(container) = chat_scroll_container() else {
-        return false;
-    };
-
-    // Passive throughout: none of these handlers call `preventDefault`, and the
-    // jank this replaces (#151) came from doing work on the scroll path.
-    let passive = web_sys::AddEventListenerOptions::new();
-    passive.set_passive(true);
-
-    // One DOM measurement per settle, not per scroll event.
-    let settle = {
-        let pinned = pinned.clone();
-        let last_top = last_top.clone();
-        let window_anchor = window_anchor.clone();
-        let window_overgrown = window_overgrown.clone();
-        let trim_landed = trim_landed.clone();
-        let reader = reader.clone();
-        Closure::wrap(Box::new(move || {
-            let Some(container) = chat_scroll_container() else {
-                return;
-            };
-            // Hidden, everything measures 0 and would read as "at the bottom".
-            if !history_has_layout(&container) {
-                return;
-            }
-            // Revealed but not restored yet: not the reader's position.
-            if reader.hidden.get() {
-                return;
-            }
-            let settled_at = container.scroll_top();
-            let ours = (settled_at - last_top.top()).abs() <= SCROLL_TOP_SLACK_PX;
-            // Where the view ended up is a fact whoever caused it, and it is
-            // what everything else compares against. Recorded before the
-            // `ours` early-out on purpose: the version that only recorded it
-            // for reader settles is what let a stale offset suppress the
-            // follow indefinitely.
-            last_top.record(settled_at, container.client_height());
-            let distance = container.scroll_height() as f64
-                - settled_at as f64
-                - container.client_height() as f64;
-            // A settle landing AT the bottom is the ONE moment a window trim
-            // is provably invisible: removing rows above the viewport shrinks
-            // `scrollHeight` and the browser clamps `scrollTop` down with it,
-            // so the same tail stays glued to the bottom edge
-            // (`reader_moved_up_since`'s `.min(max_scroll_top(..))` already
-            // treats that clamp as not the reader). Trimming anywhere else
-            // shifts content under the reader now that scroll anchoring is
-            // off, so growth accumulated while parked is bounded by
-            // `WINDOW_ITEMS_CEILING` instead of trimmed.
-            //
-            // Checked BEFORE the `ours` early-out, deliberately: every
-            // followed arrival's snap settles as ours, and so does the
-            // scroll-to-latest button — a touch reader who only ever returns
-            // to the bottom through the button would otherwise never trim
-            // (#505 review). Gated at SCROLL_TOP_SLACK_PX, not
-            // BOTTOM_THRESHOLD_PX: a reader parked up to 100px above the
-            // bottom still counts as pinned, and a trim from there would
-            // clamp their offset to the exact bottom — a visible yank. And
-            // skipped entirely when the trimmed tail would leave the backfill
-            // sentinel in range of the bottom viewport — trimming then
-            // re-fires the backfill and the two oscillate at render speed
-            // (#505 re-review; see `trim_would_rearm_backfill`).
-            //
-            // Deferred: this runs from a raw JS callback with no Dioxus scope,
-            // and `window_items` is a signal the render subscribes to. See
-            // .claude/rules/dioxus-signal-safety.md.
-            if trim_is_due(&container, window_overgrown.get(), &reader) {
-                window_overgrown.set(false);
-                let window_anchor = window_anchor.clone();
-                let window_overgrown = window_overgrown.clone();
-                let reader = reader.clone();
-                let epoch = reader.room_epoch.get();
-                let mut window_items = window_items;
-                // The trim removes rows ABOVE a view that is at the bottom, so
-                // the browser clamps `scrollTop` down by their height. That
-                // clamp is OURS, but `last_scroll_top` still holds the
-                // pre-trim bottom, so an arrival that grows the content back
-                // before the clamp's settle lands makes
-                // `reader_moved_up_since` read the clamp as the reader
-                // scrolling up — and the follow stands down, leaving them a
-                // row short of the newest message. Flagged here and repaired
-                // by the effect that watches `window_items`.
-                let trim_landed = trim_landed.clone();
-                crate::util::defer(move || {
-                    // Re-check: the reader may have moved, switched rooms or hidden
-                    // the panel since the settle.
-                    if reader.room_epoch.get() != epoch {
-                        return;
-                    }
-                    if !chat_scroll_container().is_some_and(|c| trim_is_due(&c, true, &reader)) {
-                        // Still overgrown; a later settle at the bottom may trim.
-                        window_overgrown.set(true);
-                        return;
-                    }
-                    *window_anchor.borrow_mut() = None;
-                    // Raised in the SAME task as the write it describes, so
-                    // no other `window_items` writer can run between the two
-                    // and consume a flag meant for this trim.
-                    trim_landed.set(true);
-                    window_items.set(INITIAL_WINDOW_ITEMS);
-                });
-            }
-            remember_reading_position(&reader);
-            if ours {
-                return;
-            }
-            // A held range's bottom is not the latest message.
-            pinned.set(distance <= BOTTOM_THRESHOLD_PX && !reader.has_newer.get());
-        }) as Box<dyn FnMut()>)
-    };
-    let settle_fn: js_sys::Function = settle.as_ref().unchecked_ref::<js_sys::Function>().clone();
-    // Leaked deliberately, on the same reasoning as the IntersectionObserver
-    // below: `Conversation` mounts once for the app's lifetime (rooms are
-    // swapped by CSS, not by unmount) and `use_effect` has no cleanup hook, so
-    // there is nothing to disconnect these from.
-    settle.forget();
-
-    // `scrollend` fires once, when the position has settled. Where it is
-    // missing, a trailing debounce on `scroll` stands in; that listener still
-    // measures nothing per event, it only resets a timer.
-    let has_scrollend =
-        js_sys::Reflect::has(&container, &JsValue::from_str("onscrollend")).unwrap_or(false);
-    if has_scrollend {
-        let cb = Closure::wrap(Box::new(move |_: web_sys::Event| {
-            let _ = settle_fn.call0(&JsValue::NULL);
-        }) as Box<dyn FnMut(web_sys::Event)>);
-        let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
-            "scrollend",
-            cb.as_ref().unchecked_ref(),
-            &passive,
-        );
-        cb.forget();
-    } else {
-        let pending: Rc<std::cell::Cell<Option<i32>>> = Rc::new(std::cell::Cell::new(None));
-        let cb = Closure::wrap(Box::new(move |_: web_sys::Event| {
-            let Some(window) = web_sys::window() else {
-                return;
-            };
-            if let Some(handle) = pending.take() {
-                window.clear_timeout_with_handle(handle);
-            }
-            if let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                &settle_fn,
-                SCROLL_SETTLE_DEBOUNCE_MS,
-            ) {
-                pending.set(Some(handle));
-            }
-        }) as Box<dyn FnMut(web_sys::Event)>);
-        let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
-            "scroll",
-            cb.as_ref().unchecked_ref(),
-            &passive,
-        );
-        cb.forget();
-    }
-
-    true
-}
+fn newest_key(items: &[DisplayItem]) -> Option<NewestKey> {
+    items.last().and_then(display_item_newest)
+}
+
+/// The value a contended read stands in with: the last good one, but only if
+/// it was taken for `room`. Another room's rows never render in this one.
+fn last_good_for_room<K: PartialEq, T: Clone>(cache: &Option<(K, T)>, room: &K) -> Option<T> {
+    cache
+        .as_ref()
+        .filter(|(cached, _)| cached == room)
+        .map(|(_, value)| value.clone())
+}
+
+/// The `message_groups` memo's value: the room's display items, self's member
+/// id and the member names. Shared, so the contended-read cache costs a
+/// pointer, not a copy of every rendered message.
+type MessageGroupsValue = Rc<(
+    Vec<DisplayItem>,
+    Option<MemberId>,
+    HashMap<MemberId, String>,
+)>;
 
 /// The two affordances the no-room screen must offer in EVERY load state
 /// (freenet/river#509).
@@ -3618,98 +1011,61 @@ fn NoRoomFooter() -> Element {
 
 #[component]
 pub fn Conversation() -> Element {
+    // The open room as the last render whose `ROOMS` read succeeded saw it.
+    // See `current_room_data` below.
+    let last_good_room = use_hook(|| {
+        Rc::new(std::cell::RefCell::new(
+            None::<(ed25519_dalek::VerifyingKey, Rc<crate::room_data::RoomData>)>,
+        ))
+    });
     let current_room_data = {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key {
-            // Use try_read() to avoid panic when ROOMS is mutably borrowed.
-            // Dioxus write guard Drop notifies subscribers synchronously on Firefox,
-            // which can re-enter this component while ROOMS is still borrowed.
-            ROOMS
-                .try_read()
-                .ok()
-                .and_then(|rooms| rooms.map.get(&key).cloned())
+            // try_read() so a borrowed ROOMS can't panic the render. A
+            // contended read renders the open room as last seen, never
+            // nothing: with no rows the container collapses, `scrollTop`
+            // drops to 0, and nothing puts the reader back when the rows
+            // return. Only ever the same room's data (`last_good_for_room`).
+            match ROOMS.try_read() {
+                Ok(rooms) => {
+                    let fresh = rooms.map.get(&key).cloned().map(Rc::new);
+                    *last_good_room.borrow_mut() = fresh.clone().map(|room| (key, room));
+                    fresh
+                }
+                Err(_) => {
+                    // This render holds no `ROOMS` subscription; the nudge
+                    // renders it again (freenet/river#555).
+                    crate::util::signal_guard::anchor();
+                    crate::util::signal_guard::schedule_nudge();
+                    last_good_for_room(&last_good_room.borrow(), &key)
+                }
+            }
         } else {
             None
         }
     };
-    // Drives the scroll-to-latest button only: "is the end of the history on
-    // screen right now?". Auto-scroll is gated on `pinned_to_bottom` below,
-    // which answers the different question this one cannot (#486).
-    let mut is_at_bottom = use_signal(|| true);
+    // Drives the scroll-to-latest button: "is the newest message's bottom on
+    // screen right now?".
+    let mut newest_in_view = use_signal(|| true);
     // How many trailing display items the history renders. Grows only when the
     // reader reaches the top of what is rendered — see `INITIAL_WINDOW_ITEMS`.
     let mut window_items = use_signal(|| INITIAL_WINDOW_ITEMS);
-    // The IDENTITY of the item the last render's window started at, so
-    // arrivals GROW the window instead of sliding it (#501), and so index
-    // shifts from at-cap message pruning cannot move the head in content
-    // space (#505 review, blocker 1) — see `WindowAnchor`. Inter-render
-    // memory written back during render; nothing renders FROM it, so there is
-    // no subscriber to notify.
-    let window_anchor = use_hook(|| Rc::new(std::cell::RefCell::new(None::<WindowAnchor>)));
-    // Identity of a held range's last items (newest first), set only while
-    // `HistoryWindow::has_newer`. Relocated like `window_anchor`.
-    let window_tail = use_hook(|| Rc::new(std::cell::RefCell::new(None::<WindowAnchor>)));
     // See `ReaderPosition`.
     let reader_position = use_hook(|| Rc::new(ReaderPosition::default()));
-    // How many display items the last render actually put on screen. The
-    // backfill growth step reads this instead of the requested size: after
-    // arrivals grow an anchored window, growing from the stale requested size
-    // can reveal zero new rows and dead-end paging (#505 review, blocker 2).
-    let window_rendered = use_hook(|| Rc::new(std::cell::Cell::new(0usize)));
-    // Whether the rendered window currently holds more than a fresh room-open
-    // would render — i.e. whether the bottom-settle trim in
-    // `install_scroll_pin_listeners` has anything to do. Maintained by render,
-    // read from the raw settle callback (which cannot touch signals).
-    let window_overgrown = use_hook(|| Rc::new(std::cell::Cell::new(false)));
-    // Set when the settle handler schedules a trim, cleared once the view has
-    // been re-anchored to the bottom afterwards. See the trim site in
-    // `install_scroll_pin_listeners` for why the re-anchor is required.
-    let trim_landed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
-    // A pending "keep the parked reader's view still" adjustment: when a
-    // render swaps the window head for a LATER item (the head was pruned out
-    // from under the anchor, or a ceiling trim dropped it), the rows above
-    // the viewport shrink, and with scroll anchoring disabled nothing
-    // compensates. The render captures a surviving row's pre-patch
-    // `offsetTop` here (see `select_reposition_probe`); the `head_reposition`
-    // effect below re-measures it after the patch and shifts `scrollTop` by
-    // the difference. `(key, pre_patch_offset_top)`.
-    // `(probe key, its pre-patch offsetTop, the container's pre-patch
-    // scrollTop)`. The scroll offset is captured too because the browser
-    // clamps `scrollTop` down on its own when a patch shortens the content,
-    // and it does so BEFORE the effect runs: computing the target from the
-    // post-clamp offset would apply the shift on top of the clamp and
-    // over-shift the reader (#505 delta review). This is a TRADE, not a
-    // strict improvement — a live read is immune to the reader scrolling
-    // between render and effect, a captured one is immune to the browser's
-    // clamp. The clamp is the far more frequent hazard here (every
-    // head-removing patch that shortens the content), and `BackfillAnchor`
-    // already captures its offset even earlier for the same reason.
-    let reposition_pending =
-        use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, i32, i32)>)));
-    // The backfill sentinel's capture, consumed by the restore effect. See
-    // `BackfillAnchor`. Not `cfg`-gated — the sentinel's handler is compiled
-    // on every target, only the DOM reads inside it are wasm-only.
-    let backfill_anchor = use_hook(|| Rc::new(std::cell::RefCell::new(None::<BackfillAnchor>)));
     // Whether the opening snap for the CURRENT room has landed. The backfill
     // sentinel only mounts once this is true: a freshly-opened >window room
     // renders at `scrollTop = 0` for a beat before the snap runs, and a
     // sentinel mounted during that beat is intersecting, fires, and cascades
-    // the backfill until the whole room is rendered (#501 H2). A signal, not a
-    // `Cell`, because the sentinel's `if` in rsx renders from it.
+    // the backfill until the whole room is rendered (#501). A signal, not a
+    // `Cell`, because the sentinel's `if` in rsx renders from it. Set by
+    // `complete_scroll_request`.
     let mut opening_snap_done = use_signal(|| false);
-    // Set by the room-change effect and the send path to force the next scroll
-    // regardless of the pin (#402), so a room switch or your own outgoing
-    // message always lands at the newest message. A plain `Cell`, not a
-    // signal, so reading it does not subscribe. Declared here (not next to the
-    // scroll effect that consumes it) because the backfill-restore effect
-    // below also has to stand down while a forced snap is in flight.
-    let force_scroll = use_hook(|| Rc::new(std::cell::Cell::new(false)));
 
     // Reset the windowing Cells the moment THIS render is for a different
     // room — not only in the effect below, which runs AFTER the first render
     // of the new room has already resolved against the OLD room's anchor and
     // requested size (cloning and patching up to a fully-backfilled room's
-    // depth for one wasted frame; #505 review). Cells are safe to write
+    // depth for one wasted frame; #505). Cells are safe to write
     // during render; the signals (`window_items`, `opening_snap_done`) still
     // reset in the effect, so this render substitutes `INITIAL_WINDOW_ITEMS`
     // below and keeps the sentinel unmounted until they catch up.
@@ -3725,55 +1081,42 @@ pub fn Conversation() -> Element {
         let changed = prev_render_room.get() != Some(room);
         if changed {
             prev_render_room.set(Some(room));
-            *window_anchor.borrow_mut() = None;
-            *window_tail.borrow_mut() = None;
+            *reader_position.window_anchor.borrow_mut() = None;
+            *reader_position.window_tail.borrow_mut() = None;
             // Never restore the old room's position. `hidden` stays so the
-            // reveal still snaps the new room.
+            // reveal still opens the new room.
             *reader_position.anchor.borrow_mut() = None;
             reader_position.has_newer.set(false);
-            reader_position.select_latest.set(false);
-            reader_position.snap_latest.set(false);
+            // The new room opens at its newest message; this also cancels a
+            // request made in the old room, and drops the captures taken from
+            // the OLD room's geometry, which must not restore into the new
+            // room (#505).
+            reader_position.request_end(room);
             reader_position.extend_newer.set(false);
-            reader_position.newer_resolved.set(false);
             reader_position
                 .room_epoch
                 .set(reader_position.room_epoch.get().wrapping_add(1));
-            window_rendered.set(0);
-            window_overgrown.set(false);
-            trim_landed.set(false);
-            *reposition_pending.borrow_mut() = None;
-            // A capture from the OLD room's geometry must not restore into
-            // the new room (#505 re-review).
-            *backfill_anchor.borrow_mut() = None;
+            // The old room's hold and range end with it.
+            reader_position.forget_range();
+            reader_position.window_rendered.set(0);
+            reader_position.window_overgrown.set(false);
+        } else if reader_position
+            .request
+            .get()
+            .is_some_and(|request| request.room != room)
+        {
+            // Made for a room this history no longer shows.
+            reader_position.request.set(None);
         }
         changed
     };
-
-    // "The reader wants to stay with the newest message." Plain `Cell`s, not
-    // signals: they are written from raw JS event callbacks that run with no
-    // Dioxus scope on the stack, and nothing renders from them, so there is no
-    // subscriber to notify and no reason to risk the Firefox-mobile panic that
-    // forced the IntersectionObserver's write through `defer` (#402).
-    let pinned_to_bottom = use_hook(|| Rc::new(std::cell::Cell::new(true)));
-    // Where the scroll position was last accounted for: our own scrolls write
-    // the position (both edges) they asked for, and every settle overwrites it
-    // with where the view actually came to rest. Two readers depend on it —
-    // the settle handler uses it to tell our own scroll's settle from the
-    // reader's, and the ResizeObserver uses it to tell "content grew
-    // underneath us" from "the reader has moved since", which
-    // `pinned_to_bottom` alone cannot answer until the settle lands. Only the
-    // browser has scroll positions, hence the gate. See
-    // `install_scroll_pin_listeners`.
-    #[cfg(target_arch = "wasm32")]
-    let last_scroll_top = use_hook(|| Rc::new(ScrollMark::default()));
 
     // Re-window when the reader opens a DIFFERENT room. The window means "how
     // far back have I looked in THIS room", so carrying it across rooms would
     // render a freshly-opened room to the depth of the last one.
     //
-    // Guarded on an ACTUAL key change for the same reason the force-scroll
-    // effect below is: Dioxus re-runs the effect on any write to
-    // `CURRENT_ROOM`, and re-selecting the already-open room in the sidebar
+    // Guarded on an ACTUAL key change: Dioxus re-runs the effect on any write
+    // to `CURRENT_ROOM`, and re-selecting the already-open room in the sidebar
     // rewrites it with the same key. Without the guard, that would collapse a
     // window the reader had scrolled back through — dropping them to the newest
     // 60 items mid-read.
@@ -3788,145 +1131,15 @@ pub fn Conversation() -> Element {
             if prev_windowed_room.get() != room {
                 prev_windowed_room.set(room);
                 window_items.set(INITIAL_WINDOW_ITEMS);
-                // Re-gate the backfill sentinel until the new room's opening
-                // snap has landed (#501 H2).
+                // Re-gate the backfill sentinel; see `opening_snap_done`.
                 opening_snap_done.set(false);
+                // Hide the scroll-to-latest button until the observer reports
+                // on the new room.
+                newest_in_view.set(true);
             }
         });
     }
 
-    // Re-anchor to the bottom after a TRIM. The trim only ever runs from a
-    // settle that landed at the bottom, so "at the bottom" is where the view
-    // belongs afterwards — but the rows it removes are ABOVE the viewport, so
-    // the browser clamps `scrollTop` down by their height while
-    // `last_scroll_top` still holds the pre-trim bottom. Left alone, that gap
-    // reads as the reader having scrolled up (`reader_moved_up_since`), and
-    // an arrival landing before the clamp's settle is NOT followed — the
-    // reader sits a row short of the newest message, and a taller row would
-    // push them past `BOTTOM_THRESHOLD_PX` and clear the pin for good.
-    // Routing through `scroll_history_to_bottom` fixes both halves: it puts
-    // the view on the bottom and records that offset as ours.
-    //
-    // It also finishes a jump to latest from a held range: only after the
-    // render that swapped in the latest range is there a newest row to scroll
-    // to. The reader asked for it, so no gate applies.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let trim_landed = trim_landed.clone();
-        let pinned_to_bottom = pinned_to_bottom.clone();
-        let last_scroll_top = last_scroll_top.clone();
-        let reader_position = reader_position.clone();
-        use_effect(move || {
-            // Subscribe, so this runs after the render the trim caused.
-            let _ = window_items();
-            if reader_position.snap_latest.replace(false) {
-                trim_landed.set(false);
-                scroll_history_to_bottom(
-                    &pinned_to_bottom,
-                    &last_scroll_top,
-                    web_sys::ScrollBehavior::Instant,
-                );
-                return;
-            }
-            if !trim_landed.get() {
-                return;
-            }
-            trim_landed.set(false);
-            let Some(container) = chat_scroll_container() else {
-                return;
-            };
-            // The trim fired from a settle AT the bottom, but this effect runs
-            // a task later — long enough on a mid-range phone for the reader
-            // to have started swiping up. Re-anchoring then yanks them back,
-            // re-arms the pin, and records their position as ours, so their
-            // own `scrollend` is discarded and nothing self-corrects inside
-            // the gesture. Both halves are needed and neither subsumes the
-            // other: the pin catches a reader whose settle beat this effect,
-            // the distance catches one still inside the pre-settle window.
-            // Same shape as the arrival snap's gate.
-            if !pinned_to_bottom.get()
-                || (max_scroll_top(&container) - container.scroll_top()) as f64
-                    > BOTTOM_THRESHOLD_PX
-            {
-                return;
-            }
-            scroll_history_to_bottom(
-                &pinned_to_bottom,
-                &last_scroll_top,
-                web_sys::ScrollBehavior::Instant,
-            );
-        });
-    }
-
-    // Put the view back where the reader was after a backfill. The revealed
-    // items land ABOVE the current offset, so without this the history jumps by
-    // their full height. Restoring the offset is also what stops the backfill
-    // cascading: the sentinel ends up above the viewport again, so it stops
-    // intersecting until the reader scrolls back up to it.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let backfill_anchor = backfill_anchor.clone();
-        let last_scroll_top = last_scroll_top.clone();
-        let pinned_to_bottom = pinned_to_bottom.clone();
-        let force_scroll = force_scroll.clone();
-        use_effect(move || {
-            // Subscribe, so this runs after the render that added the items.
-            let _ = window_items();
-            let Some(anchor) = backfill_anchor.borrow_mut().take() else {
-                return;
-            };
-            // The restore serves a reader who is up in the history holding
-            // their place. It must never fight the bottom pin or a forced
-            // snap (#501 H3): unconditionally it could park the view at
-            // the anchor over a concurrent arrival — and because it writes
-            // `last_scroll_top`, the settle would read as OURS and the pin
-            // would quietly survive pointing somewhere the reader never
-            // asked to be. The pin alone is not enough, though: a continuous
-            // fling from the bottom into the sentinel band produces no settle
-            // mid-gesture, so `pinned_to_bottom` can still read a stale true —
-            // a reader AT the sentinel has definitionally moved up, which is
-            // exactly what `reader_moved_up_since` detects (#505 review).
-            if (pinned_to_bottom.get() && !reader_moved_up_since(&last_scroll_top))
-                || force_scroll.get()
-            {
-                return;
-            }
-            let Some(container) = chat_scroll_container() else {
-                return;
-            };
-            // Synchronous, not deferred: Dioxus has already patched the DOM
-            // when effects run, and reading layout here forces the reflow the
-            // restore needs. A macrotask hop let the browser paint one frame
-            // of the prepended rows at the wrong offset before the
-            // reposition landed — a flicker native scroll anchoring used to
-            // mask (#505 review).
-            //
-            // MEASURED, not height-delta'd: the probed head row's `offsetTop`
-            // shift is exactly the height prepended ABOVE the viewport. The
-            // raw `scrollHeight` delta also counts an arrival batched into
-            // the same patch BELOW the viewport, and over-shifts the reader
-            // by its height (#505 re-review). The delta method survives only
-            // as the fallback for a probe row pruned in the same patch.
-            let shift = match history_row_offset_top(&anchor.probe_key) {
-                Some(post_top) => post_top - anchor.probe_top,
-                None => container.scroll_height() - anchor.scroll_height,
-            };
-            if shift > 0 {
-                let target = anchor.scroll_top + shift;
-                // Move the reference BY THE SHIFT, for the same reason the
-                // head reposition below does: `last_scroll_top` is what
-                // `reader_moved_up_since` measures against, and writing the
-                // reader's new absolute offset into it erases the fact that
-                // they are up in the history whenever their `scrollend` has
-                // not landed yet — after which the stale-true pin lets both
-                // follow paths drag them to the bottom (#505 delta review).
-                // Relative keeps the gap, and keeps this settle readable as
-                // the reader's so the pin resolves honestly.
-                last_scroll_top.shift(shift);
-                container.set_scroll_top(target);
-            }
-        });
-    }
     // Which message's touch action menu (kebab) is open, by message ID string.
     // Owned by Conversation (not per message group) so only ONE menu is open at
     // a time across the whole history — opening one closes any other (#402).
@@ -4022,6 +1235,15 @@ pub fn Conversation() -> Element {
     // Memoize expensive message grouping (decryption + markdown parsing)
     // This prevents re-computing on every render/keystroke
     // Returns (groups, self_member_id, member_names) so we can highlight user's reactions and show names in tooltips
+    //
+    // `last_good_groups` is the memo's last value and the room it was computed
+    // for. A contended pass returns it rather than `None`, which would empty
+    // the history, for the reason `current_room_data` above keeps the room.
+    let last_good_groups = use_hook(|| {
+        Rc::new(std::cell::RefCell::new(
+            None::<(ed25519_dalek::VerifyingKey, Option<MessageGroupsValue>)>,
+        ))
+    });
     let message_groups = use_memo(move || {
         // Anchor FIRST: a contended `ROOMS.try_read()` below registers no
         // subscription (dioxus-signals `signal.rs:409` returns before
@@ -4032,553 +1254,188 @@ pub fn Conversation() -> Element {
         // reloaded -- while rendering "No messages yet. Start the conversation!"
         // into a room full of history. freenet/river#555.
         crate::util::signal_guard::anchor();
-        let current_room = CURRENT_ROOM.read();
-        if let Some(key) = current_room.owner_key {
-            let Ok(rooms) = ROOMS.try_read() else {
-                crate::util::signal_guard::schedule_nudge();
-                return None;
-            };
-            if let Some(room_data) = rooms.map.get(&key) {
-                let room_state = &room_data.room_state;
-                // Check if there are any displayable messages
-                if room_state
-                    .recent_messages
-                    .display_messages()
-                    .next()
-                    .is_some()
-                {
-                    // Only the PUBLIC half is needed here, and only for
-                    // cosmetics: own-reaction highlighting, `is_self` grouping,
-                    // deputy badges. `None` (no locally-known identity) is
-                    // carried through rather than returned: bailing here would
-                    // render "No messages yet. Start the conversation!" over a
-                    // room full of history, which is the exact wrong-render
-                    // freenet/river#555 was about. Nothing is mis-attributed —
-                    // an unknown identity matches no member.
-                    let self_member_id: Option<MemberId> = room_data.self_member_id();
-                    // Build member name lookup (reaction tooltips, @mention chips).
-                    let member_names: HashMap<MemberId, String> = room_state
-                        .member_info
-                        .member_info
-                        .iter()
-                        .map(|ami| {
-                            (
-                                ami.member_info.member_id,
-                                display_nickname(
-                                    &ami.member_info.preferred_nickname,
-                                    &room_data.secrets,
-                                ),
-                            )
-                        })
-                        .collect();
-                    // Which authors show a 🛡 shield in this viewer's view.
-                    // Computed once here, not per message: the maps behind it
-                    // are O(members) to build.
-                    // The badge map is VIEWER-relative (which deputies could
-                    // ban *you*), so with no identity there is no viewer to be
-                    // relative to and the shields degrade to "no badge" — an
-                    // empty map, exactly what a room with no deputies produces.
-                    // The helper keeps its `MemberId` parameter: it has ~30
-                    // call sites, and a fabricated viewer id here would be
-                    // worse than none.
-                    let deputy_badges = match self_member_id {
-                        Some(self_member_id) => deputy_badges_for_viewer(
-                            &room_state.members,
-                            &room_state.member_info,
-                            &room_data.secrets,
-                            MemberId::from(&key),
-                            self_member_id,
-                        ),
-                        None => HashMap::new(),
-                    };
-                    // The ⚠ impersonation checker, from the SAME badge map, so
-                    // "who is a deputy" has one answer across the conversation
-                    // and the member list. Built once here, like the badges.
-                    let impersonation = impersonation_checker_for_viewer(
+        let key = CURRENT_ROOM.read().owner_key?;
+        let Ok(rooms) = ROOMS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            // This room's groups as last computed: another room's never.
+            return last_good_for_room(&last_good_groups.borrow(), &key).flatten();
+        };
+        let groups = rooms.map.get(&key).and_then(|room_data| {
+            let room_state = &room_data.room_state;
+            // Check if there are any displayable messages
+            if room_state
+                .recent_messages
+                .display_messages()
+                .next()
+                .is_some()
+            {
+                // Only the PUBLIC half is needed here, and only for
+                // cosmetics: own-reaction highlighting, `is_self` grouping,
+                // deputy badges. `None` (no locally-known identity) is
+                // carried through rather than returned: bailing here would
+                // render "No messages yet. Start the conversation!" over a
+                // room full of history, which is the exact wrong-render
+                // freenet/river#555 was about. Nothing is mis-attributed —
+                // an unknown identity matches no member.
+                let self_member_id: Option<MemberId> = room_data.self_member_id();
+                // Build member name lookup (reaction tooltips, @mention chips).
+                let member_names: HashMap<MemberId, String> = room_state
+                    .member_info
+                    .member_info
+                    .iter()
+                    .map(|ami| {
+                        (
+                            ami.member_info.member_id,
+                            display_nickname(
+                                &ami.member_info.preferred_nickname,
+                                &room_data.secrets,
+                            ),
+                        )
+                    })
+                    .collect();
+                // Which authors show a 🛡 shield in this viewer's view.
+                // Computed once here, not per message: the maps behind it
+                // are O(members) to build.
+                // The badge map is VIEWER-relative (which deputies could
+                // ban *you*), so with no identity there is no viewer to be
+                // relative to and the shields degrade to "no badge" — an
+                // empty map, exactly what a room with no deputies produces.
+                // The helper keeps its `MemberId` parameter: it has ~30
+                // call sites, and a fabricated viewer id here would be
+                // worse than none.
+                let deputy_badges = match self_member_id {
+                    Some(self_member_id) => deputy_badges_for_viewer(
+                        &room_state.members,
                         &room_state.member_info,
                         &room_data.secrets,
                         MemberId::from(&key),
-                        &deputy_badges,
-                    );
-                    // Borrowed once per pass, not once per message. The old
-                    // per-message `get_delay_secs` read the same global from
-                    // inside the loop, so for any room with messages this is
-                    // the same subscription taken once instead of N times. (A
-                    // room with no displayable messages never reached that read
-                    // and so did not subscribe; now it does. Harmless, and
-                    // noted so the claim is not overstated.)
-                    let receive_times = crate::components::app::receive_times::RECEIVE_TIMES.read();
-                    let groups = group_messages(
-                        &room_state.recent_messages,
-                        &room_state.member_info,
                         self_member_id,
-                        &room_data.secrets,
-                        &member_names,
-                        &deputy_badges,
-                        &impersonation,
-                        MemberId::from(&key),
-                        MessageClock {
-                            receive_times: &receive_times,
-                            // One "now" for the whole pass. Only reached by
-                            // messages with no recorded arrival time.
-                            fallback_now: Utc::now(),
-                        },
-                    );
-                    return Some((groups, self_member_id, member_names));
-                }
+                    ),
+                    None => HashMap::new(),
+                };
+                // The ⚠ impersonation checker, from the SAME badge map, so
+                // "who is a deputy" has one answer across the conversation
+                // and the member list. Built once here, like the badges.
+                let impersonation = impersonation_checker_for_viewer(
+                    &room_state.member_info,
+                    &room_data.secrets,
+                    MemberId::from(&key),
+                    &deputy_badges,
+                );
+                // Borrowed once per pass, not once per message. The old
+                // per-message `get_delay_secs` read the same global from
+                // inside the loop, so for any room with messages this is
+                // the same subscription taken once instead of N times. (A
+                // room with no displayable messages never reached that read
+                // and so did not subscribe; now it does. Harmless, and
+                // noted so the claim is not overstated.)
+                let receive_times = crate::components::app::receive_times::RECEIVE_TIMES.read();
+                let groups = group_messages(
+                    &room_state.recent_messages,
+                    &room_state.member_info,
+                    self_member_id,
+                    &room_data.secrets,
+                    &member_names,
+                    &deputy_badges,
+                    &impersonation,
+                    MemberId::from(&key),
+                    MessageClock {
+                        receive_times: &receive_times,
+                        // One "now" for the whole pass. Only reached by
+                        // messages with no recorded arrival time.
+                        fallback_now: Utc::now(),
+                    },
+                );
+                return Some(Rc::new((groups, self_member_id, member_names)));
             }
-        }
-        None
+            None
+        });
+        *last_good_groups.borrow_mut() = Some((key, groups.clone()));
+        groups
     });
 
-    // Use IntersectionObserver to track whether the user is near the bottom of the
-    // chat scroll container.  This replaces the old `onscroll` handler that performed
-    // DOM queries (scrollTop / clientHeight / scrollHeight) on every scroll event,
-    // causing visible scroll-bar jank on mobile (issue #151).
-    //
-    // A 1px invisible sentinel div sits at the bottom of the scroll content.
-    // A rootMargin of "0px 0px 100px 0px" expands the detection zone 100px above
-    // the sentinel, so the user is considered "at the bottom" when within 100px of
-    // the end.  The observer fires only on intersection changes, so there is zero
-    // work during normal scrolling.
+    // The Latest observer on `bottom-sentinel` (`observe_newest`).
+    #[cfg(target_arch = "wasm32")]
+    let observer_reader = reader_position.clone();
     #[cfg(target_arch = "wasm32")]
     use_effect(move || {
-        use wasm_bindgen::prelude::*;
-
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let Some(document) = window.document() else {
-            return;
-        };
-        let Some(sentinel) = document.get_element_by_id("bottom-sentinel") else {
-            return;
-        };
-        let Some(root) = document.get_element_by_id("chat-scroll-container") else {
-            return;
-        };
-
-        let cb = Closure::wrap(Box::new(move |entries: js_sys::Array| {
-            if let Some(entry) = entries
-                .get(0)
-                .dyn_ref::<web_sys::IntersectionObserverEntry>()
-            {
-                // Defer the signal write: this raw JS callback runs with no
-                // Dioxus runtime/scope on the stack, and `is_at_bottom` is now
-                // subscribed in render (the scroll-to-latest button), so a
-                // direct `.set()` would fire a subscriber notification from an
-                // empty scope and panic on Firefox mobile. See
-                // .claude/rules/dioxus-signal-safety.md. (#402)
-                let intersecting = entry.is_intersecting();
-                crate::util::defer(move || is_at_bottom.set(intersecting));
+        let reader_position = observer_reader.clone();
+        let observer = observe_newest(&ROOM_HISTORY, newest_in_view, move |intersecting| {
+            // The reader scrolled to the newest message, or it came back
+            // into view: the read rule may mark it.
+            if intersecting {
+                note_newest_seen(&reader_position);
             }
-        }) as Box<dyn FnMut(js_sys::Array)>);
-
-        let options = web_sys::IntersectionObserverInit::new();
-        options.set_root(Some(&root));
-        // Expand the detection zone below the viewport edge so the user counts
-        // as "at bottom" when within `BOTTOM_THRESHOLD_PX` of the sentinel.
-        // Built from the constant rather than written out, so the button and
-        // the pin cannot drift apart: the doc on `BOTTOM_THRESHOLD_PX` claims
-        // they agree, and this is what makes that true.
-        options.set_root_margin(&format!("0px 0px {BOTTOM_THRESHOLD_PX}px 0px"));
-        options.set_threshold(&JsValue::from_f64(0.0));
-
-        if let Ok(observer) =
-            web_sys::IntersectionObserver::new_with_options(cb.as_ref().unchecked_ref(), &options)
-        {
-            observer.observe(&sentinel);
-            // Leak the closure so it lives as long as the observer.  The Conversation
-            // component is mounted once and never unmounted (hidden/shown via CSS),
-            // so this leak is bounded.  Dioxus use_effect has no cleanup return, so
-            // explicit disconnect is not possible here.
-            cb.forget();
-        }
+        });
+        // Leaked, so it never disconnects: the Conversation component is
+        // mounted once and never unmounted (hidden/shown via CSS), so this
+        // leak is bounded, and `use_effect` has no cleanup hook.
+        std::mem::forget(observer);
     });
 
-    // The pin that actually gates auto-scroll. Installed once, in its own
-    // effect, because the listeners must outlive every re-render of the
-    // history. Reading `message_groups` only makes the effect re-runnable, so
-    // a first attempt that found no container yet (nothing rendered) gets
-    // another chance; `installed` is set only on success, so a successful
-    // install is never repeated.
+    // The settle listener and the resize observer. Installed once each, in
+    // one effect, because they must outlive every re-render of the history.
+    // Reading `message_groups` only makes the effect re-runnable, so an
+    // attempt that found no container yet (nothing rendered) gets another
+    // chance; each flag is set only on success.
     #[cfg(target_arch = "wasm32")]
     {
-        let pinned_to_bottom = pinned_to_bottom.clone();
-        let last_scroll_top = last_scroll_top.clone();
-        let window_anchor = window_anchor.clone();
-        let window_overgrown = window_overgrown.clone();
-        let trim_landed = trim_landed.clone();
-        let reader_position = reader_position.clone();
-        let installed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+        let reader = reader_position.clone();
+        let listening = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+        let observing = use_hook(|| Rc::new(std::cell::Cell::new(false)));
         use_effect(move || {
             let _retry_on_content_change = message_groups.read().is_some();
-            if installed.get() {
-                return;
+            if !listening.get() {
+                listening.set(install_scroll_settle_listener(window_items, reader.clone()));
             }
-            if install_scroll_pin_listeners(
-                pinned_to_bottom.clone(),
-                last_scroll_top.clone(),
-                window_items,
-                window_anchor.clone(),
-                window_overgrown.clone(),
-                trim_landed.clone(),
-                reader_position.clone(),
-            ) {
-                installed.set(true);
+            if !observing.get() {
+                observing.set(observe_history_resize(reader.clone(), opening_snap_done));
             }
         });
     }
 
-    // Keep a PARKED reader's view still when the window head is swapped for a
-    // later item — the head was pruned out from under the anchor (an at-cap
-    // room drains its oldest message on every arrival), or a ceiling trim
-    // dropped it (#505 review, blocker 1). Rows above the viewport shrink,
-    // and with `overflow-anchor: none` the browser no longer compensates, so
-    // this effect is the one piece of scroll anchoring reimplemented under
-    // our own control: the render captured a SURVIVING row's `offsetTop`
-    // BEFORE the patch (into `reposition_pending` — the new head row when it
-    // already existed, else the first row after it that did, since a
-    // re-keyed multi-message head group has no pre-patch row under its new
-    // key; see `select_reposition_probe`). Re-measuring it after the patch
-    // gives exactly how far the content above the viewport shifted,
-    // date-separator churn included — top-contiguous removals shift every
-    // surviving row identically. Synchronous — post-patch, pre-paint — for
-    // the same no-flicker reason as the backfill restore above.
-    //
-    // Known limitation, deliberately accepted: a mid-window removal (a
-    // deletion, a ban purge) or late-loading media above the viewport still
-    // shifts a parked reader — rare events, versus the every-arrival churn
-    // this compensates. Full generality is what browser scroll anchoring
-    // does, and fighting the pin machinery is why it is switched off.
+    // After each render that can move rows: the patch corrections, which
+    // stand down while a request is pending, then the pending request, then
+    // the read rule against what the render left on screen.
     #[cfg(target_arch = "wasm32")]
     {
-        let reposition_pending = reposition_pending.clone();
-        let last_scroll_top = last_scroll_top.clone();
-        let pinned_to_bottom = pinned_to_bottom.clone();
-        let force_scroll = force_scroll.clone();
         let reader_position = reader_position.clone();
         use_effect(move || {
-            // Subscribe: heads swap on content changes and on newer pages.
+            // Subscribe: a backfill and a newer page change `window_items`,
+            // and heads swap on content changes too.
             let _ = message_groups.read().is_some();
             let _ = window_items();
-            'reposition: {
-                let Some((key, pre_top, pre_scroll_top)) = reposition_pending.borrow_mut().take()
-                else {
-                    break 'reposition;
-                };
-                // A pinned reader needs no compensation — the arrival effect
-                // snaps to the bottom — and a forced snap owns the view outright.
-                // The pin is distrusted mid-gesture exactly as in the restore
-                // above: a reader flinging upward has moved even if their settle
-                // has not landed yet.
-                if force_scroll.get()
-                    || (pinned_to_bottom.get() && !reader_moved_up_since(&last_scroll_top))
-                {
-                    break 'reposition;
-                }
-                let Some(container) = chat_scroll_container() else {
-                    break 'reposition;
-                };
-                // Hidden rows measure 0; the reveal restores the reader instead.
-                if !history_has_layout(&container) {
-                    break 'reposition;
-                }
-                // The scroll-to-latest button's SMOOTH scroll is the one animated
-                // scroll in the app, and while it is in flight the state reads
-                // exactly like a parked reader (pinned, position above the
-                // recorded target). Its recorded target is the bottom — so when
-                // the view is PINNED and `last_scroll_top` already points at the
-                // maximum, a scrollTop write here would cancel that animation
-                // mid-flight for a reader who is headed to the bottom anyway
-                // (#505 re-review). Gated on the pin as well as the offset: with
-                // `pinned == false` no animation can be in flight, so an unpinned
-                // reader whose patch pulled `max_scroll_top` under their recorded
-                // offset still gets compensated.
-                if pinned_to_bottom.get() && last_scroll_top.top() >= max_scroll_top(&container) {
-                    break 'reposition;
-                }
-                let Some(post_top) = history_row_offset_top(&key) else {
-                    break 'reposition;
-                };
-                let shift = post_top - pre_top;
-                if shift != 0 {
-                    // From the PRE-patch offset, not the live one: when the patch
-                    // shortens the content the browser has already clamped
-                    // `scrollTop` down by the time this runs, and shifting from
-                    // the clamped value applies the clamp twice (#505 delta
-                    // review). Clamping the result is left to the browser.
-                    let target = (pre_scroll_top + shift).max(0);
-                    // Move the reference BY THE SHIFT, not to the new absolute
-                    // offset. `last_scroll_top` is what `reader_moved_up_since`
-                    // measures against, and it is only meaningful in the window
-                    // between the reader moving and their `scrollend` landing —
-                    // writing their freshly-compensated position into it collapses
-                    // that signal to "has not moved", and with `pinned_to_bottom`
-                    // still stale-true BOTH follow paths then yank them to the
-                    // bottom (#505 delta review). A relative update preserves
-                    // their gap to the reference in both directions, so the guard
-                    // keeps answering truthfully. The pin resolves correctly
-                    // either way: in the pre-settle window the reference and the
-                    // view differ, so this settle reads as the READER's and the
-                    // handler re-measures and clears the stale pin; for a reader
-                    // whose settle already landed the two move together, so it
-                    // reads as ours and leaves their (already correct) pin
-                    // alone.
-                    last_scroll_top.shift(shift);
-                    container.set_scroll_top(target);
-                }
-            }
-            // A reader whose settle at a held end cleared the pin is at the newest
-            // message once the last withheld items land, but nothing scrolls, so
-            // no settle re-measures it. After the compensation above, same test.
-            if reader_position.newer_resolved.replace(false)
-                && !reader_position.has_newer.get()
-                && !reader_position.hidden.get()
-                && chat_scroll_container().is_some_and(|c| {
-                    history_has_layout(&c)
-                        && ((max_scroll_top(&c) - c.scroll_top()) as f64) <= BOTTOM_THRESHOLD_PX
-                })
-                && !reader_moved_up_since(&last_scroll_top)
-            {
-                pinned_to_bottom.set(true);
-            }
+            correct_view_after_patch(&reader_position);
+            complete_scroll_request(&reader_position, opening_snap_done);
+            note_newest_seen(&reader_position);
         });
     }
 
-    // Keep the newest message in view when the history grows.
-    //
-    // Scroll the chat-scroll-container itself, not the last bubble:
-    // scrollIntoView aligns the bubble's top to the container's top, which can
-    // leave the actual bottom (reactions, sentinel, padding) off-screen. On
-    // page refresh this surfaced as scrolling only ~70% of the way down.
-    //
-    // `force_scroll` (declared with the pin cells above) is what makes a room
-    // switch or your own outgoing message snap regardless of the pin (#402).
-    use_effect({
-        let force_scroll = force_scroll.clone();
-        let pinned_to_bottom = pinned_to_bottom.clone();
-        // Only the wasm arm below scrolls anything, so on native this clone is
-        // genuinely unused rather than accidentally so.
-        #[cfg(target_arch = "wasm32")]
-        let last_scroll_top = last_scroll_top.clone();
-        move || {
-            // Re-run on ANY change to the rendered history, not just a remount
-            // of the last bubble. The old trigger was an `onmounted` on the
-            // last message group, which is silent for every content change
-            // that leaves that row in place: a mid-list insert, a reaction, an
-            // edit, or another join folding into an existing "N people joined"
-            // summary (that summary is keyed on its FIRST event, so absorbing
-            // a new one grows it without remounting anything). Subscribing to
-            // the memo is what makes those cases reach this effect at all.
-            let has_content = message_groups.read().is_some();
-            let forced = force_scroll.get();
-            if !has_content || !(forced || pinned_to_bottom.get()) {
-                return;
-            }
-            force_scroll.set(false);
-            #[cfg(target_arch = "wasm32")]
-            {
-                let pinned_to_bottom = pinned_to_bottom.clone();
-                let last_scroll_top = last_scroll_top.clone();
-                // Which room this snap belongs to. A rapid room switch can
-                // leave the previous room's snap task queued; it must not
-                // un-gate the NEW room's backfill sentinel (#505 review).
-                let room_at_snap = CURRENT_ROOM.peek().owner_key;
-                // Deferred so the scroll measures a container Dioxus has
-                // finished patching, and (per `safe_spawn_local`) so no signal
-                // borrow is live when it runs.
-                crate::util::safe_spawn_local(async move {
-                    // A forced scroll — a room switch, or your own outgoing
-                    // message — is an explicit instruction, and nothing below
-                    // may cancel it. Everything else has to survive two
-                    // separate ways of being out of date by the time this
-                    // deferred task actually runs:
-                    //
-                    // 1. the gate above ran BEFORE this task was queued, and a
-                    //    reader `scrollend` can resolve the pin to false in
-                    //    between (measured on Firefox: the gate saw
-                    //    `pinned = true` at 4791ms, the reader's settle cleared
-                    //    it at 4854ms, and this task ran at 4974ms), so the pin
-                    //    is re-read here rather than trusted from then;
-                    // 2. the reader may have moved with their `scrollend` still
-                    //    in flight, so the pin has not caught up at all yet —
-                    //    which is what `reader_moved_up_since` answers.
-                    //
-                    // Neither check subsumes the other, and dropping either one
-                    // reproduces the yank-back on Firefox, WebKit or mobile
-                    // Safari while Chromium stays green.
-                    if !forced
-                        && (!pinned_to_bottom.get() || reader_moved_up_since(&last_scroll_top))
-                    {
-                        return;
-                    }
-                    scroll_history_to_bottom(
-                        &pinned_to_bottom,
-                        &last_scroll_top,
-                        // Instant, not Smooth. The ResizeObserver below reaches
-                        // the same target as soon as layout settles, so an
-                        // animation here would only ever be overtaken by it —
-                        // and a smooth scroll that lands short because more
-                        // content arrived mid-flight is exactly the race the
-                        // pin has to be defended against. Deliberate scrolls
-                        // the reader asks for (the scroll-to-latest button)
-                        // still animate.
-                        web_sys::ScrollBehavior::Instant,
-                    );
-                    // The opening snap for this room has landed, so the
-                    // backfill sentinel may mount (#501 H2). Deferred, and the
-                    // signal is only written on the transition, so steady-state
-                    // arrivals do not re-notify the render for nothing. The
-                    // room is re-checked because this task can outlive a rapid
-                    // room switch, and a stale set here would un-gate the new
-                    // room's sentinel before ITS snap (#505 review).
-                    crate::util::defer(move || {
-                        if CURRENT_ROOM.peek().owner_key == room_at_snap
-                            && !*opening_snap_done.peek()
-                        {
-                            opening_snap_done.set(true);
-                        }
-                    });
-                });
-            }
-        }
-    });
-
-    // Size changes that no re-render can see still have to keep the newest
-    // message in view. `message_groups` covers state changes; this covers
-    // layout ones, and there are two independent kinds:
-    //
-    // * the CONTENT grows or reflows under a fixed window — a late-loading
-    //   image, a web font swapping in, a markdown block rewrapping on a
-    //   narrower screen;
-    // * the WINDOW shrinks over fixed content — which is what growing the
-    //   composer does. That is freenet/river#486's third cause: a growing
-    //   composer can take more than the observer's 100px margin off the
-    //   history in one step, with no network activity at all.
-    //   De-latching the gate stops that freezing auto-scroll for good, but on
-    //   its own it still leaves the newest message below the fold until
-    //   something else happens, so the container has to be watched too.
-    //
-    // Watching only the content wrapper misses the second kind entirely: the
-    // container's `clientHeight` changes while the wrapper's box does not.
+    // Back in the foreground (the tab became visible, a DM thread closed):
+    // whatever is on screen now counts as seen, which nothing else would
+    // notice (no scroll, no resize, no observer change). Never scrolls.
     #[cfg(target_arch = "wasm32")]
     {
-        let pinned_to_bottom = pinned_to_bottom.clone();
-        let last_scroll_top = last_scroll_top.clone();
         let reader_position = reader_position.clone();
-        let observed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
         use_effect(move || {
-            use wasm_bindgen::prelude::*;
-
-            let _retry_on_content_change = message_groups.read().is_some();
-            if observed.get() {
+            // Anchored before the fallible reads, this effect's only
+            // subscriptions (freenet/river#555).
+            crate::util::signal_guard::anchor();
+            if crate::components::app::document_title::DOCUMENT_VISIBLE
+                .try_read()
+                .is_err()
+            {
+                crate::util::signal_guard::schedule_nudge();
                 return;
             }
-            let (Some(content), Some(container)) =
-                (chat_content_wrapper(), chat_scroll_container())
-            else {
+            if crate::components::direct_messages::OPEN_DM_THREAD
+                .try_read()
+                .is_err()
+            {
+                crate::util::signal_guard::schedule_nudge();
                 return;
-            };
-
-            let pinned_to_bottom = pinned_to_bottom.clone();
-            let last_scroll_top = last_scroll_top.clone();
-            let reader_position = reader_position.clone();
-            let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
-                // Hiding the chat panel resizes the container to 0 and showing it
-                // resizes it back. That is the history's only notice, so the
-                // reveal is handled here, first.
-                let Some(container) = chat_scroll_container() else {
-                    return;
-                };
-                if !history_has_layout(&container) {
-                    reader_position.hidden.set(true);
-                    return;
-                }
-                if reader_position.hidden.replace(false) && !pinned_to_bottom.get() {
-                    // A parked reader goes back to their row; a following reader
-                    // falls through to the snap.
-                    if let Some(anchor) = reader_position.anchor.borrow().clone() {
-                        restore_reading_anchor(&anchor, &last_scroll_top);
-                    }
-                    return;
-                }
-                if !pinned_to_bottom.get() {
-                    return;
-                }
-                // Stand down if the reader has moved since we last knew where
-                // the view was; the settle on its way is what decides. Without
-                // this, a resize landing in that window undoes their scroll —
-                // measured on Firefox: reader reaches scrollTop 0, a resize
-                // fires 2ms later, the view snaps back.
-                if reader_moved_up_since(&last_scroll_top) {
-                    return;
-                }
-                // Instant: this fires DURING layout settling, so animating
-                // would chase a target that is still moving.
-                scroll_history_to_bottom(
-                    &pinned_to_bottom,
-                    &last_scroll_top,
-                    web_sys::ScrollBehavior::Instant,
-                );
-            }) as Box<dyn FnMut(js_sys::Array)>);
-
-            if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
-                observer.observe(&content);
-                observer.observe(&container);
-                // Leaked for the same reason as the observers above.
-                cb.forget();
-                observed.set(true);
             }
-        });
-    }
-
-    // Snap to the newest message whenever the selected room changes (#402). The
-    // Conversation component is mounted once and reused across rooms (hidden or
-    // shown via CSS), so `#chat-scroll-container` and `is_at_bottom` otherwise
-    // persist from the previous room, frequently leaving the user far up the
-    // new room's history. Reading `CURRENT_ROOM` (which holds only `owner_key`)
-    // makes this effect re-run on every room change and nothing else.
-    //
-    // This effect only raises `force_scroll`; the actual scroll runs in the
-    // content-triggered effect above once the new room's groups are rendered
-    // (its trigger, `message_groups`, necessarily changes AFTER this room
-    // change, so the ordering is causal — not dependent on effect scheduling).
-    // Using a persistent `force_scroll` flag means nothing can cancel the snap
-    // in the gap between the two effects.
-    // `is_at_bottom` = true hides the scroll-to-latest button immediately on
-    // switch (the observer reconfirms after the snap).
-    //
-    // Guarded on an ACTUAL key change: Dioxus re-runs the effect on any write
-    // to `CURRENT_ROOM`, and re-selecting the already-open room in the sidebar
-    // rewrites it with the same key. Without the guard that would arm
-    // `force_scroll` with no new content to consume it, so a later message
-    // would snap the reader to the bottom (#402 review).
-    {
-        let force_scroll = force_scroll.clone();
-        let pinned_to_bottom = pinned_to_bottom.clone();
-        #[cfg(target_arch = "wasm32")]
-        let last_scroll_top = last_scroll_top.clone();
-        let prev_room =
-            use_hook(|| Rc::new(std::cell::Cell::new(None::<ed25519_dalek::VerifyingKey>)));
-        use_effect(move || {
-            let room = CURRENT_ROOM.read().owner_key;
-            if prev_room.get() != room {
-                prev_room.set(room);
-                force_scroll.set(true);
-                is_at_bottom.set(true);
-                // Opening a room starts you at its newest message, so the pin
-                // starts armed. Set here rather than left to the snap below,
-                // because a room with no messages produces no scroll at all
-                // and would otherwise inherit the previous room's pin state.
-                pinned_to_bottom.set(true);
-                // Same reason: an offset measured in the room we just left says
-                // nothing about this one, and `reader_moved_up_since` would
-                // read it as "the reader has scrolled up" and stand the follow
-                // down. Zero is the "no constraint yet" value it starts at.
-                #[cfg(target_arch = "wasm32")]
-                last_scroll_top.record(0, 0);
-            }
+            note_newest_seen(&reader_position);
         });
     }
 
@@ -4635,7 +1492,7 @@ pub fn Conversation() -> Element {
                 // that actually protects the ROOMS write is the
                 // `crate::util::defer` below (a real setTimeout) — inlining
                 // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512 review).
+                // handler's stack (freenet/river#512).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -4814,7 +1671,7 @@ pub fn Conversation() -> Element {
                 // that actually protects the ROOMS write is the
                 // `crate::util::defer` below (a real setTimeout) — inlining
                 // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512 review).
+                // handler's stack (freenet/river#512).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -4946,7 +1803,7 @@ pub fn Conversation() -> Element {
                 // that actually protects the ROOMS write is the
                 // `crate::util::defer` below (a real setTimeout) — inlining
                 // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512 review).
+                // handler's stack (freenet/river#512).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -5030,7 +1887,7 @@ pub fn Conversation() -> Element {
 
     // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
-        let force_scroll = force_scroll.clone();
+        let reader_position = reader_position.clone();
         move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
             if message_text.is_empty() {
                 warn!("Message is empty");
@@ -5071,20 +1928,18 @@ pub fn Conversation() -> Element {
                     .get_secret()
                     .map(|(secret, version)| (*secret, version));
 
-                // Cloned into the async send so `force_scroll` (consumed by the
-                // mount effect when the sent message appears) is raised ONLY
-                // after the delta applies locally — a rejected send (empty,
-                // over-size, serialize/sign/delta failure) then leaves the
-                // scroll position and the scroll-to-latest button untouched
-                // rather than snapping a later unrelated message to the bottom
-                // (#402 review).
-                let force_scroll = force_scroll.clone();
+                // Cloned into the async send so the scroll request is made
+                // ONLY after the delta applies locally — a rejected send
+                // (empty, over-size, serialize/sign/delta failure) then leaves
+                // the scroll position untouched rather than taking a later
+                // unrelated message to the end (#402).
+                let reader_position = reader_position.clone();
                 // Retained even though this block no longer awaits anything:
                 // it keeps the body off the event handler's stack. The guard
                 // that actually protects the ROOMS write is the
                 // `crate::util::defer` below (a real setTimeout) — inlining
                 // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512 review).
+                // handler's stack (freenet/river#512).
                 spawn_local(async move {
                     use river_core::room_state::content::{
                         ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
@@ -5254,17 +2109,14 @@ pub fn Conversation() -> Element {
                         });
                         if delta_applied {
                             // Local apply succeeded and a message will mount:
-                            // scroll it into view — but only if the user is still
-                            // viewing the room this send targeted. This runs two
-                            // task hops after the keypress (`spawn_local`, then
+                            // take the view to it once, after the render that
+                            // adds it — but only if the user is still viewing
+                            // the room this send targeted. This runs two task
+                            // hops after the keypress (`spawn_local`, then
                             // `defer`'s setTimeout), so they may have switched
-                            // rooms; arming the conversation-wide flag then would
-                            // snap the NEW room to the bottom on its next message
-                            // (#402 review). Still required now that signing is
-                            // synchronous — the hops, not the signature, are what
-                            // let a room switch interleave.
+                            // rooms (#402).
                             if CURRENT_ROOM.peek().owner_key == Some(current_room) {
-                                force_scroll.set(true);
+                                reader_position.request_end(Some(current_room));
                             }
                             crate::util::debug_log("[send] marking NEEDS_SYNC");
                             crate::components::app::mark_needs_sync(current_room);
@@ -5323,14 +2175,7 @@ pub fn Conversation() -> Element {
                                     // Unread-elsewhere badge: new messages in OTHER rooms
                                     // (and DMs) are invisible on mobile while a room fills
                                     // the screen — surface them on the room-list button.
-                                    if panel_unread() > 0 {
-                                        span {
-                                            class: "absolute top-0 right-0 flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-accent text-white text-[10px] font-semibold leading-none pointer-events-none",
-                                            "data-testid": "hamburger-unread-badge",
-                                            "aria-hidden": "true",
-                                            "{panel_unread}"
-                                        }
-                                    }
+                                    CountBadge { count: panel_unread(), position: "top-0 right-0", testid: "hamburger-unread-badge" }
                                 }
                                 // Description is a sibling of the title button, not a child:
                                 // `<a>` is interactive content and cannot be nested inside
@@ -5467,25 +2312,22 @@ pub fn Conversation() -> Element {
                     // menu content is left-aligned and stays visible) rather
                     // than show a horizontal scrollbar in the history. #402.
                     class: "h-full overflow-y-auto overflow-x-hidden",
-                    // `overflow-anchor: none`: the pin machinery owns this
-                    // container's `scrollTop`. Browser scroll anchoring rewrites
-                    // it whenever rendered rows change above the viewport (a
-                    // window trim, date-separator churn at the window head), and
-                    // `reader_moved_up_since` then attributes the browser's
-                    // adjustment to the reader and stands the follow down —
-                    // freenet/river#501. With anchoring off, `scrollTop` only
-                    // changes through our own scrolls, the reader's, or the
-                    // browser's shrink clamp, which the guard's
-                    // `.min(max_scroll_top(..))` already accounts for. Inline
-                    // style, not a Tailwind arbitrary class, so it cannot depend
-                    // on the class scanner seeing it.
+                    // `overflow-anchor: none`: our own corrections (the
+                    // backfill restore, the head reposition, the reveal restore)
+                    // own this container's `scrollTop`. Safari before 27 has no
+                    // scroll anchoring, so relying on the browser would jump
+                    // every older-history page there by the height it adds, and
+                    // two owners of one job would fight. Inline style, not a
+                    // Tailwind arbitrary class, so it cannot depend on the class
+                    // scanner seeing it.
                     style: "overflow-anchor:none;",
                     id: "chat-scroll-container",
+                    "data-testid": "chat-scroll-container",
                     div { class: "max-w-4xl mx-auto px-4 py-4", id: "chat-content",
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
-                            match message_groups.read().as_ref() {
+                            match message_groups.read().as_deref() {
                                 Some((groups, self_member_id, member_names)) => {
                                     // Render only the tail the reader has asked
                                     // for. Slicing BEFORE the clone is the
@@ -5504,173 +2346,28 @@ pub fn Conversation() -> Element {
                                     } else {
                                         subscribed_window
                                     };
-                                    // Re-locate the anchored window by
-                                    // IDENTITY: at-cap pruning shifts every
-                                    // index, so the stored index is only a
-                                    // hint, and the head key alone can vanish
-                                    // while its neighbors survive (#505
-                                    // blockers; see `WindowAnchor` and
-                                    // `relocate_window`).
-                                    //
-                                    // Jump to latest and own sends swap a
-                                    // held range for the latest one.
-                                    let select_latest = reader_position.select_latest.replace(false)
-                                        || (force_scroll.get() && reader_position.has_newer.get());
-                                    let key_at =
-                                        |i: usize, key: &str| display_item_key_matches(&groups[i], key);
-                                    let prev_anchor = if select_latest {
-                                        None
-                                    } else {
-                                        window_anchor.borrow().clone()
-                                    };
-                                    let relocated = prev_anchor.as_ref().map(|a| {
-                                        relocate_window(groups.len(), a, key_at)
-                                    });
-                                    // Parked unless following or about to
-                                    // be taken to the latest. Hidden, trust
-                                    // the pin alone.
+                                    // Before the range resolves, so a follow
+                                    // selects the latest range in this render.
                                     #[cfg(target_arch = "wasm32")]
-                                    let following = force_scroll.get()
-                                        || (pinned_to_bottom.get()
-                                            && !chat_scroll_container().is_some_and(|c| {
-                                                history_has_layout(&c)
-                                                    && reader_moved_up_since(&last_scroll_top)
-                                            }));
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    let following = force_scroll.get() || pinned_to_bottom.get();
-                                    let parked = !following && !select_latest;
-                                    // Only a parked reader keeps a held end;
-                                    // a following reader's range reaches the
-                                    // newest item.
-                                    let prev_tail = if parked {
-                                        window_tail.borrow().clone()
-                                    } else {
-                                        None
-                                    };
-                                    let extend_newer = reader_position.extend_newer.replace(false);
-                                    let held_end = prev_tail.as_ref().map(|t| {
-                                        let end = relocate_tail(groups.len(), t, key_at)
-                                            // Every held item gone: keep the count.
-                                            .unwrap_or_else(|| {
-                                                relocated.map_or(0, |r| r.start)
-                                                    + window_rendered.get()
-                                            });
-                                        if extend_newer {
-                                            end + WINDOW_GROWTH_ITEMS
-                                        } else {
-                                            end
-                                        }
-                                    });
-                                    // Keep the reading row, plus one item
-                                    // for a group the view top cuts through.
-                                    let keep = if parked {
-                                        reader_position
-                                            .anchor
-                                            .borrow()
-                                            .as_ref()
-                                            .and_then(|a| locate_reading_item(groups, a))
-                                            .map(|i| i.saturating_sub(1))
-                                    } else {
-                                        None
-                                    };
-                                    let history_window = HistoryWindow::resolve_held(
-                                        groups.len(),
+                                    follow_arrival_at_end(
+                                        groups,
+                                        CURRENT_ROOM.peek().owner_key,
+                                        &reader_position,
+                                    );
+                                    let (history_window, head_removed) = resolve_rendered_range(
+                                        groups,
                                         requested_window,
-                                        relocated.as_ref().map(|r| r.start),
-                                        RangeHold {
-                                            end: held_end,
-                                            parked,
-                                            keep,
-                                        },
+                                        CURRENT_ROOM.peek().owner_key,
+                                        &reader_position,
                                     );
-                                    // Was rendered content at or above the new
-                                    // head removed in this very patch? True
-                                    // when the old head is gone (pruned,
-                                    // deleted, or re-keyed by a drained first
-                                    // message) or now sits BEFORE the window
-                                    // (ceiling trim). A parked reader needs
-                                    // their offset compensated for it — the
-                                    // `head_reposition` effect's job.
-                                    let head_removed = match &relocated {
-                                        None => false,
-                                        Some(r) => {
-                                            !r.head_survived
-                                                || history_window.start > r.start
-                                        }
-                                    };
-                                    if head_removed {
-                                        // Capture a surviving row's PRE-patch
-                                        // offset, AND the container's
-                                        // pre-patch scrollTop; the DOM still
-                                        // shows the previous render here. The
-                                        // probe row is not necessarily the
-                                        // head itself: a re-keyed head group
-                                        // has no pre-patch row under its new
-                                        // key (#505 re-review blocker; see
-                                        // `select_reposition_probe`). The
-                                        // scroll offset is captured because
-                                        // the browser clamps it down before
-                                        // the effect can read it when the
-                                        // patch shortens the content (#505
-                                        // delta review).
+                                    // A request about to move the view anyway
+                                    // needs no compensation.
+                                    if head_removed && reader_position.request.get().is_none() {
+                                        // The DOM still shows the previous
+                                        // render here.
                                         #[cfg(target_arch = "wasm32")]
-                                        if let (Some((key, pre_top)), Some(container)) = (
-                                            select_reposition_probe(
-                                                groups[history_window.start..history_window.end]
-                                                    .iter()
-                                                    .map(display_item_key),
-                                                first_history_row_offset,
-                                            ),
-                                            // Hidden rows all measure 0.
-                                            chat_scroll_container().filter(history_has_layout),
-                                        ) {
-                                            *reposition_pending.borrow_mut() =
-                                                Some((key, pre_top, container.scroll_top()));
-                                        }
+                                        reader_position.capture_before_patch();
                                     }
-                                    // Remember where this render started so the
-                                    // NEXT one grows instead of sliding (#501).
-                                    // Cell/RefCell writes during render are
-                                    // fine: inter-render memory, nothing
-                                    // renders from them, and re-resolving with
-                                    // the values just written is a fixed point.
-                                    *window_anchor.borrow_mut() = Some(WindowAnchor {
-                                        keys: groups[history_window.start..]
-                                            .iter()
-                                            .take(WINDOW_ANCHOR_KEYS)
-                                            .map(display_item_key)
-                                            .collect(),
-                                        index: history_window.start,
-                                    });
-                                    // What the backfill growth step grows FROM
-                                    // (#505 blocker 2; see `grown_window`).
-                                    window_rendered
-                                        .set(history_window.end - history_window.start);
-                                    // Only a held range remembers its end.
-                                    *window_tail.borrow_mut() = history_window.has_newer.then(|| {
-                                        WindowAnchor {
-                                            keys: groups[history_window.start..history_window.end]
-                                                .iter()
-                                                .rev()
-                                                .take(WINDOW_ANCHOR_KEYS)
-                                                .map(display_item_key)
-                                                .collect(),
-                                            index: history_window.end - 1,
-                                        }
-                                    });
-                                    reader_position.range_start.set(history_window.start);
-                                    if reader_position.has_newer.replace(history_window.has_newer)
-                                        && !history_window.has_newer
-                                    {
-                                        reader_position.newer_resolved.set(true);
-                                    }
-                                    // Tell the settle handler whether a
-                                    // bottom-settle trim would shrink anything.
-                                    window_overgrown.set(
-                                        requested_window > INITIAL_WINDOW_ITEMS
-                                            || history_window.end - history_window.start
-                                                > INITIAL_WINDOW_ITEMS,
-                                    );
                                     let withheld_newer = groups.len() - history_window.end;
                                     let groups =
                                         groups[history_window.start..history_window.end].to_vec();
@@ -5721,102 +2418,39 @@ pub fn Conversation() -> Element {
                                         rows
                                     };
                                     Some(rsx! {
-                                        // Backfill trigger, rendered only while
-                                        // older items are held back. Once the
-                                        // whole room is on screen it leaves the
-                                        // DOM, and with it the observer — so a
-                                        // fully-read room behaves exactly as
-                                        // before.
-                                        //
-                                        // Deliberately OUTSIDE the `space-y-4`
-                                        // list: as a child it would take the
-                                        // first row's place, pushing that row
-                                        // down by the 1rem gap and shifting the
-                                        // history by that much every time the
-                                        // sentinel appeared or (on the last
-                                        // backfill) disappeared.
-                                        // Gated on the opening snap having
-                                        // landed as well: a >window room's
-                                        // first render sits at `scrollTop = 0`
-                                        // until the snap runs, and a sentinel
-                                        // mounted during that beat fires from
-                                        // the top of the history and cascades
-                                        // the backfill (#501 H2). Mounting it
-                                        // after the snap means its first
-                                        // observation sees the view at the
-                                        // bottom, far below the strip. The
-                                        // room-change check covers the one
-                                        // render where `opening_snap_done` is
-                                        // still the PREVIOUS room's true —
-                                        // its reset only lands in the effect
-                                        // pass after this render.
+                                        // Backfill trigger while older items
+                                        // are held back; see `BACKFILL_LEAD_PX`.
+                                        // Outside the `space-y-4` list, where
+                                        // it would add a row gap above the
+                                        // history. Waits for the opening snap
+                                        // (see `opening_snap_done`) and for
+                                        // that signal's room-change reset.
                                         if history_window.has_older
                                             && opening_snap_done()
                                             && !room_changed_this_render
                                         {
-                                            // Zero-height anchor; the sentinel
-                                            // inside it is absolutely
-                                            // positioned, so it contributes no
-                                            // layout at all.
+                                            // Zero-height wrapper: the strip
+                                            // inside adds no layout.
                                             div { style: "position:relative;height:0;",
                                                 div {
                                                     id: "top-backfill-sentinel",
-                                                    // A STRIP spanning the top
-                                                    // BACKFILL_LEAD_PX of the
-                                                    // history, so the backfill
-                                                    // fires as the reader
-                                                    // approaches the end of what
-                                                    // is rendered rather than
-                                                    // when they hit it — and
-                                                    // still fires at scrollTop 0
-                                                    // on a viewport shorter than
-                                                    // the lead. See
-                                                    // `BACKFILL_LEAD_PX` for why
-                                                    // a point marker fails.
-                                                    // Inline style, not a
-                                                    // Tailwind arbitrary value:
-                                                    // the class scanner does not
-                                                    // see class names built
-                                                    // inside rsx.
+                                                    // Inline style: the class
+                                                    // scanner does not see class
+                                                    // names built inside rsx.
                                                     style: "position:absolute;top:0;height:{BACKFILL_LEAD_PX}px;width:1px;",
-                                                    onvisible: move |evt| {
-                                                        if evt.data().is_intersecting().unwrap_or(false) {
-                                                            // Capture BEFORE the re-render so the
-                                                            // restore effect can put the reader back
-                                                            // on the row they were looking at: the
-                                                            // current head row's identity + offset
-                                                            // (the measured probe), plus scroll
-                                                            // geometry (offset to restore from, and
-                                                            // the height-delta fallback). See
-                                                            // `BackfillAnchor`.
-                                                            #[cfg(target_arch = "wasm32")]
-                                                            if let (
-                                                                Some(container),
-                                                                Some((probe_key, probe_top)),
-                                                            ) = (
-                                                                chat_scroll_container(),
-                                                                first_history_row_identity(),
-                                                            ) {
-                                                                *backfill_anchor.borrow_mut() =
-                                                                    Some(BackfillAnchor {
-                                                                        probe_key,
-                                                                        probe_top,
-                                                                        scroll_top: container
-                                                                            .scroll_top(),
-                                                                        scroll_height: container
-                                                                            .scroll_height(),
-                                                                    });
+                                                    onvisible: {
+                                                        let reader_position = reader_position.clone();
+                                                        move |evt: dioxus::prelude::Event<VisibleData>| {
+                                                            if evt.data().is_intersecting().unwrap_or(false) {
+                                                                // Before the re-render; see
+                                                                // `restore_after_patch`.
+                                                                #[cfg(target_arch = "wasm32")]
+                                                                reader_position.capture_before_patch();
+                                                                // See `grown_window`.
+                                                                window_items.with_mut(|n| {
+                                                                    *n = grown_window(*n, reader_position.window_rendered.get())
+                                                                });
                                                             }
-                                                            // Grow from the RENDERED size, not the
-                                                            // requested one: arrivals grow an anchored
-                                                            // window past the request, and growing from
-                                                            // the stale request can reveal zero new rows
-                                                            // — the sentinel then never re-fires and
-                                                            // paging dead-ends (#505 blocker 2; see
-                                                            // `grown_window`).
-                                                            window_items.with_mut(|n| {
-                                                                *n = grown_window(*n, window_rendered.get())
-                                                            });
                                                         }
                                                     },
                                                 }
@@ -5828,7 +2462,7 @@ pub fn Conversation() -> Element {
                                             // history rows (AGENTS.md test-id
                                             // rule); additive markup only.
                                             "data-testid": "conversation-history",
-                                            // Newer items withheld below a parked
+                                            // Newer items withheld below the
                                             // reader, for tests (additive markup).
                                             "data-newer-withheld": "{withheld_newer}",
                                             {rows.into_iter().map({
@@ -5855,9 +2489,6 @@ pub fn Conversation() -> Element {
                                                         rsx! {
                                                             div {
                                                                 key: "{key}",
-                                                                // Identity tag for the
-                                                                // head-reposition machinery
-                                                                // (`history_row_offset_top`).
                                                                 "data-item-key": "{key}",
                                                                 // For `capture_reading_anchor`.
                                                                 "data-anchor-key": "{key}",
@@ -5873,9 +2504,9 @@ pub fn Conversation() -> Element {
                                                         let key = group.messages[0].id.clone();
                                                         rsx! {
                                                             // The wrapper exists to carry
-                                                            // `data-item-key` — the identity
-                                                            // the head-reposition machinery
-                                                            // locates rows by — since a
+                                                            // `data-item-key`, which marks the
+                                                            // item rows the scroll code
+                                                            // measures, since a
                                                             // component cannot carry a DOM
                                                             // attribute directly. It is the
                                                             // keyed list child, so diffing
@@ -5952,81 +2583,58 @@ pub fn Conversation() -> Element {
                                         }
                                     })
                                 }
-                                None => Some(rsx! {
-                                    div { class: "flex flex-col items-center justify-center h-64 text-text-muted",
-                                        p { "No messages yet. Start the conversation!" }
-                                    }
-                                })
+                                None => {
+                                    // No rows: nothing to hold at the end.
+                                    reader_position.forget_range();
+                                    Some(rsx! {
+                                        div { class: "flex flex-col items-center justify-center h-64 text-text-muted",
+                                            p { "No messages yet. Start the conversation!" }
+                                        }
+                                    })
+                                }
                             }
                         } else {
+                            reader_position.forget_range();
                             None
                         }
                     }
-                }
-                    // Invisible sentinel near the bottom of the scroll container.
-                    // An IntersectionObserver watches this element instead of using
-                    // onscroll, which avoids per-scroll-event DOM queries that cause
-                    // scroll jank on mobile (see issue #151).
+                    // Invisible sentinel right under the newest rendered row,
+                    // after the history list and above `#chat-content`'s bottom
+                    // padding, so its top edge is that row's bottom (the
+                    // newer-history strip before it has no height). Watched by
+                    // `observe_newest` and measured by `HistoryDom::end_seen`.
                     div {
                         id: "bottom-sentinel",
                         class: "h-px pointer-events-none",
                     }
+                }
             }
-                // Scroll-to-latest button (#402): shown whenever the user is not
-                // pinned to the bottom of the history. Reuses the `is_at_bottom`
-                // IntersectionObserver state, so it appears after scrolling up
-                // (e.g. reading back through a long, multi-room history) and
-                // hides once the newest message is in view. Handy on every
-                // device but especially on touch, where there is no scrollbar
-                // to drag.
-                //
-                // Also shown while a held range withholds newer items.
-                if !is_at_bottom() || reader_position.has_newer.get() {
-                    button {
-                        class: "absolute bottom-4 right-4 z-30 flex items-center justify-center w-10 h-10 rounded-full bg-panel shadow-lg border border-border text-text-muted hover:text-accent transition-colors",
-                        "aria-label": "Scroll to latest messages",
-                        "data-testid": "scroll-to-bottom",
-                        // Do NOT optimistically set `is_at_bottom` here: the
-                        // IntersectionObserver flips it (hiding the button) once
-                        // the sentinel actually reaches view. Setting it eagerly
-                        // would leave the button hidden if the user interrupts
-                        // the smooth scroll before reaching the bottom (the
-                        // observer emits no new change and stays quiet). #402.
+                // Latest (#402): shown while the newest message's bottom is off
+                // screen, or a held range withholds newer items.
+                if !newest_in_view() || reader_position.has_newer.get() {
+                    LatestButton {
+                        aria_label: "Scroll to latest messages",
+                        test_id: "scroll-to-bottom",
                         onclick: {
                             let reader_position = reader_position.clone();
                             move |_| {
-                            // The newest message isn't rendered: swap in the
-                            // latest range; the `window_items` effect scrolls
-                            // once it lands.
+                            // The newest message isn't rendered: request the
+                            // latest range; the request completes after the
+                            // render that swaps it in.
                             if reader_position.has_newer.get() {
                                 let reader_position = reader_position.clone();
                                 let mut window_items = window_items;
                                 crate::util::defer(move || {
-                                    reader_position.select_latest.set(true);
-                                    reader_position.snap_latest.set(true);
+                                    reader_position.request_end(CURRENT_ROOM.peek().owner_key);
                                     window_items.set(INITIAL_WINDOW_ITEMS);
                                 });
-                                return;
-                            }
-                            // Asking for the newest message is the clearest
-                            // possible statement of intent, so this re-arms the
-                            // pin (inside `scroll_history_to_bottom`) even
-                            // though the button itself renders off the
-                            // IntersectionObserver.
-                            #[cfg(target_arch = "wasm32")]
-                            {
-                                let pinned_to_bottom = pinned_to_bottom.clone();
-                                let last_scroll_top = last_scroll_top.clone();
-                                crate::util::safe_spawn_local(async move {
-                                    scroll_history_to_bottom(
-                                        &pinned_to_bottom,
-                                        &last_scroll_top,
-                                        web_sys::ScrollBehavior::Smooth,
-                                    );
-                                });
+                            } else {
+                                #[cfg(target_arch = "wasm32")]
+                                if let Some(container) = ROOM_HISTORY.container() {
+                                    land_at_end(&reader_position, &container);
+                                }
                             }
                         }},
-                        Icon { icon: FaChevronDown, width: 18, height: 18 }
                     }
                 }
             }
@@ -6035,7 +2643,7 @@ pub fn Conversation() -> Element {
             {
                 // Find user's most recent message for up-arrow-to-edit
                 let request_edit_last = move |_| {
-                    if let Some((groups, _, _)) = message_groups.read().as_ref() {
+                    if let Some((groups, _, _)) = message_groups.read().as_deref() {
                         for item in groups.iter().rev() {
                             if let DisplayItem::Messages(group) = item {
                                 if group.is_self {
@@ -6194,14 +2802,7 @@ pub fn Conversation() -> Element {
                                 // Same unread-elsewhere badge as the room-header
                                 // hamburger; with no room selected every room's
                                 // unread (plus DMs) counts.
-                                if panel_unread() > 0 {
-                                    span {
-                                        class: "absolute top-0 right-0 flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-accent text-white text-[10px] font-semibold leading-none pointer-events-none",
-                                        "data-testid": "hamburger-unread-badge",
-                                        "aria-hidden": "true",
-                                        "{panel_unread}"
-                                    }
-                                }
+                                CountBadge { count: panel_unread(), position: "top-0 right-0", testid: "hamburger-unread-badge" }
                             }
                         }
                         // freenet/river#509: this panel is the ONLY thing a
@@ -6229,7 +2830,7 @@ pub fn Conversation() -> Element {
                         // which arms the 60s backstop, runs only after a
                         // successful connect — so without the pill that user
                         // would watch a spinner with nothing telling them the
-                        // socket is down (#509 review).
+                        // socket is down (#509).
                         match crate::components::room_list::current_room_list_display() {
                             crate::components::room_list::RoomListDisplay::Loading => rsx! {
                                 div {
@@ -6410,14 +3011,14 @@ fn MessageGroupComponent(
     // right-anchored (open leftward). Chosen from the tap's horizontal position
     // so the menu always opens toward the viewport centre regardless of
     // self/other side or bubble width, and never clips its content off a narrow
-    // screen edge (#402 review).
+    // screen edge (#402).
     let mut menu_align_left: Signal<bool> = use_signal(|| false);
 
     // Max height (px) for the kebab action menu, measured at tap time as the
     // actual space available on the chosen side within the chat scrollport. The
     // menu is `overflow-y-auto`, so on a very short/landscape viewport where it
     // fits neither side fully it scrolls internally instead of being clipped by
-    // the scroll container with Edit/Delete unreachable (#402 review).
+    // the scroll container with Edit/Delete unreachable (#402).
     let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
 
     // Track if emoji picker should appear above (true) or below (false) the button
@@ -6609,11 +3210,20 @@ fn MessageGroupComponent(
                                                     ),
                                                     style: "width: 100%; max-width: 550px; overflow: visible;",
                                                     tabindex: "0",
-                                                    // Scroll into view when edit dialog appears (#93)
+                                                    // Scroll into view when edit dialog appears (#93),
+                                                    // only as far as needed. Instant: the textarea's
+                                                    // focus right after cancels a smooth scroll before
+                                                    // it moves, leaving Save below the view.
                                                     onmounted: move |cx| {
                                                         let el = cx.data();
                                                         wasm_bindgen_futures::spawn_local(async move {
-                                                            let _ = el.scroll_to(ScrollBehavior::Smooth).await;
+                                                            let _ = el
+                                                                .scroll_to_with_options(dioxus::html::ScrollToOptions {
+                                                                    behavior: ScrollBehavior::Instant,
+                                                                    vertical: dioxus::html::ScrollLogicalPosition::Nearest,
+                                                                    horizontal: dioxus::html::ScrollLogicalPosition::Nearest,
+                                                                })
+                                                                .await;
                                                         });
                                                     },
                                                     // Global key bindings on the container (#94): Esc cancels,
@@ -7022,14 +3632,14 @@ fn MessageGroupComponent(
                                                 // `right-full`/`left-full` (NOT `translate`): a transform
                                                 // would become the containing block for the `fixed`
                                                 // dismiss backdrop below, shrinking it to this element
-                                                // instead of the viewport (#402 review).
+                                                // instead of the viewport (#402).
                                                 // Raise the OPEN wrapper above sibling kebabs: every
                                                 // `.touch-actions` is z-50, and later ones paint above an
                                                 // open popover, so without this a nearby message's kebab
                                                 // could sit over the menu rows and steal the tap. `z-[60]`
                                                 // lifts the whole open popover+backdrop above them (and its
                                                 // backdrop then covers those kebabs, so a tap on one just
-                                                // dismisses). (#402 review)
+                                                // dismisses). (#402)
                                                 class: format!(
                                                     "touch-actions absolute top-1 {} {}",
                                                     if menu_open { "z-[60]" } else { "z-50" },
@@ -7068,7 +3678,7 @@ fn MessageGroupComponent(
                                                             // fit below AND there's more room above. A received menu
                                                             // (2 rows) is shorter than an own menu (4 rows), so it
                                                             // stays down in cases where an own menu would flip.
-                                                            // (#402 review)
+                                                            // (#402)
                                                             let (sp_top, sp_bottom) = web_sys::window()
                                                                 .and_then(|w| w.document())
                                                                 .and_then(|d| {
@@ -7107,7 +3717,7 @@ fn MessageGroupComponent(
                                                                 menu_align_left.set(align_left);
                                                                 menu_max_h.set(max_h);
                                                                 // Dismiss any open reaction picker so the two
-                                                                // popovers can't stack (#402 review).
+                                                                // popovers can't stack (#402).
                                                                 open_emoji_picker.set(None);
                                                                 open_action_menu.set(Some(id));
                                                             });
@@ -7159,7 +3769,7 @@ fn MessageGroupComponent(
                                                                 let picker_id = format!("inline-{}", msg_id_menu_react);
                                                                 // Inherit the kebab's flip direction so the picker
                                                                 // for a bottom message also opens upward, not
-                                                                // clipped by the composer (#402 review).
+                                                                // clipped by the composer (#402).
                                                                 let above = *menu_show_above.peek();
                                                                 crate::util::defer(move || {
                                                                     picker_show_above.set(above);
@@ -7293,7 +3903,7 @@ fn MessageGroupComponent(
                                                 // Raise the whole picker (grid + z-40 backdrop) above the
                                                 // z-50 message kebabs while it's open, so a nearby closed
                                                 // kebab can't paint over the emoji grid and steal a tap
-                                                // (mirrors the action menu's z-[60] behaviour). (#402 review)
+                                                // (mirrors the action menu's z-[60] behaviour). (#402)
                                                 class: format!(
                                                     "relative group/react inline-flex items-center {}",
                                                     if is_inline_picker_open { "z-[60]" } else { "" }
@@ -7653,619 +4263,22 @@ mod tests {
         );
     }
 
-    /// The newest item is on screen for ANY window size — including the
-    /// degenerate zero, which would otherwise render a history the reader
-    /// cannot scroll into (the window only ever grows upward from the bottom).
     #[test]
-    fn the_window_always_renders_the_newest_item() {
-        for total in 1..200usize {
-            for window in [0, 1, 2, 59, 60, 61, 199, 200, 5000] {
-                for anchor in [None, Some(0), Some(30), Some(total)] {
-                    let w = HistoryWindow::resolve(total, window, anchor);
-                    assert!(
-                        w.start < total,
-                        "total {total}, window {window}, anchor {anchor:?}: \
-                         start {} skips every item",
-                        w.start
-                    );
-                }
-            }
-        }
-    }
-
-    /// A room that fits in the window renders exactly as it did before the
-    /// window existed: every item, and no backfill sentinel to observe.
-    #[test]
-    fn a_room_inside_the_window_is_rendered_whole() {
-        for total in 0..=INITIAL_WINDOW_ITEMS {
-            let w = HistoryWindow::resolve(total, INITIAL_WINDOW_ITEMS, None);
-            assert_eq!(
-                w.start, 0,
-                "total {total} should render from the first item"
-            );
-            assert!(!w.has_older, "total {total} has nothing to backfill");
-        }
-    }
-
-    /// Past the window, only the tail renders and the sentinel appears. The
-    /// counts here are the live "Off Topic" room's shape.
-    #[test]
-    fn a_room_past_the_window_renders_only_its_tail() {
-        let w = HistoryWindow::resolve(1133, INITIAL_WINDOW_ITEMS, None);
-        assert_eq!(w.start, 1133 - INITIAL_WINDOW_ITEMS);
-        assert!(w.has_older, "1133 items must offer a backfill");
-
-        // Each backfill reveals exactly one growth step more... (the anchor is
-        // carried the way the render carries it, and moving it BACK for a
-        // backfill is allowed — only forward movement is the #501 slide)
-        let grown = HistoryWindow::resolve(
-            1133,
-            INITIAL_WINDOW_ITEMS + WINDOW_GROWTH_ITEMS,
-            Some(w.start),
-        );
-        assert_eq!(w.start - grown.start, WINDOW_GROWTH_ITEMS);
-
-        // ...until the window covers the room, at which point the sentinel goes.
-        let all = HistoryWindow::resolve(1133, 1133, Some(grown.start));
-        assert_eq!(all.start, 0);
-        assert!(!all.has_older);
-    }
-
-    /// Arrivals GROW an anchored window instead of sliding it (#501): with the
-    /// reader pinned to the bottom, the start index stays put as the total
-    /// climbs, so nothing is removed above the viewport in the same patch that
-    /// appends below it.
-    #[test]
-    fn arrivals_grow_an_anchored_window_instead_of_sliding_it() {
-        let opened = HistoryWindow::resolve(100, INITIAL_WINDOW_ITEMS, None);
-        assert_eq!(opened.start, 40);
-
-        let mut anchor = Some(opened.start);
-        for arrivals in 1..=50usize {
-            let w = HistoryWindow::resolve(100 + arrivals, INITIAL_WINDOW_ITEMS, anchor);
-            assert_eq!(
-                w.start, opened.start,
-                "arrival {arrivals} slid the window instead of growing it"
-            );
-            anchor = Some(w.start);
-        }
-    }
-
-    /// The trim — the settle handler clearing the anchor and resetting the
-    /// requested window once the reader's own settle lands at the bottom —
-    /// resolves back to the plain tail.
-    #[test]
-    fn a_trim_resolves_back_to_the_plain_tail() {
-        // 40 arrivals grew the anchored window to 100 rendered items...
-        let grown = HistoryWindow::resolve(140, INITIAL_WINDOW_ITEMS, Some(40));
-        assert_eq!(grown.start, 40);
-        // ...and the trim (anchor cleared, window back to INITIAL) collapses
-        // it to the newest INITIAL_WINDOW_ITEMS.
-        let trimmed = HistoryWindow::resolve(140, INITIAL_WINDOW_ITEMS, None);
-        assert_eq!(trimmed.start, 140 - INITIAL_WINDOW_ITEMS);
-        assert!(trimmed.has_older);
-    }
-
-    /// The ceiling bounds what arrival growth can accumulate — a reader pinned
-    /// through a very long burst must not re-accumulate the unbounded render
-    /// the window exists to prevent — but it NEVER caps a reader-requested
-    /// backfill, which would dead-end paging through history.
-    #[test]
-    fn the_ceiling_caps_arrival_growth_but_never_reader_backfill() {
-        // Anchored at 100 while the room ran away to 1000 items: capped.
-        let w = HistoryWindow::resolve(1000, INITIAL_WINDOW_ITEMS, Some(100));
-        assert_eq!(w.start, 1000 - WINDOW_ITEMS_CEILING);
-        assert!(w.has_older);
-
-        // A reader who backfilled PAST the ceiling keeps everything they asked
-        // for: the requested window wins over the ceiling.
-        let requested = WINDOW_ITEMS_CEILING + WINDOW_GROWTH_ITEMS;
-        let w = HistoryWindow::resolve(1000, requested, Some(1000 - requested));
-        assert_eq!(w.start, 1000 - requested);
-
-        // Arrival-grace headroom: a reader who backfilled TO the ceiling and
-        // parked is not hit with a ceiling slide by the next few arrivals —
-        // the cap sits one growth step above the request (#505 review).
-        let at_ceiling = WINDOW_ITEMS_CEILING;
-        let anchor = 1000 - at_ceiling;
-        let w = HistoryWindow::resolve(1010, at_ceiling, Some(anchor));
-        assert_eq!(
-            w.start, anchor,
-            "10 arrivals within the grace must not slide a ceiling-deep window"
-        );
-    }
-
-    /// Anchor carrying the head + spare keys the way the render does.
-    fn anchor_of(keys: &[String], start: usize) -> WindowAnchor {
-        WindowAnchor {
-            keys: keys[start..]
-                .iter()
-                .take(WINDOW_ANCHOR_KEYS)
-                .cloned()
-                .collect(),
-            index: start,
-        }
-    }
-
-    /// #505 blocker 1: the anchor is re-located by IDENTITY. An at-cap room
-    /// prunes its oldest message per arrival, shifting every index down — the
-    /// walk below is that steady state, and the head must stay the same ITEM
-    /// (its index marching toward 0), not the same index.
-    #[test]
-    fn the_anchor_follows_the_item_through_at_cap_pruning() {
-        // A 100-item room at cap: items are identified by these keys.
-        let mut keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
-        let opened = HistoryWindow::resolve(keys.len(), INITIAL_WINDOW_ITEMS, None);
-        assert_eq!(opened.start, 40);
-        let head_key = keys[opened.start].clone();
-        let mut anchor = anchor_of(&keys, opened.start);
-
-        for arrival in 0..40usize {
-            // apply_delta at cap: drain the oldest, append the new.
-            keys.remove(0);
-            keys.push(format!("new{arrival}"));
-            let relocated = relocate_window(keys.len(), &anchor, |i, key| keys[i] == key);
-            assert!(relocated.head_survived, "arrival {arrival}: head survives");
-            let start =
-                HistoryWindow::resolve(keys.len(), INITIAL_WINDOW_ITEMS, Some(relocated.start))
-                    .start;
-            assert_eq!(
-                keys[start], head_key,
-                "arrival {arrival}: the window head changed identity — the \
-                 #501 slide reproduced in content space"
-            );
-            assert_eq!(start, opened.start - (arrival + 1), "start marches down");
-            anchor = anchor_of(&keys, start);
-        }
-
-        // One more prune consumes the head itself: the head key is gone, but
-        // the FIRST SPARE (the item right after the old head) survives at
-        // index 0, so the relocation lands on the nearest surviving item and
-        // reports the head as removed — which is what arms the measured
-        // reposition for a parked reader.
-        keys.remove(0);
-        keys.push("new40".into());
-        let relocated = relocate_window(keys.len(), &anchor, |i, key| keys[i] == key);
-        assert!(!relocated.head_survived, "the head itself was pruned");
-        assert_eq!(
-            relocated.start, 0,
-            "the first surviving spare pins the window to the nearest \
-             surviving item"
-        );
-    }
-
-    /// #505 re-review blocker: a MULTI-message head group RE-KEYS when an
-    /// at-cap drain consumes its first message (a group's key is its first
-    /// message's id). The old key is gone while the group itself survives —
-    /// the spares must still pin the window to the survivors, and the
-    /// reposition probe must skip the un-measurable new head key and land on
-    /// a row that existed pre-patch.
-    #[test]
-    fn a_rekeyed_multi_message_head_group_is_still_anchored_and_measurable() {
-        // Window head at index 0: a group keyed by its first message "m0",
-        // followed by neighbors. The at-cap drain consumes "m0"; the group
-        // survives RE-KEYED as "m1". (Modelled at the key level — exactly
-        // what `display_item_key` exposes to this machinery.)
-        let anchor = WindowAnchor {
-            keys: vec!["m0".into(), "b".into(), "c".into(), "d".into()],
-            index: 0,
-        };
-        let post_keys = ["m1", "b", "c", "d", "e"];
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(
-            !relocated.head_survived,
-            "the re-keyed head must count as removed — its row is replaced \
-             and its height changed"
-        );
-        assert_eq!(
-            relocated.start, 0,
-            "the first spare (\"b\", found at index 1, offset 1 in the \
-             anchor) pins the window back to the re-keyed group"
-        );
-
-        // The measured probe: the new head key "m1" has NO pre-patch row —
-        // a head-only probe dead-fires and the parked reader crawls one
-        // intra-group line per arrival. The walk lands on "b", which does.
-        let probe = select_reposition_probe(
-            post_keys.iter().map(|k| k.to_string()),
-            pre_patch_dom(&[("m0", 100), ("b", 160), ("c", 220)]),
-        );
-        assert_eq!(
-            probe,
-            Some(("b".to_string(), 160)),
-            "the probe must walk past the un-measurable re-keyed head to the \
-             first row that existed pre-patch"
-        );
-    }
-
-    /// A pre-patch DOM as a `first_history_row_offset`-shaped lookup: the
-    /// first candidate key that has a row, with its offset.
-    fn pre_patch_dom(rows: &[(&'static str, i32)]) -> impl Fn(&[String]) -> Option<(String, i32)> {
-        let rows = rows.to_vec();
-        move |keys: &[String]| {
-            keys.iter().find_map(|k| {
-                rows.iter()
-                    .find(|(rk, _)| rk == k)
-                    .map(|(_, top)| (k.clone(), *top))
+    fn a_join_folding_into_the_trailing_summary_raises_the_newest_key() {
+        let summary = |last_time_ms: i64, seed: &[u8]| {
+            DisplayItem::Event(EventSummary {
+                names: vec!["Ann".into()],
+                id: "summary".into(),
+                last_time: DateTime::from_timestamp_millis(last_time_ms).unwrap(),
+                last_sent_ms: last_time_ms,
+                last_message_id: MessageId(freenet_scaffold::util::fast_hash(seed)),
             })
-        }
-    }
-
-    /// The probe walk must outlast the DEEPEST spare the anchor can relocate
-    /// through. Landing via spare `k` sets `start = i - k`, widening the
-    /// window backward by `k` items that were never rendered pre-patch, so
-    /// the first `k` candidates cannot have pre-patch rows. A walk shorter
-    /// than `WINDOW_ANCHOR_KEYS` dead-fires exactly when the removal is
-    /// biggest — a bulk delete of several contiguous leading items above a
-    /// parked reader (#505 delta review).
-    #[test]
-    fn the_probe_walk_outlasts_the_deepest_spare() {
-        assert!(
-            REPOSITION_PROBE_ROWS >= WINDOW_ANCHOR_KEYS,
-            "the probe walk must cover every spare the anchor can land on"
-        );
-
-        // Anchor: head + 7 spares. A bulk delete removes the head and the
-        // first 6 spares; relocation lands on spare 7 ("s7"), so the window
-        // widens back by 7 items that have no pre-patch rows.
-        let anchor = WindowAnchor {
-            keys: (0..WINDOW_ANCHOR_KEYS)
-                .map(|i| {
-                    if i == 0 {
-                        "head".to_string()
-                    } else {
-                        format!("s{i}")
-                    }
-                })
-                .collect(),
-            index: 20,
         };
-        let post_keys: Vec<String> = (0..7)
-            .map(|i| format!("older{i}"))
-            .chain(std::iter::once("s7".to_string()))
-            .chain((0..10).map(|i| format!("rest{i}")))
-            .collect();
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(!relocated.head_survived);
-        assert_eq!(
-            relocated.start, 0,
-            "spare 7 found at index 7, offset 7 in the anchor → start 0"
-        );
-
-        // Only the 8th candidate ("s7") has a pre-patch row; the seven
-        // widened-in rows above it do not. A 4-row walk finds nothing.
-        let probe = select_reposition_probe(
-            post_keys.iter().map(|k| k.to_string()),
-            pre_patch_dom(&[("s7", 480), ("rest0", 540)]),
-        );
-        assert_eq!(
-            probe,
-            Some(("s7".to_string(), 480)),
-            "the walk must reach the deepest spare's row, or the compensation \
-             silently dead-fires on the largest removals"
-        );
-    }
-
-    /// A batched drain that consumes the head AND several spares (the
-    /// `appendMessages` burst crossing the anchor) still lands on the first
-    /// surviving spare, offset back to where the head would have been.
-    #[test]
-    fn a_batched_drain_past_the_head_lands_on_the_first_surviving_spare() {
-        // 100 items, window head at 25 with spares 25..33.
-        let keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
-        let anchor = anchor_of(&keys, 25);
-        // A 30-item drain + 30 arrivals: items 0..30 gone, head (25) and
-        // spares 25..29 with it; spare "m30" (offset 5) survives at index 0.
-        let post_keys: Vec<String> = (30..100)
-            .map(|i| format!("m{i}"))
-            .chain((0..30).map(|i| format!("new{i}")))
-            .collect();
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(!relocated.head_survived);
-        assert_eq!(
-            relocated.start, 0,
-            "spare m30 found at index 0, offset 5 in the anchor → start 0: \
-             the whole surviving remainder of the old window stays rendered"
-        );
-
-        // And when the drain consumes every spare too, the only safe answer
-        // for a front-contiguous drain is index 0 — the oldest survivor.
-        let post_keys: Vec<String> = (40..100)
-            .map(|i| format!("m{i}"))
-            .chain((0..40).map(|i| format!("new{i}")))
-            .collect();
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(!relocated.head_survived);
-        assert_eq!(relocated.start, 0);
-    }
-
-    /// The case where the spares are load-bearing and no fallback can stand
-    /// in for them: the head alone vanishes MID-window (its whole group
-    /// deleted), the neighbors survive in place. The first spare pins the
-    /// window one slot back from where it sits — a head-only relocation
-    /// would fall back to index 0 and blow the window open across the whole
-    /// room (ceiling-bounded, but a ~180-item over-render and a torn view).
-    #[test]
-    fn a_mid_window_head_deletion_reanchors_on_the_next_survivor() {
-        let keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
-        let anchor = anchor_of(&keys, 40);
-        // The head item "m40" is deleted outright; everything else survives,
-        // shifted down by one from index 41 on.
-        let post_keys: Vec<String> = keys
-            .iter()
-            .filter(|k| k.as_str() != "m40")
-            .cloned()
-            .collect();
-        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(!relocated.head_survived);
-        assert_eq!(
-            relocated.start, 39,
-            "spare m41 (offset 1) found at index 40 → start 39: the window \
-             re-anchors one slot back, not at the front of the room"
-        );
-    }
-
-    /// Skip the trim when the measured tail would leave the backfill strip in
-    /// view; trim and backfill would otherwise loop (#505 re-review).
-    #[test]
-    fn the_trim_skips_when_the_tail_would_rearm_the_sentinel() {
-        let reach = |client: i32| client + BACKFILL_LEAD_PX + TRIM_HEADROOM_PX as i32;
-        // Exactly at the reach clears it; one px short does not.
-        assert!(!trim_would_rearm_backfill(reach(900), 900));
-        assert!(trim_would_rearm_backfill(reach(900) - 1, 900));
-    }
-
-    /// Item keys `m0..m{total}` for the range tests.
-    fn item_keys(total: usize) -> Vec<String> {
-        (0..total).map(|i| format!("m{i}")).collect()
-    }
-
-    /// The tail anchor the render stores for a held range.
-    fn tail_of(keys: &[String], end: usize) -> WindowAnchor {
-        WindowAnchor {
-            keys: keys[..end]
-                .iter()
-                .rev()
-                .take(WINDOW_ANCHOR_KEYS)
-                .cloned()
-                .collect(),
-            index: end - 1,
-        }
-    }
-
-    /// A parked reader's hold.
-    fn parked(end: Option<usize>, keep: Option<usize>) -> RangeHold {
-        RangeHold {
-            end,
-            parked: true,
-            keep,
-        }
-    }
-
-    /// Past the ceiling, a parked reader's range holds its end instead of sliding
-    /// its start, and later arrivals don't grow it (#732 review 42f541b6).
-    #[test]
-    fn a_parked_reader_s_range_holds_its_end_at_the_ceiling() {
-        let opened = HistoryWindow::resolve(201, INITIAL_WINDOW_ITEMS, None);
-        let hold = parked(None, None);
-        // 200 arrivals in one patch, start anchored.
-        let held = HistoryWindow::resolve_held(401, INITIAL_WINDOW_ITEMS, Some(opened.start), hold);
-        assert_eq!(
-            held.start, opened.start,
-            "the start must not slide past the reader"
-        );
-        assert_eq!(held.end - held.start, WINDOW_ITEMS_CEILING);
-        assert!(held.has_newer, "the newest items are withheld");
-
-        // More arrivals: the held end stays on its item, so the DOM stops growing.
-        let again = HistoryWindow::resolve_held(
-            501,
-            INITIAL_WINDOW_ITEMS,
-            Some(held.start),
-            parked(Some(held.end), None),
-        );
-        assert_eq!((again.start, again.end), (held.start, held.end));
-
-        // Below the ceiling nothing changes for a parked reader either.
-        let small =
-            HistoryWindow::resolve_held(230, INITIAL_WINDOW_ITEMS, Some(opened.start), hold);
-        assert_eq!((small.start, small.end), (opened.start, 230));
-        assert!(!small.has_newer);
-    }
-
-    /// An at-cap drain shifts every index; a held range keeps both edges on
-    /// their items.
-    #[test]
-    fn a_held_range_follows_its_items_through_pruning() {
-        let mut keys = item_keys(400);
-        let (start, end) = (100, 100 + WINDOW_ITEMS_CEILING);
-        let head = anchor_of(&keys, start);
-        let tail = tail_of(&keys, end);
-        let (first, last) = (keys[start].clone(), keys[end - 1].clone());
-        // A batch of 40 arrivals drains the 40 oldest items.
-        keys.drain(..40);
-        keys.extend((0..40).map(|i| format!("new{i}")));
-        let relocated = relocate_window(keys.len(), &head, |i, k| keys[i] == k);
-        let held_end = relocate_tail(keys.len(), &tail, |i, k| keys[i] == k);
-        assert_eq!(held_end, Some(end - 40));
-        let w = HistoryWindow::resolve_held(
-            keys.len(),
-            INITIAL_WINDOW_ITEMS,
-            Some(relocated.start),
-            parked(held_end, None),
-        );
-        assert_eq!(keys[w.start], first);
-        assert_eq!(keys[w.end - 1], last);
-        assert!(w.has_newer);
-
-        // The last held item deleted outright: its spare places the end.
-        let gone = keys[w.end - 1].clone();
-        keys.retain(|k| *k != gone);
-        assert_eq!(
-            relocate_tail(
-                keys.len(),
-                &tail_of_keys(&[gone, keys[w.end - 2].clone()]),
-                |i, k| keys[i] == k
-            ),
-            Some(w.end - 1)
-        );
-        assert_eq!(
-            relocate_tail(keys.len(), &tail_of_keys(&["nope".into()]), |i, k| keys[i]
-                == k),
-            None
-        );
-    }
-
-    /// A tail anchor from explicit keys (newest first), hint past the end.
-    fn tail_of_keys(keys: &[String]) -> WindowAnchor {
-        WindowAnchor {
-            keys: keys.to_vec(),
-            index: 10_000,
-        }
-    }
-
-    /// A held range pages both ways. A newer page slides the start behind the
-    /// reader, but never past `keep`.
-    #[test]
-    fn a_held_range_pages_older_and_newer() {
-        let total = 1000;
-        let (start, end) = (300, 300 + WINDOW_ITEMS_CEILING);
-        // Older: one growth step from the rendered size reveals exactly one page.
-        let requested = grown_window(INITIAL_WINDOW_ITEMS, end - start);
-        let older =
-            HistoryWindow::resolve_held(total, requested, Some(start), parked(Some(end), None));
-        assert_eq!((older.start, older.end), (start - WINDOW_GROWTH_ITEMS, end));
-
-        // Newer: the end moves one page down and the ceiling slides the start.
-        let newer = HistoryWindow::resolve_held(
-            total,
-            INITIAL_WINDOW_ITEMS,
-            Some(start),
-            parked(Some(end + WINDOW_GROWTH_ITEMS), None),
-        );
-        assert_eq!(newer.end, end + WINDOW_GROWTH_ITEMS);
-        assert_eq!(newer.end - newer.start, WINDOW_ITEMS_CEILING);
-
-        // The reader's row bounds that slide: the cap gives way, not the row.
-        let keep = start + 20;
-        let kept = HistoryWindow::resolve_held(
-            total,
-            INITIAL_WINDOW_ITEMS,
-            Some(start),
-            parked(Some(end + WINDOW_GROWTH_ITEMS), Some(keep)),
-        );
-        assert_eq!(kept.start, keep);
-        assert!(kept.end - kept.start > WINDOW_ITEMS_CEILING);
-
-        // Paging newer until the end reaches the newest item ends the hold.
-        let last = HistoryWindow::resolve_held(
-            total,
-            INITIAL_WINDOW_ITEMS,
-            Some(900),
-            parked(Some(total + 30), None),
-        );
-        assert_eq!(last.end, total);
-        assert!(!last.has_newer);
-
-        // A held end with nothing left falls back to the newest, not to empty.
-        let empty = HistoryWindow::resolve_held(
-            total,
-            INITIAL_WINDOW_ITEMS,
-            Some(900),
-            parked(Some(0), None),
-        );
-        assert_eq!(empty.end, total);
-    }
-
-    /// A deleted reading row falls back to its nearest surviving neighbour.
-    #[test]
-    fn the_reading_anchor_restores_through_its_neighbours() {
-        let anchor = ReadingAnchor {
-            rows: vec![
-                ("read".into(), 40),
-                ("below".into(), 120),
-                ("above".into(), -30),
-            ],
-            item_hint: 0,
-        };
-        // Everything survives: the reading row goes back to 40px.
-        let dom = |rows: &'static [(&'static str, i32)]| {
-            move |k: &str| rows.iter().find(|(rk, _)| *rk == k).map(|(_, t)| *t)
-        };
-        assert_eq!(
-            reading_anchor_shift(&anchor, dom(&[("read", -600), ("below", -520)])),
-            Some(-640)
-        );
-        // The reading row was deleted: the nearest-first neighbour is restored
-        // to ITS offset.
-        assert_eq!(
-            reading_anchor_shift(&anchor, dom(&[("above", 10), ("below", 700)])),
-            Some(580)
-        );
-        // Nothing survives: no move at all.
-        assert_eq!(reading_anchor_shift(&anchor, dom(&[("other", 0)])), None);
-    }
-
-    /// `relocate_anchor` search order and fallbacks.
-    #[test]
-    fn relocate_anchor_finds_shifted_heads_and_reports_lost_ones() {
-        let keys = ["a", "b", "c", "d", "e"];
-        let find =
-            |key: &'static str, hint: usize| relocate_anchor(keys.len(), hint, |i| keys[i] == key);
-        // Unshifted: found at the hint.
-        assert_eq!(find("c", 2), Some(2));
-        // Front prune shifted it down: found below the hint.
-        assert_eq!(find("c", 3), Some(2));
-        // Older history merged in above: found above the hint.
-        assert_eq!(find("c", 0), Some(2));
-        // Hint out of range entirely: still found.
-        assert_eq!(find("e", 400), Some(4));
-        // Gone: None, and `relocate_window` moves on to the next spare.
-        assert_eq!(find("zz", 2), None);
-        assert_eq!(relocate_anchor(0, 0, |_| true), None, "empty list");
-    }
-
-    /// #505 blocker 2: one backfill growth step must always reveal more than
-    /// what is RENDERED — growing from the stale requested size can resolve to
-    /// a start the anchor already renders (zero new rows, sentinel never
-    /// re-fires, paging dead-ends). The trace is the review's: open at 1000
-    /// items, 61 arrivals, page up.
-    #[test]
-    fn a_growth_step_reveals_rows_even_after_arrivals_grew_the_window() {
-        let opened = HistoryWindow::resolve(1000, INITIAL_WINDOW_ITEMS, None);
-        assert_eq!(opened.start, 940);
-        // 61 arrivals: the anchored start holds, rendered = 121.
-        let grown = HistoryWindow::resolve(1061, INITIAL_WINDOW_ITEMS, Some(opened.start));
-        assert_eq!(grown.start, opened.start);
-        let rendered = 1061 - grown.start;
-        assert_eq!(rendered, 121);
-
-        // The regression this pins: growing from the REQUESTED size reveals
-        // nothing (min(anchor, 1061-120) = anchor).
-        let dead = HistoryWindow::resolve(
-            1061,
-            INITIAL_WINDOW_ITEMS + WINDOW_GROWTH_ITEMS,
-            Some(grown.start),
-        );
-        assert_eq!(
-            dead.start, grown.start,
-            "premise: the naive growth really does dead-end — if this stops \
-             holding, the whole scenario needs rebuilding"
-        );
-
-        // The fix: grow from the rendered size.
-        let requested = grown_window(INITIAL_WINDOW_ITEMS, rendered);
-        assert_eq!(requested, rendered + WINDOW_GROWTH_ITEMS);
-        let paged = HistoryWindow::resolve(1061, requested, Some(grown.start));
-        assert!(
-            paged.start < grown.start,
-            "a growth step must strictly decrease start"
-        );
-        assert_eq!(
-            grown.start - paged.start,
-            WINDOW_GROWTH_ITEMS,
-            "and by exactly one growth step"
-        );
+        let before = newest_key(&[summary(1_000, b"join-1")]);
+        // The same summary item, now holding a second join.
+        let after = newest_key(&[summary(2_000, b"join-2")]);
+        assert!(is_arrival(before.as_ref(), after.as_ref(), false));
+        assert_eq!(newest_key(&[]), None);
     }
 
     /// Source-grep pin: the history must render through the window. Rendering
@@ -8274,14 +4287,27 @@ mod tests {
     /// opens a room with a thousand messages in it.
     #[test]
     fn the_history_renders_through_the_window() {
-        let source = include_str!("conversation.rs");
-        let prod = &source[..source
-            .find("#[cfg(test)]\nmod tests {")
-            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")];
-        let squashed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        // The render, and the range resolution in `history_scroll.rs`.
+        let squashed: String = [
+            ("conversation.rs", include_str!("conversation.rs")),
+            (
+                "history_scroll.rs",
+                include_str!("conversation/history_scroll.rs"),
+            ),
+        ]
+        .into_iter()
+        .flat_map(|(file, source)| {
+            source[..source
+                .find("#[cfg(test)]\nmod tests {")
+                .unwrap_or_else(|| panic!("{file} should have a `#[cfg(test)] mod tests` block"))]
+                .chars()
+        })
+        .filter(|c| !c.is_whitespace())
+        .collect();
 
         assert!(
-            squashed.contains("HistoryWindow::resolve_held(groups.len(),requested_window,"),
+            squashed.contains("resolve_rendered_range(groups,requested_window,")
+                && squashed.contains("HistoryWindow::resolve_held(groups.len(),requested_window,"),
             "the history must slice its display items through `HistoryWindow`"
         );
         assert!(
@@ -8292,18 +4318,19 @@ mod tests {
              blocker 1)"
         );
         assert!(
-            squashed.contains("*window_anchor.borrow_mut()=Some(WindowAnchor{"),
+            squashed.contains("*reader.window_anchor.borrow_mut()=Some(WindowAnchor{"),
             "the render must write the resolved head's identity back so the \
              NEXT render grows instead of sliding (#501)"
         );
         assert!(
-            squashed.contains("window_rendered.set(history_window.end-history_window.start);"),
+            squashed
+                .contains("reader.window_rendered.set(history_window.end-history_window.start);"),
             "the render must record the RENDERED size — the backfill growth \
              step grows from it, or paging dead-ends after arrivals (#505 \
              blocker 2)"
         );
         assert!(
-            squashed.contains("*n=grown_window(*n,window_rendered.get())"),
+            squashed.contains("*n=grown_window(*n,reader_position.window_rendered.get())"),
             "the backfill sentinel must grow through `grown_window`, from the \
              rendered size (#505 blocker 2)"
         );
@@ -8320,9 +4347,11 @@ mod tests {
         // Anchored on needles unique to the ROOM-SWITCH reset. The obvious
         // needle — `window_items.set(INITIAL_WINDOW_ITEMS)` — also matches
         // the bottom-settle trim, so deleting the room reset would have
-        // false-passed against it (#505 review).
+        // false-passed against it (#505).
         assert!(
-            squashed.contains("prev_render_room.set(Some(room));*window_anchor.borrow_mut()=None;"),
+            squashed.contains(
+                "prev_render_room.set(Some(room));*reader_position.window_anchor.borrow_mut()=None;"
+            ),
             "the windowing Cells must reset inline in the render on a room \
              switch — the effect-based reset runs one render too late, so \
              the new room's first frame would render at the old room's depth"
@@ -8382,1892 +4411,6 @@ mod tests {
         for spoof in ["Mallory 🛡", "Mallory 👑", "Mallory \u{1F6E1}\u{FE0F}"] {
             assert_eq!(sanitize_display_name(spoof), "Mallory");
         }
-    }
-
-    /// A mention token carries a `[name]` SNAPSHOT written by the sender. When
-    /// the member reference doesn't resolve, that snapshot is what renders —
-    /// so `@[Admin 🛡](rv:<nobody>)` would paint a shield inside a message with
-    /// no nickname involved at all. Any member can type this into any message,
-    /// which makes it a broader vector than the nickname one.
-    #[test]
-    fn unresolved_mention_chip_snapshot_is_sanitised() {
-        let unknown = MemberId(freenet_scaffold::util::FastHash(0xDEAD_BEEF));
-        let me = MemberId(freenet_scaffold::util::FastHash(1));
-        let token = river_core::mention::encode_mention(unknown, "Admin 🛡");
-
-        let html = message_to_html_with_mentions(&token, &HashMap::new(), Some(me));
-        assert!(
-            !html.contains('\u{1F6E1}'),
-            "an unresolved mention rendered a badge glyph from its snapshot: {html}"
-        );
-        assert!(
-            html.contains("Admin"),
-            "the name itself must survive: {html}"
-        );
-    }
-
-    /// Same snapshot, the other renderer: the quoted reply preview resolves
-    /// mention tokens to plain `@name` and falls back to the sender-written
-    /// snapshot for an unknown member.
-    #[test]
-    fn reply_preview_sanitises_an_unresolved_mention_snapshot() {
-        let unknown = MemberId(freenet_scaffold::util::FastHash(0xDEAD_BEEF));
-        let token = river_core::mention::encode_mention(unknown, "Admin 🛡");
-
-        let preview = clean_reply_preview(&token, &HashMap::new());
-        assert!(
-            !preview.contains('\u{1F6E1}'),
-            "reply preview rendered a badge glyph from a mention snapshot: {preview}"
-        );
-        assert!(preview.contains("@Admin"), "got: {preview}");
-    }
-
-    // A previous revision of this branch sanitised
-    // `ReplyContentV1.target_author_name` on both decode paths, because the
-    // reply strip rendered that sender-written snapshot. freenet/river#480
-    // removed the field from the decoder's return type entirely, so there is
-    // no longer a value to sanitise: the quote author comes from
-    // `resolve_member_nickname` on live state, covered by
-    // `resolve_reply_strip_tests::quote_author_label_is_sanitised`.
-
-    /// Issue #315 — pin that the markdown renderer never passes raw HTML
-    /// through to the DOM. `markdown_to_html` feeds attacker-controlled
-    /// message text into `markdown::to_html_with_options(_, Options::gfm())`,
-    /// whose output is then injected via `dangerous_inner_html` at three
-    /// sites (room description, message body, DM body). GFM mode defaults
-    /// `allow_dangerous_html = false`, so raw HTML is escaped rather than
-    /// emitted as live markup. This test fails loudly if a future `markdown`
-    /// upgrade or an `Options` change ever flips that on — which would
-    /// re-open the stored-XSS hole closed alongside #227 / #314.
-    #[test]
-    fn raw_html_is_escaped_not_executed() {
-        // Each payload is a classic stored-XSS vector. With
-        // allow_dangerous_html=false the leading `<` must be escaped to
-        // `&lt;`, so the markup survives as inert text instead of a live
-        // element.
-        //
-        // `<img>` and `<svg>` are deliberately chosen: they are NOT on the
-        // GFM tagfilter's neutralization list, so if `allow_dangerous_html`
-        // were ever flipped on they would pass through as live `<img …>` /
-        // `<svg …>` tags — making these the payloads that actually trip the
-        // tripwire. (`<script>`/`<iframe>` are masked by the tagfilter even
-        // with dangerous HTML enabled, so they can't distinguish the flip;
-        // they're covered below only for the escaping guarantee.)
-        let live_tag_vectors = ["<img src=x onerror=alert(1)>", "<svg onload=alert(1)>"];
-        for payload in live_tag_vectors {
-            let html = message_to_html(payload);
-            assert!(
-                html.contains("&lt;"),
-                "raw HTML payload should be HTML-escaped (expected `&lt;`): \
-                 input={payload:?} output={html:?}"
-            );
-            assert!(
-                !html.contains("<img")
-                    && !html.contains("<svg")
-                    && !html.contains("<iframe")
-                    && !html.contains("<script"),
-                "raw HTML payload must not survive as an executable tag: \
-                 input={payload:?} output={html:?}"
-            );
-        }
-
-        // `<script>`/`<iframe>` must still be escaped on the safe path.
-        for payload in ["<script>alert(1)</script>", "<iframe></iframe>"] {
-            let html = message_to_html(payload);
-            assert!(
-                html.contains("&lt;"),
-                "raw HTML should be HTML-escaped (expected `&lt;`): \
-                 input={payload:?} output={html:?}"
-            );
-        }
-    }
-
-    /// Issue #315 — pin that the markdown renderer never emits a dangerous
-    /// URL scheme in an `href`. GFM mode defaults
-    /// `allow_dangerous_protocol = false`, so `javascript:` / `vbscript:` /
-    /// `data:` links (whether autolinked `<scheme:...>` or `[text](scheme:...)`)
-    /// have their `href` neutralized to empty rather than carrying the
-    /// executable scheme into the DOM. This fails loudly if that protection
-    /// is ever switched off.
-    #[test]
-    fn dangerous_url_schemes_are_neutralized() {
-        let cases = [
-            "<javascript:alert(1)>",
-            "[click](javascript:alert(1))",
-            "[x](vbscript:msgbox(1))",
-            "[d](data:text/html,<script>alert(1)</script>)",
-        ];
-        for payload in cases {
-            let html = message_to_html(payload);
-            assert!(
-                !html.contains("href=\"javascript:")
-                    && !html.contains("href=\"vbscript:")
-                    && !html.contains("href=\"data:"),
-                "dangerous URL scheme must not reach an href: \
-                 input={payload:?} output={html:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn bare_url_is_linkified() {
-        let html = message_to_html("check out https://freenet.org for more info");
-        assert!(
-            html.contains(
-                r#"<a target="_blank" rel="noopener noreferrer" href="https://freenet.org">"#
-            ),
-            "bare URL should be linkified with target=_blank: {html}"
-        );
-    }
-
-    #[test]
-    fn url_in_code_span_not_linkified() {
-        let html = message_to_html("did you do `curl -fsSL https://freenet.org/install.sh | sh`?");
-        assert!(
-            !html.contains("<a "),
-            "URL inside backticks should NOT be linkified: {html}"
-        );
-    }
-
-    #[test]
-    fn url_in_fenced_code_block_not_linkified() {
-        let html = message_to_html("```\ncurl https://freenet.org/install.sh\n```");
-        assert!(
-            !html.contains("<a "),
-            "URL in code block should NOT be linkified: {html}"
-        );
-    }
-
-    #[test]
-    fn markdown_link_preserved() {
-        let html = message_to_html("see [Freenet](https://freenet.org)");
-        assert!(
-            html.contains(r#"href="https://freenet.org">"#),
-            "markdown link should be preserved: {html}"
-        );
-        assert!(
-            html.contains(">Freenet</a>"),
-            "markdown link text should be preserved: {html}"
-        );
-    }
-
-    #[test]
-    fn newlines_become_hard_breaks() {
-        let html = message_to_html("line one\nline two");
-        assert!(
-            html.contains("<br"),
-            "newlines should become hard breaks: {html}"
-        );
-    }
-
-    /// Issue #158: a blank line between two blocks of text is a paragraph
-    /// break, and the Markdown renderer must emit a separate `<p>` for each
-    /// so the stylesheet can space them apart. This is the HTML-structure
-    /// half of the fix; the CSS half is pinned by
-    /// `prose_paragraph_spacing_css_present` below.
-    #[test]
-    fn blank_line_produces_separate_paragraphs() {
-        let html = message_to_html("First paragraph.\n\nSecond paragraph.");
-        let paragraphs = html.matches("<p>").count();
-        assert_eq!(
-            paragraphs, 2,
-            "blank-line-separated text should render as two <p> blocks: {html}"
-        );
-    }
-
-    /// Issue #158 root cause: Tailwind v4's Preflight reset zeroes the
-    /// margin on every element, so the `<p>` blocks above collapse into a
-    /// single wall of text unless the stylesheet re-adds paragraph spacing.
-    /// The message body is rendered inside a `.prose` container, so the
-    /// `.prose p` margin rule is what actually makes paragraph breaks
-    /// visible. Pin its presence in the source stylesheet so a future
-    /// Tailwind bump or CSS refactor that silently drops it fails CI rather
-    /// than regressing the rendering. `styles.css` (the compiled output) is
-    /// a gitignored build artifact, so we assert against the tracked source.
-    #[test]
-    fn prose_paragraph_spacing_css_present() {
-        const TAILWIND_CSS: &str = include_str!("../../assets/tailwind.css");
-        assert!(
-            TAILWIND_CSS.contains(".prose p {"),
-            "tailwind.css must keep a `.prose p` rule so Markdown paragraph \
-             breaks are visible (issue #158); the Tailwind reset zeroes <p> \
-             margins otherwise"
-        );
-    }
-
-    /// The `> quoted` Markdown a reader types has to reach the stylesheet as a
-    /// `<blockquote>` for any of the blockquote rules below to apply at all.
-    /// `message_to_html` rewrites every single newline to a hard break
-    /// (`"  \n"`) before Markdown runs, so pin that the block construct still
-    /// parses through that rewrite.
-    #[test]
-    fn markdown_quote_renders_as_blockquote() {
-        let html = message_to_html("> quoted line\n\nnormal line");
-        assert!(
-            html.contains("<blockquote>"),
-            "`> …` must render as a <blockquote> for the blockquote CSS to \
-             apply: {html}"
-        );
-    }
-
-    /// Extract the declaration body of a CSS rule by its exact selector text.
-    ///
-    /// Anchored on a LINE START (`"\n{selector} {{"`), not a bare substring:
-    /// `.prose blockquote {` is a suffix of `.bg-accent .prose blockquote {`,
-    /// so a substring search would silently return the wrong rule's body if
-    /// the two were ever reordered in the file.
-    fn css_rule_body<'a>(css: &'a str, selector: &str) -> &'a str {
-        let needle = format!("\n{selector} {{");
-        let start = css
-            .find(&needle)
-            .unwrap_or_else(|| panic!("tailwind.css should contain a `{selector}` rule"))
-            + needle.len();
-        let end = start
-            + css[start..]
-                .find('}')
-                .unwrap_or_else(|| panic!("`{selector}` rule should be closed"));
-        &css[start..end]
-    }
-
-    /// A quote inside the local user's own bubble must take the bubble's own
-    /// text colour, not a hardcoded one.
-    ///
-    /// `.bg-accent` is the solid brand-blue sent-message bubble, whose text is
-    /// `text-white`, and it is the SAME blue in light and dark mode. The rule
-    /// used to paint the quote `rgba(0, 0, 0, 0.8)`, so quoted text rendered
-    /// near-black inside a bubble of white text — 3.52:1 against the bubble,
-    /// under the 4.5:1 WCAG AA floor, in BOTH colour schemes. Pinning
-    /// `color: inherit` is what keeps the quote tied to the bubble's palette
-    /// instead of drifting from it again.
-    ///
-    /// The browser-side counterpart, which measures the real composited
-    /// contrast in both colour schemes rather than the declaration text, is
-    /// `ui/tests/blockquote-contrast.spec.ts`.
-    #[test]
-    fn sent_bubble_blockquote_inherits_bubble_text_colour() {
-        const TAILWIND_CSS: &str = include_str!("../../assets/tailwind.css");
-        let body = css_rule_body(TAILWIND_CSS, ".bg-accent .prose blockquote");
-
-        // Check the LAST `color:` declaration, not merely that `inherit`
-        // appears somewhere in the body. CSS is last-one-wins within a rule,
-        // so `color: inherit; color: #111;` reintroduces the bug in full while
-        // a `contains("color: inherit")` check happily passes — a substring
-        // search cannot model the cascade. Take the final declaration, which
-        // is the one that actually paints.
-        //
-        // `border-left-color:` also ends in `color:`, hence the `-` guard.
-        let last_color = body
-            .split(';')
-            .map(str::trim)
-            .filter(|d| d.starts_with("color:"))
-            .next_back()
-            .unwrap_or_else(|| {
-                panic!("`.bg-accent .prose blockquote` should declare a colour. Found: {body}")
-            });
-
-        assert_eq!(
-            last_color, "color: inherit",
-            "the winning `color` declaration in `.bg-accent .prose blockquote` \
-             must be `inherit` so the quote takes the sent bubble's own text \
-             colour; a hardcoded colour is what made quoted text render \
-             black-on-blue beside white text. Full rule: {body}"
-        );
-    }
-
-    /// Quotes outside the sent bubble use a dedicated `--color-text-quote`
-    /// token rather than the app-wide `--color-text-muted`.
-    ///
-    /// The muted token is tuned for glanceable metadata (timestamps, field
-    /// labels) and falls under 4.5:1 on two of the backgrounds a quote
-    /// actually appears over, both in LIGHT mode: `--color-surface` (4.47:1)
-    /// and the `bg-accent/20` outgoing DM bubble (3.96:1, the worst quote
-    /// surface in the app). The dark-mode equivalents were already fine.
-    ///
-    /// The token must be declared in BOTH colour schemes, and the two ways to
-    /// break that fail DIFFERENTLY — which is why this counts declarations
-    /// instead of asserting either symptom:
-    ///
-    /// - Drop the DARK value and `:root`'s light value still resolves, so
-    ///   every dark-mode quote silently paints the light colour (2.49:1 on a
-    ///   dark received bubble — worse than the bug this PR fixes).
-    /// - Drop the LIGHT value and the token is undefined everywhere `:root`
-    ///   would have supplied it, so `var()` is invalid at computed-value time,
-    ///   `color` inherits the body text colour, and the muted look vanishes
-    ///   entirely while contrast stays high enough that no AA floor notices.
-    #[test]
-    fn blockquote_uses_dedicated_quote_colour_token_in_both_schemes() {
-        const TAILWIND_CSS: &str = include_str!("../../assets/tailwind.css");
-
-        let body = css_rule_body(TAILWIND_CSS, ".prose blockquote");
-        assert!(
-            body.contains("color: var(--color-text-quote)"),
-            "`.prose blockquote` must use `--color-text-quote`, not the \
-             app-wide muted token, so a quote stays above the WCAG AA floor \
-             without repainting every timestamp and label. Found: {body}"
-        );
-
-        // `:root` carries the light-mode values; the dark-mode overrides live
-        // in the `prefers-color-scheme: dark` block. Both must define the
-        // token, so count declarations rather than merely finding one.
-        let declarations = TAILWIND_CSS.matches("--color-text-quote:").count();
-        assert_eq!(
-            declarations, 2,
-            "`--color-text-quote` must be declared exactly twice — once in \
-             `:root` (light) and once under `prefers-color-scheme: dark` — \
-             found {declarations}"
-        );
-    }
-
-    const SAMPLE_ID: &str = "UDzGbcWrKN748tYbhvbPCCCQrZc9r9xkN3tUuun5Rts";
-    /// Real-shape 44-char base58 ID for tests that need a second distinct ID.
-    const SAMPLE_ID_2: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
-
-    // ---- Share links (freenet.org/open and `freenet:`) ----
-
-    /// River's own contract id (a vector id in the shared share-link file).
-    const RIVER_ID: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
-    /// Harvest's contract id, for the store-link shape Harvest shares.
-    const HARVEST_ID: &str = "6FzSeAUKcqJrveKyU8RJgGKc5jRB1Z2juvxXtwTA4Em9";
-
-    fn anchor_to(html: &str, href: &str, text: &str) -> bool {
-        html.contains(&format!(
-            "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"{href}\">{text}</a>"
-        ))
-    }
-
-    #[test]
-    fn freenet_org_open_link_opens_app_on_own_node() {
-        let link = format!("https://freenet.org/open#{HARVEST_ID}/#store=ABCDEFGHJKLMNPQR");
-        let html = message_to_html(&format!("my store: {link}"));
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{HARVEST_ID}/#store=ABCDEFGHJKLMNPQR"),
-                &link
-            ),
-            "a freenet.org/open link must point at the app on the reader's node, \
-             keeping the original text: {html}"
-        );
-        assert!(!html.contains("href=\"https://freenet.org"), "{html}");
-    }
-
-    #[test]
-    fn freenet_org_open_slash_form_is_converted() {
-        let link = format!("https://freenet.org/open/#{RIVER_ID}/?invitation=abc123&x=y");
-        let html = message_to_html(&link);
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{RIVER_ID}/?invitation=abc123&amp;x=y"),
-                &link.replace('&', "&amp;")
-            ),
-            "{html}"
-        );
-    }
-
-    #[test]
-    fn bare_freenet_scheme_links_are_converted() {
-        for link in [
-            format!("freenet:{RIVER_ID}/"),
-            format!("freenet://{RIVER_ID}/"),
-            format!("FREENET:{HARVEST_ID}/#store=ABCDEFGHJKLMNPQR"),
-        ] {
-            let html = message_to_html(&format!("open {link} please"));
-            let path = crate::util::share_link::parse_share_link(&link)
-                .unwrap()
-                .local_path();
-            assert!(anchor_to(&html, &path, &link), "{link}: {html}");
-        }
-    }
-
-    #[test]
-    fn bare_freenet_link_trailing_punctuation_is_not_part_of_it() {
-        let html = message_to_html(&format!(
-            "try freenet:{RIVER_ID}. Or (freenet:{HARVEST_ID}/)!"
-        ));
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{RIVER_ID}"),
-                &format!("freenet:{RIVER_ID}")
-            ),
-            "{html}"
-        );
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{HARVEST_ID}/"),
-                &format!("freenet:{HARVEST_ID}/")
-            ),
-            "{html}"
-        );
-    }
-
-    #[test]
-    fn angle_bracket_freenet_autolink_is_converted() {
-        // The markdown crate emits `<a href="">` for a scheme it does not
-        // allow; the share-link pass gives it its real destination.
-        let html = message_to_html(&format!("<freenet:{RIVER_ID}/a/b#x/../y>"));
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{RIVER_ID}/a/b#x/../y"),
-                &format!("freenet:{RIVER_ID}/a/b#x/../y")
-            ),
-            "{html}"
-        );
-    }
-
-    #[test]
-    fn share_links_in_code_are_not_converted() {
-        for text in [
-            format!("`freenet:{RIVER_ID}/`"),
-            format!("```\nfreenet:{RIVER_ID}/\n```"),
-            format!("`https://freenet.org/open#{RIVER_ID}/`"),
-        ] {
-            let html = message_to_html(&text);
-            assert!(!html.contains("<a "), "{text:?}: {html}");
-        }
-    }
-
-    #[test]
-    fn freenet_scheme_inside_other_words_or_attributes_is_not_converted() {
-        for text in [
-            format!("xfreenet:{RIVER_ID}/"),
-            format!("![freenet:{RIVER_ID}/](https://example.com/x.png)"),
-        ] {
-            let html = message_to_html(&text);
-            assert!(!html.contains("/v1/contract/web/"), "{text:?}: {html}");
-        }
-    }
-
-    /// The destination comes only from the visible text. A share-link label
-    /// over a different href goes where the label says; a share-link href
-    /// behind an ordinary label is left pointing at the freenet.org page
-    /// (which shows the id), never turned into a one-click open.
-    #[test]
-    fn share_link_destination_always_matches_visible_text() {
-        let html = message_to_html(&format!(
-            "[freenet:{RIVER_ID}/](https://freenet.org/open#{HARVEST_ID}/)"
-        ));
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{RIVER_ID}/"),
-                &format!("freenet:{RIVER_ID}/")
-            ),
-            "{html}"
-        );
-        assert!(!html.contains(HARVEST_ID), "{html}");
-
-        let html = message_to_html(&format!(
-            "[https://freenet.org/open#{RIVER_ID}/](https://evil.example/)"
-        ));
-        assert!(
-            html.contains(&format!("href=\"/v1/contract/web/{RIVER_ID}/\"")),
-            "{html}"
-        );
-        assert!(!html.contains("evil.example"), "{html}");
-
-        let html = message_to_html(&format!(
-            "[click here](https://freenet.org/open#{HARVEST_ID}/)"
-        ));
-        assert!(
-            html.contains(&format!("href=\"https://freenet.org/open#{HARVEST_ID}/\"")),
-            "a labelled share link must stay a link to the freenet.org page: {html}"
-        );
-        assert!(!html.contains("/v1/contract/web/"), "{html}");
-    }
-
-    #[test]
-    fn share_links_untouched_without_a_gateway() {
-        let link = format!("https://freenet.org/open#{RIVER_ID}/");
-        let html = message_to_html_inner(&link, false);
-        assert!(html.contains(&format!("href=\"{link}\"")), "{html}");
-        let html = message_to_html_inner(&format!("freenet:{RIVER_ID}/"), false);
-        assert!(!html.contains("<a "), "{html}");
-    }
-
-    /// Markdown syntax that is valid inside a share link must not split it:
-    /// `…/a*b*c` used to render as `…/a<em>b</em>c` and link only `…/a`.
-    #[test]
-    fn markdown_syntax_inside_a_bare_link_does_not_split_it() {
-        for rest in ["/a*b*c", "/a_b_c", "/a~~b~~c", "/x*y", "/#a*b*c"] {
-            let link = format!("freenet:{RIVER_ID}{rest}");
-            let html = message_to_html(&format!("see {link} now"));
-            let path = format!("/v1/contract/web/{RIVER_ID}{rest}");
-            assert!(anchor_to(&html, &path, &link), "{link}: {html}");
-        }
-    }
-
-    #[test]
-    fn emphasised_bare_link_is_linked_inside_the_emphasis() {
-        let html = message_to_html(&format!(
-            "*freenet:{RIVER_ID}/* and **freenet:{HARVEST_ID}/**"
-        ));
-        assert!(
-            html.contains(&format!(
-                "<em><a target=\"_blank\" rel=\"noopener noreferrer\" \
-                 href=\"/v1/contract/web/{RIVER_ID}/\">freenet:{RIVER_ID}/</a></em>"
-            )),
-            "{html}"
-        );
-        assert!(
-            html.contains(&format!(
-                "<strong><a target=\"_blank\" rel=\"noopener noreferrer\" \
-                 href=\"/v1/contract/web/{HARVEST_ID}/\">freenet:{HARVEST_ID}/</a></strong>"
-            )),
-            "{html}"
-        );
-    }
-
-    #[test]
-    fn bare_link_at_the_very_start_of_a_message() {
-        let link = format!("freenet:{RIVER_ID}/");
-        let html = message_to_html(&link);
-        assert!(
-            anchor_to(&html, &format!("/v1/contract/web/{RIVER_ID}/"), &link),
-            "{html}"
-        );
-    }
-
-    /// Byte offsets from the markdown parser must line up with the source even
-    /// after multi-byte text: the code-span link stays code, the other links.
-    #[test]
-    fn non_ascii_before_links_keeps_code_exclusion_aligned() {
-        let text = format!("é ü 🦀 `freenet:{RIVER_ID}/` then freenet:{HARVEST_ID}/");
-        let html = message_to_html(&text);
-        assert!(
-            html.contains(&format!("<code>freenet:{RIVER_ID}/</code>")),
-            "{html}"
-        );
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{HARVEST_ID}/"),
-                &format!("freenet:{HARVEST_ID}/")
-            ),
-            "{html}"
-        );
-        assert!(
-            !html.contains(&format!("/v1/contract/web/{RIVER_ID}")),
-            "{html}"
-        );
-    }
-
-    /// A bare link inside a construct that is not prose must never nest an
-    /// anchor or land in an attribute.
-    #[test]
-    fn bare_links_inside_links_titles_and_footnotes_stay_plain() {
-        for text in [
-            format!("[see freenet:{RIVER_ID}/](https://example.com/)"),
-            format!("[x](https://example.com/ \"freenet:{RIVER_ID}/\")"),
-            format!("text[^freenet:{RIVER_ID}/]\n\n[^freenet:{RIVER_ID}/]: note"),
-            format!("[r]: https://example.com/ \"freenet:{RIVER_ID}/\"\n\n[x][r]"),
-            format!("<span title=\"freenet:{RIVER_ID}/\">x</span>"),
-            format!("[x](freenet:{RIVER_ID}/)"),
-            format!("![x](freenet:{RIVER_ID}/)"),
-        ] {
-            let html = message_to_html(&text);
-            assert!(
-                !html.contains(&format!("href=\"/v1/contract/web/{RIVER_ID}")),
-                "{text:?}: {html}"
-            );
-            assert!(
-                !html.contains('\u{E002}') && !html.contains("%EE%80%82"),
-                "{text:?}: sentinel leaked: {html}"
-            );
-            // No anchor opens inside another anchor.
-            for piece in html.split("<a ").skip(1) {
-                let close = piece.find("</a>").unwrap_or(piece.len());
-                assert!(!piece[..close].contains("<a "), "{text:?}: nested: {html}");
-            }
-        }
-    }
-
-    /// A message cannot forge the private-use sentinels the bare-link pass
-    /// uses: they are stripped before any are inserted.
-    #[test]
-    fn forged_bare_link_sentinels_are_inert() {
-        let text = format!("\u{E002}0\u{E003} \u{E002}1\u{E003} freenet:{RIVER_ID}/");
-        let html = message_to_html(&text);
-        assert_eq!(html.matches("<a ").count(), 1, "{html}");
-        assert!(
-            !html.contains('\u{E002}') && !html.contains('\u{E003}'),
-            "{html}"
-        );
-    }
-
-    #[test]
-    fn share_links_render_alongside_mentions() {
-        let member = MemberId(freenet_scaffold::util::FastHash(42));
-        let names: HashMap<MemberId, String> = [(member, "Bob".to_string())].into();
-        let token = river_core::mention::encode_mention(member, "Bob");
-        let html = message_to_html_with_mentions(
-            &format!("{token} try freenet:{RIVER_ID}/ and https://freenet.org/open#{HARVEST_ID}/"),
-            &names,
-            None,
-        );
-        assert!(html.contains("river-mention"), "{html}");
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{RIVER_ID}/"),
-                &format!("freenet:{RIVER_ID}/")
-            ),
-            "{html}"
-        );
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{HARVEST_ID}/"),
-                &format!("https://freenet.org/open#{HARVEST_ID}/")
-            ),
-            "{html}"
-        );
-    }
-
-    /// A converted anchor carries nothing else from the message, so a `title`
-    /// cannot name a different link in the tooltip.
-    #[test]
-    fn converted_share_link_drops_title() {
-        let html = message_to_html(&format!(
-            "[freenet:{RIVER_ID}/](https://x.example/ \"https://freenet.org/open#{HARVEST_ID}/\")"
-        ));
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{RIVER_ID}/"),
-                &format!("freenet:{RIVER_ID}/")
-            ),
-            "{html}"
-        );
-        assert!(!html.contains("title="), "{html}");
-    }
-
-    /// Pre-existing gateway-URL rewrite: an ENCODED dot segment is resolved by
-    /// the browser just like `..`, so it must be refused too.
-    #[test]
-    fn gateway_url_with_encoded_dot_segments_is_not_rewritten() {
-        for suffix in [
-            format!("/%2e%2e/{SAMPLE_ID_2}/"),
-            "/%2E%2e/%2e%2E/%2e%2e/permission/apps".to_string(),
-            "/.%2e/x".to_string(),
-            "/%2e./x".to_string(),
-        ] {
-            let url = format!("https://x.example/v1/contract/web/{SAMPLE_ID}{suffix}");
-            let html = message_to_html(&format!("[River update]({url})"));
-            assert!(
-                !html.contains("href=\"/v1/contract/web/"),
-                "{suffix}: {html}"
-            );
-        }
-    }
-
-    /// Message text is attacker-controlled: a crafted body must not make the
-    /// bare-link scan super-linear. `freenet:freenet:…)))` made every
-    /// occurrence a candidate spanning the rest of the run, trimmed one
-    /// character at a time with a full parenthesis recount each step (O(n^3):
-    /// 186 s for 16 KB natively). The size is small enough that a cubic
-    /// regression still FINISHES (2.4 s release, far longer in a debug test
-    /// build) and fails the bound, rather than hanging the test run; the fixed
-    /// scan renders all of these in milliseconds.
-    #[test]
-    fn adversarial_bare_link_text_renders_in_bounded_time() {
-        let n = 4 * 1024;
-        let payloads = [
-            format!("{}{}", "freenet:".repeat(n / 16), ")".repeat(n / 2)),
-            format!("freenet:{}", ")".repeat(n)),
-            "freenet:".repeat(n / 8),
-            format!("freenet:{RIVER_ID}/ ").repeat(n / 55),
-            "(freenet:x) ".repeat(n / 12),
-        ];
-        for payload in payloads {
-            let started = std::time::Instant::now();
-            let _ = message_to_html(&payload);
-            let elapsed = started.elapsed();
-            assert!(
-                elapsed < std::time::Duration::from_secs(10),
-                "rendering {} bytes took {elapsed:?}",
-                payload.len()
-            );
-        }
-    }
-
-    /// Every path that renders user-written text as markdown: message bodies
-    /// (with and without the gateway-only bare link pass, which also parses
-    /// to an AST), room descriptions, bodies with mentions, and reply
-    /// previews.
-    fn render_every_markdown_path(text: &str) {
-        let member = MemberId(freenet_scaffold::util::FastHash(7));
-        let names: HashMap<MemberId, String> = [(member, "Bob".to_string())].into();
-        for behind_gateway in [true, false] {
-            let _ = message_to_html_inner(text, behind_gateway);
-            let _ = description_to_html(text, behind_gateway);
-        }
-        let with_mention = format!(
-            "{} {text}",
-            river_core::mention::encode_mention(member, "Bob")
-        );
-        let _ = message_to_html_with_mentions(&with_mention, &names, Some(member));
-        let _ = clean_reply_preview(text, &names);
-        let _ = strip_markdown(text);
-    }
-
-    /// Inputs the unpatched `markdown` crate panics on (see
-    /// `[patch.crates-io]` in the root Cargo.toml).
-    #[test]
-    fn malformed_markdown_renders_without_panicking() {
-        let inputs = [
-            // A line ending inside a link title or reference label. The
-            // renderer turns every `\n` into a hard break (`"  \n"`), so a
-            // plain line break inside the title is enough.
-            "[a](b \"x\ny\")",
-            "[a](b 'x\ny')",
-            "[a](b (x\ny))",
-            "![a](b \"x\ny\")",
-            "[a](b \"x \ny\")",
-            "[a](b \"x \r\ny\")",
-            "[x](/x \"> \n\")",
-            "[a][b\nc]\n\n[b c]: d",
-            "[][a \n]\n\n[a ]:\0",
-            // An email address in an image title that spans lines.
-            "![a](b \"c@d.com\ne\")",
-            // Setext underlines next to each other.
-            "=\n=\n=\na\n=",
-            "}\n-\n--\n]\n=",
-            // A list item ending in unclosed code or HTML, then another marker.
-            "1. <!--\n-",
-            "*\t~~~\n1.",
-            "- ```\n1)",
-            // An unfinished CDATA opener, then an empty numeric reference.
-            "<![C&#;",
-            // A table head, then a new container on the last line.
-            "a\n|-\n- <",
-            "a\n|-\n> <",
-        ];
-        for input in inputs {
-            for text in [input.to_string(), format!("freenet:{RIVER_ID}/ {input}")] {
-                let rendered = std::panic::catch_unwind(|| render_every_markdown_path(&text));
-                assert!(rendered.is_ok(), "rendering {text:?} panicked");
-            }
-        }
-    }
-
-    /// The AST helpers walk and drop a tree without recursion, so a deep tree
-    /// cannot overflow the stack even if one gets past
-    /// `markdown_cost_is_bounded`. Runs on a small stack to leave a margin
-    /// below wasm's 1 MiB.
-    #[test]
-    fn deep_markdown_trees_are_walked_without_recursion() {
-        std::thread::Builder::new()
-            .stack_size(256 * 1024)
-            .spawn(|| {
-                let deep = format!("{}`a` b", ">".repeat(5_000));
-                assert!(!non_prose_ranges(&deep).is_empty());
-                let tree = markdown::to_mdast(&deep, &markdown::ParseOptions::gfm()).unwrap();
-                let mut text = String::new();
-                collect_mdast_text(&tree, &mut text);
-                assert!(text.starts_with('a'), "{text}");
-                drop_mdast(tree);
-            })
-            .expect("spawn")
-            .join()
-            .expect("walking a deep markdown tree panicked");
-    }
-
-    /// Deep block nesting on one line, a wide table, or too much text is
-    /// shown as plain text, however the line breaks are written.
-    #[test]
-    fn costly_markdown_is_shown_as_plain_text() {
-        let deep_list = format!("{}x", "- ".repeat(MARKDOWN_MAX_LINE_NESTING + 1));
-        let deep_quote = format!("{}x", "> 1. ".repeat(MARKDOWN_MAX_LINE_NESTING));
-        let wide_table = format!("{}\n{}\n|", "|a".repeat(40), "|-".repeat(40));
-        for costly in [
-            deep_list.clone(),
-            format!("a\r{deep_list}"),
-            format!("a\r\n{deep_quote}"),
-            format!("[^a]: {deep_list}"),
-            format!("\u{feff}{deep_list}"),
-            format!("{BARE_LINK_OPEN}{deep_list}"),
-            wide_table,
-            "a\n".repeat(MARKDOWN_MAX_SOURCE_BYTES),
-        ] {
-            assert!(!markdown_cost_is_bounded(&costly), "{costly:?}");
-            assert!(message_to_html(&costly).starts_with("<p>"), "{costly:?}");
-        }
-        for fine in [
-            format!("{}x", "- ".repeat(MARKDOWN_MAX_LINE_NESTING)),
-            "> quote\n- item\n  1. nested".to_string(),
-            "| a | b |\n| - | - |\n| 1 | 2 |".to_string(),
-            "-1 and 2.5 and -x".to_string(),
-        ] {
-            assert!(markdown_cost_is_bounded(&fine), "{fine:?}");
-        }
-        assert_eq!(line_container_depth("  > - 1) * x"), 4);
-        assert_eq!(line_container_depth(">>> x"), 3);
-        assert_eq!(line_container_depth("-x"), 0);
-        assert_eq!(line_container_depth("2024. was"), 1);
-        assert_eq!(line_container_depth("[^a]: > - x"), 3);
-        assert_eq!(line_container_depth("[^a] x"), 0);
-    }
-
-    /// Markdown that renders to far more HTML than its size is shown as plain
-    /// text instead.
-    #[test]
-    fn markdown_that_expands_too_far_is_shown_as_plain_text() {
-        let text = format!("[a]: b '{}'\n\n{}", "\"".repeat(100), "[a]".repeat(300));
-        assert!(markdown_cost_is_bounded(&text));
-        assert!(render_gfm(&text).len() > MARKDOWN_MAX_HTML_BYTES);
-        let html = message_to_html(&text);
-        assert!(html.starts_with("<p>[a]: b"), "{}", &html[..200]);
-        assert!(html.len() < 2 * text.len(), "{}", html.len());
-        assert!(description_to_html(&text, true).starts_with("<p>[a]: b"));
-        // The plain text is the message as written, without the hard-break
-        // rewrite, so CRLF line breaks are not doubled.
-        let crlf = text.replace('\n', "\r\n");
-        let html = message_to_html(&crlf);
-        assert!(html.starts_with("<p>[a]: b"), "{}", &html[..200]);
-        assert!(!html.contains("  <br />"), "{}", &html[..400]);
-    }
-
-    /// A mention that markdown moves into an attribute or copies (through a
-    /// reference definition's title) is not substituted there: the message
-    /// is shown as plain text with one chip per mention.
-    #[test]
-    fn mentions_markdown_moves_or_copies_fall_back_to_plain_text() {
-        let member = MemberId(freenet_scaffold::util::FastHash(7));
-        let names: HashMap<MemberId, String> = [(member, "Bob".to_string())].into();
-        let token = river_core::mention::encode_mention(member, "Bob");
-        let copied = format!("[a]: b '{}'\n\n{}", token.repeat(20), "[a] ".repeat(150));
-        let in_title = format!("[x](https://x.example \"{token}\")");
-        let in_destination = format!("[x](https://x.example/{token})");
-        let in_alt = format!("![{token}](https://x.example/i.png)");
-        for text in [copied, in_title, in_destination, in_alt] {
-            let html = message_to_html_with_mentions(&text, &names, None);
-            assert!(html.starts_with("<p>"), "{html}");
-            assert!(!html.contains("<a "), "{html}");
-            assert!(html.len() < 20 * text.len(), "{}", html.len());
-            assert!(html.contains("river-mention"), "{html}");
-        }
-        // A mention in link text still renders as a chip inside the link.
-        let html = message_to_html_with_mentions(
-            &format!("[hi {token}](https://x.example)"),
-            &names,
-            None,
-        );
-        assert!(
-            html.contains("<a ") && html.contains("river-mention"),
-            "{html}"
-        );
-    }
-
-    /// Past the size limit, text is shown as escaped plain text with its line
-    /// breaks, and mentions still become chips.
-    #[test]
-    fn text_past_the_markdown_limit_renders_as_plain_text() {
-        let member = MemberId(freenet_scaffold::util::FastHash(7));
-        let names: HashMap<MemberId, String> = [(member, "Bob".to_string())].into();
-        let long = "**<b>x</b>**\n".repeat(MARKDOWN_MAX_SOURCE_BYTES / 10);
-        assert!(long.len() > MARKDOWN_MAX_SOURCE_BYTES);
-        let html = message_to_html(&long);
-        assert!(
-            html.starts_with("<p>**&lt;b&gt;x&lt;/b&gt;**<br />\n"),
-            "{html}"
-        );
-        assert!(
-            !html.contains("<strong>") && !html.contains("<b>"),
-            "{html}"
-        );
-        let with_mention = format!(
-            "{} {long}",
-            river_core::mention::encode_mention(member, "Bob")
-        );
-        let html = message_to_html_with_mentions(&with_mention, &names, None);
-        assert!(html.contains("river-mention"), "{html}");
-        assert!(description_to_html(&long, true).starts_with("<p>**&lt;b&gt;"));
-        // The reply preview parses only a prefix, as markdown.
-        assert!(
-            strip_markdown(&long).starts_with('x'),
-            "{}",
-            strip_markdown(&long)
-        );
-    }
-
-    /// A seeded sweep over short strings of markdown syntax, the shape that
-    /// found every input above. It is deterministic (fixed seed), so a failure
-    /// reproduces exactly; the panic message names the input.
-    #[test]
-    fn generated_markdown_renders_without_panicking() {
-        #[rustfmt::skip]
-        const PIECES: &[&str] = &[
-            "[", "]", "(", ")", "\"", "'", " ", "  ", "\t", "\n", "\n", "\r\n", "\r", "a",
-            "x y", "!", ":", "<", ">", "*", "_", "~", "`", "```", "~~~", "\\", "-", "#", "|",
-            "^", "=", "&", "&amp;", "&#;", "&#65;", "https://x.example", "www.a.example",
-            "c@d.example", "1.", "1)", "é", "\u{a0}", "😀", "[a](b \"", "[a](b '", "[a](b (",
-            "[a][", "[^", "]: ", "![", "](", "<a ", "<!--", "-->", "<![C", "    ", "> ",
-            "- ", "---", "| - |", "\\\n", "[ ]", "[x]", "\0",
-        ];
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for _ in 0..3_000 {
-            let len = 1 + (next() % 24) as usize;
-            let text: String = (0..len)
-                .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
-                .collect();
-            let rendered = std::panic::catch_unwind(|| render_every_markdown_path(&text));
-            assert!(rendered.is_ok(), "rendering {text:?} panicked");
-        }
-    }
-
-    #[test]
-    fn longest_valid_bare_link_still_converts() {
-        let rest = format!("/{}", "a".repeat(1999));
-        let link = format!("freenet://{RIVER_ID}{rest}");
-        let html = message_to_html(&format!("{link}."));
-        assert!(
-            anchor_to(&html, &format!("/v1/contract/web/{RIVER_ID}{rest}"), &link),
-            "a 2000-byte rest is valid and must still link"
-        );
-    }
-
-    /// `[<freenet:A/>](https://x)` nests an anchor inside a link label; the
-    /// inner one used to escape `finalize_anchors` with an empty href.
-    #[test]
-    fn nested_autolink_in_a_label_is_flattened() {
-        let html = message_to_html(&format!("[<freenet:{RIVER_ID}/>](https://evil.example/)"));
-        assert_eq!(html.matches("<a ").count(), 1, "{html}");
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{RIVER_ID}/"),
-                &format!("freenet:{RIVER_ID}/")
-            ),
-            "{html}"
-        );
-        assert!(!html.contains("evil.example"), "{html}");
-
-        let html = message_to_html("[see <mailto:a@b.example> here](https://x.example/)");
-        assert_eq!(html.matches("<a ").count(), 1, "{html}");
-        assert_eq!(html.matches("</a>").count(), 1, "{html}");
-        assert!(html.contains("href=\"https://x.example/\""), "{html}");
-    }
-
-    /// A link that opens a contract on the reader's node must not carry a
-    /// label naming a different contract; such a label is shown as text.
-    #[test]
-    fn label_naming_another_contract_is_not_a_link() {
-        for hidden in [
-            format!("http://x.example/v1/contract/web/{SAMPLE_ID}/"),
-            format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/"),
-            format!("//127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/"),
-            format!("/v1/contract/web/{SAMPLE_ID}/"),
-            format!("http:/v1/contract/web/{SAMPLE_ID}/"),
-            format!("HTTPS:../{SAMPLE_ID}/"),
-        ] {
-            for label in [
-                format!("freenet:{RIVER_ID}/ "),
-                format!("freenet:{RIVER_ID}/&#8203;"),
-                format!("*freenet:{RIVER_ID}/* app"),
-                format!("https://freenet.org/open#{RIVER_ID}/ "),
-                format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID_2}/"),
-                "freenet:raAqMhMG".to_string(),
-            ] {
-                let html = message_to_html(&format!("[{label}]({hidden})"));
-                assert!(!html.contains("<a "), "{label:?} -> {hidden}: {html}");
-            }
-        }
-    }
-
-    /// Labels that name the destination's own contract, or none at all, keep
-    /// their link (and the gateway rewrite).
-    #[test]
-    fn honest_labels_keep_their_link_and_rewrite() {
-        let href = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
-        let local = format!("href=\"/v1/contract/web/{SAMPLE_ID}/\"");
-        for label in [
-            "River update".to_string(),
-            "my freenet: node".to_string(),
-            format!("freenet:{SAMPLE_ID} (mirror)"),
-            format!("freenet:{}", &SAMPLE_ID[..8]),
-            format!("freenet:{}\u{22EF}{}", &SAMPLE_ID[..8], &SAMPLE_ID[36..]),
-        ] {
-            let html = message_to_html(&format!("[{label}]({href})"));
-            assert!(html.contains(&local), "{label:?}: {html}");
-        }
-        let html = message_to_html(&format!(
-            "[/v1/contract/web/{SAMPLE_ID}/](/v1/contract/web/{SAMPLE_ID}/)"
-        ));
-        assert!(html.contains("<a "), "{html}");
-        let html = message_to_html("[see /contract/web/ docs](/docs)");
-        assert!(html.contains("<a "), "{html}");
-        // A bare link whose href is the markdown crate's normalisation of its
-        // text is still rewritten.
-        let bare = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/{{x}}");
-        let html = message_to_html(&bare);
-        assert!(
-            html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/%7Bx%7D\"")),
-            "{html}"
-        );
-        // So is a v2 gateway URL.
-        let html = message_to_html(&format!(
-            "http://127.0.0.1:7509/v2/contract/web/{SAMPLE_ID}/"
-        ));
-        assert!(
-            html.contains(&format!("href=\"/v2/contract/web/{SAMPLE_ID}/\"")),
-            "{html}"
-        );
-    }
-
-    /// The label check sees what the reader sees: invisible characters,
-    /// character references, fancy text, homoglyphs and image alt text do not
-    /// hide an id.
-    #[test]
-    fn disguised_ids_in_labels_are_still_seen() {
-        let hidden = format!("http://x.example/v1/contract/web/{SAMPLE_ID}/");
-        for label in [
-            RIVER_ID.to_string(),
-            format!("free&#8203;net:{RIVER_ID}/"),
-            format!("freenet\u{FF1A}{RIVER_ID}/"),
-            format!("open {RIVER_ID}"),
-            format!("open {}", RIVER_ID.replace('a', "\u{0430}")),
-            format!("open {}", RIVER_ID.replace('M', "\u{200B}M\u{2060}")),
-            format!("open {}", RIVER_ID.replace('r', "&#114;")),
-            format!("free\u{200B}net:{}", &RIVER_ID[..10]),
-            format!("\u{1D41F}\u{1D42B}eenet:{RIVER_ID}"),
-            format!("![freenet:{RIVER_ID}](x.png)"),
-        ] {
-            let html = message_to_html(&format!("[{label}]({hidden})"));
-            assert!(
-                !html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}"))
-                    && !html.contains(&format!("href=\"{hidden}\"")),
-                "{label:?}: {html}"
-            );
-        }
-    }
-
-    /// A dot segment moves where the browser lands, so a link whose path
-    /// has one (or that is a contract path the parser refuses) has an unknown
-    /// destination, and any contract its label names blocks it.
-    #[test]
-    fn dot_segments_make_the_destination_unknown() {
-        let a = RIVER_ID;
-        let b = SAMPLE_ID;
-        for href in [
-            format!("/v1/contract/web/{a}/../{b}/"),
-            format!("/v1/contract/web/{a}/%2e%2e/{b}/"),
-            format!("/v1/contract/web/{a}/.%2E/{b}/"),
-            format!("http:/v1/contract/web/{a}/../{b}/"),
-            format!("http://127.0.0.1:7509/v1/contract/web/{a}/../{b}/"),
-            format!("//127.0.0.1:7509/v1/contract/web/{a}/%2e%2e/{b}/"),
-            format!("http://127.0.0.1:7509/v1/./contract/web/{b}/"),
-            format!("http://127.0.0.1:7509/v1/contract/web/%36%46{}/", &b[2..]),
-        ] {
-            for label in [format!("River: {a}"), "open freenet:raAqMhMG".to_string()] {
-                let html = message_to_html(&format!("[{label}]({href})"));
-                assert!(!html.contains("<a "), "{label:?} -> {href}: {html}");
-            }
-        }
-        // A relative "bare" link hides nothing only if it parses; this one
-        // shows A while resolving elsewhere.
-        let rel = format!("/v1/contract/web/{a}/%2e%2e/{b}/");
-        let html = message_to_html(&format!("[{rel}]({rel})"));
-        assert!(!html.contains("<a "), "{html}");
-    }
-
-    /// Breaks the reader does not see (or reads as an id wrapping) do not
-    /// split an id into runs too short to count.
-    #[test]
-    fn invisible_or_wrapping_breaks_do_not_split_a_claimed_id() {
-        let (head, tail) = RIVER_ID.split_at(20);
-        let hidden = format!("/v1/contract/web/{SAMPLE_ID}/");
-        for label in [
-            format!("{head}![]({hidden}x.png){tail}"),
-            format!("{head}![Q](x.png){tail}"),
-            format!("{head}\n{tail}"),
-            format!("{head}\u{0591}{tail}"),
-            format!("{head}\u{200A}{tail}"),
-            format!("{head}\u{2009}{tail}"),
-            format!("{head}\u{202F}{tail}"),
-            "freenet:/raAqMhMG".to_string(),
-            "freenet\u{A789}raAqMhMG".to_string(),
-            format!("{head}\u{000B}{tail}"),
-            format!("{head}\u{000C}{tail}"),
-            format!("{head}\u{0085}{tail}"),
-            format!("{head}\u{2028}{tail}"),
-            format!("{head}\u{2029}{tail}"),
-            format!("{head}\u{A7B3}{tail}"),
-            format!("{head}\u{10317}{tail}"),
-            format!("{head}\u{05BC}\u{05BC}\u{05BC}\u{05BC}{tail}"),
-            format!("{head}\u{A7AB}{tail}"),
-            format!("{head}\u{2D5D}{tail}"),
-            format!("{head}\u{302A}{tail}"),
-            format!("{head}\u{1D167}{tail}"),
-            "freenet:\u{05BC}raAqMhMG".to_string(),
-            "freenet:/\u{0E31}raAqMhMG".to_string(),
-            "freenet\u{A4FD}raAqMhMG".to_string(),
-            format!("{head}\u{222A}{tail}"),
-            format!("{head}\u{2A2F}{tail}"),
-            format!("{head}\u{311A}{tail}"),
-            format!("{head}{}{tail}", "\u{05BC}".repeat(12)),
-            format!("{head}\u{27D9}{tail}"),
-            format!("freenet:{}\u{2178}GbcW", &SAMPLE_ID_2[..3]),
-            format!("{head}{}{tail}", "\u{0EC8}".repeat(4)),
-            format!("{head}{}{tail}", "\u{0730}".repeat(9)),
-            format!("{head}\u{0E31}{}{tail}", "\u{0730}".repeat(4)),
-            format!("{head}\u{222A}\u{05C4}{tail}"),
-            format!("{head}\u{2A2F}\u{15F7}{tail}"),
-            format!("{head}\u{2282}\u{10B3}{tail}"),
-            format!("{head}\u{2E26}{tail}"),
-            format!("{head}\u{3147}{tail}"),
-            "freenet\u{2236}raAqMhMG".to_string(),
-        ] {
-            let html = message_to_html(&format!("[{label}]({hidden})"));
-            assert!(
-                !html.contains(&format!("href=\"{hidden}\"")),
-                "{label:?}: {html}"
-            );
-        }
-    }
-
-    /// A tooltip is label text too: one naming another contract unlinks a
-    /// link that opens on the reader's node; an honest one is kept.
-    #[test]
-    fn node_link_title_is_checked_like_the_label() {
-        let href = format!("/v1/contract/web/{SAMPLE_ID}/");
-        for text in [
-            format!("[River]({href} \"freenet:{RIVER_ID}\")"),
-            format!("[![River](x.png \"freenet:{RIVER_ID}\")]({href})"),
-        ] {
-            let html = message_to_html(&text);
-            assert!(!html.contains("<a "), "{text:?}: {html}");
-        }
-        let html = message_to_html(&format!(
-            "[Explore with Atlas](http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/ \"Atlas search engine\")"
-        ));
-        assert!(
-            html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/\""))
-                && html.contains("title=\"Atlas search engine\""),
-            "{html}"
-        );
-    }
-
-    #[test]
-    fn round5_label_bypasses_are_closed() {
-        let a = RIVER_ID;
-        let b = SAMPLE_ID;
-        let (head, tail) = a.split_at(20);
-        for text in [
-            // `://` later in a relative href does not make it absolute.
-            format!("[River {a}](/v1/contract/./web/{b}/?x=://)"),
-            format!("[River {a}](../{b}/#://)"),
-            format!("[freenet:raAqMhMG](../{b}/#://)"),
-            // Unfolded homoglyphs and zero-width marks inside an id.
-            format!("[{head}\u{0261}{tail}](/v1/contract/web/{b}/)"),
-            format!("[{head}\u{051A}{tail}](/v1/contract/web/{b}/)"),
-            format!("[{head}\u{0417}{tail}](/v1/contract/web/{b}/)"),
-            format!("[River: {head}\u{05BC}{tail}](/v1/contract/web/{b}/)"),
-            format!("[open freenet:raAq\u{05BC}MhMG](/v1/contract/web/{b}/)"),
-            // A look-alike that is not base58.
-            format!("[River: {head}O{tail}](/v1/contract/web/{b}/)"),
-            // Userinfo shows `freenet:<A>` first.
-            format!(
-                "[http://freenet:{a}@x.example/v1/contract/web/{b}/](http://127.0.0.1:7509/v1/contract/web/{b}/)"
-            ),
-        ] {
-            let html = message_to_html(&text);
-            assert!(!html.contains("<a "), "{text:?}: {html}");
-        }
-        // A bare URL whose text hides where it lands (encoded dot segment and
-        // id) is not a link.
-        let html = message_to_html(&format!(
-            "http://127.0.0.1:7509/v1/contract/web/{a}/%2e%2e/%36%46{}/",
-            &b[2..]
-        ));
-        assert!(!html.contains("<a "), "{html}");
-        let rel = format!("/v1/contract/web/{a}/%2e%2e/{b}/#://");
-        let html = message_to_html(&format!("[{rel}]({rel})"));
-        assert!(!html.contains("<a "), "{html}");
-    }
-
-    #[test]
-    fn claim_rule_edges() {
-        let b = SAMPLE_ID;
-        let href = format!("/v1/contract/web/{b}/");
-        // A claim must be a PREFIX of the destination id, not just appear in it.
-        let html = message_to_html(&format!("[freenet:{}]({href})", &b[3..12]));
-        assert!(!html.contains("<a "), "substring, not prefix: {html}");
-        let html = message_to_html(&format!("[freenet:{}]({href})", &b[..9]));
-        assert!(html.contains("<a "), "a true prefix is consistent: {html}");
-        // A long lowercase run (a hex hash) is not an id claim.
-        let html = message_to_html(&format!(
-            "[commit 3f2a9c1be47d58a6f0c2e9b1d3a4f5e6c7b8a9d0]({href})"
-        ));
-        assert!(html.contains("<a "), "hex hash is not a claim: {html}");
-        // A URL-shaped label for the right contract that ALSO names another.
-        let html = message_to_html(&format!(
-            "[http://other.example/v1/contract/web/{b}/freenet:{RIVER_ID}](http://other.example/v1/contract/web/{b}/x)"
-        ));
-        assert!(!html.contains("<a "), "embedded second claim: {html}");
-        // A bare URL whose id is percent-encoded does not show where it goes.
-        let html = message_to_html(&format!(
-            "http://127.0.0.1:7509/v1/contract/web/%36%46{}/",
-            &b[2..]
-        ));
-        assert!(!html.contains("<a "), "encoded id: {html}");
-    }
-
-    /// A pasted URL is a link to what it shows, but not when the text before
-    /// its contract path reads as another destination, or its tooltip does.
-    #[test]
-    fn pasted_url_that_poses_before_its_path_is_not_a_link() {
-        let b = SAMPLE_ID;
-        let a = RIVER_ID;
-        for url in [
-            format!("http://freenet.org:{a}@127.0.0.1:7509/v1/contract/web/{b}/#freenet"),
-            format!("http://freenet:{a}@127.0.0.1:7509/v1/contract/web/{b}/?via=freenet"),
-            format!("http://{a}.example/v1/contract/web/{b}/#freenet"),
-            format!("http://River@127.0.0.1:7509/v1/contract/web/{b}/"),
-        ] {
-            for text in [url.clone(), format!("<{url}>"), format!("[{url}]({url})")] {
-                let html = message_to_html(&text);
-                assert!(!html.contains("<a "), "{text:?}: {html}");
-            }
-        }
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{b}/");
-        let html = message_to_html(&format!("[{url}]({url} \"freenet:{a}\")"));
-        assert!(!html.contains("<a "), "title on a pasted link: {html}");
-    }
-
-    #[test]
-    fn freenet_in_prose_labels_is_not_a_claim() {
-        let href = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
-        for label in [
-            "Try it on Freenet: Harvest market",
-            "Freenet: Ghostkey",
-            "Get Freenet: Windows installer",
-            "freenet:Harvest",
-            "Freenet: GitHub mirror",
-            "freenet: iPhone app",
-            "Freenet: River2026 launch",
-            "Freenet: Stra\u{00DF}e",
-            "Join\u{00A0}the\u{00A0}Freenet\u{00A0}Official\u{00A0}River\u{00A0}Chat\u{00A0}Room",
-            "FreenetのRiverでチャット、DeltaでWebサイト、AtlasでHarvest市場",
-            "ติดตั้งFreenetแล้วเปิดRiverและDeltaหรือGhostKeyและHarvestได้เลย",
-        ] {
-            let html = message_to_html(&format!("[{label}]({href})"));
-            assert!(
-                html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/\"")),
-                "{label:?}: {html}"
-            );
-        }
-    }
-
-    #[test]
-    fn bare_link_in_a_table_cell_stops_at_the_cell() {
-        let html = message_to_html(&format!("|a|b|\n|-|-|\n|freenet:{RIVER_ID}/x|y|"));
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{RIVER_ID}/x"),
-                &format!("freenet:{RIVER_ID}/x")
-            ),
-            "{html}"
-        );
-        assert!(html.contains("<td>y</td>"), "{html}");
-    }
-
-    #[test]
-    fn bare_link_inside_cjk_text() {
-        let html = message_to_html(&format!("打开freenet:{RIVER_ID}/。"));
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{RIVER_ID}/"),
-                &format!("freenet:{RIVER_ID}/")
-            ),
-            "{html}"
-        );
-    }
-
-    /// A pasted gateway URL is a link to what it shows (host and contract
-    /// id first); when its path also names a contract it is shown in full
-    /// rather than shortened to an 8-character id prefix.
-    #[test]
-    fn pasted_gateway_url_naming_another_contract_is_shown_in_full() {
-        for url in [
-            format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/freenet:{RIVER_ID}"),
-            format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/x/{RIVER_ID}"),
-        ] {
-            let html = message_to_html(&url);
-            assert!(html.contains(&format!(">{url}</a>")), "{html}");
-            assert!(
-                html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/")),
-                "{html}"
-            );
-        }
-    }
-
-    /// River's own invite links carry a long base58 code; a pasted one must
-    /// stay a (shortened) link, not be read as naming another contract.
-    #[test]
-    fn pasted_river_invite_link_stays_a_link() {
-        let code =
-            "2NEpo7TZRRrLZSi2U7MpNwwdMV3fjDaZaYcAhMR1FUD4xYLQ7mQAnfk9dVYNEUoGXxBxcMGRgHtqXPC";
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{RIVER_ID}/?invitation={code}");
-        for text in [
-            url.clone(),
-            format!("Join: {url}"),
-            format!("2. Open this link: {url}"),
-        ] {
-            let html = message_to_html(&text);
-            assert!(
-                html.contains(&format!(
-                    "href=\"/v1/contract/web/{RIVER_ID}/?invitation={code}\""
-                )),
-                "{text:?}: {html}"
-            );
-            assert!(
-                html.contains(&format!(
-                    ">freenet:{}/?invitation={code}</a>",
-                    &RIVER_ID[..8]
-                )),
-                "{text:?}: {html}"
-            );
-        }
-    }
-
-    /// A share link that sits right against a non-prose range (no space)
-    /// still links: the overlap sweep treats ranges as half-open.
-    #[test]
-    fn bare_link_right_after_a_code_span_still_links() {
-        let html = message_to_html(&format!("`code`freenet:{RIVER_ID}"));
-        assert!(
-            anchor_to(
-                &html,
-                &format!("/v1/contract/web/{RIVER_ID}"),
-                &format!("freenet:{RIVER_ID}")
-            ),
-            "{html}"
-        );
-    }
-
-    /// A relative link already resolves on the reader's node, so behind a
-    /// label that reads as a different Freenet link it is shown as text.
-    #[test]
-    fn relative_link_behind_a_freenet_looking_label_is_unlinked() {
-        for text in [
-            format!("[freenet:{RIVER_ID}/ ](/v1/contract/web/{SAMPLE_ID}/)"),
-            format!("[**freenet:{RIVER_ID}/**](../{SAMPLE_ID}/)"),
-            format!("[https://freenet.org/open#{RIVER_ID}/ ](/v1/contract/web/{SAMPLE_ID}/)"),
-            format!("[freenet:{RIVER_ID}/ ](javascript:alert(1))"),
-        ] {
-            let html = message_to_html(&text);
-            assert!(!html.contains("<a "), "{text:?}: {html}");
-            assert!(html.contains("freenet"), "{text:?}: label kept: {html}");
-        }
-        // An ordinary relative link, and an external one, are left alone.
-        let html = message_to_html(&format!("[docs](/v1/contract/web/{SAMPLE_ID}/)"));
-        assert!(html.contains("<a "), "{html}");
-        let html = message_to_html(&format!("[freenet:{RIVER_ID}/ ](https://example.com/)"));
-        assert!(html.contains("href=\"https://example.com/\""), "{html}");
-    }
-
-    #[test]
-    fn relative_href_classification() {
-        for h in ["", "/v1/x", "../x", "x", "?q", "#f", "a/b:c"] {
-            assert!(is_relative_href(h), "{h:?}");
-        }
-        for h in ["//evil.example/", "https://x", "mailto:a@b", "javascript:x"] {
-            assert!(!is_relative_href(h), "{h:?}");
-        }
-    }
-
-    /// The source scan and the render parse different text (a sentinel in
-    /// place of the link); where they disagree, the message renders as if the
-    /// bare-link pass had not run, never with a sentinel in a URL or with
-    /// content lost.
-    #[test]
-    fn bare_link_pass_falls_back_when_the_two_parses_disagree() {
-        for text in [
-            format!("[x](freenet:{RIVER_ID}/(a )"),
-            format!("![x](freenet:{RIVER_ID}/(a )"),
-            format!("[r]: freenet:{RIVER_ID}/(a \n\n[x][r]"),
-            format!("[r]: /x/freenet:{RIVER_ID}/(\n\n[r]"),
-            format!("[see freenet:{RIVER_ID}/] ](https://example.com/)"),
-        ] {
-            let html = message_to_html(&text);
-            let plain = message_to_html_inner(&text, false);
-            assert!(
-                !html.contains('\u{E002}') && !html.to_ascii_uppercase().contains("%EE%80%82"),
-                "{text:?}: {html}"
-            );
-            // Same structure as a render with no bare-link pass (the gateway
-            // flag only changes hrefs, and none of these has a gateway URL).
-            assert_eq!(html, plain, "{text:?}");
-        }
-    }
-
-    #[test]
-    fn restore_accepts_only_prose_sentinels_each_exactly_once() {
-        let links = vec![format!("freenet:{RIVER_ID}/")];
-        let s = |i: usize| format!("{BARE_LINK_OPEN}{i}{BARE_LINK_CLOSE}");
-        let ok = restore_bare_freenet_links(&format!("<p>a {} b</p>", s(0)), &links);
-        assert_eq!(
-            ok.as_deref(),
-            Some(format!("<p>a <a href=\"\">freenet:{RIVER_ID}/</a> b</p>").as_str())
-        );
-        for html in [
-            format!("<p><code>{}</code></p>", s(0)),
-            format!("<p><a href=\"x\">{}</a></p>", s(0)),
-            format!("<pre><code>{}</code></pre>", s(0)),
-            format!("<img alt=\"{}\" />", s(0)),
-            format!("<p>{} {}</p>", s(0), s(0)),
-            "<p>missing</p>".to_string(),
-            format!("<p>{}</p>", s(1)),
-            format!("<a href=\"%EE%80%820%EE%80%83\">x</a><p>{}</p>", s(0)),
-        ] {
-            assert_eq!(restore_bare_freenet_links(&html, &links), None, "{html}");
-        }
-    }
-
-    /// Candidates longer than the longest valid link plus trailing-punctuation
-    /// slack are not examined at all (the scan's work bound), even if trimming
-    /// would have left a valid link.
-    #[test]
-    fn bare_link_candidate_length_cap_is_enforced() {
-        let link = format!("freenet:{RIVER_ID}");
-        let short = format!("{link}{}", "!".repeat(10));
-        let html = message_to_html(&short);
-        assert!(html.contains("href=\"/v1/contract/web/"), "{html}");
-        let over = format!("{link}{}", "!".repeat(MAX_BARE_LINK_CANDIDATE_LEN));
-        let html = message_to_html(&over);
-        assert!(!html.contains("<a "), "over-long candidate must be skipped");
-    }
-
-    /// Whitespace, `<` and `>` end an angle-bracket autolink, after which GFM
-    /// autolinks the leading part as a plain URL. A vector containing one
-    /// therefore tests markdown's tokenising, not the validator, and its
-    /// prefix may legitimately be a valid link (the text shown is then that
-    /// prefix, so it is still honest).
-    fn ends_markdown_autolink(raw: &str) -> bool {
-        raw.contains(|c: char| c.is_whitespace() || c == '<' || c == '>')
-    }
-
-    /// Through the full renderer, every shared vector must convert to exactly
-    /// its `local_path` (valid) or produce no link to a node path at all
-    /// (invalid). The angle-bracket autolink form keeps the text verbatim
-    /// (no GFM trailing-punctuation trimming), so the check is exact.
-    #[test]
-    fn shared_vectors_through_the_renderer() {
-        let parsed: serde_json::Value =
-            serde_json::from_str(include_str!("../util/share-link-vectors.json")).unwrap();
-        for v in parsed["vectors"].as_array().unwrap() {
-            let raw = v["raw"].as_str().unwrap();
-            let note = v["note"].as_str().unwrap_or("");
-            for prefix in ["https://freenet.org/open#", "freenet:"] {
-                let html = message_to_html(&format!("<{prefix}{raw}>"));
-                if v["valid"].as_bool().unwrap() {
-                    let path = v["local_path"].as_str().unwrap();
-                    let href = format!("href=\"{}\"", escape_html_attr(path));
-                    assert!(
-                        html.contains(&href),
-                        "valid vector ({note}) via {prefix:?}: expected {href} in {html}"
-                    );
-                } else if !ends_markdown_autolink(raw) {
-                    assert!(
-                        !html.contains("href=\"/v1/"),
-                        "invalid vector ({note}) via {prefix:?} must not link \
-                         to the node: {html}"
-                    );
-                }
-            }
-            // Bare text: an invalid vector must never become a node link.
-            // Whitespace ends a bare candidate (as it ends any autolink), so a
-            // vector containing it tests tokenising, not validation: skip it.
-            if !v["valid"].as_bool().unwrap() && !raw.contains(char::is_whitespace) {
-                let html = message_to_html(&format!("see freenet:{raw} now"));
-                assert!(
-                    !html.contains("href=\"/v1/"),
-                    "invalid vector ({note}) as bare text must not link: {html}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn freenet_web_url_label_shortened() {
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
-        let html = message_to_html(&url);
-        assert!(
-            html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/\"")),
-            "href should be rewritten to absolute path: {html}"
-        );
-        assert!(
-            !html.contains("href=\"http://127.0.0.1:7509/"),
-            "host/port must be stripped from href: {html}"
-        );
-        assert!(
-            html.contains(">freenet:UDzGbcWr</a>"),
-            "label should be shortened to 8-char prefix: {html}"
-        );
-        assert!(
-            !html.contains(&format!(">{url}</a>")),
-            "raw URL should not appear as link text: {html}"
-        );
-    }
-
-    #[test]
-    fn freenet_web_url_with_path_keeps_path() {
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/index.html");
-        let html = message_to_html(&url);
-        assert!(
-            html.contains(">freenet:UDzGbcWr/index.html</a>"),
-            "label should include path: {html}"
-        );
-    }
-
-    #[test]
-    fn freenet_web_url_https_handled() {
-        let url = format!("https://nova.locut.us/v1/contract/web/{SAMPLE_ID}/");
-        let html = message_to_html(&url);
-        assert!(
-            html.contains(">freenet:UDzGbcWr</a>"),
-            "https URL should also be beautified: {html}"
-        );
-    }
-
-    #[test]
-    fn freenet_web_url_with_query_kept() {
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/?invite=abc");
-        let html = message_to_html(&url);
-        assert!(
-            html.contains(">freenet:UDzGbcWr/?invite=abc</a>"),
-            "query string should be kept: {html}"
-        );
-    }
-
-    #[test]
-    fn custom_markdown_link_text_preserved() {
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
-        let html = message_to_html(&format!("see [my room]({url}) here"));
-        assert!(
-            html.contains(">my room</a>"),
-            "user-supplied link text should be preserved: {html}"
-        );
-        assert!(
-            !html.contains("freenet:UDzGbcWr"),
-            "should not rewrite label when link text is custom: {html}"
-        );
-        assert!(
-            html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/\"")),
-            "href should still be rewritten so the link works for any reader: {html}"
-        );
-    }
-
-    #[test]
-    fn non_freenet_url_unchanged() {
-        let html = message_to_html("https://example.com/foo/bar");
-        assert!(
-            html.contains(">https://example.com/foo/bar</a>"),
-            "unrelated URLs should keep their full text: {html}"
-        );
-    }
-
-    #[test]
-    fn freenet_url_in_code_span_unchanged() {
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
-        let html = message_to_html(&format!("run `curl {url}`"));
-        assert!(
-            !html.contains("<a "),
-            "URL inside backticks should not be linkified: {html}"
-        );
-        assert!(
-            !html.contains("freenet:UDzGbcWr"),
-            "URL inside backticks should not be beautified: {html}"
-        );
-    }
-
-    #[test]
-    fn non_web_contract_path_left_alone() {
-        // /v1/contract/<id>/ (no /web/) is not a real browsable route; leave the
-        // link text as-is rather than pretend we beautified it.
-        let url = format!("http://127.0.0.1:7509/v1/contract/{SAMPLE_ID}/");
-        let html = message_to_html(&url);
-        assert!(
-            html.contains(&format!(">{url}</a>")),
-            "non-web contract URL should keep its full text: {html}"
-        );
-    }
-
-    #[test]
-    fn marker_in_query_string_not_beautified() {
-        // External redirect URLs that happen to embed the marker in a query
-        // parameter must NOT be presented as Freenet links — that would be a
-        // phishing vector (caught by Codex review of #223).
-        let url = format!("https://evil.example/redirect?next=/v1/contract/web/{SAMPLE_ID}/");
-        let html = message_to_html(&url);
-        assert!(
-            !html.contains("freenet:"),
-            "marker buried in query must not produce a freenet: label: {html}"
-        );
-    }
-
-    #[test]
-    fn marker_after_userinfo_or_path_segment_not_beautified() {
-        // Marker buried deeper in the path must not match either.
-        let url = format!("https://evil.example/foo/v1/contract/web/{SAMPLE_ID}/");
-        let html = message_to_html(&url);
-        assert!(
-            !html.contains("freenet:"),
-            "marker as a deeper path segment must not match: {html}"
-        );
-    }
-
-    #[test]
-    fn multiple_freenet_links_in_one_message() {
-        let url_a = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
-        let url_b = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID_2}/foo.html");
-        let html = message_to_html(&format!("see {url_a} and also {url_b} thanks"));
-        assert!(
-            html.contains(">freenet:UDzGbcWr</a>"),
-            "first link should be shortened: {html}"
-        );
-        assert!(
-            html.contains(">freenet:EqJ5YpEE/foo.html</a>"),
-            "second link should be shortened: {html}"
-        );
-        assert!(
-            html.matches("<a ").count() == 2,
-            "both anchors should be present: {html}"
-        );
-    }
-
-    #[test]
-    fn empty_contract_id_not_beautified() {
-        // /v1/contract/web// has no id — bail out and leave the original.
-        let url = "http://127.0.0.1:7509/v1/contract/web//".to_string();
-        let html = message_to_html(&url);
-        assert!(
-            !html.contains("freenet:"),
-            "empty contract id must not produce a label: {html}"
-        );
-    }
-
-    #[test]
-    fn ampersand_in_query_keeps_full_url() {
-        // GFM HTML-escapes `&` to `&amp;` in BOTH href and text content, so the
-        // h == inner equality still holds and beautification proceeds with the
-        // entity-encoded suffix.
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/?a=1&b=2");
-        let html = message_to_html(&url);
-        assert!(
-            html.contains(">freenet:UDzGbcWr/?a=1&amp;b=2</a>"),
-            "ampersand-bearing query should be kept (entity-encoded): {html}"
-        );
-    }
-
-    #[test]
-    fn href_rewritten_strips_host_and_port() {
-        // The whole point of this fix: a link pasted with `127.0.0.1:7509`
-        // by user A must still resolve for user B, who is connected to
-        // their own gateway on a different host/port.
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/index.html");
-        let html = message_to_html(&url);
-        assert!(
-            html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/index.html\"")),
-            "href should be rewritten to a same-origin absolute path: {html}"
-        );
-        assert!(
-            !html.contains("127.0.0.1:7509"),
-            "the original host:port must not survive anywhere in the output: {html}"
-        );
-    }
-
-    #[test]
-    fn href_rewrite_preserves_fragment() {
-        // Lukas's report (matrix, 2026-04-27): pasted River room URLs include a
-        // fragment like `#AWPjDQdKey/1/home`. Stripping the host but losing the
-        // fragment would still break navigation, so this guards the suffix path.
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID_2}/#AWPjDQdKey/1/home");
-        let html = message_to_html(&url);
-        assert!(
-            html.contains(&format!(
-                "href=\"/v1/contract/web/{SAMPLE_ID_2}/#AWPjDQdKey/1/home\""
-            )),
-            "fragment should be carried through the rewrite: {html}"
-        );
-    }
-
-    #[test]
-    fn href_rewrite_handles_https() {
-        let url = format!("https://gw.example.com/v1/contract/web/{SAMPLE_ID}/");
-        let html = message_to_html(&url);
-        assert!(
-            html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/\"")),
-            "https URLs should also have host stripped: {html}"
-        );
-    }
-
-    #[test]
-    fn invalid_base58_mid_id_not_rewritten() {
-        // The id_end scan stops at the first non-base58 char. Construct a
-        // string where an `O` sits 20 chars in: id_end == 20 falls outside
-        // the 43|44 length window, so the URL must not be rewritten. This
-        // exercises the "valid base58 chars surround a forbidden char"
-        // path, not the "first char is forbidden" path that returns id_end=0.
-        let mid_bogus = format!(
-            "{}O{}",
-            &SAMPLE_ID[..20],
-            &SAMPLE_ID[21..] // total = 20 + 1 + 22 = 43 chars, but with `O` at position 20
-        );
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{mid_bogus}/index.html");
-        let html = message_to_html(&url);
-        assert!(
-            !html.contains("freenet:"),
-            "bogus ID with mid-string non-base58 char must not be beautified: {html}"
-        );
-        assert!(
-            html.contains(&format!("href=\"{url}\"")),
-            "bogus ID must leave href alone (host/port preserved): {html}"
-        );
-    }
-
-    #[test]
-    fn short_id_segment_not_rewritten() {
-        // ID segments shorter than 43 chars cannot be BLAKE3 hashes.
-        let url = "http://127.0.0.1:7509/v1/contract/web/tooshort/page.html".to_string();
-        let html = message_to_html(&url);
-        assert!(
-            !html.contains("freenet:"),
-            "short ID must not be beautified: {html}"
-        );
-        assert!(
-            html.contains(&format!("href=\"{url}\"")),
-            "short ID must leave href alone: {html}"
-        );
-    }
-
-    #[test]
-    fn overlong_id_segment_not_rewritten() {
-        // ID segments longer than 44 chars also cannot be BLAKE3 hashes.
-        let too_long = "a".repeat(45);
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{too_long}/");
-        let html = message_to_html(&url);
-        assert!(
-            !html.contains("freenet:"),
-            "overlong ID must not be beautified: {html}"
-        );
-        assert!(
-            html.contains(&format!("href=\"{url}\"")),
-            "overlong ID must leave href alone: {html}"
-        );
-    }
-
-    #[test]
-    fn id_segment_42_chars_not_rewritten() {
-        // 42-char base58 segment: one char short of the lower bound.
-        // Pins the lower edge of the `matches!(id_end, 43 | 44)` predicate.
-        let too_short = "a".repeat(42);
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{too_short}/");
-        let html = message_to_html(&url);
-        assert!(
-            !html.contains("freenet:"),
-            "42-char ID is one short of lower bound, must not be beautified: {html}"
-        );
-        assert!(
-            html.contains(&format!("href=\"{url}\"")),
-            "42-char ID must leave href alone: {html}"
-        );
-    }
-
-    #[test]
-    fn dev_mode_does_not_rewrite_href_but_still_beautifies_label() {
-        // When River is served outside a gateway (e.g. `dx serve`,
-        // `cargo make dev-example`, or `python -m http.server`), there is no
-        // gateway behind the dev server to redirect to. Stripping the host
-        // would turn a working `https://gw.example/v1/contract/web/<id>/`
-        // link into a 404 against the dev server. Leave the href intact;
-        // the label can still be shortened (purely cosmetic).
-        let url = format!("https://gw.example.com/v1/contract/web/{SAMPLE_ID}/");
-        let html = message_to_html_inner(&url, /* behind_gateway = */ false);
-        assert!(
-            html.contains(&format!("href=\"{url}\"")),
-            "dev-mode must preserve the original gateway-qualified href: {html}"
-        );
-        assert!(
-            !html.contains("href=\"/v1/contract/web/"),
-            "dev-mode must not produce a same-origin absolute path: {html}"
-        );
-        assert!(
-            html.contains(">freenet:UDzGbcWr</a>"),
-            "label beautification still applies in dev mode (cosmetic only): {html}"
-        );
-    }
-
-    #[test]
-    fn path_traversal_in_suffix_not_rewritten() {
-        // Defense against an attacker pasting a URL whose suffix contains
-        // `..` segments. Without this guard, the same-origin rewrite would
-        // hand the browser a path that normalizes onto unrelated endpoints
-        // on the reader's local gateway — turning a paste into a CSRF-style
-        // redirect. (Caught in skeptical review of #224.)
-        let url = format!(
-            "http://attacker.example/v1/contract/web/{SAMPLE_ID}/../../v1/peer/diagnostics"
-        );
-        let html = message_to_html(&url);
-        assert!(
-            !html.contains("href=\"/v1/contract/web/"),
-            "URL with `..` segments in suffix must NOT be rewritten to same-origin: {html}"
-        );
-        assert!(
-            !html.contains("freenet:"),
-            "URL with `..` segments in suffix must not be beautified either: {html}"
-        );
-        // Its text names a contract but the dot segments move where it lands
-        // (on the reader's node too, when the host is theirs), so since #733
-        // it is shown as plain text rather than as a link to either place.
-        assert!(
-            !html.contains("<a ") && html.contains(&url),
-            "a `..` gateway URL must be shown as text, never as a link: {html}"
-        );
-    }
-
-    #[test]
-    fn dotdot_in_query_or_fragment_is_fine() {
-        // `..` is only dangerous as a path segment — the browser normalizes
-        // path segments before the `?` or `#`. A literal `..` inside a query
-        // value or fragment is just data and should not block the rewrite.
-        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/?next=../foo");
-        let html = message_to_html(&url);
-        assert!(
-            html.contains(&format!(
-                "href=\"/v1/contract/web/{SAMPLE_ID}/?next=../foo\""
-            )),
-            "`..` in query string should not block the rewrite: {html}"
-        );
-    }
-
-    #[test]
-    fn non_http_scheme_not_rewritten() {
-        // `parse_freenet_web_url` must restrict to http/https. Defense in
-        // depth: if the markdown crate (or a future change) ever surfaces a
-        // `[label](javascript:...)` link, we want the parser to refuse to
-        // touch it rather than trust the upstream sanitizer alone.
-        // Markdown autolinks won't normally produce non-http(s) URLs from
-        // bare text, so we exercise this via the explicit-link form.
-        let html = message_to_html(&format!(
-            "[click](ftp://x.example/v1/contract/web/{SAMPLE_ID}/)"
-        ));
-        assert!(
-            !html.contains("href=\"/v1/contract/web/"),
-            "non-http(s) scheme must not be rewritten to same-origin: {html}"
-        );
     }
 
     // -----------------------------------------------------------------
@@ -10351,362 +4494,6 @@ mod tests {
             rendered.contains("v5"),
             "the rotated-past placeholder should surface the missing \
              version number, got: {rendered}"
-        );
-    }
-
-    // --- @mention rendering ---------------------------------------------
-
-    fn mid_from(hex: &str) -> MemberId {
-        river_core::mention::member_id_from_hex(hex).unwrap()
-    }
-
-    fn msg_id(seed: &[u8]) -> MessageId {
-        MessageId(freenet_scaffold::util::fast_hash(seed))
-    }
-
-    /// The cached renderer must always return exactly what the uncached
-    /// renderer would for the *current* inputs — a repeat call (hit) and a
-    /// content edit (same id) must each reflect current state.
-    #[test]
-    fn cached_message_html_matches_uncached_across_input_changes() {
-        clear_message_html_cache();
-        let id = msg_id(b"m-cache-1");
-        let alice = mid_from("00000000000000aa");
-        let me = mid_from("00000000000000bb");
-        let mut names = HashMap::new();
-        names.insert(alice, "Alice".to_string());
-        let fp = member_names_fingerprint(&names);
-
-        // Plain (mention-free) body: repeat call returns identical HTML.
-        let text = "hello **world** https://freenet.org";
-        let first = render_message_html_cached(&id, text, &names, fp, Some(me));
-        let second = render_message_html_cached(&id, text, &names, fp, Some(me));
-        assert_eq!(first, second, "cache hit is identical");
-        assert_eq!(
-            first,
-            message_to_html_with_mentions(text, &names, Some(me)),
-            "cached output equals uncached"
-        );
-
-        // Editing the body (same id) invalidates and re-renders.
-        let edited = "goodbye **world**";
-        let after_edit = render_message_html_cached(&id, edited, &names, fp, Some(me));
-        assert_eq!(
-            after_edit,
-            message_to_html_with_mentions(edited, &names, Some(me)),
-            "edited content re-rendered"
-        );
-        assert_ne!(after_edit, first, "edit changed the HTML");
-    }
-
-    /// A mention chip renders the member's *current* nickname; renaming the
-    /// member must invalidate the cached body even though its text is unchanged.
-    #[test]
-    fn cached_message_html_reflects_member_rename_for_mentions() {
-        clear_message_html_cache();
-        let id = msg_id(b"m-cache-2");
-        let alice = mid_from("00000000000000aa");
-        let me = mid_from("00000000000000bb");
-        let token = river_core::mention::encode_mention(alice, "Alice");
-        let text = format!("hey {token}!");
-
-        let mut names = HashMap::new();
-        names.insert(alice, "Alice".to_string());
-        let fp1 = member_names_fingerprint(&names);
-        let before = render_message_html_cached(&id, &text, &names, fp1, Some(me));
-        assert!(
-            before.contains("Alice"),
-            "chip shows current name: {before}"
-        );
-
-        // Rename Alice -> Roberta (not a substring of the old name). Same
-        // message text, new member map.
-        names.insert(alice, "Roberta".to_string());
-        let fp2 = member_names_fingerprint(&names);
-        assert_ne!(fp1, fp2, "rename changes the member fingerprint");
-        let after = render_message_html_cached(&id, &text, &names, fp2, Some(me));
-        assert_eq!(
-            after,
-            message_to_html_with_mentions(&text, &names, Some(me)),
-            "rename invalidated the cached chip"
-        );
-        assert!(after.contains("Roberta"), "chip shows new name: {after}");
-        assert!(!after.contains("Alice"), "old name gone: {after}");
-    }
-
-    /// A mention-free body must fingerprint the same regardless of the member
-    /// map, so ordinary messages survive member joins/renames in the cache; a
-    /// body carrying a mention token must incorporate the member fingerprint.
-    #[test]
-    fn message_html_fingerprint_gates_member_inputs_on_mentions() {
-        let me = mid_from("00000000000000bb");
-        let plain = "just a normal message, no mentions here";
-        assert_eq!(
-            message_html_fingerprint(plain, 111, Some(me)),
-            message_html_fingerprint(plain, 222, Some(me)),
-            "mention-free fingerprint ignores member fp"
-        );
-
-        let alice = mid_from("00000000000000aa");
-        let token = river_core::mention::encode_mention(alice, "Alice");
-        let mentioned = format!("ping {token}");
-        assert_ne!(
-            message_html_fingerprint(&mentioned, 111, Some(me)),
-            message_html_fingerprint(&mentioned, 222, Some(me)),
-            "mention fingerprint depends on member fp"
-        );
-    }
-
-    /// `prune_message_html_cache` drops entries for messages no longer visible
-    /// (e.g. after a room switch) while keeping the still-visible ones.
-    #[test]
-    fn prune_message_html_cache_bounds_to_visible_set() {
-        clear_message_html_cache();
-        let me = mid_from("00000000000000bb");
-        let names = HashMap::new();
-        let fp = member_names_fingerprint(&names);
-        let keep = msg_id(b"keep");
-        let drop = msg_id(b"drop");
-        render_message_html_cached(&keep, "keep me", &names, fp, Some(me));
-        render_message_html_cached(&drop, "drop me", &names, fp, Some(me));
-        assert_eq!(MESSAGE_HTML_CACHE.with(|c| c.borrow().len()), 2);
-
-        let mut visible = std::collections::HashSet::new();
-        visible.insert(keep.clone());
-        prune_message_html_cache(&visible);
-
-        MESSAGE_HTML_CACHE.with(|c| {
-            let c = c.borrow();
-            assert!(c.contains_key(&keep), "visible entry kept");
-            assert!(!c.contains_key(&drop), "off-screen entry pruned");
-        });
-    }
-
-    #[test]
-    fn strip_markdown_removes_formatting_and_keeps_link_text() {
-        let s = strip_markdown("**bold** and `code` and [a link](http://x.example) end");
-        assert!(!s.contains('*'), "emphasis markers removed: {s}");
-        assert!(!s.contains('`'), "code fences removed: {s}");
-        assert!(!s.contains("http://x.example"), "link url dropped: {s}");
-        assert!(s.contains("bold") && s.contains("code") && s.contains("end"));
-        assert!(s.contains("a link"), "link visible text kept: {s}");
-    }
-
-    #[test]
-    fn clean_reply_preview_resolves_mention_to_current_name_and_strips_markdown() {
-        let id = mid_from("00000000000000aa");
-        let mut names = HashMap::new();
-        names.insert(id, "Alice".to_string());
-        // Token snapshot is "OldAlice"; the live map says "Alice".
-        let token = river_core::mention::encode_mention(id, "OldAlice");
-        let cleaned = clean_reply_preview(&format!("hey {token}, **see** this"), &names);
-        assert!(
-            cleaned.contains("@Alice"),
-            "current nickname used: {cleaned}"
-        );
-        assert!(
-            !cleaned.contains("OldAlice"),
-            "snapshot overridden: {cleaned}"
-        );
-        assert!(
-            !cleaned.contains("rv:"),
-            "no raw mention token syntax: {cleaned}"
-        );
-        assert!(
-            !cleaned.contains("**") && !cleaned.contains("]("),
-            "markdown stripped: {cleaned}"
-        );
-        assert!(cleaned.contains("see"));
-    }
-
-    #[test]
-    fn mention_chip_uses_current_name_not_snapshot() {
-        let id = mid_from("00000000000000aa");
-        let mut names = HashMap::new();
-        names.insert(id, "CurrentName".to_string());
-        let token = river_core::mention::encode_mention(id, "OldName");
-        let html = message_to_html_with_mentions(
-            &format!("hi {token}!"),
-            &names,
-            Some(mid_from("00000000000000ff")),
-        );
-        assert!(
-            html.contains("data-member-id=\"00000000000000aa\""),
-            "chip must carry the lossless member id: {html}"
-        );
-        assert!(
-            html.contains(">@CurrentName</span>"),
-            "chip must show the CURRENT name, following renames: {html}"
-        );
-        assert!(
-            !html.contains("OldName"),
-            "stale snapshot name must be overridden: {html}"
-        );
-    }
-
-    #[test]
-    fn mention_chip_falls_back_to_snapshot_for_unknown_member() {
-        let id = mid_from("0000000000000abc");
-        let names = HashMap::new(); // member not resolvable
-        let token = river_core::mention::encode_mention(id, "Ghost");
-        let html =
-            message_to_html_with_mentions(&token, &names, Some(mid_from("0000000000000001")));
-        assert!(
-            html.contains(">@Ghost</span>"),
-            "unknown member falls back to the token's snapshot name: {html}"
-        );
-    }
-
-    #[test]
-    fn mention_chip_escapes_attacker_controlled_nickname() {
-        // Nicknames are attacker-controlled and the chip enters the DOM via
-        // dangerous_inner_html (freenet/river#227) — must be escaped.
-        let id = mid_from("0000000000000001");
-        let mut names = HashMap::new();
-        names.insert(id, "<img src=x onerror=alert(1)>".to_string());
-        let token = river_core::mention::encode_mention(id, "snap");
-        let html =
-            message_to_html_with_mentions(&token, &names, Some(mid_from("0000000000000002")));
-        assert!(
-            !html.contains("<img"),
-            "raw markup must not survive: {html}"
-        );
-        assert!(
-            html.contains("&lt;img"),
-            "nickname must be HTML-escaped: {html}"
-        );
-    }
-
-    #[test]
-    fn mention_of_self_gets_distinct_highlight_class() {
-        let me = mid_from("0000000000000007");
-        let mut names = HashMap::new();
-        names.insert(me, "Me".to_string());
-        let token = river_core::mention::encode_mention(me, "Me");
-        let html = message_to_html_with_mentions(&token, &names, Some(me));
-        assert!(
-            html.contains("river-mention-self"),
-            "a mention of the local user must get the self class: {html}"
-        );
-    }
-
-    #[test]
-    fn text_without_mentions_renders_identically_to_plain() {
-        let names = HashMap::new();
-        let text = "a normal *markdown* msg with a https://example.com link";
-        let any = mid_from("0000000000000001");
-        assert_eq!(
-            message_to_html_with_mentions(text, &names, Some(any)),
-            message_to_html(text),
-            "the no-mention fast path must match the plain renderer byte-for-byte"
-        );
-    }
-
-    #[test]
-    fn multiple_mentions_each_resolve_independently() {
-        let a = mid_from("000000000000000a");
-        let b = mid_from("000000000000000b");
-        let mut names = HashMap::new();
-        names.insert(a, "Ann".to_string());
-        names.insert(b, "Bob".to_string());
-        let text = format!(
-            "{} and {}",
-            river_core::mention::encode_mention(a, "x"),
-            river_core::mention::encode_mention(b, "y")
-        );
-        let html = message_to_html_with_mentions(&text, &names, Some(mid_from("00000000000000ff")));
-        assert!(html.contains(">@Ann</span>"), "{html}");
-        assert!(html.contains(">@Bob</span>"), "{html}");
-        assert!(
-            html.contains("data-member-id=\"000000000000000a\""),
-            "{html}"
-        );
-        assert!(
-            html.contains("data-member-id=\"000000000000000b\""),
-            "{html}"
-        );
-    }
-
-    #[test]
-    fn current_token_chip_carries_full_id_resolved_from_short_ref() {
-        // The wire token now carries only the 8-char short ref; the chip must
-        // still recover the FULL id (for the click interceptor) by matching the
-        // short ref against the known members.
-        let id = mid_from("00000000000000aa");
-        let mut names = HashMap::new();
-        names.insert(id, "Alice".to_string());
-        let token = river_core::mention::encode_mention(id, "Alice");
-        assert!(
-            token.contains(&format!(
-                "rv:{}",
-                river_core::mention::member_id_to_short(id)
-            )),
-            "token uses the short base32 ref: {token}"
-        );
-        let html =
-            message_to_html_with_mentions(&token, &names, Some(mid_from("00000000000000ff")));
-        assert!(
-            html.contains("data-member-id=\"00000000000000aa\""),
-            "chip recovers the lossless id from the short ref: {html}"
-        );
-    }
-
-    #[test]
-    fn legacy_hex_mention_chip_is_clickable_even_when_member_unknown() {
-        // A legacy `rv:<hex>` token carries the full id, so its chip stays
-        // clickable (data-member-id present) even for a member we can't name.
-        let id = mid_from("0000000000000abc");
-        let names = HashMap::new(); // member not resolvable by name
-        let legacy = format!(
-            "hi @[Bob]({}{})!",
-            river_core::mention::REF_SCHEME,
-            river_core::mention::member_id_to_hex(id)
-        );
-        let html =
-            message_to_html_with_mentions(&legacy, &names, Some(mid_from("0000000000000001")));
-        assert!(
-            html.contains("data-member-id=\"0000000000000abc\""),
-            "legacy chip keeps the full id: {html}"
-        );
-        assert!(html.contains(">@Bob</span>"), "snapshot name used: {html}");
-    }
-
-    #[test]
-    fn unknown_short_mention_renders_inert_chip_without_member_id() {
-        // A current (short) token naming a member this client doesn't know
-        // cannot recover a full id, so the chip renders the snapshot name but
-        // carries no data-member-id (nothing for the interceptor to open).
-        let id = mid_from("0000000000000abc");
-        let names = HashMap::new();
-        let token = river_core::mention::encode_mention(id, "Ghost");
-        let html =
-            message_to_html_with_mentions(&token, &names, Some(mid_from("0000000000000001")));
-        assert!(
-            html.contains(">@Ghost</span>"),
-            "snapshot name shown: {html}"
-        );
-        assert!(
-            !html.contains("data-member-id"),
-            "unknown short ref must not fabricate a member id: {html}"
-        );
-    }
-
-    #[test]
-    fn legacy_hex_self_mention_gets_highlight() {
-        // A self-mention in an OLD (hex) message must still resolve to self and
-        // get the self-highlight class, just like the current short form.
-        let me = mid_from("0000000000000007");
-        let mut names = HashMap::new();
-        names.insert(me, "Me".to_string());
-        let legacy = format!(
-            "@[Me]({}{})",
-            river_core::mention::REF_SCHEME,
-            river_core::mention::member_id_to_hex(me)
-        );
-        let html = message_to_html_with_mentions(&legacy, &names, Some(me));
-        assert!(
-            html.contains("river-mention-self"),
-            "legacy self-mention must get the self class: {html}"
         );
     }
 }
@@ -11958,393 +5745,88 @@ mod group_messages_clock_tests {
         assert!(!g.time_clamped);
         assert_eq!(g.messages[0].time, sent);
     }
-}
 
-/// Source-grep pins for the auto-scroll wiring in [`Conversation`].
-///
-/// The behaviour these guard is only observable in a browser (it is measured
-/// by `ui/tests/conversation-autoscroll.spec.ts`), so these exist to make a
-/// silent revert in a refactor fail at `cargo test` rather than in the field.
-/// freenet/river#486 is what a silent revert costs: the view stopped following
-/// the conversation for 54 consecutive arrivals.
-#[cfg(test)]
-mod autoscroll_wiring_pins {
-    /// The production half of this file, cut at the first test module.
-    ///
-    /// Cut by a needle that cannot match itself — it contains an escaped
-    /// newline in the source, not a literal one. `rfind` would land on
-    /// whichever test module was appended most recently and quietly put these
-    /// needles inside the scanned text, making every assertion below
-    /// self-satisfying (freenet/river#471).
-    fn production_source() -> &'static str {
-        let source = include_str!("conversation.rs");
-        &source[..source
-            .find("#[cfg(test)]\nmod tests {")
-            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")]
+    /// A tail stamped far ahead with no arrival time is clamped to the pass's
+    /// "now", which moves on every pass; its arrival identity must not.
+    #[test]
+    fn the_newest_key_ignores_the_fallback_clock() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+
+        let now = at(1_700_000_000_000);
+        let messages = state(vec![message_at(
+            owner_id,
+            &alice,
+            now + chrono::Duration::minutes(10),
+        )]);
+        let member_info = info(&alice, "Alice");
+        let receive_times = ReceiveTimes::new();
+
+        let first = group(&messages, &member_info, owner_id, &receive_times, now);
+        let later = group(
+            &messages,
+            &member_info,
+            owner_id,
+            &receive_times,
+            now + chrono::Duration::seconds(30),
+        );
+        assert_ne!(
+            only_group(&first).messages[0].time,
+            only_group(&later).messages[0].time,
+            "premise: the display time follows the fallback clock"
+        );
+
+        assert_eq!(newest_key(&first), newest_key(&later));
     }
 
-    /// `is_at_bottom` answers "is the end of the history on screen right now?".
-    /// Gating auto-scroll on it is the #486 latch: once the gap exceeded the
-    /// observer's margin the gate read false and nothing re-armed it. The
-    /// signal may still drive the scroll-to-latest button, so this pins the
-    /// narrow thing — it must not appear in the auto-scroll effect's condition.
+    /// A new tail clamped to an arrival earlier than the previous tail's
+    /// unclamped time is still later in display order: an arrival.
     #[test]
-    fn autoscroll_is_not_gated_on_the_intersection_observer() {
-        let prod = production_source();
-        for forbidden in [
-            "forced || *is_at_bottom.peek()",
-            "*is_at_bottom.peek() || forced",
-            "forced || is_at_bottom()",
-        ] {
-            assert!(
-                !prod.contains(forbidden),
-                "auto-scroll must be gated on the user-intent pin, not on the \
-                 scroll-to-latest button's IntersectionObserver: found `{forbidden}`"
-            );
-        }
-        assert!(
-            prod.contains("forced || pinned_to_bottom.get()"),
-            "the auto-scroll gate must read the user-intent pin"
-        );
-    }
+    fn a_new_tail_clamped_below_the_previous_one_is_an_arrival() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
 
-    /// The pin is only meaningful if something maintains it. Removing the
-    /// listener install would freeze it at its initial `true`, which looks
-    /// fine until the reader scrolls up to read history and gets yanked back.
-    #[test]
-    fn the_pin_is_maintained_by_scroll_listeners() {
-        let prod = production_source();
-        assert!(
-            prod.contains("fn install_scroll_pin_listeners"),
-            "the user-intent pin needs a listener that maintains it"
+        let received = at(1_700_000_000_000);
+        let a = message_at(owner_id, &alice, received + chrono::Duration::seconds(50));
+        let b = message_at(owner_id, &alice, received + chrono::Duration::seconds(130));
+        let mut receive_times = ReceiveTimes::new();
+        receive_times.insert(a.id().0 .0, received.timestamp_millis() as f64);
+        receive_times.insert(
+            b.id().0 .0,
+            (received + chrono::Duration::seconds(10)).timestamp_millis() as f64,
         );
-        assert!(
-            prod.contains("if install_scroll_pin_listeners("),
-            "`install_scroll_pin_listeners` must actually be called from `Conversation`"
+        let member_info = info(&alice, "Alice");
+        let now = received + chrono::Duration::seconds(20);
+
+        let before = group(
+            &state(vec![a.clone()]),
+            &member_info,
+            owner_id,
+            &receive_times,
+            now,
         );
-        assert!(
-            prod.contains("\"scrollend\""),
-            "the pin is re-evaluated once per settle, via `scrollend`"
+        let after = group(
+            &state(vec![a, b]),
+            &member_info,
+            owner_id,
+            &receive_times,
+            now,
         );
-        // Safari before 17.4 has no `scrollend`, so the settle is spotted by a
-        // trailing debounce on `scroll` instead. Every engine Playwright drives
-        // exposes `scrollend`, so that branch NEVER executes in CI and could be
-        // deleted or broken without a single test going red.
-        assert!(
-            prod.contains("SCROLL_SETTLE_DEBOUNCE_MS") && prod.contains("\"scroll\""),
-            "browsers without `scrollend` need the debounced `scroll` fallback; \
-             nothing in the browser suite covers it, so it is pinned here"
-        );
-        // Whose settle it is, is decided by comparing where it landed against
-        // the offset our last scroll asked for — and `last_top` is refreshed
-        // for EVERY settle, including our own, BEFORE the early-out. Recording
-        // it only for the reader's settles is what let a stale offset suppress
-        // the follow indefinitely, so the ORDER of these three is the thing
-        // being pinned, not merely their presence.
-        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
-        let at = |needle: &str| {
-            dense
-                .find(needle)
-                .unwrap_or_else(|| panic!("the settle handler must contain `{needle}`"))
+        let tail = |items: &[DisplayItem]| match items.last() {
+            Some(DisplayItem::Messages(g)) => g.messages.last().expect("a message").time,
+            _ => panic!("expected a message group last"),
         };
-        let decide = at("letours=(settled_at-last_top.top()).abs()<=SCROLL_TOP_SLACK_PX;");
-        let record = at("last_top.record(settled_at,container.client_height());");
-        let early_out = at("ifours{return;}");
         assert!(
-            decide < record && record < early_out,
-            "the settle handler must decide whose settle it is by POSITION, then \
-             record that position, and only THEN skip the pin update for our own \
-             scroll"
+            tail(&after) < tail(&before),
+            "premise: the new tail displays earlier than the previous one"
         );
-    }
 
-    /// The pin is resolved by a `scrollend`, which arrives milliseconds after
-    /// the reader actually moves. Both things that scroll on the strength of
-    /// the pin must therefore also check that the reader has not moved since —
-    /// otherwise a message (or a resize) landing inside that window drags them
-    /// back down. Dropping either call site is silent: the suite still passes
-    /// on Chromium, where the `scrollend` happens to win the race, and fails
-    /// only on Firefox, WebKit and mobile Safari.
-    #[test]
-    fn both_scroll_paths_defer_to_a_reader_scroll_the_pin_has_not_seen_yet() {
-        let prod = production_source();
-        assert!(
-            prod.contains("fn reader_moved_up_since"),
-            "the stale-pin window needs an explicit guard"
-        );
-        assert_eq!(
-            prod.matches("reader_moved_up_since(&last_scroll_top)")
-                .count(),
-            6,
-            "the guard has exactly six consumers: the content-change effect \
-             and the ResizeObserver (which scroll on the strength of the pin), \
-             the backfill restore and the head reposition (which distrust a \
-             stale-true pin mid-fling, #505 review), the render deciding \
-             whether a reader is parked (which holds their range at the \
-             ceiling), and the re-arm after the final newer page (#747 \
-             review); found a different number of call sites"
-        );
-        // Whitespace-insensitive: `cargo fmt` decides how this condition wraps,
-        // and a pin that a reformat can break is a pin that gets deleted.
-        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(
-            dense.contains(
-                "if!forced&&(!pinned_to_bottom.get()||reader_moved_up_since(&last_scroll_top))"
-            ),
-            "the deferred scroll must RE-READ the pin (a reader settle can clear \
-             it between the gate and the scroll) as well as consult the guard, \
-             and a forced scroll must override both"
-        );
-        // A resize moves one edge, a reader scroll moves both. Dropping the
-        // bottom-edge conjunct reads a composer collapse's scrollTop clamp as
-        // the reader scrolling up, and the follow stops short (#722).
-        assert!(
-            dense
-                .contains("top+SCROLL_TOP_SLACK_PX<top_was&&bottom+SCROLL_TOP_SLACK_PX<bottom_was"),
-            "the guard must require BOTH edges of the view to have moved up"
-        );
-        // A zero height puts the recorded bottom edge at the top, so the
-        // bottom-edge check never fires and the guard goes silent.
-        assert!(
-            dense
-                .contains("last_top.record(max_scroll_top(&container),container.client_height());"),
-            "our own scroll must record the view's real height alongside its top"
-        );
-    }
-
-    /// The trigger, not just the gate. An `onmounted` on the last bubble is
-    /// silent for every content change that leaves that row in place, so the
-    /// effect has to subscribe to the grouped-message memo instead.
-    #[test]
-    fn autoscroll_is_triggered_by_content_change_not_by_a_remount() {
-        let prod = production_source();
-        assert!(
-            !prod.contains("last_chat_element"),
-            "the last-bubble mount handle is not a content-change trigger; it \
-             misses mid-list inserts, merged join summaries, reactions and edits"
-        );
-        // Whitespace-insensitive, like the sibling pin below: `cargo fmt`
-        // decides how this wraps, and a pin a reformat can break gets deleted.
-        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(
-            dense.contains("lethas_content=message_groups.read().is_some();"),
-            "the auto-scroll effect must subscribe to `message_groups` so any \
-             content change re-runs it"
-        );
-        assert!(
-            prod.contains("ResizeObserver::new"),
-            "content-height changes with no re-render (late-loading images, \
-             font swaps) must also reach the scroll"
-        );
-        // Two observations, not one. The content wrapper sees the history
-        // growing or reflowing; only the container sees the WINDOW shrinking,
-        // which is what growing the composer does — #486's third cause.
-        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(
-            dense.contains("observer.observe(&content);observer.observe(&container);"),
-            "the resize follow must watch BOTH the content wrapper and the \
-             scroll container; watching only the wrapper misses the composer \
-             taking height away from the history"
-        );
-    }
-
-    /// The scroll container must opt out of browser scroll anchoring (#501).
-    /// With anchoring on, any change to rendered rows above the viewport (a
-    /// window trim, date-separator churn) makes the browser rewrite
-    /// `scrollTop` behind the pin machinery's back, and
-    /// `reader_moved_up_since` attributes the browser's adjustment to the
-    /// reader — which is exactly how the windowed tail latched the follow.
-    #[test]
-    fn the_scroll_container_disables_scroll_anchoring() {
-        let dense: String = production_source()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        assert!(
-            dense.contains(concat!("style:\"overflow-", "anchor:none;\"")),
-            "#chat-scroll-container must set `overflow-anchor: none` — browser \
-             scroll anchoring rewriting scrollTop is #501's H1"
-        );
-    }
-
-    /// The #501/#505 windowing contract: trims happen at a settle landing AT
-    /// the bottom — ours included, so the scroll-to-latest button trims too —
-    /// gated at the slack, not the threshold, so a reader parked inside the
-    /// 100px band is never clamped to the exact bottom; the backfill restore
-    /// stands down while the view is pinned (unless the reader has visibly
-    /// moved — the fling case) or a forced snap is in flight (H3); the
-    /// backfill sentinel waits for the opening snap (H2) and for the
-    /// room-switch reset to catch up. Each of these is a one-line edit away
-    /// from silently reverting, and none is visible to `cargo test` except
-    /// through these pins.
-    #[test]
-    fn the_window_trims_at_the_bottom_and_backfill_defers_to_the_pin() {
-        let prod = production_source();
-        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(
-            dense.contains("iftrim_is_due(&container,window_overgrown.get(),&reader)"),
-            "the settle handler must trim the grown window when a settle — \
-             the reader's or ours — lands at the exact bottom"
-        );
-        assert!(
-            dense.contains("ifdistance>SCROLL_TOP_SLACK_PX{returnfalse;}"),
-            "a trim is due only at the exact bottom (the slack), never inside \
-             the 100px band, where it would clamp a parked reader to the end"
-        );
-        assert!(
-            dense.contains("ifreader.room_epoch.get()!=epoch{return;}")
-                && dense.contains("trim_is_due(&c,true,&reader)"),
-            "the deferred trim must re-check the room and re-measure \
-             eligibility: the settle that scheduled it is a task old, and the \
-             reader may have moved, hidden the panel or switched rooms since"
-        );
-        assert!(
-            dense.contains("trim_landed.set(true);"),
-            "a trim must flag itself so the view is re-anchored to the bottom \
-             afterwards: the rows it removes are above the viewport, and the \
-             browser's clamp otherwise reads as the reader scrolling up, so \
-             the next arrival is not followed"
-        );
-        assert!(
-            dense.contains("if!trim_landed.get(){return;}"),
-            "the re-anchor effect must consume the trim flag"
-        );
-        // Consuming the flag is not the repair — SCROLLING is. Deleting the
-        // scroll call leaves the assertions above passing with the fix gone,
-        // so the repair itself is pinned here.
-        assert!(
-            dense.contains("trim_landed.set(false);letSome(container)=chat_scroll_container()"),
-            "the re-anchor effect must go on to measure the container after \
-             consuming the flag"
-        );
-        assert!(
-            dense.contains(
-                "if!pinned_to_bottom.get()||(max_scroll_top(&container)-container.scroll_top())asf64>BOTTOM_THRESHOLD_PX"
-            ),
-            "the re-anchor must stand down for a reader who has started \
-             moving inside the flag-to-effect window — it is otherwise the \
-             one unguarded programmatic scroll in the file"
-        );
-        assert_eq!(
-            dense
-                .matches(
-                    "scroll_history_to_bottom(&pinned_to_bottom,&last_scroll_top,web_sys::ScrollBehavior::Instant,);"
-                )
-                .count(),
-            3,
-            "the arrival snap, the trim re-anchor and the jump into a held \
-             range's latest messages must all scroll through \
-             `scroll_history_to_bottom`, which is what records the offset as \
-             ours; consuming the trim flag without scrolling silently reverts \
-             the fix"
-        );
-        // Without the read the effect never re-runs — it would fire once at
-        // mount and then go silent, which no other assertion can see.
-        assert_eq!(
-            dense.matches("let_=window_items();").count(),
-            3,
-            "the trim re-anchor, the backfill restore and the head \
-             reposition (newer pages slide the head) must each subscribe to \
-             `window_items`"
-        );
-        assert!(
-            dense.contains("!trim_would_rearm_backfill(tail,container.client_height())"),
-            "the trim must be geometry-gated: on a viewport tall enough that \
-             the trimmed tail leaves the sentinel strip in range, trim and \
-             backfill oscillate at render speed (#505 re-review)"
-        );
-        let trim_at = dense
-            .find("iftrim_is_due(&container,window_overgrown.get(),&reader)")
-            .expect("asserted above");
-        let ours_early_out = dense
-            .find("ifours{return;}")
-            .expect("the settle handler early-outs for our own settles");
-        assert!(
-            trim_at < ours_early_out,
-            "the trim check must run BEFORE the `ours` early-out, or a touch \
-             reader who only returns to the bottom via the scroll-to-latest \
-             button (whose settle is ours) never trims (#505 review)"
-        );
-        assert!(
-            dense.contains(
-                "if(pinned_to_bottom.get()&&!reader_moved_up_since(&last_scroll_top))||force_scroll.get(){return;}"
-            ),
-            "the backfill restore must stand down while the view is pinned — \
-             unless the reader has visibly moved up (a fling into the sentinel \
-             band settles no pin) — or a forced snap is in flight (#501 H3, \
-             #505 review)"
-        );
-        assert!(
-            dense.contains(
-                "ifhistory_window.has_older&&opening_snap_done()&&!room_changed_this_render"
-            ),
-            "the backfill sentinel must not mount until the room-open snap has \
-             landed (#501 H2), including the one render where the previous \
-             room's `opening_snap_done` is still true"
-        );
-    }
-
-    /// The #505 blocker-1 compensation wiring: rows carry their item identity,
-    /// the render captures the new head's pre-patch offset when rendered
-    /// content above it is removed, and the reposition effect shifts a parked
-    /// reader's offset by the measured difference. Removing any leg silently
-    /// reverts to "parked readers crawl upward one row per arrival in every
-    /// at-cap room".
-    #[test]
-    fn head_swaps_reposition_a_parked_reader() {
-        let prod = production_source();
-        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(
-            dense.contains("\"data-item-key\":\"{key}\""),
-            "history rows must carry `data-item-key` — the reposition \
-             machinery locates rows by item identity"
-        );
-        assert!(
-            dense.contains("fnhistory_row_offset_top"),
-            "the reposition machinery needs the row-offset lookup"
-        );
-        assert!(
-            dense.contains("reposition_pending.borrow_mut().take()"),
-            "the head-reposition effect must consume the render's pre-patch \
-             capture and shift the parked reader's offset"
-        );
-        assert!(
-            dense.contains("letshift=post_top-pre_top;"),
-            "the reposition must be BY MEASUREMENT (post-patch minus pre-patch \
-             offset of a surviving row), not a guess"
-        );
-        // The reference moves BY THE SHIFT. Writing the reader's new absolute
-        // offset instead collapses `reader_moved_up_since` to false while the
-        // pin is still stale-true, and both follow paths then yank a parked
-        // reader to the bottom (#505 delta review). Two call sites: the head
-        // reposition and the backfill restore.
-        assert_eq!(
-            dense.matches("last_scroll_top.shift(shift);").count(),
-            2,
-            "both the head reposition and the backfill restore must update \
-             `last_scroll_top` RELATIVELY — an absolute write erases the \
-             reader's movement and the follow paths drag them to the bottom"
-        );
-        assert!(
-            dense.contains("lettarget=(pre_scroll_top+shift).max(0);"),
-            "the reposition target must be computed from the PRE-patch scroll \
-             offset — the browser clamps `scrollTop` down before the effect \
-             runs when a patch shortens the content, and shifting from the \
-             clamped value applies the clamp twice (#505 delta review)"
-        );
-        assert!(
-            dense.contains("select_reposition_probe("),
-            "the capture must pick its probe through the forward walk — a \
-             head-only probe dead-fires when an at-cap drain re-keys a \
-             multi-message head group, and the parked reader crawls one \
-             intra-group line per arrival (#505 re-review blocker)"
-        );
-        assert!(
-            dense.contains("matchhistory_row_offset_top(&anchor.probe_key)"),
-            "the backfill restore must reposition by the measured probe row, \
-             not the raw scrollHeight delta — the delta counts arrivals \
-             appended BELOW the viewport in the same patch and over-shifts \
-             the reader (#505 re-review)"
-        );
+        assert!(is_arrival(
+            newest_key(&before).as_ref(),
+            newest_key(&after).as_ref(),
+            false
+        ));
     }
 }

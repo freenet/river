@@ -1,37 +1,40 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
-//! INBOUND messages, remove messages, and drive the no-room screen's load
-//! states.
+//! INBOUND messages, remove messages, drive the no-room screen's load states,
+//! and complete an own DM while another thread is open.
 //!
-//! The composer is not a substitute: `handle_send_message` raises
-//! `force_scroll`, which deliberately bypasses the pin that the scroll specs
-//! exist to test, so a message sent through the UI proves nothing about how an
-//! arriving one behaves. These write straight into `ROOMS`, as an arriving
-//! network update does.
+//! The composer is not a substitute: an own send is an explicit request to go
+//! to the newest message, so a message sent through the UI
+//! proves nothing about how an arriving one behaves. These write straight into
+//! `ROOMS`, as an arriving network update does.
 //!
-//! They skip `apply_delta`'s verification on purpose, so they must never be
-//! reachable anywhere the result could be pushed to the network. The module
-//! compiles only for wasm32 with two features, both required:
+//! The room hooks skip `apply_delta`'s verification on purpose, and every hook
+//! admits test identities on self's say-so, so none may be reachable anywhere
+//! the result could be pushed to the network. The module compiles only for
+//! wasm32 with two features, both required:
 //!
 //! * `example-data`, which is off for the published webapp (`UI_FEATURES` is
 //!   empty for `build-webapp`) and for every non-example build;
 //! * `no-sync`, because `cargo make dev-example` turns `example-data` on
-//!   WITHOUT it. A message minted here is signed by a key that is not a room
-//!   member, so a developer pointing that build at a live node would otherwise
-//!   have the synchronizer try to push contract-invalid state.
+//!   WITHOUT it. A developer pointing that build at a live node would
+//!   otherwise have the synchronizer push the test members and their messages
+//!   into a real room, or contract-invalid state where they do not verify.
 
 use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::{CurrentRoom, RoomData};
 use dioxus::prelude::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use freenet_scaffold::ComposableState;
 use river_core::room_state::{
-    member::MemberId,
+    configuration::AuthorizedConfigurationV1,
+    direct_messages::{compose_direct_message, DirectMessagesDelta},
+    member::{AuthorizedMember, Member, MemberId},
     member_info::{AuthorizedMemberInfo, MemberInfo},
     message::{AuthorizedMessageV1, MessageV1, RoomMessageBody},
-    privacy::SealedBytes,
+    privacy::{PrivacyMode, SealedBytes},
+    ChatRoomParametersV1,
 };
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen::convert::FromWasmAbi;
 use wasm_bindgen::JsValue;
 
 pub fn install_test_hooks() {
@@ -43,91 +46,219 @@ pub fn install_test_hooks() {
         return;
     }
 
-    fn expose<A: FromWasmAbi + 'static>(
-        hooks: &js_sys::Object,
-        name: &str,
-        hook: impl FnMut(A) + 'static,
-    ) {
-        let hook = Closure::<dyn FnMut(A)>::new(hook).into_js_value();
-        let _ = js_sys::Reflect::set(hooks, &JsValue::from_str(name), &hook);
-    }
-
     let hooks = js_sys::Object::new();
+    let set_hook = |name: &str, hook: JsValue| {
+        let _ = js_sys::Reflect::set(&hooks, &JsValue::from_str(name), &hook);
+    };
 
-    expose(&hooks, "appendMessage", move |text: String| {
-        crate::util::defer(move || deliver([(text, Delivery::Append)]));
-    });
+    set_hook(
+        "appendMessage",
+        Closure::<dyn FnMut(String)>::new(move |text: String| {
+            crate::util::defer(move || deliver([(text, Delivery::Append)]));
+        })
+        .into_js_value(),
+    );
 
-    expose(&hooks, "insertMessageBeforeLast", move |text: String| {
-        crate::util::defer(move || deliver([(text, Delivery::BeforeLast)]));
-    });
+    // A DM history from test peer `peer` to self, in ONE mutation: `count`
+    // messages labelled "<history_label> NN", a minute apart and all in the
+    // past, so a DM sent or delivered afterwards sorts below them. Long enough
+    // at 30 to make the thread scroll on every test viewport.
+    set_hook(
+        "appendDmsForPeer",
+        Closure::<dyn FnMut(u32, u32)>::new(move |peer: u32, count: u32| {
+            let peer = dm_peer(peer);
+            crate::util::defer(move || append_dm_history(peer, count));
+        })
+        .into_js_value(),
+    );
+
+    // One inbound DM from test peer `peer`, stamped after every DM in the
+    // thread so it renders as the newest.
+    set_hook(
+        "deliverDmForPeer",
+        Closure::<dyn FnMut(u32, String)>::new(move |peer: u32, text: String| {
+            let peer = dm_peer(peer);
+            crate::util::defer(move || deliver_dms(peer, vec![text], DmStamp::Newest));
+        })
+        .into_js_value(),
+    );
+
+    // Admit a test peer to the current room with no DMs, so a spec can open
+    // an empty thread with them from Member Info.
+    set_hook(
+        "admitDmPeer",
+        Closure::<dyn FnMut(u32)>::new(move |peer: u32| {
+            let peer = dm_peer(peer);
+            crate::util::defer(move || {
+                with_current_room_mut(|room, room_key| {
+                    let room_key = *room_key;
+                    let peer_sk = SigningKey::from_bytes(&peer.seed);
+                    admit_with_nickname(room, &room_key, &peer_sk, peer.nickname);
+                })
+            });
+        })
+        .into_js_value(),
+    );
+
+    // An own DM to test peer `peer` in the current room, through the invite
+    // picker's send path, so it can complete while another thread is open.
+    // Resolves to the outcome's name, "Sent" on success.
+    set_hook(
+        "sendDmToPeer",
+        Closure::<dyn FnMut(u32, String) -> js_sys::Promise>::new(
+            move |peer: u32, text: String| {
+                let peer_id =
+                    MemberId::from(&SigningKey::from_bytes(&dm_peer(peer).seed).verifying_key());
+                let (tx, rx) = futures::channel::oneshot::channel();
+                crate::util::defer(move || {
+                    let _ = tx.send(CURRENT_ROOM.peek().owner_key);
+                });
+                wasm_bindgen_futures::future_to_promise(async move {
+                    let room = rx
+                        .await
+                        .ok()
+                        .flatten()
+                        .ok_or_else(|| JsValue::from_str("sendDmToPeer: no current room"))?;
+                    let body = river_core::room_state::dm_body::DirectMessageBody::Text { text };
+                    let outcome =
+                        crate::components::direct_messages::send_structured_dm(room, peer_id, body)
+                            .await;
+                    Ok(JsValue::from_str(&format!("{outcome:?}")))
+                })
+            },
+        )
+        .into_js_value(),
+    );
+
+    set_hook(
+        "insertMessageBeforeLast",
+        Closure::<dyn FnMut(String)>::new(move |text: String| {
+            crate::util::defer(move || deliver([(text, Delivery::BeforeLast)]));
+        })
+        .into_js_value(),
+    );
 
     // A burst in ONE state mutation — one delta application, one re-render —
     // as a network delta carrying many messages produces. The windowing specs
     // use it to grow an anchored window well past one backfill step without
-    // paying per-delivery render round-trips (#505 blocker 2).
-    expose(&hooks, "appendMessages", move |count: u32| {
-        crate::util::defer(move || {
-            deliver((0..count).map(|i| (format!("batched arrival {i:02}"), Delivery::Append)))
-        });
-    });
+    // paying per-delivery render round-trips (#505).
+    set_hook(
+        "appendMessages",
+        Closure::<dyn FnMut(u32)>::new(move |count: u32| {
+            crate::util::defer(move || {
+                deliver((0..count).map(|i| (format!("batched arrival {i:02}"), Delivery::Append)))
+            });
+        })
+        .into_js_value(),
+    );
 
     // Remove every message in the current room whose text contains the given
     // substring, in ONE mutation — the shape of a ban purge or a retention
     // drain, which take messages out of the list rather than adding a delete
     // action. The scroll specs use it for deletions above and at the reader.
-    expose(&hooks, "removeMessages", move |needle: String| {
-        crate::util::defer(move || remove_messages(&needle));
-    });
+    set_hook(
+        "removeMessages",
+        Closure::<dyn FnMut(String)>::new(move |needle: String| {
+            crate::util::defer(move || remove_messages(&needle));
+        })
+        .into_js_value(),
+    );
+
+    // Put the current room in the state of a private room whose secret this
+    // device does not hold. A send then falls back to a public body, which
+    // the send's own local `apply_delta` rejects ("Cannot send public messages
+    // in private room"), so the send fails AFTER the composer has handed it
+    // off: the failed-send case of the A06 specs. The rendered history does
+    // not change, since every example message body is public.
+    //
+    // Only for a room self owns: the configuration is re-signed with the
+    // owner's key, because a configuration that fails its signature check
+    // reads as a room still awaiting its initial sync, which has no composer.
+    set_hook(
+        "makeRoomPrivateWithoutSecret",
+        Closure::<dyn FnMut()>::new(move || {
+            crate::util::defer(|| {
+                with_current_room_mut(|room, room_key| {
+                    let Some(owner_sk) = room
+                        .signing_key()
+                        .filter(|sk| sk.verifying_key() == *room_key)
+                        .cloned()
+                    else {
+                        web_sys::console::error_1(
+                            &"__riverTest.makeRoomPrivateWithoutSecret: self must own the room"
+                                .into(),
+                        );
+                        return;
+                    };
+                    let mut config = room.room_state.configuration.configuration.clone();
+                    config.privacy_mode = PrivacyMode::Private;
+                    room.room_state.configuration =
+                        AuthorizedConfigurationV1::new(config, &owner_sk);
+                    room.secrets.clear();
+                    room.current_secret_version = None;
+                });
+            });
+        })
+        .into_js_value(),
+    );
 
     // Drive the no-room screen's load states (freenet/river#509), which the
     // example build, always seeded with rooms, never leaves. Clears ROOMS too:
     // `room_list_display_state` renders the list whenever there is anything to show.
-    expose(&hooks, "setRoomsLoadState", move |state: String| {
-        let parsed = match state.as_str() {
-            "loading" => RoomsLoadState::Loading,
-            "migrating" => RoomsLoadState::Migrating,
-            "failed" => RoomsLoadState::LoadFailed,
-            "loaded" => RoomsLoadState::Loaded,
-            other => wasm_bindgen::throw_str(&format!("unknown rooms load state {other:?}")),
-        };
-        crate::util::defer(move || {
-            ROOMS.with_mut(|rooms| {
-                rooms.map.clear();
-                rooms.room_order.clear();
-                rooms.current_room_key = None;
+    set_hook(
+        "setRoomsLoadState",
+        Closure::<dyn FnMut(String)>::new(move |state: String| {
+            let parsed = match state.as_str() {
+                "loading" => RoomsLoadState::Loading,
+                "migrating" => RoomsLoadState::Migrating,
+                "failed" => RoomsLoadState::LoadFailed,
+                "loaded" => RoomsLoadState::Loaded,
+                other => wasm_bindgen::throw_str(&format!("unknown rooms load state {other:?}")),
+            };
+            crate::util::defer(move || {
+                ROOMS.with_mut(|rooms| {
+                    rooms.map.clear();
+                    rooms.room_order.clear();
+                    rooms.current_room_key = None;
+                });
+                *CURRENT_ROOM.write() = CurrentRoom { owner_key: None };
+                *ROOMS_LOAD_STATE.write() = parsed;
             });
-            *CURRENT_ROOM.write() = CurrentRoom { owner_key: None };
-            *ROOMS_LOAD_STATE.write() = parsed;
-        });
-    });
+        })
+        .into_js_value(),
+    );
 
     // Switch rooms the way a notification click does: CURRENT_ROOM changes
     // while whatever modal is open stays open. The room list is behind the
     // modal's backdrop, so the UI itself cannot do this from a test.
-    expose(&hooks, "switchRoom", move |name: String| {
-        // Everything inside `defer`: reading ROOMS needs the Dioxus runtime, which
-        // a raw JS call does not have (and `panic = "abort"` would kill the page).
-        crate::util::defer(move || {
-            let key = ROOMS.peek().map.iter().find_map(|(key, room)| {
-                let sealed = &room.room_state.configuration.configuration.display.name;
-                let shown = crate::util::ecies::unseal_bytes_with_secrets(sealed, &room.secrets)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                    .unwrap_or_else(|_| sealed.to_string_lossy());
-                (shown == name).then_some(*key)
-            });
-            match key {
-                Some(key) => {
-                    *CURRENT_ROOM.write() = CurrentRoom {
-                        owner_key: Some(key),
-                    };
+    set_hook(
+        "switchRoom",
+        Closure::<dyn FnMut(String)>::new(move |name: String| {
+            // Everything inside `defer`: reading ROOMS needs the Dioxus runtime, which
+            // a raw JS call does not have (and `panic = "abort"` would kill the page).
+            crate::util::defer(move || {
+                let key = ROOMS.peek().map.iter().find_map(|(key, room)| {
+                    let sealed = &room.room_state.configuration.configuration.display.name;
+                    let shown =
+                        crate::util::ecies::unseal_bytes_with_secrets(sealed, &room.secrets)
+                            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                            .unwrap_or_else(|_| sealed.to_string_lossy());
+                    (shown == name).then_some(*key)
+                });
+                match key {
+                    Some(key) => {
+                        *CURRENT_ROOM.write() = CurrentRoom {
+                            owner_key: Some(key),
+                        };
+                    }
+                    None => web_sys::console::error_1(
+                        &format!("__riverTest.switchRoom: no room named {name:?}").into(),
+                    ),
                 }
-                None => web_sys::console::error_1(
-                    &format!("__riverTest.switchRoom: no room named {name:?}").into(),
-                ),
-            }
-        });
-    });
+            });
+        })
+        .into_js_value(),
+    );
 
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
@@ -156,7 +287,7 @@ thread_local! {
 /// APPENDED arrivals ALTERNATE between two identities per message, so a burst
 /// of N arrivals is N display items rather than folding into one group — a
 /// six-arrival follow loop that renders as a single item exercises the
-/// windowing's grow/trim interleave zero times (#505 review).
+/// windowing's grow/trim interleave zero times (#505).
 fn test_author(delivery: Delivery) -> (SigningKey, &'static str) {
     match delivery {
         Delivery::Append => {
@@ -171,9 +302,69 @@ fn test_author(delivery: Delivery) -> (SigningKey, &'static str) {
     }
 }
 
+/// Admit `member_vk` to `room` as a member invited by self, so its messages
+/// survive `MessagesV1::apply_delta`, which keeps only messages signed by a
+/// member or the owner. The invitation chain is test identity -> self ->
+/// owner. Skipped where self cannot vouch: an observer is not a member, and
+/// such a room has no composer, so no local `apply_delta` runs there anyway.
+fn admit_test_member(room: &mut RoomData, room_key: &VerifyingKey, member_vk: VerifyingKey) {
+    let owner_id = MemberId::from(room_key);
+    let members = &room.room_state.members.members;
+    if member_vk == *room_key || members.iter().any(|m| m.member.member_vk == member_vk) {
+        return;
+    }
+    let Some(self_sk) = room.signing_key().cloned() else {
+        return;
+    };
+    let self_vk = self_sk.verifying_key();
+    if self_vk != *room_key && !members.iter().any(|m| m.member.member_vk == self_vk) {
+        return;
+    }
+    room.room_state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: MemberId::from(&self_vk),
+            member_vk,
+        },
+        &self_sk,
+    ));
+}
+
+/// Admit `sk`'s identity (see `admit_test_member`) and register its nickname
+/// the first time it speaks, so it renders like any other member rather than
+/// as "Unknown".
+fn admit_with_nickname(
+    room: &mut RoomData,
+    room_key: &VerifyingKey,
+    sk: &SigningKey,
+    nickname: &str,
+) {
+    let id = MemberId::from(&sk.verifying_key());
+    admit_test_member(room, room_key, sk.verifying_key());
+    if !room
+        .room_state
+        .member_info
+        .member_info
+        .iter()
+        .any(|entry| entry.member_info.member_id == id)
+    {
+        room.room_state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo {
+                    member_id: id,
+                    version: 0,
+                    preferred_nickname: SealedBytes::public(nickname.as_bytes().to_vec()),
+                    deputies: Vec::new(),
+                },
+                sk,
+            ));
+    }
+}
+
 /// Insert `text` into `room` where `delivery` says, as that delivery's test
-/// identity, registering the identity's nickname the first time it speaks so
-/// the bubble renders like any other member's rather than as "Unknown".
+/// identity.
 fn push_test_message(
     room: &mut RoomData,
     room_key: &VerifyingKey,
@@ -182,33 +373,15 @@ fn push_test_message(
 ) {
     let (sk, nickname) = test_author(delivery);
     let author = MemberId::from(&sk.verifying_key());
-    if !room
-        .room_state
-        .member_info
-        .member_info
-        .iter()
-        .any(|entry| entry.member_info.member_id == author)
-    {
-        room.room_state
-            .member_info
-            .member_info
-            .push(AuthorizedMemberInfo::new_with_member_key(
-                MemberInfo {
-                    member_id: author,
-                    version: 0,
-                    preferred_nickname: SealedBytes::public(nickname.as_bytes().to_vec()),
-                    deputies: Vec::new(),
-                },
-                &sk,
-            ));
-    }
+    admit_with_nickname(room, room_key, &sk, nickname);
 
+    let time = crate::util::get_current_system_time();
     let message = AuthorizedMessageV1::new(
         MessageV1 {
             room_owner: MemberId::from(room_key),
             author,
             content: RoomMessageBody::public(text),
-            time: crate::util::get_current_system_time(),
+            time,
         },
         &sk,
     );
@@ -224,7 +397,7 @@ fn push_test_message(
 /// What a real arrival does once the room is at `max_recent_messages`: drain
 /// the oldest. Mirrors `MessagesV1::apply_delta`
 /// (common/src/room_state/message.rs) — without this, the hooks grow the
-/// message list unboundedly and the at-cap index-shift path (#505 blocker 1)
+/// message list unboundedly and the at-cap index-shift path (#505)
 /// is unreachable from the browser suite.
 fn prune_to_cap(room: &mut RoomData) {
     let max = room
@@ -239,36 +412,163 @@ fn prune_to_cap(room: &mut RoomData) {
     }
 }
 
-/// Drop the current room's messages whose public text contains `needle`.
-fn remove_messages(needle: &str) {
+/// Run `f` on the current room in ONE `ROOMS` mutation. It writes `ROOMS`, so
+/// call it only from inside a `defer` closure.
+fn with_current_room_mut(f: impl FnOnce(&mut RoomData, &VerifyingKey)) {
     let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
         return;
     };
     ROOMS.with_mut(|rooms| {
         if let Some(room) = rooms.map.get_mut(&room_key) {
-            room.room_state.recent_messages.messages.retain(|m| {
-                !m.message
-                    .content
-                    .as_public_string()
-                    .is_some_and(|text| text.contains(needle))
-            });
+            f(room, &room_key);
         }
+    });
+}
+
+/// Drop the current room's messages whose public text contains `needle`.
+fn remove_messages(needle: &str) {
+    with_current_room_mut(|room, _| {
+        room.room_state.recent_messages.messages.retain(|m| {
+            !m.message
+                .content
+                .as_public_string()
+                .is_some_and(|text| text.contains(needle))
+        });
     });
 }
 
 /// Deliver every message to the current room in ONE `ROOMS` mutation, so one
 /// re-render, as a network delta does.
 fn deliver(messages: impl IntoIterator<Item = (String, Delivery)>) {
-    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
-        return;
-    };
-    ROOMS.with_mut(|rooms| {
-        let Some(room) = rooms.map.get_mut(&room_key) else {
-            return;
-        };
+    with_current_room_mut(|room, room_key| {
         for (text, delivery) in messages {
-            push_test_message(room, &room_key, text, delivery);
+            push_test_message(room, room_key, text, delivery);
         }
         prune_to_cap(room);
+    });
+}
+
+/// A fixed test identity on the other side of a DM thread.
+struct DmPeer {
+    seed: [u8; 32],
+    /// What the specs open the thread by, so no nickname may contain another.
+    nickname: &'static str,
+    /// Prefix of the DMs `append_dm_history` seeds, "<prefix> NN".
+    history_label: &'static str,
+}
+
+/// The DM hooks' test peers, by index: a spec that needs a second thread in the
+/// same room uses peer 1.
+const DM_PEERS: [DmPeer; 2] = [
+    DmPeer {
+        seed: [0x9D; 32],
+        nickname: "DM Test Peer",
+        history_label: "dm history",
+    },
+    DmPeer {
+        seed: [0xAE; 32],
+        nickname: "Other DM Peer",
+        history_label: "other dm history",
+    },
+];
+
+/// The test peer at `index`; throws to the caller for any other index.
+fn dm_peer(index: u32) -> &'static DmPeer {
+    DM_PEERS.get(index as usize).unwrap_or_else(|| {
+        wasm_bindgen::throw_str(&format!(
+            "__riverTest DM hooks: no test peer {index} (there are {})",
+            DM_PEERS.len()
+        ))
+    })
+}
+
+/// `count` DMs from `peer` labelled "<history_label> NN", a minute apart and
+/// all in the past, in ONE mutation (see `appendDmsForPeer`).
+fn append_dm_history(peer: &DmPeer, count: u32) {
+    deliver_dms(
+        peer,
+        (0..count)
+            .map(|i| format!("{} {i:02}", peer.history_label))
+            .collect(),
+        DmStamp::History,
+    )
+}
+
+/// How a DM delivery is timestamped.
+#[derive(Clone, Copy)]
+enum DmStamp {
+    /// A minute apart, the last one a minute ago.
+    History,
+    /// Now, or one second after the thread's newest DM if that is later, so
+    /// the delivery sorts last even within one second of the previous one
+    /// (the thread orders same-second DMs by signature).
+    Newest,
+}
+
+/// Deliver `texts` from `peer` to self in the current room, in ONE `ROOMS`
+/// mutation, through the DM field's `apply_delta`: it checks each signature
+/// and both memberships, and keeps the stored order and caps.
+fn deliver_dms(peer: &DmPeer, texts: Vec<String>, stamp: DmStamp) {
+    with_current_room_mut(|room, room_key| {
+        let room_key = *room_key;
+        let Some(self_vk) = room.signing_key().map(|sk| sk.verifying_key()) else {
+            web_sys::console::error_1(&"__riverTest DM hooks: self holds no key here".into());
+            return;
+        };
+        let peer_sk = SigningKey::from_bytes(&peer.seed);
+        admit_with_nickname(room, &room_key, &peer_sk, peer.nickname);
+
+        let self_id = MemberId::from(&self_vk);
+        let peer_id = MemberId::from(&peer_sk.verifying_key());
+        let now = crate::util::get_current_system_time()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let count = texts.len() as u64;
+        let (first, step) = match stamp {
+            DmStamp::History => (now.saturating_sub(count * 60), 60),
+            DmStamp::Newest => (
+                room.room_state
+                    .direct_messages
+                    .messages
+                    .iter()
+                    .filter(|m| {
+                        let (s, r) = (m.message.sender, m.message.recipient);
+                        (s == self_id && r == peer_id) || (s == peer_id && r == self_id)
+                    })
+                    .map(|m| m.message.timestamp + 1)
+                    .fold(now, u64::max),
+                1,
+            ),
+        };
+        let new_messages: Vec<_> = texts
+            .into_iter()
+            .zip(0..)
+            .filter_map(|(text, i)| {
+                let ts = first + i * step;
+                compose_direct_message(&peer_sk, &self_vk, &room_key, ts, now, text.as_bytes())
+                    .inspect_err(|e| {
+                        web_sys::console::error_1(&format!("__riverTest DM compose: {e}").into())
+                    })
+                    .ok()
+            })
+            .collect();
+        let expected = new_messages.len();
+        let delta = Some(DirectMessagesDelta {
+            new_messages,
+            advanced_purges: vec![],
+        });
+        let parent = room.room_state.clone();
+        let params = ChatRoomParametersV1 { owner: room_key };
+        let held_before = room.room_state.direct_messages.messages.len();
+        if let Err(e) = room
+            .room_state
+            .direct_messages
+            .apply_delta(&parent, &params, &delta)
+        {
+            web_sys::console::error_1(&format!("__riverTest DM apply: {e}").into());
+        } else if room.room_state.direct_messages.messages.len() != held_before + expected {
+            web_sys::console::error_1(&"__riverTest DM apply dropped a delivery".into());
+        }
     });
 }

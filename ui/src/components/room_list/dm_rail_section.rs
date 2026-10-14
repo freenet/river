@@ -225,7 +225,9 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
                         }
                     }
                     if entry.unread > 0 {
-                        span { class: "ml-2 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
+                        span {
+                            "data-testid": "dm-rail-unread-badge",
+                            class: "ml-2 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
                             "{entry.unread}"
                         }
                     }

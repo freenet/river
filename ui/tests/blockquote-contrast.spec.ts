@@ -13,7 +13,7 @@ import { openMemberInfoForFirstNonSelf } from "./invite-picker";
 // Both schemes are exercised below for exactly that reason: the assertion is
 // duplicative by construction, and it is there to keep it that way.
 //
-// The Rust pins in `conversation.rs` assert the declaration TEXT. This spec
+// The Rust pins in `conversation/markdown.rs` assert the declaration TEXT. This spec
 // asserts what a reader actually sees: it puts a quote in a REAL rendered
 // bubble, so the class list, the cascade and the compiled stylesheet are all
 // the app's own, then composites the colours the browser computed.

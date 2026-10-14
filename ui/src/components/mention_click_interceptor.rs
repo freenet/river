@@ -2,7 +2,7 @@
 //!
 //! Mention chips are rendered as `<span class="river-mention"
 //! data-member-id="<hex>">@Name</span>` inside message bodies that are injected
-//! via `dangerous_inner_html` (see `conversation::message_to_html_with_mentions`).
+//! via `dangerous_inner_html` (see `conversation::markdown::message_to_html_with_mentions`).
 //! Because that markup is raw HTML, Dioxus can't attach an `onclick` to the
 //! chip directly. Instead we install one document-level `click` listener that
 //! walks up from the click target to the nearest `[data-member-id]` element and

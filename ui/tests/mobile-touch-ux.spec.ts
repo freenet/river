@@ -1,12 +1,13 @@
 import { test, expect, Page } from "@playwright/test";
 import { waitForApp, selectRoom } from "./example-room";
+import { AT_BOTTOM_EPSILON_PX } from "./history-geometry";
 
 // Coverage for freenet/river#402 — mobile / touch UX improvements:
 //   1. Touch-accessible message action menu (kebab), since the hover action
 //      bar can never appear on a device without a hover pointer.
 //   2. Header hamburger spacing: see room-header-layout.spec.ts.
-//   3. A scroll-to-latest button shown whenever the history is not pinned to
-//      the bottom, plus a snap-to-bottom on room switch.
+//   3. A scroll-to-latest button shown whenever the newest message's bottom
+//      is off screen, plus a jump to the newest message on room switch.
 
 // Whether this browser context has no hover pointer (i.e. a touch device).
 // The kebab is shown only in that case; the hover action bar only otherwise.
@@ -328,10 +329,10 @@ test.describe("Scroll-to-latest button (#402.3)", () => {
 
     await button.click();
 
-    // Ground truth: the animated scroll returns the history to the bottom.
+    // Latest jumps to the end instantly.
     await expect
-      .poll(() => distanceFromBottom(page), { timeout: 8_000 })
-      .toBeLessThan(120);
+      .poll(() => distanceFromBottom(page), { timeout: 2_000 })
+      .toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
     // Once the observer sees the sentinel again, the button hides.
     await expect(button).toBeHidden({ timeout: 5_000 });
   });
@@ -347,7 +348,7 @@ test.describe("Room-switch scroll reset (#402.3)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    // Enter a room and scroll up so it is no longer pinned to the bottom.
+    // Enter a room and scroll up until its newest message is off screen.
     await selectRoom(page, "Your Private Room");
     await waitSettledAtBottom(page);
     await scrollUpUntilButtonVisible(page);

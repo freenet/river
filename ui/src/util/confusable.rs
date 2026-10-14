@@ -3266,13 +3266,25 @@ mod tests {
         // field or an ordinary function — verified against the whole tree when
         // this was written. Anything else in backticks is left alone, so this
         // cannot start failing on a normal identifier.
-        let sources: [(&str, &str); 5] = [
+        let sources: [(&str, &str); 8] = [
             ("confusable.rs", include_str!("confusable.rs")),
             ("display_name.rs", include_str!("display_name.rs")),
             ("members.rs", include_str!("../components/members.rs")),
             (
                 "conversation.rs",
                 include_str!("../components/conversation.rs"),
+            ),
+            (
+                "conversation/markdown.rs",
+                include_str!("../components/conversation/markdown.rs"),
+            ),
+            (
+                "conversation/history_window.rs",
+                include_str!("../components/conversation/history_window.rs"),
+            ),
+            (
+                "conversation/history_scroll.rs",
+                include_str!("../components/conversation/history_scroll.rs"),
             ),
             ("nickname.rs", include_str!("../nickname.rs")),
         ];

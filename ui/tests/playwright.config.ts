@@ -43,7 +43,10 @@ export default defineConfig({
       grepInvert: CHROMIUM_ONLY,
       use: { ...devices["Desktop Safari"] },
     },
-    // Mobile viewports (Chromium engine)
+    // Mobile devices: mobile-chrome runs Chromium, mobile-safari WebKit
+    // (iPhone 13's default engine; no browserName is set). Neither is real
+    // Safari, and Playwright's WebKit has scroll anchoring that Safari before
+    // 27 lacks.
     {
       name: "mobile-chrome",
       grepInvert: CHROMIUM_ONLY,

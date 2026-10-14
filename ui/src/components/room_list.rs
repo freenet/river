@@ -10,11 +10,10 @@ pub(crate) mod room_name_field;
 use crate::components::app::chat_delegate::{
     retry_rooms_load, save_rooms_to_delegate, RoomsLoadState, ROOMS_LOAD_STATE,
 };
-use crate::components::app::document_title::{
-    count_unread_in_room_data_with_mode, mark_current_room_as_read,
-};
+use crate::components::app::document_title::count_unread_in_room_data_with_mode;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
+use crate::components::back_to_chat::BackToChatButton;
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
 use crate::components::room_list::join_with_code_modal::JoinWithCodeModal;
@@ -23,8 +22,8 @@ use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
     icons::fa_solid_icons::{
-        FaArrowLeft, FaArrowsUpDown, FaChevronDown, FaChevronUp, FaComments, FaFileImport, FaLock,
-        FaPlus, FaRightToBracket, FaTriangleExclamation,
+        FaArrowsUpDown, FaChevronDown, FaChevronUp, FaComments, FaFileImport, FaLock, FaPlus,
+        FaRightToBracket, FaTriangleExclamation,
     },
     Icon,
 };
@@ -96,7 +95,7 @@ pub(crate) fn room_list_display_state(
 /// one of their messages — so the copy must not claim "messages", and must
 /// name replies as well as mentions (freenet/river#500). Both variants are
 /// singular-aware so a count of 1 never reads "1 unread messages".
-fn unread_badge_label(unread: usize, is_mentions: bool) -> String {
+pub(crate) fn unread_badge_label(unread: usize, is_mentions: bool) -> String {
     match (is_mentions, unread) {
         (true, 1) => "1 unread mention or reply".to_string(),
         (true, n) => format!("{n} unread mentions or replies"),
@@ -212,6 +211,16 @@ pub fn RoomList() -> Element {
         // it re-poll a macrotask later instead.
         crate::util::signal_guard::anchor();
         let current_room_key = CURRENT_ROOM.read().owner_key;
+        // While another mobile panel replaces the chat, Latest is hidden with
+        // it, so the open room's row badges its unread messages too
+        // (`.claude/rules/history-scrolling.md`).
+        let chat_hidden = match MOBILE_VIEW.try_read() {
+            Ok(view) => *view != MobileView::Chat,
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                false
+            }
+        };
         let Ok(rooms) = ROOMS.try_read() else {
             crate::util::signal_guard::schedule_nudge();
             return Vec::new();
@@ -281,7 +290,13 @@ pub fn RoomList() -> Element {
                     .get(&room_key)
                     .copied()
                     .unwrap_or_default();
-                let unread = count_unread_in_room_data_with_mode(room_data, mode);
+                // The open room's Latest button offers its unread messages
+                // while the chat shows, so its row badges none.
+                let unread = if is_current && !chat_hidden {
+                    0
+                } else {
+                    count_unread_in_room_data_with_mode(room_data, mode)
+                };
                 // Badge label matches what is being counted: qualifying
                 // mentions/replies for MentionsAndReplies rooms, all unread
                 // messages otherwise. (Muted rooms never render the badge.)
@@ -335,10 +350,10 @@ pub fn RoomList() -> Element {
             class: "w-full md:w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
             // Mobile back button (hidden on desktop)
             div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
-                button {
-                    class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Chat),
-                    Icon { icon: FaArrowLeft, width: 16, height: 16 }
+                BackToChatButton {
+                    class: "p-2",
+                    icon_size: 16,
+                    testid: "rooms-back-to-chat-button",
                 }
                 span { class: "ml-2 text-sm font-semibold text-text", "Rooms" }
             }
@@ -577,8 +592,9 @@ pub fn RoomList() -> Element {
                                     // Defer signal mutations to a clean execution context to
                                     // prevent RefCell re-entrant borrow panics.
                                     crate::util::defer(move || {
+                                        // The title effect applies the read rule
+                                        // on this write.
                                         *CURRENT_ROOM.write() = CurrentRoom { owner_key: Some(room_key) };
-                                        mark_current_room_as_read();
                                         // Switch to chat view on mobile
                                         *MOBILE_VIEW.write() = MobileView::Chat;
                                         spawn(async move {
@@ -600,19 +616,24 @@ pub fn RoomList() -> Element {
                                             Icon { width: 12, height: 12, icon: FaLock }
                                         }
                                     }
-                                    // Unread badge — hidden for the current
-                                    // room (its messages are marked read on
-                                    // open, so a badge there would only
-                                    // flicker) and for Muted rooms (their
-                                    // count is always 0, freenet/river#500).
-                                    // Styling mirrors the DM rail badge plus
-                                    // `flex-shrink-0` so a long truncated
-                                    // room name can't squash it; the accent
-                                    // styling applies to any nonzero count,
-                                    // whichever mode produced it.
-                                    if unread > 0 && !is_current {
+                                    // Unread badge, absent for Muted rooms
+                                    // (their count is always 0,
+                                    // freenet/river#500) and for the open room
+                                    // while the chat shows (see `room_items`).
+                                    // The open room's badge is `md:hidden`: on
+                                    // desktop the chat always shows, whatever
+                                    // `MOBILE_VIEW` says.
+                                    //
+                                    // Styling mirrors the DM rail badge, plus
+                                    // `flex-shrink-0` so a long truncated room
+                                    // name can't squash it.
+                                    if unread > 0 {
                                         span {
-                                            class: "ml-2 flex-shrink-0 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
+                                            class: if is_current {
+                                                "ml-2 flex-shrink-0 inline-flex md:hidden items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white"
+                                            } else {
+                                                "ml-2 flex-shrink-0 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white"
+                                            },
                                             "data-testid": "room-unread-badge",
                                             title: "{badge_title}",
                                             "aria-label": "{badge_aria}",

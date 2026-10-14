@@ -39,6 +39,8 @@ pub static OPEN_DM_THREAD: GlobalSignal<Option<(VerifyingKey, MemberId)>> = Glob
 /// user has actually viewed in [`DmThreadModal`]. Anything in
 /// `room.direct_messages.messages` addressed to the local user with
 /// `timestamp > last_seen` counts as unread.
+/// Known limitation: DMs from the same peer in the same Unix second are
+/// read together, even if one arrives later or remains below the fold (#764).
 pub static DM_LAST_SEEN: GlobalSignal<HashMap<(VerifyingKey, MemberId), u64>> =
     Global::new(HashMap::new);
 
@@ -46,42 +48,37 @@ pub static DM_LAST_SEEN: GlobalSignal<HashMap<(VerifyingKey, MemberId), u64>> =
 /// actually advance the stored cutoff? `current` is the existing
 /// `DM_LAST_SEEN` entry for the `(room, peer)` pair (`None` = no entry
 /// yet, which reads as cutoff 0 everywhere else).
-///
-/// Split out because the answer gates whether `mark_thread_read`
-/// touches the signal at all: `DmThreadModalBody` calls
-/// `mark_thread_read` from its render body on every render while a
-/// thread is open, and `with_mut` notifies subscribers even when the
-/// mutation changed nothing — so an unconditional write turned an open
-/// DM thread into a continuous write pulse on `DM_LAST_SEEN`, widening
-/// the contention window that blanked the DM rail (issue #499).
-/// Pinned by the `thread_read_needs_write_*` tests plus the wiring pin
-/// `mark_thread_read_write_is_gated_pinned`.
-pub(crate) fn thread_read_needs_write(current: Option<u64>, up_to_ts: u64) -> bool {
+fn thread_read_needs_write(current: Option<u64>, up_to_ts: u64) -> bool {
     up_to_ts > current.unwrap_or(0)
 }
 
-/// Mark every DM from `peer` in `room` as seen up to (and including) the
-/// most recent inbound message timestamp known to the synchronizer.
-pub fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
+/// Mark every DM from `peer` in `room` as seen up to (and including)
+/// `up_to_ts`. The open thread calls it only with an inbound DM the reader
+/// has had on screen with the tab visible; see
+/// `ThreadSeenWitness` in `dm_thread_modal.rs`.
+///
+/// The write is gated on [`thread_read_needs_write`]. The open thread calls
+/// this from every read-rule trigger, and `with_mut` notifies subscribers
+/// even when the mutation changed nothing, so an unconditional write turned
+/// an open DM thread into a continuous write pulse on `DM_LAST_SEEN`,
+/// widening the contention window that blanked the DM rail (issue #499).
+// Its one caller measures the DOM, so it exists only on wasm32.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
     crate::util::defer(move || {
-        // Skip the write when the stored cutoff would not advance —
-        // `with_mut` notifies subscribers even for a no-op mutation and
-        // this runs on every render of an open thread (issue #499
-        // write-pulse). `try_peek` registers no subscription; it fails
-        // ONLY while a live WRITE borrow exists on `DM_LAST_SEEN` — and
-        // on that same synchronous stack `with_mut` (which is
-        // `f(&mut *self.write())`, a panicking borrow) would be a
-        // GUARANTEED panic. So a contended peek must SKIP, never fall
-        // through to the write. Skipping is harmless: this function
-        // re-fires on every render of the open thread and again on the
-        // next inbound message, so a skipped advance self-heals on the
-        // next clean pass. The `false` fallback below is load-bearing —
-        // a `true` fallback is the panic path. Pinned by
-        // `mark_thread_read_write_is_gated_pinned`.
-        let needs_write = DM_LAST_SEEN
+        // `try_peek` registers no subscription; it fails ONLY while a live
+        // WRITE borrow exists on `DM_LAST_SEEN` — and on that same
+        // synchronous stack `with_mut` (which is `f(&mut *self.write())`, a
+        // panicking borrow) would be a GUARANTEED panic. So a contended peek
+        // must SKIP, never fall through to the write, and nudge: the nudge
+        // re-runs the thread's witness effect, which calls this again.
+        let Ok(needs_write) = DM_LAST_SEEN
             .try_peek()
             .map(|seen| thread_read_needs_write(seen.get(&(room, peer)).copied(), up_to_ts))
-            .unwrap_or(false);
+        else {
+            crate::util::signal_guard::schedule_nudge();
+            return;
+        };
         if !needs_write {
             return;
         }
@@ -94,8 +91,9 @@ pub fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
     });
 }
 
-/// Open the DM thread modal for `(room, peer)`. Closes any other open
-/// thread first.
+/// Open the DM thread modal on `(room, peer)`, deferred. There is one modal,
+/// so this replaces whichever thread is open, and the modal mounts a fresh
+/// body for the new one.
 pub fn open_dm_thread(room: VerifyingKey, peer: MemberId) {
     crate::util::defer(move || {
         *OPEN_DM_THREAD.write() = Some((room, peer));
@@ -171,7 +169,7 @@ impl OutboundDmsCache {
     /// Insert an entry — exposed so unit tests can construct a
     /// populated cache without depending on the delegate I/O path.
     /// Production callers should go through
-    /// `chat_delegate::save_outbound_dm` to also get per-pair cap
+    /// `chat_delegate::save_outbound_dm_now` to also get per-pair cap
     /// eviction and a delegate save.
     #[cfg(test)]
     pub(crate) fn insert_for_test(&mut self, entry: OutboundDmEntry) {
@@ -350,7 +348,7 @@ pub async fn send_structured_dm(
     peer: MemberId,
     body: river_core::room_state::dm_body::DirectMessageBody,
 ) -> SendDmOutcome {
-    use crate::components::app::chat_delegate::{save_outbound_dm, unhide_dm_thread};
+    use crate::components::app::chat_delegate::{save_outbound_dm_now, unhide_dm_thread};
     use crate::components::app::{mark_needs_sync, ROOMS};
     use freenet_scaffold::ComposableState;
     use river_core::room_state::direct_messages::{compose_direct_message, DirectMessagesDelta};
@@ -528,7 +526,7 @@ pub async fn send_structured_dm(
 
         if matches!(outcome, SendDmOutcome::Sent) {
             mark_needs_sync(room);
-            save_outbound_dm(
+            save_outbound_dm_now(
                 room,
                 self_id,
                 peer,
@@ -543,10 +541,9 @@ pub async fn send_structured_dm(
             // who had scrolled up: the picker's success banner lives inside
             // the picker and is torn down in the same defer block that closes
             // it, so it renders for zero frames, and the thread simply looked
-            // unchanged. This send adds a message, so a fresh bubble mounts
-            // and re-runs the auto-scroll effect — the condition
-            // `note_outbound_send`'s docs require of any caller.
-            dm_thread_modal::note_outbound_send();
+            // unchanged. This send adds a DM to that thread, which re-renders
+            // it — the condition `OUTBOUND_SENDS`'s docs require of any caller.
+            dm_thread_modal::note_outbound_send(room, peer);
         }
         let _ = tx.send(outcome);
     });
@@ -961,16 +958,12 @@ mod tests {
         }
     }
 
-    /// Issue #499 write-pulse: `mark_thread_read` is called from
-    /// `DmThreadModalBody`'s render body on every render while a thread
-    /// is open, and `with_mut` notifies subscribers even when the
-    /// mutation is a no-op — so the `with_mut` MUST stay gated on
-    /// `thread_read_needs_write`. Source-scrape (the function needs a
-    /// Dioxus runtime to exercise): match whitespace-stripped source so
-    /// rustfmt reflowing can't fake a failure; cut at `mod tests` (this
-    /// file has exactly one) so these needles can't satisfy their own
-    /// check; bound the segment by the NEXT function head so a gate
-    /// elsewhere in the file can't vacuously pass.
+    /// `mark_thread_read`'s `with_mut` stays gated on
+    /// `thread_read_needs_write` (see its doc). Source-scrape (the function
+    /// needs a Dioxus runtime to exercise): match whitespace-stripped source
+    /// so rustfmt reflowing can't fake a failure; cut at `mod tests` so these
+    /// needles can't satisfy their own check; bound the segment by the NEXT
+    /// function head so a gate elsewhere in the file can't vacuously pass.
     #[test]
     fn mark_thread_read_write_is_gated_pinned() {
         let src = include_str!("direct_messages.rs");
@@ -978,7 +971,7 @@ mod tests {
         let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
 
         let start = stripped
-            .find("pubfnmark_thread_read")
+            .find("fnmark_thread_read(")
             .expect("mark_thread_read not found");
         let end = stripped[start..]
             .find("pubfnopen_dm_thread")
@@ -999,37 +992,34 @@ mod tests {
             decide < gate && gate < write,
             "mark_thread_read's with_mut must come AFTER the needs-write gate \
              (decide at {decide}, gate at {gate}, write at {write}) — an ungated \
-             with_mut notifies DM rail subscribers on every render of an open \
-             thread (issue #499 write-pulse)"
+             with_mut notifies DM rail subscribers each time an open thread \
+             re-applies its read rule (issue #499 write-pulse)"
         );
 
-        // The contended-peek fallback must be FALSE (skip the write).
-        // `try_peek` fails only while a live WRITE borrow exists on
-        // DM_LAST_SEEN, and on that same synchronous stack `with_mut`
-        // is a panicking borrow — so a `true` fallback converts every
-        // contended peek into a guaranteed RefCell panic. `false` is
-        // safe: mark_thread_read re-fires on every render of the open
-        // thread, so a skipped advance self-heals on the next clean
-        // pass. (Needles built with concat! so this comment and the
-        // assertion literals cannot drift into matching themselves —
-        // they sit inside the cut anyway, belt and braces.)
-        let fallback_false = concat!(".unwrap_or(", "false)");
-        let fallback_true = concat!(".unwrap_or(", "true)");
+        // A contended peek must SKIP the write and nudge (see the comment in
+        // `mark_thread_read`). Needles built with concat! so the assertion
+        // literals cannot match themselves.
+        let skip_on_contention = concat!(
+            "else{crate::util::signal_guard::",
+            "schedule_nudge();return;};"
+        );
+        let skip = seg.find(skip_on_contention).unwrap_or_else(|| {
+            panic!(
+                "mark_thread_read's contended try_peek must `else {{ schedule_nudge(); \
+                 return; }}`: skip the write (with_mut would panic) and nudge to retry it"
+            )
+        });
         assert!(
-            seg.contains(fallback_false),
-            "mark_thread_read's try_peek fallback must be `false` (skip on \
-             contention) — a contended peek means a live write borrow, and \
-             falling through to with_mut on that stack panics"
+            seg.contains(concat!("letOk(needs_write)=DM_LAST_SEEN", ".try_peek()")),
+            "mark_thread_read must bind the peeked decision with `let Ok(needs_write)`"
         );
         assert!(
-            !seg.contains(fallback_true),
-            "mark_thread_read must NOT fall back to `true` on a contended \
-             try_peek — that is the guaranteed-panic path (with_mut on a \
-             signal whose write borrow is live)"
+            skip < gate,
+            "mark_thread_read's contended-peek skip must come before the gated write"
         );
     }
 
-    /// Decision table for the issue #499 write-pulse gate.
+    /// Decision table for `thread_read_needs_write`.
     #[test]
     fn thread_read_needs_write_only_when_cutoff_advances() {
         // No stored entry: any positive timestamp advances the cutoff…

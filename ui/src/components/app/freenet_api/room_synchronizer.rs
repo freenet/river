@@ -2,9 +2,7 @@
 
 use super::error::SynchronizerError;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
-use crate::components::app::document_title::{
-    mark_current_room_as_read, update_document_title, DOCUMENT_VISIBLE,
-};
+use crate::components::app::document_title::update_document_title;
 use crate::components::app::freenet_api::backward_probe::{start_rekey_merge, RekeyStart};
 use crate::components::app::freenet_api::constants::INVITATION_TIMEOUT_MS;
 use crate::components::app::freenet_api::response_handler::get_response::request_seed_put;
@@ -13,7 +11,7 @@ use crate::components::app::notifications::{
 };
 use crate::components::app::receive_times::record_receive_times;
 use crate::components::app::sync_info::{now_ms, RoomSyncStatus, SubscribeRoute, SYNC_INFO};
-use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
+use crate::components::app::{PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
 use crate::util::{owner_vk_to_contract_key, strip_upgrade_pointer, to_cbor_vec};
@@ -602,13 +600,6 @@ impl RoomSynchronizer {
                 &member_info,
                 &room_secrets,
             );
-
-            // If user is viewing this room with tab visible, mark as read
-            let is_visible = *DOCUMENT_VISIBLE.read();
-            let is_current_room = CURRENT_ROOM.read().owner_key == Some(owner_vk);
-            if is_visible && is_current_room {
-                mark_current_room_as_read();
-            }
         }
     }
 }
@@ -1709,13 +1700,6 @@ impl RoomSynchronizer {
                 &member_info,
                 &room_secrets,
             );
-
-            // If user is viewing this room with tab visible, mark as read
-            let is_visible = *DOCUMENT_VISIBLE.read();
-            let is_current_room = CURRENT_ROOM.read().owner_key == Some(room_owner_copy);
-            if is_visible && is_current_room {
-                mark_current_room_as_read();
-            }
         }
     }
 

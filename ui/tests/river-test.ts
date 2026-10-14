@@ -8,8 +8,16 @@ type RiverTestHooks = {
   insertMessageBeforeLast(text: string): void;
   appendMessages(count: number): void;
   removeMessages(containing: string): void;
+  makeRoomPrivateWithoutSecret(): void;
   setRoomsLoadState(state: RoomsLoadState): void;
   switchRoom(name: string): void;
+  // Peer 0 and peer 1 are two fixed test identities, each with its own thread. Others throw.
+  appendDmsForPeer(peerIndex: 0 | 1, count: number): void;
+  deliverDmForPeer(peerIndex: 0 | 1, text: string): void;
+  // Admits the peer as a member with no DMs, for an empty thread.
+  admitDmPeer(peerIndex: 0 | 1): void;
+  // An own DM to the peer through the real send path; resolves to the outcome, "Sent" on success.
+  sendDmToPeer(peerIndex: 0 | 1, text: string): Promise<string>;
 };
 
 // One hook per round trip.

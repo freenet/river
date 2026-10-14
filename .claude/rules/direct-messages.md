@@ -78,6 +78,24 @@ seeds `DM_LAST_SEEN` from the max inbound DM timestamp per
 arriving inbound DM would be instantly marked seen and never surface as
 unread.
 
+**Read rule and scrolling.** The follow-at-end policy and its rationale live
+in [history-scrolling.md](history-scrolling.md).
+An open thread advances `DM_LAST_SEEN` (`mark_thread_read`) only up to an inbound DM
+that was on screen while the thread was in the foreground (tab visible and
+the thread laid out, `foreground::in_foreground`; its own confirmation dialog
+does not count) — never from
+render, since an arrival can render below the fold. `ThreadSeenWitness::check`
+in `dm_thread_modal.rs` measures `dm-bottom-sentinel` against the thread's
+view; it runs after the thread changes, when the tab becomes visible
+(`DOCUMENT_VISIBLE`), from the newest-DM
+observer, and after the opening, own-send, follow and Latest placements. An
+inbound DM follows a reader at the end (newest DM's bottom within
+`FOLLOW_BAND_PX` = 100px, the room's band, measured before the patch by
+`HistoryDom::arrival_follows`); otherwise the Latest control (`dm-scroll-to-latest`)
+shows while the newest DM's bottom is more than a few px off screen, and
+jumps instantly. The modal body is keyed by `(room, peer)`, so opening
+another thread remounts it (and its witness).
+
 ## Share-invite-via-DM picker
 
 `INVITE_VIA_DM_PICKER` global signal opens
@@ -152,7 +170,9 @@ plaintext in the chat delegate.
   hit → plaintext; miss → legacy placeholder. Pinned by
   `dm_outbound_lookup_returns_plaintext_on_hit` /
   `…_returns_err_on_miss`.
-- **Save path**: `save_outbound_dm()` defers the cache insert, enforces
+- **Save path**: `save_outbound_dm_now()` inserts into the cache at once
+  (both senders call it inside the `defer` block that adds the DM to
+  `ROOMS`, so the sent bubble never renders as a placeholder), enforces
   `MAX_DM_MESSAGES_PER_PAIR` eviction, and queues a coalesced save via
   `save_outbound_dms_to_delegate`. The coalesce primitive is the shared
   `coalesce_save` helper in `chat_delegate.rs`, driven by a
