@@ -634,6 +634,26 @@ pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
     ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code)
 }
 
+/// The room contract this binary bundles, parameterised for `owner_vk`, as a
+/// PUT carries it.
+///
+/// Only for a path that PUTs the contract's real bytes, which riverctl has only
+/// for the generation it bundles; such a path must first check
+/// `KeyIntent::PublishCode`.
+fn bundled_room_contract_container(owner_vk: &VerifyingKey) -> Result<ContractContainer> {
+    let params_bytes = {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&ChatRoomParametersV1 { owner: *owner_vk }, &mut buf)
+            .map_err(|e| anyhow!("Failed to serialize parameters: {}", e))?;
+        buf
+    };
+    // bundled-wasm-ok: the caller PUTs these bytes, gated on `PublishCode`.
+    let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+    Ok(ContractContainer::from(ContractWasmAPIVersion::V1(
+        WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
+    )))
+}
+
 /// Resolve a message's human-readable body for display.
 ///
 /// `effective_text` only yields text for `Text`/`Reply` bodies (and any edited
@@ -1023,14 +1043,15 @@ async fn await_update_response<S: ResponseSource>(
 /// stored is `new_key`, never one read off a response.
 ///
 /// A notification for `new_key` itself is stepped over too, rather than taken
-/// as a merge, because it is never the PUT's answer. It reaches this connection
-/// only through a subscription to `new_key` the connection already held, and
-/// the PUT is answered separately regardless: every exit of freenet-core's
-/// local `perform_contract_put` returns an `UpdateResponse` or `PutResponse`
-/// (after `finalize_state_commit` has notified existing subscribers), and the
-/// network PUT driver answers `PutResponse` or an error. Taking the
-/// notification would end the wait early and leave that answer on the shared
-/// connection for the next waiter to misread.
+/// as a merge, because it is never the PUT's answer. It comes from a
+/// subscription to `new_key`: one the connection already held, or, in network
+/// mode, the listener this PUT's `subscribe: true` registers before the node
+/// stores the state, so the PUT's own commit can notify it ahead of the answer.
+/// The PUT is answered separately either way: freenet-core's local
+/// `perform_contract_put` answers `UpdateResponse` or `PutResponse` on success
+/// and an error otherwise, and the network PUT driver answers `PutResponse` or
+/// an error. Taking the notification would end the wait early and leave that
+/// answer on the shared connection for the next waiter to misread.
 async fn await_migration_and_record<S: ResponseSource>(
     storage: &Storage,
     web_api: &mut S,
@@ -4331,24 +4352,9 @@ impl ApiClient {
             .await?
             .authorize(KeyIntent::PublishCode)?;
 
-        let parameters = ChatRoomParametersV1 {
-            owner: *room_owner_key,
-        };
-        let params_bytes = {
-            let mut buf = Vec::new();
-            ciborium::ser::into_writer(&parameters, &mut buf)
-                .map_err(|e| anyhow!("Failed to serialize parameters: {}", e))?;
-            buf
-        };
-
-        // bundled-wasm-ok: this path PUTs the contract's real bytes, and riverctl
-        // only has the ones it bundles. Gated above on `KeyIntent::PublishCode`,
-        // which refuses unless River's pointer record agrees these bytes are the
-        // current generation.
-        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-        let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
-            WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
-        ));
+        // Gated above on `KeyIntent::PublishCode`, which refuses unless River's
+        // pointer record agrees the bundled bytes are the current generation.
+        let contract_container = bundled_room_contract_container(room_owner_key)?;
         // The node answers under the key of the container we PUT, and the
         // waiter below accepts only `new_contract_key`. The `PublishCode` gate
         // above makes the two agree; if they ever did not, every answer would
@@ -7425,22 +7431,16 @@ mod migration_recovery_tests {
     }
 
     /// The premise of `migrate_room_to_new_contract`'s pre-send check: the
-    /// container it PUTs is keyed exactly as the bundled derivation, so the
-    /// node's answer carries the key the migration waits for.
+    /// container it PUTs is keyed exactly as the key it waits for, which
+    /// `ensure_room_migrated` takes from the room anchor, i.e. the registry
+    /// derivation for the bundled code hash once `PublishCode` is authorized.
     #[test]
-    fn migration_container_key_matches_the_bundled_derivation() {
+    fn migration_container_key_matches_the_anchor_derivation() {
         let owner = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
-        let mut params = Vec::new();
-        ciborium::ser::into_writer(&ChatRoomParametersV1 { owner }, &mut params).unwrap();
-        // bundled-wasm-ok: built exactly as the migration builds its PUT.
-        let code = ContractCode::from(ROOM_CONTRACT_WASM);
-        let container = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
-            Arc::new(code),
-            Parameters::from(params),
-        )));
-        // bundled-wasm-ok: the derivation `ensure_room_migrated` resolves to
-        // when `KeyIntent::PublishCode` is authorized.
-        assert_eq!(container.key().id(), compute_contract_key(&owner).id());
+        let container = bundled_room_contract_container(&owner).unwrap();
+        let via_anchor =
+            river_core::migration::contract_key_for_code_hash(&owner, &bundled_room_code_hash());
+        assert_eq!(container.key().id(), via_anchor.id());
     }
 
     /// The current room-contract WASM must NOT be in the legacy registry — the
