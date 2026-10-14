@@ -13,7 +13,9 @@ use rand::rngs::OsRng;
 use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::direct_messages::{sign_direct_message, DirectMessagesDelta};
-use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersDelta, MembersV1};
+use river_core::room_state::member::{
+    AuthorizedMember, BanResolution, Member, MemberId, MembersDelta, MembersV1,
+};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
 use river_core::room_state::message::{
     AuthorizedMessageV1, MessageV1, MessagesV1, RoomMessageBody,
@@ -529,6 +531,20 @@ impl Room {
             id: sk.verifying_key().into(),
             auth: AuthorizedMember::new(member, &inviter.sk),
             sk,
+        }
+    }
+
+    /// A person holding `sk`, invited by the owner.
+    fn person_signed_by(&self, sk: &SigningKey) -> Person {
+        let member = Member {
+            owner_member_id: self.owner_id,
+            invited_by: self.owner_id,
+            member_vk: sk.verifying_key(),
+        };
+        Person {
+            id: sk.verifying_key().into(),
+            auth: AuthorizedMember::new(member, &self.owner_sk),
+            sk: sk.clone(),
         }
     }
 
@@ -1927,4 +1943,115 @@ fn empty_ban_evidence_is_not_serialized() {
     );
     let back: ChatRoomStateV1 = ciborium::de::from_reader(&bytes[..]).unwrap();
     assert_eq!(ser(&back), bytes);
+}
+
+/// A ban that closes a mutual-ban cycle ranks with the mutual bans at the
+/// `max_user_bans` cap even when an earlier ban already removed its issuer
+/// (Ian, 2026-09-24: both bans of a mutual ban stand). Under cap pressure the
+/// cycle's bans are kept and other bans that take no effect go first.
+#[test]
+fn cycle_bans_rank_mutual_after_an_earlier_removal() {
+    let room = capped_room(20, 4);
+    let (a, b, c, t, u) = (
+        room.person(),
+        room.person(),
+        room.person(),
+        room.person(),
+        room.person(),
+    );
+    let s = room.modded_state(&[&a, &b, &c, &t, &u], &[&a, &b, &c], vec![]);
+    let c_bans_a = room.ban(&c, &a, 5);
+    let (a_bans_b, b_bans_a) = (room.ban(&a, &b, 10), room.ban(&b, &a, 11));
+    let s = apply_checked(
+        &s,
+        bans_delta(vec![c_bans_a.clone(), a_bans_b.clone(), b_bans_a.clone()]),
+        &room.params,
+    );
+    let resolution = s
+        .members
+        .resolve_bans(&s.ban_evidence, &s.bans, &s.member_info, &room.params);
+    assert_eq!(resolution.tier(&a_bans_b.id()), BanResolution::MUTUAL);
+    assert_eq!(resolution.tier(&b_bans_a.id()), BanResolution::MUTUAL);
+
+    // Two later bans by B that take no effect push the room over the cap.
+    let extra = vec![room.ban(&b, &t, 1_000_000), room.ban(&b, &u, 1_000_001)];
+    let after = apply_checked(&s, bans_delta(extra), &room.params);
+    assert!(has_ban(&after, &c_bans_a));
+    assert!(has_ban(&after, &a_bans_b) && has_ban(&after, &b_bans_a));
+    let active = active_ids(&after, &room.params);
+    assert!(!active.contains(&a.id) && !active.contains(&b.id));
+    assert!(active.contains(&t.id) && active.contains(&u.id));
+}
+
+/// Only signature-verified bans compete for the one ranked slot per
+/// `(issuer, target)` pair: a ban attributed to D for the same target, dated
+/// earlier but not signed by D, does not take the slot from D's own ban.
+#[test]
+fn pair_ranking_counts_only_verified_bans() {
+    let room = capped_room(20, 2);
+    let (d, x, y, z) = (room.person(), room.person(), room.person(), room.person());
+    let s = room.modded_state(&[&d, &x, &y, &z], &[&d], vec![]);
+    let real = room.ban(&d, &x, 20);
+    let other_sk = SigningKey::generate(&mut OsRng);
+    let other = room.ban(&room.person_signed_by(&other_sk), &x, 1);
+    let unsigned_by_d = AuthorizedUserBan {
+        banned_by: d.id,
+        ..other
+    };
+    let mut bans = vec![
+        unsigned_by_d,
+        real.clone(),
+        room.ban(&d, &y, 30),
+        room.ban(&y, &z, 40),
+    ];
+    BansV1::enforce_user_ban_cap(
+        &mut bans,
+        2,
+        &s.members,
+        &s.ban_evidence,
+        &s.member_info,
+        &room.params,
+    );
+    assert!(
+        bans.iter().any(|b| b.id() == real.id()),
+        "D's own ban keeps its slot"
+    );
+}
+
+/// Bans stored before ban evidence existed, by a present member on targets
+/// whose records are held nowhere (they left before the upgrade), keep their
+/// place at the `max_user_bans` cap as they had it before: ranked with the
+/// bans that take effect. The Official room held 120-144 such bans at its
+/// cap. Here the room is at its cap of 3 when a ban the room cannot verify
+/// arrives: that one is evicted, not the oldest stored ban.
+#[test]
+fn bans_on_targets_held_nowhere_keep_their_cap_rank() {
+    let room = capped_room(20, 3);
+    let (d, t) = (room.person(), room.person());
+    let (g1, g2, g3) = (room.person(), room.person(), room.person()); // never members
+    let s = room.modded_state(&[&d, &t], &[], vec![]);
+    let (d_g1, d_g2) = (room.ban(&d, &g1, 1), room.ban(&d, &g2, 2));
+    let owner_g3 = room.owner_ban(&g3, 3);
+    let s = apply_checked(
+        &s,
+        bans_delta(vec![d_g1.clone(), d_g2.clone(), owner_g3.clone()]),
+        &room.params,
+    );
+    let resolution = s
+        .members
+        .resolve_bans(&s.ban_evidence, &s.bans, &s.member_info, &room.params);
+    assert_eq!(
+        resolution.tier(&d_g1.id()),
+        BanResolution::INERT,
+        "precondition: authority over a target held nowhere cannot be judged"
+    );
+    // A ban by someone the room has no record of, newer than all three.
+    let stranger = room.person();
+    let after = apply_checked(
+        &s,
+        bans_delta(vec![room.ban(&stranger, &t, 100)]),
+        &room.params,
+    );
+    assert!(has_ban(&after, &d_g1) && has_ban(&after, &d_g2) && has_ban(&after, &owner_g3));
+    assert!(active_ids(&after, &room.params).contains(&t.id));
 }

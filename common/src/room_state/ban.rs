@@ -149,16 +149,19 @@ impl BansV1 {
     /// 1. owner bans ([`BanResolution::OWNER`]): a non-owner ban can never
     ///    evict one;
     /// 2. bans that take effect because their issuer is not removed
-    ///    ([`BanResolution::EFFECTIVE`]);
-    /// 3. the halves of a mutual-ban cycle ([`BanResolution::MUTUAL`]);
+    ///    ([`BanResolution::EFFECTIVE`]), and bans whose target's record is
+    ///    held nowhere, by a present member whose signature verifies and whom
+    ///    no ban removes (their authority cannot be judged without the
+    ///    target's record; this is how they ranked before ban evidence);
+    /// 3. bans that close a mutual-ban cycle ([`BanResolution::MUTUAL`]);
     /// 4. everything else: bans that take no effect, by removed issuers, or
     ///    unverifiable ([`BanResolution::INERT`]).
     ///
-    /// Only one ban per `(issuer, target)` pair keeps its tier (the oldest by
-    /// `(banned_at, id)`); later duplicates add nothing and rank inert. Within
-    /// a tier it evicts oldest before newest, then by ban id, and restores the
-    /// canonical `(banned_at, id)` stored order. A no-op when already within
-    /// the cap.
+    /// Only one signature-verified ban per `(issuer, target)` pair keeps its
+    /// tier (the oldest by `(banned_at, id)`); later duplicates, owner bans
+    /// included, add nothing and rank inert. Within a tier it evicts oldest
+    /// before newest, then by ban id, and restores the canonical
+    /// `(banned_at, id)` stored order. A no-op when already within the cap.
     ///
     /// What this bounds: a member removed by a ban that takes effect, re-added
     /// with a burst of bans, or a ring of sybils banning each other in pairs
@@ -180,8 +183,13 @@ impl BansV1 {
         }
         let resolution =
             members.resolve_bans(evidence, &BansV1(bans.clone()), member_info, parameters);
+        // Only signature-verified bans compete for their pair, so a forged
+        // earlier copy cannot displace the real one.
         let mut first_of_pair: HashMap<(MemberId, MemberId), (SystemTime, BanId)> = HashMap::new();
-        for ban in bans.iter() {
+        for ban in bans
+            .iter()
+            .filter(|b| resolution.verified.contains(&b.id()))
+        {
             let key = (ban.banned_by, ban.ban.banned_user);
             let rank = (ban.ban.banned_at, ban.id());
             first_of_pair
@@ -193,15 +201,34 @@ impl BansV1 {
                 })
                 .or_insert(rank);
         }
+        let owner_id = parameters.owner_id();
+        let present = members.members_by_member_id();
+        let known = evidence.lookup(members, owner_id);
         let tier = |ban: &AuthorizedUserBan| {
             let first = first_of_pair
                 .get(&(ban.banned_by, ban.ban.banned_user))
                 .is_some_and(|(at, id)| *at == ban.ban.banned_at && *id == ban.id());
-            if first {
-                resolution.tier(&ban.id())
-            } else {
-                BanResolution::INERT
+            if !first {
+                return BanResolution::INERT;
             }
+            let tier = resolution.tier(&ban.id());
+            // A ban whose target's record is held nowhere cannot have its
+            // authority judged, and removes nobody until the target returns.
+            // It ranks as it did before ban evidence existed (`main`'s
+            // `ban_is_enforcing`): kept as a ban that takes effect when its
+            // issuer is a present member whose signature verifies and whom
+            // no ban removes. Bans stored before the upgrade, whose targets
+            // left before evidence was kept, keep their place at the cap.
+            if tier == BanResolution::INERT
+                && ban.banned_by != owner_id
+                && ban.ban.banned_user != owner_id
+                && present.contains_key(&ban.banned_by)
+                && !known.contains_key(&ban.ban.banned_user)
+                && !resolution.removed.contains(&ban.banned_by)
+            {
+                return BanResolution::EFFECTIVE;
+            }
+            tier
         };
         bans.sort_by_cached_key(|ban| (tier(ban), ban.ban.banned_at, ban.id()));
         let to_remove = bans.len() - max_bans;

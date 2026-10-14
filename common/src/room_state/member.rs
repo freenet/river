@@ -442,12 +442,14 @@ impl MembersV1 {
         // Step 0: the owner's bans.
         let owner_removed = owner_removed_in(&children, bans_v1, parameters);
         let mut ban_tiers: HashMap<BanId, u8> = HashMap::new();
+        let mut verified: HashSet<BanId> = HashSet::new();
         for ban in &bans_v1.0 {
             if ban.banned_by == owner_id
                 && ban.ban.banned_user != owner_id
                 && ban.verify_signature(&parameters.owner).is_ok()
             {
                 ban_tiers.insert(ban.id(), BanResolution::OWNER);
+                verified.insert(ban.id());
             }
         }
 
@@ -462,6 +464,7 @@ impl MembersV1 {
             {
                 continue;
             }
+            verified.insert(ban.id());
             if !Self::is_ban_authorized(issuer, ban.ban.banned_user, &lookup, member_info, owner_id)
             {
                 continue;
@@ -498,15 +501,10 @@ impl MembersV1 {
                 let removed_earlier = removed.contains(issuer);
                 for (ban_id, reach) in bans {
                     if in_cycle {
+                        // A cycle ban holds the cycle together whether or
+                        // not an earlier ban already removed its issuer.
                         if reach.iter().any(|y| component.contains(y)) {
-                            ban_tiers.insert(
-                                ban_id.clone(),
-                                if removed_earlier {
-                                    BanResolution::INERT
-                                } else {
-                                    BanResolution::MUTUAL
-                                },
-                            );
+                            ban_tiers.insert(ban_id.clone(), BanResolution::MUTUAL);
                         }
                     } else if !removed_earlier {
                         removed.extend(reach.iter().copied());
@@ -524,7 +522,11 @@ impl MembersV1 {
         // authority change cannot silently turn a ban of the owner into a ban
         // of the whole room.
         removed.remove(&owner_id);
-        BanResolution { removed, ban_tiers }
+        BanResolution {
+            removed,
+            ban_tiers,
+            verified,
+        }
     }
 
     /// Whether `banner` is currently authorized to ban `target` (#410).
@@ -827,13 +829,15 @@ pub struct BanResolution {
     /// first ([`Self::OWNER`], [`Self::EFFECTIVE`], [`Self::MUTUAL`]). A ban
     /// that is absent here ranks [`Self::INERT`].
     pub ban_tiers: HashMap<BanId, u8>,
+    /// The bans whose signature was checked against their issuer's key and
+    /// verified. Bans by owner-removed issuers are not checked.
+    pub verified: HashSet<BanId>,
 }
 
 impl BanResolution {
-    /// A ban that takes no effect, or a mutual-ban half whose issuer an
-    /// earlier ban had already removed.
+    /// A ban that takes no effect.
     pub const INERT: u8 = 0;
-    /// One half of a mutual-ban cycle whose issuer no earlier ban removed.
+    /// A ban that closes a mutual-ban cycle.
     pub const MUTUAL: u8 = 1;
     /// A ban that takes effect because its issuer is not removed.
     pub const EFFECTIVE: u8 = 2;
