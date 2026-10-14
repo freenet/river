@@ -1117,6 +1117,30 @@ mod tests {
                 "the reader scrolls up 6px, past the margin",
             ),
             (
+                view(1129, 1629),
+                4,
+                false,
+                "the reader scrolls up 4px, exactly at the margin, which keeps the hold",
+            ),
+            (
+                view(1128, 1628),
+                5,
+                true,
+                "the reader scrolls up 5px, one past the margin, which releases the hold",
+            ),
+            (
+                view(1129, 1629),
+                10,
+                false,
+                "the reader scrolls up 4px while content grows below, so the rise alone is at the margin",
+            ),
+            (
+                view(1123, 1623),
+                4,
+                false,
+                "the reader scrolls up 10px but ends exactly 4px from the end, at the margin",
+            ),
+            (
                 view(1130, 1630),
                 3,
                 false,
