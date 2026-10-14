@@ -875,7 +875,7 @@ fn a_ban_on_ones_own_inviter_is_void() {
 /// A self-ban is void (it would remove its issuer), and a ban on the owner
 /// never takes effect.
 #[test]
-fn self_bans_and_bans_on_the_owner() {
+fn a_self_ban_is_void() {
     let room = Room::new();
     let (a, t) = (room.person(), room.person());
     let s = room.modded_state(&[&a, &t], &[&a], vec![]);
@@ -884,21 +884,24 @@ fn self_bans_and_bans_on_the_owner() {
         active_ids(&after, &room.params).contains(&a.id),
         "a self-ban is void"
     );
+}
 
+#[test]
+fn a_ban_on_the_owner_removes_nobody() {
+    let room = Room::new();
+    let (a, t) = (room.person(), room.person());
     let owner = Person {
         sk: room.owner_sk.clone(),
         id: room.owner_id,
         auth: a.auth.clone(),
     };
     let s = room.modded_state(&[&a, &t], &[&a], vec![]);
-    let after = apply_checked(
-        &s,
-        bans_delta(vec![room.ban(&a, &owner, 10), room.owner_ban(&a, 11)]),
-        &room.params,
-    );
+    let after = apply_checked(&s, bans_delta(vec![room.ban(&a, &owner, 10)]), &room.params);
     let ids = active_ids(&after, &room.params);
-    assert!(!ids.contains(&a.id), "the owner's ban takes effect");
-    assert!(ids.contains(&t.id), "a ban on the owner removes nobody");
+    assert!(
+        ids.contains(&a.id) && ids.contains(&t.id),
+        "a ban on the owner removes nobody"
+    );
 }
 
 /// The owner's ban wins (Ian, 2026-09-24): a member the owner bans has no
@@ -1140,15 +1143,29 @@ fn a_removed_member_can_neither_send_nor_receive_dms() {
         }),
         ..Default::default()
     };
-    let mut after = s.clone();
-    // Either rejected outright or accepted and swept: both leave no DM.
-    if after.apply_delta(&s, &room.params, &Some(delta)).is_ok() {
-        after
-            .verify(&after, &room.params)
-            .expect("result must verify");
-    } else {
-        after = s.clone();
-    }
+    // Accepted, and the DMs to and from the removed member are swept.
+    let after = apply_checked(&s, delta, &room.params);
+    assert!(!member_ids(&after).contains(&a.id), "A stays removed");
+
+    // Control: the same delta shape between T and the owner keeps both DMs,
+    // so the sweep above is about A, not about the delta.
+    let owner = Person {
+        sk: room.owner_sk.clone(),
+        id: room.owner_id,
+        auth: t.auth.clone(),
+    };
+    let control = apply_checked(
+        &s,
+        ChatRoomStateV1Delta {
+            direct_messages: Some(DirectMessagesDelta {
+                new_messages: vec![dm(&t, &owner, 40), dm(&owner, &t, 41)],
+                advanced_purges: vec![],
+            }),
+            ..Default::default()
+        },
+        &room.params,
+    );
+    assert_eq!(control.direct_messages.messages.len(), 2);
     assert!(
         after.direct_messages.messages.is_empty(),
         "no DM to or from a removed member is held"
@@ -1897,7 +1914,9 @@ fn ban_evidence_records_must_verify() {
     use river_core::room_state::member::AuthorizedMember;
     let room = Room::new();
     let (t, x) = (room.person(), room.person());
-    let s = room.state(&[&t], vec![], vec![room.msg(&t, 1)]);
+    // T's ban on X references both, so neither check below is the
+    // "not referenced by a stored ban" one.
+    let s = room.state(&[&t], vec![room.ban(&t, &x, 0)], vec![room.msg(&t, 1)]);
 
     let forged =
         AuthorizedMember::with_signature(x.auth.member.clone(), Signature::from_bytes(&[3u8; 64]));
@@ -1905,19 +1924,26 @@ fn ban_evidence_records_must_verify() {
     bad.ban_evidence = BanEvidenceV1 {
         members: vec![forged.clone()],
     };
-    assert!(
-        bad.verify(&bad, &room.params).is_err(),
-        "forged evidence rejected"
-    );
+    let err = bad.verify(&bad, &room.params).unwrap_err();
+    assert!(err.contains("Invalid signature"), "forged evidence: {err}");
 
     let mut present = s.clone();
     present.ban_evidence = BanEvidenceV1 {
         members: vec![t.auth.clone()],
     };
+    let err = present.verify(&present, &room.params).unwrap_err();
     assert!(
-        present.verify(&present, &room.params).is_err(),
-        "a current member is not evidence"
+        err.contains("is a current member"),
+        "a current member is not evidence: {err}"
     );
+
+    // The genuine record is accepted, so the two rejections above are about
+    // the records, not the state.
+    let mut good = s.clone();
+    good.ban_evidence = BanEvidenceV1 {
+        members: vec![x.auth.clone()],
+    };
+    good.verify(&good, &room.params).unwrap();
 
     let after = apply_checked(
         &s,
@@ -2023,6 +2049,174 @@ fn pair_ranking_counts_only_verified_bans() {
         bans.iter().any(|b| b.id() == real.id()),
         "D's own ban keeps its slot"
     );
+}
+
+/// A member's record is kept as ban evidence when it is only an ISSUER: D,
+/// invited by P, bans X; then moderator M bans P, which removes P's subtree,
+/// D included. D's record stays as evidence because D's stored ban
+/// references D, and D's ban takes no effect (its issuer was removed).
+#[test]
+fn an_issuers_record_is_kept_as_evidence() {
+    let room = Room::new();
+    let (p, m, x) = (room.person(), room.person(), room.person());
+    let d = room.person_invited_by(&p);
+    let s = room.modded_state(&[&p, &m, &x, &d], &[&m, &d], vec![]);
+    let d_bans_x = room.ban(&d, &x, 10);
+    let s = apply_checked(&s, bans_delta(vec![d_bans_x.clone()]), &room.params);
+    assert!(
+        !member_ids(&s).contains(&x.id),
+        "precondition: D's ban works"
+    );
+    let after = apply_checked(&s, bans_delta(vec![room.ban(&m, &p, 20)]), &room.params);
+    let ids = member_ids(&after);
+    assert!(!ids.contains(&p.id) && !ids.contains(&d.id));
+    assert!(
+        evidence_ids(&after).contains(&d.id),
+        "D's record is evidence"
+    );
+    assert!(has_ban(&after, &d_bans_x), "D's ban stays stored");
+    let resolution = after.members.resolve_bans(
+        &after.ban_evidence,
+        &after.bans,
+        &after.member_info,
+        &room.params,
+    );
+    assert_eq!(resolution.tier(&d_bans_x.id()), BanResolution::INERT);
+}
+
+/// A member held as ban evidence keeps the ban authority its grants give.
+/// Owner-appointed moderator D invited T and never posts; moderator M bans T,
+/// so D's record is T's ancestor in M's ban; cleanup prunes D (D issued no
+/// ban, so the banner exemption does not apply) and keeps D's record as
+/// evidence. A NEW ban by D on U then takes effect: the same authority D would
+/// have by re-adding its own public record, and nothing distinguishes a new
+/// ban from one issued before the prune (`banned_at` is signed by the issuer).
+#[test]
+fn a_pruned_moderator_held_as_evidence_keeps_ban_authority() {
+    let room = Room::new();
+    let (d, m, u) = (room.person(), room.person(), room.person());
+    let t = room.person_invited_by(&d);
+    let mut s = room.state(
+        &[&d, &m, &u, &t],
+        vec![],
+        vec![room.msg(&m, 1), room.msg(&u, 2), room.msg(&t, 3)],
+    );
+    s.member_info = room.owner_mods(&[&d, &m]);
+    let s = apply_checked(&s, bans_delta(vec![room.ban(&m, &t, 5)]), &room.params);
+    assert!(!member_ids(&s).contains(&d.id), "precondition: D is pruned");
+    assert!(
+        evidence_ids(&s).contains(&d.id),
+        "precondition: D is evidence"
+    );
+    let after = apply_checked(&s, bans_delta(vec![room.ban(&d, &u, 30)]), &room.params);
+    assert!(
+        !member_ids(&after).contains(&u.id),
+        "D's new ban takes effect"
+    );
+}
+
+/// The owner ranks above everything at the `max_user_bans` cap, and only one
+/// ban per (issuer, target) keeps its tier: a later duplicate of an effective
+/// ban is evicted before a different effective ban.
+#[test]
+fn cap_keeps_owner_bans_first_and_one_ban_per_pair() {
+    let room = capped_room(20, 3);
+    let (d, x, y, z) = (room.person(), room.person(), room.person(), room.person());
+    let s = room.modded_state(&[&d, &x, &y, &z], &[&d], vec![]);
+    let owner_bans_x = room.owner_ban(&x, 50);
+    let d_bans_y = room.ban(&d, &y, 10);
+    let d_bans_y_again = room.ban(&d, &y, 60);
+    let d_bans_z = room.ban(&d, &z, 20);
+    let s = apply_checked(
+        &s,
+        bans_delta(vec![
+            owner_bans_x.clone(),
+            d_bans_y.clone(),
+            d_bans_z.clone(),
+        ]),
+        &room.params,
+    );
+    let after = apply_checked(&s, bans_delta(vec![d_bans_y_again.clone()]), &room.params);
+    assert!(has_ban(&after, &owner_bans_x));
+    assert!(has_ban(&after, &d_bans_y) && has_ban(&after, &d_bans_z));
+    assert!(
+        !has_ban(&after, &d_bans_y_again),
+        "the duplicate goes first"
+    );
+}
+
+/// An evidence record whose inviter leaves `members` at the `max_members` trim
+/// (which runs before cleanup) no longer reaches the owner, so every reader
+/// leaves it out and cleanup drops it. The result verifies and cleanup is a
+/// fixpoint. (The issuer's own record is lost to the trim before it can
+/// become evidence, a documented residual, so its ban is swept.)
+#[test]
+fn evidence_whose_inviter_is_trimmed_is_dropped() {
+    let room = Room::new();
+    let mut people: Vec<Person> = (0..4).map(|_| room.person()).collect();
+    people.sort_by_key(|p| p.id);
+    // The trim evicts the highest id among equal chain lengths.
+    let i = people.pop().unwrap();
+    let e = room.person_invited_by(&i);
+    let mut members: Vec<&Person> = people.iter().collect();
+    members.push(&i);
+    members.push(&e);
+    let s = room.modded_state(&members, &[], vec![]);
+    let s = apply_checked(&s, bans_delta(vec![room.ban(&i, &e, 10)]), &room.params);
+    assert!(evidence_ids(&s).contains(&e.id), "precondition");
+
+    let lower = AuthorizedConfigurationV1::new(
+        Configuration {
+            configuration_version: 2,
+            max_members: people.len(),
+            ..room.config.configuration.clone()
+        },
+        &room.owner_sk,
+    );
+    let after = apply_checked(
+        &s,
+        ChatRoomStateV1Delta {
+            configuration: Some(lower),
+            ..Default::default()
+        },
+        &room.params,
+    );
+    assert!(
+        !member_ids(&after).contains(&i.id),
+        "precondition: I is trimmed"
+    );
+    assert!(
+        evidence_ids(&after).is_empty(),
+        "E no longer reaches the owner"
+    );
+}
+
+/// A state stored before the `ban_evidence` field existed (no key at all in
+/// its CBOR map) deserializes, cleans up into the new shape and verifies.
+#[test]
+fn a_state_without_the_ban_evidence_field_deserializes_and_cleans_up() {
+    let room = Room::new();
+    let (a, b, t) = (room.person(), room.person(), room.person());
+    let mut s = room.modded_state(&[&a, &b, &t], &[&a, &b], vec![]);
+    s.bans = BansV1(vec![room.ban(&a, &b, 10), room.ban(&b, &a, 11)]);
+    // Serialize, then drop the key to get the old shape.
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&s, &mut bytes).unwrap();
+    let value: ciborium::value::Value = ciborium::de::from_reader(&bytes[..]).unwrap();
+    let map = value.into_map().unwrap();
+    assert!(
+        !map.iter().any(|(k, _)| k.as_text() == Some("ban_evidence")),
+        "an empty field is not serialized, so this is the old shape"
+    );
+    let mut old = Vec::new();
+    ciborium::ser::into_writer(&ciborium::value::Value::Map(map), &mut old).unwrap();
+    let mut decoded: ChatRoomStateV1 = ciborium::de::from_reader(&old[..]).unwrap();
+    assert!(decoded.ban_evidence.members.is_empty());
+    decoded.post_apply_cleanup(&room.params).unwrap();
+    decoded.verify(&decoded, &room.params).unwrap();
+    let ids = member_ids(&decoded);
+    assert!(!ids.contains(&a.id) && !ids.contains(&b.id) && ids.contains(&t.id));
+    assert!(evidence_ids(&decoded).contains(&a.id) && evidence_ids(&decoded).contains(&b.id));
 }
 
 /// Bans stored before ban evidence existed, by a present member on targets
