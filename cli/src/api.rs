@@ -640,6 +640,7 @@ pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
 /// Only for a path that PUTs the contract's real bytes, which riverctl has only
 /// for the generation it bundles; such a path must first check
 /// `KeyIntent::PublishCode`.
+// bundled-wasm-ok: the helper itself; every caller needs its own marker.
 fn bundled_room_contract_container(owner_vk: &VerifyingKey) -> Result<ContractContainer> {
     let params_bytes = {
         let mut buf = Vec::new();
@@ -4352,8 +4353,10 @@ impl ApiClient {
             .await?
             .authorize(KeyIntent::PublishCode)?;
 
-        // Gated above on `KeyIntent::PublishCode`, which refuses unless River's
-        // pointer record agrees the bundled bytes are the current generation.
+        // bundled-wasm-ok: this path PUTs the contract's real bytes, and riverctl
+        // only has the ones it bundles. Gated above on `KeyIntent::PublishCode`,
+        // which refuses unless River's pointer record agrees these bytes are the
+        // current generation.
         let contract_container = bundled_room_contract_container(room_owner_key)?;
         // The node answers under the key of the container we PUT, and the
         // waiter below accepts only `new_contract_key`. The `PublishCode` gate
@@ -7291,6 +7294,9 @@ mod migration_recovery_tests {
             "owner_vk_to_contract_key(", // bundled-wasm-ok: the needle itself
             // bundled-wasm-ok: the needle itself
             "ContractCode::from(ROOM_CONTRACT_WASM)",
+            // bundled-wasm-ok: the needle itself. Its marked root is inside the
+            // helper, so without this a caller would inherit that marker.
+            "bundled_room_contract_container(",
         ];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -7437,6 +7443,7 @@ mod migration_recovery_tests {
     #[test]
     fn migration_container_key_matches_the_anchor_derivation() {
         let owner = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        // bundled-wasm-ok: this test is about the bundled container's key.
         let container = bundled_room_contract_container(&owner).unwrap();
         let via_anchor =
             river_core::migration::contract_key_for_code_hash(&owner, &bundled_room_code_hash());
