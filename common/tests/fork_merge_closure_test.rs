@@ -50,6 +50,53 @@ fn drain_not_idempotent() -> Vec<String> {
     NOT_IDEMPOTENT.with(|v| std::mem::take(&mut *v.borrow_mut()))
 }
 
+/// What the generator produced and what the real `apply_delta` accepted, per
+/// delta shape, plus merge rejections and how many runs ended holding ban
+/// evidence. The floors asserted on these keep a test from passing because the
+/// generator stopped producing (or the contract stopped accepting) a shape.
+#[derive(Default, Debug)]
+struct Stats {
+    produced: std::collections::BTreeMap<String, usize>,
+    accepted: std::collections::BTreeMap<String, usize>,
+    merge_rejections: usize,
+    other_merge_rejections: usize,
+    runs: usize,
+    runs_with_evidence: usize,
+}
+
+thread_local! {
+    static STATS: RefCell<Stats> = RefCell::new(Stats::default());
+}
+
+fn take_stats() -> Stats {
+    STATS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+/// A delta's shape: which fields it carries, and how many bans.
+fn shape_of(d: &ChatRoomStateV1Delta) -> String {
+    let mut parts = Vec::new();
+    if d.configuration.is_some() {
+        parts.push("config".to_string());
+    }
+    if let Some(b) = &d.bans {
+        parts.push(format!("bans{}", b.len().min(3)));
+    }
+    if d.members.is_some() {
+        parts.push("members".to_string());
+    }
+    if d.member_info.is_some() {
+        parts.push("info".to_string());
+    }
+    if d.recent_messages.is_some() {
+        parts.push("msgs".to_string());
+    }
+    if parts.is_empty() {
+        "empty".to_string()
+    } else {
+        parts.join("+")
+    }
+}
+
 struct PoolMember {
     sk: SigningKey,
     id: MemberId,
@@ -553,12 +600,15 @@ fn apply(
     params: &ChatRoomParametersV1,
     d: ChatRoomStateV1Delta,
 ) -> bool {
+    let shape = shape_of(&d);
+    STATS.with(|s| *s.borrow_mut().produced.entry(shape.clone()).or_default() += 1);
     let parent = state.clone();
     let mut next = state.clone();
     match next.apply_delta(&parent, params, &Some(d)) {
         Ok(()) if next.verify(&next, params).is_ok() => {
             check_idempotent(&next, params, "apply");
             *state = next;
+            STATS.with(|s| *s.borrow_mut().accepted.entry(shape).or_default() += 1);
             true
         }
         _ => false, // a real peer rejects it and keeps its state
@@ -572,7 +622,20 @@ fn merge(
 ) -> Result<ChatRoomStateV1, String> {
     let mut s = a.clone();
     let parent = s.clone();
-    s.merge(&parent, p, b)?;
+    if let Err(e) = s.merge(&parent, p, b) {
+        STATS.with(|st| {
+            let mut st = st.borrow_mut();
+            st.merge_rejections += 1;
+            // The one rejection honest peers produce: a ban delta over a
+            // `max_user_bans` the receiver has already lowered (the
+            // `BansV1::apply_delta` flood guard), which ends once the sender
+            // takes the new configuration.
+            if !e.contains("refusing to process a flood") {
+                st.other_merge_rejections += 1;
+            }
+        });
+        return Err(e);
+    }
     s.verify(&s, p)
         .map_err(|e| format!("merged state fails verify: {e}"))?;
     check_idempotent(&s, p, "merge");
@@ -723,6 +786,13 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> (Vec<String>, Vec<String>) {
         drain_not_idempotent();
         let (w, a, b) = fork_pair(seed, SHAPES[shape], mode);
         let end = ending(&w, &a, &b);
+        STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            s.runs += 1;
+            if !a.ban_evidence.is_empty() || !b.ban_evidence.is_empty() {
+                s.runs_with_evidence += 1;
+            }
+        });
         let broken = drain_not_idempotent();
         if !broken.is_empty() {
             silent.push(format!(
@@ -744,12 +814,40 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> (Vec<String>, Vec<String>) {
     (rejecting, silent)
 }
 
+/// The run produced, and the contract accepted, every shape in `required`;
+/// with `all_accepted`, every delta produced was accepted.
+fn assert_floors(mode: Mode, stats: &Stats, required: &[&str], all_accepted: bool) {
+    for shape in required {
+        assert!(
+            stats.accepted.get(*shape).copied().unwrap_or(0) > 0,
+            "{mode:?}: no accepted `{shape}` delta: {stats:?}"
+        );
+    }
+    if all_accepted {
+        assert_eq!(
+            stats.produced, stats.accepted,
+            "{mode:?}: a delta was rejected"
+        );
+    }
+}
+
 /// Honest divergence: every fork pair must fully converge. `FORK_SEEDS=N` runs
 /// more (0 of 3000 failed at N=1000).
 #[test]
 fn honest_forks_always_converge() {
     let seeds = default_seeds(seeds_from_env(3));
     let (rejecting, silent) = endings(Mode::Honest, &seeds);
+    let stats = take_stats();
+    assert_floors(
+        Mode::Honest,
+        &stats,
+        &["bans1", "config", "info", "members+info+msgs", "msgs"],
+        true,
+    );
+    assert_eq!(
+        stats.other_merge_rejections, 0,
+        "an honest merge was rejected other than by the flood guard: {stats:?}"
+    );
     assert!(
         rejecting.is_empty() && silent.is_empty(),
         "honest fork pairs that never converge, of {}:\nrejecting:\n{}\nsilent:\n{}",
@@ -782,6 +880,17 @@ fn adversarial_forks_never_permanently_reject_each_other() {
     let mut seeds = default_seeds(seeds_from_env(3));
     seeds.extend([(40, 1), (60, 2), (83, 2), (201, 2), (252, 2), (292, 2)]);
     let (rejecting, silent) = endings(Mode::Adversarial, &seeds);
+    let stats = take_stats();
+    assert_floors(
+        Mode::Adversarial,
+        &stats,
+        &["bans1", "config", "info", "members+info+msgs", "msgs"],
+        true,
+    );
+    assert!(
+        stats.runs_with_evidence > 0,
+        "no run held ban evidence: {stats:?}"
+    );
     assert!(
         rejecting.is_empty() && silent.is_empty(),
         "adversarial fork pairs that never converge, of {}:\nPERMANENTLY REJECTING (#423):\n{}\nsilently diverged:\n{}",
@@ -798,6 +907,25 @@ fn adversarial_forks_never_permanently_reject_each_other() {
 fn extended_forks_converge_and_cleanup_is_idempotent() {
     let seeds = default_seeds(seeds_from_env(3));
     let (rejecting, silent) = endings(Mode::Extended, &seeds);
+    let stats = take_stats();
+    assert_floors(
+        Mode::Extended,
+        &stats,
+        &[
+            "bans1",
+            "bans2",
+            "bans3",
+            "bans1+info",
+            "bans1+members",
+            "bans1+members+msgs",
+            "members+info+msgs",
+        ],
+        false,
+    );
+    assert!(
+        stats.runs_with_evidence > 0,
+        "no run held ban evidence: {stats:?}"
+    );
     assert!(
         rejecting.is_empty() && silent.is_empty(),
         "extended fork pairs that fail, of {}:\nPERMANENTLY REJECTING:\n{}\nsilent or non-idempotent:\n{}",
@@ -810,6 +938,12 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
 /// Delivery-split equivalence: the same few bans (extended shapes) delivered
 /// as one delta to one peer, and one ban per peer to three others, must end in
 /// one state after gossip, with cleanup idempotent throughout.
+///
+/// Red on the round-4 tombstone design (`c6c41bf8`, run with this test as
+/// introduced in `f0b748d2`): at `FORK_SEEDS=10`, seed 0 shape 1 leaves
+/// cleanup not idempotent. `extended_forks_converge_and_cleanup_is_idempotent`
+/// passes there at the same seed count, so this is the extended-mode test
+/// that separates the two designs.
 #[test]
 fn split_delivery_converges() {
     let mut failures = Vec::new();
@@ -834,9 +968,11 @@ fn split_delivery_converges() {
                     pieces.extend(b);
                 }
             }
-            pieces.truncate(4);
+            // At most the room's `max_user_bans`: a larger ban delta is
+            // refused as a flood, and the combined peer must apply it.
+            pieces.truncate(4.min(base.configuration.configuration.max_user_bans));
             let mut peers = vec![base.clone()];
-            apply(
+            let combined_ok = apply(
                 &mut peers[0],
                 &w.params,
                 ChatRoomStateV1Delta {
@@ -844,6 +980,11 @@ fn split_delivery_converges() {
                     ..Default::default()
                 },
             );
+            if !combined_ok {
+                failures.push(format!(
+                    "seed {seed} shape {shape_ix}: the combined delta was rejected"
+                ));
+            }
             for b in &pieces {
                 let mut p = base.clone();
                 apply(
