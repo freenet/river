@@ -447,6 +447,10 @@ impl ComposableState for MemberInfoV1 {
         let max_nickname_size = parent_state.configuration.configuration.max_nickname_size;
 
         if let Some(delta) = delta {
+            // Members plus ban evidence, built once for the whole delta.
+            let known = parent_state
+                .ban_evidence
+                .lookup(&parent_state.members, parameters.owner_id());
             for member_info in delta {
                 let member_id = &member_info.member_info.member_id;
 
@@ -484,10 +488,7 @@ impl ComposableState for MemberInfoV1 {
                     // member held in ban evidence counts (freenet/river#702): its
                     // record keeps merging by rank like any other. Freezing it
                     // at removal cannot converge, see `BanEvidenceV1`.
-                    let members = parent_state
-                        .ban_evidence
-                        .lookup(&parent_state.members, parameters.owner_id());
-                    let member = match members.get(member_id) {
+                    let member = match known.get(member_id) {
                         Some(m) => m,
                         None => continue,
                     };

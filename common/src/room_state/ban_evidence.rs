@@ -88,30 +88,36 @@ impl BanEvidenceV1 {
     /// whose chain no longer reaches the owner (an ancestor was lost, for
     /// example to the `max_members` trim, which runs before cleanup) is left
     /// out for every reader at once, and `post_apply_cleanup` drops it.
+    ///
+    /// Linear in the records: a walk down from the owner and the members
+    /// through the evidence records each one invited. Evidence holds at most
+    /// one record per id (`verify`).
     pub fn lookup<'a>(
         &'a self,
         members: &'a MembersV1,
         owner_id: MemberId,
     ) -> HashMap<MemberId, &'a AuthorizedMember> {
         let mut map = members.members_by_member_id();
-        let mut pending: Vec<&AuthorizedMember> = self
+        let mut invited: HashMap<MemberId, Vec<&'a AuthorizedMember>> = HashMap::new();
+        for m in self
             .members
             .iter()
             .filter(|m| !map.contains_key(&m.member.id()))
+        {
+            invited.entry(m.member.invited_by).or_default().push(m);
+        }
+        // Seeded in stored order, not map order, so the walk (and with it the
+        // record kept when two share an id) is the same on every call.
+        let mut reached: Vec<MemberId> = std::iter::once(owner_id)
+            .chain(members.members.iter().map(|m| m.member.id()))
             .collect();
-        loop {
-            let before = pending.len();
-            pending.retain(|m| {
-                let inviter = m.member.invited_by;
-                if inviter == owner_id || map.contains_key(&inviter) {
-                    map.insert(m.member.id(), m);
-                    false
-                } else {
-                    true
+        while let Some(inviter) = reached.pop() {
+            for m in invited.remove(&inviter).unwrap_or_default() {
+                let id = m.member.id();
+                if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(id) {
+                    slot.insert(m);
+                    reached.push(id);
                 }
-            });
-            if pending.len() == before {
-                break;
             }
         }
         map
@@ -584,6 +590,84 @@ mod tests {
             kept_some > 100 && dropped_some > 100,
             "{kept_some} {dropped_some}"
         );
+    }
+
+    /// `lookup` as it was before it became a single walk: rescan the pending
+    /// records until a pass admits none.
+    fn lookup_by_rescanning<'a>(
+        evidence: &'a BanEvidenceV1,
+        members: &'a MembersV1,
+        owner_id: MemberId,
+    ) -> HashMap<MemberId, &'a AuthorizedMember> {
+        let mut map = members.members_by_member_id();
+        let mut pending: Vec<&AuthorizedMember> = evidence
+            .members
+            .iter()
+            .filter(|m| !map.contains_key(&m.member.id()))
+            .collect();
+        loop {
+            let before = pending.len();
+            pending.retain(|m| {
+                let inviter = m.member.invited_by;
+                if inviter == owner_id || map.contains_key(&inviter) {
+                    map.insert(m.member.id(), m);
+                    false
+                } else {
+                    true
+                }
+            });
+            if pending.len() == before {
+                break;
+            }
+        }
+        map
+    }
+
+    /// The single-walk `lookup` returns the same map as rescanning, on random
+    /// trees split between `members` and the evidence, with a record removed
+    /// (so its subtree is unreachable) or its inviter pointed at itself.
+    #[test]
+    fn lookup_matches_rescanning() {
+        use rand::{Rng, SeedableRng};
+        for seed in 0..200u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let owner_sk = SigningKey::generate(&mut rng);
+            let owner_id: MemberId = owner_sk.verifying_key().into();
+            let n = rng.gen_range(1..30);
+            let (mut records, _) = random_tree(&mut rng, &owner_sk, n);
+            let i = rng.gen_range(0..records.len());
+            match seed % 3 {
+                0 => {}
+                1 => {
+                    records.remove(i);
+                }
+                _ => records[i].member.invited_by = records[i].member.id(),
+            }
+            let (present, held): (Vec<_>, Vec<_>) =
+                records.into_iter().partition(|_| rng.gen_bool(0.3));
+            let members = MembersV1 { members: present };
+            let mut evidence = BanEvidenceV1 { members: held };
+            evidence.members.sort_by_key(|m| m.member.id());
+            assert_eq!(
+                evidence.lookup(&members, owner_id),
+                lookup_by_rescanning(&evidence, &members, owner_id),
+                "seed {seed}"
+            );
+        }
+    }
+
+    /// A chain held in id order, which rescanning admitted one record per pass
+    /// when the ids descend down the chain, is admitted in one walk.
+    #[test]
+    fn lookup_admits_a_deep_chain_in_any_id_order() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let mut records = chain(&owner_sk, 2_000);
+        records.sort_by_key(|m| m.member.id());
+        let evidence = BanEvidenceV1 { members: records };
+        let members = MembersV1::default();
+        let map = evidence.lookup(&members, owner_id);
+        assert_eq!(map.len(), 2_000);
     }
 
     /// A chain owner -> m0 -> ... -> m{n-1}: the records and the last key.
