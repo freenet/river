@@ -7273,12 +7273,14 @@ mod migration_recovery_tests {
     /// needle set. Swapping the main message-send path to it left the suite at
     /// 337 passed. A guard with one door is not a guard.
     ///
-    /// So this pin closes all three doors and scans the whole crate:
+    /// So this pin closes every door it knows of and scans the whole crate:
     ///
     /// * `compute_contract_key` and `owner_vk_to_contract_key`, the two helpers
-    ///   that derive from the bundled WASM; and
-    /// * the `ContractCode::from` of the bundled WASM, the root both helpers
-    ///   use, which catches a fresh derivation calling neither.
+    ///   that derive from the bundled WASM;
+    /// * `bundled_room_contract_container`, which builds the bundled contract
+    ///   for a PUT and whose key is the same derivation (freenet/river#689); and
+    /// * the `ContractCode::from` of the bundled WASM, the root all three
+    ///   use, which catches a fresh derivation calling none of them.
     ///
     /// It walks `src/` rather than naming files, so a NEW file cannot be born
     /// outside its scope. Legitimate uses carry an explicit `bundled-wasm-ok:`
