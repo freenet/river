@@ -791,6 +791,33 @@ pub(crate) fn classify_put_response(sent_key: &ContractKey, response: &HostRespo
     }
 }
 
+/// Whether `response` answers the migration PUT we sent for `new_key`.
+///
+/// [`classify_put_response`], plus one shape it rejects: an `UpdateNotification`
+/// for `new_key` is also taken as [`PutAck::Merged`]. Migration has always
+/// accepted a notification as "merged into the existing contract", and that
+/// tolerance is kept here because the cost of dropping it is a 60s timeout that
+/// leaves the room on its previous generation.
+///
+/// What it must NOT do, and what it did until freenet/river#689, is accept a
+/// notification for ANY key. The caller persists the migrated key to local
+/// storage, so a notification for some other subscribed room arriving inside
+/// the wait wrote that room's key against this one: silent corruption, not a
+/// misreport a retry corrects. Every arm here compares the key.
+pub(crate) fn classify_migration_put_response(
+    new_key: &ContractKey,
+    response: &HostResponse,
+) -> PutAck {
+    match response {
+        HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, .. })
+            if key.id() == new_key.id() =>
+        {
+            PutAck::Merged
+        }
+        _ => classify_put_response(new_key, response),
+    }
+}
+
 /// The half of the shared connection [`await_response`] needs: hand me the next
 /// response.
 ///
@@ -1003,6 +1030,23 @@ async fn await_update_response<S: ResponseSource>(
         |response| match classify_update_response(sent_key, response) {
             UpdateAck::Answered => Some(Ok(())),
             UpdateAck::NotYet => None,
+        },
+    )
+    .await
+}
+
+/// Wait for the node's answer to the migration PUT we sent for `new_key`.
+async fn await_migration_put_response<S: ResponseSource>(
+    web_api: &mut S,
+    new_key: &ContractKey,
+) -> Result<PutAck> {
+    await_response(
+        web_api,
+        PUT_RESPONSE_TIMEOUT,
+        "migration PUT response",
+        |response| match classify_migration_put_response(new_key, response) {
+            PutAck::NotYet => None,
+            answered => Some(Ok(answered)),
         },
     )
     .await
@@ -4321,40 +4365,28 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send PUT for migration: {}", e))?;
 
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => return Err(anyhow!("Failed to receive migration response: {}", e)),
-                Err(_) => return Err(anyhow!("Timeout during room migration")),
-            };
-
-        match response {
-            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
-                info!("Room migrated successfully to: {}", key.id());
-                // Update local storage with new contract key
-                self.storage.update_contract_key(room_owner_key, &key)?;
-                Ok(key)
+        // Every success shape is matched on `new_contract_key`, so the key
+        // persisted below is the one we PUT, never one read off a response for
+        // another contract (freenet/river#689).
+        let ack = await_migration_put_response(&mut web_api, &new_contract_key).await?;
+        match ack {
+            PutAck::Stored => info!("Room migrated successfully to: {}", new_contract_key.id()),
+            PutAck::Merged => {
+                info!("Room migrated successfully (merged into the existing contract)")
             }
-            HostResponse::Ok => {
-                info!("Room migrated successfully (Ok response)");
-                self.storage
-                    .update_contract_key(room_owner_key, &new_contract_key)?;
-                Ok(new_contract_key)
+            PutAck::Acknowledged => info!("Room migrated successfully (Ok response)"),
+            // Not reachable: the waiter maps `NotYet` to "keep waiting". See the
+            // same arm in `republish_room`.
+            PutAck::NotYet => {
+                return Err(anyhow!(
+                    "internal error: the migration PUT waiter answered `NotYet`, so its \
+                     classifier and this match disagree about what counts as an answer"
+                ))
             }
-            HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-                key, ..
-            }) => {
-                // PUT to an existing contract triggers an UpdateNotification (merge).
-                // This is a successful migration.
-                info!("Room migrated successfully via merge (UpdateNotification)");
-                self.storage.update_contract_key(room_owner_key, &key)?;
-                Ok(key)
-            }
-            _ => Err(anyhow!(
-                "Unexpected response during migration: {:?}",
-                response
-            )),
         }
+        self.storage
+            .update_contract_key(room_owner_key, &new_contract_key)?;
+        Ok(new_contract_key)
     }
 
     pub async fn list_rooms(&self) -> Result<Vec<crate::storage::RoomListing>> {
@@ -9525,6 +9557,64 @@ mod subscribe_handshake_tests {
         );
     }
 
+    pub(super) fn notification_for(k: ContractKey) -> HostResponse {
+        HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+            key: k,
+            update: freenet_stdlib::prelude::UpdateData::Delta(
+                freenet_stdlib::prelude::StateDelta::from(vec![1u8, 2, 3]),
+            ),
+        })
+    }
+
+    /// freenet/river#689: a notification for ANOTHER contract arriving while
+    /// the migration PUT waits is not its answer. Taking it as one persisted
+    /// that contract's key against the migrating room.
+    #[test]
+    fn a_notification_for_another_contract_does_not_answer_the_migration() {
+        assert_eq!(
+            classify_migration_put_response(&key(), &notification_for(other_key())),
+            PutAck::NotYet
+        );
+    }
+
+    /// The tolerance migration has always had, kept: a notification for the
+    /// contract we are migrating onto reads as a merge.
+    #[test]
+    fn a_notification_for_the_new_contract_answers_the_migration_as_merged() {
+        assert_eq!(
+            classify_migration_put_response(&key(), &notification_for(key())),
+            PutAck::Merged
+        );
+    }
+
+    /// The other PUT answers are compared on the key too, exactly as
+    /// `classify_put_response` does.
+    #[test]
+    fn migration_put_answers_for_another_contract_do_not_answer_ours() {
+        assert_eq!(
+            classify_migration_put_response(
+                &key(),
+                &HostResponse::ContractResponse(ContractResponse::PutResponse { key: other_key() })
+            ),
+            PutAck::NotYet
+        );
+        assert_eq!(
+            classify_migration_put_response(&key(), &update_answer(other_key())),
+            PutAck::NotYet
+        );
+        assert_eq!(
+            classify_migration_put_response(
+                &key(),
+                &HostResponse::ContractResponse(ContractResponse::PutResponse { key: key() })
+            ),
+            PutAck::Stored
+        );
+        assert_eq!(
+            classify_migration_put_response(&key(), &update_answer(key())),
+            PutAck::Merged
+        );
+    }
+
     /// Anything else the node may send is also non-fatal.
     #[test]
     fn other_responses_are_tolerated() {
@@ -12339,7 +12429,7 @@ mod response_multiplexing_pin {
     /// Every production `.recv()` on the shared connection.
     ///
     /// One of them IS the `ResponseSource` impl `await_response` reads through;
-    /// the other ten are sites the fix has not reached. All eleven are listed
+    /// the other nine are sites the fix has not reached. All ten are listed
     /// rather than only the unreached ones, so the constant can be audited by
     /// walking the list. Note a plain `grep -c` over the file does NOT give 11:
     /// it also counts the meta-tests' own string literals, which the pin strips
@@ -12362,11 +12452,14 @@ mod response_multiplexing_pin {
     ///  8. `try_get_state` -- #690.
     ///  9. `accept_invitation_struct`'s join delta -- #690.
     /// 10. `ensure_room_migrated` -- #690.
-    /// 11. `migrate_room_to_new_contract` -- freenet/river#689.
     ///
-    /// 6 through 11 are deliberately outside this change, but NOT all for the
+    /// `migrate_room_to_new_contract` was the eleventh. freenet/river#689 moved
+    /// it onto `await_migration_put_response`, which is pinned in
+    /// `CLASSIFIER_WIRING` below.
+    ///
+    /// 6 through 10 are deliberately outside this change, but NOT all for the
     /// same reason, and an earlier version of this comment gave one reason for
-    /// all six.
+    /// all of them.
     ///
     /// Four of them are TOLERANT: `put_room_state`, `try_get_state`, the join
     /// delta and `ensure_room_migrated` fold an unrelated response into a
@@ -12374,8 +12467,8 @@ mod response_multiplexing_pin {
     /// changes what counts as success. That is a different risk class from
     /// stepping over a message that is not ours.
     ///
-    /// The other two are FATAL, like the ten this change converted, and are
-    /// held back for their own reasons:
+    /// The fifth is FATAL, like the ten this change converted, and is held back
+    /// for its own reason:
     ///   * `create_room` errors on an unrelated response, and additionally
     ///     reports "Contract key mismatch" for a notification carrying another
     ///     key, which is the v0.2.135 failure shape and still live. Converting
@@ -12384,13 +12477,9 @@ mod response_multiplexing_pin {
     ///     (`add_room_with_invitation_secrets`) and the bare-`Ok` arm does not
     ///     (`add_room`), so a room created down the second path silently loses
     ///     them. That is a behaviour decision, not a mechanical conversion.
-    ///   * `migrate_room_to_new_contract` folds an `UpdateNotification` of ANY
-    ///     key into success and writes that key to local storage. That is data
-    ///     corruption rather than a tolerance bug, which is why it has its own
-    ///     issue (#689) rather than riding along here.
     ///
-    /// Lowering this number is #690's job, and #689's.
-    const DIRECT_CONNECTION_READS: usize = 11;
+    /// Lowering this number further is #690's job.
+    const DIRECT_CONNECTION_READS: usize = 10;
 
     /// Production references to the connection field, and locks taken on it.
     ///
@@ -12448,11 +12537,12 @@ mod response_multiplexing_pin {
     /// join delta, which is #690's.
     const UPDATE_SENDS: usize = 8;
 
-    /// The three non-update paths this change converted, and the needle each
-    /// must still contain.
+    /// The non-update paths routed through a waiter, and the needle each must
+    /// still contain.
     ///
     /// `UPDATE_SEND_PATHS` below covers the seven update sends; these are the
-    /// PUT and the two GETs. Without them `republish_room` could be rewired to
+    /// republish PUT, the two GETs, and the migration PUT (freenet/river#689).
+    /// Without them `republish_room` could be rewired to
     /// `|_| Some(Ok(PutAck::Stored))`, accepting ANY response as a successful
     /// republish, and every test would stay green: `classify_put_response` has
     /// its own unit tests, but nothing said `republish_room` still calls it.
@@ -12470,6 +12560,12 @@ mod response_multiplexing_pin {
         (
             "pub async fn accept_invitation_struct(",
             "await_get_response(",
+        ),
+        // freenet/river#689: the migration PUT persists the key it is answered
+        // for, so it must keep comparing that key against the one it sent.
+        (
+            "async fn migrate_room_to_new_contract(",
+            "await_migration_put_response(&mutweb_api,&new_contract_key)",
         ),
     ];
 
@@ -12642,6 +12738,35 @@ mod response_multiplexing_pin {
         assert!(problems.is_empty(), "{}", problems.join("\n\n"));
     }
 
+    /// freenet/river#689: the migration persists the key it PUT, and nothing
+    /// read off a response. The classifier compares keys, but a later edit
+    /// could still bind a key out of the response and store that, which is
+    /// the original defect, so every store in the body is pinned to
+    /// `new_contract_key`.
+    #[test]
+    fn migration_persists_only_the_key_it_put() {
+        let production = production_source(include_str!("api.rs"));
+        let code = strip_comment_lines(&production.source);
+        let body = squash(
+            method_body(&code, "async fn migrate_room_to_new_contract(")
+                .expect("could not isolate `migrate_room_to_new_contract`"),
+        );
+        let stores = body.matches(".update_contract_key(").count();
+        let pinned = body
+            .matches(".update_contract_key(room_owner_key,&new_contract_key)")
+            .count();
+        assert!(
+            stores > 0,
+            "the migration no longer persists its key at all"
+        );
+        assert_eq!(
+            stores, pinned,
+            "`migrate_room_to_new_contract` persists a key other than \
+             `new_contract_key`; a key read off the shared connection can belong \
+             to another contract (freenet/river#689)"
+        );
+    }
+
     /// Apply a mutation to the real source, exactly once, failing loudly if it
     /// does not apply: a mutation that silently no-ops looks exactly like a
     /// working pin.
@@ -12724,7 +12849,7 @@ mod response_multiplexing_pin {
         );
         assert_caught(
             &mutated,
-            "found 12",
+            "found 11",
             "a newly-added direct read whose guard is not called `web_api`",
         );
     }
@@ -12838,7 +12963,9 @@ mod response_multiplexing_pin {
 /// under `start_paused` virtual time: no socket, no node, no real clock.
 #[cfg(test)]
 mod await_response_tests {
-    use super::subscribe_handshake_tests::{key, notification, other_key, update_answer};
+    use super::subscribe_handshake_tests::{
+        key, notification, notification_for, other_key, update_answer,
+    };
     use super::*;
     use std::collections::VecDeque;
 
@@ -13105,5 +13232,43 @@ mod await_response_tests {
         let mut conn = Scripted::new(vec![]);
         let err = await_update_response(&mut conn, &key()).await.unwrap_err();
         assert!(err.to_string().contains("the node sent nothing"), "{err}");
+    }
+
+    /// freenet/river#689, end to end through the waiter. Another room's
+    /// notification and another contract's `PutResponse` arrive first; the
+    /// migration must step over both and take only the answer for the key it
+    /// PUT.
+    #[tokio::test(start_paused = true)]
+    async fn the_migration_waits_past_answers_for_other_contracts() {
+        let mut conn = Scripted::new(vec![
+            Ok(notification_for(other_key())),
+            Ok(HostResponse::ContractResponse(
+                ContractResponse::PutResponse { key: other_key() },
+            )),
+            Ok(HostResponse::ContractResponse(
+                ContractResponse::PutResponse { key: key() },
+            )),
+        ]);
+        let ack = await_migration_put_response(&mut conn, &key())
+            .await
+            .expect("our own PutResponse must answer the migration");
+        assert_eq!(ack, PutAck::Stored);
+        assert_eq!(conn.reads, 3);
+    }
+
+    /// The exact #689 shape: the ONLY thing the node sends is a notification
+    /// for another contract. That used to be reported as a successful merge,
+    /// and its key written to local storage. It must now end in a timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_notification_for_another_contract_is_not_a_migration() {
+        let mut conn = Scripted::new(vec![Ok(notification_for(other_key()))]);
+        let err = await_migration_put_response(&mut conn, &key())
+            .await
+            .expect_err("another contract's notification must not answer the migration");
+        assert!(
+            err.to_string()
+                .contains("Timeout waiting for migration PUT response"),
+            "{err}"
+        );
     }
 }
