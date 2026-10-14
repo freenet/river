@@ -323,9 +323,10 @@ fn a_banned_moderator_cannot_act_through_a_same_delta_re_add() {
         .verify(&after, &room.params)
         .expect("result must verify");
 
-    // Since #702 a removed issuer of a valid ban stays as an enforced-banned
-    // tombstone and its ban stays stored, so that a later counter-ban can
-    // still close a cycle. What matters is that the ban takes no effect.
+    // Since #702 a removed issuer of a valid ban leaves `members`, its record
+    // is kept as ban evidence and its ban stays stored, so that a later
+    // counter-ban can still close a cycle. What matters is that the ban takes
+    // no effect.
     let active = active_ids(&after, &room.params);
     assert!(
         active.contains(&t.id),
@@ -498,7 +499,7 @@ fn a_stored_ban_cannot_act_through_a_same_delta_re_add_of_its_banned_banner() {
         .verify(&after, &room.params)
         .expect("result must verify");
 
-    // X is an enforced-banned tombstone (see the note in the test above);
+    // X is removed and held as ban evidence (see the note in the test above);
     // its stored ban takes no effect.
     let active = active_ids(&after, &room.params);
     assert!(
@@ -592,17 +593,21 @@ fn has_ban(s: &ChatRoomStateV1, ban: &AuthorizedUserBan) -> bool {
     s.bans.0.iter().any(|b| b.id() == ban.id())
 }
 
-/// Members who are IN the room: present and not enforced-banned. Members of a
-/// mutual-ban cycle stay in `members` as tombstones (so their bans remain
-/// verifiable) but are enforced-banned, so they are not in this set.
+/// Members who are IN the room, read from the emitted state: `member_ids`.
+/// Every caller passes a cleaned state, where each enforced-banned member has
+/// left `members` (its record kept as ban evidence if a ban needs it); this
+/// asserts that, so a test cannot pass on the ban computation alone while the
+/// state still lists the member.
 fn active_ids(s: &ChatRoomStateV1, p: &ChatRoomParametersV1) -> Vec<MemberId> {
     let banned = s
         .members
         .banned_member_ids(&s.ban_evidence, &s.bans, &s.member_info, p);
-    member_ids(s)
-        .into_iter()
-        .filter(|id| !banned.contains(id))
-        .collect()
+    let ids = member_ids(s);
+    assert!(
+        ids.iter().all(|id| !banned.contains(id)),
+        "an enforced-banned member is still listed in `members`"
+    );
+    ids
 }
 
 /// Apply `delta` to `s`, require success, `verify`, and idempotent cleanup.
@@ -850,7 +855,7 @@ fn a_counter_ban_on_ones_own_inviter_is_void() {
     let ids = active_ids(&after, &room.params);
     assert!(ids.contains(&x.id), "Y's ban on its own inviter is void");
     assert!(!ids.contains(&y.id), "X's ban on Y takes effect");
-    assert!(!member_ids(&after).contains(&y.id), "Y is no tombstone");
+    assert!(!member_ids(&after).contains(&y.id), "Y leaves `members`");
     assert!(ids.contains(&t.id));
 }
 
@@ -899,8 +904,8 @@ fn self_bans_and_bans_on_the_owner() {
 /// The owner's ban wins (Ian, 2026-09-24): a member the owner bans has no
 /// ban authority, even inside a mutual ban. An existing mutual ban between X
 /// and Y is resolved; then the owner bans X. X's ban on Y stops counting, so
-/// Y is released, and X leaves `members` entirely (an owner-removed member is
-/// never a tombstone).
+/// Y is released, and X leaves `members` (an owner-removed member's record is
+/// kept only if another ban needs it).
 #[test]
 fn an_owner_ban_breaks_a_mutual_ban() {
     let room = Room::new();
@@ -957,8 +962,9 @@ fn an_inert_ban_on_an_issuer_cannot_delete_their_stored_ban() {
 
 /// A mutual-ban cycle member whose inviter is ALSO banned, here by a
 /// moderator (an owner ban would make the cycle member owner-removed too,
-/// with no authority left). The inviter must be retained as a tombstone, or
-/// the cycle member's invite chain breaks and `verify` rejects the state.
+/// with no authority left). The inviter's record must be kept as ban
+/// evidence, or the cycle member's invite chain breaks and `verify` rejects
+/// the state.
 /// Everyone in the chain stays enforced-banned, and a second cleanup changes
 /// nothing.
 #[test]
@@ -988,7 +994,7 @@ fn a_cycle_members_banned_inviter_is_retained_with_them() {
     );
 }
 
-/// Whole-room convergence with a tombstone: a peer that never saw the mutual
+/// Whole-room convergence with ban evidence: a peer that never saw the mutual
 /// ban and a peer that resolved it agree after gossip, whichever merges first.
 #[test]
 fn a_resolved_mutual_ban_converges_with_a_peer_that_never_saw_it() {
@@ -1005,12 +1011,11 @@ fn a_resolved_mutual_ban_converges_with_a_peer_that_never_saw_it() {
 }
 
 // ---------------------------------------------------------------------------
-// Tombstones (#702): members removed by a ban that must stay in `members` so
-// their own effective ban stays verifiable. For them "removed" means "present
-// in `members` but enforced-banned". The tests below check, capability by
-// capability, that a tombstone gets NOTHING membership confers, that nothing
-// evicts it while its ban stands, and that it is released correctly when the
-// ban stops taking effect.
+// Removed members held as ban evidence (#702): they leave `members`, and their
+// records are kept only so their bans stay verifiable. The tests below check,
+// capability by capability, that such a member gets NOTHING membership
+// confers, that its bans keep working, and that it is released correctly when
+// the ban stops taking effect.
 // ---------------------------------------------------------------------------
 
 /// A room where owner-appointed moderators A and B have banned each other,
@@ -1089,7 +1094,7 @@ fn a_removed_member_cannot_react_edit_or_delete() {
             .messages
             .iter()
             .any(|m| m.message.author == a.id),
-        "none of the tombstone's actions are stored"
+        "none of the removed member's actions are stored"
     );
     assert!(
         after
@@ -1106,7 +1111,7 @@ fn a_removed_member_cannot_react_edit_or_delete() {
         .unwrap_or(false);
     assert!(
         !reacted,
-        "the tombstone's reaction is not in the actions cache"
+        "the removed member's reaction is not in the actions cache"
     );
 }
 
@@ -1177,7 +1182,7 @@ fn a_removed_members_invitee_is_removed_and_stays_removed() {
 /// for why it is not frozen), but a `deputies` list grants authority only
 /// over its author's own subtree and never voids a ban on its author.
 #[test]
-fn a_tombstone_cannot_escape_by_deputizing_its_partner() {
+fn a_removed_moderator_cannot_escape_by_deputizing_its_partner() {
     let room = Room::new();
     let (a, b, _t, s) = resolved_mutual_ban(&room);
     let mut info = MemberInfo::new_public(a.id, 5, "a".into());
@@ -1417,7 +1422,10 @@ fn an_owner_ban_voids_a_replayed_counter_ban() {
                 active.contains(&d.id),
                 "the owner's ban voids M's counter-ban"
             );
-            assert!(!member_ids(&after).contains(&m.id), "and M is no tombstone");
+            assert!(
+                !member_ids(&after).contains(&m.id),
+                "and M leaves `members`"
+            );
         } else {
             assert!(
                 !active.contains(&d.id),
@@ -1428,9 +1436,9 @@ fn an_owner_ban_voids_a_replayed_counter_ban() {
 }
 
 /// A deputizes A1 and A2 (both invited by A), and they ban each other: a
-/// mutual ban, so both are tombstones. The owner then bans A. A's subtree,
-/// A1 and A2 included, is owner-removed: no authority, no tombstones, and
-/// nobody stays behind in `members`.
+/// mutual ban, so both are removed. The owner then bans A. A's subtree, A1
+/// and A2 included, is owner-removed: no authority, and nobody stays behind
+/// in `members`.
 #[test]
 fn an_owner_ban_dissolves_a_deputy_cycle() {
     let room = Room::new();
@@ -1482,10 +1490,9 @@ fn capped_room(max_members: usize, max_user_bans: usize) -> Room {
 }
 
 /// Round-4 M2: a deep invite chain of sybils with a mutual ban at the
-/// bottom must not push real members out at the `max_members` trim. The
-/// trim only protects possible tombstones with their ancestors within a
-/// budget of `max_user_bans` members; this chain needs more than that, so
-/// it is trimmed first as usual (longest chains first).
+/// bottom must not push real members out at the `max_members` trim. The trim
+/// protects no one: it removes the longest chains first, so this chain is
+/// trimmed first as usual.
 #[test]
 fn a_deep_sybil_chain_cannot_evict_real_members() {
     let room = capped_room(6, 4);
@@ -1551,7 +1558,7 @@ fn a_banned_issuer_cannot_flood_the_ban_cap() {
     assert!(!active.contains(&b.id) && active.contains(&t.id) && active.contains(&d.id));
 }
 
-/// The same for a mutual-ban tombstone: its bans outside the cycle take no
+/// The same for a removed mutual-ban member: its bans outside the cycle take no
 /// effect, so they are evicted first, and the two mutual bans survive.
 #[test]
 fn a_removed_cycle_member_cannot_flood_the_ban_cap() {

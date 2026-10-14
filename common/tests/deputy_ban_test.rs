@@ -827,7 +827,7 @@ fn no_transitive_re_deputization() {
 }
 
 /// The owner is never a valid ban target: an "authorized" ban of the owner
-/// would cascade `get_downstream_members(owner)` = the whole room. Even an
+/// would reach the owner's whole invite subtree = the whole room. Even an
 /// owner-appointed global mod cannot ban the owner.
 #[test]
 fn deputy_cannot_ban_owner_and_room_survives() {
@@ -1767,7 +1767,8 @@ fn post_apply_cleanup_is_idempotent_for_garbage_sig_member_banner() {
 
 /// #411 round 8 (convergence re-review item 2 / cap comment gate): the
 /// `max_user_bans` 0-cap eviction is NOT byte-equal across delta order without a
-/// further exchange — it classifies `ban_is_enforcing` on the INTERMEDIATE
+/// further exchange — it ranks bans (then `ban_is_enforcing`, now the
+/// `resolve_bans` tiers) on the INTERMEDIATE
 /// (pre-step-0) member set, which is arrival-order sensitive (cascade removal).
 /// This is a KNOWN, PRE-EXISTING limitation (reproduces with the cap at the
 /// round-6 5b position too); the substantive fix is deferred to

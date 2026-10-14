@@ -6241,8 +6241,9 @@ impl ApiClient {
         // Prevent banning yourself out of the room, directly or transitively
         // (freenet/river#478). ONE rule: refuse when the ban's cascade would
         // remove US — the target being self, or the target being one of our own
-        // invite ancestors, whose `get_downstream_members` closure contains us.
-        // Both are contract-VALID, so nothing downstream stops them.
+        // invite ancestors, whose invite subtree contains us. Since
+        // freenet/river#702 the contract voids such a ban, so this only spares
+        // the user a ban that would do nothing.
         if let Some(reason) =
             crate::deputies::self_removing_ban_reason(&room_state, my_member_id, banned_member_id)
         {

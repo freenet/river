@@ -154,7 +154,7 @@ impl ChatRoomStateV1 {
         };
 
         // 0-cap. Enforce `max_user_bans` FIRST — BEFORE ban enforcement (step 0)
-        //     and the ban evidence (step 5a) — so both read
+        //     and the ban evidence (step 4a) — so both read
         //     the FINAL surviving (post-cap) ban set (#411 round 7 / Codex P1
         //     #1+#2). Running the cap here, on the converged pre-enforcement
         //     state, is what keeps `post_apply_cleanup` IDEMPOTENT and identical
@@ -195,7 +195,7 @@ impl ChatRoomStateV1 {
         //     Limitation 1). Do NOT claim the eviction is order-independent per
         //     delta.
         //     `verify`'s hard cap ceiling still rejects any stored state left over
-        //     the cap. The signature sweep (step 5) still runs AFTER enforcement
+        //     the cap. The signature sweep (step 4) still runs AFTER enforcement
         //     to drop bans orphaned by a banner's removal, and only removes bans,
         //     so the ban count stays <= the cap.
         let max_bans = self.configuration.configuration.max_user_bans;
@@ -406,7 +406,7 @@ impl ChatRoomStateV1 {
             .members
             .retain(|m| required_ids.contains(&m.member.id()));
 
-        // 5. Sweep any ban whose issuer is unknown or whose signature does
+        // 4. Sweep any ban whose issuer is unknown or whose signature does
         //    not match the issuer's key (#411 round 3 item A.3, round 4 item
         //    A; AGENTS.md State Authorization Rule). "Known" means present in
         //    `members` OR `ban_evidence` at the START of this pass, so a ban
@@ -425,7 +425,7 @@ impl ChatRoomStateV1 {
             )
         });
 
-        // 5a. Recompute the ban evidence (freenet/river#702): every record
+        // 4a. Recompute the ban evidence (freenet/river#702): every record
         //     known at the start of this pass whose member a stored ban
         //     references (issuer or target, and their invite ancestors), and
         //     who is no longer in `members`. Ban resolution reads members plus
@@ -455,7 +455,7 @@ impl ChatRoomStateV1 {
             self.ban_evidence.members = evidence;
         }
 
-        // 4. Clean member_info for members who are gone, keeping the records
+        // 5. Clean member_info for members who are gone, keeping the records
         //    of evidenced members: `is_ban_authorized` reads their `deputies`
         //    (rule 4, the grant of an ancestor), and dropping them
         //    would change a ban's validity on the next pass. They keep merging
@@ -471,7 +471,7 @@ impl ChatRoomStateV1 {
             id == owner_id || required_ids.contains(&id) || evidenced.contains(&id)
         });
 
-        // 4a. Collapse duplicate member_info records to the single canonical
+        // 5a. Collapse duplicate member_info records to the single canonical
         //     (highest-rank) one per member (#411 round 8 item C / security
         //     FINDING 2+3). `verify` accepts duplicate records (migration-safety),
         //     so a peer can hold several records for one member; without this,
@@ -484,7 +484,7 @@ impl ChatRoomStateV1 {
         //     permissionless migration PUT is unaffected.
         self.member_info.dedup_to_canonical();
 
-        // 4b. Sweep recent messages authored by members removed above (deputy-
+        // 5b. Sweep recent messages authored by members removed above (deputy-
         //     authorized ban cascade or inactivity prune).
         //     `MessagesV1::apply_delta` already drops non-member-authored
         //     messages, but it runs BEFORE this cleanup in field order — so a

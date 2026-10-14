@@ -76,13 +76,12 @@ impl BansV1 {
                 ban.verify_signature(&banning_member.member.member_vk)
                     .map_err(|e| format!("Invalid ban signature: {}", e))?;
             } else {
-                // Banning member not in current members list. This can happen when:
-                // 1. During merge when bans are applied before the members delta
-                // 2. The banner was pruned for inactivity (no recent messages)
-                // In both cases, skip signature verification — we can't verify
-                // without the banner's key, and the signature was verified when
-                // the ban was first created. post_apply_cleanup step 5 sweeps
-                // every ban whose banner is not a current member.
+                // Banning member's record is neither in `members` nor in ban
+                // evidence. This happens during a merge, when bans apply before
+                // the members delta. Skip signature verification: there is no
+                // key to check against. post_apply_cleanup step 4 sweeps every
+                // ban whose banner's record is known nowhere, and enforcement
+                // re-checks the signature (`ban_signature_matches_current_key`).
             }
         }
 
@@ -391,7 +390,7 @@ impl ComposableState for BansV1 {
             // now decided once, from converged state, by
             // `MembersV1::resolve_bans` at `post_apply_cleanup` step 0. A ban
             // stored here whose issuer is absent is unverifiable and takes no
-            // effect there, and step 5 sweeps it. A ban whose issuer the same
+            // effect there, and step 4 sweeps it. A ban whose issuer the same
             // delta re-adds is verified at step 0 against that issuer's key,
             // and takes no effect if the issuer is banned by a ban that does.
             //

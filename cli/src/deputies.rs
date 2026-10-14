@@ -111,7 +111,7 @@ pub struct DeputyGrant {
     /// plainly ban the whole subtree, which is the same class of false negative
     /// this field exists to avoid. It also counts DIRECT targets: a ban
     /// cascades to the target's own invite subtree
-    /// (`MembersV1::get_downstream_members`), so the number understates removal
+    /// (the ban's reach in `MembersV1::resolve_bans`), so the number understates removal
     /// blast radius for every target, not just the excluded self.
     pub members_deputy_can_ban: usize,
     /// Whether the contract honours the grant: the deputy is in the room or
@@ -550,8 +550,8 @@ impl<'a> RoomDeputies<'a> {
 /// `member -> the members they invited, directly or indirectly`, for every
 /// member with a non-empty invite subtree.
 ///
-/// Computes the same set `MembersV1::get_downstream_members` does (which is
-/// private to the contract crate), so the reach reported here matches the
+/// Computes the same set as the contract's `reach_in` (private to the contract
+/// crate, used by `MembersV1::resolve_bans`), so the reach reported here matches the
 /// subtree `is_ban_authorized` grants authority over. Like the contract's
 /// version it carries a visited-set guard, so it does not hang on a fetched
 /// state with circular invite chains.
@@ -607,9 +607,8 @@ pub fn member_id_from_key_input(input: &str) -> Option<MemberId> {
 }
 
 /// Everyone a ban of `target` would remove from the room: `target` themselves
-/// PLUS their entire transitive invite subtree — exactly what the contract's
-/// `check_banned_members` inserts (the banned user) and then extends with
-/// (`get_downstream_members`).
+/// PLUS their entire transitive invite subtree — exactly the ban's reach in
+/// the contract (`reach_in`, read by `MembersV1::resolve_bans`).
 ///
 /// Builds every subtree to read one, which is deliberate: [`invite_subtrees`] is
 /// the already-tested walk, carries the cycle guard the contract omits, and a

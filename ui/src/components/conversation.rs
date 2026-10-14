@@ -333,7 +333,7 @@ enum ReplyStrip {
 /// the message it quotes:
 ///
 ///   * BANNED author — the motivating case. An ENFORCED ban removes the member,
-///     which makes `post_apply_cleanup` purge their messages (step 4b) AND
+///     which makes `post_apply_cleanup` purge their messages (step 5b) AND
 ///     their `member_info` record, so their abusive text would otherwise
 ///     survive verbatim in every reply that quoted it. This CANNOT be keyed on
 ///     looking the quoted author up in `bans`: the snapshot carries no

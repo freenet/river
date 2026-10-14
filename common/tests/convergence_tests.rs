@@ -286,6 +286,8 @@ fn test_member_removal_tiebreak_convergence() {
 //         invalid_bans.insert(ban.id(), BanValidationError::ExceededMaximumBans);
 //     }
 //
+// (That code, and `BanValidationError`, have since been removed.)
+//
 // When multiple bans have the same timestamp, their relative order after sorting
 // is undefined, leading to non-deterministic behavior.
 //

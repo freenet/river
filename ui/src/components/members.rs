@@ -780,10 +780,10 @@ pub(crate) fn relevant_appointers(
 /// Everyone a ban of `target` would remove from the room: `target` themselves
 /// PLUS their entire transitive invite subtree.
 ///
-/// This mirrors what the contract actually does. `MembersV1::check_banned_members`
-/// inserts the banned user and then extends with `get_downstream_members`, which
-/// is private to the contract crate, so the walk is recomputed here rather than
-/// approximated. (`cli/src/deputies.rs::invite_subtrees` is riverctl's mirror of
+/// This mirrors what the contract actually does: a ban reaches the banned user
+/// and their whole invite subtree (`reach_in`, read by
+/// `MembersV1::resolve_bans`), which is private to the contract crate, so the
+/// walk is recomputed here rather than approximated. (`cli/src/deputies.rs::invite_subtrees` is riverctl's mirror of
 /// the same thing.)
 ///
 /// Like the contract's version it carries a visited-set guard: the UI walks
@@ -819,17 +819,14 @@ pub(crate) fn ban_removal_set(members: &MembersV1, target: MemberId) -> HashSet<
 /// invite ancestor of `banner`, so the cascade sweeps the banner up with them)
 /// as the single case they are — do NOT split this back into two special cases.
 ///
-/// The CONTRACT permits both: `is_ban_authorized` has no self-check, and step 3
-/// (owner-appointed global moderator) fires before anything that would stop it,
-/// so an owner-appointed deputy is authorized to ban themselves AND to ban their
-/// own ancestors. Such a ban is fully valid: `verify` accepts it, and
-/// `check_banned_members` then cascades removal to `get_downstream_members`,
-/// taking the banner's ENTIRE INVITE SUBTREE with them. On the Official room
-/// that is ~105 members for one misclick.
-///
-/// This is therefore a gate at the interaction layer, not a contract fix. Do NOT
-/// "simplify" it away on the assumption that the contract prevents it: it does
-/// not.
+/// `is_ban_authorized` has no self-check, and step 3 (owner-appointed global
+/// moderator) fires before anything that would stop it, so an owner-appointed
+/// deputy is authorized to ban themselves AND their own ancestors. Before
+/// freenet/river#702 such a ban took effect and took the banner's ENTIRE INVITE
+/// SUBTREE with them (~105 members on the Official room for one misclick).
+/// `MembersV1::resolve_bans` now voids a ban whose reach contains its issuer,
+/// so the gate here spares the user a ban that would do nothing, and still
+/// protects clients talking to an older room contract.
 ///
 /// Returns the user-visible reason when the ban is refused, `None` when the rule
 /// does not apply. The wording differs between the two routes because they read
@@ -1403,7 +1400,7 @@ fn badge_for_target(
     }
     let can_ban_viewer = (target != self_member_id).then(|| {
         // A ban CASCADES to the banned member's whole invite subtree
-        // (`MembersV1::get_downstream_members`), so "can they ban you" is not
+        // (the ban's reach in `MembersV1::resolve_bans`), so "can they ban you" is not
         // just `is_ban_authorized(target, viewer)`: someone who can ban anyone
         // the viewer descends from removes the viewer too. `viewer_relevant`
         // is exactly {owner} ∪ the viewer's strict ancestors ∪ {viewer}, which
@@ -4255,7 +4252,7 @@ mod tests {
     // freenet/river#478: nobody may ban themselves OUT OF THE ROOM.
     //
     // One rule, two routes to the same damage: ban yourself, or ban a member
-    // you joined through (the cascade to `get_downstream_members` sweeps you
+    // you joined through (the ban's reach, `reach_in`, sweeps you
     // and your whole subtree up with them). The fixture below is shared by
     // every case so the ALLOWED cases are proved against the same room as the
     // REFUSED ones — an over-broad guard cannot hide behind a friendlier
@@ -4388,7 +4385,7 @@ mod tests {
 
     /// The transitive route: a deputy may not ban anyone ABOVE them in the
     /// invite chain, at any depth. Same blast radius as a self-ban, because
-    /// `get_downstream_members` is the full transitive closure.
+    /// a ban's reach (`reach_in`) is the full transitive closure.
     #[test]
     fn ban_is_refused_for_every_strict_ancestor() {
         let c = ban_chain();
@@ -4475,7 +4472,7 @@ mod tests {
     }
 
     /// The removal set is the target PLUS their whole transitive subtree —
-    /// the same set `check_banned_members` builds. A one-level-only walk (the
+    /// the same set the contract's ban reach (`reach_in`) covers. A one-level-only walk (the
     /// easy mistake) would miss the grandchild and let the grandparent ban
     /// through.
     #[test]

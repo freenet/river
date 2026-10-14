@@ -977,7 +977,7 @@ impl RoomData {
     /// `ChatRoomStateV1::post_apply_cleanup`), NOT the raw `bans.0` list.
     ///
     /// A stored ban can be INERT: its banner may have no current authority — a
-    /// revoked-deputy tombstone, an unauthorized banner, or a garbage-signature
+    /// revoked deputy, an unauthorized banner, or a garbage-signature
     /// ban — in which case it removes nobody. Consulting the raw ban list would
     /// keep such a target blocked in the UI and omit their secret on rotation,
     /// so the deputy design's retroactive un-ban would never take effect
@@ -994,7 +994,8 @@ impl RoomData {
     }
 
     /// Whether SELF is ENFORCED-banned. Unlike `enforced_banned_member_ids`
-    /// (which reads only the live members list), this reconstructs self's invite
+    /// (which reads the live members list and the ban evidence), this
+    /// reconstructs self's invite
     /// ancestry from the stored `self_authorized_member` (and, when needed, the
     /// cached `invite_chain`) when self has ALREADY been removed from `members`
     /// (a prior ban+prune). Without it, a still-active deputy/ancestor ban of a
@@ -1006,7 +1007,7 @@ impl RoomData {
     /// immediate inviter), cleanup removes the root AND every descendant —
     /// including any intermediate ancestors between the root and self — so
     /// pushing only `self_authorized_member` leaves a gap the downstream walk
-    /// (`get_downstream_members`, which follows `invited_by` pointers within
+    /// (the contract's `reach_in`, which follows `invited_by` pointers within
     /// the augmented member list) cannot bridge: it can't discover self is
     /// downstream of the banned root without the intermediate ancestors' own
     /// `invited_by` edges also being present. Pushing the full `invite_chain`
@@ -8551,7 +8552,7 @@ mod tests {
     // self — from the live members list. `is_self_enforced_banned` must
     // reconstruct the FULL cached `invite_chain`, not just
     // `self_authorized_member`: otherwise the downstream walk
-    // (`get_downstream_members`, which follows `invited_by` pointers within
+    // (the contract's `reach_in`, which follows `invited_by` pointers within
     // the augmented member list) cannot bridge the missing intermediate
     // hop(s), misclassifying the ban INERT and flapping a rejoin the
     // contract immediately re-bans.

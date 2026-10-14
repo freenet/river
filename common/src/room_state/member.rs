@@ -311,11 +311,6 @@ impl MembersV1 {
         self.members.iter().map(|m| (m.member.id(), m)).collect()
     }
 
-    /// Checks if there are any banned members or members downstream of banned members in the invite chain
-    pub fn has_banned_members(&self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) -> bool {
-        self.check_banned_members(bans_v1, parameters).is_some()
-    }
-
     /// Every member id removed by a verifiable OWNER ban, over `members`
     /// alone: each target plus its invite subtree. Used by the early removal
     /// in [`ComposableState::apply_delta`]; see [`Self::resolve_bans`] step 0.
@@ -392,7 +387,7 @@ impl MembersV1 {
     ///    against its issuer's key ([`BansV1::ban_signature_matches_current_key`])
     ///    and the issuer is authorized to ban the target
     ///    ([`Self::is_ban_authorized`]). A ban whose issuer's record is known
-    ///    nowhere takes no effect, and `post_apply_cleanup` step 5 sweeps it.
+    ///    nowhere takes no effect, and `post_apply_cleanup` step 4 sweeps it.
     /// 2. **Reach.** Removing a member removes their whole invite subtree (a
     ///    member cannot stay without their inviter). A ban on `t` reaches `t`
     ///    and `t`'s subtree, and "the issuer is removed" uses the same notion.
@@ -584,21 +579,21 @@ impl MembersV1 {
         }
 
         // 2. Genuine strict ancestor. The chain walk above only reaches
-        //    PRESENT members, so this grant
-        //    already implies the banner is a current member.
+        //    records in `members_by_id`, so this grant already implies the
+        //    banner's record is known.
         if strict_ancestors.contains(&banner) {
             return true;
         }
 
         // Deputy authority (steps 3 & 4) is granted to a banner ID only while
-        // that banner is a CURRENT, signature-validated member (#411 round 3).
-        // Otherwise a deputy who gets pruned leaves a stale non-member ID in
-        // some `deputies` list, and any outsider could forge a ban
-        // `banner=<stale id>` with a garbage signature (which `verify` skips for
-        // non-member banners) and have it honored as authorized — removing an
-        // arbitrary member + subtree. Requiring current membership closes that:
-        // a stale/forged deputy ID grants nothing, and a present member's ban
-        // signature is verified in `verify`.
+        // the banner's record is known (#411 round 3): `members_by_id` holds
+        // the members, plus the ban evidence when called from `resolve_bans`
+        // (freenet/river#702). A stale deputy ID with no record grants
+        // nothing, so an outsider cannot forge `banner=<stale id>`; a known
+        // banner's ban must verify against that record's key, which
+        // `resolve_bans` checks before asking about authority. A member held
+        // as evidence keeps the authority its grants give, the same authority
+        // it would have by re-adding its own public record.
         let banner_is_member = members_by_id.contains_key(&banner);
 
         // 3. Owner-appointed global moderator (among members).
@@ -653,39 +648,6 @@ impl MembersV1 {
 
         self.members
             .retain(|m| !ids_to_remove.contains(&m.member.id()));
-    }
-
-    /// Checks for banned members and returns a set of member IDs to be removed if any are found.
-    /// Uses chain walking without Ed25519 verification since we only need to check membership,
-    /// not cryptographic validity.
-    fn check_banned_members(
-        &self,
-        bans_v1: &BansV1,
-        parameters: &ChatRoomParametersV1,
-    ) -> Option<HashSet<MemberId>> {
-        let banned_user_ids: HashSet<MemberId> =
-            bans_v1.0.iter().map(|b| b.ban.banned_user).collect();
-        if banned_user_ids.is_empty() {
-            return None;
-        }
-
-        let members_by_id = self.members_by_member_id();
-        let owner_id = parameters.owner_id();
-        let mut result = HashSet::new();
-
-        for m in &self.members {
-            // Walk the invite chain without Ed25519 verification
-            let chain_ids = Self::invite_chain_ids(m, owner_id, &members_by_id);
-            if chain_ids.iter().any(|id| banned_user_ids.contains(id)) {
-                result.insert(m.member.id());
-            }
-        }
-
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
     }
 
     /// Get the full invite chain with Ed25519 signature verification at each link.
@@ -790,31 +752,6 @@ impl MembersV1 {
             }
         }
         length
-    }
-
-    /// Walk the invite chain and return all member IDs in the chain WITHOUT Ed25519 verification.
-    /// Used by `check_banned_members` where we only need to check if any chain member is banned.
-    fn invite_chain_ids(
-        member: &AuthorizedMember,
-        owner_id: MemberId,
-        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
-    ) -> Vec<MemberId> {
-        let mut chain_ids = vec![member.member.id()];
-        let mut current_id = member.member.invited_by;
-        let mut visited = HashSet::new();
-        visited.insert(member.member.id());
-
-        while current_id != owner_id {
-            if !visited.insert(current_id) {
-                break;
-            }
-            chain_ids.push(current_id);
-            match members_by_id.get(&current_id) {
-                Some(inviter) => current_id = inviter.member.invited_by,
-                None => break,
-            }
-        }
-        chain_ids
     }
 }
 
@@ -1966,43 +1903,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_has_banned_members() {
-        let owner_signing_key = SigningKey::generate(&mut OsRng);
-        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = owner_verifying_key.into();
-
-        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
-        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
-        let (member3, _) = create_test_member(owner_id, member2.id());
-
-        let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
-        let authorized_member3 = AuthorizedMember::new(member3.clone(), &member2_signing_key);
-
-        let members = MembersV1 {
-            members: vec![authorized_member1, authorized_member2, authorized_member3],
-        };
-
-        let parameters = ChatRoomParametersV1 {
-            owner: owner_verifying_key,
-        };
-
-        // Test case 1: No banned members
-        let empty_bans = BansV1(vec![]);
-        assert!(!members.has_banned_members(&empty_bans, &parameters));
-
-        // Test case 2: One banned member
-        let banned_member = UserBan {
-            owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
-            banned_user: member2.id(),
-        };
-        let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
-        let bans = BansV1(vec![authorized_ban]);
-        assert!(members.has_banned_members(&bans, &parameters));
-    }
-
-    #[test]
     fn test_remove_banned_members() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
@@ -2206,39 +2106,6 @@ pub(crate) mod tests {
             MembersV1::invite_chain_length(&auth_m3, owner_id, &members_by_id),
             2
         );
-    }
-
-    #[test]
-    fn test_invite_chain_ids() {
-        let owner_signing_key = SigningKey::generate(&mut OsRng);
-        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id: MemberId = owner_verifying_key.into();
-
-        // Build a chain: owner -> m1 -> m2 -> m3
-        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
-        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
-        let (member3, _) = create_test_member(owner_id, member2.id());
-
-        let auth_m1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let auth_m2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
-        let auth_m3 = AuthorizedMember::new(member3.clone(), &member2_signing_key);
-
-        let members = MembersV1 {
-            members: vec![auth_m1.clone(), auth_m2.clone(), auth_m3.clone()],
-        };
-        let members_by_id = members.members_by_member_id();
-
-        // m1 (depth 0): chain is just [m1] (no ancestors other than owner)
-        let ids = MembersV1::invite_chain_ids(&auth_m1, owner_id, &members_by_id);
-        assert_eq!(ids, vec![member1.id()]);
-
-        // m2 (depth 1): chain is [m2, m1]
-        let ids = MembersV1::invite_chain_ids(&auth_m2, owner_id, &members_by_id);
-        assert_eq!(ids, vec![member2.id(), member1.id()]);
-
-        // m3 (depth 2): chain is [m3, m2, m1]
-        let ids = MembersV1::invite_chain_ids(&auth_m3, owner_id, &members_by_id);
-        assert_eq!(ids, vec![member3.id(), member2.id(), member1.id()]);
     }
 
     #[test]

@@ -43,7 +43,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Every member id a stored non-owner ban references: its issuer and target,
 /// and their invite ancestors, as far as `inviters` knows them. The set
-/// `post_apply_cleanup` step 5a keeps evidence for, and the only evidence
+/// `post_apply_cleanup` step 4a keeps evidence for, and the only evidence
 /// `verify` accepts. `inviters(id)` gives the inviter of every known record
 /// with that id; with more than one, every one is followed.
 pub(crate) fn referenced_by_bans<I: IntoIterator<Item = MemberId>>(
@@ -231,7 +231,7 @@ impl ComposableState for BanEvidenceV1 {
         let present = parent_state.members.members_by_member_id();
         if let Some(delta) = delta {
             // Only records a stored ban references can be kept (see `verify`;
-            // cleanup step 5a drops the rest), so the others are dropped here
+            // cleanup step 4a drops the rest), so the others are dropped here
             // before any chain is checked, by id alone. `bans` is final by
             // field order, before the `max_user_bans` cap, which only removes
             // bans; every record that could be known by cleanup is followed,
