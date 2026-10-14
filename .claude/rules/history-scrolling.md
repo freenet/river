@@ -78,7 +78,7 @@ inserted above it, and a join folding into the trailing event summary (which
 raises the key) are told apart by it. The 60s clock-skew clamp only affects
 grouping and the timestamp shown.
 
-Current behavior, by design:
+Current behavior:
 
 - A reader dragging within the band when an arrival lands is taken to the
   end. There is no gesture guard: remembering that the reader had moved up

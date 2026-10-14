@@ -462,7 +462,7 @@ test.describe("Members back arrow counts the open room's unread messages", () =>
     await expect(roomUnreadBadge(page, "Team Chat Room"), "the open room's row disagrees with the back arrow").toHaveText(
       "1",
     );
-    await expect(page.getByTestId("rooms-back-to-chat-button").locator("span[aria-hidden]")).toHaveCount(0);
+    await expect(page.getByTestId("rooms-back-to-chat-button").locator('[data-testid$="unread-badge"]')).toHaveCount(0);
     await expect(page.getByTestId("rooms-back-to-chat-button")).toHaveAccessibleName("Back to chat");
     await page.getByTestId("rooms-back-to-chat-button").click();
     await expect(page.locator("#chat-scroll-container")).toBeVisible();
