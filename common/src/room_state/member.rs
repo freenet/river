@@ -227,56 +227,112 @@ impl MembersV1 {
         members_by_id: &HashMap<MemberId, &'a AuthorizedMember>,
         verified: &mut HashSet<&'a AuthorizedMember>,
     ) -> Result<(), String> {
-        let owner_id = parameters.owner_id();
+        Self::verify_invite_chain_memo(member, parameters, members_by_id, verified, None)
+    }
+
+    /// [`Self::verify_invite_chain`], also remembering failures in `failed`
+    /// when given: a walk that fails marks every record on it (each one's chain
+    /// runs through the failing link), and a later walk reaching one of them
+    /// fails at once. Only walks starting from the lookup record use either
+    /// memo, so a record whose chain returns to its own id marks nothing.
+    pub(crate) fn verify_invite_chain_memo<'a>(
+        member: &'a AuthorizedMember,
+        parameters: &ChatRoomParametersV1,
+        members_by_id: &HashMap<MemberId, &'a AuthorizedMember>,
+        verified: &mut HashSet<&'a AuthorizedMember>,
+        mut failed: Option<&mut HashSet<&'a AuthorizedMember>>,
+    ) -> Result<(), String> {
         let use_memo = members_by_id
             .get(&member.member.id())
             .is_some_and(|held| *held == member);
         let mut path_ids = HashSet::new();
         let mut path: Vec<&'a AuthorizedMember> = Vec::new();
         let mut current: &'a AuthorizedMember = member;
-        loop {
+        let result = loop {
             if use_memo && verified.contains(current) {
-                break;
+                break Ok(());
             }
-            let id = current.member.id();
-            if !path_ids.insert(id) {
-                return Err(format!(
-                    "Circular invite chain detected for member {:?}",
-                    id
+            if use_memo
+                && failed
+                    .as_ref()
+                    .is_some_and(|failed| failed.contains(current))
+            {
+                break Err(format!(
+                    "Invite chain of member {:?} failed verification",
+                    current.member.id()
                 ));
             }
-            if current.member.invited_by == id {
-                return Err(format!("Self-invitation detected for member {:?}", id));
+            match Self::verify_invite_link(current, parameters, members_by_id, &mut path_ids) {
+                Err(e) => {
+                    path.push(current);
+                    break Err(e);
+                }
+                Ok(None) => {
+                    path.push(current);
+                    break Ok(());
+                }
+                Ok(Some(inviter)) => {
+                    path.push(current);
+                    current = inviter;
+                }
             }
-            path.push(current);
-            #[cfg(test)]
-            tests::count_invite_signature_check();
-            if current.member.invited_by == owner_id {
-                current.verify_signature(&parameters.owner).map_err(|e| {
-                    format!(
-                        "Invalid signature for member {:?} invited by owner: {}",
-                        id, e
-                    )
-                })?;
-                break;
-            }
-            let inviter: &'a AuthorizedMember = members_by_id
-                .get(&current.member.invited_by)
-                .ok_or_else(|| {
-                    format!(
-                        "Inviter {:?} not found for member {:?}",
-                        current.member.invited_by, id
-                    )
-                })?;
-            current
-                .verify_signature(&inviter.member.member_vk)
-                .map_err(|e| format!("Invalid signature for member {:?}: {}", id, e))?;
-            current = inviter;
-        }
+        };
         if use_memo {
-            verified.extend(path);
+            match &result {
+                Ok(()) => verified.extend(path),
+                Err(_) => {
+                    if let Some(failed) = failed.as_mut() {
+                        failed.extend(path);
+                    }
+                }
+            }
         }
-        Ok(())
+        result
+    }
+
+    /// One link of an invite-chain walk: `current`'s checks and signature.
+    /// `Ok(None)` when `current` was invited by the owner, `Ok(Some(inviter))`
+    /// to continue with the inviter.
+    fn verify_invite_link<'a>(
+        current: &'a AuthorizedMember,
+        parameters: &ChatRoomParametersV1,
+        members_by_id: &HashMap<MemberId, &'a AuthorizedMember>,
+        path_ids: &mut HashSet<MemberId>,
+    ) -> Result<Option<&'a AuthorizedMember>, String> {
+        let owner_id = parameters.owner_id();
+        let id = current.member.id();
+        if !path_ids.insert(id) {
+            return Err(format!(
+                "Circular invite chain detected for member {:?}",
+                id
+            ));
+        }
+        if current.member.invited_by == id {
+            return Err(format!("Self-invitation detected for member {:?}", id));
+        }
+        #[cfg(test)]
+        tests::count_invite_signature_check();
+        if current.member.invited_by == owner_id {
+            current.verify_signature(&parameters.owner).map_err(|e| {
+                format!(
+                    "Invalid signature for member {:?} invited by owner: {}",
+                    id, e
+                )
+            })?;
+            return Ok(None);
+        }
+        let inviter: &'a AuthorizedMember = members_by_id
+            .get(&current.member.invited_by)
+            .ok_or_else(|| {
+                format!(
+                    "Inviter {:?} not found for member {:?}",
+                    current.member.invited_by, id
+                )
+            })?;
+        current
+            .verify_signature(&inviter.member.member_vk)
+            .map_err(|e| format!("Invalid signature for member {:?}: {}", id, e))?;
+        Ok(Some(inviter))
     }
 }
 
@@ -486,7 +542,7 @@ impl MembersV1 {
 
         // Steps 4-5, sources first. Owner-removed members start removed and
         // have no outgoing edges.
-        let mut removed: HashSet<MemberId> = owner_removed;
+        let mut removed: HashSet<MemberId> = owner_removed.clone();
         for component in strongly_connected_components(&adjacency).into_iter().rev() {
             let in_cycle = component.len() >= 2;
             for issuer in &component {
@@ -519,6 +575,7 @@ impl MembersV1 {
         removed.remove(&owner_id);
         BanResolution {
             removed,
+            owner_removed,
             ban_tiers,
             verified,
         }
@@ -762,6 +819,10 @@ pub struct BanResolution {
     /// members of mutual-ban cycles with theirs. May name ids that are
     /// already absent.
     pub removed: HashSet<MemberId>,
+    /// The members a verifiable owner ban removes: each target and its
+    /// invite subtree. Their bans never take effect, and `post_apply_cleanup`
+    /// sweeps them.
+    pub owner_removed: HashSet<MemberId>,
     /// How strongly the `max_user_bans` eviction keeps each ban, highest
     /// first ([`Self::OWNER`], [`Self::EFFECTIVE`], [`Self::MUTUAL`]). A ban
     /// that is absent here ranks [`Self::INERT`].

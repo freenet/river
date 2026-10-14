@@ -264,8 +264,7 @@ impl ComposableState for BansV1 {
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
-        self.verify_ban_signatures(parent_state, parameters)?;
-
+        // The count first: it needs no signature check.
         if self.0.len() > parent_state.configuration.configuration.max_user_bans {
             return Err(format!(
                 "Number of bans ({}) exceeds the maximum allowed ({})",
@@ -274,7 +273,7 @@ impl ComposableState for BansV1 {
             ));
         }
 
-        Ok(())
+        self.verify_ban_signatures(parent_state, parameters)
     }
 
     /// Creates a summary of the current ban state
@@ -480,6 +479,8 @@ impl AuthorizedUserBan {
     ///
     /// Checks that the signature was created by the key corresponding to the provided verifying key
     pub fn verify_signature(&self, banner_verifying_key: &VerifyingKey) -> Result<(), String> {
+        #[cfg(test)]
+        tests::BAN_SIGNATURE_CHECKS.with(|c| c.set(c.get() + 1));
         verify_struct(&self.ban, &self.signature, banner_verifying_key)
             .map_err(|e| format!("Invalid ban signature: {}", e))
     }
@@ -510,6 +511,57 @@ pub struct BanId(pub FastHash);
 mod tests {
     use super::*;
     use crate::room_state::configuration::AuthorizedConfigurationV1;
+
+    thread_local! {
+        /// Ban signature checks (`AuthorizedUserBan::verify_signature`).
+        pub(super) static BAN_SIGNATURE_CHECKS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    /// `BansV1::verify` rejects more bans than `max_user_bans` before
+    /// checking any signature.
+    #[test]
+    fn verify_checks_the_ban_count_before_any_signature() {
+        use crate::room_state::configuration::Configuration;
+        let owner_sk = SigningKey::generate(&mut rand::thread_rng());
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_user_bans: 3,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        let ban = |i: u64| {
+            AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(i),
+                    banned_user: MemberId::from(
+                        &SigningKey::generate(&mut rand::thread_rng()).verifying_key(),
+                    ),
+                },
+                owner_id,
+                &owner_sk,
+            )
+        };
+        state.bans = BansV1((0..500).map(ban).collect());
+        let before = BAN_SIGNATURE_CHECKS.with(|c| c.get());
+        let err = state.bans.verify(&state, &params).unwrap_err();
+        assert!(err.contains("exceeds the maximum"), "{err}");
+        assert_eq!(BAN_SIGNATURE_CHECKS.with(|c| c.get()) - before, 0);
+        state.bans.0.truncate(3);
+        let before = BAN_SIGNATURE_CHECKS.with(|c| c.get());
+        state.bans.verify(&state, &params).unwrap();
+        assert_eq!(BAN_SIGNATURE_CHECKS.with(|c| c.get()) - before, 3);
+    }
     use crate::room_state::member::{AuthorizedMember, Member, MembersV1};
     use ed25519_dalek::SigningKey;
     use std::time::Duration;

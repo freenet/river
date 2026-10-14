@@ -865,10 +865,20 @@ pub(crate) fn enforced_ban_set_of(
     parameters: &ChatRoomParametersV1,
 ) -> HashSet<MemberId> {
     let max_bans = parent_state.configuration.configuration.max_user_bans;
+    // The evidence `post_apply_cleanup` reads: without records deeper than
+    // the cap, which it drops first.
+    let pruned = parent_state.ban_evidence.without_too_deep(
+        &parent_state.members,
+        parameters.owner_id(),
+        crate::room_state::ban_evidence::evidence_depth_cap(
+            parent_state.configuration.configuration.max_members,
+        ),
+    );
+    let evidence = pruned.as_ref().unwrap_or(&parent_state.ban_evidence);
 
     if parent_state.bans.0.len() <= max_bans {
         return parent_state.members.banned_member_ids(
-            &parent_state.ban_evidence,
+            evidence,
             &parent_state.bans,
             &parent_state.member_info,
             parameters,
@@ -879,12 +889,12 @@ pub(crate) fn enforced_ban_set_of(
         &mut capped,
         max_bans,
         &parent_state.members,
-        &parent_state.ban_evidence,
+        evidence,
         &parent_state.member_info,
         parameters,
     );
     parent_state.members.banned_member_ids(
-        &parent_state.ban_evidence,
+        evidence,
         &BansV1(capped),
         &parent_state.member_info,
         parameters,

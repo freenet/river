@@ -3186,9 +3186,11 @@ fn lowering_max_user_bans_converges_with_a_stale_peer() {
 }
 
 /// A member bans the head and the tail of a 1003-deep invite chain under
-/// them. Both bans take effect, and every record on the chain stays as ban
-/// evidence, since the tail's ban references its ancestors. A peer that has
-/// none of it merges the state, and the two peers converge, in either order.
+/// them. Both bans take effect. Ban evidence keeps only records within
+/// `MAX_EVIDENCE_DEPTH` invites of the owner, so of the whole chain only the
+/// head's record stays (the tail's record is too deep to keep, and with it
+/// the chain linking the tail to the head). A peer that has none of it merges
+/// the state, and the two peers converge, in either order.
 #[test]
 fn a_deep_ban_evidence_chain_merges_into_a_fresh_peer() {
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
@@ -3237,7 +3239,13 @@ fn a_deep_ban_evidence_chain_merges_into_a_fresh_peer() {
     };
     deep.post_apply_cleanup(&parameters).unwrap();
     assert_eq!(deep.members.members.len(), 1);
-    assert_eq!(deep.ban_evidence.members.len(), depth);
+    let evidence: Vec<MemberId> = deep
+        .ban_evidence
+        .members
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
+    assert_eq!(evidence, vec![chain[0]]);
     deep.verify(&deep, &parameters).unwrap();
 
     let ser = |s: &ChatRoomStateV1| {

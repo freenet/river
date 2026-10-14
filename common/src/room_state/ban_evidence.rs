@@ -39,7 +39,99 @@ use crate::room_state::ChatRoomParametersV1;
 use crate::ChatRoomStateV1;
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// A 128-bit digest of one ban-evidence record: the first 16 bytes of the
+/// BLAKE3 hash of the record's CBOR encoding (`crate::util::record_digest`).
+/// It is the value of the evidence summary, so anti-entropy sends a record
+/// whenever two peers hold different records for one id, and it orders the
+/// canonical choice between two valid records for one id (the lower digest
+/// wins). 128 bits because a party can choose both records it compares.
+/// It serializes as a CBOR byte string (17 bytes), not a 16-element array.
+/// The hash, width, kept bytes and encoding are wire format: pinned by
+/// `evidence_digest_golden_vector`; changing any of them re-keys the contract.
+/// See `.claude/rules/contract-summary-determinism.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EvidenceDigest(pub [u8; 16]);
+
+impl Serialize for EvidenceDigest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for EvidenceDigest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = <Vec<u8>>::deserialize(deserializer)?;
+        let arr: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+            serde::de::Error::custom(format!(
+                "expected 16-byte EvidenceDigest, got {} bytes",
+                bytes.len()
+            ))
+        })?;
+        Ok(EvidenceDigest(arr))
+    }
+}
+
+/// The [`EvidenceDigest`] of `record`.
+pub fn evidence_digest(record: &AuthorizedMember) -> EvidenceDigest {
+    let full = crate::util::record_digest(record);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    EvidenceDigest(out)
+}
+
+/// The deepest invite chain a ban-evidence record may have, counted in
+/// records from the owner (a member the owner invited is at depth 1). A work
+/// bound, not a room rule: every evidence record costs a chain check in each
+/// apply and verify, and a stored ban references at most two chains, so a
+/// state holds at most `2 x max_user_bans x depth` evidence records. Cleanup
+/// keeps `member_info` for at most `depth - 1` evidence ancestors per ban,
+/// but verify accepts a `member_info` for any evidence id, so a crafted state
+/// at 200 bans and depth 4 holds 1600 evidence and 1600 `member_info`
+/// records: about 3400 signature checks with the bans. In the node's WASM
+/// runtime 2000 such checks validated in 0.64-1.0 s, so that worst case is
+/// about 1.1-1.7 s, inside the 5 s compute limit. Native clients built with
+/// `opt-level = "z"` (riverctl) are about 5x slower: 5.5 s measured at 2400
+/// checks, so about 7.5 s at 3400. The deepest chain in the Official room's
+/// states is 3.
+pub const MAX_EVIDENCE_DEPTH: usize = 4;
+
+/// The evidence depth cap for a room: `min(max_members, MAX_EVIDENCE_DEPTH)`.
+pub fn evidence_depth_cap(max_members: usize) -> usize {
+    max_members.min(MAX_EVIDENCE_DEPTH)
+}
+
+/// The most ban evidence a room's configuration allows:
+/// `2 x max_user_bans x cap`, saturating so a huge `max_user_bans` cannot wrap
+/// (a wrapped bound would reject every evidence record on 32-bit WASM).
+pub fn evidence_bound(max_user_bans: usize, cap: usize) -> usize {
+    max_user_bans.saturating_mul(2).saturating_mul(cap)
+}
+
+/// Whether `record`'s invite chain, read through `known`, reaches the owner
+/// within `cap` records. A chain that leaves `known` before reaching the
+/// owner does not. Walks at most `cap` links.
+pub(crate) fn within_depth(
+    record: &AuthorizedMember,
+    known: &HashMap<MemberId, &AuthorizedMember>,
+    owner_id: MemberId,
+    cap: usize,
+) -> bool {
+    let mut depth = 1;
+    let mut inviter = record.member.invited_by;
+    while inviter != owner_id {
+        if depth >= cap {
+            return false;
+        }
+        match known.get(&inviter) {
+            Some(m) => inviter = m.member.invited_by,
+            None => return false,
+        }
+        depth += 1;
+    }
+    depth <= cap
+}
 
 /// Every member id a stored non-owner ban references: its issuer and target,
 /// and their invite ancestors, as far as `inviters` knows them. The set
@@ -83,6 +175,28 @@ impl BanEvidenceV1 {
         self.members.is_empty()
     }
 
+    /// This evidence without the records deeper than `cap`
+    /// ([`within_depth`], read through members and this field), or `None` if
+    /// every record is within it. Only a lowered `max_members` can leave a
+    /// stored record too deep: apply, cleanup and `verify` never keep one.
+    pub fn without_too_deep(
+        &self,
+        members: &MembersV1,
+        owner_id: MemberId,
+        cap: usize,
+    ) -> Option<BanEvidenceV1> {
+        let known = self.lookup(members, owner_id);
+        let keep = |m: &&AuthorizedMember| {
+            !known.contains_key(&m.member.id()) || within_depth(m, &known, owner_id, cap)
+        };
+        if self.members.iter().all(|m| keep(&m)) {
+            return None;
+        }
+        Some(BanEvidenceV1 {
+            members: self.members.iter().filter(keep).cloned().collect(),
+        })
+    }
+
     /// Every record ban resolution may read: `members`, then each evidence
     /// record whose inviter is the owner or is itself in the map. A record
     /// whose chain no longer reaches the owner (an ancestor was lost, for
@@ -97,6 +211,8 @@ impl BanEvidenceV1 {
         members: &'a MembersV1,
         owner_id: MemberId,
     ) -> HashMap<MemberId, &'a AuthorizedMember> {
+        #[cfg(test)]
+        tests::LOOKUP_CALLS.with(|c| c.set(c.get() + 1));
         let mut map = members.members_by_member_id();
         let mut invited: HashMap<MemberId, Vec<&'a AuthorizedMember>> = HashMap::new();
         for m in self
@@ -113,6 +229,8 @@ impl BanEvidenceV1 {
             .collect();
         while let Some(inviter) = reached.pop() {
             for m in invited.remove(&inviter).unwrap_or_default() {
+                #[cfg(test)]
+                tests::LOOKUP_STEPS.with(|c| c.set(c.get() + 1));
                 let id = m.member.id();
                 if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(id) {
                     slot.insert(m);
@@ -157,7 +275,8 @@ impl BanEvidenceV1 {
 
 impl ComposableState for BanEvidenceV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = BTreeSet<MemberId>;
+    /// Id -> record digest. BTreeMap so the summary bytes are deterministic.
+    type Summary = BTreeMap<MemberId, EvidenceDigest>;
     type Delta = Vec<AuthorizedMember>;
     type Parameters = ChatRoomParametersV1;
 
@@ -167,10 +286,49 @@ impl ComposableState for BanEvidenceV1 {
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
         let owner_id = parameters.owner_id();
-        self.verify_records(parent_state, parameters)?;
+        let config = &parent_state.configuration.configuration;
+        let cap = evidence_depth_cap(config.max_members);
+        // Every check that needs no signature runs first, so the signature
+        // work below is bounded by the room's configuration whatever a full
+        // state carries. The count bound is honest-safe by construction:
+        // every record must be referenced by a stored non-owner ban (its
+        // issuer's or target's invite chain) and lie within `cap` invites of
+        // the owner, so each ban accounts for at most `2 x cap` records, and
+        // `BansV1::verify` holds the bans to `max_user_bans`.
+        let bound = evidence_bound(config.max_user_bans, cap);
+        if self.members.len() > bound {
+            return Err(format!(
+                "Ban evidence holds {} records, more than {bound}",
+                self.members.len()
+            ));
+        }
+        let present = parent_state.members.members_by_member_id();
+        let mut seen = HashSet::new();
+        for m in &self.members {
+            let id = m.member.id();
+            if !seen.insert(id) {
+                return Err(format!("Duplicate ban evidence record for {id:?}"));
+            }
+            if id == owner_id || m.member.member_vk == parameters.owner {
+                return Err("Ban evidence must not hold the owner".to_string());
+            }
+            if present.contains_key(&id) {
+                return Err(format!("Ban evidence record {id:?} is a current member"));
+            }
+        }
+        let lookup = self.lookup(&parent_state.members, owner_id);
+        if let Some(m) = self
+            .members
+            .iter()
+            .find(|m| !within_depth(m, &lookup, owner_id, cap))
+        {
+            return Err(format!(
+                "Ban evidence record {:?} is deeper than {cap} invites",
+                m.member.id()
+            ));
+        }
         // Every record is one a stored ban needs, as `post_apply_cleanup`
         // keeps them, so the field is bounded by the stored bans.
-        let lookup = self.lookup(&parent_state.members, owner_id);
         let referenced = referenced_by_bans(&parent_state.bans, owner_id, |id| {
             lookup.get(&id).map(|m| m.member.invited_by)
         });
@@ -184,7 +342,7 @@ impl ComposableState for BanEvidenceV1 {
                 m.member.id()
             ));
         }
-        Ok(())
+        self.verify_records(parent_state, parameters)
     }
 
     fn summarize(
@@ -192,7 +350,10 @@ impl ComposableState for BanEvidenceV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        self.members.iter().map(|m| m.member.id()).collect()
+        self.members
+            .iter()
+            .map(|m| (m.member.id(), evidence_digest(m)))
+            .collect()
     }
 
     fn delta(
@@ -204,7 +365,7 @@ impl ComposableState for BanEvidenceV1 {
         let missing: Vec<AuthorizedMember> = self
             .members
             .iter()
-            .filter(|m| !old_state_summary.contains(&m.member.id()))
+            .filter(|m| old_state_summary.get(&m.member.id()) != Some(&evidence_digest(m)))
             .cloned()
             .collect();
         if missing.is_empty() {
@@ -230,6 +391,21 @@ impl ComposableState for BanEvidenceV1 {
         let owner_id = parameters.owner_id();
         let present = parent_state.members.members_by_member_id();
         if let Some(delta) = delta {
+            // A bound on the work one delta can cause: no state this room's
+            // configuration allows holds more evidence (see `verify`), so a
+            // delta derived from one carries no more. A peer still holding a
+            // larger set from before a configuration change is refused until
+            // it takes the new configuration, as `BansV1::apply_delta` refuses
+            // an over-cap ban delta.
+            let config = &parent_state.configuration.configuration;
+            let bound =
+                evidence_bound(config.max_user_bans, evidence_depth_cap(config.max_members));
+            if delta.len() > bound {
+                return Err(format!(
+                    "Ban evidence delta of {} exceeds {bound}",
+                    delta.len()
+                ));
+            }
             // Only records a stored ban references can be kept (see `verify`;
             // cleanup step 4a drops the rest), so the others are dropped here
             // before any chain is checked, by id alone. `bans` is final by
@@ -252,34 +428,63 @@ impl ComposableState for BanEvidenceV1 {
             let referenced = referenced_by_bans(&parent_state.bans, owner_id, |id| {
                 inviters.get(&id).cloned().unwrap_or_default()
             });
+            let depth_cap =
+                evidence_depth_cap(parent_state.configuration.configuration.max_members);
             let added = {
                 let mut combined = self.lookup(&parent_state.members, owner_id);
                 for m in delta {
                     combined.entry(m.member.id()).or_insert(m);
                 }
-                let held: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
-                let mut added_ids = HashSet::new();
-                let mut verified = HashSet::new();
-                let mut added = Vec::new();
+                let held: HashMap<MemberId, EvidenceDigest> = self
+                    .members
+                    .iter()
+                    .map(|m| (m.member.id(), evidence_digest(m)))
+                    .collect();
+                // Two valid records for one id resolve the same way on every
+                // peer, whatever order they arrive in: the lower digest wins.
+                // Per id only the lowest-digest record that passes the cheap
+                // checks is considered, and only if it would replace what is
+                // held, so an id costs at most one chain check. If it fails,
+                // a peer holding a valid record offers it on the next sync.
+                let mut best: BTreeMap<MemberId, (EvidenceDigest, &AuthorizedMember)> =
+                    BTreeMap::new();
                 for m in delta {
                     let id = m.member.id();
                     if id == owner_id
                         || !referenced.contains(&id)
                         || present.contains_key(&id)
-                        || held.contains(&id)
-                        || added_ids.contains(&id)
+                        || !within_depth(m, &combined, owner_id, depth_cap)
                     {
                         continue;
                     }
-                    if MembersV1::verify_invite_chain(m, parameters, &combined, &mut verified)
-                        .is_ok()
+                    let digest = evidence_digest(m);
+                    if held.get(&id).is_some_and(|h| *h <= digest) {
+                        continue;
+                    }
+                    if best.get(&id).is_none_or(|(d, _)| digest < *d) {
+                        best.insert(id, (digest, m));
+                    }
+                }
+                let mut verified = HashSet::new();
+                let mut failed = HashSet::new();
+                let mut added = Vec::new();
+                for (_, (_, m)) in best {
+                    if MembersV1::verify_invite_chain_memo(
+                        m,
+                        parameters,
+                        &combined,
+                        &mut verified,
+                        Some(&mut failed),
+                    )
+                    .is_ok()
                     {
-                        added_ids.insert(id);
                         added.push(m.clone());
                     }
                 }
                 added
             };
+            let replaced: HashSet<MemberId> = added.iter().map(|m| m.member.id()).collect();
+            self.members.retain(|m| !replaced.contains(&m.member.id()));
             self.members.extend(added);
         }
         self.members
@@ -290,8 +495,15 @@ impl ComposableState for BanEvidenceV1 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    thread_local! {
+        /// Calls to `BanEvidenceV1::lookup`, and evidence records it examined.
+        pub(crate) static LOOKUP_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(crate) static LOOKUP_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
     use crate::room_state::ban::{AuthorizedUserBan, UserBan};
     use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use crate::room_state::member::tests::{
@@ -331,13 +543,14 @@ mod tests {
         Ok(())
     }
 
-    /// `apply_delta` as it was before chain checks were memoized and the
-    /// delta was bounded.
+    /// `apply_delta` with every record's full chain walked (no memo): the
+    /// same filters and the same canonical choice per id.
     fn apply_walking_every_chain(
         evidence: &mut BanEvidenceV1,
         parent_state: &ChatRoomStateV1,
         parameters: &ChatRoomParametersV1,
         delta: &[AuthorizedMember],
+        eligible: impl Fn(&AuthorizedMember, &HashMap<MemberId, &AuthorizedMember>) -> bool,
     ) {
         let owner_id = parameters.owner_id();
         let present = parent_state.members.members_by_member_id();
@@ -345,16 +558,29 @@ mod tests {
         for m in delta {
             combined.entry(m.member.id()).or_insert(m);
         }
-        let mut added = Vec::new();
+        // Per id, the lowest-digest eligible record, if it is lower than the
+        // held one; then a full walk of its chain.
+        let held: HashMap<MemberId, EvidenceDigest> = evidence
+            .members
+            .iter()
+            .map(|m| (m.member.id(), evidence_digest(m)))
+            .collect();
+        let mut best: BTreeMap<MemberId, (EvidenceDigest, &AuthorizedMember)> = BTreeMap::new();
         for m in delta {
             let id = m.member.id();
-            if id == owner_id
-                || present.contains_key(&id)
-                || evidence.members.iter().any(|e| e.member.id() == id)
-                || added.iter().any(|e: &AuthorizedMember| e.member.id() == id)
-            {
+            if id == owner_id || !eligible(m, &combined) || present.contains_key(&id) {
                 continue;
             }
+            let digest = evidence_digest(m);
+            if held.get(&id).is_some_and(|h| *h <= digest) {
+                continue;
+            }
+            if best.get(&id).is_none_or(|(d, _)| digest < *d) {
+                best.insert(id, (digest, m));
+            }
+        }
+        let mut added = Vec::new();
+        for (_, (_, m)) in best {
             if parent_state
                 .members
                 .get_invite_chain_with_lookup(m, parameters, &combined)
@@ -363,6 +589,10 @@ mod tests {
                 added.push(m.clone());
             }
         }
+        let replaced: HashSet<MemberId> = added.iter().map(|m| m.member.id()).collect();
+        evidence
+            .members
+            .retain(|m| !replaced.contains(&m.member.id()));
         evidence.members.extend(added);
         evidence
             .members
@@ -560,15 +790,22 @@ mod tests {
             let mut reversed = delta.clone();
             reversed.reverse();
             for delta in [delta, reversed] {
-                // The full walk, then only the records a ban references: an
-                // unreferenced id is dropped whichever record carries it.
                 let mut expected = BanEvidenceV1 {
                     members: held.clone(),
                 };
-                apply_walking_every_chain(&mut expected, &parent_state, &parameters, &delta);
-                expected
-                    .members
-                    .retain(|m| referenced.contains(&m.member.id()) || held.contains(m));
+                // The full walk, filtered as the apply filters: records a ban
+                // references, within the depth cap.
+                let cap = evidence_depth_cap(parent_state.configuration.configuration.max_members);
+                apply_walking_every_chain(
+                    &mut expected,
+                    &parent_state,
+                    &parameters,
+                    &delta,
+                    |m, combined| {
+                        referenced.contains(&m.member.id())
+                            && within_depth(m, combined, owner_id, cap)
+                    },
+                );
                 let mut actual = BanEvidenceV1 {
                     members: held.clone(),
                 };
@@ -623,6 +860,47 @@ mod tests {
         map
     }
 
+    /// `evidence_digest` pinned to one fixed record: the hash, the width, the
+    /// kept bytes and the CBOR byte-string encoding are wire format.
+    #[test]
+    fn evidence_digest_golden_vector() {
+        let owner = SigningKey::from_bytes(&[1u8; 32]);
+        let member = SigningKey::from_bytes(&[2u8; 32]);
+        let owner_id: MemberId = owner.verifying_key().into();
+        let mut raw = [0u8; 64];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let record = AuthorizedMember::with_signature(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member.verifying_key(),
+            },
+            ed25519_dalek::Signature::from_bytes(&raw),
+        );
+        let digest = evidence_digest(&record);
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&digest, &mut encoded).unwrap();
+        const EXPECTED: [u8; 16] = [
+            0x51, 0x56, 0xe2, 0x67, 0xa0, 0x30, 0xa8, 0x26, 0x99, 0x76, 0xdc, 0x87, 0x02, 0x01,
+            0x2a, 0xa6,
+        ];
+        assert_eq!(
+            digest.0, EXPECTED,
+            "evidence_digest changed: a wire-format change"
+        );
+        let mut expected_encoding = vec![0x50];
+        expected_encoding.extend_from_slice(&EXPECTED);
+        assert_eq!(
+            encoded, expected_encoding,
+            "encoded as a 16-byte CBOR byte string"
+        );
+        let mut reversed = EXPECTED;
+        reversed.reverse();
+        assert_ne!(reversed, EXPECTED);
+    }
+
     /// The single-walk `lookup` returns the same map as rescanning, on random
     /// trees split between `members` and the evidence, with a record removed
     /// (so its subtree is unreachable) or its inviter pointed at itself.
@@ -657,17 +935,59 @@ mod tests {
     }
 
     /// A chain held in id order, which rescanning admitted one record per pass
-    /// when the ids descend down the chain, is admitted in one walk.
+    /// when the ids descend down the chain (quadratic), is admitted in one
+    /// walk that examines each record once, in either id order.
     #[test]
-    fn lookup_admits_a_deep_chain_in_any_id_order() {
+    fn lookup_admits_a_deep_chain_in_one_walk() {
         let owner_sk = SigningKey::generate(&mut OsRng);
         let owner_id: MemberId = owner_sk.verifying_key().into();
-        let mut records = chain(&owner_sk, 2_000);
-        records.sort_by_key(|m| m.member.id());
-        let evidence = BanEvidenceV1 { members: records };
-        let members = MembersV1::default();
-        let map = evidence.lookup(&members, owner_id);
-        assert_eq!(map.len(), 2_000);
+        let n = 2_000;
+        let mut records = chain(&owner_sk, n);
+        for descending in [false, true] {
+            records.sort_by_key(|m| m.member.id());
+            if descending {
+                records.reverse();
+            }
+            let evidence = BanEvidenceV1 {
+                members: records.clone(),
+            };
+            let members = MembersV1::default();
+            let before = LOOKUP_STEPS.with(|c| c.get());
+            let map = evidence.lookup(&members, owner_id);
+            assert_eq!(map.len(), n);
+            assert_eq!(LOOKUP_STEPS.with(|c| c.get()) - before, n);
+        }
+    }
+
+    /// `MemberInfoV1::apply_delta` builds the lookup a fixed number of times
+    /// per delta, not once per record.
+    #[test]
+    fn member_info_apply_builds_the_lookup_once() {
+        use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let mut members = Vec::new();
+        let mut infos = Vec::new();
+        for _ in 0..20 {
+            let (member, sk) = create_test_member(owner_id, owner_id);
+            infos.push(AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo::new_public(member.id(), 1, "n".into()),
+                &sk,
+            ));
+            members.push(AuthorizedMember::new(member, &owner_sk));
+        }
+        let parent_state = state_with(&owner_sk, 10, members);
+        let calls = |delta: Vec<AuthorizedMemberInfo>| {
+            let mut info = MemberInfoV1::default();
+            let before = LOOKUP_CALLS.with(|c| c.get());
+            info.apply_delta(&parent_state, &parameters, &Some(delta))
+                .unwrap();
+            LOOKUP_CALLS.with(|c| c.get()) - before
+        };
+        assert_eq!(calls(infos[..1].to_vec()), calls(infos.clone()));
     }
 
     /// A chain owner -> m0 -> ... -> m{n-1}: the records and the last key.
@@ -685,8 +1005,9 @@ mod tests {
         records
     }
 
-    /// Each link of a chain held as evidence, or added in one delta in
-    /// either order, is checked once.
+    /// Each link of a chain held as evidence is checked once by
+    /// `verify_records`, and each link of a chain at the depth cap added in
+    /// one delta, in either order, once by `apply_delta`.
     #[test]
     fn each_link_of_a_deep_chain_is_checked_once() {
         let n = 200;
@@ -705,6 +1026,10 @@ mod tests {
         evidence.verify_records(&parent_state, &parameters).unwrap();
         assert_eq!(invite_signature_checks() - before, n);
 
+        // `apply_delta` keeps records within the depth cap only.
+        let n = MAX_EVIDENCE_DEPTH;
+        let records = chain(&owner_sk, n);
+        parent_state.bans = bans_naming([records[n - 1].member.id()], parameters.owner_id());
         let mut deepest_first = records.clone();
         deepest_first.reverse();
         for delta in [records, deepest_first] {
@@ -720,7 +1045,7 @@ mod tests {
 
     /// Records no stored ban references are dropped before any chain is
     /// checked: a delta of 500 of them costs no signature checks, and the one
-    /// referenced chain in it costs one check per link.
+    /// referenced chain in it (at the depth cap) costs one check per link.
     #[test]
     fn unreferenced_records_cost_no_chain_checks() {
         let owner_sk = SigningKey::generate(&mut OsRng);
@@ -728,10 +1053,13 @@ mod tests {
         let parameters = ChatRoomParametersV1 {
             owner: owner_sk.verifying_key(),
         };
-        let mut parent_state = state_with(&owner_sk, 10, Vec::new());
+        let mut parent_state = state_with(&owner_sk, 200, Vec::new());
         let mut delta: Vec<AuthorizedMember> = chain(&owner_sk, 500);
-        let referenced_chain = chain(&owner_sk, 8);
-        parent_state.bans = bans_naming([referenced_chain[7].member.id()], owner_id);
+        let referenced_chain = chain(&owner_sk, MAX_EVIDENCE_DEPTH);
+        parent_state.bans = bans_naming(
+            [referenced_chain[MAX_EVIDENCE_DEPTH - 1].member.id()],
+            owner_id,
+        );
 
         let mut evidence = BanEvidenceV1::default();
         let before = invite_signature_checks();
@@ -746,10 +1074,190 @@ mod tests {
         evidence
             .apply_delta(&parent_state, &parameters, &Some(delta))
             .unwrap();
-        assert_eq!(invite_signature_checks() - before, 8);
+        assert_eq!(invite_signature_checks() - before, MAX_EVIDENCE_DEPTH);
         let mut expected = referenced_chain;
         expected.sort_by_key(|m| m.member.id());
         assert_eq!(evidence.members, expected);
+    }
+
+    /// The work bound `MAX_EVIDENCE_DEPTH` documents: 200 bans, each
+    /// referencing two disjoint chains at the depth cap, is 1600 evidence
+    /// records, and `verify` checks each record's signature once.
+    #[test]
+    fn evidence_at_the_work_bound_costs_one_check_per_record() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let bans = 200;
+        let mut state = state_with(&owner_sk, bans, Vec::new());
+        let mut records = Vec::new();
+        let mut stored = Vec::new();
+        for _ in 0..bans {
+            let issuer = chain(&owner_sk, MAX_EVIDENCE_DEPTH);
+            let target = chain(&owner_sk, MAX_EVIDENCE_DEPTH);
+            let mut ban = bans_naming([target[MAX_EVIDENCE_DEPTH - 1].member.id()], owner_id)
+                .0
+                .remove(0);
+            ban.banned_by = issuer[MAX_EVIDENCE_DEPTH - 1].member.id();
+            stored.push(ban);
+            records.extend(issuer);
+            records.extend(target);
+        }
+        records.sort_by_key(|m| m.member.id());
+        state.bans = BansV1(stored);
+        state.ban_evidence = BanEvidenceV1 { members: records };
+        assert_eq!(
+            state.ban_evidence.members.len(),
+            2 * bans * MAX_EVIDENCE_DEPTH
+        );
+        let before = invite_signature_checks();
+        state.ban_evidence.verify(&state, &parameters).unwrap();
+        assert_eq!(
+            invite_signature_checks() - before,
+            2 * bans * MAX_EVIDENCE_DEPTH
+        );
+    }
+
+    /// `verify` rejects evidence over its count bound, or holding a record no
+    /// stored ban references, before checking any signature.
+    #[test]
+    fn verify_rejects_unreferenced_or_excess_evidence_before_any_signature() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let mut state = state_with(&owner_sk, 10, Vec::new());
+        let record = || AuthorizedMember::new(create_test_member(owner_id, owner_id).0, &owner_sk);
+        // 10 bans x cap 4 x 2 = 80.
+        for (count, reason) in [(2_000, "more than 80"), (50, "not referenced")] {
+            let mut members: Vec<AuthorizedMember> = (0..count).map(|_| record()).collect();
+            members.sort_by_key(|m| m.member.id());
+            state.ban_evidence = BanEvidenceV1 { members };
+            let before = invite_signature_checks();
+            let err = state.ban_evidence.verify(&state, &parameters).unwrap_err();
+            assert!(err.contains(reason), "{count}: {err}");
+            assert_eq!(invite_signature_checks() - before, 0, "{count}");
+        }
+    }
+
+    /// Many distinct records for one referenced id cost one chain check,
+    /// whether or not it verifies.
+    #[test]
+    fn repeated_records_for_one_id_cost_one_check() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let mut parent_state = state_with(&owner_sk, 200, Vec::new());
+        let (member, _) = create_test_member(owner_id, owner_id);
+        parent_state.bans = bans_naming([member.id()], owner_id);
+        // 100 distinct records for one id, each signed by a different wrong
+        // key.
+        let bad: Vec<AuthorizedMember> = (0..100)
+            .map(|_| {
+                let other = SigningKey::generate(&mut OsRng);
+                AuthorizedMember::with_signature(
+                    member.clone(),
+                    crate::util::sign_struct(&member, &other),
+                )
+            })
+            .collect();
+        assert_eq!(
+            bad.iter().collect::<HashSet<_>>().len(),
+            100,
+            "precondition: the records are distinct"
+        );
+        let mut evidence = BanEvidenceV1::default();
+        let before = invite_signature_checks();
+        evidence
+            .apply_delta(&parent_state, &parameters, &Some(bad))
+            .unwrap();
+        assert_eq!(invite_signature_checks() - before, 1);
+        assert!(evidence.members.is_empty());
+    }
+
+    /// The bound saturates rather than wrapping at a huge `max_user_bans`, so
+    /// evidence is still accepted.
+    #[test]
+    fn the_evidence_bound_saturates() {
+        assert_eq!(evidence_bound(usize::MAX, 4), usize::MAX);
+        assert_eq!(evidence_bound(usize::MAX / 4, 4), usize::MAX);
+        assert_eq!(evidence_bound(200, 4), 1_600);
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let records = chain(&owner_sk, 2);
+        let mut state = state_with(&owner_sk, usize::MAX, Vec::new());
+        state.bans = bans_naming([records[1].member.id()], owner_id);
+        let mut evidence = BanEvidenceV1::default();
+        evidence
+            .apply_delta(&state, &parameters, &Some(records))
+            .unwrap();
+        assert_eq!(evidence.members.len(), 2);
+        state.ban_evidence = evidence;
+        state.ban_evidence.verify(&state, &parameters).unwrap();
+    }
+
+    /// An evidence delta over `2 x max_user_bans x depth cap` records is
+    /// refused before any check.
+    #[test]
+    fn an_evidence_delta_over_the_bound_is_refused() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let parent_state = state_with(&owner_sk, 10, Vec::new());
+        let record = || AuthorizedMember::new(create_test_member(owner_id, owner_id).0, &owner_sk);
+        let mut evidence = BanEvidenceV1::default();
+        let at_bound: Vec<AuthorizedMember> = (0..80).map(|_| record()).collect();
+        evidence
+            .apply_delta(&parent_state, &parameters, &Some(at_bound))
+            .unwrap();
+        let over: Vec<AuthorizedMember> = (0..81).map(|_| record()).collect();
+        let before = invite_signature_checks();
+        let err = evidence
+            .apply_delta(&parent_state, &parameters, &Some(over))
+            .unwrap_err();
+        assert!(err.contains("exceeds 80"), "{err}");
+        assert_eq!(invite_signature_checks() - before, 0);
+    }
+
+    /// Records whose chains all run through one record that fails are
+    /// checked once each, and the failing record once: a failed walk is
+    /// remembered.
+    #[test]
+    fn a_failing_shared_ancestor_is_checked_once() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let mut parent_state = state_with(&owner_sk, 200, Vec::new());
+        let (a, a_sk) = create_test_member(owner_id, owner_id);
+        let other = SigningKey::generate(&mut OsRng);
+        let bad_a =
+            AuthorizedMember::with_signature(a.clone(), crate::util::sign_struct(&a, &other));
+        let n = 50;
+        let invitees: Vec<AuthorizedMember> = (0..n)
+            .map(|_| AuthorizedMember::new(create_test_member(owner_id, a.id()).0, &a_sk))
+            .collect();
+        parent_state.bans = bans_naming(invitees.iter().map(|m| m.member.id()), owner_id);
+        let mut delta = vec![bad_a];
+        delta.extend(invitees);
+        let mut evidence = BanEvidenceV1::default();
+        let before = invite_signature_checks();
+        evidence
+            .apply_delta(&parent_state, &parameters, &Some(delta))
+            .unwrap();
+        assert_eq!(invite_signature_checks() - before, n + 1);
+        assert!(evidence.members.is_empty());
     }
 
     /// `verify` rejects an evidence record no stored ban references, and

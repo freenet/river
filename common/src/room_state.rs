@@ -129,6 +129,19 @@ impl ChatRoomStateV1 {
     /// `direct_messages.rs` module docs, "Interaction with bans".
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
+        let depth_cap = crate::room_state::ban_evidence::evidence_depth_cap(
+            self.configuration.configuration.max_members,
+        );
+        // A lowered `max_members` can leave held evidence deeper than the
+        // cap. Drop it before anything reads it, so every step of this pass
+        // (and `enforced_ban_set_of`, which drops it the same way) judges the
+        // same records the next pass will.
+        if let Some(pruned) = self
+            .ban_evidence
+            .without_too_deep(&self.members, owner_id, depth_cap)
+        {
+            self.ban_evidence = pruned;
+        }
         // Every record known at the start of this pass: members plus ban
         // evidence. Step 5 and the evidence recomputation read THIS, never the
         // pruned member set, so nothing this pass removes can change which
@@ -142,11 +155,12 @@ impl ChatRoomStateV1 {
 
         // Snapshot for the equality assert below. Taken HERE, before step 0-cap
         // mutates `self.bans`, because this is the one point where `self` still
-        // holds exactly what `parent_state` held when the `direct_messages`
-        // field applied — the five inputs `enforced_ban_set_of` reads
+        // holds what `parent_state` held when the `direct_messages` field
+        // applied: the five inputs `enforced_ban_set_of` reads
         // (`configuration`, `bans`, `members`, `ban_evidence`, `member_info`)
-        // are all final by
-        // then and none is touched between there and here.
+        // are all final by then, and the only change since is the evidence
+        // deeper than the cap dropped above, which `enforced_ban_set_of` drops
+        // the same way.
         #[cfg(debug_assertions)]
         let dm_apply_time_ban_set = {
             let snapshot = self.clone();
@@ -234,12 +248,13 @@ impl ChatRoomStateV1 {
         // peer converges to the same member set regardless of delta order.
         // Kept in post_apply_cleanup (NOT verify) so verify stays stable
         // across ban/deputy changes, mirroring the DM ban-sweep precedent.
-        let enforced_banned_ids = self.members.banned_member_ids(
+        let resolution = self.members.resolve_bans(
             &self.ban_evidence,
             &self.bans,
             &self.member_info,
             parameters,
         );
+        let enforced_banned_ids = resolution.removed.clone();
 
         // THE load-bearing invariant of the freenet/river#675 remedy: the ban
         // set `DirectMessagesV1::apply_delta` derived, before this function
@@ -408,21 +423,38 @@ impl ChatRoomStateV1 {
 
         // 4. Sweep any ban whose issuer is unknown or whose signature does
         //    not match the issuer's key (#411 round 3 item A.3, round 4 item
-        //    A; AGENTS.md State Authorization Rule). "Known" means present in
-        //    `members` OR `ban_evidence` at the START of this pass, so a ban
-        //    whose issuer this pass removes or prunes stays: its issuer's
-        //    record moves to evidence just below (freenet/river#702). This
-        //    runs before the evidence recomputation, which reads the swept
-        //    ban set, and it only removes bans, so the count stays <= the cap.
-        let known_by_id: std::collections::HashMap<MemberId, &AuthorizedMember> =
+        //    A; AGENTS.md State Authorization Rule), and every ban by a member
+        //    an owner ban removes: the owner's ban wins over everything, so
+        //    such a ban can never take effect while it stands.
+        //    "Known" means present in `members` now, or known at the START of
+        //    this pass and within the evidence depth cap, so a ban whose
+        //    issuer this pass removes or prunes stays exactly when the
+        //    issuer's record moves to evidence just below (freenet/river#702).
+        //    This runs before the evidence recomputation, which reads the
+        //    swept ban set, and it only removes bans, so the count stays <=
+        //    the cap.
+        let all_known: std::collections::HashMap<MemberId, &AuthorizedMember> =
             known_at_start.iter().map(|(id, m)| (*id, m)).collect();
+        let present: HashSet<MemberId> =
+            self.members.members.iter().map(|m| m.member.id()).collect();
+        let known_by_id: std::collections::HashMap<MemberId, &AuthorizedMember> = all_known
+            .iter()
+            .filter(|(id, m)| {
+                present.contains(*id)
+                    || crate::room_state::ban_evidence::within_depth(
+                        m, &all_known, owner_id, depth_cap,
+                    )
+            })
+            .map(|(id, m)| (*id, *m))
+            .collect();
         self.bans.0.retain(|ban| {
-            BansV1::ban_signature_matches_current_key(
-                ban,
-                &known_by_id,
-                owner_id,
-                &parameters.owner,
-            )
+            !resolution.owner_removed.contains(&ban.banned_by)
+                && BansV1::ban_signature_matches_current_key(
+                    ban,
+                    &known_by_id,
+                    owner_id,
+                    &parameters.owner,
+                )
         });
 
         // 4a. Recompute the ban evidence (freenet/river#702): every record
@@ -444,31 +476,46 @@ impl ChatRoomStateV1 {
                 crate::room_state::ban_evidence::referenced_by_bans(&self.bans, owner_id, |id| {
                     known_by_id.get(&id).map(|m| m.member.invited_by)
                 });
-            let present: HashSet<MemberId> =
-                self.members.members.iter().map(|m| m.member.id()).collect();
-            let mut evidence: Vec<AuthorizedMember> = known_at_start
+            let mut evidence: Vec<AuthorizedMember> = known_by_id
                 .iter()
                 .filter(|(id, _)| referenced.contains(*id) && !present.contains(*id))
-                .map(|(_, m)| m.clone())
+                .map(|(_, m)| (*m).clone())
                 .collect();
             evidence.sort_by_key(|m| m.member.id());
             self.ban_evidence.members = evidence;
         }
 
-        // 5. Clean member_info for members who are gone, keeping the records
-        //    of evidenced members: `is_ban_authorized` reads their `deputies`
-        //    (rule 4, the grant of an ancestor), and dropping them
-        //    would change a ban's validity on the next pass. They keep merging
-        //    like any other record (highest rank wins); see `BanEvidenceV1`.
-        let evidenced: HashSet<MemberId> = self
-            .ban_evidence
-            .members
-            .iter()
-            .map(|m| m.member.id())
-            .collect();
+        // 5. Clean member_info for members who are gone. A member held only
+        //    as ban evidence keeps its record where a stored ban may read it:
+        //    `is_ban_authorized` rule 4 reads the `deputies` of the target's
+        //    strict ancestors, so for each stored non-owner ban every evidence
+        //    ancestor of its target, up to the first present ancestor, keeps
+        //    its `member_info` whatever it holds. Keeping it regardless of
+        //    content is what makes the choice independent of which version of
+        //    the record a peer holds: a newer record (a revoked grant) is never
+        //    dropped and then outranked by an older one supplied again. The
+        //    depth cap bounds this to `cap - 1` records per ban. No reader shows
+        //    an evidence-only member's nickname. They keep merging like any other
+        //    record (highest rank wins); see `BanEvidenceV1`.
+        let needed_grantors: HashSet<MemberId> = {
+            let known = self.ban_evidence.lookup(&self.members, owner_id);
+            let present_ids: HashSet<MemberId> =
+                self.members.members.iter().map(|m| m.member.id()).collect();
+            let mut needed = HashSet::new();
+            for ban in self.bans.0.iter().filter(|b| b.banned_by != owner_id) {
+                let mut ancestor = known.get(&ban.ban.banned_user).map(|m| m.member.invited_by);
+                while let Some(a) = ancestor {
+                    if a == owner_id || present_ids.contains(&a) || !needed.insert(a) {
+                        break;
+                    }
+                    ancestor = known.get(&a).map(|m| m.member.invited_by);
+                }
+            }
+            needed
+        };
         self.member_info.member_info.retain(|info| {
             let id = info.member_info.member_id;
-            id == owner_id || required_ids.contains(&id) || evidenced.contains(&id)
+            id == owner_id || required_ids.contains(&id) || needed_grantors.contains(&id)
         });
 
         // 5a. Collapse duplicate member_info records to the single canonical

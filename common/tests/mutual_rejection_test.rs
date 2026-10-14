@@ -1195,9 +1195,9 @@ fn a_removed_members_invitee_is_removed_and_stays_removed() {
 
 /// A removed moderator editing their own `deputies` cannot escape a cycle
 /// whose other edge rests on ABSOLUTE authority (owner-appointed moderator).
-/// Their record is ban evidence, so the update merges (see `BanEvidenceV1`
-/// for why it is not frozen), but a `deputies` list grants authority only
-/// over its author's own subtree and never voids a ban on its author.
+/// Their record is ban evidence, so the update applies, but a `deputies` list
+/// grants authority only over its author's own subtree and never voids a ban
+/// on its author. No stored ban needs the grant, so cleanup does not keep it.
 #[test]
 fn a_removed_moderator_cannot_escape_by_deputizing_its_partner() {
     let room = Room::new();
@@ -1209,11 +1209,11 @@ fn a_removed_moderator_cannot_escape_by_deputizing_its_partner() {
         ..Default::default()
     };
     // The record is signed by A, whose record is ban evidence, so the
-    // update applies. It just cannot be used to escape.
+    // update applies. It cannot be used to escape, and nothing needs it.
     let after = apply_checked(&s, delta, &room.params);
     assert!(
-        after.member_info.deputies_of(a.id).contains(&b.id),
-        "the deputies record was stored"
+        !after.member_info.deputies_of(a.id).contains(&b.id),
+        "an evidence-only member's grant no ban needs is not kept"
     );
     let active = active_ids(&after, &room.params);
     assert!(!active.contains(&a.id) && !active.contains(&b.id));
@@ -2255,4 +2255,503 @@ fn bans_on_targets_held_nowhere_keep_their_cap_rank() {
     );
     assert!(has_ban(&after, &d_g1) && has_ban(&after, &d_g2) && has_ban(&after, &owner_g3));
     assert!(active_ids(&after, &room.params).contains(&t.id));
+}
+
+/// owner -> c1 -> ... -> c{n}, all members who have posted.
+fn invite_chain_of(room: &Room, n: usize) -> Vec<Person> {
+    let mut chain = vec![room.person()];
+    while chain.len() < n {
+        let next = room.person_invited_by(chain.last().unwrap());
+        chain.push(next);
+    }
+    chain
+}
+
+/// Ban evidence keeps a record at depth `MAX_EVIDENCE_DEPTH` (4 invites from
+/// the owner) and not one at depth 5. Either way the ban stands, its target
+/// stays removed, and cleanup is a fixpoint.
+#[test]
+fn evidence_depth_cap_keeps_depth_4_and_drops_depth_5() {
+    use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
+    for depth in [MAX_EVIDENCE_DEPTH, MAX_EVIDENCE_DEPTH + 1] {
+        let room = capped_room(20, 10);
+        let chain = invite_chain_of(&room, depth);
+        let members: Vec<&Person> = chain.iter().collect();
+        let s = room.modded_state(&members, &[], vec![]);
+        let (top, deepest) = (&chain[0], &chain[depth - 1]);
+        let ban = room.ban(top, deepest, 10);
+        let after = apply_checked(&s, bans_delta(vec![ban.clone()]), &room.params);
+        assert!(!member_ids(&after).contains(&deepest.id), "depth {depth}");
+        assert!(has_ban(&after, &ban), "depth {depth}: the ban stands");
+        assert_eq!(
+            evidence_ids(&after).contains(&deepest.id),
+            depth <= MAX_EVIDENCE_DEPTH,
+            "depth {depth}"
+        );
+    }
+}
+
+/// Lowering `max_members` lowers the evidence depth cap with it
+/// (`min(max_members, MAX_EVIDENCE_DEPTH)`): a record deeper than the new cap
+/// leaves the evidence. Two peers that took the ban and the new configuration
+/// in opposite orders end in the same state.
+#[test]
+fn lowering_max_members_drops_deeper_evidence_and_converges() {
+    let room = capped_room(20, 10);
+    let chain = invite_chain_of(&room, 3);
+    let (a, b, c) = (&chain[0], &chain[1], &chain[2]);
+    let s = room.modded_state(&[a, b, c], &[], vec![]);
+    let ban = bans_delta(vec![room.ban(a, c, 10)]);
+    let lower = ChatRoomStateV1Delta {
+        configuration: Some(AuthorizedConfigurationV1::new(
+            Configuration {
+                configuration_version: 2,
+                max_members: 2,
+                ..room.config.configuration.clone()
+            },
+            &room.owner_sk,
+        )),
+        ..Default::default()
+    };
+    let banned_first = apply_checked(&s, ban.clone(), &room.params);
+    assert!(
+        evidence_ids(&banned_first).contains(&c.id),
+        "depth 3 <= cap 4"
+    );
+    let x = apply_checked(&banned_first, lower.clone(), &room.params);
+    let lowered_first = apply_checked(&s, lower, &room.params);
+    let y = apply_checked(&lowered_first, ban, &room.params);
+    assert!(!evidence_ids(&x).contains(&c.id), "depth 3 > cap 2");
+    assert_eq!(ser(&x), ser(&y), "both orders end in one state");
+    let (agreed, _) = gossip_until_equal(&x, &y, &room.params, 3);
+    assert_eq!(ser(&agreed), ser(&x));
+}
+
+/// An owner ban on a member who is already absent (held as ban evidence)
+/// sweeps that member's bans, and with them the evidence only those bans
+/// referenced. The same owner ban on a present member does the same, so the
+/// result does not depend on whether the member had left yet.
+#[test]
+fn an_owner_ban_on_an_absent_member_sweeps_their_bans_and_evidence() {
+    let room = capped_room(20, 10);
+    let x = room.person();
+    let x1 = room.person_invited_by(&x);
+    let x2 = room.person_invited_by(&x1);
+    let t = room.person();
+    // X is no longer a member: X ships its own record as evidence with a ban
+    // on its invitee X2 and the chain linking them.
+    let s = room.modded_state(&[&t], &[], vec![]);
+    let x_bans = room.ban(&x, &x2, 10);
+    let s = apply_checked(
+        &s,
+        ChatRoomStateV1Delta {
+            bans: Some(vec![x_bans.clone()]),
+            ban_evidence: Some(vec![x.auth.clone(), x1.auth.clone(), x2.auth.clone()]),
+            ..Default::default()
+        },
+        &room.params,
+    );
+    assert!(has_ban(&s, &x_bans), "precondition");
+    assert!(evidence_ids(&s).contains(&x.id), "precondition");
+    let owner_bans_x = room.owner_ban(&x, 20);
+    let after = apply_checked(&s, bans_delta(vec![owner_bans_x.clone()]), &room.params);
+    assert!(has_ban(&after, &owner_bans_x));
+    assert!(!has_ban(&after, &x_bans), "X's ban is swept");
+    assert!(
+        evidence_ids(&after).is_empty(),
+        "nothing references the records"
+    );
+    assert!(member_ids(&after).contains(&t.id));
+}
+
+/// A member, or a former member, cannot make the ban evidence grow beyond the
+/// depth cap. A delta carrying a ban on the tail of a 1500-deep invite chain
+/// they signed, with the whole chain as evidence, is over the evidence delta
+/// bound (`2 x max_user_bans x depth cap`, 80 here) and refused. The same
+/// with a 70-deep chain applies and keeps at most the records within
+/// `MAX_EVIDENCE_DEPTH` invites.
+#[test]
+fn a_deep_signed_chain_cannot_grow_the_evidence() {
+    use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
+    for x_is_member in [true, false] {
+        for depth in [1500, 70] {
+            let room = capped_room(20, 10);
+            let t = room.person();
+            let chain = invite_chain_of(&room, depth);
+            let x = &chain[0];
+            let tail = chain.last().unwrap();
+            let mut members = vec![&t];
+            if x_is_member {
+                members.push(x);
+            }
+            let s = room.modded_state(&members, &[], vec![]);
+            let evidence: Vec<AuthorizedMember> = chain
+                .iter()
+                .skip(usize::from(x_is_member))
+                .map(|p| p.auth.clone())
+                .collect();
+            let delta = ChatRoomStateV1Delta {
+                bans: Some(vec![room.ban(x, tail, 10)]),
+                ban_evidence: Some(evidence),
+                ..Default::default()
+            };
+            if depth > 80 {
+                let mut after = s.clone();
+                let err = after
+                    .apply_delta(&s, &room.params, &Some(delta))
+                    .unwrap_err();
+                assert!(err.contains("exceeds 80"), "{err}");
+                continue;
+            }
+            let after = apply_checked(&s, delta, &room.params);
+            assert!(
+                after.ban_evidence.members.len() <= 2 * MAX_EVIDENCE_DEPTH,
+                "x_is_member {x_is_member}: {} records kept",
+                after.ban_evidence.members.len()
+            );
+            assert!(member_ids(&after).contains(&t.id));
+        }
+    }
+}
+
+/// The `member_info` of a member held only as ban evidence is kept when it is
+/// a strict ancestor of a stored ban's target: A invited T and deputized D;
+/// D bans T on A's grant. A never posts and is pruned, so A's record and A's
+/// `member_info` (an evidence ancestor of T, kept whatever it holds) are
+/// kept. The ban keeps taking effect across cleanups.
+#[test]
+fn a_grant_a_ban_rests_on_is_kept_for_an_evidence_member() {
+    let room = Room::new();
+    let (a, d) = (room.person(), room.person());
+    let t = room.person_invited_by(&a);
+    let mut s = room.state(
+        &[&a, &d, &t],
+        vec![],
+        vec![room.msg(&d, 1), room.msg(&t, 2)],
+    );
+    s.member_info = MemberInfoV1 {
+        member_info: vec![deputies_record(&a, 1, &[&d])],
+    };
+    s.verify(&s, &room.params).unwrap();
+    let after = apply_checked(&s, bans_delta(vec![room.ban(&d, &t, 10)]), &room.params);
+    let ids = member_ids(&after);
+    assert!(
+        !ids.contains(&t.id) && !ids.contains(&a.id),
+        "T banned, A pruned"
+    );
+    assert!(evidence_ids(&after).contains(&a.id));
+    assert!(
+        after.member_info.deputies_of(a.id).contains(&d.id),
+        "A's grant is kept"
+    );
+    let mut again = after.clone();
+    again.post_apply_cleanup(&room.params).unwrap();
+    assert!(!member_ids(&again).contains(&t.id));
+}
+
+/// A member at invite depth `depth`: `depth - 1` posting ancestors above it.
+fn person_at_depth(room: &Room, depth: usize) -> (Person, Vec<Person>) {
+    let mut chain = invite_chain_of(room, depth);
+    let p = chain.pop().unwrap();
+    (p, chain)
+}
+
+/// Mutual bans between moderators deeper than `MAX_EVIDENCE_DEPTH` invites
+/// (intended under the depth cap; no real room has such a member, the
+/// deepest chain seen is 3). Two deep moderators who ban each other in one
+/// delta are both removed, and both bans lapse with their records, so both
+/// may return. Delivered one at a time, the first ban removes the other
+/// moderator and the second is swept with its issuer's record, so the outcome
+/// depends on delivery order; every pair of peers still converges.
+#[test]
+fn a_mutual_ban_between_deep_moderators_lapses_and_converges() {
+    use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
+    let room = capped_room(40, 10);
+    let (a, a_up) = person_at_depth(&room, MAX_EVIDENCE_DEPTH + 1);
+    let (b, b_up) = person_at_depth(&room, MAX_EVIDENCE_DEPTH + 1);
+    let mut members: Vec<&Person> = a_up.iter().chain(b_up.iter()).collect();
+    members.extend([&a, &b]);
+    let s = room.modded_state(&members, &[&a, &b], vec![]);
+    let (ab, ba) = (room.ban(&a, &b, 10), room.ban(&b, &a, 11));
+    let both = apply_checked(&s, bans_delta(vec![ab.clone(), ba.clone()]), &room.params);
+    let ids = member_ids(&both);
+    assert!(!ids.contains(&a.id) && !ids.contains(&b.id), "both removed");
+    assert!(
+        !has_ban(&both, &ab) && !has_ban(&both, &ba),
+        "both bans lapse"
+    );
+    let a_first = apply_checked(
+        &apply_checked(&s, bans_delta(vec![ab.clone()]), &room.params),
+        bans_delta(vec![ba.clone()]),
+        &room.params,
+    );
+    let b_first = apply_checked(
+        &apply_checked(&s, bans_delta(vec![ba.clone()]), &room.params),
+        bans_delta(vec![ab.clone()]),
+        &room.params,
+    );
+    assert!(member_ids(&a_first).contains(&a.id) && !member_ids(&a_first).contains(&b.id));
+    assert!(member_ids(&b_first).contains(&b.id) && !member_ids(&b_first).contains(&a.id));
+    for (x, y) in [(&a_first, &b_first), (&both, &a_first), (&both, &b_first)] {
+        let (p, q) = (
+            merge(x, y, &room.params).unwrap(),
+            merge(y, x, &room.params).unwrap(),
+        );
+        let (agreed, _) = gossip_until_equal(&p, &q, &room.params, 4);
+        agreed.verify(&agreed, &room.params).unwrap();
+    }
+}
+
+/// One moderator deeper than the cap, one shallow, banning each other. The
+/// deep one's ban lapses with its record; the shallow one's ban stands and
+/// keeps the deep one out. Whether the shallow one is removed depends on
+/// delivery order (removed when both bans arrive together, kept when its own
+/// ban arrives first); peers converge either way.
+#[test]
+fn a_mutual_ban_with_one_deep_moderator_converges() {
+    use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
+    let room = capped_room(40, 10);
+    let (a, a_up) = person_at_depth(&room, MAX_EVIDENCE_DEPTH + 1);
+    let b = room.person();
+    let mut members: Vec<&Person> = a_up.iter().collect();
+    members.extend([&a, &b]);
+    let s = room.modded_state(&members, &[&a, &b], vec![]);
+    let (ab, ba) = (room.ban(&a, &b, 10), room.ban(&b, &a, 11));
+    let both = apply_checked(&s, bans_delta(vec![ab.clone(), ba.clone()]), &room.params);
+    let a_first = apply_checked(
+        &apply_checked(&s, bans_delta(vec![ab.clone()]), &room.params),
+        bans_delta(vec![ba.clone()]),
+        &room.params,
+    );
+    let b_first = apply_checked(
+        &apply_checked(&s, bans_delta(vec![ba.clone()]), &room.params),
+        bans_delta(vec![ab.clone()]),
+        &room.params,
+    );
+    assert!(!member_ids(&both).contains(&b.id), "together: B is removed");
+    assert!(
+        member_ids(&b_first).contains(&b.id),
+        "B's ban first: B stays"
+    );
+    for state in [&both, &a_first, &b_first] {
+        assert!(!member_ids(state).contains(&a.id));
+        assert!(has_ban(state, &ba) && !has_ban(state, &ab));
+    }
+    for (x, y) in [(&a_first, &b_first), (&both, &a_first), (&both, &b_first)] {
+        let (agreed, _) = gossip_until_equal(x, y, &room.params, 4);
+        assert!(!member_ids(&agreed).contains(&a.id));
+        assert!(has_ban(&agreed, &ba) && !has_ban(&agreed, &ab));
+    }
+}
+
+/// A revoked grant stays revoked once its author is held as ban evidence. A
+/// invited T and deputized D (version 1); D bans T on that grant; A is pruned
+/// and kept as evidence. A then publishes version 2 with no deputies. When
+/// version 1 is offered again, version 2 still wins: cleanup keeps an
+/// evidence ancestor's `member_info` whatever it holds, so it never drops the
+/// newer record and lets the older one back in.
+#[test]
+fn a_revoked_grant_of_an_evidence_member_cannot_be_replayed() {
+    let room = Room::new();
+    let (a, d) = (room.person(), room.person());
+    let t = room.person_invited_by(&a);
+    let mut s = room.state(
+        &[&a, &d, &t],
+        vec![],
+        vec![room.msg(&d, 1), room.msg(&t, 2)],
+    );
+    let v1 = deputies_record(&a, 1, &[&d]);
+    s.member_info = MemberInfoV1 {
+        member_info: vec![v1.clone()],
+    };
+    s.verify(&s, &room.params).unwrap();
+    let s = apply_checked(&s, bans_delta(vec![room.ban(&d, &t, 10)]), &room.params);
+    assert!(
+        evidence_ids(&s).contains(&a.id),
+        "precondition: A is evidence"
+    );
+    let info_delta = |r: AuthorizedMemberInfo| ChatRoomStateV1Delta {
+        member_info: Some(vec![r]),
+        ..Default::default()
+    };
+    let revoked = apply_checked(&s, info_delta(deputies_record(&a, 2, &[])), &room.params);
+    assert!(
+        revoked.member_info.deputies_of(a.id).is_empty(),
+        "v2 revokes"
+    );
+    let replayed = apply_checked(&revoked, info_delta(v1), &room.params);
+    assert!(
+        replayed.member_info.deputies_of(a.id).is_empty(),
+        "the older grant does not come back"
+    );
+}
+
+/// Two peers holding different valid evidence records for one id (T invited
+/// by the owner, and a second record for T's key signed by member Y) end with
+/// the same record, the one with the lower digest, whichever merges first,
+/// and the result is a cleanup fixpoint.
+#[test]
+fn competing_evidence_records_for_one_id_converge() {
+    use river_core::room_state::ban_evidence::evidence_digest;
+    let room = Room::new();
+    let (d, y, t) = (room.person(), room.person(), room.person());
+    let ban = room.ban(&d, &t, 10);
+    let by_owner = t.auth.clone();
+    let by_y = AuthorizedMember::new(
+        Member {
+            owner_member_id: room.owner_id,
+            invited_by: y.id,
+            member_vk: t.sk.verifying_key(),
+        },
+        &y.sk,
+    );
+    let lower = std::cmp::min_by_key(by_owner.clone(), by_y.clone(), evidence_digest);
+    // P1 saw T as a member and removed them: it holds the owner's record.
+    let p1 = apply_checked(
+        &room.modded_state(&[&d, &y, &t], &[&d], vec![]),
+        bans_delta(vec![ban.clone()]),
+        &room.params,
+    );
+    // P2 never had T as a member: it learned the ban with Y's record.
+    let p2 = apply_checked(
+        &room.modded_state(&[&d, &y], &[&d], vec![]),
+        ChatRoomStateV1Delta {
+            bans: Some(vec![ban.clone()]),
+            ban_evidence: Some(vec![by_y.clone()]),
+            ..Default::default()
+        },
+        &room.params,
+    );
+    let record_of = |s: &ChatRoomStateV1| {
+        s.ban_evidence
+            .members
+            .iter()
+            .find(|m| m.member.id() == t.id)
+            .cloned()
+    };
+    assert_eq!(record_of(&p1), Some(by_owner.clone()));
+    assert_eq!(record_of(&p2), Some(by_y.clone()));
+    let a = merge(&p1, &p2, &room.params).unwrap();
+    let b = merge(&p2, &p1, &room.params).unwrap();
+    let (agreed, _) = gossip_until_equal(&a, &b, &room.params, 3);
+    assert_eq!(record_of(&agreed), Some(lower));
+    assert!(!member_ids(&agreed).contains(&t.id));
+}
+
+/// Split delivery with competing evidence records: one peer gets the owner's
+/// record for T, one gets Y's, two get both in either order. After gossip
+/// every peer holds the same state, with the lower-digest record.
+#[test]
+fn split_delivery_of_competing_evidence_records_converges() {
+    use river_core::room_state::ban_evidence::evidence_digest;
+    let room = Room::new();
+    let (d, y, t) = (room.person(), room.person(), room.person());
+    let ban = room.ban(&d, &t, 10);
+    let by_owner = t.auth.clone();
+    let by_y = AuthorizedMember::new(
+        Member {
+            owner_member_id: room.owner_id,
+            invited_by: y.id,
+            member_vk: t.sk.verifying_key(),
+        },
+        &y.sk,
+    );
+    let lower = std::cmp::min_by_key(by_owner.clone(), by_y.clone(), evidence_digest);
+    let base = apply_checked(
+        &room.modded_state(&[&d, &y], &[&d], vec![]),
+        bans_delta(vec![ban]),
+        &room.params,
+    );
+    let deliver = |records: Vec<AuthorizedMember>| {
+        apply_checked(
+            &base,
+            ChatRoomStateV1Delta {
+                ban_evidence: Some(records),
+                ..Default::default()
+            },
+            &room.params,
+        )
+    };
+    let mut peers = vec![
+        deliver(vec![by_owner.clone()]),
+        deliver(vec![by_y.clone()]),
+        deliver(vec![by_owner.clone(), by_y.clone()]),
+        deliver(vec![by_y.clone(), by_owner.clone()]),
+    ];
+    assert_eq!(ser(&peers[2]), ser(&peers[3]), "one delta, either order");
+    for _ in 0..3 {
+        for i in 0..peers.len() {
+            for j in 0..peers.len() {
+                if i != j {
+                    peers[i] = merge(&peers[i], &peers[j], &room.params).unwrap();
+                }
+            }
+        }
+    }
+    for p in &peers {
+        assert_eq!(ser(p), ser(&peers[0]));
+    }
+    assert!(peers[0].ban_evidence.members.contains(&lower));
+}
+
+/// Cleanup keeps `member_info` for every evidence strict ancestor of a ban's
+/// target, up to the first present ancestor. A target at depth 4 whose three
+/// ancestors are all absent keeps exactly those three records, and not the
+/// target's own. When the depth-2 ancestor posts, it and its inviter stay
+/// members and the walk stops there: of the absent members, only the depth-3
+/// ancestor keeps its `member_info`.
+#[test]
+fn evidence_member_info_is_kept_up_to_the_first_present_ancestor() {
+    use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
+    for depth2_posts in [false, true] {
+        let room = Room::new();
+        let m = room.person();
+        let chain = invite_chain_of(&room, MAX_EVIDENCE_DEPTH);
+        let t = &chain[MAX_EVIDENCE_DEPTH - 1];
+        let mut msgs = vec![room.msg(&m, 1), room.msg(t, 2)];
+        if depth2_posts {
+            msgs.push(room.msg(&chain[1], 3));
+        }
+        let mut members: Vec<&Person> = chain.iter().collect();
+        members.push(&m);
+        let mut s = room.state(&members, vec![], msgs);
+        let mut infos = room.owner_mods(&[&m]).member_info;
+        infos.extend(chain.iter().map(|p| deputies_record(p, 1, &[])));
+        s.member_info = MemberInfoV1 { member_info: infos };
+        s.verify(&s, &room.params).unwrap();
+
+        let after = apply_checked(&s, bans_delta(vec![room.ban(&m, t, 10)]), &room.params);
+        let present = member_ids(&after);
+        assert!(!present.contains(&t.id), "T banned");
+        let kept: Vec<MemberId> = after
+            .member_info
+            .member_info
+            .iter()
+            .map(|r| r.member_info.member_id)
+            .filter(|id| *id != room.owner_id && !present.contains(id))
+            .collect();
+        let expected: Vec<MemberId> = if depth2_posts {
+            assert!(present.contains(&chain[0].id) && present.contains(&chain[1].id));
+            vec![chain[2].id]
+        } else {
+            chain[..MAX_EVIDENCE_DEPTH - 1]
+                .iter()
+                .map(|p| p.id)
+                .collect()
+        };
+        let mut kept_sorted = kept.clone();
+        kept_sorted.sort();
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        assert_eq!(
+            kept_sorted, expected_sorted,
+            "depth-2 posts: {depth2_posts}"
+        );
+        for id in &expected {
+            assert!(
+                evidence_ids(&after).contains(id),
+                "ancestor held as evidence"
+            );
+        }
+    }
 }

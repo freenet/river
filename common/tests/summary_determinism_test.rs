@@ -273,8 +273,17 @@ fn top_level_summary_serialization_is_order_independent() {
         let order = |i: i64| if reversed { N - 1 - i } else { i };
         let bans = (0..N).map(|i| ban_id(order(i))).collect();
         let members = (0..N).map(|i| member_id(order(i))).collect();
-        // freenet/river#702: the ban-evidence summary is a BTreeSet too.
-        let ban_evidence = (0..N).map(|i| member_id(order(i) + 1000)).collect();
+        // freenet/river#702: the ban-evidence summary is a BTreeMap of
+        // record digests.
+        let ban_evidence = (0..N)
+            .map(|i| {
+                let j = order(i);
+                (
+                    member_id(j + 1000),
+                    river_core::room_state::ban_evidence::EvidenceDigest([j as u8; 16]),
+                )
+            })
+            .collect();
         let member_info = (0..N)
             .map(|i| {
                 let j = order(i);
@@ -477,5 +486,67 @@ fn member_info_summary_stays_small_per_entry() {
          measured against the wrong encoding — River's `SignatureBytes` newtype \
          uses `serialize_bytes` and costs 66, but the member_info summary never \
          used that type."
+    );
+}
+
+/// The ban-evidence summary carries an `EvidenceDigest` per record so two
+/// peers holding different records for one id see the difference. Measured
+/// here against the id-only shape it replaced, rebuilt from the same records.
+#[test]
+fn ban_evidence_summary_bytes_per_entry() {
+    use river_core::room_state::ban_evidence::{BanEvidenceV1, EvidenceDigest};
+    use river_core::room_state::member::{AuthorizedMember, Member};
+    use std::collections::BTreeSet;
+    const RECORDS: u64 = 200;
+
+    let owner_sk = SigningKey::from_bytes(blake3::hash(b"owner").as_bytes());
+    let owner_id = MemberId::from(&owner_sk.verifying_key());
+    let members: Vec<AuthorizedMember> = (0..RECORDS)
+        .map(|i| {
+            let sk = SigningKey::from_bytes(blake3::hash(&i.to_le_bytes()).as_bytes());
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        })
+        .collect();
+    let state = BanEvidenceV1 { members };
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+
+    let summary: BTreeMap<MemberId, EvidenceDigest> =
+        state.summarize(&ChatRoomStateV1::default(), &parameters);
+    assert_eq!(summary.len() as u64, RECORDS, "one entry per record");
+    let bytes = cbor(&summary).len();
+    let per_entry = bytes as f64 / RECORDS as f64;
+
+    let before: BTreeSet<MemberId> = state.members.iter().map(|m| m.member.id()).collect();
+    let before_bytes = cbor(&before).len();
+    let before_per_entry = before_bytes as f64 / RECORDS as f64;
+
+    println!(
+        "ban_evidence summary over {RECORDS} records:\n  \
+         before (id only):      {before_bytes} B = {before_per_entry:.2} B/entry\n  \
+         after  (id, digest):   {bytes} B = {per_entry:.2} B/entry"
+    );
+
+    // Measured 9.01 -> 26.01 B/entry at 200 records: the digest adds its
+    // 17-byte CBOR byte string to each entry. Above the
+    // bound means the digest lost its hand-written `Serialize` (a 16-element
+    // array is about 32 bytes) or the value grew.
+    assert!(
+        per_entry - before_per_entry < 18.0,
+        "each entry must cost the id plus a 17-byte digest (got {per_entry:.2} \
+         vs {before_per_entry:.2} B/entry)"
+    );
+    assert!(
+        per_entry - before_per_entry >= 17.0,
+        "the digest must be in every entry (got {per_entry:.2} vs \
+         {before_per_entry:.2} B/entry)"
     );
 }
