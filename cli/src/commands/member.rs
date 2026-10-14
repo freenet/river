@@ -709,6 +709,7 @@ mod tests {
             nickname: Some("Alice".to_string()),
             is_owner: false,
             in_room: true,
+            retains_ban_authority: false,
         };
         let json = member_list_json(&party, &[b], &[], Some("SoMeBaSe58Key"));
         assert_eq!(json["member_id"], a.to_string());
@@ -729,6 +730,7 @@ mod tests {
             nickname: None,
             is_owner: false,
             in_room: true,
+            retains_ban_authority: false,
         };
         let json = member_list_json(&anonymous, &[], &[a], None);
         assert_eq!(json["nickname"], "");

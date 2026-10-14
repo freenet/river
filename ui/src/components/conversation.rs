@@ -73,6 +73,26 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys;
 
+/// The `member_info` records of the owner and present members. Since
+/// freenet/river#702 `member_info` can also hold records of members kept only
+/// as ban evidence, who are not in the room: the @mention pickers and the name
+/// lookup must not offer them.
+fn present_member_infos(
+    state: &river_core::room_state::ChatRoomStateV1,
+) -> Vec<&AuthorizedMemberInfo> {
+    let present = state.members.members_by_member_id();
+    let owner_id = state.configuration.configuration.owner_member_id;
+    state
+        .member_info
+        .member_info
+        .iter()
+        .filter(|info| {
+            let id = info.member_info.member_id;
+            id == owner_id || present.contains_key(&id)
+        })
+        .collect()
+}
+
 /// Try to build a rejoin delta for the current user in the given room.
 /// Returns (None, None) if the user is already a member or ROOMS is busy.
 fn try_rejoin_delta(
@@ -1598,10 +1618,8 @@ pub fn Conversation() -> Element {
                 // an unknown identity matches no member.
                 let self_member_id: Option<MemberId> = room_data.self_member_id();
                 // Build member name lookup (reaction tooltips, @mention chips).
-                let member_names: HashMap<MemberId, String> = room_state
-                    .member_info
-                    .member_info
-                    .iter()
+                let member_names: HashMap<MemberId, String> = present_member_infos(room_state)
+                    .into_iter()
                     .map(|ami| {
                         (
                             ami.member_info.member_id,
@@ -3177,11 +3195,9 @@ pub fn Conversation() -> Element {
                                 // Option so an absent key would merely leave
                                 // self in the mention list instead of panicking.
                                 let self_id = room_data.self_member_id();
-                                let mut mention_members: Vec<(MemberId, String)> = room_data
-                                    .room_state
-                                    .member_info
-                                    .member_info
-                                    .iter()
+                                let mut mention_members: Vec<(MemberId, String)> =
+                                    present_member_infos(&room_data.room_state)
+                                    .into_iter()
                                     .filter(|ami| Some(ami.member_info.member_id) != self_id)
                                     .map(|ami| {
                                         (
@@ -4964,6 +4980,61 @@ fn MessageGroupComponent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The @mention pickers and name lookup offer the owner and present
+    /// members, not identities held only as ban evidence.
+    #[test]
+    fn present_member_infos_leaves_out_evidence_only_records() {
+        use ed25519_dalek::SigningKey;
+        use river_core::room_state::member::{AuthorizedMember, Member};
+        use river_core::room_state::member_info::MemberInfo;
+        let owner = SigningKey::from_bytes(&[1u8; 32]);
+        let present = SigningKey::from_bytes(&[2u8; 32]);
+        let removed = SigningKey::from_bytes(&[3u8; 32]);
+        let owner_id = MemberId::from(&owner.verifying_key());
+        let record = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: sk.verifying_key(),
+                },
+                &owner,
+            )
+        };
+        let info = |sk: &SigningKey| {
+            AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo::new_public(MemberId::from(&sk.verifying_key()), 1, "n".into()),
+                sk,
+            )
+        };
+        let mut state = river_core::room_state::ChatRoomStateV1::default();
+        state.configuration.configuration.owner_member_id = owner_id;
+        state.members.members.push(record(&present));
+        state.ban_evidence.members.push(record(&removed));
+        state.member_info.member_info = vec![info(&owner), info(&present), info(&removed)];
+        let mut ids: Vec<MemberId> = present_member_infos(&state)
+            .iter()
+            .map(|i| i.member_info.member_id)
+            .collect();
+        ids.sort();
+        let mut expected = vec![owner_id, MemberId::from(&present.verifying_key())];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    /// Both @mention name sources read `present_member_infos`, not the raw
+    /// `member_info` vector.
+    #[test]
+    fn mention_name_sources_read_present_member_infos() {
+        let src = include_str!("conversation.rs");
+        for needle in [
+            "let mut mention_members: Vec<(MemberId, String)> =\n                                    present_member_infos(&room_data.room_state)",
+            "let member_names: HashMap<MemberId, String> = present_member_infos(room_state)",
+        ] {
+            assert!(src.contains(needle), "missing: {needle}");
+        }
+    }
 
     /// A lone bubble is fully round, and a grouped one pinches only the
     /// sender-side corners that face a neighbour.

@@ -1353,6 +1353,74 @@ pub(crate) fn room_has_member_key(
             .any(|m| m.member.member_vk == *candidate)
 }
 
+/// Whether `target` holds a deputy grant from the owner or a present member.
+/// The `member_info` of a member held as ban evidence is kept
+/// (freenet/river#702), but their grants cover only their own removed invite
+/// subtree, so they do not count here.
+pub(crate) fn is_deputy_of_a_present_appointer(
+    room_state: &ChatRoomStateV1,
+    owner_id: MemberId,
+    target: MemberId,
+) -> bool {
+    let present = room_state.members.members_by_member_id();
+    room_state.member_info.member_info.iter().any(|record| {
+        let appointer = record.member_info.member_id;
+        (appointer == owner_id || present.contains_key(&appointer))
+            && room_state
+                .member_info
+                .deputies_of(appointer)
+                .contains(&target)
+    })
+}
+
+/// Refuse a send from a member the room's bans remove: the room contract drops
+/// their messages, so say why instead of reporting a send that never lands
+/// (freenet/river#702 rehearsal). A removed member's record is kept as ban
+/// evidence while a ban needs it, so this holds after removal too. Every
+/// message-sending path calls it.
+pub(crate) fn refuse_banned_sender(
+    room_state: &ChatRoomStateV1,
+    room_owner_key: &VerifyingKey,
+    sender_vk: &VerifyingKey,
+) -> Result<()> {
+    let params = ChatRoomParametersV1 {
+        owner: *room_owner_key,
+    };
+    let banned = room_state.members.banned_member_ids(
+        &room_state.ban_evidence,
+        &room_state.bans,
+        &room_state.member_info,
+        &params,
+    );
+    if banned.contains(&MemberId::from(sender_vk)) {
+        return Err(anyhow!(
+            "You are banned from this room, so the room would drop this message."
+        ));
+    }
+    Ok(())
+}
+
+/// After applying a send locally (the same apply the contract runs), refuse to
+/// report it as sent if the apply dropped the message.
+pub(crate) fn refuse_if_dropped(
+    room_state: &ChatRoomStateV1,
+    message_id: &river_core::room_state::message::MessageId,
+) -> Result<()> {
+    if room_state
+        .recent_messages
+        .messages
+        .iter()
+        .any(|m| m.id() == *message_id)
+    {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "The room would drop this message (applying it locally removed it), \
+             so it was not sent."
+        ))
+    }
+}
+
 /// Send-authorization pre-flight for a signer on the explicit-signing-key path
 /// (`riverctl message send --signing-key` / `RIVER_SIGNING_KEY`).
 ///
@@ -1383,24 +1451,7 @@ pub(crate) fn authorize_send(
     sender_vk: &VerifyingKey,
     rejoin_members_delta: Option<&MembersDelta>,
 ) -> Result<()> {
-    // A banned sender's message is dropped by the room contract, so refuse it
-    // here with the reason instead of reporting a send that never lands
-    // (freenet/river#702 rehearsal). A removed member's record is kept as ban
-    // evidence while a ban needs it, so this holds after removal too.
-    let params = ChatRoomParametersV1 {
-        owner: *room_owner_key,
-    };
-    let banned = room_state.members.banned_member_ids(
-        &room_state.ban_evidence,
-        &room_state.bans,
-        &room_state.member_info,
-        &params,
-    );
-    if banned.contains(&MemberId::from(sender_vk)) {
-        return Err(anyhow!(
-            "You are banned from this room, so the room would drop this message."
-        ));
-    }
+    refuse_banned_sender(room_state, room_owner_key, sender_vk)?;
     if room_has_member_key(room_state, room_owner_key, sender_vk) {
         return Ok(());
     }
@@ -1434,7 +1485,7 @@ pub(crate) fn resolve_outgoing_mentions(room_state: &ChatRoomStateV1, text: &str
     use std::collections::HashMap;
     // Lowercased nickname -> Some((id, canonical name)) if unique, None if shared.
     let mut by_name: HashMap<String, Option<(MemberId, String)>> = HashMap::new();
-    for info in &room_state.member_info.member_info {
+    for info in &member_infos_of_present_members(room_state) {
         if let Some(bytes) = info.member_info.preferred_nickname.as_public_bytes() {
             let name = String::from_utf8_lossy(bytes).to_string();
             let id = info.member_info.member_id;
@@ -3829,28 +3880,12 @@ impl ApiClient {
             &invitation.room_secrets,
         );
 
-        // Store credentials locally first
-        self.storage.add_room_with_invitation_secrets(
-            &room_owner_vk,
-            &invitation.invitee_signing_key,
-            room_state.clone(),
-            &contract_key,
-            invitation_secrets_map.clone(),
-        )?;
-
-        self.storage
-            .store_authorized_member(&room_owner_vk, &invitation.invitee, &invite_chain)?;
-
-        // Persist our chosen nickname so a later rejoin (after
-        // an inactivity prune) restores it instead of "Member".
-        self.storage
-            .update_self_nickname(&room_owner_vk, nickname)?;
-
         // Immediately publish membership + join event atomically.
         // The join event counts as a message, preventing
         // post_apply_cleanup from pruning the new member.
         let signing_key = &invitation.invitee_signing_key;
         let self_id = author_member_id(signing_key);
+        refuse_banned_sender(&room_state, &room_owner_vk, &signing_key.verifying_key())?;
 
         // Build members delta: invitee + any missing invite chain members
         let current_member_ids: HashSet<MemberId> = room_state
@@ -3922,6 +3957,7 @@ impl ApiClient {
         };
         let auth_join_message =
             river_core::room_state::message::AuthorizedMessageV1::new(join_message, signing_key);
+        let join_message_id = auth_join_message.id();
 
         let delta = ChatRoomStateV1Delta {
             recent_messages: Some(vec![auth_join_message]),
@@ -3935,6 +3971,27 @@ impl ApiClient {
         local_state
             .apply_delta(&room_state, &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Failed to apply join delta: {:?}", e))?;
+        refuse_if_dropped(&local_state, &join_message_id)?;
+
+        // Store credentials locally only once the join is known to apply, so
+        // a refused accept (banned invitee, dropped join event, failed apply)
+        // stores nothing and a retry is not caught by the re-accept guard.
+        // They are stored before the network send so a failed send keeps them.
+        self.storage.add_room_with_invitation_secrets(
+            &room_owner_vk,
+            &invitation.invitee_signing_key,
+            room_state.clone(),
+            &contract_key,
+            invitation_secrets_map.clone(),
+        )?;
+
+        self.storage
+            .store_authorized_member(&room_owner_vk, &invitation.invitee, &invite_chain)?;
+
+        // Persist our chosen nickname so a later rejoin (after
+        // an inactivity prune) restores it instead of "Member".
+        self.storage
+            .update_self_nickname(&room_owner_vk, nickname)?;
 
         // Update stored state
         self.storage
@@ -4637,19 +4694,8 @@ impl ApiClient {
             .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Failed to apply message delta: {:?}", e))?;
         // The contract runs exactly this apply. If it dropped the message here
-        // it will drop it on the network too, so say so rather than report a
-        // send that never lands.
-        if !room_state
-            .recent_messages
-            .messages
-            .iter()
-            .any(|m| m.id() == sent_message_id)
-        {
-            return Err(anyhow!(
-                "The room would drop this message (applying it locally removed it), \
-                 so it was not sent."
-            ));
-        }
+        // it will drop it on the network too.
+        refuse_if_dropped(&room_state, &sent_message_id)?;
 
         // Send the delta to the network
         let contract_key = self
@@ -4705,6 +4751,7 @@ impl ApiClient {
 
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
+        refuse_banned_sender(&room_state, room_owner_key, &signing_key.verifying_key())?;
 
         // Resolve any bare @nickname mentions to full mention tokens.
         let message_content = resolve_outgoing_mentions(&room_state, &message_content);
@@ -4758,6 +4805,7 @@ impl ApiClient {
         room_state
             .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Failed to apply message delta: {:?}", e))?;
+        refuse_if_dropped(&room_state, &sent_message_id)?;
 
         // Update the stored state
         self.storage
@@ -4856,6 +4904,7 @@ impl ApiClient {
 
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
+        refuse_banned_sender(&room_state, room_owner_key, &signing_key.verifying_key())?;
 
         // Build the action body — plaintext for a public room, AES-256-GCM
         // sealed for a private room (secret resolved from the contract's
@@ -4883,6 +4932,7 @@ impl ApiClient {
         // Sign the message
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+        let action_message_id = auth_message.id();
 
         // Check if we need to re-add ourselves (pruned for inactivity)
         let (members_delta, member_info_delta) =
@@ -4903,6 +4953,7 @@ impl ApiClient {
         room_state
             .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Failed to apply edit delta: {:?}", e))?;
+        refuse_if_dropped(&room_state, &action_message_id)?;
 
         // Update the stored state
         self.storage.update_room_state(room_owner_key, room_state)?;
@@ -4930,6 +4981,7 @@ impl ApiClient {
 
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
+        refuse_banned_sender(&room_state, room_owner_key, &signing_key.verifying_key())?;
 
         // Build the action body — plaintext (public) or AES-256-GCM sealed
         // (private). See `edit_message` for the storage / secret rationale.
@@ -4953,6 +5005,7 @@ impl ApiClient {
         // Sign the message
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+        let action_message_id = auth_message.id();
 
         // Check if we need to re-add ourselves (pruned for inactivity)
         let (members_delta, member_info_delta) =
@@ -4973,6 +5026,7 @@ impl ApiClient {
         room_state
             .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Failed to apply delete delta: {:?}", e))?;
+        refuse_if_dropped(&room_state, &action_message_id)?;
 
         // Update the stored state
         self.storage.update_room_state(room_owner_key, room_state)?;
@@ -5002,6 +5056,7 @@ impl ApiClient {
 
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
+        refuse_banned_sender(&room_state, room_owner_key, &signing_key.verifying_key())?;
 
         // Build the action body — plaintext (public) or AES-256-GCM sealed
         // (private). See `edit_message` for the storage / secret rationale.
@@ -5025,6 +5080,7 @@ impl ApiClient {
         // Sign the message
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+        let action_message_id = auth_message.id();
 
         // Check if we need to re-add ourselves (pruned for inactivity)
         let (members_delta, member_info_delta) =
@@ -5045,6 +5101,7 @@ impl ApiClient {
         room_state
             .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Failed to apply reaction delta: {:?}", e))?;
+        refuse_if_dropped(&room_state, &action_message_id)?;
 
         // Update the stored state
         self.storage.update_room_state(room_owner_key, room_state)?;
@@ -5074,6 +5131,7 @@ impl ApiClient {
 
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
+        refuse_banned_sender(&room_state, room_owner_key, &signing_key.verifying_key())?;
 
         // Build the action body — plaintext (public) or AES-256-GCM sealed
         // (private). See `edit_message` for the storage / secret rationale.
@@ -5100,6 +5158,7 @@ impl ApiClient {
         // Sign the message
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+        let action_message_id = auth_message.id();
 
         // Check if we need to re-add ourselves (pruned for inactivity)
         let (members_delta, member_info_delta) =
@@ -5120,6 +5179,7 @@ impl ApiClient {
         room_state
             .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Failed to apply remove_reaction delta: {:?}", e))?;
+        refuse_if_dropped(&room_state, &action_message_id)?;
 
         // Update the stored state
         self.storage.update_room_state(room_owner_key, room_state)?;
@@ -5148,6 +5208,7 @@ impl ApiClient {
 
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
+        refuse_banned_sender(&room_state, room_owner_key, &signing_key.verifying_key())?;
 
         // Decrypt the room's private content BEFORE selecting the reply target:
         // this rebuilds `actions_state` from the decrypted private edit/delete
@@ -5247,6 +5308,7 @@ impl ApiClient {
         room_state
             .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Failed to apply reply delta: {:?}", e))?;
+        refuse_if_dropped(&room_state, &reply_message_id)?;
 
         // Update the stored state
         self.storage.update_room_state(room_owner_key, room_state)?;
@@ -6128,7 +6190,7 @@ impl ApiClient {
         // first-8, first-match). No deputy fallback for a ban target.
         let key_target = crate::deputies::member_id_from_key_input(member_id_short);
         let banned_member_id = resolve_deputy_target(
-            &room_state.member_info.member_info,
+            &member_infos_of_present_members(&room_state),
             &[],
             member_id_short,
             false,
@@ -6166,12 +6228,8 @@ impl ApiClient {
         }
 
         if safety.require_not_deputy {
-            let is_deputy = room_state.member_info.member_info.iter().any(|record| {
-                room_state
-                    .member_info
-                    .deputies_of(record.member_info.member_id)
-                    .contains(&banned_member_id)
-            });
+            let is_deputy =
+                is_deputy_of_a_present_appointer(&room_state, owner_member_id, banned_member_id);
             if is_deputy {
                 return Err(anyhow!(
                     "Safety preflight refused: member '{}' is a deputy.",
@@ -6345,7 +6403,7 @@ impl ApiClient {
         // (otherwise it silently reactivates if the deputy's membership is later
         // replayed).
         let target = resolve_deputy_target(
-            &room_state.member_info.member_info,
+            &member_infos_of_present_members(&room_state),
             &deputies,
             member_id_short,
             !add, // allow the own-deputies fallback only when revoking
@@ -6828,6 +6886,26 @@ fn resolve_own_member_info_base(
         .map(|info| info.member_info.clone())
 }
 
+/// The `member_info` records of the owner and present members only. Since
+/// freenet/river#702 `member_info` can also hold records of members kept as
+/// ban evidence, who are not in the room: a deputy grant, a ban or a mention
+/// must not resolve to them by name (the revoke path still finds a removed
+/// deputy through the caller's own `deputies`, see [`resolve_deputy_target`]).
+fn member_infos_of_present_members(room_state: &ChatRoomStateV1) -> Vec<AuthorizedMemberInfo> {
+    let present = room_state.members.members_by_member_id();
+    let owner_id = room_state.configuration.configuration.owner_member_id;
+    room_state
+        .member_info
+        .member_info
+        .iter()
+        .filter(|info| {
+            let id = info.member_info.member_id;
+            id == owner_id || present.contains_key(&id)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Resolve a `member set-deputy` / `revoke-deputy` short id to a full `MemberId`.
 ///
 /// Primary: a present member, matched via their `member_info` (same rule as
@@ -6888,6 +6966,52 @@ mod deputy_resolve_tests {
     fn short(id: &MemberId) -> String {
         let s = id.to_string();
         s[..8.min(s.len())].to_string()
+    }
+
+    /// A member held as ban evidence keeps a `member_info` record, but is not
+    /// in the room: `set-deputy` cannot resolve them by name, and
+    /// `revoke-deputy` still can through the caller's own deputies.
+    #[test]
+    fn an_evidence_only_member_is_not_a_deputy_candidate() {
+        use river_core::room_state::member::{AuthorizedMember, Member};
+        use river_core::room_state::ChatRoomStateV1;
+        let owner = SigningKey::from_bytes(&[1u8; 32]);
+        let present = SigningKey::from_bytes(&[7u8; 32]);
+        let removed = SigningKey::from_bytes(&[9u8; 32]);
+        let owner_id: MemberId = owner.verifying_key().into();
+        let record = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: sk.verifying_key(),
+                },
+                &owner,
+            )
+        };
+        let mut state = ChatRoomStateV1::default();
+        state.members.members.push(record(&present));
+        state.ban_evidence.members.push(record(&removed));
+        state.member_info.member_info = vec![info(&present), info(&removed)];
+        let removed_id: MemberId = removed.verifying_key().into();
+        let present_id: MemberId = present.verifying_key().into();
+
+        let candidates = super::member_infos_of_present_members(&state);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            resolve_deputy_target(&candidates, &[], &short(&present_id), false),
+            Some(present_id)
+        );
+        assert_eq!(
+            resolve_deputy_target(&candidates, &[], &short(&removed_id), false),
+            None,
+            "set-deputy must not resolve a member held only as ban evidence"
+        );
+        assert_eq!(
+            resolve_deputy_target(&candidates, &[removed_id], &short(&removed_id), true),
+            Some(removed_id),
+            "revoke still resolves them from the caller's own deputies"
+        );
     }
 
     /// #411 round 4 C: revoke can resolve a pruned deputy (no member_info) from
@@ -10657,9 +10781,22 @@ mod mention_cli_tests {
     }
 
     /// Build a room state whose `member_info` carries the given (key, nickname)
-    /// entries.
+    /// entries, each a present member (the records are not signed by an
+    /// owner: name resolution reads only the id).
     fn state_with_members(members: &[(SigningKey, SealedBytes)]) -> ChatRoomStateV1 {
         let mut state = ChatRoomStateV1::default();
+        for (sk, _) in members {
+            state.members.members.push(AuthorizedMember::with_signature(
+                river_core::room_state::member::Member {
+                    owner_member_id: MemberId::from(
+                        &SigningKey::from_bytes(&[0u8; 32]).verifying_key(),
+                    ),
+                    invited_by: MemberId::from(&SigningKey::from_bytes(&[0u8; 32]).verifying_key()),
+                    member_vk: sk.verifying_key(),
+                },
+                ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+            ));
+        }
         for (i, (sk, nickname)) in members.iter().enumerate() {
             let info = MemberInfo {
                 member_id: member_id(sk),
@@ -10673,6 +10810,19 @@ mod mention_cli_tests {
                 .push(AuthorizedMemberInfo::new_with_member_key(info, sk));
         }
         state
+    }
+
+    /// A nickname of a member held only as ban evidence (a `member_info`
+    /// record but not in `members`) is not resolved to a mention.
+    #[test]
+    fn an_evidence_only_nickname_is_not_resolved() {
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let mut state = state_with_members(&[(sk.clone(), SealedBytes::public(b"alice".to_vec()))]);
+        state.members.members.clear();
+        assert_eq!(
+            resolve_outgoing_mentions(&state, "hi @alice!"),
+            "hi @alice!"
+        );
     }
 
     fn msg_with_text(text: String) -> AuthorizedMessageV1 {
@@ -11549,6 +11699,188 @@ mod authorize_send_tests {
             err.contains("Owner should not be included"),
             "unexpected rejection reason: {err}"
         );
+    }
+
+    /// Every path that sends a room message (text, reply, edit, delete,
+    /// reactions, the join event of an accepted invitation) refuses a banned sender and does not report as sent a
+    /// message its local apply drops. Pinned by source, since each path is an
+    /// async network method.
+    #[test]
+    fn every_message_send_path_refuses_banned_senders_and_dropped_messages() {
+        let production = production_source(include_str!("api.rs"));
+        let code = strip_comment_lines(&production.source);
+        for signature in [
+            "pub async fn send_message_with_key(",
+            "pub async fn send_message(",
+            "pub async fn send_reply(",
+            "pub async fn edit_message(",
+            "pub async fn delete_message(",
+            "pub async fn add_reaction(",
+            "pub async fn remove_reaction(",
+            "pub async fn accept_invitation_struct(",
+        ] {
+            let body = method_body(&code, signature)
+                .unwrap_or_else(|| panic!("{signature} is missing from the scanned source"));
+            if signature != "pub async fn send_message_with_key(" {
+                assert!(
+                    body.contains("refuse_banned_sender("),
+                    "{signature} does not refuse a banned sender"
+                );
+            }
+            assert!(
+                body.contains("refuse_if_dropped("),
+                "{signature} does not check that its local apply kept the message"
+            );
+        }
+    }
+
+    /// A refused invitation accept stores nothing: `accept_invitation_struct`
+    /// runs every refusal (banned invitee, failed local apply, dropped join
+    /// event) before its first storage write, so a retry is not caught by the
+    /// re-accept guard. Pinned by source order, since the method needs a node;
+    /// the refusal itself is `a_banned_invitee_is_refused_before_accepting`.
+    #[test]
+    fn a_refused_accept_stores_nothing() {
+        let production = production_source(include_str!("api.rs"));
+        let code = strip_comment_lines(&production.source);
+        let body = method_body(&code, "pub async fn accept_invitation_struct(")
+            .expect("accept_invitation_struct is missing from the scanned source");
+        let first_write = [
+            "self.storage.add_room_with_invitation_secrets(",
+            ".store_authorized_member(",
+            ".update_self_nickname(",
+            ".update_room_state(",
+        ]
+        .iter()
+        .map(|w| {
+            body.find(w)
+                .unwrap_or_else(|| panic!("accept_invitation_struct no longer calls {w}"))
+        })
+        .min()
+        .unwrap();
+        for refusal in [
+            "refuse_banned_sender(",
+            ".apply_delta(",
+            "refuse_if_dropped(",
+        ] {
+            let at = body
+                .find(refusal)
+                .unwrap_or_else(|| panic!("accept_invitation_struct no longer calls {refusal}"));
+            assert!(
+                at < first_write,
+                "{refusal} must run before accept_invitation_struct stores anything"
+            );
+        }
+    }
+
+    /// An invitee the room already bans is refused at accept, with the
+    /// reason, before anything is stored or sent.
+    #[test]
+    fn a_banned_invitee_is_refused_before_accepting() {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        let owner = key(1);
+        let invitee = key(2);
+        let owner_vk = owner.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let mut state = room(&owner, &[]);
+        state.configuration.configuration.max_user_bans = 10;
+        state.bans = BansV1(vec![AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: std::time::SystemTime::UNIX_EPOCH,
+                banned_user: MemberId::from(&invitee.verifying_key()),
+            },
+            owner_id,
+            &owner,
+        )]);
+        let err = super::refuse_banned_sender(&state, &owner_vk, &invitee.verifying_key())
+            .expect_err("a banned invitee must be refused");
+        assert!(err.to_string().contains("banned"), "{err}");
+        assert!(
+            super::refuse_banned_sender(&room(&owner, &[]), &owner_vk, &invitee.verifying_key())
+                .is_ok(),
+            "an invitee nobody banned is not refused"
+        );
+    }
+
+    #[test]
+    fn a_grant_by_a_member_held_as_ban_evidence_does_not_count_as_deputy() {
+        let owner = key(1);
+        let appointer = key(2);
+        let deputy = key(3);
+        let mut state = room(&owner, &[&appointer, &deputy]);
+        let mut info =
+            MemberInfo::new_public(MemberId::from(&appointer.verifying_key()), 1, "a".into());
+        info.deputies = vec![MemberId::from(&deputy.verifying_key())];
+        state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(info, &appointer));
+        let owner_id = MemberId::from(&owner.verifying_key());
+        let deputy_id = MemberId::from(&deputy.verifying_key());
+        assert!(super::is_deputy_of_a_present_appointer(
+            &state, owner_id, deputy_id
+        ));
+        // The appointer leaves `members` and is kept as ban evidence.
+        let appointer_id = MemberId::from(&appointer.verifying_key());
+        let record = state
+            .members
+            .members
+            .iter()
+            .find(|m| m.member.id() == appointer_id)
+            .cloned()
+            .unwrap();
+        state
+            .members
+            .members
+            .retain(|m| m.member.id() != appointer_id);
+        state.ban_evidence.members.push(record);
+        assert!(!super::is_deputy_of_a_present_appointer(
+            &state, owner_id, deputy_id
+        ));
+    }
+
+    /// Name resolution for `ban`, `set-deputy` / `revoke-deputy` and outgoing
+    /// mentions reads only the owner's and present members' `member_info`.
+    #[test]
+    fn name_resolution_reads_only_present_members() {
+        let production = production_source(include_str!("api.rs"));
+        let code = strip_comment_lines(&production.source);
+        for signature in [
+            "pub async fn ban_member_with_safety(",
+            "async fn update_own_deputies(",
+            "pub(crate) fn resolve_outgoing_mentions(",
+        ] {
+            let body = method_body(&code, signature)
+                .unwrap_or_else(|| panic!("{signature} is missing from the scanned source"));
+            assert!(
+                body.contains("member_infos_of_present_members("),
+                "{signature} does not filter to present members"
+            );
+            assert!(
+                !body.contains("&room_state.member_info.member_info"),
+                "{signature} reads every member_info record"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_message_is_refused() {
+        let owner = key(1);
+        let state = room(&owner, &[]);
+        let message = river_core::room_state::message::AuthorizedMessageV1::new(
+            river_core::room_state::message::MessageV1 {
+                room_owner: MemberId::from(&owner.verifying_key()),
+                author: MemberId::from(&owner.verifying_key()),
+                content: river_core::room_state::message::RoomMessageBody::public("hi".into()),
+                time: std::time::SystemTime::UNIX_EPOCH,
+            },
+            &owner,
+        );
+        assert!(super::refuse_if_dropped(&state, &message.id()).is_err());
+        let mut kept = state.clone();
+        kept.recent_messages.messages.push(message.clone());
+        assert!(super::refuse_if_dropped(&kept, &message.id()).is_ok());
     }
 
     /// freenet/river#702: a banned member is refused with the reason, even

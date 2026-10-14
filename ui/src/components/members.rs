@@ -620,6 +620,11 @@ fn relevant_deputizers(
 /// unioning deputies across ALL of a member's duplicate records (rather than
 /// reading only the converged/canonical one) can keep a revoked deputy grant
 /// showing even after the revoke has won (freenet/river#411 round 8).
+///
+/// Since freenet/river#702 `member_info` also holds the records of members kept
+/// as ban evidence, so this map can name removed appointers. Every caller
+/// intersects it with [`viewer_relevant_deputizer_set`] (the owner, the viewer
+/// and the viewer's strict ancestors, all present), which leaves them out.
 pub(crate) fn build_deputizers_of(
     member_info: &river_core::room_state::member_info::MemberInfoV1,
 ) -> HashMap<MemberId, Vec<MemberId>> {

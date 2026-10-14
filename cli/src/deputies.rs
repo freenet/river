@@ -50,6 +50,10 @@ pub struct DeputyParty {
     /// `members.members`, **or** the room owner (who is never in that list —
     /// see `MembersV1::is_ban_authorized`).
     pub in_room: bool,
+    /// Not in the room, but the room keeps their record as ban evidence and
+    /// no ban removes them, so the contract still honours their bans and the
+    /// grants they hold (freenet/river#702). Always `false` when `in_room`.
+    pub retains_ban_authority: bool,
 }
 
 /// How far a grant reaches, when it is active.
@@ -110,13 +114,15 @@ pub struct DeputyGrant {
     /// (`MembersV1::get_downstream_members`), so the number understates removal
     /// blast radius for every target, not just the excluded self.
     pub members_deputy_can_ban: usize,
-    /// Whether the grant is structurally live: both parties are currently in the
-    /// room. The load-bearing half is the DEPUTY: `is_ban_authorized` gates both
-    /// deputy branches on the banner being a current member, so a grant naming a
-    /// pruned deputy is honoured by nobody. The deputizer half is
-    /// defence-in-depth: `MemberInfoV1::verify` rejects a `member_info` record
-    /// whose member is neither the owner nor a current member, so a deputizer
-    /// absent from the room cannot occur in a state the contract accepted.
+    /// Whether the contract honours the grant: the deputy is in the room or
+    /// retains ban authority (held as ban evidence, removed by no ban), and the
+    /// deputizer is in the room or held as ban evidence. The load-bearing half
+    /// is the DEPUTY: `is_ban_authorized` gates both deputy branches on the
+    /// banner's record being known (members plus ban evidence), and
+    /// `MembersV1::resolve_bans` gives no effect to a ban whose issuer a ban
+    /// removes. A deputizer's `deputies` count for their own invite subtree
+    /// while their `member_info` is kept, which `MemberInfoV1::verify` allows
+    /// only for the owner, current members and ban evidence.
     ///
     /// `active` does NOT mean the deputy can ban a given person; see
     /// [`Self::members_deputy_can_ban`] and [`Self::scope`] for how far it goes.
@@ -157,8 +163,11 @@ pub struct RoomDeputies<'a> {
     /// `member -> the members they invited, directly or indirectly`, for every
     /// member with a non-empty subtree.
     subtrees: HashMap<MemberId, HashSet<MemberId>>,
-    /// Index required by `MembersV1::is_ban_authorized`, built once.
+    /// Index required by `MembersV1::is_ban_authorized`, built once: members
+    /// plus ban evidence, exactly what the contract's ban resolution reads.
     members_by_id: HashMap<MemberId, &'a AuthorizedMember>,
+    /// Members the room's bans remove (`MembersV1::resolve_bans`).
+    removed: HashSet<MemberId>,
     /// The room owner's verifying key. The owner is never in `members_by_id`
     /// (they are not in `members.members`), so their key is held separately to
     /// answer [`Self::verifying_key`] for the owner.
@@ -249,7 +258,16 @@ impl<'a> RoomDeputies<'a> {
         }
 
         let subtrees = invite_subtrees(state);
-        let members_by_id = state.members.members_by_member_id();
+        let members_by_id = state.ban_evidence.lookup(&state.members, owner_id);
+        let removed = state
+            .members
+            .resolve_bans(
+                &state.ban_evidence,
+                &state.bans,
+                &state.member_info,
+                &river_core::room_state::ChatRoomParametersV1 { owner: *owner_vk },
+            )
+            .removed;
 
         Self {
             state,
@@ -260,6 +278,7 @@ impl<'a> RoomDeputies<'a> {
             known_ids,
             subtrees,
             members_by_id,
+            removed,
             owner_vk: *owner_vk,
         }
     }
@@ -343,14 +362,31 @@ impl<'a> RoomDeputies<'a> {
         id == self.owner_id || self.current_members.contains(&id)
     }
 
-    /// Every member holding a `member_info` record, deduplicated and ordered.
+    /// Whether `id` is out of the room but held as ban evidence.
+    fn held_as_evidence(&self, id: MemberId) -> bool {
+        !self.in_room(id) && self.members_by_id.contains_key(&id)
+    }
+
+    /// Whether `id` is out of the room but the contract still honours their
+    /// bans: held as ban evidence, and no ban removes them.
+    fn retains_ban_authority(&self, id: MemberId) -> bool {
+        self.held_as_evidence(id) && !self.removed.contains(&id)
+    }
+
+    /// Every member in the room holding a `member_info` record (the owner
+    /// included), deduplicated and ordered.
     ///
     /// This is the canonical row set for a member listing: the raw
     /// `member_info.member_info` vector can hold several records for one member
     /// (`MemberInfoV1::verify` accepts duplicates for migration-safety), so
     /// iterating it directly yields duplicate rows carrying losing nicknames.
+    /// It also holds records of members kept only as ban evidence, who are
+    /// not in the room and are left out.
     pub fn members_with_info(&self) -> impl Iterator<Item = MemberId> + '_ {
-        self.deputies_by_deputizer.keys().copied()
+        self.deputies_by_deputizer
+            .keys()
+            .copied()
+            .filter(|id| self.in_room(*id))
     }
 
     /// Resolve one member for display.
@@ -368,6 +404,7 @@ impl<'a> RoomDeputies<'a> {
             nickname,
             is_owner: id == self.owner_id,
             in_room: self.in_room(id),
+            retains_ban_authority: self.retains_ban_authority(id),
         }
     }
 
@@ -433,7 +470,8 @@ impl<'a> RoomDeputies<'a> {
 
     /// Build the resolved view of a single `deputizer -> deputy` grant.
     pub fn grant(&self, deputizer: MemberId, deputy: MemberId) -> DeputyGrant {
-        let active = self.in_room(deputizer) && self.in_room(deputy);
+        let active = (self.in_room(deputizer) || self.held_as_evidence(deputizer))
+            && (self.in_room(deputy) || self.retains_ban_authority(deputy));
         DeputyGrant {
             scope: if deputizer == self.owner_id {
                 DeputyScope::RoomWide
@@ -678,9 +716,14 @@ pub fn escape_nickname_inline(nickname: &str) -> String {
 /// by [`display_nickname`]; `(unknown)` is unquoted precisely so it cannot be
 /// confused with a member whose nickname is literally `unknown`.
 pub fn party_label(party: &DeputyParty) -> String {
-    match &party.nickname {
+    let label = match &party.nickname {
         Some(nickname) => format!("{} ({})", display_nickname(nickname), party.member_id),
         None => format!("(unknown) ({})", party.member_id),
+    };
+    if party.retains_ban_authority {
+        format!("{label} [removed, ban authority retained]")
+    } else {
+        label
     }
 }
 
@@ -826,6 +869,82 @@ mod tests {
 
     fn no_secrets() -> HashMap<u32, [u8; 32]> {
         HashMap::new()
+    }
+
+    /// A record of `sk` invited by the owner, held as ban evidence (not in
+    /// `members`).
+    fn push_evidence(state: &mut ChatRoomStateV1, owner: &SigningKey, sk: &SigningKey) {
+        let member = Member {
+            owner_member_id: id(owner),
+            invited_by: id(owner),
+            member_vk: sk.verifying_key(),
+        };
+        state
+            .ban_evidence
+            .members
+            .push(AuthorizedMember::new(member, owner));
+    }
+
+    /// A member listing does not include an identity the room holds only as
+    /// ban evidence, though it keeps a `member_info` record for it.
+    #[test]
+    fn members_with_info_leaves_out_evidence_only_identities() {
+        let owner = key(1);
+        let alice = key(2);
+        let bob = key(3);
+        let mut state = room(&owner, &[&alice]);
+        push_evidence(&mut state, &owner, &bob);
+        push_info(&mut state, &alice, 1, "alice", vec![]);
+        push_info(&mut state, &bob, 1, "bob", vec![]);
+        push_info(&mut state, &owner, 1, "owner", vec![]);
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        let mut listed: Vec<MemberId> = d.members_with_info().collect();
+        listed.sort();
+        let mut expected = vec![id(&owner), id(&alice)];
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    /// An owner-appointed moderator the room holds as ban evidence, removed by
+    /// no ban, keeps the authority the contract honours: the grant is active,
+    /// reaches every other member, and is labelled as such. Once a ban removes
+    /// them, the grant is inactive.
+    #[test]
+    fn an_evidence_backed_moderator_keeps_an_active_grant() {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        let owner = key(1);
+        let moderator = key(2);
+        let (t, u) = (key(3), key(4));
+        let mut state = room(&owner, &[&t, &u]);
+        push_evidence(&mut state, &owner, &moderator);
+        push_info(&mut state, &owner, 1, "owner", vec![id(&moderator)]);
+        push_info(&mut state, &moderator, 1, "mod", vec![]);
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        let grant = d.grant(id(&owner), id(&moderator));
+        assert!(grant.active);
+        assert!(!grant.deputy.in_room && grant.deputy.retains_ban_authority);
+        assert_eq!(grant.members_deputy_can_ban, 2);
+        assert!(
+            grant_status_line(&grant).contains("removed, ban authority retained")
+                || party_label(&grant.deputy).contains("removed, ban authority retained")
+        );
+        assert!(!d.members_with_info().any(|m| m == id(&moderator)));
+
+        state.bans = BansV1(vec![AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: id(&owner),
+                banned_at: std::time::UNIX_EPOCH,
+                banned_user: id(&moderator),
+            },
+            id(&owner),
+            &owner,
+        )]);
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        let grant = d.grant(id(&owner), id(&moderator));
+        assert!(!grant.active && !grant.deputy.retains_ban_authority);
+        assert_eq!(grant.members_deputy_can_ban, 0);
     }
 
     #[test]
