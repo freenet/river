@@ -1023,12 +1023,14 @@ async fn await_update_response<S: ResponseSource>(
 /// stored is `new_key`, never one read off a response.
 ///
 /// A notification for `new_key` itself is stepped over too, rather than taken
-/// as a merge. It is never the PUT's answer: the node fans a committed merge
-/// out to subscribers before it builds the PUT's own `UpdateResponse` or
-/// `PutResponse` (freenet-core `perform_contract_put`, which calls
-/// `finalize_state_commit` first), so taking the notification would end the
-/// wait early and leave the real answer on the shared connection for the next
-/// waiter to misread.
+/// as a merge, because it is never the PUT's answer. It reaches this connection
+/// only through a subscription to `new_key` the connection already held, and
+/// the PUT is answered separately regardless: every exit of freenet-core's
+/// local `perform_contract_put` returns an `UpdateResponse` or `PutResponse`
+/// (after `finalize_state_commit` has notified existing subscribers), and the
+/// network PUT driver answers `PutResponse` or an error. Taking the
+/// notification would end the wait early and leave that answer on the shared
+/// connection for the next waiter to misread.
 async fn await_migration_and_record<S: ResponseSource>(
     storage: &Storage,
     web_api: &mut S,
@@ -7422,6 +7424,25 @@ mod migration_recovery_tests {
         );
     }
 
+    /// The premise of `migrate_room_to_new_contract`'s pre-send check: the
+    /// container it PUTs is keyed exactly as the bundled derivation, so the
+    /// node's answer carries the key the migration waits for.
+    #[test]
+    fn migration_container_key_matches_the_bundled_derivation() {
+        let owner = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let mut params = Vec::new();
+        ciborium::ser::into_writer(&ChatRoomParametersV1 { owner }, &mut params).unwrap();
+        // bundled-wasm-ok: built exactly as the migration builds its PUT.
+        let code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let container = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(code),
+            Parameters::from(params),
+        )));
+        // bundled-wasm-ok: the derivation `ensure_room_migrated` resolves to
+        // when `KeyIntent::PublishCode` is authorized.
+        assert_eq!(container.key().id(), compute_contract_key(&owner).id());
+    }
+
     /// The current room-contract WASM must NOT be in the legacy registry — the
     /// registry holds only *previous* generations. Listing the current hash
     /// would make a probe redundantly re-fetch the current contract.
@@ -13261,17 +13282,23 @@ mod await_response_tests {
         assert_eq!(stored_key(&storage, &owner_vk), before.id().to_string());
     }
 
-    /// Nor does a notification for the new contract on its own. The node
-    /// sends it on committing the merge, BEFORE the PUT's own answer, so
-    /// taking it as the answer would strand that answer on the connection.
+    /// Nor does a notification for the new contract on its own. It comes from
+    /// a subscription, and the PUT's own answer still follows it, so taking it
+    /// as the answer would strand that answer on the connection.
     #[tokio::test(start_paused = true)]
     async fn a_notification_for_the_new_contract_is_not_the_answer() {
         let before = generation_before();
         let (storage, _dir, owner_vk) = storage_with_room(&before);
         let mut conn = Scripted::new(vec![Ok(notification_for(key()))]);
-        await_migration_and_record(&storage, &mut conn, &owner_vk, &key())
+        let err = await_migration_and_record(&storage, &mut conn, &owner_vk, &key())
             .await
             .expect_err("a notification is not a PUT acknowledgement");
+        assert!(
+            err.to_string()
+                .contains("Timeout waiting for migration PUT response"),
+            "{err}"
+        );
+        assert_eq!(conn.reads, 1);
         assert_eq!(stored_key(&storage, &owner_vk), before.id().to_string());
     }
 
