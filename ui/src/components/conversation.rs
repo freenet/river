@@ -3614,6 +3614,29 @@ fn reaction_owner_marks(
     )
 }
 
+/// Avatar shades for other members, as Tailwind literals the `@source` scan
+/// picks up. No blue (the own name's colour), no red, amber or yellow (error
+/// and warning colours), no teal (too close to emerald).
+const AVATAR_PALETTE: [&str; 6] = [
+    "text-emerald-600 dark:text-emerald-400",
+    "text-cyan-600 dark:text-cyan-400",
+    "text-violet-600 dark:text-violet-400",
+    "text-fuchsia-600 dark:text-fuchsia-400",
+    "text-pink-600 dark:text-pink-400",
+    "text-orange-600 dark:text-orange-400",
+];
+
+/// The avatar shade for another member. From the member id, not the
+/// nickname, so a rename keeps it and an exact-name impersonator does not
+/// inherit it.
+#[allow(dead_code)] // Wired into the group's first row by the next commit.
+fn avatar_colour_class(author_id: MemberId) -> &'static str {
+    let digest = blake3::hash(&author_id.0 .0.to_le_bytes());
+    let bytes = digest.as_bytes();
+    let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    AVATAR_PALETTE[n as usize % AVATAR_PALETTE.len()]
+}
+
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -5033,6 +5056,28 @@ mod tests {
             "let member_names: HashMap<MemberId, String> = present_member_infos(room_state)",
         ] {
             assert!(src.contains(needle), "missing: {needle}");
+        }
+    }
+
+    /// Pins which shade each member's avatar gets, so a change to the hash
+    /// input, the byte order or the palette order (any of which would repaint
+    /// every member) shows up here.
+    #[test]
+    fn avatar_colour_is_pinned_per_member_id() {
+        let cases: [(i64, &str); 6] = [
+            (0, "text-fuchsia-600 dark:text-fuchsia-400"),
+            (1, "text-pink-600 dark:text-pink-400"),
+            (-1, "text-fuchsia-600 dark:text-fuchsia-400"),
+            (42, "text-pink-600 dark:text-pink-400"),
+            (i64::MIN, "text-violet-600 dark:text-violet-400"),
+            (i64::MAX, "text-orange-600 dark:text-orange-400"),
+        ];
+        for (id, expected) in cases {
+            assert_eq!(
+                avatar_colour_class(MemberId(freenet_scaffold::util::FastHash(id))),
+                expected,
+                "member id {id}"
+            );
         }
     }
 
