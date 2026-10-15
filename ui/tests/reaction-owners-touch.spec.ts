@@ -81,15 +81,27 @@ async function addOwnReaction(page: Page): Promise<Locator> {
   return chip;
 }
 
-// Playwright's click() is a mouse pointer even on a touch project.
-// The app trusts pointerType, so a finger on mobile has to be tap().
+// Playwright's click() is a mouse pointer even on a touch project, and its
+// tap() is still a mouse click under WebKit. The app trusts pointerType, so
+// a finger is a click event whose pointerType is "touch".
 function mobileProject(): boolean {
   return test.info().project.name.startsWith("mobile");
 }
 
 async function pressChip(chip: Locator) {
   if (mobileProject()) {
-    await chip.tap();
+    await chip.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      el.dispatchEvent(
+        new PointerEvent("click", {
+          bubbles: true,
+          cancelable: true,
+          pointerType: "touch",
+          clientX: rect.x + rect.width / 2,
+          clientY: rect.y + rect.height / 2,
+        }),
+      );
+    });
   } else {
     await chip.click();
   }
