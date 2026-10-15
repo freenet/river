@@ -1017,8 +1017,9 @@ fn NoRoomFooter() -> Element {
 /// clips it horizontally and `max-h-[calc(1lh+4px)]` vertically, so a list,
 /// a heading or a hard break cannot grow the header either. The 4px lets a
 /// line made taller by inline code or an emoji (17-19px against a 16px line,
-/// measured) show uncut; a heading or a list item is taller than that, so it
-/// overflows and gets the chevron (`header_description_overflows`). Expanded wraps and scrolls
+/// measured) without reaching the clamp; a heading or a list item is taller
+/// than that, so it reaches the clamp and gets the chevron
+/// (`header_description_overflows`). Expanded wraps and scrolls
 /// so a long description stays in the header instead of pushing the messages
 /// off the screen (freenet/river#718).
 fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
@@ -1058,18 +1059,36 @@ fn header_description_is_expanded() -> bool {
         .is_some_and(|value| value == "true")
 }
 
+/// The description's computed `max-height` in px, `None` for `none`.
+#[cfg(target_arch = "wasm32")]
+fn description_max_height_px(element: &web_sys::Element) -> Option<f64> {
+    web_sys::window()?
+        .get_computed_style(element)
+        .ok()??
+        .get_property_value("max-height")
+        .ok()?
+        .strip_suffix("px")?
+        .parse()
+        .ok()
+}
+
 fn header_description_overflows() -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        // Both axes, against the same box the collapsed class clamps to
-        // (see `room_description_class`): a long line overflows sideways, and
-        // a list, a heading or a hard break overflows downwards. Anything that
-        // overflows is cut off, so it must get the chevron. The 1px slack: a
-        // flex item at a fractional size can round a pixel apart and look
-        // truncated when it fits.
+        // Both axes, against the box the collapsed class clamps to (see
+        // `room_description_class`): a long line overflows sideways, and a
+        // list, a heading or a hard break is taller than the clamp. Downwards
+        // it counts only once the box has reached the clamp: below it, the
+        // box already holds the whole line, and the 1-3px `scrollHeight`
+        // reports past it is an inline box (inline code) hanging below the
+        // line box, not text the clamp hides. The 1px slack: a flex item at a
+        // fractional size can round a pixel apart and look truncated when it
+        // fits.
         return header_description_element().is_some_and(|element| {
-            element.scroll_width() > element.client_width() + 1
-                || element.scroll_height() > element.client_height() + 1
+            let sideways = element.scroll_width() > element.client_width() + 1;
+            let clamped = description_max_height_px(&element)
+                .is_some_and(|max| f64::from(element.client_height()) + 1.0 >= max);
+            sideways || clamped && element.scroll_height() > element.client_height() + 1
         });
     }
     #[cfg(not(target_arch = "wasm32"))]

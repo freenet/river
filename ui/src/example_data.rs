@@ -225,7 +225,7 @@ pub fn create_example_rooms() -> Rooms {
         // A heading alone, and a single list item: one line each, but taller
         // than the collapsed clamp, so each is cut off and needs the chevron.
         for (name, description) in [
-            ("Heading Room", "## Welcome to the heading room"),
+            ("Heading Room", "## Read this first"),
             ("Single Item Room", "- Be kind"),
         ] {
             let room = create_room(
