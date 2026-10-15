@@ -66,7 +66,7 @@ use river_core::room_state::message::{
     AuthorizedMessageV1, MessageId, MessageV1, MessagesV1, RoomMessageBody,
 };
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 use wasm_bindgen::JsCast;
@@ -972,6 +972,9 @@ type MessageGroupsValue = Rc<(
     Vec<DisplayItem>,
     Option<MemberId>,
     HashMap<MemberId, String>,
+    ImpersonationChecker,
+    HashMap<MemberId, DeputyBadge>,
+    MemberId,
 )>;
 
 /// The two affordances the no-room screen must offer in EVERY load state
@@ -1303,12 +1306,13 @@ pub fn Conversation() -> Element {
                 // The helper keeps its `MemberId` parameter: it has ~30
                 // call sites, and a fabricated viewer id here would be
                 // worse than none.
+                let owner_id = MemberId::from(&key);
                 let deputy_badges = match self_member_id {
                     Some(self_member_id) => deputy_badges_for_viewer(
                         &room_state.members,
                         &room_state.member_info,
                         &room_data.secrets,
-                        MemberId::from(&key),
+                        owner_id,
                         self_member_id,
                     ),
                     None => HashMap::new(),
@@ -1319,7 +1323,7 @@ pub fn Conversation() -> Element {
                 let impersonation = impersonation_checker_for_viewer(
                     &room_state.member_info,
                     &room_data.secrets,
-                    MemberId::from(&key),
+                    owner_id,
                     &deputy_badges,
                 );
                 // Borrowed once per pass, not once per message. The old
@@ -1338,7 +1342,7 @@ pub fn Conversation() -> Element {
                     &member_names,
                     &deputy_badges,
                     &impersonation,
-                    MemberId::from(&key),
+                    owner_id,
                     MessageClock {
                         receive_times: &receive_times,
                         // One "now" for the whole pass. Only reached by
@@ -1346,7 +1350,14 @@ pub fn Conversation() -> Element {
                         fallback_now: Utc::now(),
                     },
                 );
-                return Some(Rc::new((groups, self_member_id, member_names)));
+                return Some(Rc::new((
+                    groups,
+                    self_member_id,
+                    member_names,
+                    impersonation,
+                    deputy_badges,
+                    owner_id,
+                )));
             }
             None
         });
@@ -2328,7 +2339,14 @@ pub fn Conversation() -> Element {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
                             match message_groups.read().as_deref() {
-                                Some((groups, self_member_id, member_names)) => {
+                                Some((
+                                    groups,
+                                    self_member_id,
+                                    member_names,
+                                    impersonation,
+                                    deputy_badges,
+                                    owner_id,
+                                )) => {
                                     // Render only the tail the reader has asked
                                     // for. Slicing BEFORE the clone is the
                                     // point: `GroupedMessage` carries the
@@ -2372,7 +2390,10 @@ pub fn Conversation() -> Element {
                                     let groups =
                                         groups[history_window.start..history_window.end].to_vec();
                                     let self_member_id = *self_member_id;
+                                    let owner_id = *owner_id;
                                     let member_names = member_names.clone();
+                                    let impersonation = impersonation.clone();
+                                    let deputy_badges = deputy_badges.clone();
                                     // Room limits for the in-place edit form's
                                     // encoded-size gate (same measure the
                                     // contract enforces on the edit action).
@@ -2468,10 +2489,14 @@ pub fn Conversation() -> Element {
                                             {rows.into_iter().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
+                                                let impersonation = impersonation.clone();
+                                                let deputy_badges = deputy_badges.clone();
                                                 move |row| {
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let handle_edit_message = handle_edit_message.clone();
                                                 let member_names = member_names.clone();
+                                                let impersonation = impersonation.clone();
+                                                let deputy_badges = deputy_badges.clone();
                                                 match row {
                                                     DisplayRow::DateSeparator { key, label } => rsx! {
                                                         div {
@@ -2519,6 +2544,9 @@ pub fn Conversation() -> Element {
                                                                 group: group,
                                                                 self_member_id: self_member_id,
                                                                 member_names: member_names,
+                                                                impersonation: impersonation,
+                                                                deputy_badges: deputy_badges,
+                                                                owner_id: owner_id,
                                                                 max_message_size: edit_max_size,
                                                                 is_private: edit_is_private,
                                                                 edit_trigger: edit_trigger,
@@ -2643,7 +2671,7 @@ pub fn Conversation() -> Element {
             {
                 // Find user's most recent message for up-arrow-to-edit
                 let request_edit_last = move |_| {
-                    if let Some((groups, _, _)) = message_groups.read().as_deref() {
+                    if let Some((groups, _, _, _, _, _)) = message_groups.read().as_deref() {
                         for item in groups.iter().rev() {
                             if let DisplayItem::Messages(group) = item {
                                 if group.is_self {
@@ -2952,6 +2980,86 @@ fn bubble_corner_classes(is_self: bool, is_first: bool, is_last: bool) -> &'stat
     }
 }
 
+/// Position of an open reactor list. Stored as one signal so the flip, the
+/// anchor, and the caps update together.
+#[derive(Clone, PartialEq)]
+struct ReactionOwnersPopover {
+    key: String,
+    above: bool,
+    align_right: bool,
+    max_h: f64,
+    max_w: f64,
+}
+
+const REACTION_OWNERS_POPOVER_HEIGHT_PX: f64 = 160.0;
+
+fn coarse_pointer() -> bool {
+    web_sys::window()
+        .and_then(|w| {
+            w.match_media("(hover: none), (any-pointer: coarse)")
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|mq| mq.matches())
+}
+
+/// A finger or a pen on a coarse screen opens the list. A mouse removes.
+/// Dioxus stores the click as a `MouseEvent` even when the browser object is
+/// a `PointerEvent`, so the cast is on the JS value. A plain mouse event
+/// (Safari before 17) falls back to the media query.
+fn gesture_opens_owner_list(evt: &dioxus_core::Event<MouseData>) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(mouse) = evt.data().downcast::<web_sys::MouseEvent>() {
+            if let Some(pointer) = mouse.dyn_ref::<web_sys::PointerEvent>() {
+                match pointer.pointer_type().as_str() {
+                    "touch" => return true,
+                    // A pencil has no hover tooltip. On a touch device it
+                    // should open the list, the same as a finger.
+                    "pen" => return coarse_pointer(),
+                    "mouse" => return false,
+                    _ => {}
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = evt;
+    }
+    coarse_pointer()
+}
+
+fn chat_scrollport_bounds() -> (f64, f64) {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("chat-scroll-container"))
+        .map(|el| {
+            let rect = el.get_bounding_client_rect();
+            (rect.top(), rect.bottom())
+        })
+        .unwrap_or((60.0, 600.0))
+}
+
+/// ⚠ and 🛡 for one reactor. `reactor_id` is the member whose name is shown.
+fn reaction_owner_marks(
+    reactor_id: MemberId,
+    display_name: &str,
+    impersonation: &ImpersonationChecker,
+    owner_id: MemberId,
+    deputy_badges: &HashMap<MemberId, DeputyBadge>,
+) -> (Option<ImpersonationWarning>, Option<DeputyBadge>) {
+    (
+        impersonation_warning_for_display(
+            impersonation,
+            reactor_id,
+            display_name,
+            privilege_in_view(reactor_id, owner_id, deputy_badges),
+        ),
+        deputy_badges.get(&reactor_id).cloned(),
+    )
+}
+
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -2961,6 +3069,9 @@ fn MessageGroupComponent(
     /// answer.
     self_member_id: Option<MemberId>,
     member_names: HashMap<MemberId, String>,
+    impersonation: ImpersonationChecker,
+    deputy_badges: HashMap<MemberId, DeputyBadge>,
+    owner_id: MemberId,
     /// Room max message size in ENCODED content bytes — bounds the edit
     /// action body (`RoomMessageBody::measure_edit`), not the raw text.
     max_message_size: usize,
@@ -3023,6 +3134,64 @@ fn MessageGroupComponent(
 
     // Track if emoji picker should appear above (true) or below (false) the button
     let mut picker_show_above: Signal<bool> = use_signal(|| false);
+    let mut open_reaction_owners: Signal<Option<ReactionOwnersPopover>> = use_signal(|| None);
+    {
+        let live_owner_keys: HashSet<String> = group
+            .messages
+            .iter()
+            .flat_map(|msg| {
+                let id = msg.id.clone();
+                msg.reactions
+                    .keys()
+                    .map(move |emoji| format!("{id}:{emoji}"))
+            })
+            .collect();
+        let owners_stale = open_reaction_owners
+            .read()
+            .as_ref()
+            .is_some_and(|popup| !live_owner_keys.contains(&popup.key));
+        if owners_stale {
+            let mut open_reaction_owners = open_reaction_owners;
+            crate::util::defer(move || {
+                let still = open_reaction_owners
+                    .peek()
+                    .as_ref()
+                    .is_some_and(|popup| !live_owner_keys.contains(&popup.key));
+                if still {
+                    open_reaction_owners.set(None);
+                }
+            });
+        }
+    }
+    {
+        let owners_focus = use_hook(|| Rc::new(std::cell::Cell::new(None::<String>)));
+        let mut open_reaction_owners = open_reaction_owners;
+        use_effect(move || {
+            let current = open_reaction_owners
+                .read()
+                .as_ref()
+                .map(|popup| popup.key.clone());
+            let previous = owners_focus.replace(current.clone());
+            #[cfg(target_arch = "wasm32")]
+            crate::util::defer(move || {
+                let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+                    return;
+                };
+                let target = if current.is_some() {
+                    Some("reaction-owners-dialog".to_string())
+                } else {
+                    previous.map(|key| format!("reaction-chip-{key}"))
+                };
+                if let Some(id) = target {
+                    if let Some(element) = document.get_element_by_id(&id) {
+                        let _ = element
+                            .dyn_ref::<web_sys::HtmlElement>()
+                            .map(|node| node.focus());
+                    }
+                }
+            });
+        });
+    }
 
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
@@ -3850,49 +4019,226 @@ fn MessageGroupComponent(
                                                     let emoji_for_click = emoji.clone();
                                                     let msg_id_for_click = msg_id_react.clone();
 
-                                                    // Build list of reactor names for tooltip
-                                                    let reactor_names: Vec<String> = reactors.iter().map(|reactor_id| {
-                                                        // Unknown identity ⇒ nobody is
-                                                        // labelled "You"; every reactor
-                                                        // falls through to their nickname.
-                                                        if Some(*reactor_id) == self_member_id {
+                                                    // "You" is not a nickname, so it is not checked
+                                                    // for impersonation. Everyone else gets the
+                                                    // same ⚠ / 🛡 as the author line.
+                                                    let shown_reactors: Vec<_> = reactors.iter().map(|reactor_id| {
+                                                        let is_you = Some(*reactor_id) == self_member_id;
+                                                        let name = if is_you {
                                                             "You".to_string()
                                                         } else {
                                                             member_names.get(reactor_id)
                                                                 .cloned()
                                                                 .unwrap_or_else(|| "Unknown".to_string())
-                                                        }
+                                                        };
+                                                        let (warning, badge) = if is_you {
+                                                            (None, deputy_badges.get(reactor_id).cloned())
+                                                        } else {
+                                                            reaction_owner_marks(
+                                                                *reactor_id,
+                                                                &name,
+                                                                &impersonation,
+                                                                owner_id,
+                                                                &deputy_badges,
+                                                            )
+                                                        };
+                                                        (name, warning, badge)
                                                     }).collect();
-                                                    let names_str = reactor_names.join(", ");
-
+                                                    let names_str = shown_reactors
+                                                        .iter()
+                                                        .map(|(name, _, _)| name.as_str())
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ");
                                                     let tooltip = if is_user_reaction {
-                                                        format!("{} (click to remove)", names_str)
+                                                        format!("{names_str} (click to remove)")
                                                     } else {
                                                         names_str
                                                     };
+                                                    let owners_key = format!("{msg_id_for_inline}:{emoji}");
+                                                    let (
+                                                        owners_open,
+                                                        owners_above,
+                                                        owners_align_right,
+                                                        owners_max_h,
+                                                        owners_max_w,
+                                                    ) = {
+                                                        let open = open_reaction_owners.read();
+                                                        let mine = open.as_ref().filter(|popup| popup.key == owners_key);
+                                                        (
+                                                            mine.is_some(),
+                                                            mine.is_some_and(|popup| popup.above),
+                                                            mine.is_some_and(|popup| popup.align_right),
+                                                            mine.map(|popup| popup.max_h).unwrap_or(REACTION_OWNERS_POPOVER_HEIGHT_PX),
+                                                            mine.map(|popup| popup.max_w).unwrap_or(240.0),
+                                                        )
+                                                    };
+                                                    let msg_id_for_remove = msg_id_for_click.clone();
+                                                    let emoji_for_remove = emoji_for_click.clone();
+                                                    let owners_key_for_click = owners_key.clone();
+                                                    let chip_id = format!("reaction-chip-{owners_key}");
 
                                                     rsx! {
-                                                        span {
+                                                        div {
                                                             key: "{emoji}",
-                                                            "data-testid": "reaction-chip",
                                                             class: format!(
-                                                                "inline-flex items-center gap-0.5 text-base transition-transform {}",
-                                                                if is_user_reaction {
-                                                                    // Subtle indicator: underline for user's reaction
-                                                                    "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
-                                                                } else {
-                                                                    "cursor-default hover:scale-110"
-                                                                }
+                                                                "relative inline-flex items-center {}",
+                                                                if owners_open { "z-[60]" } else { "" }
                                                             ),
-                                                            title: "{tooltip}",
-                                                            onclick: move |_| {
-                                                                if is_user_reaction {
-                                                                    on_react.call((msg_id_for_click.clone(), emoji_for_click.clone()));
+                                                            if owners_open {
+                                                                div {
+                                                                    class: "fixed inset-0 z-40",
+                                                                    onclick: move |_| {
+                                                                        crate::util::defer(move || open_reaction_owners.set(None));
+                                                                    },
                                                                 }
-                                                            },
-                                                            "{emoji}"
-                                                            if count > 1 {
-                                                                span { class: "text-xs text-text-muted", "{count}" }
+                                                                div {
+                                                                    id: "reaction-owners-dialog",
+                                                                    "data-testid": "reaction-owners",
+                                                                    role: "dialog",
+                                                                    tabindex: "-1",
+                                                                    "aria-label": "Who reacted",
+                                                                    class: format!(
+                                                                        "absolute z-50 w-max min-w-[8rem] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
+                                                                        if owners_above { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                                        if owners_align_right { "right-0" } else { "left-0" }
+                                                                    ),
+                                                                    style: format!("max-height: {owners_max_h}px; max-width: {owners_max_w}px"),
+                                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                                    onkeydown: move |e: KeyboardEvent| {
+                                                                        if e.key() == Key::Escape {
+                                                                            e.prevent_default();
+                                                                            crate::util::defer(move || open_reaction_owners.set(None));
+                                                                        }
+                                                                    },
+                                                                    if is_user_reaction {
+                                                                        button {
+                                                                            "data-testid": "reaction-remove",
+                                                                            class: "px-3 py-2 text-sm text-left text-red-500 hover:bg-error-bg",
+                                                                            onclick: move |_| {
+                                                                                let id = msg_id_for_remove.clone();
+                                                                                let emoji = emoji_for_remove.clone();
+                                                                                crate::util::defer(move || {
+                                                                                    on_react.call((id, emoji));
+                                                                                    open_reaction_owners.set(None);
+                                                                                });
+                                                                            },
+                                                                            "Remove"
+                                                                        }
+                                                                    }
+                                                                    {shown_reactors.iter().enumerate().map(|(index, (name, warning, badge))| {
+                                                                        rsx! {
+                                                                            div {
+                                                                                key: "{index}",
+                                                                                class: "flex items-baseline gap-1 px-3 py-1.5 text-sm text-text text-left",
+                                                                                span {
+                                                                                    "data-testid": "reaction-owner",
+                                                                                    class: "[overflow-wrap:anywhere]",
+                                                                                    "{name}"
+                                                                                }
+                                                                                if let Some(warning) = warning {
+                                                                                    {
+                                                                                        let tooltip = warning.tooltip();
+                                                                                        rsx! {
+                                                                                            span {
+                                                                                                "data-testid": "reaction-owner-impersonation-warning",
+                                                                                                class: "cursor-default",
+                                                                                                title: "{tooltip}",
+                                                                                                "aria-label": "{tooltip}",
+                                                                                                {crate::util::confusable::WARNING_GLYPH}
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                if let Some(badge) = badge {
+                                                                                    {
+                                                                                        let tooltip = badge.tooltip();
+                                                                                        rsx! {
+                                                                                            span {
+                                                                                                "data-testid": "reaction-owner-deputy-badge",
+                                                                                                class: "cursor-default",
+                                                                                                title: "{tooltip}",
+                                                                                                "aria-label": "{tooltip}",
+                                                                                                "🛡"
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    })}
+                                                                }
+                                                            }
+                                                            span {
+                                                                id: "{chip_id}",
+                                                                "data-testid": "reaction-chip",
+                                                                role: "button",
+                                                                tabindex: "0",
+                                                                "aria-expanded": if owners_open { "true" } else { "false" },
+                                                                class: format!(
+                                                                    "inline-flex items-center gap-0.5 text-base transition-transform {}",
+                                                                    if is_user_reaction {
+                                                                        "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
+                                                                    } else {
+                                                                        "cursor-default hover:scale-110"
+                                                                    }
+                                                                ),
+                                                                title: "{tooltip}",
+                                                                onclick: move |e: MouseEvent| {
+                                                                    let click_y = e.client_coordinates().y;
+                                                                    let click_x = e.client_coordinates().x;
+                                                                    if gesture_opens_owner_list(&e) {
+                                                                        let key = owners_key_for_click.clone();
+                                                                        let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
+                                                                        let space_below = scroll_bottom - click_y;
+                                                                        let space_above = click_y - scroll_top;
+                                                                        let above = space_below < REACTION_OWNERS_POPOVER_HEIGHT_PX
+                                                                            && space_above > space_below;
+                                                                        let max_h = ((if above { space_above } else { space_below }) - 16.0).max(1.0);
+                                                                        let win_w = web_sys::window()
+                                                                            .and_then(|w| w.inner_width().ok())
+                                                                            .and_then(|v| v.as_f64())
+                                                                            .unwrap_or(400.0);
+                                                                        let space_right = (win_w - click_x - 8.0).max(128.0);
+                                                                        let space_left = (click_x - 8.0).max(128.0);
+                                                                        let align_right = space_left > space_right;
+                                                                        let max_w = if align_right { space_left } else { space_right };
+                                                                        crate::util::defer(move || {
+                                                                            let already_open = open_reaction_owners
+                                                                                .peek()
+                                                                                .as_ref()
+                                                                                .is_some_and(|popup| popup.key == key);
+                                                                            if already_open {
+                                                                                open_reaction_owners.set(None);
+                                                                            } else {
+                                                                                open_emoji_picker.set(None);
+                                                                                open_action_menu.set(None);
+                                                                                open_reaction_owners.set(Some(ReactionOwnersPopover {
+                                                                                    key,
+                                                                                    above,
+                                                                                    align_right,
+                                                                                    max_h,
+                                                                                    max_w,
+                                                                                }));
+                                                                            }
+                                                                        });
+                                                                    } else if is_user_reaction {
+                                                                        let id = msg_id_for_click.clone();
+                                                                        let emoji = emoji_for_click.clone();
+                                                                        crate::util::defer(move || {
+                                                                            on_react.call((id, emoji));
+                                                                        });
+                                                                    }
+                                                                },
+                                                                onkeydown: move |e: KeyboardEvent| {
+                                                                    if e.key() == Key::Escape {
+                                                                        e.prevent_default();
+                                                                        crate::util::defer(move || open_reaction_owners.set(None));
+                                                                    }
+                                                                },
+                                                                "{emoji}"
+                                                                if count > 1 {
+                                                                    span { class: "text-xs text-text-muted", "{count}" }
+                                                                }
                                                             }
                                                         }
                                                     }

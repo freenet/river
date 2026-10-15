@@ -7384,6 +7384,33 @@ mod tests {
             "the member-info modal no longer renders the warning's explanation \
              element"
         );
+
+        // --- Reaction owner list (freenet/river#714) ---------------------
+        let marks = between(
+            conversation,
+            "fn reaction_owner_marks(",
+            "\n#[component]\nfn MessageGroupComponent(",
+            "reaction_owner_marks",
+        );
+        assert!(
+            squashed(marks).contains(
+                "impersonation_warning_for_display( impersonation, reactor_id, display_name, \
+                 privilege_in_view(reactor_id, owner_id, deputy_badges), )"
+            ),
+            "the reactor list helper no longer passes the reactor's own id"
+        );
+        assert!(
+            squashed(conversation).contains(
+                "reaction_owner_marks( *reactor_id, &name, &impersonation, owner_id, \
+                 &deputy_badges, )"
+            ),
+            "the reactor list call site no longer passes `*reactor_id`. Passing \
+             the viewer id would flag the real owner"
+        );
+        assert!(
+            conversation.contains("\"data-testid\": \"reaction-owner-impersonation-warning\""),
+            "the reactor list no longer renders the warning element"
+        );
     }
 
     /// #768 review A7: the import modal's fallible signal reads follow
