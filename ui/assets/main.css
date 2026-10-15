@@ -215,10 +215,23 @@
      * an opacity-0 element still captures taps. On a touch device (no hover) it
      * can never become visible, so make it non-interactive there; otherwise a
      * tap on the gutter where it sits would fire an invisible reply/edit/delete.
-     * Left interactive on desktop (@media hover:hover) so slow mouse travel
-     * across the gap to the bar still works. (#402) */
+     * (#402) */
     .hover-actions {
         pointer-events: none;
+    }
+}
+
+/* On a hover pointer the bar takes clicks only while its row is hovered. It
+ * sits in the row's own right gutter, so the pointer reaches it without
+ * leaving the row; an idle, invisible bar must not cover the Latest button or
+ * a neighbouring row. Keyboard focus reaches its buttons either way. */
+@media (hover: hover) {
+    .hover-actions {
+        pointer-events: none;
+    }
+
+    .msg-row:hover .hover-actions {
+        pointer-events: auto;
     }
 }
 

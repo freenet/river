@@ -4279,15 +4279,13 @@ fn MessageGroupComponent(
                                         let reply_author_name = group.author_name.clone();
                                         rsx! {
                                             div {
-                                                // `.hover-actions` (main.css) makes this invisible
-                                                // (opacity-0) bar `pointer-events:none` ONLY on touch
-                                                // devices (@media hover:none), so it can't intercept a
-                                                // gutter tap there — while leaving it fully hit-testable on
-                                                // desktop, where the pointer must cross an empty gap to
-                                                // reach it (a Tailwind `group-hover:pointer-events` gate
-                                                // would drop hover mid-gap and make it unreachable). #402.
                                                 // In the row's right gutter, past the content
                                                 // column's right edge, for every author.
+                                                // `.hover-actions` (main.css) keeps this invisible
+                                                // (opacity-0) bar from taking taps on touch devices
+                                                // (#402), and on a hover pointer lets it take clicks
+                                                // only while its row is hovered, so it never covers
+                                                // Latest or a neighbouring row.
                                                 class: "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 right-0 translate-x-full ml-2",
                                                 // Reply button - available for all messages
                                                 button {
