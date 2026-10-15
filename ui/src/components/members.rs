@@ -23,6 +23,24 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use crate::util::to_cbor_vec;
 use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 
+/// Move focus back to the Active Members control after Escape closes the
+/// search. The button stays mounted; the field does not.
+fn focus_member_search_toggle() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        let Some(button) = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.get_element_by_id("member-search-toggle"))
+        else {
+            return;
+        };
+        let _ = button
+            .dyn_ref::<web_sys::HtmlElement>()
+            .map(|element| element.focus());
+    }
+}
+
 pub(crate) mod invitation_builder;
 pub mod invite_member_modal;
 pub mod member_info_modal;
@@ -1605,11 +1623,10 @@ pub fn MemberList() -> Element {
                         current_room_badge: "members-current-room-unread-badge",
                     }
                     button {
+                        id: "member-search-toggle",
                         "data-testid": "member-search-toggle",
                         class: "flex-1 min-w-0 text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2 text-left",
                         "aria-expanded": if *member_search_open.read() { "true" } else { "false" },
-                        "aria-label": "Search active members",
-                        title: "Search active members",
                         onclick: move |_| {
                             crate::util::defer(move || {
                                 let open = !*member_search_open.peek();
@@ -1630,13 +1647,32 @@ pub fn MemberList() -> Element {
                     // 16px text so iOS does not zoom the page when the field
                     // is focused. The members panel is full width on a phone.
                     input {
+                        id: "member-search-input",
                         "data-testid": "member-search-input",
                         class: "mt-2 w-full px-3 py-2 bg-surface border border-border rounded-lg text-base text-text",
                         r#type: "search",
                         placeholder: "Search members",
                         value: "{member_query}",
-                        autofocus: true,
+                        // `autofocus` only runs on the first page load. This
+                        // field is mounted later, when the heading is clicked.
+                        onmounted: move |cx| {
+                            let element = cx.data();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                let _ = element.set_focus(true).await;
+                            });
+                        },
                         oninput: move |evt| member_query.set(evt.value()),
+                        onkeydown: move |evt: KeyboardEvent| {
+                            if evt.key() != Key::Escape {
+                                return;
+                            }
+                            evt.prevent_default();
+                            crate::util::defer(move || {
+                                member_search_open.set(false);
+                                member_query.set(String::new());
+                                focus_member_search_toggle();
+                            });
+                        },
                     }
                 }
             }

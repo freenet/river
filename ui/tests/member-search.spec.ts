@@ -55,9 +55,11 @@ test.describe("Member search", { tag: "@chromium-only" }, () => {
     expect(before).toBeGreaterThan(1);
 
     await expect(page.getByTestId("member-search-input")).toHaveCount(0);
-    await page.getByTestId("member-search-toggle").click();
+    const toggle = page.getByTestId("member-search-toggle");
+    await toggle.click();
     const input = page.getByTestId("member-search-input");
     await expect(input).toBeVisible();
+    await expect(input).toBeFocused();
 
     const nickname = (
       await rows.nth(1).locator("span").first().innerText()
@@ -73,5 +75,11 @@ test.describe("Member search", { tag: "@chromium-only" }, () => {
     await input.fill(nickname);
     await rows.first().click();
     await expect(page.getByTestId("member-info-modal")).toBeVisible();
+    await page.getByTestId("member-info-close-button").click();
+
+    await input.press("Escape");
+    await expect(page.getByTestId("member-search-input")).toHaveCount(0);
+    await expect(toggle).toBeFocused();
+    await expect(rows).toHaveCount(before);
   });
 });
