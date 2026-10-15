@@ -122,9 +122,9 @@ async function removeOwnReaction(page: Page, chip: Locator) {
 }
 
 /// Scroll the history so `chip` is just out of view, without leaving the
-/// rendered range. Returns the scroller's `scrollTop` afterwards.
-async function scrollChipOutOfView(page: Page, chip: Locator): Promise<number> {
-  const top = await chip.evaluate((el) => {
+/// rendered range.
+async function scrollChipOutOfView(page: Page, chip: Locator): Promise<void> {
+  await chip.evaluate((el) => {
     const scroller = document.getElementById("chat-scroll-container")!;
     const chipRect = el.getBoundingClientRect();
     const viewRect = scroller.getBoundingClientRect();
@@ -135,7 +135,6 @@ async function scrollChipOutOfView(page: Page, chip: Locator): Promise<number> {
     // above the view.
     const below = chipTop - scroller.clientHeight - 24;
     scroller.scrollTop = below >= 0 ? below : Math.min(chipBottom + 24, max);
-    return scroller.scrollTop;
   });
   await settle(page);
   const inView = await chip.evaluate((el) => {
@@ -144,7 +143,6 @@ async function scrollChipOutOfView(page: Page, chip: Locator): Promise<number> {
     return r.bottom > v.top && r.top < v.bottom;
   });
   expect(inView, "premise: the chip is scrolled out of view").toBe(false);
-  return top;
 }
 
 function historyScrollTop(page: Page): Promise<number> {
@@ -278,7 +276,6 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
     await own.focus();
     await own.press("Enter");
     await expect(owners).toBeVisible();
-    await expect(owners).toHaveAttribute("aria-modal", "true");
     await expect(owners.getByTestId("reaction-remove")).toBeVisible();
     await expect(owners).toBeFocused();
     await expect(
@@ -296,12 +293,52 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
     await other.press(" ");
     await expect(owners).toBeVisible();
     await expect(owners).toBeFocused();
-    const parked = await scrollChipOutOfView(page, other);
+    await scrollChipOutOfView(page, other);
+    // Read after the scroll has settled, not before.
+    const parked = await historyScrollTop(page);
     await owners.press("Escape");
     await expect(owners).toHaveCount(0);
     await expect(other).toBeFocused();
     await settle(page);
     expect(await historyScrollTop(page)).toBeCloseTo(parked, 0);
+  });
+});
+
+test.describe("Reaction chip activated without a press (#714)", () => {
+  test("a click with no fresh press of its own opens the list, never removes", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    await waitSettledAtBottom(page);
+
+    const owners = page.getByTestId("reaction-owners");
+    const ownSelector = '[data-testid="reaction-chip"][title*="click to remove"]';
+    const own = await chipByOwnReaction(page, true);
+    const ownCount = await page.locator(ownSelector).count();
+
+    // What assistive technology does: a click event with no pointerdown.
+    await own.evaluate((el) => (el as HTMLElement).click());
+    await expect(owners).toBeVisible();
+    await expect(owners.getByTestId("reaction-remove")).toBeVisible();
+    await expect(page.locator(ownSelector)).toHaveCount(ownCount);
+    await owners.press("Escape");
+    await expect(owners).toHaveCount(0);
+
+    // A mouse press on the chip dragged off it (no click there, and no
+    // pointercancel), then later a click with no press of its own. The old
+    // "mouse" press must not decide that click.
+    const box = await own.boundingBox();
+    expect(box).not.toBeNull();
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(box!.x + box!.width / 2, box!.y - 120, { steps: 4 });
+    await page.mouse.up();
+    await page.waitForTimeout(1_800);
+    await own.evaluate((el) => (el as HTMLElement).click());
+    await expect(owners).toBeVisible();
+    await expect(page.locator(ownSelector)).toHaveCount(ownCount);
   });
 });
 

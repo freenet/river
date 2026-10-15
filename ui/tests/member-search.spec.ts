@@ -82,9 +82,15 @@ test.describe("Member search", { tag: "@chromium-only" }, () => {
     await input.fill(nickname.toLowerCase());
     await expect(rows).toHaveCount(1);
 
+    // The live region is in the page before there is anything to announce,
+    // so a screen reader is already watching it when the text arrives.
+    const status = page.getByTestId("member-search-status");
+    await expect(status).toHaveAttribute("role", "status");
+    await expect(status).toHaveText("");
     await input.fill("not-a-member-name-zzz");
     await expect(rows).toHaveCount(0);
-    await expect(list.getByRole("status")).toHaveText("No matching members");
+    await expect(list.getByText("No matching members")).toBeVisible();
+    await expect(status).toHaveText("No matching members");
 
     await input.fill(nickname);
     await rows.first().click();
