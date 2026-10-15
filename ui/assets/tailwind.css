@@ -230,6 +230,14 @@ html, body {
 .app-root {
   position: fixed;
   inset: 0;
+  /* Width from the same viewport the media queries and vw units read.
+     Narrowing the window, Chromium lays the page out once with the new
+     breakpoints and sidebar widths but the old width for `inset: 0`, so the
+     chat column is briefly wider than before or after. Rows that wrap to the
+     column then make the history shorter for that one layout, and the clamp
+     moves a reader held at the end up. The root never scrolls, so 100vw is
+     the viewport's width. */
+  width: 100vw;
 }
 
 /* Disable 300ms tap delay on all interactive elements.
