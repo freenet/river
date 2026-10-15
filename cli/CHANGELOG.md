@@ -2,6 +2,18 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.20] - 2026-10-15
+
+### Fixed
+- Migrating a room to a new contract no longer mistakes another room's
+  subscription notification for the answer to its own migration PUT. The node
+  multiplexes every subscription onto one connection, so a notification for an
+  unrelated room arriving during the wait was counted as success: the wrong
+  contract key was returned for that run, and the old state's merge was not
+  retried. The migration now waits only for the PUT's own answer, always records
+  the new contract's key, and refuses to start if the bundled contract does not
+  match it. (freenet/river#689)
+
 ## [0.2.18] - 2026-09-12
 
 ### Fixed
