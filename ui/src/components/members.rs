@@ -7,7 +7,9 @@ use crate::util::confusable::{
 use crate::util::display_name::display_nickname;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaFileExport, FaUserPlus, FaUsers};
+use dioxus_free_icons::icons::fa_solid_icons::{
+    FaFileExport, FaMagnifyingGlass, FaUserPlus, FaUsers,
+};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::identity::IdentityExport;
@@ -1604,7 +1606,7 @@ pub fn MemberList() -> Element {
                     }
                     button {
                         "data-testid": "member-search-toggle",
-                        class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2 min-w-0",
+                        class: "flex-1 min-w-0 text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2 text-left",
                         "aria-expanded": if *member_search_open.read() { "true" } else { "false" },
                         "aria-label": "Search active members",
                         title: "Search active members",
@@ -1618,13 +1620,18 @@ pub fn MemberList() -> Element {
                             });
                         },
                         Icon { icon: FaUsers, width: 16, height: 16 }
-                        span { "Active Members" }
+                        span { class: "truncate", "Active Members" }
+                        span { class: "flex-shrink-0 inline-flex",
+                            Icon { icon: FaMagnifyingGlass, width: 14, height: 14 }
+                        }
                     }
                 }
                 if *member_search_open.read() {
+                    // 16px text so iOS does not zoom the page when the field
+                    // is focused. The members panel is full width on a phone.
                     input {
                         "data-testid": "member-search-input",
-                        class: "mt-2 w-full px-3 py-1.5 bg-surface border border-border rounded-lg text-sm text-text",
+                        class: "mt-2 w-full px-3 py-2 bg-surface border border-border rounded-lg text-base text-text",
                         r#type: "search",
                         placeholder: "Search members",
                         value: "{member_query}",
