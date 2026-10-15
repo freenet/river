@@ -1014,8 +1014,11 @@ fn NoRoomFooter() -> Element {
 }
 
 /// Classes for the header description. Collapsed is one line: `truncate`
-/// clips it horizontally and `max-h-[1lh]` vertically, so a list, a heading
-/// or a hard break cannot grow the header either. Expanded wraps and scrolls
+/// clips it horizontally and `max-h-[calc(1lh+4px)]` vertically, so a list,
+/// a heading or a hard break cannot grow the header either. The 4px lets a
+/// line made taller by inline code or an emoji (17-19px against a 16px line,
+/// measured) show uncut; a heading or a list item is taller than that, so it
+/// overflows and gets the chevron (`header_description_overflows`). Expanded wraps and scrolls
 /// so a long description stays in the header instead of pushing the messages
 /// off the screen (freenet/river#718).
 fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
@@ -1024,10 +1027,10 @@ fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
             "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted [&>p]:m-0 break-words cursor-pointer max-h-48 overflow-y-auto"
         }
         (false, true) => {
-            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate max-h-[1lh] [&>*]:m-0 [&>p]:inline cursor-pointer"
+            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate max-h-[calc(1lh+4px)] [&>*]:m-0 [&>p]:inline cursor-pointer"
         }
         (false, false) => {
-            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate max-h-[1lh] [&>*]:m-0 [&>p]:inline"
+            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate max-h-[calc(1lh+4px)] [&>*]:m-0 [&>p]:inline"
         }
     }
 }
@@ -1058,16 +1061,15 @@ fn header_description_is_expanded() -> bool {
 fn header_description_overflows() -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        // Both axes: a long line overflows sideways, and a list, a heading or
-        // a hard break overflows the one-line `max-h-[1lh]` clamp downwards
-        // (see `room_description_class`). Sideways, 1px of slack: a flex item
-        // at a fractional text width can round a pixel apart and look
-        // truncated when it fits. Downwards, half a line: inline code or an
-        // emoji makes one line's box a few pixels taller than `1lh` (2-3px
-        // measured), while a second line adds a whole line.
+        // Both axes, against the same box the collapsed class clamps to
+        // (see `room_description_class`): a long line overflows sideways, and
+        // a list, a heading or a hard break overflows downwards. Anything that
+        // overflows is cut off, so it must get the chevron. The 1px slack: a
+        // flex item at a fractional size can round a pixel apart and look
+        // truncated when it fits.
         return header_description_element().is_some_and(|element| {
             element.scroll_width() > element.client_width() + 1
-                || element.scroll_height() * 2 > element.client_height() * 3
+                || element.scroll_height() > element.client_height() + 1
         });
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -1122,12 +1124,54 @@ fn description_selection_is_collapsed() -> bool {
     }
 }
 
-/// How long a mouse click on the description waits before toggling, so that
-/// the first click of a double-click (which selects a word) can be cancelled
-/// by the second. 500ms is the Windows default double-click time, the
-/// longest common default. A finger toggles at once (a double tap does not
-/// select a word), and so does the chevron.
+/// How long a mouse or pen click on the description waits before toggling,
+/// so that the first click of a double-click (which selects a word) can be
+/// cancelled by the second. 500ms is the Windows default double-click time,
+/// the longest common default. A finger toggles at once (a double tap does
+/// not select a word), and so does the chevron.
 const DESCRIPTION_DOUBLE_CLICK_WAIT_MS: u64 = 500;
+
+thread_local! {
+    /// Test-only override of [`DESCRIPTION_DOUBLE_CLICK_WAIT_MS`], set by the
+    /// `setDescriptionClickWaitMs` hook in `test_hooks.rs`, so a spec can make
+    /// the wait long enough that it cannot expire during the steps it checks.
+    static DESCRIPTION_CLICK_WAIT_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[allow(dead_code)] // Only the example-data test hooks call it.
+pub(crate) fn set_description_click_wait_ms(ms: u64) {
+    DESCRIPTION_CLICK_WAIT_OVERRIDE.with(|wait| wait.set(Some(ms)));
+}
+
+fn description_click_wait_ms() -> u64 {
+    DESCRIPTION_CLICK_WAIT_OVERRIDE
+        .with(|wait| wait.get())
+        .unwrap_or(DESCRIPTION_DOUBLE_CLICK_WAIT_MS)
+}
+
+/// Mark the description with a waiting click's state, so a test can tell
+/// "the wait has not ended" from "it ended without toggling": while a click
+/// waits, `data-click-pending` holds its number; when that click's wait ends,
+/// `data-click-outcome` is `toggled` or `cancelled`. Plain DOM attributes,
+/// not rendered state, so they cost no render.
+fn mark_description_click(armed: u64, outcome: Option<&str>) {
+    let Some(element) = header_description_element() else {
+        return;
+    };
+    match outcome {
+        None => {
+            let _ = element.remove_attribute("data-click-outcome");
+            let _ = element.set_attribute("data-click-pending", &armed.to_string());
+        }
+        Some(outcome) => {
+            if element.get_attribute("data-click-pending") == Some(armed.to_string()) {
+                let _ = element.remove_attribute("data-click-pending");
+            }
+            let _ = element.set_attribute("data-click-outcome", outcome);
+        }
+    }
+}
 
 fn note_description_overflow(description_overflows: &mut Signal<bool>) {
     if header_description_is_expanded() {
@@ -2567,6 +2611,12 @@ pub fn Conversation() -> Element {
                                                         record_press(&pressed, "description", e.data().pointer_type());
                                                     }
                                                 },
+                                                onpointercancel: {
+                                                    let pressed = description_pressed_with.clone();
+                                                    move |_| {
+                                                        pressed.borrow_mut().take();
+                                                    }
+                                                },
                                                 onclick: {
                                                     let toggle_description = toggle_description.clone();
                                                     let toggle_gen = description_toggle_gen.clone();
@@ -2587,8 +2637,10 @@ pub fn Conversation() -> Element {
                                                             return;
                                                         }
                                                         // A finger toggles at once: a double tap
-                                                        // does not select a word.
-                                                        if matches!(pressed_with.as_deref(), Some("touch" | "pen")) {
+                                                        // does not select a word. A pen waits like
+                                                        // a mouse, since a pen double-tap selects a
+                                                        // word in desktop browsers.
+                                                        if pressed_with.as_deref() == Some("touch") {
                                                             toggle_description();
                                                             return;
                                                         }
@@ -2600,14 +2652,17 @@ pub fn Conversation() -> Element {
                                                         // select a different word or none.
                                                         let toggle_gen = toggle_gen.clone();
                                                         let toggle_description = toggle_description.clone();
+                                                        let wait_ms = description_click_wait_ms();
+                                                        mark_description_click(armed, None);
                                                         crate::util::safe_spawn_local(async move {
-                                                            crate::util::sleep(crate::util::millis(
-                                                                DESCRIPTION_DOUBLE_CLICK_WAIT_MS,
-                                                            ))
-                                                            .await;
-                                                            if toggle_gen.get() == armed
-                                                                && description_selection_is_collapsed()
-                                                            {
+                                                            crate::util::sleep(crate::util::millis(wait_ms)).await;
+                                                            let toggles = toggle_gen.get() == armed
+                                                                && description_selection_is_collapsed();
+                                                            mark_description_click(
+                                                                armed,
+                                                                Some(if toggles { "toggled" } else { "cancelled" }),
+                                                            );
+                                                            if toggles {
                                                                 toggle_description();
                                                             }
                                                         });
@@ -3363,13 +3418,18 @@ type PressRecord = Rc<std::cell::RefCell<Option<(String, String, f64)>>>;
 
 /// A press older than this belongs to some other gesture: a press dragged
 /// off the control (no click, and no `pointercancel` either), followed later
-/// by a click that had no press of its own.
+/// by a click that had no press of its own. A mouse held on a reaction chip
+/// for longer than this therefore opens the list rather than removing.
 const PRESS_FRESH_MS: f64 = 1500.0;
 
+/// Monotonic milliseconds (`performance.now()`), so a wall-clock change
+/// cannot make a press look fresh or stale.
 fn now_ms() -> f64 {
     #[cfg(target_arch = "wasm32")]
     {
-        js_sys::Date::now()
+        web_sys::window()
+            .and_then(|window| window.performance())
+            .map_or(0.0, |performance| performance.now())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

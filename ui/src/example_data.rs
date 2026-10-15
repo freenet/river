@@ -222,6 +222,20 @@ pub fn create_example_rooms() -> Rooms {
             HistoryDepth::Standard,
         );
         map.insert(room.owner_vk, room.room_data);
+        // A heading alone, and a single list item: one line each, but taller
+        // than the collapsed clamp, so each is cut off and needs the chevron.
+        for (name, description) in [
+            ("Heading Room", "## Welcome to the heading room"),
+            ("Single Item Room", "- Be kind"),
+        ] {
+            let room = create_room(
+                &name.to_string(),
+                SelfIs::Member,
+                Some(description),
+                HistoryDepth::Standard,
+            );
+            map.insert(room.owner_vk, room.room_data);
+        }
         // One short line whose inline code and emoji make its line box a
         // little taller than plain text. It fits, so it gets no chevron.
         let room = create_room(

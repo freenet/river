@@ -58,6 +58,7 @@ web-sys = { workspace = true, features = [
     "MediaStreamTrack",
     "MediaQueryList",
     "MouseEvent",
+    "Performance",
     "PointerEvent",
     "IntersectionObserver",
     "IntersectionObserverEntry",

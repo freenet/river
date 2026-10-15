@@ -260,6 +260,17 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // How long a mouse click on the room description waits before it
+    // toggles. A spec sets it long, so the wait cannot end while the steps
+    // that must happen inside it run, however slow the runner.
+    set_hook(
+        "setDescriptionClickWaitMs",
+        Closure::<dyn FnMut(u32)>::new(move |ms: u32| {
+            crate::components::conversation::set_description_click_wait_ms(u64::from(ms));
+        })
+        .into_js_value(),
+    );
+
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 

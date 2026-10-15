@@ -18,6 +18,8 @@ type RiverTestHooks = {
   admitDmPeer(peerIndex: 0 | 1): void;
   // An own DM to the peer through the real send path; resolves to the outcome, "Sent" on success.
   sendDmToPeer(peerIndex: 0 | 1, text: string): Promise<string>;
+  // How long a mouse click on the room description waits before toggling.
+  setDescriptionClickWaitMs(ms: number): void;
 };
 
 // One hook per round trip.
