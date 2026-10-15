@@ -56,10 +56,17 @@ test.describe("Member search", { tag: "@chromium-only" }, () => {
 
     await expect(page.getByTestId("member-search-input")).toHaveCount(0);
     const toggle = page.getByTestId("member-search-toggle");
+    // Still a heading, with the toggle inside it.
+    await expect(page.getByRole("heading", { name: "Active Members" })).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-controls", "member-search-input");
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect((await toggle.boundingBox())!.height).toBeGreaterThanOrEqual(24);
     await toggle.click();
     const input = page.getByTestId("member-search-input");
     await expect(input).toBeVisible();
     await expect(input).toBeFocused();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(page.getByRole("searchbox", { name: "Search members by name" })).toBeVisible();
 
     const nickname = (
       await rows.nth(1).locator("span").first().innerText()
@@ -68,9 +75,22 @@ test.describe("Member search", { tag: "@chromium-only" }, () => {
     await expect(rows).toHaveCount(1);
     await expect(rows.first()).toContainText(nickname);
 
+    // Case does not matter, either way round.
+    await input.fill(nickname.toUpperCase());
+    await expect(rows).toHaveCount(1);
+    await expect(rows.first()).toContainText(nickname);
+    await input.fill(nickname.toLowerCase());
+    await expect(rows).toHaveCount(1);
+
+    // The live region is in the page before there is anything to announce,
+    // so a screen reader is already watching it when the text arrives.
+    const status = page.getByTestId("member-search-status");
+    await expect(status).toHaveAttribute("role", "status");
+    await expect(status).toHaveText("");
     await input.fill("not-a-member-name-zzz");
     await expect(rows).toHaveCount(0);
     await expect(list.getByText("No matching members")).toBeVisible();
+    await expect(status).toHaveText("No matching members");
 
     await input.fill(nickname);
     await rows.first().click();
@@ -81,5 +101,29 @@ test.describe("Member search", { tag: "@chromium-only" }, () => {
     await expect(page.getByTestId("member-search-input")).toHaveCount(0);
     await expect(toggle).toBeFocused();
     await expect(rows).toHaveCount(before);
+  });
+
+  test("switching rooms closes the search and clears the query", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+
+    const rows = page.getByTestId("member-list").locator('[data-testid^="member-item-"]');
+    await expect(rows.first()).toBeVisible();
+    const toggle = page.getByTestId("member-search-toggle");
+    await toggle.click();
+    await page.getByTestId("member-search-input").fill("not-a-member-name-zzz");
+    await expect(rows).toHaveCount(0);
+
+    await selectRoom(page, "Public Discussion Room");
+    await expect(page.getByTestId("member-search-input")).toHaveCount(0);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(rows.first()).toBeVisible();
+    await expect(page.getByText("No matching members")).toHaveCount(0);
+
+    // Coming back does not bring the old query with it.
+    await selectRoom(page, "Team Chat Room");
+    await expect(rows.first()).toBeVisible();
+    await expect(page.getByTestId("member-search-input")).toHaveCount(0);
   });
 });

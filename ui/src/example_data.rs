@@ -211,6 +211,44 @@ pub fn create_example_rooms() -> Rooms {
         }
     }
 
+    // A description that is several short lines: no line overflows
+    // sideways, but the list is taller than the one-line header clamp, so it
+    // still needs the chevron (freenet/river#718 review).
+    if fixture_requested("multiline-description") {
+        let room = create_room(
+            &"House Rules Room".to_string(),
+            SelfIs::Member,
+            Some("Rules:\n\n- Be kind\n- No spam\n- Stay on topic"),
+            HistoryDepth::Standard,
+        );
+        map.insert(room.owner_vk, room.room_data);
+        // A heading alone and a single list item, one line each. The heading
+        // renders at the header's 12px/16px and fits, so it gets no chevron;
+        // the list item's box is taller than the collapsed clamp, so it is cut
+        // off and gets the chevron.
+        for (name, description) in [
+            ("Heading Room", "## Read this first"),
+            ("Single Item Room", "- Be kind"),
+        ] {
+            let room = create_room(
+                &name.to_string(),
+                SelfIs::Member,
+                Some(description),
+                HistoryDepth::Standard,
+            );
+            map.insert(room.owner_vk, room.room_data);
+        }
+        // One short line whose inline code and emoji make its line box a
+        // little taller than plain text. It fits, so it gets no chevron.
+        let room = create_room(
+            &"Inline Code Room".to_string(),
+            SelfIs::Member,
+            Some("Run `cargo make` 🚀"),
+            HistoryDepth::Standard,
+        );
+        map.insert(room.owner_vk, room.room_data);
+    }
+
     Rooms {
         map,
         current_room_key: None,
