@@ -41,6 +41,9 @@
   --color-warning-bg: #fefce8;
   --color-error-bg: #fef2f2;
   --color-accent-soft: oklch(from #0265e7 l c h / 12%);
+  /* Message-row hover band. Derived from the surface token, so the dark
+     value follows the dark --color-surface below. */
+  --color-row-hover: color-mix(in srgb, var(--color-surface) 40%, transparent);
 }
 
 /* Dark mode colors */

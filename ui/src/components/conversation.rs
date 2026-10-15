@@ -2892,8 +2892,8 @@ pub fn Conversation() -> Element {
                                     Some(rsx! {
                                         // Backfill trigger while older items
                                         // are held back; see `BACKFILL_LEAD_PX`.
-                                        // Outside the `space-y-4` list, where
-                                        // it would add a row gap above the
+                                        // Outside the history list, so it
+                                        // adds no row of its own to the
                                         // history. Waits for the opening snap
                                         // (see `opening_snap_done`) and for
                                         // that signal's room-change reset.
@@ -2929,7 +2929,9 @@ pub fn Conversation() -> Element {
                                             }
                                         }
                                         div {
-                                            class: "space-y-4",
+                                            // -my-2 cancels the first and last rows' 8px band padding;
+                                            // separators and events pad to match.
+                                            class: "-my-2",
                                             // Stable automation hook for the
                                             // history rows (AGENTS.md test-id
                                             // rule); additive markup only.
@@ -2952,7 +2954,7 @@ pub fn Conversation() -> Element {
                                                     DisplayRow::DateSeparator { key, label } => rsx! {
                                                         div {
                                                             key: "{key}",
-                                                            class: "flex justify-center py-2",
+                                                            class: "flex justify-center py-4",
                                                             span {
                                                                 class: "text-xs font-medium text-text-muted bg-surface px-3 py-1 rounded-full",
                                                                 "{label}"
@@ -2968,7 +2970,7 @@ pub fn Conversation() -> Element {
                                                                 "data-item-key": "{key}",
                                                                 // For `capture_reading_anchor`.
                                                                 "data-anchor-key": "{key}",
-                                                                class: "flex justify-center py-1",
+                                                                class: "flex justify-center py-3",
                                                                 span {
                                                                     class: "text-xs text-text-muted italic",
                                                                     "{text}"
@@ -2986,8 +2988,7 @@ pub fn Conversation() -> Element {
                                                             // component cannot carry a DOM
                                                             // attribute directly. It is the
                                                             // keyed list child, so diffing
-                                                            // and `space-y-4` spacing are
-                                                            // unchanged.
+                                                            // is unchanged.
                                                             div {
                                                                 key: "{key}",
                                                                 "data-item-key": "{key}",

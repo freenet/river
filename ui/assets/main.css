@@ -57,12 +57,39 @@
 
 /* Message rows (conversation.rs). Every author gets the same full-column row:
  * a 36px avatar slot, a 12px gap and the content column, then a 72px right
- * gutter that holds the hover bar and the touch kebab. */
+ * gutter that holds the hover bar and the touch kebab. Rows bleed 8px into
+ * #chat-content's padding so the hover band has room: 8px around a group, 2px
+ * between its rows. The history list's -my-2 cancels the group-edge padding
+ * at its top and bottom, so the bottom sentinel sits at the newest message's
+ * bottom, not below its padding. No opacity, transform, filter, isolation or
+ * z-index on a row: a stacking context there would trap its menus beneath
+ * later rows. */
 .msg-row {
     display: grid;
     grid-template-columns: 36px minmax(0, 1fr);
     column-gap: 12px;
-    padding-right: 72px;
+    margin-inline: -0.5rem;
+    padding: 0.125rem 72px 0.125rem 0.5rem;
+    border-radius: 0.5rem;
+    transition: background-color 0.15s;
+}
+
+.msg-row:first-child {
+    padding-top: 0.5rem;
+}
+
+.msg-row:last-child {
+    padding-bottom: 0.5rem;
+}
+
+/* Fine pointers only: a touchscreen laptop would otherwise keep a sticky
+ * band. The band also stays while a control the row opened (a reaction
+ * chip's reactor list, the kebab menu) reports itself expanded. */
+@media (hover: hover) and (not (any-pointer: coarse)) {
+    .msg-row:hover,
+    .msg-row:has([aria-expanded="true"]) {
+        background-color: var(--color-row-hover);
+    }
 }
 
 .msg-avatar {

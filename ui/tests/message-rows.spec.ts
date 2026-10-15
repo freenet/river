@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { openRoomWithComposer, resolveColor, waitForApp } from "./example-room";
+import { openRoomWithComposer, resolveColor, settle, waitForApp } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // Full-width chat rows (plan 11): every author's group gets one River-logo
@@ -226,5 +226,133 @@ test.describe("Message rows at 320px", () => {
       });
       expect(hit, "the kebab is hit-testable").toBe(true);
     }
+  });
+});
+
+// The hover band (fine pointers only): hovering anywhere in a message row,
+// avatar and header included, fills that row and only that row, bleeding 8px
+// past the column on each side; it stays while a control the row opened is
+// expanded.
+async function fine(page: Page) {
+  return !(await page.evaluate(() => matchMedia("(hover: none), (any-pointer: coarse)").matches));
+}
+
+function background(row: Locator) {
+  return row.evaluate(async (el) => {
+    // Let the band's fade settle: a poll would pass on a sample mid-fade.
+    await Promise.all(el.getAnimations().map((a) => a.finished));
+    return getComputedStyle(el).backgroundColor;
+  });
+}
+
+async function bandedRows(page: Page): Promise<string[]> {
+  return page.getByTestId("message-row").evaluateAll((rows) =>
+    rows
+      .filter((r) => {
+        const c = getComputedStyle(r).backgroundColor;
+        return c !== "rgba(0, 0, 0, 0)" && c !== "transparent";
+      })
+      .map((r) => r.id),
+  );
+}
+
+test.describe("Message row hover band", () => {
+  test("only the hovered row lights, across the column, with the avatar and header", async ({ page }) => {
+    test.skip(!(await fine(page)), "no hover band on a touch pointer");
+    const { received } = await openRoomWithPairs(page);
+    const [first, second] = [received.getByTestId("message-row").first(), received.getByTestId("message-row").nth(1)];
+    const band = await resolveColor(page, "var(--color-row-hover)");
+    expect(band[3], "premise: the band token resolves to a visible colour").toBeGreaterThan(0);
+
+    for (const [what, target, row] of [
+      ["the avatar", received.getByTestId("message-group-avatar"), first],
+      ["the header", received.getByTestId("message-group-header"), first],
+      ["the first body", first.getByTestId("message-body"), first],
+      ["a continuation row", second.getByTestId("message-body"), second],
+    ] as const) {
+      await page.mouse.move(0, 0);
+      await expect.poll(() => bandedRows(page), { message: "idle: no band" }).toEqual([]);
+      await target.hover();
+      await expect
+        .poll(async () => resolveColor(page, await background(row)), { message: `${what}: band` })
+        .toEqual(band);
+      expect(await bandedRows(page), `${what}: only its row`).toEqual([await row.getAttribute("id")]);
+    }
+
+    // Across the column: 8px past the history on each side, inside the scroller.
+    const geometry = await first.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const h = document.querySelector('[data-testid="conversation-history"]')!.getBoundingClientRect();
+      const s = document.getElementById("chat-scroll-container")!;
+      return { left: h.left - r.left, right: r.right - h.right, overflow: s.scrollWidth - s.clientWidth };
+    });
+    expect(geometry.left).toBeCloseTo(8, 0);
+    expect(geometry.right).toBeCloseTo(8, 0);
+    expect(geometry.overflow).toBeLessThanOrEqual(0);
+
+    // 8px at the group's edges, 2px between its rows.
+    const spacing = await received.evaluate((el) => {
+      const [a, b] = Array.from(el.querySelectorAll('[data-testid="message-row"]'));
+      const top = (e: Element) => e.getBoundingClientRect().top;
+      return {
+        groupTop: top(a.querySelector('[data-testid="message-group-avatar"]')!) - top(a),
+        betweenRows: top(b.querySelector('[data-testid="message-body"]')!) - top(b),
+        groupBottom: b.getBoundingClientRect().bottom - b.querySelector(".msg-content")!.getBoundingClientRect().bottom,
+      };
+    });
+    expect(spacing.groupTop).toBeCloseTo(8, 0);
+    expect(spacing.betweenRows).toBeCloseTo(2, 0);
+    expect(spacing.groupBottom).toBeCloseTo(8, 0);
+  });
+
+  test.describe("at a narrow width", () => {
+    test.use({ viewport: { width: 480, height: 800 } });
+
+    test("the band stays while the row's reactor list is open, and closing it does not scroll", async ({ page }) => {
+      test.skip(!(await fine(page)), "no hover band on a touch pointer");
+      const { received } = await openRoomWithPairs(page);
+      const row = received.getByTestId("message-row").nth(1);
+      await row.scrollIntoViewIfNeeded();
+      await row.hover();
+      await row.getByTestId("add-reaction-button").click();
+      await page.getByTestId("emoji-picker").getByRole("button").first().click();
+      const chip = row.getByTestId("reaction-chip");
+      await expect(chip).toHaveCount(1);
+
+      const band = await resolveColor(page, "var(--color-row-hover)");
+      const scrollTop = () => page.evaluate(() => document.getElementById("chat-scroll-container")!.scrollTop);
+      // Park the reader short of the end, where nothing but a scroll moves
+      // scrollTop: at the end, a shorter reaction row would clamp it.
+      await page.evaluate(() => {
+        const c = document.getElementById("chat-scroll-container")!;
+        c.scrollTop = c.scrollHeight - c.clientHeight - 150;
+      });
+      await settle(page);
+      await expect(row).toBeInViewport();
+      await chip.focus();
+      await page.keyboard.press("Enter");
+      const owners = page.getByTestId("reaction-owners");
+      await expect(owners).toBeVisible();
+      await expect(chip).toHaveAttribute("aria-expanded", "true");
+      await page.mouse.move(0, 0);
+      expect(await resolveColor(page, await background(row)), "the band stays while the list is open").toEqual(band);
+      const box = (await owners.boundingBox())!;
+      expect(box.x).toBeGreaterThanOrEqual(-0.5);
+      expect(box.x + box.width).toBeLessThanOrEqual(480.5);
+
+      const before = await scrollTop();
+      await page.keyboard.press("Escape");
+      await expect(owners).toHaveCount(0);
+      await expect.poll(() => bandedRows(page), { message: "the band goes with the list" }).toEqual([]);
+      expect(await scrollTop(), "closing the list does not scroll").toBe(before);
+
+      // Remove the reaction from the list: the chip goes, and still nothing scrolls.
+      await chip.focus();
+      await page.keyboard.press("Enter");
+      await page.getByTestId("reaction-remove").click();
+      await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
+      await expect(owners).toHaveCount(0);
+      expect(await scrollTop(), "removing the reaction does not scroll").toBe(before);
+    });
   });
 });
