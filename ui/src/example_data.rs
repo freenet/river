@@ -222,6 +222,15 @@ pub fn create_example_rooms() -> Rooms {
             HistoryDepth::Standard,
         );
         map.insert(room.owner_vk, room.room_data);
+        // One short line whose inline code and emoji make its line box a
+        // little taller than plain text. It fits, so it gets no chevron.
+        let room = create_room(
+            &"Inline Code Room".to_string(),
+            SelfIs::Member,
+            Some("Run `cargo make` 🚀"),
+            HistoryDepth::Standard,
+        );
+        map.insert(room.owner_vk, room.room_data);
     }
 
     Rooms {

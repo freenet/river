@@ -1060,12 +1060,14 @@ fn header_description_overflows() -> bool {
     {
         // Both axes: a long line overflows sideways, and a list, a heading or
         // a hard break overflows the one-line `max-h-[1lh]` clamp downwards
-        // (see `room_description_class`). The 1px slack: a flex item at a
-        // fractional text width can round a pixel apart and look truncated
-        // when it fits.
+        // (see `room_description_class`). Sideways, 1px of slack: a flex item
+        // at a fractional text width can round a pixel apart and look
+        // truncated when it fits. Downwards, half a line: inline code or an
+        // emoji makes one line's box a few pixels taller than `1lh` (2-3px
+        // measured), while a second line adds a whole line.
         return header_description_element().is_some_and(|element| {
             element.scroll_width() > element.client_width() + 1
-                || element.scroll_height() > element.client_height() + 1
+                || element.scroll_height() * 2 > element.client_height() * 3
         });
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -1120,10 +1122,12 @@ fn description_selection_is_collapsed() -> bool {
     }
 }
 
-/// How long a click on the description waits before toggling, so that the
-/// first click of a double-click (which selects a word) can be cancelled by
-/// the second. The chevron toggles at once.
-const DESCRIPTION_DOUBLE_CLICK_WAIT_MS: u64 = 250;
+/// How long a mouse click on the description waits before toggling, so that
+/// the first click of a double-click (which selects a word) can be cancelled
+/// by the second. 500ms is the Windows default double-click time, the
+/// longest common default. A finger toggles at once (a double tap does not
+/// select a word), and so does the chevron.
+const DESCRIPTION_DOUBLE_CLICK_WAIT_MS: u64 = 500;
 
 fn note_description_overflow(description_overflows: &mut Signal<bool>) {
     if header_description_is_expanded() {
@@ -1368,10 +1372,15 @@ pub fn Conversation() -> Element {
     // True when the collapsed line does not fit. Stays true while expanded so
     // the chevron does not vanish on the way back to one line.
     let description_overflows = use_signal(|| false);
-    // Bumped by every click on the description. A pending single-click toggle
-    // only runs if no later click arrived, so a double-click that selects a
-    // word does not also expand the block.
-    let description_click_seq = use_hook(|| Rc::new(std::cell::Cell::new(0u64)));
+    // Bumped by every click on the description, every toggle (chevron, text,
+    // or a waiting click landing) and every room change. A waiting mouse
+    // click toggles only if nothing bumped it meanwhile, so neither a
+    // double-click, nor a chevron press, nor a room switch (even A to B and
+    // back to A) is followed by a stale toggle.
+    let description_toggle_gen = use_hook(|| Rc::new(std::cell::Cell::new(0u64)));
+    let description_seen_room =
+        use_hook(|| Rc::new(std::cell::Cell::new(None::<ed25519_dalek::VerifyingKey>)));
+    let description_pressed_with: PressRecord = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
     {
         let mut description_overflows = description_overflows;
         use_effect(move || {
@@ -1453,6 +1462,9 @@ pub fn Conversation() -> Element {
     // this is render; checked again when it runs so a quick switch back does
     // not clear the wrong room.
     if let Ok(open_room) = CURRENT_ROOM.try_read().map(|room| room.owner_key) {
+        if description_seen_room.replace(open_room) != open_room {
+            description_toggle_gen.set(description_toggle_gen.get().wrapping_add(1));
+        }
         let stale = expanded_description_room
             .try_read()
             .is_ok_and(|expanded| expanded.is_some() && *expanded != open_room);
@@ -2395,7 +2407,9 @@ pub fn Conversation() -> Element {
                         description_expanded || *description_overflows.read();
                     let toggle_description = {
                         let room_key = room_key;
+                        let toggle_gen = description_toggle_gen.clone();
                         move || {
+                            toggle_gen.set(toggle_gen.get().wrapping_add(1));
                             crate::util::defer(move || {
                                 // A delayed description click can land after
                                 // a room switch; it belongs to the old room.
@@ -2547,15 +2561,23 @@ pub fn Conversation() -> Element {
                                                     description_expanded,
                                                     description_can_toggle,
                                                 ),
+                                                onpointerdown: {
+                                                    let pressed = description_pressed_with.clone();
+                                                    move |e: PointerEvent| {
+                                                        record_press(&pressed, "description", e.data().pointer_type());
+                                                    }
+                                                },
                                                 onclick: {
                                                     let toggle_description = toggle_description.clone();
-                                                    let click_seq = description_click_seq.clone();
+                                                    let toggle_gen = description_toggle_gen.clone();
+                                                    let pressed = description_pressed_with.clone();
                                                     move |evt| {
                                                         // Every click, the second of a
                                                         // double-click included, cancels a
                                                         // toggle still waiting below.
-                                                        let this_click = click_seq.get().wrapping_add(1);
-                                                        click_seq.set(this_click);
+                                                        let armed = toggle_gen.get().wrapping_add(1);
+                                                        toggle_gen.set(armed);
+                                                        let pressed_with = take_fresh_press(&pressed, "description");
                                                         if description_click_is_link(&evt)
                                                             || description_click_is_multi(&evt)
                                                             || !description_selection_is_collapsed()
@@ -2564,19 +2586,26 @@ pub fn Conversation() -> Element {
                                                         {
                                                             return;
                                                         }
+                                                        // A finger toggles at once: a double tap
+                                                        // does not select a word.
+                                                        if matches!(pressed_with.as_deref(), Some("touch" | "pen")) {
+                                                            toggle_description();
+                                                            return;
+                                                        }
                                                         // The first click of a double-click has
                                                         // detail 1, so it cannot be told apart
                                                         // here. Wait out the double-click window:
                                                         // toggling now would reflow the text under
                                                         // the pointer, and the second click would
                                                         // select a different word or none.
-                                                        let click_seq = click_seq.clone();
+                                                        let toggle_gen = toggle_gen.clone();
+                                                        let toggle_description = toggle_description.clone();
                                                         crate::util::safe_spawn_local(async move {
                                                             crate::util::sleep(crate::util::millis(
                                                                 DESCRIPTION_DOUBLE_CLICK_WAIT_MS,
                                                             ))
                                                             .await;
-                                                            if click_seq.get() == this_click
+                                                            if toggle_gen.get() == armed
                                                                 && description_selection_is_collapsed()
                                                             {
                                                                 toggle_description();
@@ -2597,7 +2626,10 @@ pub fn Conversation() -> Element {
                                                     "aria-expanded": if description_expanded { "true" } else { "false" },
                                                     "aria-label": if description_expanded { "Hide room description" } else { "Show room description" },
                                                     title: if description_expanded { "Hide room description" } else { "Show room description" },
-                                                    onclick: move |_| toggle_description(),
+                                                    onclick: {
+                                                        let toggle_description = toggle_description.clone();
+                                                        move |_| toggle_description()
+                                                    },
                                                     if description_expanded {
                                                         Icon { icon: FaChevronUp, width: 14, height: 14 }
                                                     } else {
@@ -3324,6 +3356,41 @@ fn coarse_pointer() -> bool {
         .is_some_and(|mq| mq.matches())
 }
 
+/// The last `pointerdown` on one of a component's controls: the control's
+/// key, the `pointerType`, and when (ms). A click reads it to learn what
+/// pressed it. Not a signal: nothing renders from it.
+type PressRecord = Rc<std::cell::RefCell<Option<(String, String, f64)>>>;
+
+/// A press older than this belongs to some other gesture: a press dragged
+/// off the control (no click, and no `pointercancel` either), followed later
+/// by a click that had no press of its own.
+const PRESS_FRESH_MS: f64 = 1500.0;
+
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0.0
+    }
+}
+
+fn record_press(record: &PressRecord, key: &str, pointer_type: String) {
+    *record.borrow_mut() = Some((key.to_string(), pointer_type, now_ms()));
+}
+
+/// The `pointerType` of `key`'s own press, if it was recent. Consumes the
+/// record either way, so one press answers one click.
+fn take_fresh_press(record: &PressRecord, key: &str) -> Option<String> {
+    record
+        .borrow_mut()
+        .take()
+        .filter(|(pressed, _, at)| pressed == key && now_ms() - at <= PRESS_FRESH_MS)
+        .map(|(_, pointer_type, _)| pointer_type)
+}
+
 /// What a pointer of this type does to a chip: `Some(true)` opens the list,
 /// `Some(false)` removes, `None` is unknown.
 fn pointer_type_opens_owner_list(pointer_type: &str) -> Option<bool> {
@@ -3337,38 +3404,19 @@ fn pointer_type_opens_owner_list(pointer_type: &str) -> Option<bool> {
     }
 }
 
-/// A finger or a pen on a coarse screen opens the list. A mouse removes.
+/// A finger, or a pen on a coarse screen, opens the list. A mouse removes.
 ///
-/// `pressed_with` is the `pointerType` of the chip's own `pointerdown`, and
-/// it wins over the click's: iOS Safari 18.2 and later report a tap's
-/// `click` as `"mouse"` while its `pointerdown` says `"touch"` (WebKit bug
-/// 282988), and so does Playwright's WebKit. Without a `pointerdown` (a click
-/// synthesised by assistive technology) the click's own `pointerType`
-/// decides. Dioxus stores the click as a `MouseEvent` even when the browser
-/// object is a `PointerEvent`, so that cast is on the JS value. A plain mouse
-/// event (Safari before 17) falls back to the media query.
-fn gesture_opens_owner_list(
-    evt: &dioxus_core::Event<MouseData>,
-    pressed_with: Option<&str>,
-) -> bool {
-    if let Some(opens) = pressed_with.and_then(pointer_type_opens_owner_list) {
-        return opens;
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(mouse) = evt.data().downcast::<web_sys::MouseEvent>() {
-            if let Some(pointer) = mouse.dyn_ref::<web_sys::PointerEvent>() {
-                if let Some(opens) = pointer_type_opens_owner_list(&pointer.pointer_type()) {
-                    return opens;
-                }
-            }
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = evt;
-    }
-    coarse_pointer()
+/// `pressed_with` is the `pointerType` of the chip's own fresh `pointerdown`
+/// (see [`take_fresh_press`]), never the click's: iOS Safari 18.2 and later
+/// report a tap's `click` as `"mouse"` while its `pointerdown` says `"touch"`
+/// (WebKit bug 282988), and so does Playwright's WebKit. A click with no
+/// fresh press of its own (assistive technology activating the chip) opens
+/// the list: only a mouse removes in one step, and only when it is known to
+/// be a mouse.
+fn gesture_opens_owner_list(pressed_with: Option<&str>) -> bool {
+    pressed_with
+        .and_then(pointer_type_opens_owner_list)
+        .unwrap_or(true)
 }
 
 /// Where the reactor list for a chip opens, from a point on the chip (the
@@ -3566,11 +3614,10 @@ fn MessageGroupComponent(
             });
         }
     }
-    // The `pointerType` of the last `pointerdown` on a reaction chip in this
-    // group, with the chip's key. The chip's click consumes it; see
-    // `gesture_opens_owner_list` for why the click's own type is not enough.
-    // Not a signal: nothing renders from it.
-    let chip_pressed_with = use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, String)>)));
+    // The last `pointerdown` on a reaction chip in this group. The chip's
+    // click consumes it; see `gesture_opens_owner_list` for why the click's
+    // own type is not used.
+    let chip_pressed_with: PressRecord = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
     {
         // (key, message id) of the list that was open on the last run.
         let owners_focus = use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, String)>)));
@@ -4542,7 +4589,6 @@ fn MessageGroupComponent(
                                                                     id: "{owners_dialog_id}",
                                                                     "data-testid": "reaction-owners",
                                                                     role: "dialog",
-                                                                    "aria-modal": "true",
                                                                     tabindex: "-1",
                                                                     "aria-label": "Who reacted",
                                                                     class: format!(
@@ -4633,8 +4679,11 @@ fn MessageGroupComponent(
                                                                 ),
                                                                 title: "{tooltip}",
                                                                 onpointerdown: move |e: PointerEvent| {
-                                                                    *chip_pressed_with_down.borrow_mut() =
-                                                                        Some((owners_key_for_press.clone(), e.data().pointer_type()));
+                                                                    record_press(
+                                                                        &chip_pressed_with_down,
+                                                                        &owners_key_for_press,
+                                                                        e.data().pointer_type(),
+                                                                    );
                                                                 },
                                                                 onpointercancel: move |_| {
                                                                     chip_pressed_with_cancel.borrow_mut().take();
@@ -4642,13 +4691,12 @@ fn MessageGroupComponent(
                                                                 onclick: move |e: MouseEvent| {
                                                                     let click_y = e.client_coordinates().y;
                                                                     let click_x = e.client_coordinates().x;
-                                                                    // Only this chip's own press counts.
-                                                                    let pressed_with = chip_pressed_with_click
-                                                                        .borrow_mut()
-                                                                        .take()
-                                                                        .filter(|(key, _)| *key == owners_key_for_click)
-                                                                        .map(|(_, pointer_type)| pointer_type);
-                                                                    if gesture_opens_owner_list(&e, pressed_with.as_deref()) {
+                                                                    // Only this chip's own recent press counts.
+                                                                    let pressed_with = take_fresh_press(
+                                                                        &chip_pressed_with_click,
+                                                                        &owners_key_for_click,
+                                                                    );
+                                                                    if gesture_opens_owner_list(pressed_with.as_deref()) {
                                                                         let popover = reaction_owners_popover_at(
                                                                             owners_key_for_click.clone(),
                                                                             msg_id_for_owners.clone(),

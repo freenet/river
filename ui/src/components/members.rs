@@ -1620,6 +1620,7 @@ pub fn MemberList() -> Element {
     };
 
     let search_open = *member_search_open.read();
+    let no_match = members_loaded && members.is_empty() && !needle.is_empty();
 
     // Don't show members panel if no room is selected
     let has_room = CURRENT_ROOM.read().owner_key.is_some();
@@ -1714,16 +1715,22 @@ pub fn MemberList() -> Element {
                 }
             }
 
+            // Always in the DOM, so a screen reader is already watching it when
+            // its text changes: a live region that appears together with its
+            // message is often not announced.
+            div {
+                "data-testid": "member-search-status",
+                role: "status",
+                class: "sr-only",
+                if no_match { "No matching members" }
+            }
+
             // Member list - scrollable independently
             ul {
                 "data-testid": "member-list",
                 class: "flex-1 px-2 py-2 space-y-0.5 overflow-y-auto min-h-0",
-                if members_loaded && members.is_empty() && !needle.is_empty() {
-                    li {
-                        role: "status",
-                        class: "px-3 py-2 text-sm text-text-muted",
-                        "No matching members"
-                    }
+                if no_match {
+                    li { class: "px-3 py-2 text-sm text-text-muted", "No matching members" }
                 }
                 for (parts, member_id) in members {
                     li {
