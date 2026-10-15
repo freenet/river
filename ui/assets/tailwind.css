@@ -105,7 +105,7 @@ html, body {
    <p> blocks the Markdown renderer emits for blank-line-separated
    paragraphs collapse into a single wall of text (freenet/river#158).
    Re-add vertical spacing between paragraphs, but trim the outer edges
-   so a message bubble has no dangling gap above its first paragraph or
+   so a message body has no dangling gap above its first paragraph or
    below its last. Single newlines are already preserved as <br> by
    message_to_html, so this rule only affects true paragraph breaks. */
 .prose p {
@@ -128,18 +128,7 @@ html, body {
   color: var(--color-accent-hover);
 }
 
-/* Links in self-messages (blue background, white text) */
-.bg-accent .prose a {
-  color: white;
-  text-decoration: underline;
-  opacity: 0.95;
-}
-
-.bg-accent .prose a:hover {
-  opacity: 1;
-}
-
-/* Inline code in prose (received messages) */
+/* Inline code in prose */
 .prose code {
   background-color: rgba(0, 0, 0, 0.08);
   padding: 0.125rem 0.25rem;
@@ -153,13 +142,7 @@ html, body {
   }
 }
 
-/* Inline code in sent messages (blue background) */
-.bg-accent .prose code {
-  background-color: rgba(255, 255, 255, 0.2);
-  color: inherit;
-}
-
-/* Code blocks in prose (received messages) */
+/* Code blocks in prose */
 .prose pre {
   background-color: rgba(0, 0, 0, 0.08);
   padding: 0.75rem 1rem;
@@ -173,24 +156,18 @@ html, body {
   }
 }
 
-/* Code blocks in sent messages (blue background) */
-.bg-accent .prose pre {
-  background-color: rgba(0, 0, 0, 0.15);
-  color: inherit;
-}
-
 .prose pre code {
   background-color: transparent;
   padding: 0;
 }
 
-/* Blockquotes in prose (received bubbles, DM bubbles, room descriptions).
+/* Blockquotes in prose (message rows, DM bubbles, room descriptions).
  *
  * `--color-text-quote` rather than `--color-text-muted`: a quote must stay
  * READABLE while reading as secondary, and the muted token — which is tuned
  * for timestamps and field labels, i.e. glanceable metadata — falls under the
  * 4.5:1 WCAG AA floor on two of the backgrounds a quote actually appears over,
- * BOTH of them in light mode: 4.47:1 on `--color-surface` (a received bubble)
+ * BOTH of them in light mode: 4.47:1 on `--color-surface` (the old received bubble)
  * and 3.96:1 on the `bg-accent/20` outgoing DM bubble, which is the worst
  * quote surface in the app. The dark-mode equivalents were already fine
  * (5.93:1 and 5.56:1). The quote token is one step further from the background
@@ -213,31 +190,6 @@ html, body {
   margin-left: 0;
   color: var(--color-text-quote);
   font-style: italic;
-}
-
-/* Blockquotes in own message bubbles (solid brand-blue bg, white text).
- *
- * This rule used to paint the quote `rgba(0, 0, 0, 0.8)` — near-black text in
- * a bubble whose every other word is white. That is the same failure the
- * `.bg-accent .river-mention` / `.bg-accent .prose a` overrides in main.css
- * exist to prevent, just for a different element: `.bg-accent` is the SAME
- * brand blue in light and dark mode, so the quote read as black-on-blue in
- * BOTH (3.52:1, under the 4.5:1 WCAG AA floor, against 5.23:1 for the normal
- * text right beside it). The `--color-accent-hover` border made it worse — at
- * 1.29:1 against the accent background it was invisible, so a quote in a sent
- * bubble had no marker at all beyond the indent.
- *
- * Take the bubble's own text colour (`inherit` → white) rather than a
- * hardcoded one, so the quote can never drift from the bubble's palette again.
- * Dimming is deliberately NOT how the quote is distinguished here: white on
- * the accent blue is only 5.23:1 to begin with, so any meaningful reduction
- * drops under AA. The affordance is carried by the border + the inherited
- * `font-style: italic` instead — the same convention `.bg-accent .prose a`
- * (white + underline) and the reply strip (`bg-white/25 text-white/90`) use
- * for sent bubbles. */
-.bg-accent .prose blockquote {
-  border-left-color: rgba(255, 255, 255, 0.7);
-  color: inherit;
 }
 
 /* Lists in prose (Tailwind reset strips list-style) */
@@ -263,12 +215,6 @@ html, body {
 
 .prose ul ul ul {
   list-style-type: square;
-}
-
-/* Lists in own message bubbles (blue bg) */
-.bg-accent .prose ul,
-.bg-accent .prose ol {
-  color: inherit;
 }
 
 /* iOS Safari viewport and touch fixes */

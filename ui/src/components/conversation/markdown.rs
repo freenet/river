@@ -1827,10 +1827,9 @@ mod tests {
 
     /// Extract the declaration body of a CSS rule by its exact selector text.
     ///
-    /// Anchored on a LINE START (`"\n{selector} {{"`), not a bare substring:
-    /// `.prose blockquote {` is a suffix of `.bg-accent .prose blockquote {`,
-    /// so a substring search would silently return the wrong rule's body if
-    /// the two were ever reordered in the file.
+    /// Anchored on a LINE START (`"\n{selector} {{"`), not a bare substring,
+    /// so a descendant rule such as `.x .prose blockquote {` can never be
+    /// returned for `.prose blockquote`.
     fn css_rule_body<'a>(css: &'a str, selector: &str) -> &'a str {
         let needle = format!("\n{selector} {{");
         let start = css
@@ -1844,53 +1843,8 @@ mod tests {
         &css[start..end]
     }
 
-    /// A quote inside the local user's own bubble must take the bubble's own
-    /// text colour, not a hardcoded one.
-    ///
-    /// `.bg-accent` is the solid brand-blue sent-message bubble, whose text is
-    /// `text-white`, and it is the SAME blue in light and dark mode. The rule
-    /// used to paint the quote `rgba(0, 0, 0, 0.8)`, so quoted text rendered
-    /// near-black inside a bubble of white text — 3.52:1 against the bubble,
-    /// under the 4.5:1 WCAG AA floor, in BOTH colour schemes. Pinning
-    /// `color: inherit` is what keeps the quote tied to the bubble's palette
-    /// instead of drifting from it again.
-    ///
-    /// The browser-side counterpart, which measures the real composited
-    /// contrast in both colour schemes rather than the declaration text, is
-    /// `ui/tests/blockquote-contrast.spec.ts`.
-    #[test]
-    fn sent_bubble_blockquote_inherits_bubble_text_colour() {
-        const TAILWIND_CSS: &str = include_str!("../../../assets/tailwind.css");
-        let body = css_rule_body(TAILWIND_CSS, ".bg-accent .prose blockquote");
-
-        // Check the LAST `color:` declaration, not merely that `inherit`
-        // appears somewhere in the body. CSS is last-one-wins within a rule,
-        // so `color: inherit; color: #111;` reintroduces the bug in full while
-        // a `contains("color: inherit")` check happily passes — a substring
-        // search cannot model the cascade. Take the final declaration, which
-        // is the one that actually paints.
-        //
-        // `border-left-color:` also ends in `color:`, hence the `-` guard.
-        let last_color = body
-            .split(';')
-            .map(str::trim)
-            .filter(|d| d.starts_with("color:"))
-            .next_back()
-            .unwrap_or_else(|| {
-                panic!("`.bg-accent .prose blockquote` should declare a colour. Found: {body}")
-            });
-
-        assert_eq!(
-            last_color, "color: inherit",
-            "the winning `color` declaration in `.bg-accent .prose blockquote` \
-             must be `inherit` so the quote takes the sent bubble's own text \
-             colour; a hardcoded colour is what made quoted text render \
-             black-on-blue beside white text. Full rule: {body}"
-        );
-    }
-
-    /// Quotes outside the sent bubble use a dedicated `--color-text-quote`
-    /// token rather than the app-wide `--color-text-muted`.
+    /// Quotes use a dedicated `--color-text-quote` token rather than the
+    /// app-wide `--color-text-muted`.
     ///
     /// The muted token is tuned for glanceable metadata (timestamps, field
     /// labels) and falls under 4.5:1 on two of the backgrounds a quote

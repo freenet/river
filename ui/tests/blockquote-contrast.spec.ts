@@ -2,20 +2,17 @@ import { test, expect, Page } from "@playwright/test";
 import { waitForApp, selectRoom } from "./example-room";
 import { openMemberInfoForFirstNonSelf } from "./invite-picker";
 
-// Regression test: quoted text (`> …` Markdown) inside a message bubble must
-// stay legible, and must not invert against the bubble it sits in.
+// Regression test: quoted text (`> …` Markdown) in a message must stay
+// legible, and must not invert against the surface it sits on.
 //
-// The reported bug: in a SENT bubble — solid brand blue, every other word
-// white — `.bg-accent .prose blockquote` painted the quote `rgba(0, 0, 0, 0.8)`.
-// Quoted text rendered near-black beside white text at 3.52:1, under the 4.5:1
-// WCAG AA floor. `.bg-accent` is the same blue in light and dark mode, so the
-// bug was present in BOTH schemes even though it was reported against dark.
-// Both schemes are exercised below for exactly that reason: the assertion is
-// duplicative by construction, and it is there to keep it that way.
+// The reported bug was in the old solid-blue SENT bubble, where the quote
+// painted near-black beside white text (3.52:1). Messages now share one row
+// layout on the conversation background, so own and received rows are checked
+// alike, in both colour schemes, together with the tinted outgoing DM bubble.
 //
 // The Rust pins in `conversation/markdown.rs` assert the declaration TEXT. This spec
 // asserts what a reader actually sees: it puts a quote in a REAL rendered
-// bubble, so the class list, the cascade and the compiled stylesheet are all
+// message, so the class list, the cascade and the compiled stylesheet are all
 // the app's own, then composites the colours the browser computed.
 
 // ── WCAG 2.x relative luminance / contrast ──────────────────────────────────
@@ -37,10 +34,8 @@ function contrast(fg: Rgb, bg: Rgb): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
-// WCAG 2.1 AA: 4.5:1 for body text, 3:1 for the non-text graphics that carry
-// meaning (here, the bar marking a quote as a quote).
+// WCAG 2.1 AA: 4.5:1 for body text.
 const AA_TEXT = 4.5;
-const AA_NON_TEXT = 3;
 
 // ── Sampling the live DOM ───────────────────────────────────────────────────
 
@@ -52,13 +47,13 @@ interface Sample {
 }
 
 /** Which real surface to measure. */
-type Surface = "sent" | "received" | "dm";
+type Surface = "own" | "received" | "dm";
 
 /**
- * Put a blockquote in a real bubble on `surface`, read back what the browser
+ * Put a blockquote in a real message on `surface`, read back what the browser
  * computed for it, and clean up after.
  *
- * The room-message surfaces are probed by injecting into an existing bubble's
+ * The room-message surfaces are probed by injecting into an existing row's
  * body; the DM surface has no example-data messages at all, so its bubble is
  * created by actually sending a DM (see `openDmThread`).
  */
@@ -148,17 +143,15 @@ async function sampleQuote(page: Page, surface: Surface): Promise<Sample> {
       );
       if (!history) throw new Error("no conversation-history container");
 
-      // Find the message body whose NEAREST bubble ancestor is the requested
-      // kind. A `.bg-accent .prose` descendant selector would be wrong: it
-      // matches whenever the class appears ANYWHERE above the body, so a sent
-      // bubble nested under an unrelated `bg-surface` wrapper would answer to
-      // the received query and the test would measure the wrong bubble.
-      const wanted = which === "sent" ? "bg-accent" : "bg-surface";
-      const prose = Array.from(history.querySelectorAll(".prose")).find((el) => {
-        const b = el.closest(".bg-accent, .bg-surface");
-        return b?.classList.contains(wanted) ?? false;
-      });
-      if (!prose) throw new Error(`no .${wanted} bubble with a .prose body`);
+      // A message body in a row by the requested author.
+      const wanted = which === "own" ? "true" : "false";
+      const prose = Array.from(
+        history.querySelectorAll('[data-testid="message-body"] .prose')
+      ).find(
+        (el) =>
+          el.closest("[data-message-self]")?.getAttribute("data-message-self") === wanted
+      );
+      if (!prose) throw new Error(`no ${which} message with a .prose body`);
 
       // Inject a quote and an ordinary paragraph as siblings inside the real
       // body container, so both are measured under the identical cascade.
@@ -200,7 +193,7 @@ async function openRoomWithMessages(page: Page) {
   await waitForApp(page);
 
   // "Your Private Room" is the example-data room the local user owns, so it
-  // carries both self-authored (bg-accent) and received (bg-surface) bubbles.
+  // carries both own and received messages.
   await selectRoom(page, "Your Private Room");
   await expect(
     page.locator('[data-testid="conversation-history"] .prose')
@@ -232,10 +225,9 @@ async function openDmThread(page: Page) {
 // ── Assertions shared by every surface ──────────────────────────────────────
 
 function expectNotInverted(s: Sample) {
-  // The reported symptom, stated directly: the sent bubble is white text on
-  // brand blue, and the quote used to be near-black — i.e. it sat on the
+  // The reported symptom, stated directly: the quote used to sit on the
   // OPPOSITE side of the background's luminance from every other word in the
-  // same bubble. This fails on that regression even if some future palette
+  // same message. This fails on that regression even if some future palette
   // happened to keep the raw ratio above AA.
   const bg = luminance(s.background);
   expect(
@@ -253,47 +245,15 @@ for (const colorScheme of ["dark", "light"] as const) {
     // to exercise — the stylesheet under test is viewport-independent.
     test.use({ colorScheme, viewport: { width: 1280, height: 900 } });
 
-    test("quoted text in an own (accent) bubble matches the bubble's text", async ({
-      page,
-    }) => {
-      await openRoomWithMessages(page);
-      const s = await sampleQuote(page, "sent");
-
-      const quote = contrast(s.quote, s.background);
-      const normal = contrast(s.normal, s.background);
-
-      expectNotInverted(s);
-      expect(quote, "quoted text must clear the WCAG AA floor").toBeGreaterThanOrEqual(
-        AA_TEXT
-      );
-
-      // Inside the sent bubble the quote takes the bubble's own colour, so it
-      // should read as no dimmer than the surrounding text. White on the
-      // accent blue is only ~5.2:1 to begin with, which leaves no headroom to
-      // dim a quote and stay above AA — hence `inherit` rather than a tint.
-      expect(
-        quote,
-        "quoted text in an own bubble must be no dimmer than its normal text"
-      ).toBeGreaterThanOrEqual(normal * 0.95);
-
-      // The quote bar is the only marker left once the text colour matches;
-      // it used to be `--color-accent-hover` on `--color-accent`, i.e. 1.29:1
-      // and effectively invisible.
-      expect(
-        contrast(s.quoteBorder, s.background),
-        "the quote bar must be visible against the bubble"
-      ).toBeGreaterThanOrEqual(AA_NON_TEXT);
-    });
-
-    // The two muted surfaces. A quote here is deliberately dimmer than its
-    // normal text — it just has to stay above AA while doing it, which the
-    // app-wide `--color-text-muted` did not in light mode (4.47:1 received,
-    // 3.96:1 DM). Both bounds are asserted: without the upper one, deleting
-    // `--color-text-quote`'s light value makes `var()` invalid, the quote
-    // inherits full body colour, and every floor-only assertion still passes.
-    for (const surface of ["received", "dm"] as const) {
-      const label = surface === "received" ? "a received (surface)" : "an outgoing DM";
-      test(`quoted text in ${label} bubble is readable and still muted`, async ({
+    // A quote is deliberately dimmer than its normal text — it just has to
+    // stay above AA while doing it, which the app-wide `--color-text-muted`
+    // did not in light mode (3.96:1 on the outgoing DM bubble). Both bounds
+    // are asserted: without the upper one, deleting `--color-text-quote`'s
+    // light value makes `var()` invalid, the quote inherits full body colour,
+    // and every floor-only assertion still passes.
+    for (const surface of ["own", "received", "dm"] as const) {
+      const label = { own: "an own message", received: "a received message", dm: "an outgoing DM bubble" }[surface];
+      test(`quoted text in ${label} is readable and still muted`, async ({
         page,
       }) => {
         if (surface === "dm") {
@@ -313,8 +273,8 @@ for (const colorScheme of ["dark", "light"] as const) {
         ).toBeGreaterThanOrEqual(AA_TEXT);
         expect(
           quote,
-          "a quote outside the accent bubble must stay visibly secondary to " +
-            "its normal text, not collapse into the body colour"
+          "a quote must stay visibly secondary to its normal text, not " +
+            "collapse into the body colour"
         ).toBeLessThan(normal * 0.8);
       });
     }

@@ -103,9 +103,9 @@ test.describe("Message action kebab menu (#402.1)", () => {
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
-    // A self (right-aligned, accent-coloured) message bubble. Its row carries
-    // the kebab that must expose Edit + Delete as well as Reply.
-    const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
+    // An own message. Its row carries the kebab that must expose Edit +
+    // Delete as well as Reply.
+    const ownRow = page.locator('[id^="msg-"][data-message-self="true"]').first();
     await expect(ownRow).toBeVisible();
     const ownKebab = ownRow.locator('[data-testid="message-kebab"]');
     await ownKebab.click();
@@ -198,11 +198,11 @@ test.describe("Message action kebab menu (#402.1)", () => {
     );
 
     const vp = page.viewportSize();
-    // Both a self (accent bubble) and a received (surface bubble) message: the
-    // menu opens on opposite sides, so both must stay within the viewport.
+    // Both an own (4-row menu) and a received (2-row menu) message: both
+    // menus must stay within the viewport.
     for (const sel of [
-      '[id^="msg-"]:has(.bg-accent)',
-      '[id^="msg-"]:has(.bg-surface)',
+      '[id^="msg-"][data-message-self="true"]',
+      '[id^="msg-"][data-message-self="false"]',
     ]) {
       const row = page.locator(sel).first();
       if ((await row.count()) === 0) continue;
@@ -256,7 +256,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     // capped to the available space (and scroll internally) rather than extend
     // past the scroll container with actions unreachable.
     await page
-      .locator('[id^="msg-"]:has(.bg-accent)')
+      .locator('[id^="msg-"][data-message-self="true"]')
       .first()
       .locator('[data-testid="message-kebab"]')
       .click();

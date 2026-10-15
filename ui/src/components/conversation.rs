@@ -600,7 +600,7 @@ fn group_messages(
     member_info: &MemberInfoV1,
     // `None` when this build holds no locally-known identity for the room.
     // Every message still renders; the identity-relative cosmetics (the
-    // `is_self` side of the bubble, the "mention of you" chip highlight)
+    // own name and avatar colours, the "mention of you" chip highlight)
     // degrade to "not me". Never a mis-attribution: an unknown identity
     // matches nobody.
     self_member_id: Option<MemberId>,
@@ -684,7 +684,7 @@ fn group_messages(
             self_member_id,
         );
         // With no locally-known identity nothing is "self", so every group
-        // renders on the other-party side rather than claiming an author.
+        // renders as someone else's rather than claiming an author.
         let is_self = Some(author_id) == self_member_id;
 
         // Get edited status and reactions
@@ -3414,21 +3414,6 @@ pub fn Conversation() -> Element {
     }
 }
 
-/// Corner radii for a bubble at this position in its group: every corner is
-/// round except the ones on the sender's side that face a neighbouring bubble.
-/// Takes position only, so nothing else (reactions, edits) can reshape it.
-fn bubble_corner_classes(is_self: bool, is_first: bool, is_last: bool) -> &'static str {
-    match (is_self, is_first, is_last) {
-        (_, true, true) => "rounded-2xl",
-        (true, true, false) => "rounded-t-2xl rounded-bl-2xl rounded-br-md",
-        (true, false, true) => "rounded-b-2xl rounded-tl-2xl rounded-tr-md",
-        (true, false, false) => "rounded-l-2xl rounded-r-md",
-        (false, true, false) => "rounded-t-2xl rounded-br-2xl rounded-bl-md",
-        (false, false, true) => "rounded-b-2xl rounded-tr-2xl rounded-tl-md",
-        (false, false, false) => "rounded-r-2xl rounded-l-md",
-    }
-}
-
 /// Position of an open reactor list. Stored as one signal so the flip, the
 /// anchor, and the caps update together.
 #[derive(Clone, PartialEq)]
@@ -3614,6 +3599,9 @@ fn reaction_owner_marks(
     )
 }
 
+/// The avatar: the River logo as an alpha mask, painted in `currentColor`.
+const RIVER_LOGO: Asset = asset!("/assets/river_logo.svg");
+
 /// Avatar shades for other members, as Tailwind literals the `@source` scan
 /// picks up. No blue (the own name's colour), no red, amber or yellow (error
 /// and warning colours), no teal (too close to emerald).
@@ -3629,7 +3617,6 @@ const AVATAR_PALETTE: [&str; 6] = [
 /// The avatar shade for another member. From the member id, not the
 /// nickname, so a rename keeps it and an exact-name impersonator does not
 /// inherit it.
-#[allow(dead_code)] // Wired into the group's first row by the next commit.
 fn avatar_colour_class(author_id: MemberId) -> &'static str {
     let digest = blake3::hash(&author_id.0 .0.to_le_bytes());
     let bytes = digest.as_bytes();
@@ -3698,7 +3685,7 @@ fn MessageGroupComponent(
     // Whether the kebab action menu should be left-anchored (open rightward) or
     // right-anchored (open leftward). Chosen from the tap's horizontal position
     // so the menu always opens toward the viewport centre regardless of
-    // self/other side or bubble width, and never clips its content off a narrow
+    // where the row sits, and never clips its content off a narrow
     // screen edge (#402).
     let mut menu_align_left: Signal<bool> = use_signal(|| false);
 
@@ -3844,130 +3831,143 @@ fn MessageGroupComponent(
         }
     });
 
+    // The own group's avatar takes the text colour; everyone else's comes from
+    // their member id. Once per group, outside the row loop.
+    let avatar_class = if is_self {
+        "text-text"
+    } else {
+        avatar_colour_class(group.author_id)
+    };
+    let name_class = if is_self {
+        "text-sm font-medium min-w-0 [overflow-wrap:anywhere] text-accent hover:text-accent-hover cursor-pointer transition-colors"
+    } else {
+        "text-sm font-medium min-w-0 [overflow-wrap:anywhere] text-text cursor-pointer hover:text-accent transition-colors"
+    };
+    let author_id = group.author_id;
+
     rsx! {
         div {
-            class: format!(
-                "flex min-w-0 {}",
-                if is_self { "justify-end" } else { "justify-start" }
-            ),
-            div {
-                class: format!(
-                    "max-w-[75%] {}",
-                    if is_self { "items-end" } else { "items-start" }
-                ),
-                // Header with name and time (only for others)
-                if !is_self {
-                    div { class: "flex items-baseline gap-2 mb-1 px-1",
-                        span {
-                            class: "text-sm font-medium text-text cursor-pointer hover:text-accent transition-colors",
-                            title: "Member ID: {group.author_id}",
-                            onclick: move |_| {
-                                crate::util::defer(move || {
-                                    MEMBER_INFO_MODAL.with_mut(|signal| {
-                                        signal.member = Some(group.author_id);
-                                    });
-                                });
-                            },
-                            "{group.author_name}"
-                        }
-                        // Impersonation warning. Sits immediately after the
-                        // name, before the shield slot. The two are NOT
-                        // mutually exclusive — two deputies whose names collide
-                        // each carry a shield AND a warning — so these really
-                        // are two badge positions and both can be filled at
-                        // once. Do not collapse them into one slot, and do not
-                        // suppress the warning when a shield is present: a
-                        // deputised sockpuppet carries a genuine shield, and
-                        // suppressing on it is the exact immunity
-                        // `a_deputised_sockpuppet_cannot_suppress_its_own_warning`
-                        // denies.
-                        //
-                        // The nickname above cannot forge this glyph: U+26A0 is
-                        // inside the range `display_name::is_display_hidden`
-                        // strips, so it can never survive into a rendered
-                        // nickname. `the_warning_glyph_cannot_appear_in_a_nickname`
-                        // pins that.
-                        if let Some(warning) = group.author_impersonation.as_ref() {
-                            {
-                                let tooltip = warning.tooltip();
-                                rsx! {
-                                    span {
-                                        "data-testid": "message-author-impersonation-warning",
-                                        class: "text-sm cursor-default",
-                                        title: "{tooltip}",
-                                        "aria-label": "{tooltip}",
-                                        {crate::util::confusable::WARNING_GLYPH}
-                                    }
-                                }
-                            }
-                        }
-                        // Deputy shield. Same glyph, same visibility rule and
-                        // the same tooltip as the member-list row and the
-                        // member-info modal chip, so the three read as one
-                        // badge. The nickname above cannot forge it: nicknames
-                        // are stripped of emoji by `crate::util::display_name`.
-                        if let Some(badge) = group.author_badge.as_ref() {
-                            {
-                                let tooltip = badge.tooltip();
-                                rsx! {
-                                    span {
-                                        "data-testid": "message-author-deputy-badge",
-                                        class: "text-sm cursor-default",
-                                        title: "{tooltip}",
-                                        "aria-label": "{tooltip}",
-                                        "🛡"
-                                    }
-                                }
-                            }
-                        }
-                        span {
-                            class: if time_clamped {
-                                "text-xs text-text-muted cursor-default italic opacity-70"
-                            } else {
-                                "text-xs text-text-muted cursor-default"
-                            },
-                            title: "{full_time_str}",
-                            if time_clamped { "~{time_str}" } else { "{time_str}" }
-                        }
-                    }
-                }
-
-                // Message bubbles
-                div {
-                    class: format!(
-                        "space-y-1 {}",
-                        if is_self { "flex flex-col items-end" } else { "" }
-                    ),
-                    {
-                        let messages_len = group.messages.len();
-                        group.messages.into_iter().enumerate().map(move |(idx, msg)| {
-                        let is_last = idx == messages_len - 1;
+            class: "msg-group",
+            {
+                group.messages.into_iter().enumerate().map(move |(idx, msg)| {
                         let is_first = idx == 0;
                         let has_reactions = !msg.reactions.is_empty();
                         let reply_strip_val = msg.reply_strip.clone();
 
                         rsx! {
-                            // `min-w-0 max-w-full` clamps this per-message wrapper to
-                            // its column (`max-w-[75%]`) width. For a SELF message the
-                            // enclosing bubbles wrapper is `flex flex-col items-end`, so
-                            // without this the wrapper is a non-stretched flex item that
-                            // sizes to the bubble's `max-w-prose` (65ch) content width and
-                            // escapes the column. A self reply whose nowrap reply-strip
-                            // preview holds a long URL then overflows both edges of a
-                            // narrow mobile viewport (clipped, text cut off). `min-w-0`
-                            // lets the flex item shrink below its content's min-size so
-                            // `max-w-full` can actually take effect.
+                            // One full-column grid row per message: the avatar
+                            // slot (first row only), then the content column.
+                            // Padding on the right is the gutter the hover bar
+                            // and the touch kebab sit in.
                             div {
                                 key: "{msg.id}",
                                 id: "msg-{msg.id}",
                                 // For `capture_reading_anchor`; unlike the
                                 // group key, a message id never re-keys.
                                 "data-anchor-key": "{msg.id}",
-                                class: "flex flex-col group min-w-0 max-w-full",
-                                // Container for message bubble + hover actions
+                                "data-testid": "message-row",
+                                "data-message-self": "{is_self}",
+                                class: "msg-row group",
+                                if is_first {
+                                    // Decorative: the name beside it is the
+                                    // accessible, focusable control that does
+                                    // the same thing.
+                                    span {
+                                        "data-testid": "message-group-avatar",
+                                        "aria-hidden": "true",
+                                        class: "msg-avatar {avatar_class}",
+                                        style: "-webkit-mask-image: url({RIVER_LOGO}); mask-image: url({RIVER_LOGO});",
+                                        onclick: move |_| {
+                                            crate::util::defer(move || {
+                                                MEMBER_INFO_MODAL.with_mut(|signal| {
+                                                    signal.member = Some(author_id);
+                                                });
+                                            });
+                                        },
+                                    }
+                                }
                                 div {
-                                    class: "relative",
-                                    // Message bubble (or edit form if editing)
+                                    // `relative` anchors the hover bar and the
+                                    // kebab, which sit just past its right edge.
+                                    class: "msg-content relative",
+                                    if is_first {
+                                        div {
+                                            "data-testid": "message-group-header",
+                                            class: "flex flex-wrap items-baseline gap-x-2 mb-0.5",
+                                            span {
+                                                class: name_class,
+                                                title: "Member ID: {author_id}",
+                                                onclick: move |_| {
+                                                    crate::util::defer(move || {
+                                                        MEMBER_INFO_MODAL.with_mut(|signal| {
+                                                            signal.member = Some(author_id);
+                                                        });
+                                                    });
+                                                },
+                                                "{group.author_name}"
+                                            }
+                                            // Impersonation warning. Sits immediately after the
+                                            // name, before the shield slot. The two are NOT
+                                            // mutually exclusive — two deputies whose names collide
+                                            // each carry a shield AND a warning — so these really
+                                            // are two badge positions and both can be filled at
+                                            // once. Do not collapse them into one slot, and do not
+                                            // suppress the warning when a shield is present: a
+                                            // deputised sockpuppet carries a genuine shield, and
+                                            // suppressing on it is the exact immunity
+                                            // `a_deputised_sockpuppet_cannot_suppress_its_own_warning`
+                                            // denies.
+                                            //
+                                            // The nickname above cannot forge this glyph: U+26A0 is
+                                            // inside the range `display_name::is_display_hidden`
+                                            // strips, so it can never survive into a rendered
+                                            // nickname. `the_warning_glyph_cannot_appear_in_a_nickname`
+                                            // pins that.
+                                            if let Some(warning) = group.author_impersonation.as_ref() {
+                                                {
+                                                    let tooltip = warning.tooltip();
+                                                    rsx! {
+                                                        span {
+                                                            "data-testid": "message-author-impersonation-warning",
+                                                            class: "text-sm cursor-default",
+                                                            title: "{tooltip}",
+                                                            "aria-label": "{tooltip}",
+                                                            {crate::util::confusable::WARNING_GLYPH}
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Deputy shield. Same glyph, same visibility rule and
+                                            // the same tooltip as the member-list row and the
+                                            // member-info modal chip, so the three read as one
+                                            // badge. The nickname above cannot forge it: nicknames
+                                            // are stripped of emoji by `crate::util::display_name`.
+                                            if let Some(badge) = group.author_badge.as_ref() {
+                                                {
+                                                    let tooltip = badge.tooltip();
+                                                    rsx! {
+                                                        span {
+                                                            "data-testid": "message-author-deputy-badge",
+                                                            class: "text-sm cursor-default",
+                                                            title: "{tooltip}",
+                                                            "aria-label": "{tooltip}",
+                                                            "🛡"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            span {
+                                                class: if time_clamped {
+                                                    "text-xs text-text-muted cursor-default italic opacity-70"
+                                                } else {
+                                                    "text-xs text-text-muted cursor-default"
+                                                },
+                                                title: "{full_time_str}",
+                                                if time_clamped { "~{time_str}" } else { "{time_str}" }
+                                            }
+                                        }
+                                    }
+                                    // Message body (or edit form if editing)
                                     {
                                         let is_editing = editing_message.read().as_ref() == Some(&msg.id);
                                         let msg_id_for_save = msg.message_id.clone();
@@ -3984,11 +3984,8 @@ fn MessageGroupComponent(
                                             let input_members = edit_mention_members.clone();
                                             rsx! {
                                                 div {
-                                                    class: format!(
-                                                        "p-3 rounded-2xl {}",
-                                                        if is_self { "bg-accent" } else { "bg-surface" }
-                                                    ),
-                                                    style: "width: 100%; max-width: 550px; overflow: visible;",
+                                                    class: "p-3 rounded-2xl bg-surface",
+                                                    style: "width: 100%; overflow: visible;",
                                                     tabindex: "0",
                                                     // Scroll into view when edit dialog appears (#93),
                                                     // only as far as needed. Instant: the textarea's
@@ -4054,10 +4051,7 @@ fn MessageGroupComponent(
                                                         }
                                                         textarea {
                                                             id: "{edit_id}",
-                                                            class: format!(
-                                                                "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none {}",
-                                                                if is_self { "bg-white/10 text-white placeholder-white/50 border border-white/20" } else { "bg-bg text-text border border-border" }
-                                                            ),
+                                                            class: "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none bg-bg text-text border border-border",
                                                             value: "{edit_text}",
                                                             onmounted: move |cx| {
                                                                 let element = cx.data();
@@ -4115,8 +4109,6 @@ fn MessageGroupComponent(
                                                                 div {
                                                                     class: if over_limit {
                                                                         "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium"
-                                                                    } else if is_self {
-                                                                        "text-xs text-right mt-1 pr-1 text-white/70"
                                                                     } else {
                                                                         "text-xs text-right mt-1 pr-1 text-text-muted"
                                                                     },
@@ -4130,11 +4122,7 @@ fn MessageGroupComponent(
                                                             div { class: "flex justify-end gap-3 mt-3",
                                                                 style: "overflow: visible;",
                                                                 button {
-                                                                    class: if is_self {
-                                                                        "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white/20 text-white hover:bg-white/30"
-                                                                    } else {
-                                                                        "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border"
-                                                                    },
+                                                                    class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border",
                                                                     onclick: move |_| editing_message.set(None),
                                                                     "Cancel (Esc)"
                                                                 }
@@ -4181,40 +4169,11 @@ fn MessageGroupComponent(
                                         } else {
                                             let reply_strip_inner = reply_strip_val.clone();
                                             rsx! {
-                                                // Message bubble. The reply strip (if any) is rendered as
-                                                // the first child INSIDE the bubble so it shares the
-                                                // bubble's width and its intrinsic size cannot reflow
-                                                // the parent (fixes #206 and #207).
-                                                div {
-                                                    "data-testid": "message-bubble",
-                                                    class: format!(
-                                                        "flex flex-col text-sm overflow-hidden {} {} {}",
-                                                        if is_self {
-                                                            "bg-accent text-white"
-                                                        } else {
-                                                            "bg-surface text-text"
-                                                        },
-                                                        // Grouped bubbles pinch the corner facing a
-                                                        // neighbour. Position only: a reaction must
-                                                        // not reshape the bubble.
-                                                        bubble_corner_classes(is_self, is_first, is_last),
-                                                        // Max width for readability; overflow-hidden on
-                                                        // parent + min-w-0 on the reply strip prevents
-                                                        // the nowrap strip from widening the bubble.
-                                                        "max-w-prose"
-                                                    ),
-                                                    // Reply-quote strip (inside bubble, first child).
-                                                    // Exactly one arm renders, enforced by the type: an
-                                                    // unverifiable quote is `Unavailable`, which carries no
-                                                    // author or preview to render.
-                                                    //
-                                                    // Self bubbles use a white-tinted overlay so the strip
-                                                    // stays legible against the accent background; other
-                                                    // bubbles use a dark-tinted overlay against the surface
-                                                    // background. The previous `bg-accent/40 text-accent`
-                                                    // was invisible on self bubbles because the strip
-                                                    // composited to the same colour as the bubble.
-                                                    {
+                                                // Reply-quote strip, above the body. Exactly one arm
+                                                // renders, enforced by the type: an unverifiable quote
+                                                // is `Unavailable`, which carries no author or preview
+                                                // to render.
+                                                {
                                                         match reply_strip_inner {
                                                             ReplyStrip::NotAReply => rsx! {},
                                                             // Deliberately inert — no `role`/`tabindex`/
@@ -4231,10 +4190,7 @@ fn MessageGroupComponent(
                                                             ReplyStrip::Unavailable => rsx! {
                                                                 div {
                                                                     "data-testid": "reply-strip-unavailable",
-                                                                    class: format!(
-                                                                        "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 italic {}",
-                                                                        if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
-                                                                    ),
+                                                                    class: "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 mb-0.5 rounded-md italic bg-surface text-text-muted",
                                                                     // The arrow is decorative; the sentence
                                                                     // after it is what a screen reader needs.
                                                                     span { "aria-hidden": "true", "\u{21a9} " }
@@ -4249,10 +4205,7 @@ fn MessageGroupComponent(
                                                                 rsx! {
                                                                     div {
                                                                         "data-testid": "reply-strip",
-                                                                        class: format!(
-                                                                            "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 cursor-pointer {}",
-                                                                            if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
-                                                                        ),
+                                                                        class: "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 mb-0.5 rounded-md cursor-pointer bg-surface text-text-muted",
                                                                         title: "Scroll to original message (Enter or Space to activate)",
                                                                         role: "button",
                                                                         tabindex: "0",
@@ -4290,30 +4243,19 @@ fn MessageGroupComponent(
                                                             }
                                                         }
                                                     }
-                                                    // Message body, wrapped in a padding container so the
-                                                    // "(edited)" indicator can sit inline at the trailing
-                                                    // edge of the body text rather than as a separate
-                                                    // flex-column row. `[overflow-wrap:anywhere]` ensures
-                                                    // long URLs and unbreakable tokens wrap instead of
-                                                    // forcing the bubble past `max-w-prose`. `anywhere` is
-                                                    // stricter than `break-word`: it also lowers the
-                                                    // element's min-content so flex/grid parents can shrink
-                                                    // the bubble to fit.
+                                                // Message body, with "(edited)" after it.
+                                                // `[overflow-wrap:anywhere]` breaks a long URL or
+                                                // other unbreakable token only where it would
+                                                // otherwise overflow the column.
+                                                div {
+                                                    "data-testid": "message-body",
+                                                    class: "text-sm text-text min-w-0",
                                                     div {
-                                                        class: "px-3 py-2 min-w-0",
-                                                        div {
-                                                            class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
-                                                            dangerous_inner_html: "{msg.content_html}"
-                                                        }
-                                                        if msg.edited {
-                                                            span {
-                                                                class: format!(
-                                                                    "text-xs ml-2 {}",
-                                                                    if is_self { "text-white/70" } else { "text-text-muted" }
-                                                                ),
-                                                                "(edited)"
-                                                            }
-                                                        }
+                                                        class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
+                                                        dangerous_inner_html: "{msg.content_html}"
+                                                    }
+                                                    if msg.edited {
+                                                        span { class: "text-xs ml-2 text-text-muted", "(edited)" }
                                                     }
                                                 }
                                             }
@@ -4343,11 +4285,9 @@ fn MessageGroupComponent(
                                                 // desktop, where the pointer must cross an empty gap to
                                                 // reach it (a Tailwind `group-hover:pointer-events` gate
                                                 // would drop hover mid-gap and make it unreachable). #402.
-                                                class: format!(
-                                                    "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 {} {}",
-                                                    if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" },
-                                                    ""
-                                                ),
+                                                // In the row's right gutter, past the content
+                                                // column's right edge, for every author.
+                                                class: "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 right-0 translate-x-full ml-2",
                                                 // Reply button - available for all messages
                                                 button {
                                                     class: "text-xs text-text-muted hover:text-accent transition-colors",
@@ -4408,8 +4348,8 @@ fn MessageGroupComponent(
                                             == Some(msg_id_kebab.as_str());
                                         rsx! {
                                             div {
-                                                // Positioned in the gutter beside the bubble with
-                                                // `right-full`/`left-full` (NOT `translate`): a transform
+                                                // Positioned in the row's right gutter with
+                                                // `left-full` (NOT `translate`): a transform
                                                 // would become the containing block for the `fixed`
                                                 // dismiss backdrop below, shrinking it to this element
                                                 // instead of the viewport (#402).
@@ -4421,9 +4361,8 @@ fn MessageGroupComponent(
                                                 // backdrop then covers those kebabs, so a tap on one just
                                                 // dismisses). (#402)
                                                 class: format!(
-                                                    "touch-actions absolute top-1 {} {}",
+                                                    "touch-actions absolute top-1 left-full ml-1 {}",
                                                     if menu_open { "z-[60]" } else { "z-50" },
-                                                    if is_self { "right-full mr-1" } else { "left-full ml-1" }
                                                 ),
                                                 // Kebab toggle button
                                                 button {
@@ -4514,10 +4453,9 @@ fn MessageGroupComponent(
                                                         onclick: move |_| crate::util::defer(move || open_action_menu.set(None)),
                                                     }
                                                     div {
-                                                        // Opens toward the bubble/centre (self: right of the
-                                                        // left-gutter kebab; other: left of the right-gutter
-                                                        // kebab); `max-w` clamps it to the viewport as a
-                                                        // backstop against a narrow-screen overflow.
+                                                        // Opens toward the viewport centre from the
+                                                        // gutter kebab; `max-w` clamps it to the viewport
+                                                        // as a backstop against a narrow-screen overflow.
                                                         class: format!(
                                                             "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
                                                             if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
@@ -4593,7 +4531,6 @@ fn MessageGroupComponent(
                                             }
                                         }
                                     }
-                                }
                                 // Reactions display with inline add button
                                 {
                                     let msg_id_for_inline = msg.id.clone();
@@ -4616,10 +4553,8 @@ fn MessageGroupComponent(
 
                                     rsx! {
                                         div {
-                                            class: format!(
-                                                "flex flex-wrap items-center gap-1 mt-0.5 {}",
-                                                if is_self { "justify-end" } else { "justify-start" }
-                                            ),
+                                            "data-testid": "message-reaction-row",
+                                            class: "flex flex-wrap items-center justify-start gap-1 mt-0.5",
                                             // Existing reactions (clickable to toggle if user has reacted)
                                             {
                                                 let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
@@ -4941,9 +4876,8 @@ fn MessageGroupComponent(
                                                     div {
                                                         "data-testid": "emoji-picker",
                                                         class: format!(
-                                                            "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid {} {}",
+                                                            "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid left-0 {}",
                                                             if *picker_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                            if is_self { "right-0" } else { "left-0" }
                                                         ),
                                                         style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
                                                         onclick: move |e: MouseEvent| e.stop_propagation(),
@@ -4977,24 +4911,10 @@ fn MessageGroupComponent(
                                         }
                                     }
                                 }
+                                }
                             }
                         }
-                    })
-                    }
-                }
-
-                // Time for self messages (shown at the end)
-                if is_self {
-                    div {
-                        class: if time_clamped {
-                            "text-xs text-text-muted mt-1 px-1 cursor-default italic opacity-70"
-                        } else {
-                            "text-xs text-text-muted mt-1 px-1 cursor-default"
-                        },
-                        title: "{full_time_str}",
-                        if time_clamped { "~{time_str}" } else { "{time_str}" }
-                    }
-                }
+                })
             }
         }
     }
@@ -5078,31 +4998,6 @@ mod tests {
                 expected,
                 "member id {id}"
             );
-        }
-    }
-
-    /// A lone bubble is fully round, and a grouped one pinches only the
-    /// sender-side corners that face a neighbour.
-    #[test]
-    fn bubble_corners_pinch_only_toward_a_neighbour() {
-        for is_self in [true, false] {
-            assert_eq!(bubble_corner_classes(is_self, true, true), "rounded-2xl");
-            for (is_first, is_last) in [(true, false), (false, true), (false, false)] {
-                let classes = bubble_corner_classes(is_self, is_first, is_last);
-                let pinched: Vec<&str> =
-                    classes.split(' ').filter(|c| c.ends_with("-md")).collect();
-                let side = if is_self { 'r' } else { 'l' };
-                let expected = match (is_first, is_last) {
-                    (true, false) => format!("rounded-b{side}-md"),
-                    (false, true) => format!("rounded-t{side}-md"),
-                    _ => format!("rounded-{side}-md"),
-                };
-                assert_eq!(
-                    pinched,
-                    vec![expected.as_str()],
-                    "is_self={is_self} is_first={is_first} is_last={is_last}"
-                );
-            }
         }
     }
 
@@ -6193,7 +6088,7 @@ mod resolve_reply_strip_tests {
     }
 
     /// The preview is truncated so a long quoted message cannot dominate the
-    /// bubble. Truncation happens after mention/markdown cleaning.
+    /// row. Truncation happens after mention/markdown cleaning.
     #[test]
     fn quote_preview_is_truncated() {
         let owner_sk = signing_key(1);
