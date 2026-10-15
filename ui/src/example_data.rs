@@ -211,6 +211,19 @@ pub fn create_example_rooms() -> Rooms {
         }
     }
 
+    // A description that is several short lines: no line overflows
+    // sideways, but the list is taller than the one-line header clamp, so it
+    // still needs the chevron (freenet/river#718 review).
+    if fixture_requested("multiline-description") {
+        let room = create_room(
+            &"House Rules Room".to_string(),
+            SelfIs::Member,
+            Some("Rules:\n\n- Be kind\n- No spam\n- Stay on topic"),
+            HistoryDepth::Standard,
+        );
+        map.insert(room.owner_vk, room.room_data);
+    }
+
     Rooms {
         map,
         current_room_key: None,

@@ -966,8 +966,9 @@ fn last_good_for_room<K: PartialEq, T: Clone>(cache: &Option<(K, T)>, room: &K) 
 }
 
 /// The `message_groups` memo's value: the room's display items, self's member
-/// id and the member names. Shared, so the contended-read cache costs a
-/// pointer, not a copy of every rendered message.
+/// id, the member names, the impersonation checker, the deputy badges and
+/// the owner's member id. Shared, so the contended-read
+/// cache costs a pointer, not a copy of every rendered message.
 type MessageGroupsValue = Rc<(
     Vec<DisplayItem>,
     Option<MemberId>,
@@ -1012,20 +1013,28 @@ fn NoRoomFooter() -> Element {
     }
 }
 
+/// Classes for the header description. Collapsed is one line: `truncate`
+/// clips it horizontally and `max-h-[1lh]` vertically, so a list, a heading
+/// or a hard break cannot grow the header either. Expanded wraps and scrolls
+/// so a long description stays in the header instead of pushing the messages
+/// off the screen (freenet/river#718).
 fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
     match (expanded, interactive) {
         (true, _) => {
             "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted [&>p]:m-0 break-words cursor-pointer max-h-48 overflow-y-auto"
         }
         (false, true) => {
-            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline cursor-pointer"
+            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate max-h-[1lh] [&>*]:m-0 [&>p]:inline cursor-pointer"
         }
         (false, false) => {
-            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline"
+            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate max-h-[1lh] [&>*]:m-0 [&>p]:inline"
         }
     }
 }
 
+/// The collapsed header line does not fit its box. Measured on the element
+/// itself: a chevron on a line that already fits only makes the header taller
+/// (freenet/river#718 review).
 fn header_description_element() -> Option<web_sys::Element> {
     web_sys::window()?
         .document()?
@@ -1038,6 +1047,8 @@ fn header_column_element() -> Option<web_sys::Element> {
         .get_element_by_id("room-header-column")
 }
 
+/// Skip while the description is expanded: wrapping makes it fit, and storing
+/// that would hide the chevron on the way back to one line.
 fn header_description_is_expanded() -> bool {
     header_description_element()
         .and_then(|element| element.get_attribute("data-expanded"))
@@ -1047,8 +1058,15 @@ fn header_description_is_expanded() -> bool {
 fn header_description_overflows() -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        return header_description_element()
-            .is_some_and(|element| element.scroll_width() > element.client_width() + 1);
+        // Both axes: a long line overflows sideways, and a list, a heading or
+        // a hard break overflows the one-line `max-h-[1lh]` clamp downwards
+        // (see `room_description_class`). The 1px slack: a flex item at a
+        // fractional text width can round a pixel apart and look truncated
+        // when it fits.
+        return header_description_element().is_some_and(|element| {
+            element.scroll_width() > element.client_width() + 1
+                || element.scroll_height() > element.client_height() + 1
+        });
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -1101,6 +1119,11 @@ fn description_selection_is_collapsed() -> bool {
         true
     }
 }
+
+/// How long a click on the description waits before toggling, so that the
+/// first click of a double-click (which selects a word) can be cancelled by
+/// the second. The chevron toggles at once.
+const DESCRIPTION_DOUBLE_CLICK_WAIT_MS: u64 = 250;
 
 fn note_description_overflow(description_overflows: &mut Signal<bool>) {
     if header_description_is_expanded() {
@@ -1338,8 +1361,17 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // Which room's header description is expanded. Compared to the open room
+    // in render, and cleared there when the open room changes, so coming back
+    // to a room shows its description collapsed again (freenet/river#718).
     let mut expanded_description_room = use_signal(|| None::<ed25519_dalek::VerifyingKey>);
+    // True when the collapsed line does not fit. Stays true while expanded so
+    // the chevron does not vanish on the way back to one line.
     let description_overflows = use_signal(|| false);
+    // Bumped by every click on the description. A pending single-click toggle
+    // only runs if no later click arrived, so a double-click that selects a
+    // word does not also expand the block.
+    let description_click_seq = use_hook(|| Rc::new(std::cell::Cell::new(0u64)));
     {
         let mut description_overflows = description_overflows;
         use_effect(move || {
@@ -1348,6 +1380,9 @@ pub fn Conversation() -> Element {
                 crate::util::signal_guard::schedule_nudge();
                 return;
             };
+            // Read so a collapse remeasures. Do not return early when some
+            // OTHER room is the expanded one: that left the flag stuck and
+            // the next room showed a chevron on a line that already fit.
             let Ok(_expanded_room) = expanded_description_room.try_read() else {
                 crate::util::signal_guard::schedule_nudge();
                 return;
@@ -1355,14 +1390,29 @@ pub fn Conversation() -> Element {
             crate::util::defer(move || note_description_overflow(&mut description_overflows));
         });
     }
+    // Width changes (rotation, a narrow window, the mobile panel coming back)
+    // do not change the description text, so nothing above re-runs. Watch the
+    // header column, not the description: the description's own width
+    // depends on whether the chevron is showing.
     #[cfg(target_arch = "wasm32")]
     {
+        type DescriptionWatch = (
+            web_sys::Element,
+            web_sys::ResizeObserver,
+            wasm_bindgen::closure::Closure<dyn FnMut(js_sys::Array)>,
+        );
         let description_overflows = description_overflows;
-        let watch = use_hook(|| {
-            Rc::new(std::cell::RefCell::new(
-                None::<(web_sys::Element, web_sys::ResizeObserver)>,
-            ))
-        });
+        let watch = use_hook(|| Rc::new(std::cell::RefCell::new(None::<DescriptionWatch>)));
+        {
+            // The observer and its callback are owned here, not leaked, so a
+            // header node change replaces them and an unmount releases them.
+            let watch = watch.clone();
+            use_drop(move || {
+                if let Some((_, observer, _)) = watch.borrow_mut().take() {
+                    observer.disconnect();
+                }
+            });
+        }
         use_effect(move || {
             use wasm_bindgen::prelude::*;
 
@@ -1381,11 +1431,11 @@ pub fn Conversation() -> Element {
             let same = watch
                 .borrow()
                 .as_ref()
-                .is_some_and(|(attached, _)| attached == &column);
+                .is_some_and(|(attached, _, _)| attached == &column);
             if same {
                 return;
             }
-            if let Some((_, observer)) = watch.borrow_mut().take() {
+            if let Some((_, observer, _)) = watch.borrow_mut().take() {
                 observer.disconnect();
             }
             let mut description_overflows = description_overflows;
@@ -1394,15 +1444,33 @@ pub fn Conversation() -> Element {
             }) as Box<dyn FnMut(js_sys::Array)>);
             if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
                 observer.observe(&column);
-                *watch.borrow_mut() = Some((column, observer));
-                cb.forget();
+                *watch.borrow_mut() = Some((column, observer, cb));
             }
         });
     }
 
+    // Collapse the description when the open room changes. Deferred because
+    // this is render; checked again when it runs so a quick switch back does
+    // not clear the wrong room.
+    if let Ok(open_room) = CURRENT_ROOM.try_read().map(|room| room.owner_key) {
+        let stale = expanded_description_room
+            .try_read()
+            .is_ok_and(|expanded| expanded.is_some() && *expanded != open_room);
+        if stale {
+            crate::util::defer(move || {
+                let expanded = *expanded_description_room.peek();
+                if expanded.is_some() && expanded != CURRENT_ROOM.peek().owner_key {
+                    expanded_description_room.set(None);
+                }
+            });
+        }
+    }
+
     // Memoize expensive message grouping (decryption + markdown parsing)
     // This prevents re-computing on every render/keystroke
-    // Returns (groups, self_member_id, member_names) so we can highlight user's reactions and show names in tooltips
+    // Returns a `MessageGroupsValue` (groups, self_member_id, member_names,
+    // impersonation checker, deputy badges, owner id) so we can highlight the
+    // user's reactions and show names, warnings and badges by the reactors.
     //
     // `last_good_groups` is the memo's last value and the room it was computed
     // for. A contended pass returns it rather than `None`, which would empty
@@ -2329,6 +2397,11 @@ pub fn Conversation() -> Element {
                         let room_key = room_key;
                         move || {
                             crate::util::defer(move || {
+                                // A delayed description click can land after
+                                // a room switch; it belongs to the old room.
+                                if CURRENT_ROOM.peek().owner_key != room_key {
+                                    return;
+                                }
                                 let open = expanded_description_room.peek().as_ref()
                                     == room_key.as_ref();
                                 expanded_description_room.set(if open { None } else { room_key });
@@ -2476,7 +2549,13 @@ pub fn Conversation() -> Element {
                                                 ),
                                                 onclick: {
                                                     let toggle_description = toggle_description.clone();
+                                                    let click_seq = description_click_seq.clone();
                                                     move |evt| {
+                                                        // Every click, the second of a
+                                                        // double-click included, cancels a
+                                                        // toggle still waiting below.
+                                                        let this_click = click_seq.get().wrapping_add(1);
+                                                        click_seq.set(this_click);
                                                         if description_click_is_link(&evt)
                                                             || description_click_is_multi(&evt)
                                                             || !description_selection_is_collapsed()
@@ -2485,7 +2564,25 @@ pub fn Conversation() -> Element {
                                                         {
                                                             return;
                                                         }
-                                                        toggle_description();
+                                                        // The first click of a double-click has
+                                                        // detail 1, so it cannot be told apart
+                                                        // here. Wait out the double-click window:
+                                                        // toggling now would reflow the text under
+                                                        // the pointer, and the second click would
+                                                        // select a different word or none.
+                                                        let click_seq = click_seq.clone();
+                                                        let toggle_description = toggle_description.clone();
+                                                        crate::util::safe_spawn_local(async move {
+                                                            crate::util::sleep(crate::util::millis(
+                                                                DESCRIPTION_DOUBLE_CLICK_WAIT_MS,
+                                                            ))
+                                                            .await;
+                                                            if click_seq.get() == this_click
+                                                                && description_selection_is_collapsed()
+                                                            {
+                                                                toggle_description();
+                                                            }
+                                                        });
                                                     }
                                                 },
                                                 dangerous_inner_html: "{desc_html}"
@@ -2493,7 +2590,11 @@ pub fn Conversation() -> Element {
                                             if description_can_toggle {
                                                 button {
                                                     "data-testid": "room-description-toggle",
-                                                    class: "flex-shrink-0 p-0.5 -my-1 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                                    // 24px square (WCAG 2.2 target size) around a
+                                                    // 14px icon. The negative margin keeps its
+                                                    // layout height at 12px, under the 16px line,
+                                                    // so the header does not grow.
+                                                    class: "flex-shrink-0 inline-flex items-center justify-center w-6 h-6 -my-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
                                                     "aria-expanded": if description_expanded { "true" } else { "false" },
                                                     "aria-label": if description_expanded { "Hide room description" } else { "Show room description" },
                                                     title: if description_expanded { "Hide room description" } else { "Show room description" },
@@ -3204,6 +3305,8 @@ fn bubble_corner_classes(is_self: bool, is_first: bool, is_last: bool) -> &'stat
 #[derive(Clone, PartialEq)]
 struct ReactionOwnersPopover {
     key: String,
+    /// The row's `msg-{id}` suffix, for a focus fallback when the chip is gone.
+    message_id: String,
     above: bool,
     align_right: bool,
     max_h: f64,
@@ -3222,22 +3325,42 @@ fn coarse_pointer() -> bool {
         .is_some_and(|mq| mq.matches())
 }
 
+/// What a pointer of this type does to a chip: `Some(true)` opens the list,
+/// `Some(false)` removes, `None` is unknown.
+fn pointer_type_opens_owner_list(pointer_type: &str) -> Option<bool> {
+    match pointer_type {
+        "touch" => Some(true),
+        // A pencil has no hover tooltip. On a touch device it should open
+        // the list, the same as a finger.
+        "pen" => Some(coarse_pointer()),
+        "mouse" => Some(false),
+        _ => None,
+    }
+}
+
 /// A finger or a pen on a coarse screen opens the list. A mouse removes.
-/// Dioxus stores the click as a `MouseEvent` even when the browser object is
-/// a `PointerEvent`, so the cast is on the JS value. A plain mouse event
-/// (Safari before 17) falls back to the media query.
-fn gesture_opens_owner_list(evt: &dioxus_core::Event<MouseData>) -> bool {
+///
+/// `pressed_with` is the `pointerType` of the chip's own `pointerdown`, and
+/// it wins over the click's: iOS Safari 18.2 and later report a tap's
+/// `click` as `"mouse"` while its `pointerdown` says `"touch"` (WebKit bug
+/// 282988), and so does Playwright's WebKit. Without a `pointerdown` (a click
+/// synthesised by assistive technology) the click's own `pointerType`
+/// decides. Dioxus stores the click as a `MouseEvent` even when the browser
+/// object is a `PointerEvent`, so that cast is on the JS value. A plain mouse
+/// event (Safari before 17) falls back to the media query.
+fn gesture_opens_owner_list(
+    evt: &dioxus_core::Event<MouseData>,
+    pressed_with: Option<&str>,
+) -> bool {
+    if let Some(opens) = pressed_with.and_then(pointer_type_opens_owner_list) {
+        return opens;
+    }
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(mouse) = evt.data().downcast::<web_sys::MouseEvent>() {
             if let Some(pointer) = mouse.dyn_ref::<web_sys::PointerEvent>() {
-                match pointer.pointer_type().as_str() {
-                    "touch" => return true,
-                    // A pencil has no hover tooltip. On a touch device it
-                    // should open the list, the same as a finger.
-                    "pen" => return coarse_pointer(),
-                    "mouse" => return false,
-                    _ => {}
+                if let Some(opens) = pointer_type_opens_owner_list(&pointer.pointer_type()) {
+                    return opens;
                 }
             }
         }
@@ -3247,6 +3370,68 @@ fn gesture_opens_owner_list(evt: &dioxus_core::Event<MouseData>) -> bool {
         let _ = evt;
     }
     coarse_pointer()
+}
+
+/// Where the reactor list for a chip opens, from a point on the chip (the
+/// tap, or the chip's centre for a key press): below unless there is more
+/// room above, and toward whichever side of the window has more room.
+fn reaction_owners_popover_at(
+    key: String,
+    message_id: String,
+    x: f64,
+    y: f64,
+) -> ReactionOwnersPopover {
+    let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
+    let space_below = scroll_bottom - y;
+    let space_above = y - scroll_top;
+    let above = space_below < REACTION_OWNERS_POPOVER_HEIGHT_PX && space_above > space_below;
+    let max_h = ((if above { space_above } else { space_below }) - 16.0).max(1.0);
+    let win_w = web_sys::window()
+        .and_then(|w| w.inner_width().ok())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(400.0);
+    let space_right = (win_w - x - 8.0).max(128.0);
+    let space_left = (x - 8.0).max(128.0);
+    let align_right = space_left > space_right;
+    let max_w = if align_right { space_left } else { space_right };
+    ReactionOwnersPopover {
+        key,
+        message_id,
+        above,
+        align_right,
+        max_h,
+        max_w,
+    }
+}
+
+/// The centre of the element with this id, in client coordinates.
+fn element_centre(id: &str) -> Option<(f64, f64)> {
+    let element = web_sys::window()?.document()?.get_element_by_id(id)?;
+    let rect = element.get_bounding_client_rect();
+    Some((
+        rect.left() + rect.width() / 2.0,
+        rect.top() + rect.height() / 2.0,
+    ))
+}
+
+fn reaction_owners_dialog_id(key: &str) -> String {
+    format!("reaction-owners-{key}")
+}
+
+fn reaction_chip_id(key: &str) -> String {
+    format!("reaction-chip-{key}")
+}
+
+/// Focus without scrolling. Moving focus between a chip and its list must not
+/// move the history: only an arrival does (history-scrolling.md).
+#[cfg(target_arch = "wasm32")]
+fn focus_without_scrolling(element: &web_sys::Element) -> bool {
+    let Some(element) = element.dyn_ref::<web_sys::HtmlElement>() else {
+        return false;
+    };
+    let options = web_sys::FocusOptions::new();
+    options.set_prevent_scroll(true);
+    element.focus_with_options(&options).is_ok()
 }
 
 fn chat_scrollport_bounds() -> (f64, f64) {
@@ -3382,31 +3567,64 @@ fn MessageGroupComponent(
             });
         }
     }
+    // The `pointerType` of the last `pointerdown` on a reaction chip in this
+    // group, with the chip's key. The chip's click consumes it; see
+    // `gesture_opens_owner_list` for why the click's own type is not enough.
+    // Not a signal: nothing renders from it.
+    let chip_pressed_with = use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, String)>)));
     {
-        let owners_focus = use_hook(|| Rc::new(std::cell::Cell::new(None::<String>)));
-        let mut open_reaction_owners = open_reaction_owners;
+        // (key, message id) of the list that was open on the last run.
+        let owners_focus = use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, String)>)));
+        let open_reaction_owners = open_reaction_owners;
         use_effect(move || {
+            // An infallible read, deliberately. `open_reaction_owners` is this
+            // component's own `use_signal`, written only from `defer()`
+            // callbacks, so no write borrow can be live while this effect
+            // runs, and the render body reads it the same way. `try_read()`
+            // would add a failure path, plus the anchor and nudge
+            // (dioxus-signal-safety.md, freenet/river#555) to keep the effect
+            // subscribed through it, for contention that cannot happen here.
             let current = open_reaction_owners
                 .read()
                 .as_ref()
-                .map(|popup| popup.key.clone());
+                .map(|popup| (popup.key.clone(), popup.message_id.clone()));
             let previous = owners_focus.replace(current.clone());
+            if current == previous {
+                return;
+            }
             #[cfg(target_arch = "wasm32")]
             crate::util::defer(move || {
                 let Some(document) = web_sys::window().and_then(|window| window.document()) else {
                     return;
                 };
-                let target = if current.is_some() {
-                    Some("reaction-owners-dialog".to_string())
-                } else {
-                    previous.map(|key| format!("reaction-chip-{key}"))
-                };
-                if let Some(id) = target {
-                    if let Some(element) = document.get_element_by_id(&id) {
-                        let _ = element
-                            .dyn_ref::<web_sys::HtmlElement>()
-                            .map(|node| node.focus());
+                if let Some((key, _)) = current {
+                    if let Some(dialog) =
+                        document.get_element_by_id(&reaction_owners_dialog_id(&key))
+                    {
+                        focus_without_scrolling(&dialog);
                     }
+                    return;
+                }
+                let Some((key, message_id)) = previous else {
+                    return;
+                };
+                if let Some(chip) = document.get_element_by_id(&reaction_chip_id(&key)) {
+                    focus_without_scrolling(&chip);
+                    return;
+                }
+                // The chip is gone: Remove took the only reaction with that
+                // emoji. The message's add-reaction button is the nearest
+                // control. If the message is gone too, focus stays where the
+                // browser put it.
+                if let Some(add) = document
+                    .get_element_by_id(&format!("msg-{message_id}"))
+                    .and_then(|row| {
+                        row.query_selector("[data-testid=\"add-reaction-button\"]")
+                            .ok()
+                            .flatten()
+                    })
+                {
+                    focus_without_scrolling(&add);
                 }
             });
         });
@@ -4294,7 +4512,16 @@ fn MessageGroupComponent(
                                                     let msg_id_for_remove = msg_id_for_click.clone();
                                                     let emoji_for_remove = emoji_for_click.clone();
                                                     let owners_key_for_click = owners_key.clone();
-                                                    let chip_id = format!("reaction-chip-{owners_key}");
+                                                    let owners_key_for_key = owners_key.clone();
+                                                    let owners_key_for_press = owners_key.clone();
+                                                    let chip_pressed_with_click = chip_pressed_with.clone();
+                                                    let chip_pressed_with_down = chip_pressed_with.clone();
+                                                    let chip_pressed_with_cancel = chip_pressed_with.clone();
+                                                    let msg_id_for_owners = msg_id_for_inline.clone();
+                                                    let msg_id_for_owners_key = msg_id_for_inline.clone();
+                                                    let chip_id = reaction_chip_id(&owners_key);
+                                                    let chip_id_for_key = chip_id.clone();
+                                                    let owners_dialog_id = reaction_owners_dialog_id(&owners_key);
 
                                                     rsx! {
                                                         div {
@@ -4311,9 +4538,10 @@ fn MessageGroupComponent(
                                                                     },
                                                                 }
                                                                 div {
-                                                                    id: "reaction-owners-dialog",
+                                                                    id: "{owners_dialog_id}",
                                                                     "data-testid": "reaction-owners",
                                                                     role: "dialog",
+                                                                    "aria-modal": "true",
                                                                     tabindex: "-1",
                                                                     "aria-label": "Who reacted",
                                                                     class: format!(
@@ -4393,6 +4621,7 @@ fn MessageGroupComponent(
                                                                 role: "button",
                                                                 tabindex: "0",
                                                                 "aria-expanded": if owners_open { "true" } else { "false" },
+                                                                "aria-haspopup": "dialog",
                                                                 class: format!(
                                                                     "inline-flex items-center gap-0.5 text-base transition-transform {}",
                                                                     if is_user_reaction {
@@ -4402,42 +4631,40 @@ fn MessageGroupComponent(
                                                                     }
                                                                 ),
                                                                 title: "{tooltip}",
+                                                                onpointerdown: move |e: PointerEvent| {
+                                                                    *chip_pressed_with_down.borrow_mut() =
+                                                                        Some((owners_key_for_press.clone(), e.data().pointer_type()));
+                                                                },
+                                                                onpointercancel: move |_| {
+                                                                    chip_pressed_with_cancel.borrow_mut().take();
+                                                                },
                                                                 onclick: move |e: MouseEvent| {
                                                                     let click_y = e.client_coordinates().y;
                                                                     let click_x = e.client_coordinates().x;
-                                                                    if gesture_opens_owner_list(&e) {
-                                                                        let key = owners_key_for_click.clone();
-                                                                        let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
-                                                                        let space_below = scroll_bottom - click_y;
-                                                                        let space_above = click_y - scroll_top;
-                                                                        let above = space_below < REACTION_OWNERS_POPOVER_HEIGHT_PX
-                                                                            && space_above > space_below;
-                                                                        let max_h = ((if above { space_above } else { space_below }) - 16.0).max(1.0);
-                                                                        let win_w = web_sys::window()
-                                                                            .and_then(|w| w.inner_width().ok())
-                                                                            .and_then(|v| v.as_f64())
-                                                                            .unwrap_or(400.0);
-                                                                        let space_right = (win_w - click_x - 8.0).max(128.0);
-                                                                        let space_left = (click_x - 8.0).max(128.0);
-                                                                        let align_right = space_left > space_right;
-                                                                        let max_w = if align_right { space_left } else { space_right };
+                                                                    // Only this chip's own press counts.
+                                                                    let pressed_with = chip_pressed_with_click
+                                                                        .borrow_mut()
+                                                                        .take()
+                                                                        .filter(|(key, _)| *key == owners_key_for_click)
+                                                                        .map(|(_, pointer_type)| pointer_type);
+                                                                    if gesture_opens_owner_list(&e, pressed_with.as_deref()) {
+                                                                        let popover = reaction_owners_popover_at(
+                                                                            owners_key_for_click.clone(),
+                                                                            msg_id_for_owners.clone(),
+                                                                            click_x,
+                                                                            click_y,
+                                                                        );
                                                                         crate::util::defer(move || {
                                                                             let already_open = open_reaction_owners
                                                                                 .peek()
                                                                                 .as_ref()
-                                                                                .is_some_and(|popup| popup.key == key);
+                                                                                .is_some_and(|popup| popup.key == popover.key);
                                                                             if already_open {
                                                                                 open_reaction_owners.set(None);
                                                                             } else {
                                                                                 open_emoji_picker.set(None);
                                                                                 open_action_menu.set(None);
-                                                                                open_reaction_owners.set(Some(ReactionOwnersPopover {
-                                                                                    key,
-                                                                                    above,
-                                                                                    align_right,
-                                                                                    max_h,
-                                                                                    max_w,
-                                                                                }));
+                                                                                open_reaction_owners.set(Some(popover));
                                                                             }
                                                                         });
                                                                     } else if is_user_reaction {
@@ -4449,10 +4676,35 @@ fn MessageGroupComponent(
                                                                     }
                                                                 },
                                                                 onkeydown: move |e: KeyboardEvent| {
-                                                                    if e.key() == Key::Escape {
+                                                                    let key = e.key();
+                                                                    if key == Key::Escape {
                                                                         e.prevent_default();
                                                                         crate::util::defer(move || open_reaction_owners.set(None));
+                                                                        return;
                                                                     }
+                                                                    // A `role="button"` answers Enter and Space.
+                                                                    // Both open the list, never remove: removing
+                                                                    // stays one step away, behind the list's
+                                                                    // Remove, and a key press has no hover title
+                                                                    // to say who reacted.
+                                                                    let space = matches!(&key, Key::Character(c) if c == " ");
+                                                                    if key != Key::Enter && !space {
+                                                                        return;
+                                                                    }
+                                                                    // Space would scroll the history.
+                                                                    e.prevent_default();
+                                                                    let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
+                                                                    let popover = reaction_owners_popover_at(
+                                                                        owners_key_for_key.clone(),
+                                                                        msg_id_for_owners_key.clone(),
+                                                                        x,
+                                                                        y,
+                                                                    );
+                                                                    crate::util::defer(move || {
+                                                                        open_emoji_picker.set(None);
+                                                                        open_action_menu.set(None);
+                                                                        open_reaction_owners.set(Some(popover));
+                                                                    });
                                                                 },
                                                                 "{emoji}"
                                                                 if count > 1 {

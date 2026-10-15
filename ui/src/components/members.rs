@@ -1422,6 +1422,25 @@ pub fn MemberList() -> Element {
     // does not spend a row on a box nobody is using (freenet/river#493).
     let mut member_search_open = use_signal(|| false);
     let mut member_query = use_signal(String::new);
+    // `MemberList` stays mounted across room switches, so without this the
+    // last room's query would filter the next room. Compared in render and
+    // reset through `defer()`, like the description in `conversation.rs`.
+    let mut member_search_room = use_signal(|| None::<VerifyingKey>);
+    if let Ok(open_room) = CURRENT_ROOM.try_read().map(|room| room.owner_key) {
+        let moved = member_search_room
+            .try_read()
+            .is_ok_and(|searched| *searched != open_room);
+        if moved {
+            crate::util::defer(move || {
+                let open_room = CURRENT_ROOM.peek().owner_key;
+                if *member_search_room.peek() != open_room {
+                    member_search_room.set(open_room);
+                    member_search_open.set(false);
+                    member_query.set(String::new());
+                }
+            });
+        }
+    }
 
     let members = use_memo(move || {
         // freenet/river#555: keep a dependency the nudge can wake, so a contended
@@ -1580,8 +1599,11 @@ pub fn MemberList() -> Element {
         }
 
         Some(all_members)
-    })()
-    .unwrap_or_default();
+    })();
+    // `None` while the room's state is still loading (or a read was
+    // contended). "No matching members" must not show then.
+    let members_loaded = members.is_some();
+    let members = members.unwrap_or_default();
 
     let needle = member_query.read().trim().to_lowercase();
     let members: Vec<_> = members
@@ -1596,6 +1618,8 @@ pub fn MemberList() -> Element {
             });
         });
     };
+
+    let search_open = *member_search_open.read();
 
     // Don't show members panel if no room is selected
     let has_room = CURRENT_ROOM.read().owner_key.is_some();
@@ -1622,28 +1646,35 @@ pub fn MemberList() -> Element {
                         testid: "members-back-to-chat-button",
                         current_room_badge: "members-current-room-unread-badge",
                     }
-                    button {
-                        id: "member-search-toggle",
-                        "data-testid": "member-search-toggle",
-                        class: "flex-1 min-w-0 text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2 text-left",
-                        "aria-expanded": if *member_search_open.read() { "true" } else { "false" },
-                        onclick: move |_| {
-                            crate::util::defer(move || {
-                                let open = !*member_search_open.peek();
-                                member_search_open.set(open);
-                                if !open {
-                                    member_query.set(String::new());
-                                }
-                            });
-                        },
-                        Icon { icon: FaUsers, width: 16, height: 16 }
-                        span { class: "truncate", "Active Members" }
-                        span { class: "flex-shrink-0 inline-flex",
-                            Icon { icon: FaMagnifyingGlass, width: 14, height: 14 }
+                    // The heading stays a heading for screen-reader
+                    // navigation; the search control is the button inside it.
+                    h2 { class: "flex-1 min-w-0",
+                        button {
+                            id: "member-search-toggle",
+                            "data-testid": "member-search-toggle",
+                            r#type: "button",
+                            // `min-h-6`: a 24px target (WCAG 2.2) for a 20px line.
+                            class: "w-full min-h-6 text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2 text-left",
+                            "aria-expanded": if search_open { "true" } else { "false" },
+                            "aria-controls": "member-search-input",
+                            onclick: move |_| {
+                                crate::util::defer(move || {
+                                    let open = !*member_search_open.peek();
+                                    member_search_open.set(open);
+                                    if !open {
+                                        member_query.set(String::new());
+                                    }
+                                });
+                            },
+                            Icon { icon: FaUsers, width: 16, height: 16 }
+                            span { class: "truncate", "Active Members" }
+                            span { class: "flex-shrink-0 inline-flex",
+                                Icon { icon: FaMagnifyingGlass, width: 14, height: 14 }
+                            }
                         }
                     }
                 }
-                if *member_search_open.read() {
+                if search_open {
                     // 16px text so iOS does not zoom the page when the field
                     // is focused. The members panel is full width on a phone.
                     input {
@@ -1652,15 +1683,21 @@ pub fn MemberList() -> Element {
                         class: "mt-2 w-full px-3 py-2 bg-surface border border-border rounded-lg text-base text-text",
                         r#type: "search",
                         placeholder: "Search members",
+                        "aria-label": "Search members by name",
                         value: "{member_query}",
                         // `autofocus` only runs on the first page load. This
                         // field is mounted later, when the heading is clicked.
+                        // `safe_spawn_local`, not `spawn_local`: see
+                        // dioxus-signal-safety.md.
                         onmounted: move |cx| {
                             let element = cx.data();
-                            wasm_bindgen_futures::spawn_local(async move {
+                            crate::util::safe_spawn_local(async move {
                                 let _ = element.set_focus(true).await;
                             });
                         },
+                        // Written synchronously: the controlled-input exception
+                        // in dioxus-signal-safety.md (a local signal bound to
+                        // `value:`; deferring it would drop keystrokes).
                         oninput: move |evt| member_query.set(evt.value()),
                         onkeydown: move |evt: KeyboardEvent| {
                             if evt.key() != Key::Escape {
@@ -1681,8 +1718,12 @@ pub fn MemberList() -> Element {
             ul {
                 "data-testid": "member-list",
                 class: "flex-1 px-2 py-2 space-y-0.5 overflow-y-auto min-h-0",
-                if members.is_empty() && !member_query.read().trim().is_empty() {
-                    li { class: "px-3 py-2 text-sm text-text-muted", "No matching members" }
+                if members_loaded && members.is_empty() && !needle.is_empty() {
+                    li {
+                        role: "status",
+                        class: "px-3 py-2 text-sm text-text-muted",
+                        "No matching members"
+                    }
                 }
                 for (parts, member_id) in members {
                     li {
