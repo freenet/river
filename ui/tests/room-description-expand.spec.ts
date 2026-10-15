@@ -14,10 +14,44 @@ const MULTILINE_ROOM = "House Rules Room";
 // Same fixture: one short line with inline code and an emoji, whose line box
 // is a little taller than plain text's. It fits, so no chevron.
 const INLINE_CODE_ROOM = "Inline Code Room";
-// The app waits this long after a mouse click on the text before toggling
-// (`DESCRIPTION_DOUBLE_CLICK_WAIT_MS`). Waits below add a wide margin.
-const CLICK_WAIT_MS = 500;
-const PAST_CLICK_WAIT_MS = CLICK_WAIT_MS + 700;
+// Same fixture: a heading alone, and a single list item (whose margins make
+// it taller than the clamp).
+const HEADING_ROOM = "Heading Room";
+const SINGLE_ITEM_ROOM = "Single Item Room";
+// The app's own wait after a mouse click on the text is 500ms
+// (`DESCRIPTION_DOUBLE_CLICK_WAIT_MS`). Specs that must act while a click is
+// still waiting set it this long instead, so a slow runner cannot let it end
+// early, and then wait for the click's recorded outcome rather than a time.
+const LONG_CLICK_WAIT_MS = 4_000;
+
+async function useLongClickWait(page: Page) {
+  await callRiverTest(page, "setDescriptionClickWaitMs", LONG_CLICK_WAIT_MS);
+}
+
+/// Wait until the description's waiting click has ended, and return whether
+/// it toggled (`"toggled"`) or not (`"cancelled"`).
+async function clickOutcome(page: Page): Promise<string | null> {
+  const description = page.getByTestId("room-header-description");
+  await expect(description).not.toHaveAttribute("data-click-pending", /.*/, {
+    timeout: LONG_CLICK_WAIT_MS + 5_000,
+  });
+  return description.getAttribute("data-click-outcome");
+}
+
+/// Whether the description's box is shorter than its collapsed clamp, so
+/// the clamp is not what sizes it.
+function belowClamp(page: Page): Promise<boolean> {
+  return page
+    .getByTestId("room-header-description")
+    .evaluate((el) => el.clientHeight + 1 < parseFloat(getComputedStyle(el).maxHeight));
+}
+
+/// Whether the description's content is taller than its box (cut off).
+function clipped(page: Page): Promise<boolean> {
+  return page
+    .getByTestId("room-header-description")
+    .evaluate((el) => el.scrollHeight > el.clientHeight + 1);
+}
 
 /// A point on the plain-text "Welcome" at the start of the long description.
 async function welcomePoint(page: Page): Promise<{ x: number; y: number }> {
@@ -117,8 +151,9 @@ test.describe("Room description expand", () => {
     ).toBe(true);
     const toggle = page.getByTestId("room-description-toggle");
     await expect(toggle).toBeVisible();
-    // Collapsed is one line, the same height as a one-line description.
-    expect(await descriptionHeight(page)).toBeCloseTo(oneLine, 0);
+    // Collapsed is one line: no taller than a one-line description plus the
+    // clamp's 4px allowance for inline code or an emoji.
+    expect(await descriptionHeight(page)).toBeLessThanOrEqual(oneLine + 4.5);
 
     await toggle.click();
     await expect(description).toHaveAttribute("data-expanded", "true");
@@ -126,7 +161,7 @@ test.describe("Room description expand", () => {
     expect(await descriptionHeight(page)).toBeGreaterThan(oneLine * 3);
   });
 
-  test("a one-line description with inline code and an emoji gets no chevron", async ({
+  test("a one-line description with inline code and an emoji shows uncut, with no chevron", async ({
     page,
   }) => {
     await page.goto("/?multiline-description=1");
@@ -135,39 +170,83 @@ test.describe("Room description expand", () => {
     const description = page.getByTestId("room-header-description");
     await expect(description.locator("code")).toHaveText("cargo make");
     await settle(page);
+    // The whole line fits under the clamp, so the clamp hides nothing. (Its
+    // `scrollHeight` can still be 1-3px past the box: the inline code's box
+    // hangs below the line box. That is not text the clamp cuts off.)
+    expect(await belowClamp(page), "the line fits under the clamp").toBe(true);
+    await expect(page.getByTestId("room-description-toggle")).toHaveCount(0);
+  });
+
+  // The rule both cases pin: a chevron exactly when the collapsed clamp
+  // cuts something off, and expanding then shows all of it.
+  test("a single list item is cut off when collapsed, so it gets a chevron and expands uncut", async ({
+    page,
+  }) => {
+    await page.goto("/?multiline-description=1");
+    await waitForApp(page);
+    await selectRoom(page, SINGLE_ITEM_ROOM);
+    const description = page.getByTestId("room-header-description");
+    await expect(description).toContainText("Be kind");
+    await settle(page);
+    expect(await clipped(page), "premise: the collapsed item is cut off").toBe(true);
+    const toggle = page.getByTestId("room-description-toggle");
+    await expect(toggle).toBeVisible();
+    await toggle.click();
+    await expect(description).toHaveAttribute("data-expanded", "true");
+    await settle(page);
+    expect(await clipped(page), "expanded, it shows in full").toBe(false);
+  });
+
+  test("a heading-only description fits its one line uncut, with no chevron", async ({ page }) => {
+    await page.goto("/?multiline-description=1");
+    await waitForApp(page);
+    await selectRoom(page, HEADING_ROOM);
+    const description = page.getByTestId("room-header-description");
+    await expect(description.locator("h2")).toHaveText("Read this first");
+    await settle(page);
+    // The header's `text-xs` sizes the heading like the rest of the line.
+    expect(await clipped(page), "the heading is not cut off").toBe(false);
     await expect(page.getByTestId("room-description-toggle")).toHaveCount(0);
   });
 
   test("a slow double-click selects a word without expanding", async ({ page }) => {
     await openLongRoom(page);
+    await useLongClickWait(page);
     const description = page.getByTestId("room-header-description");
     const { x, y } = await welcomePoint(page);
 
-    // Two clicks 350ms apart: slower than a quick double-click, well inside
+    // Two clicks 350ms apart: slower than a quick double-click, inside
     // common OS double-click times (Windows defaults to 500ms).
     await page.mouse.click(x, y);
+    await expect(description).toHaveAttribute("data-click-pending", /\d+/);
     await page.waitForTimeout(350);
     await page.mouse.down({ clickCount: 2 });
     await page.mouse.up({ clickCount: 2 });
-    await page.waitForTimeout(PAST_CLICK_WAIT_MS);
+    expect(await clickOutcome(page)).toBe("cancelled");
     await expect(description).toHaveAttribute("data-expanded", "false");
+    // The double-click did what it is for: it selected a word.
+    expect(await page.evaluate(() => window.getSelection()?.toString().trim() ?? "")).not.toBe("");
 
-    // A single click still expands, once the double-click window has passed.
+    // A single click still expands, once its wait has ended.
     await page.evaluate(() => window.getSelection()?.removeAllRanges());
     await page.mouse.click(x, y);
+    expect(await clickOutcome(page)).toBe("toggled");
     await expect(description).toHaveAttribute("data-expanded", "true");
   });
 
   test("the chevron right after a click on the text leaves it expanded", async ({ page }) => {
     await openLongRoom(page);
+    await useLongClickWait(page);
     const description = page.getByTestId("room-header-description");
     const { x, y } = await welcomePoint(page);
 
     await page.mouse.click(x, y);
+    await expect(description).toHaveAttribute("data-click-pending", /\d+/);
     await page.getByTestId("room-description-toggle").click();
     await expect(description).toHaveAttribute("data-expanded", "true");
     // The click on the text was still waiting. It must not toggle it back.
-    await page.waitForTimeout(PAST_CLICK_WAIT_MS);
+    expect(await clickOutcome(page)).toBe("cancelled");
+    await settle(page);
     await expect(description).toHaveAttribute("data-expanded", "true");
   });
 
@@ -175,19 +254,22 @@ test.describe("Room description expand", () => {
     page,
   }) => {
     await openLongRoom(page);
+    await useLongClickWait(page);
     const description = page.getByTestId("room-header-description");
     const { x, y } = await welcomePoint(page);
 
     await page.mouse.click(x, y);
+    await expect(description).toHaveAttribute("data-click-pending", /\d+/);
     await callRiverTest(page, "switchRoom", SHORT_ROOM);
     await expect(description).toContainText("Hi");
     await callRiverTest(page, "switchRoom", LONG_ROOM);
     await expect(description).toContainText("Welcome");
-    await page.waitForTimeout(PAST_CLICK_WAIT_MS);
+    expect(await clickOutcome(page)).toBe("cancelled");
+    await settle(page);
     await expect(description).toHaveAttribute("data-expanded", "false");
   });
 
-  test("a tap on the text expands at once", async ({ page }) => {
+  test("a tap on the text expands at once, and only once", async ({ page }) => {
     test.skip(!test.info().project.name.startsWith("mobile"), "needs a touchscreen");
     await openLongRoom(page);
     const description = page.getByTestId("room-header-description");
@@ -196,10 +278,13 @@ test.describe("Room description expand", () => {
     // Low in the line: Chromium's touch adjustment moves a tap near the top
     // edge onto the Room details button just above.
     await page.touchscreen.tap(x, line.y + line.height - 3);
-    // Well under the mouse wait: a finger does not double-click to select.
-    await expect(description).toHaveAttribute("data-expanded", "true", {
-      timeout: CLICK_WAIT_MS - 150,
-    });
+    await expect(description).toHaveAttribute("data-expanded", "true");
+    // Past the mouse wait (500ms): the tap's click, which iOS reports as a
+    // mouse click, did not also start a delayed toggle that would close it.
+    await page.waitForTimeout(1_200);
+    await expect(description).toHaveAttribute("data-expanded", "true");
+    expect(await description.getAttribute("data-click-pending")).toBeNull();
+    expect(await description.getAttribute("data-click-outcome")).toBeNull();
   });
 
   test("narrowing the window reveals the chevron", async ({ page }) => {
