@@ -38,7 +38,7 @@ type RowGeometry = {
   self: string | null;
   row: Box;
   contentLeft: number;
-  avatars: Array<Box & { color: string; ariaHidden: string | null; tabIndex: number; cursor: string }>;
+  avatars: Array<Box & { color: string; background: string; radius: string; ariaHidden: string | null; tabIndex: number; cursor: string }>;
   headers: Box[];
   nameColor: string | null;
   body: Box;
@@ -64,6 +64,8 @@ function rowGeometry(group: Locator): Promise<RowGeometry[]> {
         avatars: Array.from(row.querySelectorAll('[data-testid="message-group-avatar"]')).map((a) => ({
           ...box(a),
           color: getComputedStyle(a).color,
+          background: getComputedStyle(a).backgroundColor,
+          radius: getComputedStyle(a).borderRadius,
           ariaHidden: a.getAttribute("aria-hidden"),
           tabIndex: (a as HTMLElement).tabIndex,
           cursor: getComputedStyle(a).cursor,
@@ -131,7 +133,12 @@ test.describe("Message rows", () => {
     const ownFirst = groups.own[0];
     const receivedFirst = groups.received[0];
     expect(await computedColor(page, ownFirst.nameColor!), "own name in accent").toEqual(accent);
-    expect(await computedColor(page, ownFirst.avatars[0].color), "own avatar in text colour").toEqual(text);
+    const bg = await computedColor(page, "var(--color-bg)");
+    const ownAvatar = ownFirst.avatars[0];
+    expect(await computedColor(page, ownAvatar.background), "own avatar: text-coloured disc").toEqual(text);
+    expect(await computedColor(page, ownAvatar.color), "own avatar: glyph in the background colour").toEqual(bg);
+    expect(ownAvatar.radius, "own avatar is round").toBe("9999px");
+    expect(receivedFirst.avatars[0].background, "received avatar has no disc").toBe("rgba(0, 0, 0, 0)");
     expect(await computedColor(page, receivedFirst.nameColor!), "received name unchanged").toEqual(text);
     const receivedAvatar = await computedColor(page, receivedFirst.avatars[0].color);
     expect(receivedAvatar, "received avatar from the palette").not.toEqual(text);

@@ -3832,10 +3832,11 @@ fn MessageGroupComponent(
         }
     });
 
-    // The own group's avatar takes the text colour; everyone else's comes from
-    // their member id. Once per group, outside the row loop.
+    // The own group's avatar is the inverted disc (`.msg-avatar-self`);
+    // everyone else's glyph colour comes from their member id. Once per group,
+    // outside the row loop.
     let avatar_class = if is_self {
-        "text-text"
+        "msg-avatar-self"
     } else {
         avatar_colour_class(group.author_id)
     };
@@ -3877,7 +3878,6 @@ fn MessageGroupComponent(
                                         "data-testid": "message-group-avatar",
                                         "aria-hidden": "true",
                                         class: "msg-avatar {avatar_class}",
-                                        style: "-webkit-mask-image: url({RIVER_LOGO}); mask-image: url({RIVER_LOGO});",
                                         onclick: move |_| {
                                             crate::util::defer(move || {
                                                 MEMBER_INFO_MODAL.with_mut(|signal| {
@@ -3885,6 +3885,12 @@ fn MessageGroupComponent(
                                                 });
                                             });
                                         },
+                                        // The logo as an alpha mask, filled with
+                                        // the avatar's `currentColor`.
+                                        span {
+                                            class: "msg-avatar-glyph",
+                                            style: "-webkit-mask-image: url({RIVER_LOGO}); mask-image: url({RIVER_LOGO});",
+                                        }
                                     }
                                 }
                                 div {

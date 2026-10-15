@@ -94,8 +94,24 @@
 
 .msg-avatar {
     grid-column: 1;
+    display: flex;
     width: 36px;
     height: 36px;
+    cursor: pointer;
+}
+
+/* The own group's avatar: a text-coloured disc with the glyph cut out in the
+ * page background colour, so it reads apart from the palette silhouettes in
+ * both themes. */
+.msg-avatar-self {
+    border-radius: 9999px;
+    background-color: var(--color-text);
+    color: var(--color-bg);
+    padding: 4px;
+}
+
+.msg-avatar-glyph {
+    flex: 1;
     background-color: currentColor;
     -webkit-mask-size: contain;
     mask-size: contain;
@@ -103,7 +119,6 @@
     mask-repeat: no-repeat;
     -webkit-mask-position: center;
     mask-position: center;
-    cursor: pointer;
 }
 
 .msg-content {
