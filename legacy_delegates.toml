@@ -244,3 +244,10 @@ description = "Last chat-delegate generation whose ChatDelegateRequestMsg/ChatDe
 date = "2026-10-12"
 delegate_key = "e6d48cb3a7e605387466eb0db9fca7287987e3766f2b5005e81090c36685828b"
 code_hash = "81b562f82cecabdf8b9fabd74a77a94f6d885ae60cb0c306a49dbc027756c889"
+
+[[entry]]
+version = "V34"
+description = "Last chat-delegate generation before the freenet/river#423 ban-resolution change (#702), which the delegate links through river-core's room-state code; river-core 0.1.22 -> 0.2.0"
+date = "2026-10-15"
+delegate_key = "e3c99e6897a1daef51370d0d00bc74132eec374d4267a0badf600e1a24cda5a4"
+code_hash = "cea989c88db1a0ebc3558f2c33f90ab491473388e3f80319d8a09450b13a5d81"

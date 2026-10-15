@@ -235,3 +235,9 @@ version = "V33"
 description = "Before the river-core 0.1.22 room-contract fixes"
 date = "2026-09-24"
 code_hash = "a3e63c8c0426255376f9f6f00948512e185bd0961875e43cd9e3e479ccaa0ce1"
+
+[[entry]]
+version = "V34"
+description = "Before bans were resolved from converged state (freenet/river#423, PR #702)"
+date = "2026-10-15"
+code_hash = "b98f49cf853c6dc09976197fa00d9f1e4d5a32c0e3d5b06e7e5969f9aa3c4acb"
