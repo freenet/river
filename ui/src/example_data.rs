@@ -222,8 +222,10 @@ pub fn create_example_rooms() -> Rooms {
             HistoryDepth::Standard,
         );
         map.insert(room.owner_vk, room.room_data);
-        // A heading alone, and a single list item: one line each, but taller
-        // than the collapsed clamp, so each is cut off and needs the chevron.
+        // A heading alone and a single list item, one line each. The heading
+        // renders at the header's 12px/16px and fits, so it gets no chevron;
+        // the list item's box is taller than the collapsed clamp, so it is cut
+        // off and gets the chevron.
         for (name, description) in [
             ("Heading Room", "## Read this first"),
             ("Single Item Room", "- Be kind"),

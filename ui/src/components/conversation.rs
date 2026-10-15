@@ -1017,9 +1017,10 @@ fn NoRoomFooter() -> Element {
 /// clips it horizontally and `max-h-[calc(1lh+4px)]` vertically, so a list,
 /// a heading or a hard break cannot grow the header either. The 4px lets a
 /// line made taller by inline code or an emoji (17-19px against a 16px line,
-/// measured) without reaching the clamp; a heading or a list item is taller
-/// than that, so it reaches the clamp and gets the chevron
-/// (`header_description_overflows`). Expanded wraps and scrolls
+/// measured) without reaching the clamp. A list, a list item or a hard break
+/// is taller than that, so it reaches the clamp and gets the chevron
+/// (`header_description_overflows`). A heading alone renders at the header's
+/// font size and fits. Expanded wraps and scrolls
 /// so a long description stays in the header instead of pushing the messages
 /// off the screen (freenet/river#718).
 fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
@@ -1077,7 +1078,7 @@ fn header_description_overflows() -> bool {
     {
         // Both axes, against the box the collapsed class clamps to (see
         // `room_description_class`): a long line overflows sideways, and a
-        // list, a heading or a hard break is taller than the clamp. Downwards
+        // list, a list item or a hard break is taller than the clamp. Downwards
         // it counts only once the box has reached the clamp: below it, the
         // box already holds the whole line, and the 1-3px `scrollHeight`
         // reports past it is an inline box (inline code) hanging below the
@@ -1149,6 +1150,9 @@ fn description_selection_is_collapsed() -> bool {
 /// the longest common default. A finger toggles at once (a double tap does
 /// not select a word), and so does the chevron.
 const DESCRIPTION_DOUBLE_CLICK_WAIT_MS: u64 = 500;
+// The specs override the wait, so pin the shipped value here: anything shorter
+// than the Windows default lets a slower double-click toggle under the pointer.
+const _: () = assert!(DESCRIPTION_DOUBLE_CLICK_WAIT_MS >= 500);
 
 thread_local! {
     /// Test-only override of [`DESCRIPTION_DOUBLE_CLICK_WAIT_MS`], set by the
@@ -1173,8 +1177,12 @@ fn description_click_wait_ms() -> u64 {
 /// "the wait has not ended" from "it ended without toggling": while a click
 /// waits, `data-click-pending` holds its number; when that click's wait ends,
 /// `data-click-outcome` is `toggled` or `cancelled`. Plain DOM attributes,
-/// not rendered state, so they cost no render.
+/// not rendered state, so they cost no render. Only the example-data build the
+/// specs run sets them.
 fn mark_description_click(armed: u64, outcome: Option<&str>) {
+    if !cfg!(feature = "example-data") {
+        return;
+    }
     let Some(element) = header_description_element() else {
         return;
     };

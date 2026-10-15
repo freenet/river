@@ -230,6 +230,7 @@ test.describe("Room description expand", () => {
     // A single click still expands, once its wait has ended.
     await page.evaluate(() => window.getSelection()?.removeAllRanges());
     await page.mouse.click(x, y);
+    await expect(description).toHaveAttribute("data-click-pending", /\d+/);
     expect(await clickOutcome(page)).toBe("toggled");
     await expect(description).toHaveAttribute("data-expanded", "true");
   });
