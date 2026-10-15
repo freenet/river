@@ -149,7 +149,11 @@ pub fn create_example_rooms() -> Rooms {
     let room1 = create_room(
         &"Public Discussion Room".to_string(),
         SelfIs::Observer,
-        Some("Welcome | [Website](https://freenet.org/) · [Docs](https://docs.freenet.org/)"),
+        Some(
+            "Welcome | [Website](https://freenet.org/) · [Docs](https://docs.freenet.org/) · \
+             [Dashboard](https://freenet.org/dashboard) · [Network](https://freenet.org/network) · \
+             [FAQ](https://freenet.org/faq) · [Explore with Atlas](https://freenet.org/atlas)",
+        ),
         HistoryDepth::Standard,
     );
     map.insert(room1.owner_vk, room1.room_data);
@@ -158,7 +162,7 @@ pub fn create_example_rooms() -> Rooms {
     let room2 = create_room(
         &"Team Chat Room".to_string(),
         SelfIs::Member,
-        None,
+        Some("Hi"),
         HistoryDepth::Standard,
     );
     map.insert(room2.owner_vk, room2.room_data);

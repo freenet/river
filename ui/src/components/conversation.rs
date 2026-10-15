@@ -55,8 +55,8 @@ use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaBell, FaBellSlash, FaCircleInfo, FaEllipsisVertical, FaFaceSmile, FaPenToSquare,
-    FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
+    FaBars, FaBell, FaBellSlash, FaChevronDown, FaChevronUp, FaCircleInfo, FaEllipsisVertical,
+    FaFaceSmile, FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -1012,6 +1012,109 @@ fn NoRoomFooter() -> Element {
     }
 }
 
+fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
+    match (expanded, interactive) {
+        (true, _) => {
+            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted [&>p]:m-0 break-words cursor-pointer max-h-48 overflow-y-auto"
+        }
+        (false, true) => {
+            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline cursor-pointer"
+        }
+        (false, false) => {
+            "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline"
+        }
+    }
+}
+
+fn header_description_element() -> Option<web_sys::Element> {
+    web_sys::window()?
+        .document()?
+        .get_element_by_id("room-header-description")
+}
+
+fn header_column_element() -> Option<web_sys::Element> {
+    web_sys::window()?
+        .document()?
+        .get_element_by_id("room-header-column")
+}
+
+fn header_description_is_expanded() -> bool {
+    header_description_element()
+        .and_then(|element| element.get_attribute("data-expanded"))
+        .is_some_and(|value| value == "true")
+}
+
+fn header_description_overflows() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return header_description_element()
+            .is_some_and(|element| element.scroll_width() > element.client_width() + 1);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
+fn description_click_is_link(evt: &dioxus_core::Event<MouseData>) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return evt
+            .data()
+            .downcast::<web_sys::MouseEvent>()
+            .and_then(|mouse| mouse.target())
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+            .and_then(|element| element.closest("a").ok().flatten())
+            .is_some();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = evt;
+        false
+    }
+}
+
+fn description_click_is_multi(evt: &dioxus_core::Event<MouseData>) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return evt
+            .data()
+            .downcast::<web_sys::MouseEvent>()
+            .is_some_and(|mouse| mouse.detail() >= 2);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = evt;
+        false
+    }
+}
+
+fn description_selection_is_collapsed() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|window| window.get_selection().ok().flatten())
+            .is_none_or(|selection| selection.is_collapsed())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        true
+    }
+}
+
+fn note_description_overflow(description_overflows: &mut Signal<bool>) {
+    if header_description_is_expanded() {
+        return;
+    }
+    let next = header_description_overflows();
+    let changed = description_overflows
+        .try_read()
+        .is_ok_and(|current| *current != next);
+    if changed {
+        description_overflows.set(next);
+    }
+}
+
 #[component]
 pub fn Conversation() -> Element {
     // The open room as the last render whose `ROOMS` read succeeded saw it.
@@ -1234,6 +1337,68 @@ pub fn Conversation() -> Element {
             None
         }
     });
+
+    let mut expanded_description_room = use_signal(|| None::<ed25519_dalek::VerifyingKey>);
+    let description_overflows = use_signal(|| false);
+    {
+        let mut description_overflows = description_overflows;
+        use_effect(move || {
+            crate::util::signal_guard::anchor();
+            let Ok(_html) = current_room_description_html.try_read() else {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            };
+            let Ok(_expanded_room) = expanded_description_room.try_read() else {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            };
+            crate::util::defer(move || note_description_overflow(&mut description_overflows));
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let description_overflows = description_overflows;
+        let watch = use_hook(|| {
+            Rc::new(std::cell::RefCell::new(
+                None::<(web_sys::Element, web_sys::ResizeObserver)>,
+            ))
+        });
+        use_effect(move || {
+            use wasm_bindgen::prelude::*;
+
+            crate::util::signal_guard::anchor();
+            let Ok(_html) = current_room_description_html.try_read() else {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            };
+            let Ok(_room) = CURRENT_ROOM.try_read() else {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            };
+            let Some(column) = header_column_element() else {
+                return;
+            };
+            let same = watch
+                .borrow()
+                .as_ref()
+                .is_some_and(|(attached, _)| attached == &column);
+            if same {
+                return;
+            }
+            if let Some((_, observer)) = watch.borrow_mut().take() {
+                observer.disconnect();
+            }
+            let mut description_overflows = description_overflows;
+            let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
+                crate::util::defer(move || note_description_overflow(&mut description_overflows));
+            }) as Box<dyn FnMut(js_sys::Array)>);
+            if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
+                observer.observe(&column);
+                *watch.borrow_mut() = Some((column, observer));
+                cb.forget();
+            }
+        });
+    }
 
     // Memoize expensive message grouping (decryption + markdown parsing)
     // This prevents re-computing on every render/keystroke
@@ -2154,6 +2319,22 @@ pub fn Conversation() -> Element {
                             }
                         });
                     };
+                    let room_key = CURRENT_ROOM.read().owner_key;
+                    let description_expanded = expanded_description_room.read().as_ref()
+                        == room_key.as_ref()
+                        && room_key.is_some();
+                    let description_can_toggle =
+                        description_expanded || *description_overflows.read();
+                    let toggle_description = {
+                        let room_key = room_key;
+                        move || {
+                            crate::util::defer(move || {
+                                let open = expanded_description_room.peek().as_ref()
+                                    == room_key.as_ref();
+                                expanded_description_room.set(if open { None } else { room_key });
+                            });
+                        }
+                    };
                     rsx! {
                         div { class: "flex-shrink-0 px-3 md:px-6 py-3 border-b border-border bg-panel",
                             div {
@@ -2192,7 +2373,7 @@ pub fn Conversation() -> Element {
                                 // `<a>` is interactive content and cannot be nested inside
                                 // `<button>` per the HTML spec. Nesting also bubbles link
                                 // clicks to the modal-opening onclick handler.
-                                div { class: "min-w-0 flex-1",
+                                div { id: "room-header-column", class: "min-w-0 flex-1",
                                     // Title on the left; `ml-auto` on the (i) pushes (i)
                                     // and the bell to the right edge.
                                     div { class: "flex items-center gap-1 min-w-0",
@@ -2284,10 +2465,46 @@ pub fn Conversation() -> Element {
                                         }
                                     }
                                     if let Some(desc_html) = current_room_description_html.read().as_ref() {
-                                        div {
-                                            "data-testid": "room-header-description",
-                                            class: "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline",
-                                            dangerous_inner_html: "{desc_html}"
+                                        div { class: "flex items-start gap-1 min-w-0",
+                                            div {
+                                                id: "room-header-description",
+                                                "data-testid": "room-header-description",
+                                                "data-expanded": if description_expanded { "true" } else { "false" },
+                                                class: room_description_class(
+                                                    description_expanded,
+                                                    description_can_toggle,
+                                                ),
+                                                onclick: {
+                                                    let toggle_description = toggle_description.clone();
+                                                    move |evt| {
+                                                        if description_click_is_link(&evt)
+                                                            || description_click_is_multi(&evt)
+                                                            || !description_selection_is_collapsed()
+                                                            || !*description_overflows.peek()
+                                                                && !description_expanded
+                                                        {
+                                                            return;
+                                                        }
+                                                        toggle_description();
+                                                    }
+                                                },
+                                                dangerous_inner_html: "{desc_html}"
+                                            }
+                                            if description_can_toggle {
+                                                button {
+                                                    "data-testid": "room-description-toggle",
+                                                    class: "flex-shrink-0 p-0.5 -my-1 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                                    "aria-expanded": if description_expanded { "true" } else { "false" },
+                                                    "aria-label": if description_expanded { "Hide room description" } else { "Show room description" },
+                                                    title: if description_expanded { "Hide room description" } else { "Show room description" },
+                                                    onclick: move |_| toggle_description(),
+                                                    if description_expanded {
+                                                        Icon { icon: FaChevronUp, width: 14, height: 14 }
+                                                    } else {
+                                                        Icon { icon: FaChevronDown, width: 14, height: 14 }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

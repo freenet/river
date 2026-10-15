@@ -66,6 +66,7 @@ web-sys = { workspace = true, features = [
     "NotificationOptions",
     "NotificationPermission",
     "ResizeObserver",
+    "Selection",
     "ScrollBehavior",
     "ScrollToOptions",
     "Storage",
