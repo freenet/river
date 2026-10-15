@@ -2303,8 +2303,10 @@ pub fn Conversation() -> Element {
             // Outer div handles flex sizing; inner div handles scrolling.
             // Combining flex-1 with overflow on the same element causes the
             // scroll container to shift behind the sidebar during re-renders.
+            // With no room, `hidden` gives the panel to the no-room footer
+            // below; the history stays mounted for the next room's opening.
             div {
-                class: "flex-1 min-h-0 relative",
+                class: if current_room_data.is_some() { "flex-1 min-h-0 relative" } else { "hidden" },
                 div {
                     // `overflow-x-hidden` is a backstop: a kebab action menu on
                     // a very short self message can extend a few px past the
