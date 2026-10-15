@@ -2571,7 +2571,6 @@ pub fn Conversation() -> Element {
                                                         // the pointer, and the second click would
                                                         // select a different word or none.
                                                         let click_seq = click_seq.clone();
-                                                        let toggle_description = toggle_description.clone();
                                                         crate::util::safe_spawn_local(async move {
                                                             crate::util::sleep(crate::util::millis(
                                                                 DESCRIPTION_DOUBLE_CLICK_WAIT_MS,
@@ -3589,44 +3588,46 @@ fn MessageGroupComponent(
                 .as_ref()
                 .map(|popup| (popup.key.clone(), popup.message_id.clone()));
             let previous = owners_focus.replace(current.clone());
-            if current == previous {
-                return;
-            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = previous;
             #[cfg(target_arch = "wasm32")]
-            crate::util::defer(move || {
-                let Some(document) = web_sys::window().and_then(|window| window.document()) else {
-                    return;
-                };
-                if let Some((key, _)) = current {
-                    if let Some(dialog) =
-                        document.get_element_by_id(&reaction_owners_dialog_id(&key))
-                    {
-                        focus_without_scrolling(&dialog);
+            if current != previous {
+                crate::util::defer(move || {
+                    let Some(document) = web_sys::window().and_then(|window| window.document())
+                    else {
+                        return;
+                    };
+                    if let Some((key, _)) = current {
+                        if let Some(dialog) =
+                            document.get_element_by_id(&reaction_owners_dialog_id(&key))
+                        {
+                            focus_without_scrolling(&dialog);
+                        }
+                        return;
                     }
-                    return;
-                }
-                let Some((key, message_id)) = previous else {
-                    return;
-                };
-                if let Some(chip) = document.get_element_by_id(&reaction_chip_id(&key)) {
-                    focus_without_scrolling(&chip);
-                    return;
-                }
-                // The chip is gone: Remove took the only reaction with that
-                // emoji. The message's add-reaction button is the nearest
-                // control. If the message is gone too, focus stays where the
-                // browser put it.
-                if let Some(add) = document
-                    .get_element_by_id(&format!("msg-{message_id}"))
-                    .and_then(|row| {
-                        row.query_selector("[data-testid=\"add-reaction-button\"]")
-                            .ok()
-                            .flatten()
-                    })
-                {
-                    focus_without_scrolling(&add);
-                }
-            });
+                    let Some((key, message_id)) = previous else {
+                        return;
+                    };
+                    if let Some(chip) = document.get_element_by_id(&reaction_chip_id(&key)) {
+                        focus_without_scrolling(&chip);
+                        return;
+                    }
+                    // The chip is gone: Remove took the only reaction with that
+                    // emoji. The message's add-reaction button is the nearest
+                    // control. If the message is gone too, focus stays where the
+                    // browser put it.
+                    if let Some(add) = document
+                        .get_element_by_id(&format!("msg-{message_id}"))
+                        .and_then(|row| {
+                            row.query_selector("[data-testid=\"add-reaction-button\"]")
+                                .ok()
+                                .flatten()
+                        })
+                    {
+                        focus_without_scrolling(&add);
+                    }
+                });
+            }
         });
     }
 
