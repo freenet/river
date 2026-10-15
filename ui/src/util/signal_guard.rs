@@ -312,14 +312,15 @@ mod tests {
 
     #[test]
     fn every_fallible_effect_anchors_before_its_first_try_read_and_nudges() {
-        // 9 across the 4 files; app.rs has 5, dm_thread_modal.rs 2 (the DM_DRAFT
-        // merge and the DM read rule), members.rs 1, conversation.rs 1 (the
-        // room read rule's foreground re-check).
+        // 11 across the 4 files; app.rs has 5, dm_thread_modal.rs 2 (the DM_DRAFT
+        // merge and the DM read rule), members.rs 1, conversation.rs 3 (the
+        // room read rule's foreground re-check, plus the two description
+        // overflow effects from freenet/river#718).
         assert_fallible_hooks_are_guarded(
             GUARDED_EFFECT_SITES,
             "use_effect(",
             "freenet/river#559",
-            9,
+            11,
         );
     }
 
