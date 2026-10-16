@@ -4651,8 +4651,9 @@ mod tests {
     /// room was never written there and legacy is never probed again — a
     /// permanently stranded room, on the exact path this fix exists to protect.
     ///
-    /// Here the local copy carries an owner ban whose signature does not
-    /// verify, which is what makes the fold of the newer copy fail.
+    /// Here the local copy carries a member record, attributed to the
+    /// owner's invitation, whose signature does not verify, which is what
+    /// makes the fold of the newer copy fail.
     #[test]
     fn a_failing_fold_leaves_the_existing_room_untouched() {
         let mut rng = rand::thread_rng();
@@ -4674,17 +4675,18 @@ mod tests {
             &owner,
         );
         old_room.room_state.recent_messages.messages.push(msg);
-        // A ban attributed to the owner but signed by another key.
-        old_room.room_state.bans.0.push(
-            river_core::room_state::ban::AuthorizedUserBan::with_signature(
-                river_core::room_state::ban::UserBan {
+        // A member record attributed to the owner's invitation but not
+        // signed by the owner.
+        let forged_member = SigningKey::generate(&mut rng);
+        old_room.room_state.members.members.push(
+            river_core::room_state::member::AuthorizedMember {
+                member: river_core::room_state::member::Member {
                     owner_member_id: vk.into(),
-                    banned_at: get_current_system_time(),
-                    banned_user: MemberId::from(&current_identity.verifying_key()),
+                    invited_by: vk.into(),
+                    member_vk: forged_member.verifying_key(),
                 },
-                vk.into(),
-                ed25519_dalek::Signature::from_bytes(&[0; 64]),
-            ),
+                signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+            },
         );
 
         let mut local = empty_rooms_for_merge();
@@ -4699,10 +4701,10 @@ mod tests {
             .expect("seeding the local copy must succeed");
         assert!(local.map.contains_key(&vk), "precondition: room is present");
 
-        // Folding the newer copy merges the local copy's forged ban into it,
-        // and the ban's signature check fails the fold. (Until
-        // freenet/river#703's review this used a public message in a room
-        // flipped to private; such a message is now dropped rather than
+        // Folding the newer copy merges the local copy's forged member record
+        // into it, and the record's signature check fails the fold. (Earlier
+        // fixtures used a public message in a room flipped to private, then a
+        // forged ban; since freenet/river#703 both are dropped rather than
         // failing the merge.) An earlier version of this test used an
         // ordinary public room, where the fold SUCCEEDS, and it therefore
         // passed even with the map mutated before the merge, i.e. it was
