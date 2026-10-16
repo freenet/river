@@ -44,6 +44,12 @@ fn check_idempotent(s: &ChatRoomStateV1, p: &ChatRoomParametersV1, what: &str) {
     if ser(&again) != ser(s) {
         NOT_IDEMPOTENT.with(|v| v.borrow_mut().push(what.to_string()));
     }
+    // A state an apply or merge produced is normalized, so merging it with
+    // itself leaves it as it is (merge law `state_idempotence`).
+    let mut merged = s.clone();
+    if merged.merge(s, p, s).is_err() || ser(&merged) != ser(s) {
+        NOT_IDEMPOTENT.with(|v| v.borrow_mut().push(format!("self-merge after {what}")));
+    }
 }
 
 fn drain_not_idempotent() -> Vec<String> {
