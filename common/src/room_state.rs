@@ -360,18 +360,16 @@ impl ChatRoomStateV1 {
         //         not survive in `ban_evidence` on pass 1 and vanish on pass 2
         //         (`cleanup(S) != cleanup(cleanup(S))`, which permanently
         //         diverges peers that run cleanup a different number of times).
-        //     Eviction drops bans that take no effect before those that do,
-        //     judged by `MembersV1::resolve_bans` over the uncapped set, one per
-        //     (issuer, target) (#410 review round 1, freenet/river#702). This
-        //     bounds a flood of forged, revoked-deputy or banned-issuer bans,
-        //     which `verify` accepts: those are evicted first, so they cannot
-        //     push real moderator bans out of the cap. It does NOT fully defend
-        //     the un-ban DoS: a CURRENT member's ban on an ABSENT target takes
-        //     effect, and `banned_at` is an attacker-signed, future-datable
-        //     field, so a member can mint many newest-dated effective bans that
-        //     outrank and evict genuine ones.
-        //     The substantive fix (an authorization-aware / non-attacker-ordered
-        //     cap) is deferred pending Ian's decision; tracked in
+        //     Eviction drops bans that take no effect first, judged by
+        //     `MembersV1::resolve_bans` over the uncapped set, one per
+        //     (issuer, target) (#410 review round 1, freenet/river#702), then
+        //     evicts the oldest within two pools, owner bans and the rest, each
+        //     guaranteed `max_user_bans / 2` (freenet/river#796). A flood of
+        //     forged, revoked-deputy or banned-issuer bans, which `verify`
+        //     accepts, is dead and goes first. A flood of LIVE far-future-dated
+        //     bans, which any member can mint against its own invitees or
+        //     against ids known nowhere, evicts older non-owner bans and owner
+        //     bans beyond the guaranteed half; see `enforce_user_ban_cap` and
         //     freenet/river#413 (Limitation 2).
         //
         //     CONVERGENCE HONESTY: the enforcing/inert classification is a
@@ -385,7 +383,9 @@ impl ChatRoomStateV1 {
         //     anti-entropy always converges — pinned by
         //     `cap_eviction_reconciles_via_merge`; tracked in freenet/river#413,
         //     Limitation 1). Do NOT claim the eviction is order-independent per
-        //     delta.
+        //     delta. (`enforce_user_ban_cap` is independent of the order of the
+        //     ban list it is handed; the arrival-order dependence is in the
+        //     member set it judges against.)
         //     `verify`'s hard cap ceiling still rejects any stored state left over
         //     the cap. The signature sweep (step 4) still runs AFTER enforcement
         //     to drop bans orphaned by a banner's removal, and only removes bans,
@@ -2142,27 +2142,51 @@ mod tests {
             &owner_sk,
         );
 
+        // Member D: a current member kept by a message, issuing two NEWER
+        // bans against ABSENT targets. All three bans are in the non-owner
+        // pool, which with no owner bans gets the whole cap, so the two newest
+        // (D's) survive and B's oldest is evicted (freenet/river#796).
+        let d_sk = SigningKey::generate(rng);
+        let d_vk = d_sk.verifying_key();
+        let d_id = MemberId::from(&d_vk);
+        let member_d = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: d_vk,
+            },
+            &owner_sk,
+        );
+        let msg_d = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: d_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("hi".to_string()),
+            },
+            &d_sk,
+        );
+
         let base = SystemTime::now();
-        // Two owner bans against ABSENT targets, NEWER → survive the cap.
         let absent1 = MemberId::from(&SigningKey::generate(rng).verifying_key());
         let absent2 = MemberId::from(&SigningKey::generate(rng).verifying_key());
-        let owner_ban1 = AuthorizedUserBan::new(
+        let d_ban1 = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
                 banned_at: base + std::time::Duration::from_secs(10),
                 banned_user: absent1,
             },
-            owner_id,
-            &owner_sk,
+            d_id,
+            &d_sk,
         );
-        let owner_ban2 = AuthorizedUserBan::new(
+        let d_ban2 = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
                 banned_at: base + std::time::Duration::from_secs(11),
                 banned_user: absent2,
             },
-            owner_id,
-            &owner_sk,
+            d_id,
+            &d_sk,
         );
         // B's ban against an ABSENT target, OLDEST → evicted by the cap. It is
         // "enforcing" (member banner, absent target) so ONLY the cap removes it.
@@ -2180,9 +2204,13 @@ mod tests {
         let state = ChatRoomStateV1 {
             configuration: auth_config,
             members: MembersV1 {
-                members: vec![member_b],
+                members: vec![member_b, member_d],
             },
-            bans: BansV1(vec![ban_c_by_b, owner_ban1, owner_ban2]),
+            recent_messages: MessagesV1 {
+                messages: vec![msg_d],
+                ..Default::default()
+            },
+            bans: BansV1(vec![ban_c_by_b, d_ban1, d_ban2]),
             ..Default::default()
         };
 

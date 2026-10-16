@@ -3,6 +3,7 @@ use crate::room_data::{RoomData, RoomSlot, RoomsMeta};
 use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
+use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{
@@ -3011,7 +3012,7 @@ mod tests {
     /// delegate write actually happens against a stored `Tombstone`.
     #[test]
     fn a_ranked_resurrection_survives_into_the_delegate_write() {
-        use crate::room_data::{MergeAuthority, Rooms};
+        use crate::room_data::{MergeAuthority, MergeRanks, Rooms};
 
         let vk = SigningKey::from_bytes(&[23u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk);
@@ -6230,16 +6231,16 @@ mod tests {
     /// mandatory `river-core` 0.1.22 -> 0.2.0 bump would move it regardless.
     /// V34 (`cea989c8…`, from freenet/river#768) is the outgoing generation.
     ///
-    /// Updated for V35 (the freenet/river#703 merge-law fixes): the delegate
-    /// links the room-state code they change, and the river-core 0.2.0 ->
-    /// 0.3.0 bump would move it regardless. V35 (`49a3122b…`, from #702) is
-    /// the outgoing generation.
+    /// Updated for V35 (freenet/river#796, PR #797): the delegate links the
+    /// room-state code that change touches, and the river-core 0.2.0 -> 0.2.1
+    /// bump moves it regardless. V35 (`49a3122b…`, from PR #702) is the
+    /// outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "7f3c5a1be0a2eb448c8f56576b3f5f7128d10bb4871d3456bee2545c74826979",
+            "eca06ace26857393b0c0ef283b560e06839b2c97b29d40d64b3909e9f9ead0aa",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
