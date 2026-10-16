@@ -862,3 +862,30 @@ fn a_ban_with_a_bad_signature_from_a_known_issuer_is_dropped_in_both_directions(
     let merged = assert_merges_agree(&r, &unaware, &knows);
     assert!(merged.bans.0.is_empty());
 }
+
+/// A receiver whose configuration is not signed by the room owner (an
+/// imported room's placeholder) takes the owner's configuration in a merge
+/// even when the placeholder passes the value checks and outranks it at an
+/// equal version: a placeholder never survives a merge with the real one.
+#[test]
+fn an_unsigned_valid_placeholder_yields_to_the_owners_configuration() {
+    let r = room();
+    let real = state(&r, public_config(&r));
+    let impostor = SigningKey::from_bytes(&[17; 32]);
+    // Find a placeholder signature whose digest outranks the real one at
+    // the same version, so only the placeholder branch can replace it.
+    let real_rank = real.configuration.rank(&r.params);
+    let placeholder = (0u32..64)
+        .map(|i| {
+            let mut c = public_config(&r);
+            c.max_message_size = 1000 + i as usize;
+            AuthorizedConfigurationV1::new(c, &impostor)
+        })
+        .find(|p| p.rank(&r.params) > real_rank)
+        .expect("a higher-ranked placeholder");
+    let mut receiver = real.clone();
+    receiver.configuration = placeholder;
+    let mut merged = receiver.clone();
+    merged.merge(&receiver, &r.params, &real).unwrap();
+    assert_eq!(merged.configuration, real.configuration);
+}
