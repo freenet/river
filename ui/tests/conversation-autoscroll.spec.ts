@@ -1682,11 +1682,15 @@ test.describe("The end holds after an explicit request", () => {
       await expect(page.getByText("batched arrival 79")).toHaveCount(1, { timeout: 5_000 });
       await addLoadingImageAboveTheEnd(page, image);
       await reopenTeamChat(page);
+      // The opening alone renders a few rows over the window (63 here); the
+      // backfill lands later and adds most of another window's worth.
       await expect
         .poll(() => page.locator("[data-item-key]").count(), { message: "premise: the opening backfilled" })
-        .toBeGreaterThan(INITIAL_RENDERED_ITEMS);
+        .toBeGreaterThan(INITIAL_RENDERED_ITEMS + 20);
+      await expect
+        .poll(async () => (await scrollMetrics(page)).max, { message: "premise: the history overflows" })
+        .toBeGreaterThan(0);
       await expectSettledAtBottom(page, "premise: the backfill kept the reader at the end");
-      expect((await scrollMetrics(page)).max, "premise: the history overflows").toBeGreaterThan(0);
 
       await loadImage(page, image);
 
