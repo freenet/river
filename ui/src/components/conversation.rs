@@ -27,6 +27,7 @@ use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
     get_current_system_time, local_message_date, local_today,
 };
+mod avatar_colour;
 mod emoji_picker;
 mod history_scroll;
 mod history_window;
