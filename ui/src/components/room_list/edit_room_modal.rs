@@ -624,8 +624,8 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
             description: sealed_desc,
         };
 
-        config_error
-            .set(sign_and_apply_configuration(owner_key, new_config, "Room description").err());
+        let refusal = sign_and_apply_configuration(owner_key, new_config, "Room description").err();
+        crate::util::defer(move || config_error.set(refusal));
     };
 
     rsx! {
@@ -725,7 +725,7 @@ fn NumericConfigField(
     let update_value = move |evt: Event<FormData>| {
         let new_val_str = evt.value().to_string();
         input_value.set(new_val_str.clone());
-        config_error.set(None);
+        crate::util::defer(move || config_error.set(None));
 
         let Ok(new_val) = new_val_str.parse::<usize>() else {
             return;
@@ -741,7 +741,8 @@ fn NumericConfigField(
         let mut new_config = config.clone();
         field.set(&mut new_config, new_val);
 
-        config_error.set(sign_and_apply_configuration(owner_key, new_config, label).err());
+        let refusal = sign_and_apply_configuration(owner_key, new_config, label).err();
+        crate::util::defer(move || config_error.set(refusal));
     };
 
     rsx! {
@@ -782,7 +783,7 @@ fn MaxMembersField(
         }
         let new_val_str = evt.value().to_string();
         max_members_input.set(new_val_str.clone());
-        config_error.set(None);
+        crate::util::defer(move || config_error.set(None));
 
         let Ok(new_max) = new_val_str.parse::<usize>() else {
             return;
@@ -798,7 +799,8 @@ fn MaxMembersField(
         let mut new_config = config.clone();
         new_config.max_members = new_max;
 
-        config_error.set(sign_and_apply_configuration(owner_key, new_config, "Max members").err());
+        let refusal = sign_and_apply_configuration(owner_key, new_config, "Max members").err();
+        crate::util::defer(move || config_error.set(refusal));
     };
 
     rsx! {

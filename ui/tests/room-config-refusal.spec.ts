@@ -45,3 +45,17 @@ test("a nickname limit over the ceiling is refused visibly", { tag: "@chromium-o
   await input.press("Tab");
   await expect(error).toHaveCount(0);
 });
+
+test("a refused rename keeps the dialog open with the reason", { tag: "@chromium-only" }, async ({ page }) => {
+  await page.goto("/");
+  await waitForApp(page);
+  await openRoomDetails(page);
+
+  // Over the room's max_room_name (100 bytes by default).
+  const name = page.getByTestId("room-name-input");
+  await name.fill("n".repeat(101));
+  await name.press("Enter");
+
+  await expect(page.getByTestId("edit-room-modal")).toBeVisible();
+  await expect(page.getByTestId("edit-room-modal").getByTestId("config-error")).toBeVisible();
+});

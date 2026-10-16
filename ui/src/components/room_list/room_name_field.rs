@@ -59,9 +59,12 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
     // which needs to commit the current value *before* closing the modal —
     // closing unmounts the input, so a deferred `onchange` would never fire and
     // the edit would be lost.
-    let mut save_room_name = move |new_name: String| {
+    //
+    // Returns whether the edit was refused before signing (the reason is then
+    // shown under the field), so the Enter handler keeps the dialog open.
+    let mut save_room_name = move |new_name: String| -> bool {
         if !is_owner {
-            return;
+            return false;
         }
 
         info!("Updating room name");
@@ -81,7 +84,7 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
             });
             let Some((is_private, room_secret_opt)) = seal_data else {
                 warn!("Cannot update the room name: room unavailable");
-                return;
+                return false;
             };
 
             // Privacy guard for freenet/river#299: a private room with no
@@ -100,7 +103,7 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                      configuration delta (freenet/river#299)."
                 );
                 room_name.set(stored_room_name(&config));
-                return;
+                return false;
             };
 
             let mut new_config = config.clone();
@@ -109,10 +112,13 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                 description: new_config.display.description.clone(),
             };
 
-            config_error
-                .set(sign_and_apply_configuration(owner_key, new_config, "Room name").err());
+            let refusal = sign_and_apply_configuration(owner_key, new_config, "Room name").err();
+            let refused = refusal.is_some();
+            crate::util::defer(move || config_error.set(refusal));
+            refused
         } else {
             error!("Room name is empty");
+            false
         }
     };
 
@@ -130,7 +136,9 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                 oninput: move |evt: dioxus_core::Event<FormData>| room_name.set(evt.value().to_string()),
                 onchange: {
                     let mut save_room_name = save_room_name.clone();
-                    move |evt: dioxus_core::Event<FormData>| save_room_name(evt.value().to_string())
+                    move |evt: dioxus_core::Event<FormData>| {
+                        save_room_name(evt.value().to_string());
+                    }
                 },
                 onkeydown: move |evt: dioxus_core::Event<KeyboardData>| {
                     // Commit + close the dialog on Enter (freenet/river#21).
@@ -139,14 +147,16 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                     // reports `Key::Process` (not `Key::Enter`) for the confirm
                     // keystroke, so this does not fire mid-composition.
                     // Non-owners can't edit, so closing on Enter for them is
-                    // just a quick dismiss.
+                    // just a quick dismiss. A refused edit keeps the dialog
+                    // open, so the owner sees why under the field.
                     if enter_commits_and_closes(&evt.key()) {
                         evt.prevent_default();
                         let value = room_name.read().clone();
-                        save_room_name(value);
-                        crate::util::defer(move || {
-                            EDIT_ROOM_MODAL.write().room = None;
-                        });
+                        if !save_room_name(value) {
+                            crate::util::defer(move || {
+                                EDIT_ROOM_MODAL.write().room = None;
+                            });
+                        }
                     }
                 },
             }
