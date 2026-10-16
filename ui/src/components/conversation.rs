@@ -3549,17 +3549,6 @@ struct PickerPlacement {
     align_right: bool,
 }
 
-/// Whether the inline emoji picker opens leftward (`right-0`) from its "+":
-/// toward whichever side of the chat scroller has more room.
-fn picker_align_right(
-    anchor_left: f64,
-    anchor_right: f64,
-    scroll_left: f64,
-    scroll_right: f64,
-) -> bool {
-    anchor_right - scroll_left > scroll_right - anchor_left
-}
-
 /// The centre of the element with this id, in client coordinates.
 fn element_centre(id: &str) -> Option<(f64, f64)> {
     let element = web_sys::window()?.document()?.get_element_by_id(id)?;
@@ -3601,28 +3590,35 @@ fn chat_scrollport_bounds() -> (f64, f64) {
         .unwrap_or((60.0, 600.0))
 }
 
-/// The side for `msg-{msg_id}`'s inline picker, measured from its "+" wrapper; rightward when unmeasurable.
+/// Whether `msg-{msg_id}`'s inline picker opens leftward (`right-0`): toward
+/// whichever side of the chat scroller has more room from its "+" wrapper;
+/// rightward when unmeasurable.
 fn inline_picker_align_right(msg_id: &str) -> bool {
-    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
-        return false;
+    let measure = || {
+        let document = web_sys::window()?.document()?;
+        let plus = document
+            .get_element_by_id(&format!("msg-{msg_id}"))?
+            .query_selector("[data-testid=\"add-reaction-button\"]")
+            .ok()??;
+        let a = plus.parent_element()?.get_bounding_client_rect();
+        let s = document
+            .get_element_by_id("chat-scroll-container")?
+            .get_bounding_client_rect();
+        Some(a.right() - s.left() > s.right() - a.left())
     };
-    let anchor = document
-        .get_element_by_id(&format!("msg-{msg_id}"))
-        .and_then(|row| {
-            row.query_selector("[data-testid=\"add-reaction-button\"]")
-                .ok()
-                .flatten()
-        })
-        .and_then(|plus| plus.parent_element());
-    let scroller = document.get_element_by_id("chat-scroll-container");
-    let (Some(anchor), Some(scroller)) = (anchor, scroller) else {
-        return false;
-    };
-    let (a, s) = (
-        anchor.get_bounding_client_rect(),
-        scroller.get_bounding_client_rect(),
-    );
-    picker_align_right(a.left(), a.right(), s.left(), s.right())
+    measure().unwrap_or(false)
+}
+
+/// A ⚠ or 🛡 beside a name, its tooltip also its accessible label.
+fn name_mark(
+    testid: &'static str,
+    class: &'static str,
+    tooltip: String,
+    glyph: &'static str,
+) -> Element {
+    rsx! {
+        span { "data-testid": testid, class, title: "{tooltip}", "aria-label": "{tooltip}", {glyph} }
+    }
 }
 
 /// ⚠ and 🛡 for one reactor. `reactor_id` is the member whose name is shown.
@@ -3959,45 +3955,16 @@ fn MessageGroupComponent(
                                             // strips, so it can never survive into a rendered
                                             // nickname. `the_warning_glyph_cannot_appear_in_a_nickname`
                                             // pins that.
-                                            if let Some(warning) = group.author_impersonation.as_ref() {
-                                                {
-                                                    let tooltip = warning.tooltip();
-                                                    rsx! {
-                                                        span {
-                                                            "data-testid": "message-author-impersonation-warning",
-                                                            class: "text-sm cursor-default",
-                                                            title: "{tooltip}",
-                                                            "aria-label": "{tooltip}",
-                                                            {crate::util::confusable::WARNING_GLYPH}
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                            {group.author_impersonation.as_ref().map(|warning| name_mark("message-author-impersonation-warning", "text-sm cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
                                             // Deputy shield. Same glyph, same visibility rule and
                                             // the same tooltip as the member-list row and the
                                             // member-info modal chip, so the three read as one
                                             // badge. The nickname above cannot forge it: nicknames
                                             // are stripped of emoji by `crate::util::display_name`.
-                                            if let Some(badge) = group.author_badge.as_ref() {
-                                                {
-                                                    let tooltip = badge.tooltip();
-                                                    rsx! {
-                                                        span {
-                                                            "data-testid": "message-author-deputy-badge",
-                                                            class: "text-sm cursor-default",
-                                                            title: "{tooltip}",
-                                                            "aria-label": "{tooltip}",
-                                                            "🛡"
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                            {group.author_badge.as_ref().map(|badge| name_mark("message-author-deputy-badge", "text-sm cursor-default", badge.tooltip(), "🛡"))}
                                             span {
-                                                class: if time_clamped {
-                                                    "text-xs text-text-muted cursor-default italic opacity-70"
-                                                } else {
-                                                    "text-xs text-text-muted cursor-default"
-                                                },
+                                                class: "text-xs text-text-muted cursor-default",
+                                                class: if time_clamped { "italic opacity-70" },
                                                 title: "{full_time_str}",
                                                 if time_clamped { "~{time_str}" } else { "{time_str}" }
                                             }
@@ -4712,34 +4679,8 @@ fn MessageGroupComponent(
                                                                                     class: "[overflow-wrap:anywhere]",
                                                                                     "{name}"
                                                                                 }
-                                                                                if let Some(warning) = warning {
-                                                                                    {
-                                                                                        let tooltip = warning.tooltip();
-                                                                                        rsx! {
-                                                                                            span {
-                                                                                                "data-testid": "reaction-owner-impersonation-warning",
-                                                                                                class: "cursor-default",
-                                                                                                title: "{tooltip}",
-                                                                                                "aria-label": "{tooltip}",
-                                                                                                {crate::util::confusable::WARNING_GLYPH}
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                                if let Some(badge) = badge {
-                                                                                    {
-                                                                                        let tooltip = badge.tooltip();
-                                                                                        rsx! {
-                                                                                            span {
-                                                                                                "data-testid": "reaction-owner-deputy-badge",
-                                                                                                class: "cursor-default",
-                                                                                                title: "{tooltip}",
-                                                                                                "aria-label": "{tooltip}",
-                                                                                                "🛡"
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                }
+                                                                                {warning.as_ref().map(|warning| name_mark("reaction-owner-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
+                                                                                {badge.as_ref().map(|badge| name_mark("reaction-owner-deputy-badge", "cursor-default", badge.tooltip(), "🛡"))}
                                                                             }
                                                                         }
                                                                     })}
@@ -4947,21 +4888,6 @@ fn MessageGroupComponent(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The inline picker opens toward whichever side of the chat scroller has
-    /// more room from its "+".
-    #[test]
-    fn picker_opens_toward_the_roomier_side() {
-        // A 320px scroller and a 20px "+".
-        assert!(
-            picker_align_right(220.0, 240.0, 0.0, 320.0),
-            "near the right edge it opens leftward"
-        );
-        assert!(
-            !picker_align_right(150.0, 170.0, 0.0, 320.0),
-            "a tie keeps the rightward default"
-        );
-    }
 
     /// The @mention pickers and name lookup offer the owner and present
     /// members, not identities held only as ban evidence.

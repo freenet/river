@@ -7473,13 +7473,13 @@ mod tests {
         );
         // The rendered element, anchored on its test id.
         assert!(
-            conversation.contains("\"data-testid\": \"message-author-impersonation-warning\""),
+            conversation.contains("name_mark(\"message-author-impersonation-warning\""),
             "the message author line no longer renders the warning element"
         );
         assert!(
             between(
                 conversation,
-                "\"data-testid\": \"message-author-impersonation-warning\"",
+                "name_mark(\"message-author-impersonation-warning\"",
                 "// Deputy shield.",
                 "author-line warning element",
             )
@@ -7539,7 +7539,7 @@ mod tests {
              the viewer id would flag the real owner"
         );
         assert!(
-            conversation.contains("\"data-testid\": \"reaction-owner-impersonation-warning\""),
+            conversation.contains("name_mark(\"reaction-owner-impersonation-warning\""),
             "the reactor list no longer renders the warning element"
         );
     }
