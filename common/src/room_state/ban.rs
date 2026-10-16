@@ -676,6 +676,54 @@ pub struct UserBan {
 pub struct BanId(pub FastHash);
 
 #[cfg(test)]
+mod ban_digest_golden {
+    use super::*;
+
+    /// A fixed ban record: fixed fields and fixed signature bytes (a
+    /// `Signature` is not validated on construction), so the digest input is
+    /// exactly this record's CBOR.
+    fn fixture() -> AuthorizedUserBan {
+        let mut raw = [0u8; 64];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        AuthorizedUserBan::with_signature(
+            UserBan {
+                owner_member_id: MemberId(freenet_scaffold::util::FastHash(1)),
+                banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+                banned_user: MemberId(freenet_scaffold::util::FastHash(2)),
+            },
+            MemberId(freenet_scaffold::util::FastHash(3)),
+            Signature::from_bytes(&raw),
+        )
+    }
+
+    /// `ban_digest` is wire format: the bans summary and `delta` compare it.
+    /// One fixed record, one expected digest, one expected encoding. If this
+    /// changes deliberately it re-keys the room contract.
+    #[test]
+    fn ban_digest_golden_vector() {
+        const EXPECTED: [u8; 16] = [
+            0x98, 0x22, 0xae, 0x47, 0x04, 0x56, 0xd4, 0xc9, 0xb2, 0xd1, 0x39, 0x6e, 0xce, 0xf6,
+            0x64, 0xcc,
+        ];
+        let digest = ban_digest(&fixture());
+        assert_eq!(
+            digest.0, EXPECTED,
+            "ban_digest changed: a wire-format change"
+        );
+        let mut reversed = EXPECTED;
+        reversed.reverse();
+        assert_ne!(digest.0, reversed, "the vector must distinguish byte order");
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(&digest, &mut cbor).unwrap();
+        assert_eq!(cbor.len(), 17, "a CBOR byte string of 16 bytes");
+        assert_eq!(cbor[0], 0x50);
+        assert_eq!(&cbor[1..], &EXPECTED);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::room_state::configuration::AuthorizedConfigurationV1;
