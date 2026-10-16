@@ -123,8 +123,13 @@ mod tests {
         // converged state (freenet/river#423, PR #702): `BansV1::apply_delta`
         // rejected a WHOLE delta on the orphaned-ban rule judged against the
         // pre-update member set, which could fork a room permanently.
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 34);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "2ae50081f1b74c3a");
+        //
+        // V35 registers the generation before the merge-law fixes
+        // (freenet/river#703): its whole-state merge read retention horizons,
+        // its configuration summary carried only the version, and its
+        // apply_delta rejected re-delivered records.
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 35);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "9880dcc559424027");
     }
 
     #[test]
