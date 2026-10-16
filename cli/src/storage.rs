@@ -2076,7 +2076,7 @@ mod tests {
              `rejoin_preferred_nickname` (which seals for private rooms and \
              clamps to max_nickname_size). Do NOT inline an unconditional \
              public placeholder, or a private-room nickname could leak / an \
-             over-long nickname could block rejoin."
+             over-long nickname could be signed."
         );
         assert!(
             api_src.contains("update_self_nickname(&room_owner_vk, nickname)"),

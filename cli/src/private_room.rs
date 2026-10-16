@@ -1098,9 +1098,8 @@ mod tests {
     }
 
     /// A stored nickname longer than the room's current `max_nickname_size`
-    /// must be dropped to "Member" — publishing an over-long entry would make
-    /// the contract reject the whole heal UPDATE (same clamp as
-    /// `rejoin_preferred_nickname`).
+    /// is replaced by "Member": riverctl does not sign a nickname over the
+    /// room's limit (same clamp as `rejoin_preferred_nickname`).
     #[test]
     fn heal_clamps_over_long_nickname_to_member_placeholder() {
         let owner = fresh_signing_key();

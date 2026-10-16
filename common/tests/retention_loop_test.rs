@@ -385,8 +385,8 @@ fn apply_delta_is_idempotent() {
     );
 }
 
-/// `AuthorizedConfigurationV1::apply_delta` rejects a zero cap, but `verify`
-/// does not, so a zero can still reach a peer on the full-state path. It must
+/// A configuration with a zero cap ranks below every valid one, but `verify`
+/// accepts it, so a zero can still be held after a full-state PUT. It must
 /// suppress the delta rather than panic or loop.
 #[test]
 fn zero_cap_suppresses_the_delta_instead_of_looping() {

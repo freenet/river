@@ -7099,7 +7099,7 @@ mod tests {
         // owner@0 is already in state — must NOT re-emit.
         assert!(
             !emitted.contains(&(owner_id, 0)),
-            "must not re-emit (owner, 0): contract would reject duplicate"
+            "must not re-emit (owner, 0): the room already holds it"
         );
         // The CRITICAL back-fill assertion: member gets v0 even though
         // we're rotating to v1.

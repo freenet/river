@@ -2253,14 +2253,12 @@ fn classify_reaction(
 /// - a private room has no secret available, so sealing returns `None` (we must
 ///   never publish a plaintext nickname into a private room);
 /// - the stored nickname's byte length exceeds the room's current
-///   `max_nickname_size`. The contract's `MemberInfoV1::apply_delta` rejects the
-///   ENTIRE rejoin delta (members + member_info together) when
-///   `declared_len() > max_nickname_size`, so an over-long restored nickname
-///   would block the member from rejoining at all. `declared_len()` is the
-///   plaintext byte length for both public and sealed values, so comparing
-///   `nick.len()` here matches the contract check exactly. The 6-byte `"Member"`
-///   placeholder keeps the rejoin working (regression guard — Codex/skeptical
-///   review of PR #321).
+///   `max_nickname_size`. That limit is a client rule (riverctl and the UI do
+///   not sign a nickname over it; the room holds nicknames only to a fixed
+///   ceiling), checked by `nickname_refusal` on the plaintext byte length,
+///   which is what `declared_len()` reports for public and sealed values
+///   alike. The 6-byte `"Member"` placeholder is published instead, so the
+///   rejoin still carries a nickname (regression guard, PR #321).
 fn rejoin_preferred_nickname(
     room_state: &ChatRoomStateV1,
     signing_key: &SigningKey,
@@ -9494,10 +9492,9 @@ mod rejoin_nickname_tests {
         assert_eq!(out.to_string_lossy(), "Member");
     }
 
-    /// A nickname longer than the room's current `max_nickname_size` must NOT
-    /// be published (the contract would reject the whole rejoin delta) — fall
-    /// back to "Member" so the member can still rejoin. Regression guard for the
-    /// PR #321 Codex/skeptical finding.
+    /// A nickname longer than the room's current `max_nickname_size` is not
+    /// published (riverctl does not sign a nickname over the room's limit):
+    /// the rejoin falls back to "Member". Regression guard for PR #321.
     #[test]
     fn over_long_nickname_falls_back_to_member() {
         // max 8: "Member" (6) fits, but the stored nickname (20) does not.

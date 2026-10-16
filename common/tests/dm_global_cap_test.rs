@@ -659,9 +659,9 @@ fn a_peer_below_the_global_cap_still_receives_older_dms() {
 }
 
 /// A zero cap must suppress the delta outright rather than loop against a peer
-/// that keeps nothing. `AuthorizedConfigurationV1::apply_delta` rejects a zero,
-/// but `verify` does not, so an owner-signed zero can still arrive by the
-/// full-state path.
+/// that keeps nothing. A configuration with a zero cap ranks below every
+/// valid one, but `verify` accepts it, so an owner-signed zero can be held
+/// after a full-state PUT.
 #[test]
 fn zero_global_cap_suppresses_the_delta_instead_of_looping() {
     let r = room(6, Some(40));
