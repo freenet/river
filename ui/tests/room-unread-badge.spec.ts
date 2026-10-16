@@ -257,7 +257,7 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
   /// history's bottom edge (negative: above it). Returns where it landed.
   async function parkNewestBottom(page: Page, below: number): Promise<number> {
     const now = await newestMessageBelowView(page);
-    const top = await page.evaluate(() => document.getElementById("chat-scroll-container")!.scrollTop);
+    const { top } = await scrollMetrics(page);
     await readerScrollsWithoutGesture(page, top + now - below);
     return newestMessageBelowView(page);
   }

@@ -142,3 +142,35 @@ export function resolveColor(page: Page, css: string): Promise<number[]> {
     return [r, g, b, a / 255];
   }, css);
 }
+
+/// WCAG 2.x relative luminance of an 8-bit sRGB colour (alpha ignored).
+export function luminance(c: number[]): number {
+  const [r, g, b] = c.slice(0, 3).map((v) => {
+    const s = v / 255;
+    return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/// WCAG contrast ratio of two 8-bit sRGB colours, in either order.
+export function contrast(a: number[], b: number[]): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/// Whether a finger can be the pointer: the same query as main.css.
+export function coarsePointer(page: Page): Promise<boolean> {
+  return page.evaluate(() => window.matchMedia("(hover: none), (any-pointer: coarse)").matches);
+}
+
+/// React to `row` with the picker's first emoji: hover the row unless a
+/// finger is the pointer, open the picker, pick. Expects the row to end with
+/// exactly one reaction chip, so pass a row that has none.
+export async function reactTo(page: Page, row: Locator): Promise<Locator> {
+  if (!(await coarsePointer(page))) await row.hover();
+  await row.getByTestId("add-reaction-button").click();
+  await page.getByTestId("emoji-picker").getByRole("button").first().click();
+  const chip = row.getByTestId("reaction-chip");
+  await expect(chip).toHaveCount(1);
+  return chip;
+}

@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp, selectRoom } from "./example-room";
+import { contrast, luminance, selectRoom, waitForApp } from "./example-room";
 import { openMemberInfoForFirstNonSelf } from "./invite-picker";
 
 // Regression test: quoted text (`> …` Markdown) in a message must stay
@@ -7,32 +7,16 @@ import { openMemberInfoForFirstNonSelf } from "./invite-picker";
 //
 // The reported bug was in the old solid-blue SENT bubble, where the quote
 // painted near-black beside white text (3.52:1). Messages now share one row
-// layout on the conversation background, so own and received rows are checked
-// alike, in both colour schemes, together with the tinted outgoing DM bubble.
+// layout on the conversation background, so own and received rows render the
+// same quote surface: a received row is checked, in both colour schemes,
+// together with the tinted outgoing DM bubble.
 //
 // The Rust pins in `conversation/markdown.rs` assert the declaration TEXT. This spec
 // asserts what a reader actually sees: it puts a quote in a REAL rendered
 // message, so the class list, the cascade and the compiled stylesheet are all
 // the app's own, then composites the colours the browser computed.
 
-// ── WCAG 2.x relative luminance / contrast ──────────────────────────────────
-
 type Rgb = [number, number, number];
-
-function luminance([r, g, b]: Rgb): number {
-  const channel = (c: number) => {
-    const s = c / 255;
-    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
-  };
-  return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
-}
-
-function contrast(fg: Rgb, bg: Rgb): number {
-  const a = luminance(fg);
-  const b = luminance(bg);
-  const [hi, lo] = a > b ? [a, b] : [b, a];
-  return (hi + 0.05) / (lo + 0.05);
-}
 
 // WCAG 2.1 AA: 4.5:1 for body text.
 const AA_TEXT = 4.5;
@@ -43,17 +27,16 @@ interface Sample {
   background: Rgb;
   normal: Rgb;
   quote: Rgb;
-  quoteBorder: Rgb;
 }
 
 /** Which real surface to measure. */
-type Surface = "own" | "received" | "dm";
+type Surface = "received" | "dm";
 
 /**
  * Put a blockquote in a real message on `surface`, read back what the browser
  * computed for it, and clean up after.
  *
- * The room-message surfaces are probed by injecting into an existing row's
+ * The room-message surface is probed by injecting into an existing row's
  * body; the DM surface has no example-data messages at all, so its bubble is
  * created by actually sending a DM (see `openDmThread`).
  */
@@ -143,15 +126,14 @@ async function sampleQuote(page: Page, surface: Surface): Promise<Sample> {
       );
       if (!history) throw new Error("no conversation-history container");
 
-      // A message body in a row by the requested author.
-      const wanted = which === "own" ? "true" : "false";
+      // A message body in a received row.
       const prose = Array.from(
         history.querySelectorAll('[data-testid="message-body"] .prose')
       ).find(
         (el) =>
-          el.closest("[data-message-self]")?.getAttribute("data-message-self") === wanted
+          el.closest("[data-message-self]")?.getAttribute("data-message-self") === "false"
       );
-      if (!prose) throw new Error(`no ${which} message with a .prose body`);
+      if (!prose) throw new Error("no received message with a .prose body");
 
       // Inject a quote and an ordinary paragraph as siblings inside the real
       // body container, so both are measured under the identical cascade.
@@ -173,10 +155,6 @@ async function sampleQuote(page: Page, surface: Surface): Promise<Sample> {
         background,
         normal: over(resolve(getComputedStyle(normalEl).color), background),
         quote: over(resolve(getComputedStyle(quoteEl).color), background),
-        quoteBorder: over(
-          resolve(getComputedStyle(quoteEl).borderLeftColor),
-          background
-        ),
       };
     } finally {
       cleanup();
@@ -192,8 +170,8 @@ async function openRoomWithMessages(page: Page) {
   await page.goto("/");
   await waitForApp(page);
 
-  // "Your Private Room" is the example-data room the local user owns, so it
-  // carries both own and received messages.
+  // "Your Private Room" is the example-data room the local user owns, and it
+  // carries received messages.
   await selectRoom(page, "Your Private Room");
   await expect(
     page.locator('[data-testid="conversation-history"] .prose')
@@ -251,8 +229,8 @@ for (const colorScheme of ["dark", "light"] as const) {
     // are asserted: without the upper one, deleting `--color-text-quote`'s
     // light value makes `var()` invalid, the quote inherits full body colour,
     // and every floor-only assertion still passes.
-    for (const surface of ["own", "received", "dm"] as const) {
-      const label = { own: "an own message", received: "a received message", dm: "an outgoing DM bubble" }[surface];
+    for (const surface of ["received", "dm"] as const) {
+      const label = { received: "a received message", dm: "an outgoing DM bubble" }[surface];
       test(`quoted text in ${label} is readable and still muted`, async ({
         page,
       }) => {

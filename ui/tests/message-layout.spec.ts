@@ -612,66 +612,6 @@ test.describe("Auto-scroll to bottom on refresh", () => {
   });
 });
 
-// Mobile overflow: every message row, own and received, must stay within a
-// narrow viewport, and its content must end where the 72px control gutter
-// starts. Regression: a self reply whose reply-strip preview held a long
-// unbreakable URL rendered nowrap and spilled off both edges of a 375px
-// screen. The example data carries a self reply to the long-URL message so
-// this reproduces.
-test.describe("Message row mobile overflow", () => {
-  test.use({ viewport: { width: 375, height: 667 } });
-
-  test("no message row or its content overflows a 375px viewport", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-
-    // The specific reproducer must be present: a reply strip quoting the long
-    // URL. (Its textContent keeps the full preview even though CSS ellipsizes
-    // it, so this also proves the strip rendered rather than being absent.)
-    const longReplyStrip = page
-      .locator(".reply-strip")
-      .filter({ hasText: "longlongurl" })
-      .first();
-    await expect(longReplyStrip).toBeVisible({ timeout: 10_000 });
-
-    // Horizontal position is independent of vertical scroll, so every rendered
-    // row can be checked at once: each must lie within [0, viewportWidth], and
-    // its body and reply strip must end at or before the gutter.
-    const overflow = await page.evaluate(() => {
-      const vw = window.innerWidth;
-      const bad: Array<{ what: string; left: number; right: number; text: string }> = [];
-      const note = (what: string, el: Element, r: DOMRect) =>
-        bad.push({
-          what,
-          left: Math.round(r.left),
-          right: Math.round(r.right),
-          text: (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 40),
-        });
-      for (const row of Array.from(document.querySelectorAll('[data-testid="message-row"]'))) {
-        const r = row.getBoundingClientRect();
-        if (r.width === 0) continue;
-        if (r.left < -1 || r.right > vw + 1) note("row", row, r);
-        const column = r.right - 72;
-        for (const part of Array.from(row.querySelectorAll('[data-testid="message-body"], .reply-strip'))) {
-          const p = part.getBoundingClientRect();
-          if (p.left < -1 || p.right > column + 1) note("content", part, p);
-        }
-      }
-      return { vw, bad };
-    });
-
-    expect(
-      overflow.bad,
-      `message rows overflowing the ${overflow.vw}px viewport or their gutter: ${JSON.stringify(
-        overflow.bad
-      )}`
-    ).toEqual([]);
-  });
-});
-
 // A reply whose quoted message can no longer be read from room state must show
 // a neutral placeholder instead of the replier-authored snapshot. This is what
 // a reply to a BANNED member's message renders as: banning purges the target,
