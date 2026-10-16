@@ -3011,7 +3011,7 @@ mod tests {
     /// delegate write actually happens against a stored `Tombstone`.
     #[test]
     fn a_ranked_resurrection_survives_into_the_delegate_write() {
-        use crate::room_data::{MergeAuthority, MergeRanks, Rooms};
+        use crate::room_data::{MergeAuthority, Rooms};
 
         let vk = SigningKey::from_bytes(&[23u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk);

@@ -1054,8 +1054,10 @@ fn duplicate_entries_do_not_defeat_the_global_cap() {
     messages.extend(std::iter::repeat_n(duplicated.clone(), 30));
     messages.extend(spread(&r, 200..210, 3));
 
-    let mut d = DirectMessagesV1::default();
-    d.messages = messages;
+    let mut d = DirectMessagesV1 {
+        messages,
+        ..Default::default()
+    };
     d.apply_delta(&r.state, &r.params, &None)
         .expect("empty delta must apply");
 

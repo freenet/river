@@ -3218,7 +3218,7 @@ pub fn Conversation() -> Element {
                                 rsx! {
                                     MessageInput {
                                         handle_send_message: move |msg: (String, Option<ReplyContext>)| {
-                                            let mut handle = handle_send_message.clone();
+                                            let handle = handle_send_message.clone();
                                             handle(msg)
                                         },
                                         replying_to: replying_to,

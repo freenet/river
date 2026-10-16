@@ -891,7 +891,7 @@ fn cleanup_is_a_fixpoint_after_the_trim_discards_a_members_only_dm() {
 fn deputy_ban_must_not_let_a_doomed_dm_evict_a_legitimate_one() {
     const CAP: usize = 20;
     const K: usize = 5;
-    assert!(MAX_DEPUTIES >= 1, "test premise: deputies must be possible");
+    const { assert!(MAX_DEPUTIES >= 1, "test premise: deputies must be possible") };
 
     let owner = Peer::new(1);
     let (a, b, c) = (Peer::new(10), Peer::new(11), Peer::new(12));

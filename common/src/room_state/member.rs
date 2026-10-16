@@ -1290,14 +1290,16 @@ pub(crate) mod tests {
             let sk = SigningKey::generate(rng);
             // Invited by the owner or by an earlier member, biased deep.
             let pick = rng.gen_range(0..=records.len());
-            let (inviter_id, inviter_sk) = if pick == records.len() && rng.gen_bool(0.2) {
-                (owner_id, owner_sk.clone())
-            } else if records.is_empty() {
-                (owner_id, owner_sk.clone())
-            } else {
-                let i = rng.gen_range(0..records.len());
-                (records[i].member.id(), keys[i].clone())
-            };
+            // `gen_bool` is drawn only when `pick == records.len()`, as before
+            // these two identical branches were merged, so the RNG stream is
+            // unchanged.
+            let (inviter_id, inviter_sk) =
+                if (pick == records.len() && rng.gen_bool(0.2)) || records.is_empty() {
+                    (owner_id, owner_sk.clone())
+                } else {
+                    let i = rng.gen_range(0..records.len());
+                    (records[i].member.id(), keys[i].clone())
+                };
             let member = Member {
                 owner_member_id: owner_id,
                 invited_by: inviter_id,

@@ -2171,7 +2171,7 @@ mod measure_tests {
     fn samples() -> Vec<String> {
         vec![
             String::new(),
-            "a".repeat(1),
+            "a".to_string(),
             "a".repeat(23),
             "a".repeat(24),
             "a".repeat(255),
