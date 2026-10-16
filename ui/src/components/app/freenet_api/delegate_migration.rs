@@ -1246,7 +1246,10 @@ impl RiverImportSeam for LiveImportSeam {
         let (tx, rx) = futures::channel::oneshot::channel::<Result<(), String>>();
         // A predecessor's DMs predate this session (freenet/river#801; see
         // `SnapshotDmSeen`), exactly as in the sweep's hydrate.
-        let snapshot_dm_seen = crate::components::direct_messages::SnapshotDmSeen::of(&rooms);
+        let snapshot_dm_seen = crate::components::direct_messages::SnapshotDmSeen::for_merge(
+            crate::room_data::MergeAuthority::OlderSnapshot,
+            &rooms,
+        );
         crate::util::defer(move || {
             // Re-checked at the moment of the mutation (#768 round 2 item 5):
             // a reconnect between the check above and this macrotask must not
@@ -1266,9 +1269,11 @@ impl RiverImportSeam for LiveImportSeam {
                 for room_data in current.map.values_mut() {
                     room_data.repopulate_secrets_from_state();
                 }
-                crate::components::direct_messages::advance_dm_last_seen(
-                    snapshot_dm_seen.still_held_in(current),
-                );
+                if let Some(snapshot_dm_seen) = snapshot_dm_seen {
+                    crate::components::direct_messages::advance_dm_last_seen(
+                        snapshot_dm_seen.landed_in(current),
+                    );
+                }
                 merged
             });
             // A ranked resurrection must be visible to the SAVE path, exactly

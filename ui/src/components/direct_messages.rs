@@ -676,43 +676,85 @@ pub(crate) fn compute_dm_last_seen(
 /// and saved without the user reading them.
 ///
 /// Residual: a tab still open on the previous build keeps writing to the
-/// newest predecessor, so a DM that tab received and saved unread can be
-/// marked seen here. The first-hydration seed has the same blind spot.
+/// newest predecessor, and the crate walk's post-resolve top-up re-reads it,
+/// importing rooms this session does not hold at all. A DM that tab received
+/// and saved unread in such a room is marked seen here. The first-hydration
+/// seed has the same blind spot.
 ///
 /// Captured from the snapshot BEFORE it is merged (the merge consumes it), and
-/// resolved against the merged map by [`Self::still_held_in`].
+/// resolved against the merged map by [`Self::landed_in`].
 pub(crate) struct SnapshotDmSeen {
-    seen: HashMap<(VerifyingKey, MemberId), u64>,
-    identities: HashMap<VerifyingKey, VerifyingKey>,
+    /// Per room: the identity the snapshot held it under, and its inbound DMs
+    /// as `(purge token, sender, timestamp)`.
+    rooms: HashMap<VerifyingKey, (VerifyingKey, Vec<(PurgeToken, MemberId, u64)>)>,
 }
 
 impl SnapshotDmSeen {
-    pub(crate) fn of(snapshot: &crate::room_data::Rooms) -> Self {
-        Self {
-            seen: compute_dm_last_seen(snapshot),
-            identities: snapshot
-                .map
-                .iter()
-                .filter_map(|(room, data)| Some((*room, data.self_verifying_key()?)))
-                .collect(),
-        }
+    /// The capture for a merge at `authority`: `Some` only for an
+    /// `OlderSnapshot`. An `Authoritative` copy is the current delegate's own
+    /// (or an in-session action) and may hold DMs received unread this
+    /// session, so it must never mark anything seen.
+    pub(crate) fn for_merge(
+        authority: crate::room_data::MergeAuthority,
+        snapshot: &crate::room_data::Rooms,
+    ) -> Option<Self> {
+        (authority == crate::room_data::MergeAuthority::OlderSnapshot).then(|| Self::of(snapshot))
     }
 
-    /// The cutoffs for rooms the merged map holds under the SAME identity the
-    /// snapshot had. A snapshot whose identity lost the merge (or whose room was
-    /// left) describes another identity's threads, so it advances nothing.
-    pub(crate) fn still_held_in(
+    fn of(snapshot: &crate::room_data::Rooms) -> Self {
+        let rooms = snapshot
+            .map
+            .iter()
+            .filter_map(|(room, data)| {
+                // Without an identity, inbound cannot be told from outbound.
+                let identity = data.self_verifying_key()?;
+                let self_id = MemberId::from(&identity);
+                let inbound = data
+                    .room_state
+                    .direct_messages
+                    .messages
+                    .iter()
+                    .filter(|m| m.message.recipient == self_id)
+                    .map(|m| (m.purge_token(), m.message.sender, m.message.timestamp))
+                    .collect();
+                Some((*room, (identity, inbound)))
+            })
+            .collect();
+        Self { rooms }
+    }
+
+    /// The cutoffs implied by the snapshot's inbound DMs that actually LANDED
+    /// in `merged`: the room is held under the SAME identity the snapshot had
+    /// (a losing identity's DMs describe another identity's threads), and the
+    /// DM itself is present. So a room whose merge failed, or a DM the merge
+    /// dropped (ban sweep, caps), advances nothing it did not deliver.
+    pub(crate) fn landed_in(
         self,
         merged: &crate::room_data::Rooms,
     ) -> HashMap<(VerifyingKey, MemberId), u64> {
-        let identities = self.identities;
-        self.seen
-            .into_iter()
-            .filter(|((room, _), _)| {
-                merged.map.get(room).and_then(|r| r.self_verifying_key())
-                    == identities.get(room).copied()
-            })
-            .collect()
+        let mut updates: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
+        for (room, (identity, inbound)) in self.rooms {
+            let Some(held) = merged.map.get(&room) else {
+                continue;
+            };
+            if held.self_verifying_key() != Some(identity) {
+                continue;
+            }
+            let present: std::collections::HashSet<PurgeToken> = held
+                .room_state
+                .direct_messages
+                .messages
+                .iter()
+                .map(|m| m.purge_token())
+                .collect();
+            for (token, sender, ts) in inbound {
+                if present.contains(&token) {
+                    let entry = updates.entry((room, sender)).or_insert(0);
+                    *entry = (*entry).max(ts);
+                }
+            }
+        }
+        updates
     }
 }
 
@@ -1309,6 +1351,12 @@ mod tests {
         assert_eq!(updates.get(&(owner_vk, alice_id)), Some(&1_000));
     }
 
+    fn snapshot_seen(snapshot: &Rooms, merged: &Rooms) -> HashMap<(VerifyingKey, MemberId), u64> {
+        SnapshotDmSeen::for_merge(crate::room_data::MergeAuthority::OlderSnapshot, snapshot)
+            .expect("an OlderSnapshot merge captures")
+            .landed_in(merged)
+    }
+
     /// freenet/river#801: the session seeded its cutoffs from a STALE legacy
     /// snapshot (Alice's DM at 100). A newer generation's snapshot, merged
     /// later, holds her DMs up to 300 — all from earlier sessions. They must
@@ -1332,15 +1380,50 @@ mod tests {
         push_dm(&mut newer, &owner_vk, &alice, &me.verifying_key(), 100);
         push_dm(&mut newer, &owner_vk, &alice, &me.verifying_key(), 300);
         push_dm(&mut newer, &owner_vk, &bob, &me.verifying_key(), 200);
-        let snapshot = SnapshotDmSeen::of(&newer);
-        // The merged map holds the room under the same identity.
-        apply_dm_last_seen_advance(&mut seen, snapshot.still_held_in(&newer));
+        // The merged map: a separate value holding both copies' DMs.
+        let mut merged = newer.clone();
+        push_dm(&mut merged, &owner_vk, &bob, &me.verifying_key(), 500);
+        apply_dm_last_seen_advance(&mut seen, snapshot_seen(&newer, &merged));
 
         assert_eq!(seen.get(&(owner_vk, alice_id)), Some(&300));
         assert_eq!(
             seen.get(&(owner_vk, bob_id)),
             Some(&500),
             "an older snapshot must never lower a cutoff"
+        );
+    }
+
+    /// The seed and a snapshot advance both max-merge, so they commute: the
+    /// deferred writes may land in either order.
+    #[test]
+    fn the_seed_and_a_snapshot_advance_commute() {
+        let room = fixed_sk(41).verifying_key();
+        let peer: MemberId = (&fixed_sk(42).verifying_key()).into();
+        let seed: HashMap<_, _> = [((room, peer), 100)].into();
+        let advance: HashMap<_, _> = [((room, peer), 300)].into();
+        let mut a = HashMap::new();
+        apply_dm_last_seen_advance(&mut a, seed.clone());
+        apply_dm_last_seen_advance(&mut a, advance.clone());
+        let mut b = HashMap::new();
+        apply_dm_last_seen_advance(&mut b, advance);
+        apply_dm_last_seen_advance(&mut b, seed);
+        assert_eq!(a, b);
+        assert_eq!(a.get(&(room, peer)), Some(&300));
+    }
+
+    /// An `Authoritative` merge (the current delegate's own copy on a reload)
+    /// may hold DMs received unread THIS session; it must capture nothing.
+    #[test]
+    fn an_authoritative_merge_never_marks_dms_seen() {
+        let owner = fixed_sk(51);
+        let me = fixed_sk(52);
+        let alice = fixed_sk(53);
+        let owner_vk = owner.verifying_key();
+        let mut rooms = make_rooms(&owner, &me, &[&alice]);
+        push_dm(&mut rooms, &owner_vk, &alice, &me.verifying_key(), 900);
+        assert!(
+            SnapshotDmSeen::for_merge(crate::room_data::MergeAuthority::Authoritative, &rooms)
+                .is_none()
         );
     }
 
@@ -1365,54 +1448,99 @@ mod tests {
         );
         let merged = make_rooms(&owner, &me, &[&alice]);
         assert!(
-            SnapshotDmSeen::of(&snapshot_rooms)
-                .still_held_in(&merged)
-                .is_empty(),
+            snapshot_seen(&snapshot_rooms, &merged).is_empty(),
             "a different identity's DMs must not advance this identity's cutoffs"
         );
         assert!(
-            SnapshotDmSeen::of(&snapshot_rooms)
-                .still_held_in(&empty_rooms())
-                .is_empty(),
+            snapshot_seen(&snapshot_rooms, &empty_rooms()).is_empty(),
             "a room the merge did not keep advances nothing"
         );
     }
 
-    /// The snapshot must be captured and applied through the merge sites that
-    /// take frozen snapshots — the sweep's hydrate (gated on `OlderSnapshot`,
-    /// so a reload of the current delegate's own copy never marks DMs seen) and
-    /// the crate walk's import. Source pin: the behaviour lives in signal-bound
-    /// code with no native test harness.
+    /// A DM the merge did not deliver (the room's merge failed, or the merge
+    /// dropped it) is not "already there at load", so it advances nothing.
+    #[test]
+    fn a_snapshot_dm_that_did_not_land_advances_nothing() {
+        let owner = fixed_sk(61);
+        let me = fixed_sk(62);
+        let alice = fixed_sk(63);
+        let owner_vk = owner.verifying_key();
+        let alice_id: MemberId = (&alice.verifying_key()).into();
+
+        let mut snapshot_rooms = make_rooms(&owner, &me, &[&alice]);
+        push_dm(
+            &mut snapshot_rooms,
+            &owner_vk,
+            &alice,
+            &me.verifying_key(),
+            100,
+        );
+        push_dm(
+            &mut snapshot_rooms,
+            &owner_vk,
+            &alice,
+            &me.verifying_key(),
+            900,
+        );
+        // The merged room kept only the earlier DM.
+        let mut merged = make_rooms(&owner, &me, &[&alice]);
+        push_dm(&mut merged, &owner_vk, &alice, &me.verifying_key(), 100);
+        assert_eq!(
+            snapshot_seen(&snapshot_rooms, &merged).get(&(owner_vk, alice_id)),
+            Some(&100)
+        );
+    }
+
+    /// Both frozen-snapshot merge sites must capture through
+    /// `SnapshotDmSeen::for_merge` BEFORE the merge and advance from what
+    /// landed AFTER it. Source pin, scoped to each site's function body: the
+    /// wiring lives in signal-bound code with no native harness. The gate
+    /// itself is behaviour-tested above (`for_merge`).
     #[test]
     fn snapshot_dm_seen_is_applied_at_both_snapshot_merge_sites() {
-        let hydrate = include_str!("app/freenet_api/response_handler.rs");
-        let gate = hydrate
-            .find("authority == crate::room_data::MergeAuthority::OlderSnapshot")
-            .expect("the hydrate must gate the capture on OlderSnapshot");
-        let capture = hydrate[gate..]
-            .find("SnapshotDmSeen::of(&loaded_rooms)")
-            .expect("the hydrate must capture the snapshot under that gate");
+        fn body<'a>(src: &'a str, signature: &str) -> &'a str {
+            let start = src.find(signature).expect(signature);
+            let rest = &src[start..];
+            let end = rest[1..].find("\nfn ").map_or(rest.len(), |i| i + 1);
+            let end = rest[1..]
+                .find("\n    async fn ")
+                .map_or(end, |i| end.min(i + 1));
+            &rest[..end]
+        }
+        fn squash(s: &str) -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        let hydrate = squash(body(
+            include_str!("app/freenet_api/response_handler.rs"),
+            "fn hydrate_loaded_rooms_with_authority(",
+        ));
+        let capture = hydrate
+            .find("SnapshotDmSeen::for_merge(authority,&loaded_rooms)")
+            .expect("the hydrate must capture with its own merge authority");
         let merge = hydrate
             .find("current_rooms.merge_from_source(")
             .expect("hydrate merge");
-        assert!(
-            gate + capture < merge,
-            "captured before the merge consumes it"
-        );
-        assert!(
-            hydrate[merge..].contains("snapshot_dm_seen.still_held_in(current_rooms)"),
-            "the hydrate must advance from the snapshot after the merge"
-        );
+        let advance = hydrate
+            .find("advance_dm_last_seen(snapshot_dm_seen.landed_in(current_rooms)")
+            .expect("the hydrate must advance from what landed");
+        assert!(capture < merge && merge < advance);
 
-        let walk = include_str!("app/freenet_api/delegate_migration.rs");
+        let walk = squash(body(
+            include_str!("app/freenet_api/delegate_migration.rs"),
+            "async fn merge_rooms(",
+        ));
         let capture = walk
-            .find("SnapshotDmSeen::of(&rooms)")
+            .find(
+                "SnapshotDmSeen::for_merge(crate::room_data::MergeAuthority::OlderSnapshot,&rooms",
+            )
             .expect("the walk import must capture the snapshot");
         let merge = walk
-            .find("apply_recovered_rooms(current, rooms, source_rank, ranks)")
+            .find("apply_recovered_rooms(current,rooms,source_rank,ranks)")
             .expect("walk merge");
-        assert!(capture < merge);
-        assert!(walk[merge..].contains("snapshot_dm_seen.still_held_in(current)"));
+        let advance = walk
+            .find("advance_dm_last_seen(snapshot_dm_seen.landed_in(current)")
+            .expect("the walk must advance from what landed");
+        assert!(capture < merge && merge < advance);
     }
 
     fn sample_outbound_entry(

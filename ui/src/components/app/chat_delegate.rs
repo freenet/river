@@ -3211,6 +3211,12 @@ mod tests {
             Some(ids[2].clone()),
             "the local later marker must replace the delegate's stale one"
         );
+        // A side with no marker at all (a slot written before markers existed,
+        // or a fresh local copy) never erases the other side's.
+        let mut unmarked = late.clone();
+        unmarked.last_read_message_id = None;
+        assert_eq!(stored_marker(&unmarked, &late), Some(ids[2].clone()));
+        assert_eq!(stored_marker(&late, &unmarked), Some(ids[2].clone()));
     }
 
     /// An unparseable current slot is a hard error (surfaced, not silently

@@ -1793,8 +1793,8 @@ fn hydrate_loaded_rooms_with_authority(
     // A frozen snapshot's DMs predate this session, so they count as seen
     // once its rooms are merged (freenet/river#801; see `SnapshotDmSeen`).
     // Captured here because the merge consumes `loaded_rooms`.
-    let snapshot_dm_seen = (authority == crate::room_data::MergeAuthority::OlderSnapshot)
-        .then(|| crate::components::direct_messages::SnapshotDmSeen::of(&loaded_rooms));
+    let snapshot_dm_seen =
+        crate::components::direct_messages::SnapshotDmSeen::for_merge(authority, &loaded_rooms);
 
     // Merge the loaded rooms with the current rooms
     let loaded_keys = room_keys.clone();
@@ -1827,7 +1827,7 @@ fn hydrate_loaded_rooms_with_authority(
             }
             if let Some(snapshot_dm_seen) = snapshot_dm_seen {
                 crate::components::direct_messages::advance_dm_last_seen(
-                    snapshot_dm_seen.still_held_in(current_rooms),
+                    snapshot_dm_seen.landed_in(current_rooms),
                 );
             }
             // freenet/river#590: tell the SAVE path about any room the ranked

@@ -2146,6 +2146,12 @@ impl Rooms {
 /// generation it came from. A marker not in the buffer (evicted, so it places
 /// nothing and the badge counts the whole buffer) loses to one that is. If
 /// neither is in it, `local` is kept, falling back to `incoming`.
+///
+/// Known limit: a marker can also leave the buffer by being NEWER than it
+/// places, e.g. pointing at a message a ban later purged. Such a marker loses
+/// to an older in-buffer one, which still counts no more unread than the
+/// dangling marker would (that counts the whole buffer). Telling the two apart
+/// would need the marker's timestamp persisted beside it.
 pub(crate) fn furthest_read_marker(
     messages: &[river_core::room_state::message::AuthorizedMessageV1],
     local: Option<MessageId>,
@@ -3545,6 +3551,113 @@ mod tests {
             "newest generation first: a later stale copy must not pull the \
              marker back"
         );
+    }
+
+    fn some_id(n: i64) -> Option<MessageId> {
+        Some(MessageId(freenet_scaffold::util::FastHash(n)))
+    }
+
+    /// The helper's whole decision table, directly.
+    #[test]
+    fn furthest_read_marker_decision_table() {
+        let owner = SigningKey::from_bytes(&[7u8; 32]);
+        let me = SigningKey::from_bytes(&[8u8; 32]);
+        let (room, ids) = test_room_with_messages(&owner, &me, 3, 3);
+        let buf = &room.room_state.recent_messages.messages;
+        let at = |i: usize| Some(ids[i].clone());
+        let gone_a = some_id(1);
+        let gone_b = some_id(2);
+
+        // Both in the buffer: the later one, either side; a tie keeps local.
+        assert_eq!(furthest_read_marker(buf, at(0), at(2)), at(2));
+        assert_eq!(furthest_read_marker(buf, at(2), at(0)), at(2));
+        assert_eq!(furthest_read_marker(buf, at(1), at(1)), at(1));
+        // One in the buffer: that one, whichever side and whatever the other.
+        assert_eq!(furthest_read_marker(buf, gone_a.clone(), at(0)), at(0));
+        assert_eq!(furthest_read_marker(buf, at(0), gone_a.clone()), at(0));
+        assert_eq!(furthest_read_marker(buf, None, at(1)), at(1));
+        assert_eq!(furthest_read_marker(buf, at(1), None), at(1));
+        // Neither in the buffer: local, else incoming.
+        assert_eq!(
+            furthest_read_marker(buf, gone_a.clone(), gone_b.clone()),
+            gone_a
+        );
+        assert_eq!(furthest_read_marker(buf, None, gone_b.clone()), gone_b);
+        assert_eq!(furthest_read_marker(buf, None, None), None);
+    }
+
+    /// The real #801 sequence on a per-room load: the oldest generation's
+    /// snapshot lands first, then the CURRENT delegate's authoritative copy.
+    #[test]
+    fn an_authoritative_copy_after_a_stale_snapshot_keeps_the_further_marker() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let me = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let (mut stale, ids) = test_room_with_messages(&owner, &me, 2, 4);
+        stale.last_read_message_id = Some(ids[0].clone());
+        let (mut current, _) = test_room_with_messages(&owner, &me, 4, 4);
+        current.last_read_message_id = Some(ids[3].clone());
+
+        for (first, second) in [
+            (
+                (stale.clone(), MergeAuthority::OlderSnapshot),
+                (current.clone(), MergeAuthority::Authoritative),
+            ),
+            (
+                (current, MergeAuthority::Authoritative),
+                (stale, MergeAuthority::OlderSnapshot),
+            ),
+        ] {
+            let mut local = empty_rooms_for_merge();
+            let mut ranks = MergeRanks::default();
+            for (room, authority) in [first, second] {
+                let rank = if authority == MergeAuthority::OlderSnapshot {
+                    3
+                } else {
+                    40
+                };
+                local
+                    .merge_from_source(rooms_holding(vk, room), rank, authority, &mut ranks)
+                    .expect("merge");
+            }
+            assert_eq!(local.map[&vk].last_read_message_id, Some(ids[3].clone()));
+        }
+    }
+
+    /// The adopt branch in the other direction: the ADOPTED (newer) copy holds
+    /// the further marker, so a regression to "always keep the local marker"
+    /// fails here.
+    #[test]
+    fn adopting_a_newer_identity_takes_its_further_read_marker() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let (mut older, ids) =
+            test_room_with_messages(&owner, &SigningKey::generate(&mut rng), 2, 4);
+        older.last_read_message_id = Some(ids[0].clone());
+        let new_identity = SigningKey::generate(&mut rng);
+        let (mut newer, _) = test_room_with_messages(&owner, &new_identity, 4, 4);
+        newer.last_read_message_id = Some(ids[3].clone());
+
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+        for (room, rank) in [(older, 3), (newer, 20)] {
+            local
+                .merge_from_source(
+                    rooms_holding(vk, room),
+                    rank,
+                    MergeAuthority::OlderSnapshot,
+                    &mut ranks,
+                )
+                .expect("merge");
+        }
+        let room = &local.map[&vk];
+        assert_eq!(
+            room.self_verifying_key(),
+            Some(new_identity.verifying_key())
+        );
+        assert_eq!(room.last_read_message_id, Some(ids[3].clone()));
     }
 
     /// A marker that has left the merged buffer (evicted) places nothing, so it
