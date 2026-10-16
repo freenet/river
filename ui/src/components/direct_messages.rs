@@ -783,18 +783,32 @@ pub(crate) struct DmCutoffPlan {
 /// advances: a reload of the current delegate's own copy may hold DMs this
 /// session received and saved unread.
 ///
-/// **Re-seed (identity replaced, either authority).** `DM_LAST_SEEN` is keyed
-/// by `(room, peer)` only and every other write max-merges, so cutoffs seeded
-/// or advanced under the replaced identity would otherwise hide the adopted
-/// identity's unread DMs. The replaced room's cutoffs are set to the adopted
-/// copy's landed DMs — and only those, never DMs the room already held from
-/// the network. Adoption happens on a load, when a higher-ranked copy (in
-/// practice the current delegate's) arrives after an older one, so this is
-/// exactly the seed that copy would have produced had it arrived first.
+/// **Re-seed (identity replaced; NOT gated on authority).** `DM_LAST_SEEN` is
+/// keyed by `(room, peer)` only and every other write max-merges, so cutoffs
+/// seeded or advanced under the replaced identity would otherwise hide the
+/// adopted identity's unread DMs. ALL of the replaced room's cutoffs are reset
+/// to the adopted copy's landed DMs (none, if nothing landed) — never DMs the
+/// room already held from the network. That is the seed the adopting copy
+/// would have produced had it arrived first. Adoption needs a strictly
+/// higher-ranked copy arriving after a lower one; legacy probes fire only when
+/// the current delegate holds nothing, so in practice the adopting copy is a
+/// newer legacy generation (`OlderSnapshot`). An `Authoritative` adoption is
+/// handled the same way for completeness, which is the one case an
+/// `Authoritative` copy can mark DMs seen: the cutoffs it replaces belonged to
+/// another identity and carry no information about this one.
+///
+/// Ordering: the plan is committed through `crate::util::defer`
+/// (`setTimeout(0)`, FIFO) from inside the merge, so plans apply in merge
+/// order. If the one-shot first-hydration seed reads `ROOMS` after an
+/// adoption, it max-merges the adopted room's DMs (network-held ones too) as
+/// seen, exactly as it does on main. If it read before, its write is queued
+/// first and the re-seed then replaces it.
 ///
 /// A cutoff is a timestamp maximum per `(room, peer)`, so, exactly like the
 /// first-hydration seed, it also covers any DM from that peer stamped at or
-/// below it.
+/// below it: a DM delivered live this session with an older timestamp than a
+/// snapshot's (delay, clock skew), and later DMs from a peer whose snapshot DM
+/// is stamped in the future, until real time passes that stamp.
 ///
 /// Residual: a tab still open on the previous build keeps writing to the
 /// newest predecessor. Anything that re-reads it this session (the crate
@@ -890,8 +904,9 @@ pub fn reseed_dm_last_seen_for_room(owner_vk: VerifyingKey) {
 
 /// Pure re-seed step for [`reseed_dm_last_seen_for_room`]: drop every existing
 /// last-seen cutoff for `owner_vk` (the replaced identity's) and set the new
-/// identity's from `updates` (already computed by `compute_dm_last_seen`, so
-/// keyed on the swapped-in `self_sk`), leaving other rooms untouched. Pure so
+/// identity's from `updates` (keyed on the swapped-in identity: computed by
+/// `compute_dm_last_seen`, or by `dm_cutoff_plan`), leaving other rooms
+/// untouched. Pure so
 /// the re-seed is unit-testable without the `ROOMS`/`DM_LAST_SEEN` signals.
 pub(crate) fn apply_dm_last_seen_reseed(
     seen: &mut HashMap<(VerifyingKey, MemberId), u64>,
@@ -947,18 +962,13 @@ pub fn seed_dm_last_seen_if_needed() {
     let updates = compute_dm_last_seen(&rooms);
     drop(rooms);
 
-    // Latch the seeded flag synchronously so any parallel re-run of this
-    // effect (before the deferred write hits) immediately early-exits.
-    // Doing the latch BEFORE the deferred write also avoids the
-    // one-render-frame "every historical DM looks unread" window the
-    // skeptical reviewer (#258 M3) flagged — consumers reading
-    // DM_LAST_SEEN_SEEDED see "seeded, write in flight" rather than
-    // "not seeded".
+    // The flag is latched in the SAME deferred closure as the write, so the
+    // two land together. A re-run of this effect before that closure runs
+    // computes another seed from a later `ROOMS` and queues it too; that is
+    // harmless, because every write here max-merges.
     //
-    // Safety: a same-tick re-entry doesn't lose the seed because we
-    // already computed `updates` from the just-read rooms snapshot and
-    // captured it into the defer closure. The flag latch and the write
-    // are conceptually one operation.
+    // `updates` is computed now, from the rooms snapshot just read, and
+    // captured into the closure, so a later `ROOMS` change cannot alter it.
     crate::util::defer(move || {
         *DM_LAST_SEEN_SEEDED.write() = true;
         DM_LAST_SEEN.with_mut(|seen| apply_dm_last_seen_advance(seen, updates));
@@ -1525,7 +1535,14 @@ mod tests {
             &old_me.verifying_key(),
             900,
         );
-        let held = make_rooms(&owner, &me, &[&alice]);
+        // The held room carries the very same DM, so only the identity check
+        // can keep it from counting.
+        let mut held = make_rooms(&owner, &me, &[&alice]);
+        held.map
+            .get_mut(&owner_vk)
+            .unwrap()
+            .room_state
+            .direct_messages = snapshot.map[&owner_vk].room_state.direct_messages.clone();
         assert_eq!(
             plan(&snapshot, &held, OlderSnapshot, &held),
             DmCutoffPlan::default(),
@@ -1562,7 +1579,7 @@ mod tests {
         assert_eq!(seen.get(&(owner_vk, alice_id)), Some(&100));
     }
 
-    /// Codex review: when a merge REPLACES a room's identity (A -> B), the
+    /// When a merge REPLACES a room's identity (A -> B), the
     /// cutoffs seeded or advanced under A must not survive to hide B's unread
     /// DMs. They are replaced by the adopted copy's landed DMs only — not by
     /// DMs to B the room already held from the network — whichever authority
@@ -1627,9 +1644,10 @@ mod tests {
 
     /// Both delegate-load merge sites must capture the incoming copy BEFORE
     /// the merge, watch identities before it, and commit the plan AFTER it
-    /// with their own authority. Source pin, scoped to each site's function
-    /// body: the wiring lives in signal-bound code with no native harness.
-    /// The decisions themselves are behaviour-tested above.
+    /// with their own authority. A tripwire, not behaviour coverage: a source
+    /// pin scoped to each site's function body, because the wiring lives in
+    /// signal-bound code with no native harness. The decisions themselves are
+    /// behaviour-tested above.
     #[test]
     fn dm_cutoff_plan_is_applied_at_both_merge_sites() {
         // The function's own body: from its signature to the first closing
@@ -1646,6 +1664,13 @@ mod tests {
         fn squash(s: &str) -> String {
             s.chars().filter(|c| !c.is_whitespace()).collect()
         }
+        // The production seam, not one of the test mocks implementing the
+        // same trait further down the file.
+        fn live_import_seam(src: &str) -> &str {
+            &src[src
+                .find("impl RiverImportSeam for LiveImportSeam {")
+                .expect("the live seam")..]
+        }
         for (src, signature, capture, watch, merge, commit) in [
             (
                 include_str!("app/freenet_api/response_handler.rs"),
@@ -1656,7 +1681,7 @@ mod tests {
                 "dm_cutoff_plan(&incoming_dms,&identity_watch,authority,current_rooms",
             ),
             (
-                include_str!("app/freenet_api/delegate_migration.rs"),
+                live_import_seam(include_str!("app/freenet_api/delegate_migration.rs")),
                 "async fn merge_rooms(",
                 "SnapshotDmSeen::of(&rooms)",
                 "IdentityWatch::before(current)",

@@ -2807,7 +2807,8 @@ impl Rooms {
                         errors.push(format!("merge room {vk:?}: {e}"));
                         continue;
                     }
-                    // freenet/river#590: merging ONLY `room_state` made every other
+                    // freenet/river#590 (the read marker since #801, below):
+                    // merging ONLY `room_state` made every other
                     // field first-writer-wins regardless of rank — and probes are
                     // dispatched oldest-generation-first, so the systematic winner
                     // was the OLDEST copy. This is the most-travelled of the three
