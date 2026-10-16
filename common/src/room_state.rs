@@ -143,6 +143,13 @@ impl ChatRoomStateV1 {
     /// would have been pruned on arrival and the open merge gives the same
     /// state. See [`merge_may_have_withheld_a_survivor`].
     ///
+    /// The open pass offers at most the messages work bound, newest first,
+    /// so an older window larger than the bound cannot fail the merge; and
+    /// if the open pass fails anyway, the first pass's result stands
+    /// (freenet/river#703 review). Either case can leave the two merge
+    /// directions differing only in old messages, where failing would have
+    /// refused the merge outright.
+    ///
     /// `_parent_state` is ignored: the receiver's own state is the only correct
     /// parent, and every caller passes it. The signature matches the trait's so
     /// existing call sites keep compiling and pick this up.
@@ -152,18 +159,40 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
     ) -> Result<(), String> {
-        let parent = self.clone();
         let summary = self.summarize_with_merged_configuration(parameters, other_state);
         // Field `delta`s never read their parent; pass the sender's own state,
-        // as `get_state_delta` does on the network path.
+        // as `get_state_delta` does on the network path. The macro's
+        // `apply_delta` ignores its parent (it re-reads `self` per field), so
+        // `self` itself is passed rather than a clone.
         let delta = other_state.delta(other_state, parameters, &summary);
         let mut merged = self.clone();
-        merged.apply_delta(&parent, parameters, &delta)?;
+        merged.apply_delta(self, parameters, &delta)?;
         if merge_may_have_withheld_a_survivor(&summary, &merged) {
             let open = summary.without_retention_horizons();
-            let delta = other_state.delta(other_state, parameters, &open);
-            merged = self.clone();
-            merged.apply_delta(&parent, parameters, &delta)?;
+            let mut delta = other_state.delta(other_state, parameters, &open);
+            // Offer at most as many messages as one messages delta may carry,
+            // the newest first: a sender's older window can be larger than
+            // the work bound, and the merged room keeps only the newest
+            // anyway (`max_recent_messages` <= the bound).
+            if let Some(d) = delta.as_mut() {
+                let bound = crate::room_state::message::messages_work_bound(
+                    merged.configuration.configuration.max_recent_messages,
+                );
+                if let Some(msgs) = d.recent_messages.as_mut() {
+                    if msgs.len() > bound {
+                        msgs.sort_by_key(|m| std::cmp::Reverse(m.order_key()));
+                        msgs.truncate(bound);
+                    }
+                }
+            }
+            let mut open_merged = self.clone();
+            // If the open pass fails, keep the first pass's result rather
+            // than failing a merge the first pass completed: the first pass
+            // is a valid merge that may hold fewer old messages, and failing
+            // here would refuse states the trait merge accepted.
+            if open_merged.apply_delta(self, parameters, &delta).is_ok() {
+                merged = open_merged;
+            }
         }
         *self = merged;
         Ok(())
@@ -1032,6 +1061,85 @@ mod tests {
                 .horizon,
             RetentionHorizon::OldestRetained(_)
         ));
+    }
+
+    /// freenet/river#703 review M2: when the merge's open-horizon pass would
+    /// carry more older messages than one messages delta may (the
+    /// `max(max_recent_messages, 1000)` work bound), the merge must still
+    /// succeed, and in both directions end in the same state. Here S holds
+    /// the higher-ranked configuration (cap 2) and two messages by P; O holds
+    /// 1001 older owner messages and the owner's ban on P, which empties S.
+    #[test]
+    fn room_merge_past_the_messages_work_bound_succeeds_and_commutes() {
+        let (base, params, owner_sk) = create_empty_chat_room_state();
+        let owner_id = params.owner_id();
+        let p_sk = SigningKey::generate(&mut rand::thread_rng());
+        let p = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: p_sk.verifying_key(),
+            },
+            &owner_sk,
+        );
+        let at = |t: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + t);
+        let msg = |author: MemberId, sk: &SigningKey, t: u64| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author,
+                    time: at(t),
+                    content: RoomMessageBody::public(format!("m{t}")),
+                },
+                sk,
+            )
+        };
+        let cfg = |version: u32, cap: usize| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    configuration_version: version,
+                    max_recent_messages: cap,
+                    max_members: 10,
+                    ..base.configuration.configuration.clone()
+                },
+                &owner_sk,
+            )
+        };
+        let mut s = base.clone();
+        s.configuration = cfg(3, 2);
+        s.members.members = vec![p.clone()];
+        s.recent_messages.messages = vec![
+            msg(p.member.id(), &p_sk, 5000),
+            msg(p.member.id(), &p_sk, 5001),
+        ];
+        let mut o = base.clone();
+        o.configuration = cfg(2, 1500);
+        o.recent_messages.messages = (0..1001).map(|t| msg(owner_id, &owner_sk, t)).collect();
+        o.bans = BansV1(vec![AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: at(4000),
+                banned_user: p.member.id(),
+            },
+            owner_id,
+            &owner_sk,
+        )]);
+        s.verify(&s, &params).unwrap();
+        o.verify(&o, &params).unwrap();
+
+        let mut so = s.clone();
+        so.merge(&s, &params, &o)
+            .expect("merge(S, O) must not fail on the work bound");
+        let mut os = o.clone();
+        os.merge(&o, &params, &s).expect("merge(O, S)");
+        assert_eq!(so, os, "merge(S, O) must equal merge(O, S)");
+        assert_eq!(
+            so.recent_messages.messages,
+            vec![
+                msg(owner_id, &owner_sk, 999),
+                msg(owner_id, &owner_sk, 1000)
+            ]
+        );
     }
 
     /// freenet/river#703: the retention horizon assumes everything the

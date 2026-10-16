@@ -118,6 +118,12 @@ pub struct MessagesSummary {
 /// messages. See `MessagesV1::apply_delta`.
 const MIN_MESSAGES_DELTA_BOUND: usize = 1_000;
 
+/// The most NEW messages one delta may carry under `max_recent_messages`:
+/// `max(max_recent_messages, 1000)`. See `MessagesV1::apply_delta`.
+pub fn messages_work_bound(max_recent_messages: usize) -> usize {
+    max_recent_messages.max(MIN_MESSAGES_DELTA_BOUND)
+}
+
 impl ComposableState for MessagesV1 {
     type ParentState = ChatRoomStateV1;
     type Summary = MessagesSummary;
@@ -245,12 +251,27 @@ impl ComposableState for MessagesV1 {
             // big `max_recent_messages` reduction offers only messages above
             // this peer's retention horizon, and is refused at worst until it
             // receives the new configuration and trims its own set.
-            let work_bound = max_recent_messages.max(MIN_MESSAGES_DELTA_BOUND);
-            if delta.len() > work_bound {
+            //
+            // Only NEW messages count: one this peer already holds (by id,
+            // which is what the summary and `delta` compare) costs no check,
+            // so a re-delivered message never pushes a delta over the bound
+            // (freenet/river#703). A raw length past held + bound is refused
+            // before any per-record work.
+            let work_bound = messages_work_bound(max_recent_messages);
+            if delta.len() > self.messages.len().saturating_add(work_bound) {
                 return Err(format!(
                     "Messages delta of {} exceeds {}",
                     delta.len(),
                     work_bound
+                ));
+            }
+            let held_ids: std::collections::HashSet<MessageId> =
+                self.messages.iter().map(|m| m.id()).collect();
+            let new_count = delta.iter().filter(|m| !held_ids.contains(&m.id())).count();
+            if new_count > work_bound {
+                return Err(format!(
+                    "Messages delta of {} new messages exceeds {}",
+                    new_count, work_bound
                 ));
             }
             let signed: Vec<&AuthorizedMessageV1> =
