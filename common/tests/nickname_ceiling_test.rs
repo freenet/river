@@ -184,3 +184,12 @@ fn a_lowered_limit_does_not_revive_a_revoked_grant() {
     assert_eq!(m1, m2);
     assert!(m1.member_info.deputies_of(id(&r.x)).is_empty());
 }
+
+/// The ceiling is part of the room's rules: changing it changes which records
+/// every peer keeps, so it re-keys the room contract and needs the migration
+/// steps (`.claude/rules/delegate-migration.md`). Pinned so a change is
+/// deliberate.
+#[test]
+fn the_nickname_ceiling_is_1000_bytes() {
+    assert_eq!(NICKNAME_CEILING, 1_000);
+}
