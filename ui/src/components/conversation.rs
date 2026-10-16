@@ -2769,11 +2769,9 @@ pub fn Conversation() -> Element {
             div {
                 class: if current_room_data.is_some() { "flex-1 min-h-0 relative" } else { "hidden" },
                 div {
-                    // `overflow-x-hidden` is a backstop: the kebab menu, the
-                    // reactor list and the inline picker each open toward the
-                    // roomier side, so at most a few px of trailing whitespace
-                    // can pass the viewport edge; clip that rather than
-                    // show a horizontal scrollbar in the history. #402.
+                    // `overflow-x-hidden` is a backstop: the popovers open toward
+                    // the roomier side, so at most a few px can pass the edge;
+                    // clip that rather than show a horizontal scrollbar. #402.
                     class: "h-full overflow-y-auto overflow-x-hidden",
                     // `overflow-anchor: none`: our own corrections (the
                     // backfill restore, the head reposition, the reveal restore)
@@ -3860,10 +3858,7 @@ fn MessageGroupComponent(
         }
     });
 
-    // The own group's avatar is the inverted disc (`.msg-avatar-self`);
-    // everyone else's glyph colour comes from their member id's hue and tone
-    // (`.msg-avatar-hashed` resolves them per theme). Once per group, outside
-    // the row loop.
+    // Once per group: the own disc, or the member id's hue and tone.
     let (avatar_class, avatar_style, name_colour) = if is_self {
         ("msg-avatar-self", None, "text-link hover:text-link-hover")
     } else {
@@ -3875,7 +3870,6 @@ fn MessageGroupComponent(
         )
     };
     let author_id = group.author_id;
-    // Shared by the avatar and the name.
     let open_author_info = move |_: MouseEvent| {
         crate::util::defer(move || {
             MEMBER_INFO_MODAL.with_mut(|signal| signal.member = Some(author_id));
@@ -3891,10 +3885,7 @@ fn MessageGroupComponent(
                         let reply_strip_val = msg.reply_strip.clone();
 
                         rsx! {
-                            // One full-column grid row per message: the avatar
-                            // slot (first row only), then the content column.
-                            // Padding on the right is the gutter the hover bar
-                            // and the touch kebab sit in.
+                            // One grid row per message (`.msg-row` in main.css).
                             div {
                                 key: "{msg.id}",
                                 id: "msg-{msg.id}",
@@ -3905,9 +3896,7 @@ fn MessageGroupComponent(
                                 "data-message-self": "{is_self}",
                                 class: "msg-row group",
                                 if is_first {
-                                    // Decorative and out of the tab order: the
-                                    // name button beside it opens the same
-                                    // member info from the keyboard.
+                                    // aria-hidden: the name button opens the same info from the keyboard.
                                     span {
                                         "data-testid": "message-group-avatar",
                                         "aria-hidden": "true",
@@ -4245,10 +4234,8 @@ fn MessageGroupComponent(
                                                             }
                                                         }
                                                     }
-                                                // Message body, with "(edited)" after it.
-                                                // `[overflow-wrap:anywhere]` breaks a long URL or
-                                                // other unbreakable token only where it would
-                                                // otherwise overflow the column.
+                                                // Message body, with "(edited)" after it. `[overflow-wrap:anywhere]`
+                                                // breaks a long URL only where it would overflow the column.
                                                 div {
                                                     "data-testid": "message-body",
                                                     class: "text-sm text-text",
@@ -4347,10 +4334,8 @@ fn MessageGroupComponent(
                                                 // would become the containing block for the `fixed`
                                                 // dismiss backdrop below, shrinking it to this element
                                                 // instead of the viewport (#402).
-                                                // A closed `.touch-actions` is z-20, under Latest (z-30),
-                                                // so a kebab at the bottom of the view never takes
-                                                // Latest's tap. Raise the OPEN wrapper above sibling
-                                                // kebabs: later ones paint above an open popover, so
+                                                // Closed, it is z-20 (see `.hover-actions`). Raise the OPEN
+                                                // wrapper above sibling kebabs: later ones paint above an open popover, so
                                                 // without this a nearby message's kebab could sit over the
                                                 // menu rows and steal the tap. `z-[60]` lifts the whole
                                                 // open popover+backdrop above them (and its backdrop then

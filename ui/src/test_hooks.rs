@@ -463,11 +463,9 @@ fn remove_messages(needle: &str) {
     });
 }
 
-/// Give the current room's newest message one reaction per emoji, every one
-/// held by Test Sender A (admitted here in case it has not spoken yet), in ONE
-/// mutation. A send rebuilds `actions_state` and drops the example data's
-/// reactions, which sit on random rows, so a spec that needs a row's chips to
-/// fill the line sets them here.
+/// One reaction per emoji on the current room's newest message, in ONE mutation,
+/// all held by Test Sender A. A send drops the example data's reactions, so a
+/// spec that needs a row's chips to fill the line sets them here.
 fn add_reactions_to_newest(emojis: Vec<String>) {
     with_current_room_mut(|room, room_key| {
         let Some(newest) = room

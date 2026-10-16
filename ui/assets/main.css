@@ -55,15 +55,11 @@
     }
 }
 
-/* Message rows (conversation.rs). Every author gets the same full-column row:
- * a 36px avatar slot, a 12px gap and the content column, then a 72px right
- * gutter that holds the hover bar and the touch kebab. Rows bleed 8px into
- * #chat-content's padding so the hover band has room: 8px around a group, 2px
- * between its rows. The history list's -my-2 cancels the group-edge padding
- * at its top and bottom, so the bottom sentinel sits at the newest message's
- * bottom, not below its padding. No opacity, transform, filter, isolation or
- * z-index on a row: a stacking context there would trap its menus beneath
- * later rows. */
+/* Message rows: a 36px avatar slot, the content column, and a 72px right
+ * gutter for the hover bar and kebab. Rows bleed 8px so the hover band has
+ * room; the history's -my-2 cancels the group-edge padding so the bottom
+ * sentinel sits at the newest message's bottom. No opacity, transform,
+ * filter, isolation or z-index on a row: it would trap its menus beneath later rows. */
 .msg-row {
     display: grid;
     grid-template-columns: 36px minmax(0, 1fr);
@@ -118,12 +114,8 @@
 .msg-avatar-glyph {
     flex: 1;
     background-color: currentColor;
-    -webkit-mask-size: contain;
-    mask-size: contain;
-    -webkit-mask-repeat: no-repeat;
-    mask-repeat: no-repeat;
-    -webkit-mask-position: center;
-    mask-position: center;
+    -webkit-mask: center / contain no-repeat;
+    mask: center / contain no-repeat;
 }
 
 .msg-content {
@@ -185,13 +177,13 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    overflow-wrap: anywhere;
 }
 
 @media (hover: hover) and (pointer: fine) {
     .reply-strip:hover {
         white-space: normal;
         text-overflow: clip;
-        overflow-wrap: anywhere;
     }
 }
 
@@ -201,7 +193,6 @@
 .reply-strip:focus-visible {
     white-space: normal;
     text-overflow: clip;
-    overflow-wrap: anywhere;
     outline: 2px solid currentColor;
     outline-offset: 1px;
 }
@@ -229,17 +220,12 @@
     }
 }
 
-/* The hover action bar (reply/edit/delete) is opacity-0 until its row is
- * hovered, but an opacity-0 element still captures clicks and taps, so it
- * takes none by default. On a touch device (no hover) it can never become
- * visible, and a tap on the gutter where it sits would otherwise fire an
- * invisible reply/edit/delete (#402). On a hover pointer it takes clicks only
- * while its row is hovered: it sits in the row's own right gutter, so the
- * pointer reaches it without leaving the row, and an idle, invisible bar must
- * not cover the Latest button or a neighbouring row. Keyboard focus reaches
- * its buttons either way. It and the closed kebab are z-20, under Latest
- * (z-30) and the dismiss backdrops (z-40), so a hovered bar never covers
- * Latest either. */
+/* The hover bar is opacity-0 until its row is hovered, but opacity-0 still
+ * takes clicks, so it takes none by default: on touch it never shows, and a
+ * tap on the gutter would fire an invisible reply/edit/delete (#402). On a
+ * hover pointer it takes clicks only while its row is hovered, so an idle bar
+ * never covers Latest or a neighbouring row. It and the closed kebab are z-20,
+ * under Latest (z-30) and the dismiss backdrops (z-40). */
 .hover-actions {
     pointer-events: none;
 }

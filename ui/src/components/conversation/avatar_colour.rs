@@ -48,15 +48,10 @@ mod tests {
     /// `tailwind.css` declares them.
     struct Theme {
         name: &'static str,
-        /// `--avatar-l`: lightness at tone 0.
         l: f64,
-        /// `--avatar-l-step`: lightness added per tone.
         l_step: f64,
-        /// `--avatar-c`: chroma requested before clipping to sRGB.
         c: f64,
-        /// `--color-bg`.
         bg: [u8; 3],
-        /// `--color-surface`.
         surface: [u8; 3],
         /// `--color-row-hover`'s share of `--color-surface` over `bg`.
         hover_mix: f64,

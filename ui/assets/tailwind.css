@@ -191,12 +191,8 @@ html, body {
  * It is deliberately a SEPARATE token: nudging `--color-text-muted` itself
  * would repaint every timestamp, placeholder and label in the app.
  *
- * Measure against the REAL DM modal, not a stand-in. An earlier revision of this comment claimed "4.40:1 on a dark-mode DM bubble",
- * which was wrong in both the scheme and the value: it came from a synthetic
- * page that put the bubble on `--color-bg` instead of the modal's panel, read
- * through a colour helper that un-premultiplied an already-straight-alpha
- * canvas readback. Both errors inflated a translucent background. Measure a
- * translucent surface where it actually renders. */
+ * Measure a translucent surface where it renders (the DM bubble over the
+ * modal panel, not `--color-bg`). */
 .prose blockquote {
   border-left: 3px solid var(--color-accent);
   padding-left: 1rem;
