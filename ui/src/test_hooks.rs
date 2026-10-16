@@ -153,10 +153,6 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
-    // Put each emoji on the current room's newest message, all held by one
-    // test author, in ONE mutation. A send rebuilds `actions_state` and drops
-    // the example data's reactions, and those sit on random rows, so a spec
-    // that needs a row's reaction chips to fill the line sets them here.
     set_hook(
         "addReactionsToNewest",
         Closure::<dyn FnMut(js_sys::Array)>::new(move |emojis: js_sys::Array| {
@@ -318,13 +314,18 @@ fn test_author(delivery: Delivery) -> (SigningKey, &'static str) {
         Delivery::Append => {
             let seq = APPEND_SEQ.with(|s| s.replace(s.get() + 1));
             if seq % 2 == 0 {
-                (SigningKey::from_bytes(&[0x5A; 32]), "Test Sender A")
+                test_sender_a()
             } else {
                 (SigningKey::from_bytes(&[0x6A; 32]), "Test Sender B")
             }
         }
         Delivery::BeforeLast => (SigningKey::from_bytes(&[0x7B; 32]), "Test Sender Insert"),
     }
+}
+
+/// One of the appended arrivals' two authors.
+fn test_sender_a() -> (SigningKey, &'static str) {
+    (SigningKey::from_bytes(&[0x5A; 32]), "Test Sender A")
 }
 
 /// Admit `member_vk` to `room` as a member invited by self, so its messages
@@ -463,8 +464,10 @@ fn remove_messages(needle: &str) {
 }
 
 /// Give the current room's newest message one reaction per emoji, every one
-/// held by Test Sender A (one of the appended arrivals' authors, admitted
-/// here in case it has not spoken yet).
+/// held by Test Sender A (admitted here in case it has not spoken yet), in ONE
+/// mutation. A send rebuilds `actions_state` and drops the example data's
+/// reactions, which sit on random rows, so a spec that needs a row's chips to
+/// fill the line sets them here.
 fn add_reactions_to_newest(emojis: Vec<String>) {
     with_current_room_mut(|room, room_key| {
         let Some(newest) = room
@@ -477,8 +480,8 @@ fn add_reactions_to_newest(emojis: Vec<String>) {
             web_sys::console::error_1(&"__riverTest.addReactionsToNewest: no messages".into());
             return;
         };
-        let sk = SigningKey::from_bytes(&[0x5A; 32]);
-        admit_with_nickname(room, room_key, &sk, "Test Sender A");
+        let (sk, nickname) = test_sender_a();
+        admit_with_nickname(room, room_key, &sk, nickname);
         let reactor = MemberId::from(&sk.verifying_key());
         // One member holding several reactions breaks the one-per-member rule
         // on purpose: only the chips' geometry matters here.

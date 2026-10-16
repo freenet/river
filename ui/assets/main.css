@@ -93,9 +93,7 @@
 }
 
 .msg-avatar {
-    grid-column: 1;
     display: flex;
-    width: 36px;
     height: 36px;
     cursor: pointer;
 }
@@ -148,11 +146,10 @@
     padding: 0 0.2rem;
     border-radius: 0.3rem;
     font-weight: 500;
-    white-space: normal;
     overflow-wrap: anywhere;
     cursor: pointer;
     color: var(--color-link);
-    background-color: var(--color-accent-soft, rgba(2, 101, 231, 0.12));
+    background-color: var(--color-accent-soft);
 }
 
 .river-mention:hover {

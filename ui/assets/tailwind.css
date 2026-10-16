@@ -184,20 +184,14 @@ html, body {
 /* Blockquotes in prose (message rows, DM bubbles, room descriptions).
  *
  * `--color-text-quote` rather than `--color-text-muted`: a quote must stay
- * READABLE while reading as secondary, and the muted token, which is tuned
- * for timestamps and field labels (glanceable metadata), does not clear the
- * 4.5:1 WCAG AA floor on every surface a quote appears over (the conversation
- * background, the row hover band, the DM bubble): on the `bg-accent/20`
- * outgoing DM bubble in light mode it reaches only 3.96:1 (5.56:1 dark), the
- * worst quote surface in the app. The quote token is one step further from
- * the background in each mode, which clears AA there (4.97:1 light, 7.55:1
- * dark) while staying well clear of `--color-text` so the muted look
- * survives. It is deliberately a SEPARATE token: nudging
- * `--color-text-muted` itself would repaint every timestamp, placeholder and
- * label in the app.
+ * READABLE while reading as secondary, and the muted token (tuned for
+ * timestamps and labels) falls under the 4.5:1 WCAG AA floor on the light
+ * `bg-accent/20` outgoing DM bubble, the worst quote surface in the app.
+ * blockquote-contrast.spec.ts measures every quote surface in both themes.
+ * It is deliberately a SEPARATE token: nudging `--color-text-muted` itself
+ * would repaint every timestamp, placeholder and label in the app.
  *
- * Those numbers are measured against the REAL DM modal, not a stand-in. An
- * earlier revision of this comment claimed "4.40:1 on a dark-mode DM bubble",
+ * Measure against the REAL DM modal, not a stand-in. An earlier revision of this comment claimed "4.40:1 on a dark-mode DM bubble",
  * which was wrong in both the scheme and the value: it came from a synthetic
  * page that put the bubble on `--color-bg` instead of the modal's panel, read
  * through a colour helper that un-premultiplied an already-straight-alpha
@@ -246,13 +240,9 @@ html, body {
 .app-root {
   position: fixed;
   inset: 0;
-  /* Width from the same viewport the media queries and vw units read.
-     Narrowing the window, Chromium lays the page out once with the new
-     breakpoints and sidebar widths but the old width for `inset: 0`, so the
-     chat column is briefly wider than before or after. Rows that wrap to the
-     column then make the history shorter for that one layout, and the clamp
-     moves a reader held at the end up. The root never scrolls, so 100vw is
-     the viewport's width. */
+  /* The width the breakpoints read: narrowing the window, Chromium briefly
+     lays `inset: 0` out at the old width, and that one reflow moved a reader
+     held at the end. The root never scrolls, so 100vw is the viewport. */
   width: 100vw;
 }
 

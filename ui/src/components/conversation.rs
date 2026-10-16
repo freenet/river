@@ -3868,22 +3868,18 @@ fn MessageGroupComponent(
     // everyone else's glyph colour comes from their member id's hue and tone
     // (`.msg-avatar-hashed` resolves them per theme). Once per group, outside
     // the row loop.
-    let (avatar_class, avatar_style) = if is_self {
-        ("msg-avatar-self", None)
+    let (avatar_class, avatar_style, name_colour) = if is_self {
+        ("msg-avatar-self", None, "text-link hover:text-link-hover")
     } else {
         let (hue, tone) = avatar_colour::avatar_hue_tone(group.author_id);
         (
             "msg-avatar-hashed",
             Some(format!("--avatar-hue: {hue}; --avatar-tone: {tone};")),
+            "text-text hover:text-link",
         )
     };
-    let name_colour = if is_self {
-        "text-link hover:text-link-hover"
-    } else {
-        "text-text hover:text-link"
-    };
     let author_id = group.author_id;
-    // Shared by the avatar and the name. `Copy`, since `MemberId` is.
+    // Shared by the avatar and the name.
     let open_author_info = move |_: MouseEvent| {
         crate::util::defer(move || {
             MEMBER_INFO_MODAL.with_mut(|signal| signal.member = Some(author_id));
@@ -4317,14 +4313,8 @@ fn MessageGroupComponent(
                                         let reply_author_name = group.author_name.clone();
                                         rsx! {
                                             div {
-                                                // In the row's right gutter, past the content
-                                                // column's right edge, for every author.
-                                                // `.hover-actions` (main.css) keeps this invisible
-                                                // (opacity-0) bar from taking taps on touch devices
-                                                // (#402), and on a hover pointer lets it take clicks
-                                                // only while its row is hovered, so it never covers
-                                                // Latest or a neighbouring row.
-                                                class: "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-20 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 right-0 translate-x-full ml-2",
+                                                // Right gutter; pointer rules in main.css `.hover-actions`.
+                                                class: "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-20 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 right-0 translate-x-full",
                                                 // Reply button - available for all messages
                                                 button {
                                                     class: "text-xs text-text-muted hover:text-accent transition-colors",
