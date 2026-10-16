@@ -64,6 +64,9 @@ jobs:
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-make@0.37.24
+        # Fail loudly if no prebuilt binary exists rather than silently
+        # falling back to the source build this step exists to avoid.
+        fallback: none
 
     - name: Install cargo-binstall
       uses: taiki-e/install-action@cargo-binstall
@@ -321,6 +324,9 @@ jobs:
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-make@0.37.24
+        # Fail loudly if no prebuilt binary exists rather than silently
+        # falling back to the source build this step exists to avoid.
+        fallback: none
 
     - name: Install cargo-binstall
       uses: taiki-e/install-action@cargo-binstall
