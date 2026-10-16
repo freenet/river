@@ -1195,9 +1195,10 @@ fn a_removed_members_invitee_is_removed_and_stays_removed() {
 
 /// A removed moderator editing their own `deputies` cannot escape a cycle
 /// whose other edge rests on ABSOLUTE authority (owner-appointed moderator).
-/// Their record is ban evidence, so the update applies, but a `deputies` list
-/// grants authority only over its author's own subtree and never voids a ban
-/// on its author. No stored ban needs the grant, so cleanup does not keep it.
+/// Their record is ban evidence, so the update applies and is kept (every
+/// evidence record keeps its `member_info`, freenet/river#703 review), but a
+/// `deputies` list grants authority only over its author's own subtree and
+/// never voids a ban on its author.
 #[test]
 fn a_removed_moderator_cannot_escape_by_deputizing_its_partner() {
     let room = Room::new();
@@ -1209,11 +1210,11 @@ fn a_removed_moderator_cannot_escape_by_deputizing_its_partner() {
         ..Default::default()
     };
     // The record is signed by A, whose record is ban evidence, so the
-    // update applies. It cannot be used to escape, and nothing needs it.
+    // update applies, and it is kept. It cannot be used to escape.
     let after = apply_checked(&s, delta, &room.params);
     assert!(
-        !after.member_info.deputies_of(a.id).contains(&b.id),
-        "an evidence-only member's grant no ban needs is not kept"
+        after.member_info.deputies_of(a.id).contains(&b.id),
+        "an evidence-only member's member_info is kept"
     );
     let active = active_ids(&after, &room.params);
     assert!(!active.contains(&a.id) && !active.contains(&b.id));
@@ -2694,14 +2695,15 @@ fn split_delivery_of_competing_evidence_records_converges() {
     assert!(peers[0].ban_evidence.members.contains(&lower));
 }
 
-/// Cleanup keeps `member_info` for every evidence strict ancestor of a ban's
-/// target, up to the first present ancestor. A target at depth 4 whose three
-/// ancestors are all absent keeps exactly those three records, and not the
-/// target's own. When the depth-2 ancestor posts, it and its inviter stay
-/// members and the walk stops there: of the absent members, only the depth-3
-/// ancestor keeps its `member_info`.
+/// Cleanup keeps `member_info` for every record held as ban evidence (and
+/// for no other absent member). A target at depth 4 whose three ancestors are
+/// all absent is held with them, and all four keep their records. When the
+/// depth-2 ancestor posts, it and its inviter stay members: of the absent
+/// members, the depth-3 ancestor and the target keep theirs. Until
+/// freenet/river#703's review only the ancestors a ban reads kept theirs, so
+/// a member who left `members` for evidence and came back lost it.
 #[test]
-fn evidence_member_info_is_kept_up_to_the_first_present_ancestor() {
+fn evidence_member_info_is_kept_for_every_evidence_record() {
     use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
     for depth2_posts in [false, true] {
         let room = Room::new();
@@ -2732,12 +2734,9 @@ fn evidence_member_info_is_kept_up_to_the_first_present_ancestor() {
             .collect();
         let expected: Vec<MemberId> = if depth2_posts {
             assert!(present.contains(&chain[0].id) && present.contains(&chain[1].id));
-            vec![chain[2].id]
+            vec![chain[2].id, t.id]
         } else {
-            chain[..MAX_EVIDENCE_DEPTH - 1]
-                .iter()
-                .map(|p| p.id)
-                .collect()
+            chain.iter().map(|p| p.id).collect()
         };
         let mut kept_sorted = kept.clone();
         kept_sorted.sort();

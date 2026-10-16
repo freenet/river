@@ -3349,3 +3349,202 @@ fn two_records_for_one_member_resolve_the_same_way_in_both_directions() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Fixture for the two ban-evidence tests below: owner O, members P and X
+/// invited by O, Q invited by X, deterministic keys.
+struct EvidenceRoom {
+    owner_sk: SigningKey,
+    owner_id: MemberId,
+    params: ChatRoomParametersV1,
+    p_sk: SigningKey,
+    p: AuthorizedMember,
+    x: AuthorizedMember,
+    q: AuthorizedMember,
+    m_sk: SigningKey,
+    m: AuthorizedMember,
+}
+
+fn evidence_room() -> EvidenceRoom {
+    let owner_sk = SigningKey::from_bytes(&[61; 32]);
+    let owner_id: MemberId = owner_sk.verifying_key().into();
+    let key = |b: u8| SigningKey::from_bytes(&[b; 32]);
+    let (p_sk, x_sk, q_sk, m_sk) = (key(62), key(63), key(64), key(65));
+    let rec = |sk: &SigningKey, inviter: MemberId, inviter_sk: &SigningKey| {
+        create_authorized_member(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: inviter,
+                member_vk: sk.verifying_key(),
+            },
+            inviter_sk,
+        )
+    };
+    let p = rec(&p_sk, owner_id, &owner_sk);
+    let x = rec(&x_sk, owner_id, &owner_sk);
+    let q = rec(&q_sk, x.member.id(), &x_sk);
+    let m = rec(&m_sk, owner_id, &owner_sk);
+    EvidenceRoom {
+        params: ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        },
+        owner_sk,
+        owner_id,
+        p_sk,
+        p,
+        x,
+        q,
+        m_sk,
+        m,
+    }
+}
+
+fn evidence_room_state(r: &EvidenceRoom, max_recent_messages: usize) -> ChatRoomStateV1 {
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: r.owner_id,
+                max_recent_messages,
+                ..Default::default()
+            },
+            &r.owner_sk,
+        ),
+        ..Default::default()
+    }
+}
+
+fn timed_msg(r: &EvidenceRoom, author_sk: &SigningKey, t: u64) -> AuthorizedMessageV1 {
+    AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: r.owner_id,
+            author: author_sk.verifying_key().into(),
+            time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + t),
+            content: RoomMessageBody::public(format!("m{t}")),
+        },
+        author_sk,
+    )
+}
+
+fn timed_ban(r: &EvidenceRoom, by_sk: &SigningKey, target: MemberId, t: u64) -> AuthorizedUserBan {
+    AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: r.owner_id,
+            banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + t),
+            banned_user: target,
+        },
+        by_sk.verifying_key().into(),
+        by_sk,
+    )
+}
+
+fn ser_room(s: &ChatRoomStateV1) -> Vec<u8> {
+    let mut v = Vec::new();
+    ciborium::ser::into_writer(s, &mut v).unwrap();
+    v
+}
+
+/// The same records must leave the same ban evidence whichever field they
+/// arrive in (freenet/river#703 review). X is owner-banned and is the
+/// inviter of Q, whom P's stored ban names. Delivered as members, X and Q
+/// were removed by the owner ban before cleanup saw them, so nothing was
+/// kept; delivered as ban evidence, both were kept.
+#[test]
+fn ban_evidence_does_not_depend_on_how_a_record_arrived() {
+    use river_core::room_state::ChatRoomStateV1Delta;
+    let r = evidence_room();
+    let mut base = evidence_room_state(&r, 100);
+    base.members.members = vec![r.p.clone()];
+    base.recent_messages.messages = vec![timed_msg(&r, &r.p_sk, 1)];
+    base.bans = BansV1(vec![
+        timed_ban(&r, &r.p_sk, r.q.member.id(), 2),
+        timed_ban(&r, &r.owner_sk, r.x.member.id(), 3),
+    ]);
+    base.post_apply_cleanup(&r.params).unwrap();
+    base.verify(&base, &r.params).unwrap();
+
+    let as_members = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![r.x.clone(), r.q.clone()])),
+        ..Default::default()
+    };
+    let as_evidence = ChatRoomStateV1Delta {
+        ban_evidence: Some(vec![r.x.clone(), r.q.clone()]),
+        ..Default::default()
+    };
+    let mut via_members = base.clone();
+    via_members
+        .apply_delta(&base, &r.params, &Some(as_members))
+        .unwrap();
+    let mut via_evidence = base.clone();
+    via_evidence
+        .apply_delta(&base, &r.params, &Some(as_evidence))
+        .unwrap();
+    via_members.verify(&via_members, &r.params).unwrap();
+    via_evidence.verify(&via_evidence, &r.params).unwrap();
+    assert_eq!(
+        via_members.ban_evidence, via_evidence.ban_evidence,
+        "ban evidence differs by arrival path"
+    );
+    assert!(ser_room(&via_members) == ser_room(&via_evidence));
+}
+
+/// A member's `member_info` is kept while their record is held as ban
+/// evidence, so it is still there when they come back (freenet/river#703
+/// review). M is named by P's stored (inert) ban; with a cap of one
+/// message, P's newer message prunes M into ban evidence, then M's own
+/// newer message brings M back. In the other order M is never pruned. Both
+/// orders must end in the same state, M's info included.
+#[test]
+fn member_info_survives_a_stay_in_ban_evidence() {
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+    use river_core::room_state::ChatRoomStateV1Delta;
+    let r = evidence_room();
+    let mut base = evidence_room_state(&r, 1);
+    base.members.members = vec![r.p.clone(), r.m.clone()];
+    base.recent_messages.messages = vec![timed_msg(&r, &r.m_sk, 1)];
+    base.member_info = MemberInfoV1 {
+        member_info: vec![AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(r.m.member.id(), 1, "m".into()),
+            &r.m_sk,
+        )],
+    };
+    base.bans = BansV1(vec![timed_ban(&r, &r.p_sk, r.m.member.id(), 2)]);
+    base.post_apply_cleanup(&r.params).unwrap();
+    base.verify(&base, &r.params).unwrap();
+    assert!(
+        base.members.members.contains(&r.p),
+        "premise: P is a banner"
+    );
+
+    let p_posts = ChatRoomStateV1Delta {
+        recent_messages: Some(vec![timed_msg(&r, &r.p_sk, 2)]),
+        ..Default::default()
+    };
+    let m_returns = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![r.m.clone()])),
+        recent_messages: Some(vec![timed_msg(&r, &r.m_sk, 3)]),
+        ..Default::default()
+    };
+    let run = |first: &ChatRoomStateV1Delta, second: &ChatRoomStateV1Delta| {
+        let mut s = base.clone();
+        for d in [first, second] {
+            let parent = s.clone();
+            s.apply_delta(&parent, &r.params, &Some(d.clone())).unwrap();
+            s.verify(&s, &r.params).unwrap();
+        }
+        s
+    };
+    let pruned_then_back = run(&p_posts, &m_returns);
+    let never_pruned = run(&m_returns, &p_posts);
+    assert!(
+        never_pruned
+            .member_info
+            .member_info
+            .iter()
+            .any(|i| i.member_info.member_id == r.m.member.id()),
+        "premise: M keeps its info when never pruned"
+    );
+    assert!(
+        ser_room(&pruned_then_back) == ser_room(&never_pruned),
+        "M's member_info was lost during its stay in ban evidence"
+    );
+}

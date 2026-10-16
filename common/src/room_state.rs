@@ -631,55 +631,57 @@ impl ChatRoomStateV1 {
         //     dropped here, and a member re-added to `members` leaves it.
         {
             // An owner ban needs no record: the owner's key and authority
-            // are always available, and it removes its target whatever else
-            // is known. So an owner-banned member's record (and with it their
-            // `member_info`) is only kept if another ban needs it.
-            // `BanEvidenceV1::verify` checks stored evidence against the
-            // same function.
+            // are always available, and it removes its target and subtree
+            // whatever else is known. A record an owner ban removes is never
+            // kept as evidence, even when another ban names it: such a
+            // record reaching this point as a member is already gone
+            // (`MembersV1::apply_delta` removes owner-banned members before
+            // cleanup), so keeping it only when it arrived as evidence made
+            // the result depend on how the record arrived (freenet/river#703
+            // review). Nothing needs it: a ban its member issued is swept in
+            // step 4, and a ban naming it ranks as one whose target is held
+            // nowhere. `BanEvidenceV1::verify` checks stored evidence against
+            // `referenced_by_bans`, which this only narrows.
             let referenced =
                 crate::room_state::ban_evidence::referenced_by_bans(&self.bans, owner_id, |id| {
                     known_by_id.get(&id).map(|m| m.member.invited_by)
                 });
             let mut evidence: Vec<AuthorizedMember> = known_by_id
                 .iter()
-                .filter(|(id, _)| referenced.contains(*id) && !present.contains(*id))
+                .filter(|(id, _)| {
+                    referenced.contains(*id)
+                        && !present.contains(*id)
+                        && !resolution.owner_removed.contains(*id)
+                })
                 .map(|(_, m)| (*m).clone())
                 .collect();
             evidence.sort_by_key(|m| m.member.id());
             self.ban_evidence.members = evidence;
         }
 
-        // 5. Clean member_info for members who are gone. A member held only
-        //    as ban evidence keeps its record where a stored ban may read it:
-        //    `is_ban_authorized` rule 4 reads the `deputies` of the target's
-        //    strict ancestors, so for each stored non-owner ban every evidence
-        //    ancestor of its target, up to the first present ancestor, keeps
-        //    its `member_info` whatever it holds. Keeping it regardless of
-        //    content is what makes the choice independent of which version of
-        //    the record a peer holds: a newer record (a revoked grant) is never
-        //    dropped and then outranked by an older one supplied again. The
-        //    depth cap bounds this to `cap - 1` records per ban. No reader shows
-        //    an evidence-only member's nickname. They keep merging like any other
-        //    record (highest rank wins); see `BanEvidenceV1`.
-        let needed_grantors: HashSet<MemberId> = {
-            let known = self.ban_evidence.lookup(&self.members, owner_id);
-            let present_ids: HashSet<MemberId> =
-                self.members.members.iter().map(|m| m.member.id()).collect();
-            let mut needed = HashSet::new();
-            for ban in self.bans.0.iter().filter(|b| b.banned_by != owner_id) {
-                let mut ancestor = known.get(&ban.ban.banned_user).map(|m| m.member.invited_by);
-                while let Some(a) = ancestor {
-                    if a == owner_id || present_ids.contains(&a) || !needed.insert(a) {
-                        break;
-                    }
-                    ancestor = known.get(&a).map(|m| m.member.invited_by);
-                }
-            }
-            needed
-        };
+        // 5. Clean member_info for members who are gone. A member held as
+        //    ban evidence keeps its record: a stored ban may read it
+        //    (`is_ban_authorized` rule 4 reads the `deputies` of the target's
+        //    strict ancestors), and a member who leaves `members` for ban
+        //    evidence and later returns must come back with the record they
+        //    had, as on a peer where they never left (freenet/river#703
+        //    review; keeping only the ancestors a ban reads lost it). Keeping
+        //    it regardless of content is what makes the choice independent of
+        //    which version of the record a peer holds: a newer record (a
+        //    revoked grant) is never dropped and then outranked by an older
+        //    one supplied again. Evidence is bounded by the stored bans and
+        //    the depth cap. No reader shows an evidence-only member's
+        //    nickname. They keep merging like any other record (highest rank
+        //    wins); see `BanEvidenceV1`.
+        let evidence_ids: HashSet<MemberId> = self
+            .ban_evidence
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect();
         self.member_info.member_info.retain(|info| {
             let id = info.member_info.member_id;
-            id == owner_id || required_ids.contains(&id) || needed_grantors.contains(&id)
+            id == owner_id || required_ids.contains(&id) || evidence_ids.contains(&id)
         });
 
         // 5a. Collapse duplicate member_info records to the single canonical
