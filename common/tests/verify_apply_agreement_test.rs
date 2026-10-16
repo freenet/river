@@ -889,3 +889,31 @@ fn an_unsigned_valid_placeholder_yields_to_the_owners_configuration() {
     merged.merge(&receiver, &r.params, &real).unwrap();
     assert_eq!(merged.configuration, real.configuration);
 }
+
+/// A configuration the room owner did not sign (an imported room's
+/// placeholder) is never offered: merging a state that holds one into a
+/// state holding an owner-signed configuration, even one that fails the
+/// value checks, succeeds and keeps the owner's, in both directions
+/// (freenet/river#703 review U5).
+#[test]
+fn an_unsigned_configuration_is_never_offered() {
+    let r = room();
+    let placeholder = ChatRoomStateV1::default();
+    for version in 0..3u32 {
+        let mut c = public_config(&r);
+        c.configuration_version = version;
+        c.max_members = 0;
+        let invalid = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(c, &r.owner_sk),
+            ..Default::default()
+        };
+        let mut a = invalid.clone();
+        a.merge(&invalid, &r.params, &placeholder)
+            .expect("merge(owner-signed, placeholder)");
+        let mut b = placeholder.clone();
+        b.merge(&placeholder, &r.params, &invalid)
+            .expect("merge(placeholder, owner-signed)");
+        assert_eq!(a.configuration, invalid.configuration, "version {version}");
+        assert_eq!(b.configuration, invalid.configuration, "version {version}");
+    }
+}

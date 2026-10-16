@@ -1796,15 +1796,22 @@ mod tests {
         let before = room_with_messages(&sk, &["m1", "m2"]);
         let mut room = room_data(&sk, before.clone());
         room.rekey_merge.owed = vec![contract_key_with_id(88)];
-        // The recovered state carries a newer configuration whose signature
-        // does not verify against the owner, so the merge fails. (It used a
-        // public message in a room made private until freenet/river#703's
-        // review, which now drops such a message instead of failing.)
+        // The recovered state carries a member record attributed to the
+        // owner's invitation that the owner did not sign, so the merge fails.
+        // (Earlier fixtures used a public message in a room made private,
+        // then a configuration the owner did not sign; since
+        // freenet/river#703 the room drops or never offers those.)
         let mut bad = room_with_messages(&sk, &["m1", "m9"]);
-        let mut config = bad.configuration.configuration.clone();
-        config.configuration_version += 1;
-        bad.configuration =
-            AuthorizedConfigurationV1::new(config, &SigningKey::from_bytes(&[0x5b; 32]));
+        bad.members
+            .members
+            .push(river_core::room_state::member::AuthorizedMember {
+                member: river_core::room_state::member::Member {
+                    owner_member_id: sk.verifying_key().into(),
+                    invited_by: sk.verifying_key().into(),
+                    member_vk: SigningKey::from_bytes(&[0x5b; 32]).verifying_key(),
+                },
+                signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+            });
         let mut probe = before.clone();
         assert!(
             probe

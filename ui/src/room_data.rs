@@ -3838,19 +3838,20 @@ mod tests {
     fn a_failing_room_does_not_prevent_the_others_from_merging() {
         fn forged(owner: VerifyingKey, version: u32) -> RoomData {
             let mut room = test_minimal_room_data(owner);
-            // The room's real owner id, so the configuration passes the value
-            // checks and fails only on its signature: a configuration that
-            // fails the checks is not offered at all (freenet/river#703).
-            let config = river_core::room_state::configuration::Configuration {
-                owner_member_id: owner.into(),
-                configuration_version: version,
-                ..Default::default()
-            };
-            room.room_state.configuration =
-                river_core::room_state::configuration::AuthorizedConfigurationV1::new(
-                    config,
-                    &SigningKey::from_bytes(&[99u8; 32]),
-                );
+            // A member record attributed to the owner's invitation that the
+            // owner did not sign: the merge fails on its signature. (A
+            // configuration the owner did not sign is no longer offered at
+            // all, freenet/river#703.)
+            room.room_state.members.members.push(
+                river_core::room_state::member::AuthorizedMember {
+                    member: river_core::room_state::member::Member {
+                        owner_member_id: owner.into(),
+                        invited_by: owner.into(),
+                        member_vk: SigningKey::from_bytes(&[version as u8; 32]).verifying_key(),
+                    },
+                    signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+                },
+            );
             room
         }
 

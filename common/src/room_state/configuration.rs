@@ -67,7 +67,12 @@ impl ComposableState for AuthorizedConfigurationV1 {
         parameters: &Self::Parameters,
         old_rank: &Self::Summary,
     ) -> Option<Self::Delta> {
-        if outranks(self.rank(parameters), *old_rank) {
+        // A configuration the room owner did not sign (an imported room's
+        // placeholder) is never offered: the receiver would refuse it as a
+        // forgery and fail the whole merge.
+        if outranks(self.rank(parameters), *old_rank)
+            && self.verify_signature(&parameters.owner).is_ok()
+        {
             Some(self.clone())
         } else {
             None
