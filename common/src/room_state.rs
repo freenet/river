@@ -159,7 +159,26 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
     ) -> Result<(), String> {
-        let summary = self.summarize_with_merged_configuration(parameters, other_state);
+        self.merge_from(parameters, other_state)
+    }
+
+    /// [`Self::merge`] without the ignored parent argument, so a caller
+    /// holding only `&mut self` need not clone itself to pass one.
+    pub fn merge_from(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        other_state: &ChatRoomStateV1,
+    ) -> Result<(), String> {
+        let config_delta = configuration_delta_for_merge(self, parameters, other_state);
+        // The summary is read against the configuration the merge ends with,
+        // derived once (a clone only when the configuration changes).
+        let (summary, cap) = {
+            let with_config = self.with_configuration(parameters, &config_delta);
+            (
+                self.summarize(&with_config, parameters),
+                with_config.configuration.configuration.max_recent_messages,
+            )
+        };
         // Field `delta`s never read their parent; pass the sender's own state,
         // as `get_state_delta` does on the network path. The macro's
         // `apply_delta` ignores its parent (it re-reads `self` per field), so
@@ -174,39 +193,28 @@ impl ChatRoomStateV1 {
         // other direction dropped them: merge(A, B) != merge(B, A)
         // (freenet/river#703 review). On a state a merge or delta produced,
         // the extra pass is a no-op.
-        let mut delta = Some(
-            other_state
-                .delta(other_state, parameters, &summary)
-                .unwrap_or_default(),
-        );
-        if let Some(d) = delta.as_mut() {
-            d.configuration = configuration_delta_for_merge(self, parameters, other_state);
-        }
-        let cap = self
-            .with_configuration_merged_from(parameters, other_state)
-            .configuration
-            .configuration
-            .max_recent_messages;
-        trim_messages_to_work_bound(&mut delta, cap);
+        let delta_against = |summary: &ChatRoomStateV1Summary| {
+            let mut delta = other_state
+                .delta(other_state, parameters, summary)
+                .unwrap_or_default();
+            delta.configuration = config_delta.clone();
+            let mut delta = Some(delta);
+            trim_messages_to_work_bound(&mut delta, cap);
+            delta
+        };
         let mut merged = self.clone();
-        merged.apply_delta(self, parameters, &delta)?;
+        merged.apply_delta(self, parameters, &delta_against(&summary))?;
         if merge_may_have_withheld_a_survivor(&summary, &merged) {
             let open = summary.without_retention_horizons();
-            let mut delta = Some(
-                other_state
-                    .delta(other_state, parameters, &open)
-                    .unwrap_or_default(),
-            );
-            if let Some(d) = delta.as_mut() {
-                d.configuration = configuration_delta_for_merge(self, parameters, other_state);
-            }
-            trim_messages_to_work_bound(&mut delta, cap);
             let mut open_merged = self.clone();
             // If the open pass fails, keep the first pass's result rather
             // than failing a merge the first pass completed: the first pass
             // is a valid merge that may hold fewer old messages, and failing
             // here would refuse states the trait merge accepted.
-            if open_merged.apply_delta(self, parameters, &delta).is_ok() {
+            if open_merged
+                .apply_delta(self, parameters, &delta_against(&open))
+                .is_ok()
+            {
                 merged = open_merged;
             }
         }
@@ -225,20 +233,20 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
     ) -> ChatRoomStateV1Summary {
+        let config_delta = configuration_delta_for_merge(self, parameters, other_state);
         self.summarize(
-            &self.with_configuration_merged_from(parameters, other_state),
+            &self.with_configuration(parameters, &config_delta),
             parameters,
         )
     }
 
-    /// This state with `other_state`'s configuration merged in, borrowed
-    /// unchanged when that does not change it.
-    fn with_configuration_merged_from(
+    /// This state with `config_delta` applied to its configuration, borrowed
+    /// unchanged when there is none.
+    fn with_configuration(
         &self,
         parameters: &ChatRoomParametersV1,
-        other_state: &ChatRoomStateV1,
+        config_delta: &Option<AuthorizedConfigurationV1>,
     ) -> std::borrow::Cow<'_, ChatRoomStateV1> {
-        let config_delta = configuration_delta_for_merge(self, parameters, other_state);
         if config_delta.is_none() {
             return std::borrow::Cow::Borrowed(self);
         }
@@ -247,7 +255,7 @@ impl ChatRoomStateV1 {
         // which is exactly the configuration the merge ends with.
         let _ = merged
             .configuration
-            .apply_delta(self, parameters, &config_delta);
+            .apply_delta(self, parameters, config_delta);
         std::borrow::Cow::Owned(merged)
     }
 

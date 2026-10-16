@@ -139,11 +139,12 @@ impl ContractInterface for Contract {
                 UpdateData::State(new_state) => {
                     let new_state = from_reader::<ChatRoomStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    // `ChatRoomStateV1::merge` (inherent), not the trait
-                    // default: it opens the retention horizons so the merge
-                    // is commutative (freenet/river#703).
+                    // The room's own whole-state merge (the trait default is
+                    // not commutative for rooms, freenet/river#703), called
+                    // without the parent argument it ignores, so the state is
+                    // not cloned to supply one.
                     chat_state
-                        .merge(&chat_state.clone(), &parameters, &new_state)
+                        .merge_from(&parameters, &new_state)
                         .map_err(|e| ContractError::InvalidUpdateWithInfo {
                             reason: e.to_string(),
                         })?;
