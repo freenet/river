@@ -67,7 +67,10 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: install
-        args: --force cargo-make
+        # --locked: build from cargo-make's own Cargo.lock. Every `zip` 2.x
+        # (cargo-make 0.37.24 needs `zip = "^2"`) was yanked on 2026-10-16,
+        # so an unlocked install cannot resolve; a locked one still builds.
+        args: --force --locked cargo-make
 
     - name: Install cargo-binstall
       uses: taiki-e/install-action@cargo-binstall
@@ -328,7 +331,10 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: install
-        args: --force cargo-make
+        # --locked: build from cargo-make's own Cargo.lock. Every `zip` 2.x
+        # (cargo-make 0.37.24 needs `zip = "^2"`) was yanked on 2026-10-16,
+        # so an unlocked install cannot resolve; a locked one still builds.
+        args: --force --locked cargo-make
 
     - name: Install cargo-binstall
       uses: taiki-e/install-action@cargo-binstall
