@@ -499,6 +499,7 @@ impl FreenetSynchronizer {
                             // First verify connection with ProcessRooms, then refresh all rooms to
                             // catch any updates that arrived while the page was hidden/PC was suspended.
                             info!("Connection appears active, refreshing all rooms to catch missed updates");
+                            super::generation_watch::on_page_visible();
                             if let Err(e) =
                                 message_tx.unbounded_send(SynchronizerMessage::RefreshAllRooms)
                             {
@@ -721,6 +722,12 @@ impl FreenetSynchronizer {
                                     } else {
                                         info!("Successfully processed rooms after connection");
                                     }
+
+                                    // Watch River's pointer records so a re-key while
+                                    // this tab is open reloads it (freenet/river#580).
+                                    // A subscription does not survive a reconnect, so
+                                    // this re-subscribes every time.
+                                    super::generation_watch::on_connected();
                                 } else {
                                     error!("API not available after successful connection");
                                 }

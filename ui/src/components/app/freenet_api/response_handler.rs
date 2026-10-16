@@ -123,7 +123,9 @@ impl ResponseHandler {
                 }
                 ContractResponse::SubscribeResponse { key, subscribed } => {
                     flags.needs_reput = handle_subscribe_response(key, subscribed);
-                    if subscribed {
+                    // A pointer record's GET already carried its state.
+                    let is_pointer = super::generation_watch::is_watched(key.id());
+                    if subscribed && !is_pointer {
                         // Fetch current contract state after successful subscribe.
                         // On reconnect, rooms loaded from delegate storage may be stale.
                         // Subscribe doesn't return state, so we need an explicit GET.

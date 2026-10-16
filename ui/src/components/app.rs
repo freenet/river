@@ -4,6 +4,7 @@ pub mod freenet_api;
 pub mod notifications;
 pub mod receive_times;
 pub mod sync_info;
+pub mod update_banner;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::document_title::DocumentTitleUpdater;
@@ -588,6 +589,7 @@ pub fn App() -> Element {
             invitation: receive_invitation
         }
         DocumentTitleUpdater {}
+        update_banner::UpdateBanner {}
     }
 }
 

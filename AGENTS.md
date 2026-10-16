@@ -350,6 +350,18 @@ Both the UI and riverctl detect this automatically via `regenerate_contract_key(
    the predecessor merge) run alongside the subscribe and never delay the room.
 4. If room owner: also sends an `OptionalUpgradeV1` pointer on the old key for stragglers
 
+**A tab that is already open does none of this**: it runs the build it loaded,
+with the old WASM compiled in. It notices a re-key through River's pointer
+records and reloads into the new build, which then runs the flow above
+(freenet/river#580, `ui/src/components/app/freenet_api/generation_watch.rs`).
+It reloads rather than following the new key in place for the same reason
+riverctl restarts (`cli/src/pointer.rs`, `Recheck`): the new generation can
+change the state format and validation, and the delegate cannot be followed
+without the new build's migration. The reload is capped (tries per target with
+backoff, an hourly ceiling, never over a draft); read the module docs before
+changing any of it. This is why `cargo make publish-pointer-records` is not
+optional after a re-key (`.claude/rules/river-publish.md`, step 7).
+
 **This only works if:**
 - The state format is backwards-compatible (see below)
 - All state data is cryptographically authorized (see above)

@@ -115,6 +115,21 @@ network already has: a silent no-op, or a fork if the archive differs.
 Signing (3b) happens in the PR; publishing is the network half and runs from
 `main` after the merge, like every other publish here.
 
+**This step is what reloads every River tab that is already open.** The UI
+watches both pointer records, and a tab running the old build reloads only
+when a record newer than its own lands (freenet/river#580,
+`ui/src/components/app/freenet_api/generation_watch.rs`). Skip this step and
+those tabs stay on the old room contract and old delegate with no signal: the
+room looks quiet, and their delegate writes are stranded.
+
+Order matters, and it is enforced: the pre-flight below refuses unless the UI
+carrying the new WASM is already live. Do the UI publish (step 5) first, then
+**wait ~10 minutes** before this step. The pointer is 100 bytes and the web
+container ~1.2 MB, so the pointer reaches nodes first; a tab whose node does
+not yet hold the new UI reloads into the old one and spends a retry. The UI
+retries with backoff for ~20 minutes and then falls back to a banner, so a
+short gap is not fatal, but a gap means fewer wasted reloads.
+
 ```bash
 POINTER_NODE_PORT=<a network node of yours, NOT 7509> \
 POINTER_WASM=~/code/freenet/freenet-migrate/contracts/pointer-contract/pointer-v1.wasm \
