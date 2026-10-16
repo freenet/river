@@ -2,6 +2,18 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.22] - Unreleased
+
+### Changed
+- Built against river-core 0.3.0 and the new room contract (freenet/river#703).
+  Rooms migrate to the new contract automatically.
+- Room merges no longer depend on which side merges: two owner devices that
+  changed room settings at the same version now settle on one configuration,
+  and a merge that raises the message cap or bans a member keeps every message
+  the merged room has room for.
+- A room update that repeats records the room already holds, or is computed
+  against an out-of-date view of it, now applies instead of being rejected.
+
 ## [0.2.21] - 2026-10-15
 
 ### Changed
