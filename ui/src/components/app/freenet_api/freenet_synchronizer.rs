@@ -568,6 +568,11 @@ impl FreenetSynchronizer {
                         // page in the shell, under an id the next page reuses.
                         if super::generation_watch::is_reloading() {
                             info!("Reload under way; not reconnecting");
+                            // Still clear the latch: if the reload never
+                            // happens, the next loss must be able to arm a
+                            // reconnect (generation_watch also re-sends a
+                            // Connect when it gives up).
+                            reconnect.note_connect_attempt();
                             continue;
                         }
                         // A reconnect (or the first connect) is now being

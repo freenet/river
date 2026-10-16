@@ -769,12 +769,14 @@ echo "Don't forget to: git push origin main"
 description = "Check if delegate WASM changed and migration entry is needed"
 script = ["scripts/check-migration.sh"]
 
-# --- Pointer records (stable identity for third parties) ---------------------
+# --- Pointer records (stable identity; the re-key signal) --------------------
 #
 # These are the OTHER half of a re-key. The migration registries above carry
-# OUR users' data forward across a re-key; a pointer record tells THIRD PARTIES
-# where the artifact moved to. Different problem, same trigger — so whenever you
-# run `add-migration`, you almost certainly also need `sign-pointer-records`.
+# OUR users' data forward across a re-key; a pointer record says where the
+# artifact moved to, for THIRD PARTIES and for our users' already-open tabs,
+# which reload only when a newer record lands (#580). Different problem, same
+# trigger — so whenever you run `add-migration`, you almost certainly also need
+# `sign-pointer-records`, and `publish-pointer-records` after the UI publish.
 #
 # See FREENET.md and pointer-records.toml.
 

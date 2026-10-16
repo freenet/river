@@ -91,6 +91,11 @@
 //! an id with the new page's and feed it stale notifications. A top-level
 //! (unframed) dev build reloads itself. River's other self-navigation, on an
 //! expired auth token, is freenet/river#522.
+//!
+//! The shell's `navigate` always pushes a history entry, so each reload adds
+//! one, and Back reloads the previous frame path (with its older caps, which
+//! takes a reader's press per round, so it cannot loop on its own). A
+//! replacing `navigate` is freenet/freenet-core#5910.
 
 use dioxus::logger::tracing::{info, warn};
 use ed25519_dalek::VerifyingKey;
@@ -564,9 +569,15 @@ pub(crate) enum Phase {
     },
     /// A cap refused an automatic reload. Banner with a manual Reload only.
     ManualOnly,
-    /// A reload was issued at `since_ms`. Nothing else happens until the page
-    /// is replaced, or [`RELOAD_STUCK_MS`] passes.
-    Reloading { since_ms: u64 },
+    /// A reload is under way: pending writes are being flushed, then the
+    /// reload is posted at `posted_ms`. Nothing else is ever issued from here.
+    /// A posted reload that has not replaced the page after
+    /// [`RELOAD_STUCK_MS`] did not happen.
+    Reloading { posted_ms: Option<u64> },
+    /// A posted reload never replaced the page (an old shell without
+    /// `navigate`, a cancelled frame load). Asking again would fail the same
+    /// way, so the banner asks the reader to refresh the tab.
+    ReloadFailed,
 }
 
 impl Phase {
@@ -638,7 +649,7 @@ pub(crate) fn start(i: Inputs, min_delay_ms: u64) -> Phase {
 /// backoff. So a running plan takes the later of its own wait and the new
 /// delay, and never gets shorter.
 pub(crate) fn replan(phase: Phase, decision: &CapDecision, i: Inputs) -> Phase {
-    if let Phase::Reloading { .. } = phase {
+    if let Phase::Reloading { .. } | Phase::ReloadFailed = phase {
         return phase;
     }
     let CapDecision::Allow { min_delay_ms, .. } = decision else {
@@ -678,7 +689,17 @@ pub(crate) fn replan(phase: Phase, decision: &CapDecision, i: Inputs) -> Phase {
                 hidden_due_ms: hidden_due_ms.map(|d| d.max(not_before_ms)),
             }
         }
-        Phase::Reloading { .. } => phase,
+        Phase::Reloading { .. } | Phase::ReloadFailed => phase,
+    }
+}
+
+/// The reload fell due and the caps were asked: the phase to move to, and the
+/// [`RELOAD_PARAM`] value to reload with if allowed. From here the page only
+/// waits for the reload; the stuck clock starts when it is posted.
+pub(crate) fn on_reload_due(decision: CapDecision) -> (Phase, Option<String>) {
+    match decision {
+        CapDecision::Allow { param, .. } => (Phase::Reloading { posted_ms: None }, Some(param)),
+        CapDecision::TriesExhausted | CapDecision::RateLimited => (Phase::ManualOnly, None),
     }
 }
 
@@ -687,14 +708,11 @@ pub(crate) fn replan(phase: Phase, decision: &CapDecision, i: Inputs) -> Phase {
 /// Never reloads while `busy`: the reload waits for the reader.
 pub(crate) fn step(phase: Phase, i: Inputs) -> (Phase, bool) {
     match phase {
-        Phase::Idle | Phase::ManualOnly => (phase, false),
-        Phase::Reloading { since_ms } => {
-            if i.now_ms.saturating_sub(since_ms) >= RELOAD_STUCK_MS {
-                (Phase::ManualOnly, false)
-            } else {
-                (phase, false)
-            }
-        }
+        Phase::Idle | Phase::ManualOnly | Phase::ReloadFailed => (phase, false),
+        Phase::Reloading {
+            posted_ms: Some(posted),
+        } if i.now_ms.saturating_sub(posted) >= RELOAD_STUCK_MS => (Phase::ReloadFailed, false),
+        Phase::Reloading { .. } => (phase, false),
         Phase::Snoozed { not_before_ms, .. } if i.visible => (
             Phase::Snoozed {
                 not_before_ms,
@@ -731,12 +749,15 @@ pub(crate) fn step(phase: Phase, i: Inputs) -> (Phase, bool) {
 pub enum Notice {
     /// "Reloading in N s", with Reload now / Not now.
     Countdown { secs: u64 },
-    /// The countdown ran out while the reader is busy.
+    /// The countdown ran out while the reader is busy (or the connection is
+    /// down).
     WaitingForReader,
     /// No automatic reload is coming; Reload only.
     Manual,
     /// A reload is under way.
     Reloading,
+    /// A reload did not happen; only refreshing the tab will.
+    RefreshTab,
 }
 
 /// The banner for a phase. A hidden tab needs none; it gets one on the tick
@@ -745,6 +766,7 @@ pub(crate) fn notice(phase: Phase, i: Inputs) -> Option<Notice> {
     match phase {
         Phase::Idle | Phase::Hidden { .. } => None,
         Phase::Reloading { .. } => Some(Notice::Reloading),
+        Phase::ReloadFailed => Some(Notice::RefreshTab),
         Phase::Countdown { due_ms, .. } if i.now_ms >= due_ms && i.busy => {
             Some(Notice::WaitingForReader)
         }
@@ -866,12 +888,17 @@ pub fn is_watched(id: &ContractInstanceId) -> bool {
     WATCHED.iter().any(|w| &w.pointer_id == id)
 }
 
-pub use runtime::{is_reloading, on_connected, on_page_visible, reload_now, snooze, UPDATE_NOTICE};
+pub use runtime::{
+    is_reloading, note_user_activity, on_connected, on_page_visible, reload_now, snooze,
+    UPDATE_NOTICE,
+};
 
 #[cfg(target_arch = "wasm32")]
 mod runtime {
+    use super::super::freenet_synchronizer::{SynchronizerMessage, SynchronizerStatus};
     use super::*;
-    use crate::components::app::{NEEDS_SYNC, PENDING_INVITES, WEB_API};
+    use crate::components::app::{NEEDS_SYNC, PENDING_INVITES, SYNC_STATUS, WEB_API};
+    use crate::invites::PendingRoomStatus;
     use dioxus::prelude::*;
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -973,11 +1000,37 @@ mod runtime {
                 return true;
             }
         }
-        // Unreadable means "cannot tell": treat as busy, it only delays.
+        // While disconnected, what the reader just did may not have left yet,
+        // and a reload would not make anything arrive either. Wait.
+        let connected = SYNC_STATUS
+            .try_read()
+            .map(|s| matches!(*s, SynchronizerStatus::Connected))
+            .unwrap_or(false);
+        if !connected {
+            return true;
+        }
+        // An invitation being accepted. Only the in-flight states: a finished
+        // or failed entry lingers until its dialog is closed, and an open
+        // dialog is already caught above. Unreadable means "cannot tell":
+        // treat as busy, it only delays.
         PENDING_INVITES
             .try_read()
-            .map(|p| !p.map.is_empty())
+            .map(|p| {
+                p.map.values().any(|join| {
+                    matches!(
+                        join.status,
+                        PendingRoomStatus::PendingSubscription | PendingRoomStatus::Subscribing
+                    )
+                })
+            })
             .unwrap_or(true)
+    }
+
+    /// The reader just did something that queues a sync (sent a message,
+    /// reacted, edited). Busy is otherwise sampled once a tick, which a quick
+    /// "ok⏎" can fall between; this starts the settle period at once.
+    pub fn note_user_activity() {
+        LAST_BUSY_MS.store(now_ms(), Ordering::SeqCst);
     }
 
     pub(super) fn current_inputs() -> Inputs {
@@ -1068,6 +1121,29 @@ mod runtime {
         }
     }
 
+    /// A reload did not happen. Let the synchronizer reconnect again, and ask
+    /// it to: a Connect it skipped while the reload was under way is gone, and
+    /// a connection lost meanwhile would otherwise stay lost. (Connect is a
+    /// no-op on a live connection.)
+    fn abandon_reload() {
+        if !RELOADING.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        warn!("generation watch: reload did not happen; reconnecting");
+        if let Ok(sync) = crate::components::app::SYNCHRONIZER.try_read() {
+            let _ = sync
+                .get_message_sender()
+                .unbounded_send(SynchronizerMessage::Connect);
+        }
+    }
+
+    fn still_reloading() -> bool {
+        matches!(
+            STATE.lock().map(|s| s.phase),
+            Ok(Phase::Reloading { posted_ms: None })
+        )
+    }
+
     /// Let pending writes out, then reload. Waits at most
     /// [`FLUSH_TIMEOUT_MS`] for room syncs to drain and the delegate to
     /// acknowledge the flush; a reload that never happens strands the tab,
@@ -1084,10 +1160,20 @@ mod runtime {
         if let futures::future::Either::Right(_) = futures::future::select(flush, timeout).await {
             warn!("generation watch: delegate flush did not finish in time; reloading anyway");
         }
-        if !navigate(&param) {
-            RELOADING.store(false, Ordering::SeqCst);
-            set_phase(Phase::ManualOnly);
-            set_notice(Some(Notice::Manual));
+        // The plan may have moved on while we waited; never post a stray one.
+        if !still_reloading() {
+            abandon_reload();
+            return;
+        }
+        if navigate(&param) {
+            // The stuck clock starts now that the reload is posted.
+            set_phase(Phase::Reloading {
+                posted_ms: Some(now_ms()),
+            });
+        } else {
+            set_phase(Phase::ReloadFailed);
+            set_notice(Some(Notice::RefreshTab));
+            abandon_reload();
         }
     }
 
@@ -1107,31 +1193,27 @@ mod runtime {
             }) else {
                 break;
             };
-            if next == Phase::ManualOnly {
-                RELOADING.store(false, Ordering::SeqCst);
+            if next == Phase::ReloadFailed {
+                abandon_reload();
             }
             set_notice(notice(next, i));
             if reload {
-                match current_target()
+                let decision = current_target()
                     .map(|t| cap_decision(current_reload_param().as_deref(), t, i.now_ms))
-                {
-                    Some(CapDecision::Allow { param, .. }) => {
-                        // One reload per page: from here the page only waits.
-                        set_phase(Phase::Reloading { since_ms: i.now_ms });
-                        set_notice(Some(Notice::Reloading));
-                        crate::util::safe_spawn_local(reload_after_flush(param));
-                    }
-                    other => {
-                        warn!(
-                            "generation watch: automatic reload refused ({other:?}); banner only"
-                        );
-                        set_phase(Phase::ManualOnly);
-                        set_notice(Some(Notice::Manual));
-                    }
+                    .unwrap_or(CapDecision::RateLimited);
+                if !matches!(decision, CapDecision::Allow { .. }) {
+                    warn!("generation watch: automatic reload refused ({decision:?}); banner only");
+                }
+                // One reload per page: from here the page only waits.
+                let (phase, param) = on_reload_due(decision);
+                set_phase(phase);
+                set_notice(notice(phase, i));
+                if let Some(param) = param {
+                    crate::util::safe_spawn_local(reload_after_flush(param));
                 }
             }
             let phase = STATE.lock().map(|s| s.phase).unwrap_or(Phase::Idle);
-            if matches!(phase, Phase::Idle | Phase::ManualOnly) {
+            if matches!(phase, Phase::Idle | Phase::ManualOnly | Phase::ReloadFailed) {
                 break;
             }
             // Tick fast only when something is about to happen.
@@ -1146,11 +1228,20 @@ mod runtime {
 
     /// The banner's Reload button.
     pub fn reload_now() {
-        let Some(target) = current_target() else {
+        // A click racing the automatic reload, or a double click: one reload.
+        let Ok(mut state) = STATE.lock() else {
             return;
         };
+        if is_reloading() || matches!(state.phase, Phase::Reloading { .. } | Phase::ReloadFailed) {
+            return;
+        }
+        if !state.observed.is_stale() {
+            return;
+        }
+        let target = state.observed.target(&WATCHED);
+        state.phase = Phase::Reloading { posted_ms: None };
+        drop(state);
         let param = manual_param(current_reload_param().as_deref(), target, now_ms());
-        set_phase(Phase::Reloading { since_ms: now_ms() });
         set_notice(Some(Notice::Reloading));
         ensure_driver();
         crate::util::safe_spawn_local(reload_after_flush(param));
@@ -1158,7 +1249,7 @@ mod runtime {
 
     /// The banner's "Not now" button.
     pub fn snooze() {
-        if let Ok(mut s) = STATE.lock() {
+        let snoozed = STATE.lock().is_ok_and(|mut s| {
             if let Phase::Countdown { not_before_ms, .. } | Phase::Hidden { not_before_ms, .. } =
                 s.phase
             {
@@ -1166,9 +1257,14 @@ mod runtime {
                     not_before_ms,
                     hidden_due_ms: None,
                 };
+                true
+            } else {
+                false
             }
+        });
+        if snoozed {
+            set_notice(Some(Notice::Manual));
         }
-        set_notice(Some(Notice::Manual));
     }
 
     fn send_get(id: ContractInstanceId, subscribe: bool) {
@@ -1253,6 +1349,7 @@ mod runtime {
     pub fn is_reloading() -> bool {
         false
     }
+    pub fn note_user_activity() {}
     pub fn on_connected() {}
     pub fn on_page_visible() {}
     pub fn reload_now() {}
@@ -1902,20 +1999,71 @@ mod tests {
     /// the banner.
     #[test]
     fn a_page_reloads_at_most_once() {
-        let reloading = Phase::Reloading { since_ms: 100 };
+        let posted = Phase::Reloading {
+            posted_ms: Some(100),
+        };
         for now in [100, 1_000, 100 + RELOAD_STUCK_MS - 1] {
             for i in [visible(now), hidden(now)] {
-                assert_eq!(step(reloading, i), (reloading, false));
+                assert_eq!(step(posted, i), (posted, false));
             }
         }
-        assert_eq!(
-            step(reloading, visible(100 + RELOAD_STUCK_MS)),
-            (Phase::ManualOnly, false)
-        );
-        assert_eq!(notice(reloading, visible(200)), Some(Notice::Reloading));
+        assert_eq!(notice(posted, visible(200)), Some(Notice::Reloading));
         // A newer target arriving mid-reload does not restart anything.
         let allowed = cap_decision(None, t(9, 9), 200);
-        assert_eq!(replan(reloading, &allowed, visible(200)), reloading);
+        assert_eq!(replan(posted, &allowed, visible(200)), posted);
+    }
+
+    /// Review of #792: the stuck clock must not run while pending writes are
+    /// still being flushed (a throttled hidden tab can take far longer than
+    /// [`RELOAD_STUCK_MS`] there), or the page gives up and then posts the
+    /// reload anyway.
+    #[test]
+    fn the_stuck_clock_starts_when_the_reload_is_posted() {
+        let flushing = Phase::Reloading { posted_ms: None };
+        assert_eq!(step(flushing, hidden(u64::MAX / 2)), (flushing, false));
+        let posted = Phase::Reloading {
+            posted_ms: Some(1_000),
+        };
+        assert_eq!(
+            step(posted, visible(1_000 + RELOAD_STUCK_MS)),
+            (Phase::ReloadFailed, false)
+        );
+    }
+
+    /// A reload that did not happen ends in a phase that never reloads, keeps
+    /// out a newer plan (the same reload would fail the same way), and asks
+    /// the reader to refresh the tab.
+    #[test]
+    fn a_failed_reload_asks_for_a_refresh_and_stays_put() {
+        for i in [visible(5), hidden(u64::MAX / 2)] {
+            assert_eq!(step(Phase::ReloadFailed, i), (Phase::ReloadFailed, false));
+        }
+        assert_eq!(
+            notice(Phase::ReloadFailed, visible(0)),
+            Some(Notice::RefreshTab)
+        );
+        let allowed = cap_decision(None, t(9, 9), 200);
+        assert_eq!(
+            replan(Phase::ReloadFailed, &allowed, visible(200)),
+            Phase::ReloadFailed
+        );
+    }
+
+    /// The driver's one decision when a reload falls due: reload once and wait
+    /// (stuck clock not yet running), or fall back to the banner.
+    #[test]
+    fn a_due_reload_moves_to_waiting_or_to_the_banner() {
+        let allowed = cap_decision(None, t(2, 2), 0);
+        let CapDecision::Allow { param, .. } = allowed.clone() else {
+            unreachable!()
+        };
+        assert_eq!(
+            on_reload_due(allowed),
+            (Phase::Reloading { posted_ms: None }, Some(param))
+        );
+        for refused in [CapDecision::TriesExhausted, CapDecision::RateLimited] {
+            assert_eq!(on_reload_due(refused), (Phase::ManualOnly, None));
+        }
     }
 
     #[test]
@@ -2076,6 +2224,39 @@ mod tests {
         assert_eq!(state.phase, Phase::Idle);
     }
 
+    /// The hooks' return values are what keeps a pointer response out of the
+    /// room logic (and a room response in it). Pin them against the real
+    /// watched pointers of this build.
+    #[test]
+    fn deliver_claims_exactly_the_watched_pointers() {
+        use freenet_stdlib::prelude::{State, StateDelta};
+        let stranger = ContractInstanceId::new([5u8; 32]);
+        assert!(!deliver_state(&stranger, &[1, 2, 3]));
+        assert!(!deliver_update(
+            &stranger,
+            &UpdateData::State(State::from(vec![1]))
+        ));
+        assert!(!is_watched(&stranger));
+
+        let pointer = WATCHED.first().expect("shipped build watches").pointer_id;
+        assert!(is_watched(&pointer));
+        // Claimed even when there is nothing usable in it.
+        assert!(deliver_state(&pointer, &[]));
+        assert!(deliver_update(
+            &pointer,
+            &UpdateData::Delta(StateDelta::from(vec![0u8; 7]))
+        ));
+        assert!(deliver_update(
+            &pointer,
+            &UpdateData::RelatedState {
+                related_to: ContractInstanceId::new([1; 32]),
+                state: State::from(Vec::new()),
+            }
+        ));
+        // ...and garbage plans nothing.
+        assert!(!STATE.lock().unwrap().observed.is_stale());
+    }
+
     #[test]
     fn every_carrying_update_variant_yields_the_record() {
         use freenet_stdlib::prelude::{State, StateDelta};
@@ -2098,15 +2279,33 @@ mod tests {
 
     // ---- wiring ----------------------------------------------------------
 
-    /// Whether a `return` (or `continue`) follows `needle` within `window`
-    /// bytes, i.e. the hook leaves the handler when it claims the response.
-    fn returns_soon_after(src: &str, needle: &str, window: usize) -> bool {
-        let Some(at) = src.find(needle) else {
-            return false;
-        };
-        let tail = &src[at..];
-        let tail = &tail[..tail.len().min(window)];
-        tail.contains("return") || tail.contains("continue")
+    /// Whether the block opened right after `needle` (the hook's own
+    /// `if ... { }`) leaves the handler, i.e. contains a `return` or
+    /// `continue`. Scoped to that block by brace matching, so a `return`
+    /// belonging to the NEXT statement cannot satisfy it.
+    fn hook_block_exits(src: &str, needle: &str) -> bool {
+        hook_block(src, needle)
+            .is_some_and(|block| block.contains("return") || block.contains("continue"))
+    }
+
+    /// The text of the block opened right after `needle`, brace-matched.
+    fn hook_block<'a>(src: &'a str, needle: &str) -> Option<&'a str> {
+        let at = src.find(needle)?;
+        let open = at + src[at..].find('{')?;
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&src[open..open + i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Each hook must run BEFORE the room lookup and RETURN when it claims the
@@ -2123,11 +2322,7 @@ mod tests {
             get_hook < probe,
             "pointer GET hook must precede the probe hook"
         );
-        assert!(returns_soon_after(
-            &get,
-            "generation_watch::deliver_state(",
-            120
-        ));
+        assert!(hook_block_exits(&get, "generation_watch::deliver_state("));
         let nf_hook = get
             .find("generation_watch::is_watched(")
             .expect("NotFound hook");
@@ -2138,11 +2333,7 @@ mod tests {
             nf_hook < nf_probe,
             "pointer NotFound hook must precede the probe hook"
         );
-        assert!(returns_soon_after(
-            &get,
-            "generation_watch::is_watched(",
-            200
-        ));
+        assert!(hook_block_exits(&get, "generation_watch::is_watched("));
 
         let upd = src(include_str!("response_handler/update_notification.rs"));
         let upd_fn = upd.find("pub fn handle_update_notification").unwrap();
@@ -2152,11 +2343,7 @@ mod tests {
             .expect("update hook");
         let upd_lookup = body.find("get_owner_vk_for_instance_id").unwrap();
         assert!(upd_hook < upd_lookup);
-        assert!(returns_soon_after(
-            body,
-            "generation_watch::deliver_update(",
-            120
-        ));
+        assert!(hook_block_exits(body, "generation_watch::deliver_update("));
 
         let sub = src(include_str!("response_handler/subscribe_response.rs"));
         let sub_hook = sub
@@ -2164,11 +2351,7 @@ mod tests {
             .expect("subscribe hook");
         let sub_lookup = sub.find("get_owner_vk_for_instance_id").unwrap();
         assert!(sub_hook < sub_lookup);
-        assert!(returns_soon_after(
-            &sub,
-            "generation_watch::is_watched(",
-            120
-        ));
+        assert!(hook_block_exits(&sub, "generation_watch::is_watched("));
 
         let dispatch = src(include_str!("response_handler.rs"));
         assert!(
@@ -2183,8 +2366,14 @@ mod tests {
             .find("SynchronizerMessage::Connect =>")
             .expect("Connect arm");
         assert!(
-            returns_soon_after(&sync[connect..], "generation_watch::is_reloading()", 300),
+            hook_block_exits(&sync[connect..], "generation_watch::is_reloading()"),
             "Connect must not reconnect while a reload is under way"
+        );
+        assert!(
+            hook_block(&sync[connect..], "generation_watch::is_reloading()")
+                .is_some_and(|b| b.contains("note_connect_attempt()")),
+            "a Connect skipped during a reload must still clear the reconnect latch, \
+             or a reload that never happens leaves the tab disconnected"
         );
     }
 
@@ -2221,6 +2410,28 @@ mod tests {
                 "invite_member_modal.rs",
                 include_str!("../../members/invite_member_modal.rs"),
             ),
+            (
+                "member_info_modal.rs",
+                include_str!("../../members/member_info_modal.rs"),
+            ),
+            (
+                "ban_button.rs",
+                include_str!("../../members/member_info_modal/ban_button.rs"),
+            ),
+            ("members.rs", include_str!("../../members.rs")),
+            (
+                "notification_modal.rs",
+                include_str!("../../room_list/notification_modal.rs"),
+            ),
+            (
+                "receive_invitation_modal.rs",
+                include_str!("../../room_list/receive_invitation_modal.rs"),
+            ),
+            (
+                "message_input.rs",
+                include_str!("../../conversation/message_input.rs"),
+            ),
+            ("conversation.rs", include_str!("../../conversation.rs")),
         ] {
             assert!(
                 src(body).contains("fixed inset-0"),
@@ -2228,5 +2439,17 @@ mod tests {
                  dialog there would not count as busy"
             );
         }
+    }
+
+    /// A quick send between driver ticks is only seen through this call.
+    #[test]
+    fn user_actions_start_the_settle_period() {
+        let app = crate::util::strip_comments(include_str!("../../app.rs"));
+        let at = app.find("pub fn mark_needs_sync").expect("mark_needs_sync");
+        let body = &app[at..at + app[at..].find("\n}").expect("fn end")];
+        assert!(
+            body.contains("generation_watch::note_user_activity()"),
+            "mark_needs_sync must note user activity for the reload settle period"
+        );
     }
 }

@@ -28,10 +28,17 @@ fn banner_text(notice: Notice) -> (String, bool, bool) {
             true,
         ),
         Notice::WaitingForReader => (
-            "River has been updated. It will reload when you've finished what you're doing."
-                .to_string(),
+            "River has been updated and will reload as soon as it's safe to.".to_string(),
             false,
             true,
+        ),
+        // The Reload button would fail the same way the automatic one did.
+        Notice::RefreshTab => (
+            "River has been updated but could not reload itself. Refresh this tab to keep \
+             receiving messages."
+                .to_string(),
+            false,
+            false,
         ),
         Notice::Manual => (
             "River has been updated. Reload to keep receiving messages.".to_string(),
@@ -110,6 +117,12 @@ mod tests {
         assert_eq!(banner_text(Notice::Reloading).1, false);
         assert_eq!(banner_text(Notice::Reloading).2, false);
         assert!(banner_text(Notice::Manual).2);
+        let (refresh, not_now, reload) = banner_text(Notice::RefreshTab);
+        assert!(refresh.contains("Refresh this tab"), "{refresh}");
+        assert!(
+            !not_now && !reload,
+            "a failed reload must not offer the same reload again"
+        );
     }
 
     #[test]

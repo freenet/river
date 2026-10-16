@@ -82,6 +82,9 @@ pub static NEEDS_SYNC: GlobalSignal<std::collections::HashSet<VerifyingKey>> =
 /// when polling tasks. setTimeout(0) breaks out of the WASM call stack entirely,
 /// ensuring the write happens in a completely clean execution context.
 pub fn mark_needs_sync(room_key: ed25519_dalek::VerifyingKey) {
+    // A user action is leaving: hold off any generation reload until it has
+    // (freenet/river#580).
+    freenet_api::generation_watch::note_user_activity();
     crate::util::defer(move || {
         NEEDS_SYNC.write().insert(room_key);
     });

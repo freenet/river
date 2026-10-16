@@ -374,10 +374,12 @@ else
 fi
 "$author_check" "$guard_dir/missing.tar.xz" "$guard_dir/records.toml" >/dev/null 2>&1
 status=$?
-if [[ "$status" -ne 0 ]]; then
-    ok "an archive that cannot be read is not accepted"
+# 2 = could not check, distinct from 1 = refused, so a broken check is never
+# mistaken for a verdict on the archive.
+if [[ "$status" -eq 2 ]]; then
+    ok "an archive that cannot be read is reported as uncheckable (exit 2)"
 else
-    fail "an archive that cannot be read is not accepted" "exited 0"
+    fail "an archive that cannot be read is reported as uncheckable (exit 2)" "exited $status"
 fi
 rm -rf "$guard_dir"
 
@@ -390,6 +392,13 @@ if [[ -n "$guard_line" && -n "$bump_line" && "$guard_line" -lt "$bump_line" ]]; 
 else
     fail "sign-webapp checks the pointer author key before bumping the counter" \
         "guard at line '${guard_line:-none}', bump at line '${bump_line:-none}' of the task"
+fi
+# And the refusal must stop the task: without `|| exit 1` it is only advice.
+if grep -v '^[[:space:]]*#' <<<"$sign_block" |
+    grep -q 'check-webapp-pointer-author\.sh.*|| exit 1'; then
+    ok "a refused archive stops sign-webapp"
+else
+    fail "a refused archive stops sign-webapp" "the guard call does not end in '|| exit 1'"
 fi
 
 printf '\n%d checks, %d failures\n' "$checks" "$failures"
