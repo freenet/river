@@ -78,6 +78,21 @@ strip = true        # Strip symbols from binary
 [profile.release.package."*"]
 opt-level = 'z'     # Optimize all dependencies for size as well
 
+# Debug and test builds compile the signature and hash crates optimized.
+# Unoptimized ed25519/curve25519 made the randomized fork-merge test
+# (common/tests/fork_merge_closure_test.rs) take ~300 s in CI's debug
+# `cargo test`; with these it takes ~6 s (measured 2026-10-16), and every
+# other signature-heavy test speeds up with it. Release and WASM builds use
+# their own profiles above, so no committed WASM changes (freenet/river#703).
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.blake3]
+opt-level = 3
+
 # Profile used by `dx build --release` for the web/WASM UI target.
 #
 # The Dioxus CLI (dx) builds the web app under a profile named `wasm-release`.
