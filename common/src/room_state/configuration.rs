@@ -43,21 +43,30 @@ impl ComposableState for AuthorizedConfigurationV1 {
             .map_err(|e| format!("Invalid signature: {}", e))
     }
 
+    /// A held configuration that fails [`Self::check_values`] (only a
+    /// full-state PUT can carry one: `verify` checks only the signature)
+    /// does not compete. It summarizes as the lowest rank, so any valid
+    /// configuration is offered to the peer holding it, and it is never
+    /// offered itself (freenet/river#703 review).
     fn summarize(
         &self,
         _parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
+        parameters: &Self::Parameters,
     ) -> Self::Summary {
-        self.rank()
+        if self.check_values(parameters).is_ok() {
+            self.rank()
+        } else {
+            (0, SigDigest([0; 16]))
+        }
     }
 
     fn delta(
         &self,
         _parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
+        parameters: &Self::Parameters,
         old_rank: &Self::Summary,
     ) -> Option<Self::Delta> {
-        if outranks(self.rank(), *old_rank) {
+        if self.check_values(parameters).is_ok() && outranks(self.rank(), *old_rank) {
             Some(self.clone())
         } else {
             None
@@ -94,8 +103,12 @@ impl ComposableState for AuthorizedConfigurationV1 {
             // configuration replaces it, whatever their ranks. Otherwise a
             // placeholder could outrank the room's real configuration on the
             // signature-digest tie-break and survive a merge with it.
-            let held_is_the_owners = self.verify_signature(&parameters.owner).is_ok();
-            if held_is_the_owners && !outranks(delta.rank(), self.rank()) {
+            //
+            // Likewise a held configuration that fails the value checks does
+            // not compete (see `summarize`).
+            let held_competes = self.check_values(parameters).is_ok()
+                && self.verify_signature(&parameters.owner).is_ok();
+            if held_competes && !outranks(delta.rank(), self.rank()) {
                 return Ok(());
             }
             delta
@@ -440,7 +453,10 @@ mod tests {
     fn test_summarize() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let configuration = Configuration::default();
+        let configuration = Configuration {
+            owner_member_id: owner_verifying_key.into(),
+            ..Configuration::default()
+        };
         let authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
@@ -465,7 +481,10 @@ mod tests {
     fn test_delta_new_version() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let configuration = Configuration::default();
+        let configuration = Configuration {
+            owner_member_id: owner_verifying_key.into(),
+            ..Configuration::default()
+        };
         let authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 

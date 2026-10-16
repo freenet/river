@@ -610,3 +610,24 @@ fn different_blobs_for_one_member_and_version_converge() {
     let merged = assert_merges_agree(&r, &a, &b);
     assert_eq!(merged.secrets.encrypted_secrets.len(), 1);
 }
+
+/// A held owner-signed configuration that fails the value checks (only a
+/// full-state PUT carries one; `verify` checks only the signature) does not
+/// compete: both merge directions end on the valid configuration
+/// (freenet/river#703 review B3).
+#[test]
+fn an_invalid_held_configuration_yields_to_a_valid_one_in_both_directions() {
+    let r = room();
+    let base = state(&r, public_config(&r));
+    let mut invalid = base.clone();
+    let mut c = public_config(&r);
+    c.configuration_version = 5;
+    c.max_recent_messages = 0;
+    invalid.configuration = AuthorizedConfigurationV1::new(c, &r.owner_sk);
+    let mut valid = base.clone();
+    let mut c = public_config(&r);
+    c.configuration_version = 3;
+    valid.configuration = AuthorizedConfigurationV1::new(c, &r.owner_sk);
+    let merged = assert_merges_agree(&r, &invalid, &valid);
+    assert_eq!(merged.configuration, valid.configuration);
+}
