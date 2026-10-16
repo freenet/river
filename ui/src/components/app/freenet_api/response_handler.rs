@@ -1790,10 +1790,17 @@ fn hydrate_loaded_rooms_with_authority(
         });
     });
 
+    // The DMs this copy carries, for the read-cutoff plan once it is merged
+    // (freenet/river#801; see `dm_cutoff_plan`). Captured here because the
+    // merge consumes `loaded_rooms`.
+    let incoming_dms = crate::components::direct_messages::SnapshotDmSeen::of(&loaded_rooms);
+
     // Merge the loaded rooms with the current rooms
     let loaded_keys = room_keys.clone();
     crate::util::defer(move || {
         ROOMS.with_mut(|current_rooms| {
+            let identity_watch =
+                crate::components::direct_messages::IdentityWatch::before(current_rooms);
             // Ranked by SOURCE, not arrival order (freenet/river#527): the
             // legacy fan-out hydrates from every delegate generation at once,
             // so an identity conflict is decided by which generation the copy
@@ -1819,6 +1826,14 @@ fn hydrate_loaded_rooms_with_authority(
             } else {
                 info!("Successfully merged rooms from delegate");
             }
+            crate::components::direct_messages::commit_dm_cutoff_plan(
+                crate::components::direct_messages::dm_cutoff_plan(
+                    &incoming_dms,
+                    &identity_watch,
+                    authority,
+                    current_rooms,
+                ),
+            );
             // freenet/river#590: tell the SAVE path about any room the ranked
             // merge just brought back. It cannot infer it — `MergeRanks` is never
             // persisted and `RoomSlot::Tombstone` carries no rank, so

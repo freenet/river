@@ -658,6 +658,229 @@ pub(crate) fn compute_dm_last_seen(
     updates
 }
 
+/// The inbound DMs a copy of the user's rooms carried into a merge, captured
+/// BEFORE the merge consumes it (freenet/river#801). Resolved afterwards by
+/// [`dm_cutoff_plan`].
+pub(crate) struct SnapshotDmSeen {
+    /// Per room: the identity the copy held it under, and its inbound DMs as
+    /// `(purge token, sender, timestamp)`.
+    rooms: HashMap<VerifyingKey, (VerifyingKey, Vec<(PurgeToken, MemberId, u64)>)>,
+}
+
+impl SnapshotDmSeen {
+    pub(crate) fn of(snapshot: &crate::room_data::Rooms) -> Self {
+        let rooms = snapshot
+            .map
+            .iter()
+            .filter_map(|(room, data)| {
+                // Without an identity, inbound cannot be told from outbound.
+                let identity = data.self_verifying_key()?;
+                let self_id = MemberId::from(&identity);
+                let inbound = data
+                    .room_state
+                    .direct_messages
+                    .messages
+                    .iter()
+                    .filter(|m| m.message.recipient == self_id)
+                    .map(|m| (m.purge_token(), m.message.sender, m.message.timestamp))
+                    .collect();
+                Some((*room, (identity, inbound)))
+            })
+            .collect();
+        Self { rooms }
+    }
+
+    /// The cutoffs implied by the copy's inbound DMs that actually LANDED in
+    /// `merged`: the room is held under the SAME identity the copy had (a
+    /// losing identity's DMs describe another identity's threads), and the DM
+    /// itself is present. So a room whose merge failed, or a DM the merge
+    /// dropped (ban sweep, caps), contributes nothing it did not deliver.
+    fn landed_in(
+        &self,
+        merged: &crate::room_data::Rooms,
+    ) -> HashMap<(VerifyingKey, MemberId), u64> {
+        let mut updates: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
+        for (room, (identity, inbound)) in &self.rooms {
+            let Some(held) = merged.map.get(room) else {
+                continue;
+            };
+            if held.self_verifying_key() != Some(*identity) {
+                continue;
+            }
+            let present: std::collections::HashSet<PurgeToken> = held
+                .room_state
+                .direct_messages
+                .messages
+                .iter()
+                .map(|m| m.purge_token())
+                .collect();
+            for (token, sender, ts) in inbound {
+                if present.contains(token) {
+                    let entry = updates.entry((*room, *sender)).or_insert(0);
+                    *entry = (*entry).max(*ts);
+                }
+            }
+        }
+        updates
+    }
+}
+
+/// The identity each room is held under, taken just before a merge, so rooms
+/// whose identity the merge REPLACED (a higher-ranked copy adopted another
+/// `self_sk`) can be told apart afterwards.
+pub(crate) struct IdentityWatch(HashMap<VerifyingKey, VerifyingKey>);
+
+impl IdentityWatch {
+    pub(crate) fn before(rooms: &crate::room_data::Rooms) -> Self {
+        Self(
+            rooms
+                .map
+                .iter()
+                .filter_map(|(room, data)| Some((*room, data.self_verifying_key()?)))
+                .collect(),
+        )
+    }
+
+    /// Rooms held before AND after under two different known identities.
+    fn replaced_in(&self, after: &crate::room_data::Rooms) -> Vec<VerifyingKey> {
+        self.0
+            .iter()
+            .filter(|(room, was)| {
+                after
+                    .map
+                    .get(room)
+                    .and_then(|r| r.self_verifying_key())
+                    .is_some_and(|now| now != **was)
+            })
+            .map(|(room, _)| *room)
+            .collect()
+    }
+}
+
+/// What one delegate-load merge does to [`DM_LAST_SEEN`] (freenet/river#801).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct DmCutoffPlan {
+    /// Max-merged into the existing cutoffs.
+    advance: HashMap<(VerifyingKey, MemberId), u64>,
+    /// Rooms whose cutoffs are REPLACED wholesale by `reseed`'s entries.
+    replaced: Vec<VerifyingKey>,
+    reseed: HashMap<(VerifyingKey, MemberId), u64>,
+}
+
+/// Decide a merge's effect on the DM read cutoffs from the incoming copy
+/// (captured before the merge), the identities held before it, and the merged
+/// map.
+///
+/// **Advance (OlderSnapshot only).** [`seed_dm_last_seen_if_needed`] treats
+/// every inbound DM in the FIRST non-empty `ROOMS` as already seen, once per
+/// session. During a migration that first observation is usually the OLDEST
+/// legacy generation's snapshot (probes go out oldest-first), so DMs only a
+/// newer generation held all showed as unread. A copy merged as
+/// `OlderSnapshot` (a legacy generation, the crate walk's import, the current
+/// delegate's pre-per-room `rooms_data` blob) was written by an EARLIER
+/// session, so its DMs that landed count as seen: the seed's own
+/// approximation, applied to that copy too. An `Authoritative` copy never
+/// advances: a reload of the current delegate's own copy may hold DMs this
+/// session received and saved unread.
+///
+/// **Re-seed (identity replaced; NOT gated on authority).** `DM_LAST_SEEN` is
+/// keyed by `(room, peer)` only and every other write max-merges, so cutoffs
+/// seeded or advanced under the replaced identity would otherwise hide the
+/// adopted identity's unread DMs. ALL of the replaced room's cutoffs are reset
+/// to the adopted copy's landed DMs (none, if nothing landed) — never DMs the
+/// room already held from the network. That is, approximately, the seed the
+/// adopting copy would have produced had it arrived first (it omits DMs the
+/// merge dropped). Adoption needs a strictly higher-ranked copy arriving after
+/// a lower one. Legacy probes fire when the current delegate holds nothing, or
+/// (interrupted-migration recovery) after its rooms have already merged at
+/// the current delegate's rank, above every legacy generation; and the walk
+/// imports only once the current load has merged. So in practice the adopting
+/// copy is a newer legacy generation (`OlderSnapshot`). An `Authoritative` adoption is
+/// handled the same way for completeness, which is the one case an
+/// `Authoritative` copy can mark DMs seen: the cutoffs it replaces belonged to
+/// another identity and carry no information about this one.
+///
+/// Ordering: the plan is committed through `crate::util::defer`
+/// (`setTimeout(0)`) from inside the merge. Same-delay timers run in the
+/// order queued, so plans apply in merge order. (Browsers clamp timers nested
+/// more than 5 deep to 4 ms, which could reorder a deeply nested write; none of
+/// these chains nest that deep.) If the one-shot first-hydration seed reads `ROOMS` after an
+/// adoption, it max-merges the adopted room's DMs (network-held ones too) as
+/// seen, exactly as it does on main. If it read before, its write is queued
+/// first and the re-seed then replaces it.
+///
+/// A cutoff is a timestamp maximum per `(room, peer)`, so, exactly like the
+/// first-hydration seed, it also covers any DM from that peer stamped at or
+/// below it: a DM delivered live this session with an older timestamp than a
+/// snapshot's (delay, clock skew), and later DMs from a peer whose snapshot DM
+/// is stamped in the future, until real time passes that stamp.
+///
+/// Residual: a tab still open on the previous build keeps writing to the
+/// newest predecessor. Anything that re-reads it this session (the crate
+/// walk's post-resolve top-up, or a legacy re-probe after a reconnect via
+/// `arm_legacy_migration_recovery`) marks a DM that tab saved unread as seen,
+/// even one this session also received live. The first-hydration seed has the
+/// same blind spot.
+pub(crate) fn dm_cutoff_plan(
+    incoming: &SnapshotDmSeen,
+    watch: &IdentityWatch,
+    authority: crate::room_data::MergeAuthority,
+    merged: &crate::room_data::Rooms,
+) -> DmCutoffPlan {
+    let landed = incoming.landed_in(merged);
+    let replaced = watch.replaced_in(merged);
+    let (reseed, rest): (HashMap<_, _>, HashMap<_, _>) = landed
+        .into_iter()
+        .partition(|((room, _), _)| replaced.contains(room));
+    let advance = if authority == crate::room_data::MergeAuthority::OlderSnapshot {
+        rest
+    } else {
+        HashMap::new()
+    };
+    DmCutoffPlan {
+        advance,
+        replaced,
+        reseed,
+    }
+}
+
+/// Apply a [`DmCutoffPlan`] to the cutoffs. Pure.
+pub(crate) fn apply_dm_cutoff_plan(
+    seen: &mut HashMap<(VerifyingKey, MemberId), u64>,
+    plan: DmCutoffPlan,
+) {
+    apply_dm_last_seen_advance(seen, plan.advance);
+    for room in plan.replaced {
+        apply_dm_last_seen_reseed(seen, room, &plan.reseed);
+    }
+}
+
+/// Apply a [`DmCutoffPlan`] to [`DM_LAST_SEEN`]. Everything is computed by the
+/// caller from data it already holds; only the write is deferred (the caller
+/// is inside `ROOMS.with_mut`).
+pub(crate) fn commit_dm_cutoff_plan(plan: DmCutoffPlan) {
+    if plan == DmCutoffPlan::default() {
+        return;
+    }
+    crate::util::defer(move || {
+        DM_LAST_SEEN.with_mut(|seen| apply_dm_cutoff_plan(seen, plan));
+    });
+}
+
+/// Raise each `(room, peer)` cutoff in `seen` to the one in `updates` where
+/// that is later. Never lowers one.
+pub(crate) fn apply_dm_last_seen_advance(
+    seen: &mut HashMap<(VerifyingKey, MemberId), u64>,
+    updates: HashMap<(VerifyingKey, MemberId), u64>,
+) {
+    for (key, ts) in updates {
+        let entry = seen.entry(key).or_insert(0);
+        if ts > *entry {
+            *entry = ts;
+        }
+    }
+}
+
 /// Re-seed [`DM_LAST_SEEN`] for a single room after an identity swap
 /// (freenet/river#414 round-10 P2).
 ///
@@ -686,8 +909,9 @@ pub fn reseed_dm_last_seen_for_room(owner_vk: VerifyingKey) {
 
 /// Pure re-seed step for [`reseed_dm_last_seen_for_room`]: drop every existing
 /// last-seen cutoff for `owner_vk` (the replaced identity's) and set the new
-/// identity's from `updates` (already computed by `compute_dm_last_seen`, so
-/// keyed on the swapped-in `self_sk`), leaving other rooms untouched. Pure so
+/// identity's from `updates` (keyed on the swapped-in identity: computed by
+/// `compute_dm_last_seen`, or by `dm_cutoff_plan`), leaving other rooms
+/// untouched. Pure so
 /// the re-seed is unit-testable without the `ROOMS`/`DM_LAST_SEEN` signals.
 pub(crate) fn apply_dm_last_seen_reseed(
     seen: &mut HashMap<(VerifyingKey, MemberId), u64>,
@@ -743,28 +967,17 @@ pub fn seed_dm_last_seen_if_needed() {
     let updates = compute_dm_last_seen(&rooms);
     drop(rooms);
 
-    // Latch the seeded flag synchronously so any parallel re-run of this
-    // effect (before the deferred write hits) immediately early-exits.
-    // Doing the latch BEFORE the deferred write also avoids the
-    // one-render-frame "every historical DM looks unread" window the
-    // skeptical reviewer (#258 M3) flagged — consumers reading
-    // DM_LAST_SEEN_SEEDED see "seeded, write in flight" rather than
-    // "not seeded".
+    // The flag is latched in the SAME deferred closure as the write, so the
+    // two land together. That leaves a one-macrotask window: a re-run of this
+    // effect before the closure runs seeds again from the later `ROOMS`, so
+    // anything that arrived in between also counts as seen. Same as before
+    // #801; the writes max-merge, so the second seed never lowers the first.
     //
-    // Safety: a same-tick re-entry doesn't lose the seed because we
-    // already computed `updates` from the just-read rooms snapshot and
-    // captured it into the defer closure. The flag latch and the write
-    // are conceptually one operation.
+    // `updates` is computed now, from the rooms snapshot just read, and
+    // captured into the closure, so a later `ROOMS` change cannot alter it.
     crate::util::defer(move || {
         *DM_LAST_SEEN_SEEDED.write() = true;
-        DM_LAST_SEEN.with_mut(|seen| {
-            for (key, ts) in updates {
-                let entry = seen.entry(key).or_insert(0);
-                if ts > *entry {
-                    *entry = ts;
-                }
-            }
-        });
+        DM_LAST_SEEN.with_mut(|seen| apply_dm_last_seen_advance(seen, updates));
     });
 }
 
@@ -1230,6 +1443,265 @@ mod tests {
         let updates = compute_dm_last_seen(&rooms);
         let alice_id: MemberId = (&alice.verifying_key()).into();
         assert_eq!(updates.get(&(owner_vk, alice_id)), Some(&1_000));
+    }
+
+    use crate::room_data::MergeAuthority::{Authoritative, OlderSnapshot};
+
+    /// The plan for merging `incoming` into `before`, producing `merged`.
+    fn plan(
+        incoming: &Rooms,
+        before: &Rooms,
+        authority: crate::room_data::MergeAuthority,
+        merged: &Rooms,
+    ) -> DmCutoffPlan {
+        dm_cutoff_plan(
+            &SnapshotDmSeen::of(incoming),
+            &IdentityWatch::before(before),
+            authority,
+            merged,
+        )
+    }
+
+    fn applied(
+        mut seen: HashMap<(VerifyingKey, MemberId), u64>,
+        plan: DmCutoffPlan,
+    ) -> HashMap<(VerifyingKey, MemberId), u64> {
+        apply_dm_cutoff_plan(&mut seen, plan);
+        seen
+    }
+
+    /// freenet/river#801: the session seeded its cutoffs from a STALE legacy
+    /// snapshot (Alice's DM at 100). A newer generation's snapshot, merged
+    /// later, holds her DMs up to 300 — all from earlier sessions. They must
+    /// count as seen, and the merge must never pull a cutoff back.
+    #[test]
+    fn a_later_snapshot_advances_dm_cutoffs_and_never_lowers_them() {
+        let owner = fixed_sk(21);
+        let me = fixed_sk(22);
+        let alice = fixed_sk(23);
+        let bob = fixed_sk(24);
+        let owner_vk = owner.verifying_key();
+        let alice_id: MemberId = (&alice.verifying_key()).into();
+        let bob_id: MemberId = (&bob.verifying_key()).into();
+
+        let mut stale = make_rooms(&owner, &me, &[&alice, &bob]);
+        push_dm(&mut stale, &owner_vk, &alice, &me.verifying_key(), 100);
+        push_dm(&mut stale, &owner_vk, &bob, &me.verifying_key(), 500);
+        let seed = compute_dm_last_seen(&stale); // the first-hydration seed
+
+        let mut newer = make_rooms(&owner, &me, &[&alice, &bob]);
+        push_dm(&mut newer, &owner_vk, &alice, &me.verifying_key(), 100);
+        push_dm(&mut newer, &owner_vk, &alice, &me.verifying_key(), 300);
+        push_dm(&mut newer, &owner_vk, &bob, &me.verifying_key(), 200);
+        // The merged map holds both copies' DMs.
+        let mut merged = newer.clone();
+        push_dm(&mut merged, &owner_vk, &bob, &me.verifying_key(), 500);
+
+        let seen = applied(seed, plan(&newer, &stale, OlderSnapshot, &merged));
+        assert_eq!(seen.get(&(owner_vk, alice_id)), Some(&300));
+        assert_eq!(
+            seen.get(&(owner_vk, bob_id)),
+            Some(&500),
+            "an older snapshot must never lower a cutoff"
+        );
+    }
+
+    /// An `Authoritative` merge (the current delegate's own copy on a reload)
+    /// may hold DMs received unread THIS session: it advances nothing.
+    #[test]
+    fn an_authoritative_merge_never_advances_dm_cutoffs() {
+        let owner = fixed_sk(51);
+        let me = fixed_sk(52);
+        let alice = fixed_sk(53);
+        let owner_vk = owner.verifying_key();
+        let mut rooms = make_rooms(&owner, &me, &[&alice]);
+        push_dm(&mut rooms, &owner_vk, &alice, &me.verifying_key(), 900);
+        assert_eq!(
+            plan(&rooms, &rooms, Authoritative, &rooms),
+            DmCutoffPlan::default()
+        );
+    }
+
+    /// A snapshot whose identity lost the merge described ANOTHER identity's
+    /// inbound DMs, so it advances nothing; nor does a room the merge did not
+    /// keep.
+    #[test]
+    fn a_snapshot_advances_only_rooms_held_under_its_identity() {
+        let owner = fixed_sk(31);
+        let old_me = fixed_sk(32);
+        let me = fixed_sk(33);
+        let alice = fixed_sk(34);
+        let owner_vk = owner.verifying_key();
+
+        let mut snapshot = make_rooms(&owner, &old_me, &[&alice]);
+        push_dm(
+            &mut snapshot,
+            &owner_vk,
+            &alice,
+            &old_me.verifying_key(),
+            900,
+        );
+        // The held room carries the very same DM, so only the identity check
+        // can keep it from counting.
+        let mut held = make_rooms(&owner, &me, &[&alice]);
+        held.map
+            .get_mut(&owner_vk)
+            .unwrap()
+            .room_state
+            .direct_messages = snapshot.map[&owner_vk].room_state.direct_messages.clone();
+        assert_eq!(
+            plan(&snapshot, &held, OlderSnapshot, &held),
+            DmCutoffPlan::default(),
+            "a different identity's DMs must not touch this identity's cutoffs"
+        );
+        assert_eq!(
+            plan(&snapshot, &empty_rooms(), OlderSnapshot, &empty_rooms()),
+            DmCutoffPlan::default(),
+            "a room the merge did not keep advances nothing"
+        );
+    }
+
+    /// A DM the merge did not deliver (the room's merge failed, or the merge
+    /// dropped it) is not "already there at load", so it advances nothing.
+    #[test]
+    fn a_snapshot_dm_that_did_not_land_advances_nothing() {
+        let owner = fixed_sk(61);
+        let me = fixed_sk(62);
+        let alice = fixed_sk(63);
+        let owner_vk = owner.verifying_key();
+        let alice_id: MemberId = (&alice.verifying_key()).into();
+
+        let mut snapshot = make_rooms(&owner, &me, &[&alice]);
+        push_dm(&mut snapshot, &owner_vk, &alice, &me.verifying_key(), 100);
+        push_dm(&mut snapshot, &owner_vk, &alice, &me.verifying_key(), 900);
+        // The merged room kept only the earlier DM (e.g. its merge failed and
+        // the local copy, which had only that one, stayed).
+        let mut merged = make_rooms(&owner, &me, &[&alice]);
+        push_dm(&mut merged, &owner_vk, &alice, &me.verifying_key(), 100);
+        let seen = applied(
+            HashMap::new(),
+            plan(&snapshot, &merged, OlderSnapshot, &merged),
+        );
+        assert_eq!(seen.get(&(owner_vk, alice_id)), Some(&100));
+    }
+
+    /// When a merge REPLACES a room's identity (A -> B), the
+    /// cutoffs seeded or advanced under A must not survive to hide B's unread
+    /// DMs. They are replaced by the adopted copy's landed DMs only — not by
+    /// DMs to B the room already held from the network — whichever authority
+    /// the adopting copy has.
+    #[test]
+    fn a_replaced_identity_reseeds_from_the_adopted_copy_only() {
+        let owner = fixed_sk(81);
+        let a = fixed_sk(82);
+        let b = fixed_sk(83);
+        let alice = fixed_sk(84);
+        let carol = fixed_sk(85);
+        let owner_vk = owner.verifying_key();
+        let alice_id: MemberId = (&alice.verifying_key()).into();
+        let carol_id: MemberId = (&carol.verifying_key()).into();
+
+        let before = make_rooms(&owner, &a, &[&alice, &carol]);
+        let seen_under_a: HashMap<_, _> =
+            [((owner_vk, alice_id), 900), ((owner_vk, carol_id), 50)].into();
+        // The adopted copy (identity B) carries Alice -> B at 200.
+        let mut incoming = make_rooms(&owner, &b, &[&alice, &carol]);
+        push_dm(&mut incoming, &owner_vk, &alice, &b.verifying_key(), 200);
+        // The merged room also holds Carol -> B at 700, which only the network
+        // delivered: it must stay unread.
+        let mut merged = incoming.clone();
+        push_dm(&mut merged, &owner_vk, &carol, &b.verifying_key(), 700);
+
+        for authority in [Authoritative, OlderSnapshot] {
+            let seen = applied(
+                seen_under_a.clone(),
+                plan(&incoming, &before, authority, &merged),
+            );
+            assert_eq!(seen.get(&(owner_vk, alice_id)), Some(&200), "{authority:?}");
+            assert_eq!(
+                seen.get(&(owner_vk, carol_id)),
+                None,
+                "{authority:?}: A's cutoff must not survive, and the \
+                 network-only DM must not be marked seen"
+            );
+        }
+    }
+
+    /// A room that gains an identity it lacked, or keeps the same one, is not
+    /// "replaced", so its cutoffs are only ever max-merged.
+    #[test]
+    fn only_a_changed_known_identity_counts_as_replaced() {
+        let owner = fixed_sk(71);
+        let a = fixed_sk(73);
+        let rooms = make_rooms(&owner, &a, &[]);
+        assert!(IdentityWatch::before(&rooms).replaced_in(&rooms).is_empty());
+        let mut unknown = rooms.clone();
+        for r in unknown.map.values_mut() {
+            r.self_sk = None;
+            r.self_vk = None;
+        }
+        assert!(IdentityWatch::before(&unknown)
+            .replaced_in(&rooms)
+            .is_empty());
+        assert!(IdentityWatch::before(&empty_rooms())
+            .replaced_in(&rooms)
+            .is_empty());
+    }
+
+    /// Both delegate-load merge sites must capture the incoming copy BEFORE
+    /// the merge, watch identities before it, and commit the plan AFTER it
+    /// with their own authority. A tripwire, not behaviour coverage: a source
+    /// pin scoped to each site's function body, because the wiring lives in
+    /// signal-bound code with no native harness. The decisions themselves are
+    /// behaviour-tested above.
+    #[test]
+    fn dm_cutoff_plan_is_applied_at_both_merge_sites() {
+        // The function's own body: from its signature to the first closing
+        // brace at the signature's indentation.
+        fn body<'a>(src: &'a str, signature: &str) -> &'a str {
+            let start = src.find(signature).expect(signature);
+            let line_start = src[..start].rfind('\n').map_or(0, |i| i + 1);
+            let indent = &src[line_start..start];
+            let indent = &indent[..indent.len() - indent.trim_start().len()];
+            let close = format!("\n{indent}}}\n");
+            let rest = &src[start..];
+            &rest[..rest.find(&close).expect("function end")]
+        }
+        fn squash(s: &str) -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        // The production seam, not one of the test mocks implementing the
+        // same trait further down the file.
+        fn live_import_seam(src: &str) -> &str {
+            &src[src
+                .find("impl RiverImportSeam for LiveImportSeam {")
+                .expect("the live seam")..]
+        }
+        for (src, signature, capture, watch, merge, commit) in [
+            (
+                include_str!("app/freenet_api/response_handler.rs"),
+                "fn hydrate_loaded_rooms_with_authority(",
+                "SnapshotDmSeen::of(&loaded_rooms)",
+                "IdentityWatch::before(current_rooms)",
+                "current_rooms.merge_from_source(",
+                "dm_cutoff_plan(&incoming_dms,&identity_watch,authority,current_rooms",
+            ),
+            (
+                live_import_seam(include_str!("app/freenet_api/delegate_migration.rs")),
+                "async fn merge_rooms(",
+                "SnapshotDmSeen::of(&rooms)",
+                "IdentityWatch::before(current)",
+                "apply_recovered_rooms(current,rooms,source_rank,ranks)",
+                "dm_cutoff_plan(&incoming_dms,&identity_watch,crate::room_data::MergeAuthority::OlderSnapshot,current",
+            ),
+        ] {
+            let b = squash(body(src, signature));
+            let at = |needle: &str| b.find(needle).unwrap_or_else(|| panic!("{signature}: {needle}"));
+            assert!(at(capture) < at(merge), "{signature}: capture before merge");
+            assert!(at(watch) < at(merge), "{signature}: watch before merge");
+            assert!(at(merge) < at(commit), "{signature}: plan after merge");
+            assert!(b.contains("commit_dm_cutoff_plan("), "{signature}: plan committed");
+        }
     }
 
     fn sample_outbound_entry(

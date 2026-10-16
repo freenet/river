@@ -78,7 +78,30 @@ seeds `DM_LAST_SEEN` from the max inbound DM timestamp per
 `(room, peer)` exactly once on first hydration; a one-shot
 `DM_LAST_SEEN_SEEDED` flag prevents re-seeding — otherwise every
 arriving inbound DM would be instantly marked seen and never surface as
-unread.
+unread. The seed is one-shot (a re-run inside the one-macrotask window before
+its deferred latch lands seeds again, as it always has); in addition, both
+delegate-load merge sites (the sweep's hydrate and the crate walk's import)
+apply `dm_cutoff_plan` (freenet/river#801), because during a migration the
+first hydration is usually the OLDEST generation's stale copy:
+
+- A frozen snapshot (`MergeAuthority::OlderSnapshot`: a legacy generation, the
+  walk's import, the `rooms_data` blob) advances the cutoffs, max-merged, to
+  cover its inbound DMs that landed in the merged room under its identity.
+  The current delegate's own copy (`Authoritative`) never advances: on a
+  reload it may hold DMs received unread this session. Its one exception is
+  the next bullet.
+- A merge that REPLACES a room's identity resets ALL of that room's cutoffs
+  (including ones read this session) to the adopted copy's landed DMs,
+  whatever the adopting copy's authority, since cutoffs are keyed by
+  `(room, peer)` and every other write max-merges. It does not add DMs the
+  room held only from the network, though the one-shot seed does if it reads
+  `ROOMS` after the adoption. The plan is committed through `defer`; it
+  relies on same-delay timers running in queue order.
+
+Cutoffs are per-peer timestamp maxima, so either rule also covers a DM from
+that peer stamped at or below the cutoff, as the seed does. Residual: a tab
+still open on the previous build keeps writing to the newest predecessor, so a
+DM it saved unread there is marked seen when this session re-reads it.
 
 **Read rule and scrolling.** The follow-at-end policy and its rationale live
 in [history-scrolling.md](history-scrolling.md).

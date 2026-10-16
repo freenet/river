@@ -14,6 +14,12 @@ All notable changes to riverctl will be documented in this file.
 - A room update that repeats records the room already holds, or is computed
   against an out-of-date view of it, now applies instead of being rejected.
 
+### Fixed
+- `debug bans` judges each ban record by its own signature. A record that
+  copies another ban's signature was reported with that ban's status
+  (freenet/river#797 follow-up). Display only: the contract already drops
+  such records.
+
 ## [0.2.22] - 2026-10-16
 
 ### Changed
