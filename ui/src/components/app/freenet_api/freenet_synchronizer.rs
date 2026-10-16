@@ -413,10 +413,11 @@ impl FreenetSynchronizer {
                         }
                     }
                     SynchronizerMessage::ConnectionLost => {
-                        // Keep the update banner honest about the connection
-                        // (freenet/river#580). Deferred: runs after this arm
-                        // has cleared WEB_API.
-                        super::generation_watch::on_connection_changed();
+                        // No generation reload until the reconnect has caught
+                        // up, and keep the update banner honest about it
+                        // (freenet/river#580). Its banner recompute is deferred
+                        // past this arm.
+                        super::generation_watch::on_disconnected();
                         // Coalesce: if a reconnect is already scheduled this is a
                         // duplicate loss — the socket we're about to drop will
                         // itself fire `onclose` → another ConnectionLost, and the
@@ -751,7 +752,7 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Failed to initialize connection: {}", e);
-                                super::generation_watch::on_connection_changed();
+                                super::generation_watch::on_disconnected();
                                 let armed = reconnect.on_connect_failed();
                                 warn!(
                                     "Connection failed (attempt {}), reconnecting in {}ms",

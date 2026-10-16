@@ -41,9 +41,16 @@ fn banner_text(notice: Notice) -> (String, bool, bool) {
         // The Reload button would fail the same way the automatic one did.
         // After a POSTED reload the page also no longer reconnects (see
         // `Phase::ReloadFailed`), hence the warning about undelivered messages.
-        Notice::RefreshTab => (
+        Notice::RefreshTab { posted: true } => (
             "River has been updated but could not reload itself. Refresh this tab to keep \
              receiving messages; anything sent before you do may not be delivered."
+                .to_string(),
+            false,
+            false,
+        ),
+        Notice::RefreshTab { posted: false } => (
+            "River has been updated but could not reload itself. Refresh this tab to keep \
+             receiving messages."
                 .to_string(),
             false,
             false,
@@ -134,12 +141,21 @@ mod tests {
             !not_now && !reload,
             "offline, a Reload button would do nothing"
         );
-        let (refresh, not_now, reload) = banner_text(Notice::RefreshTab);
-        assert!(refresh.contains("Refresh this tab"), "{refresh}");
-        assert!(
-            !not_now && !reload,
-            "a failed reload must not offer the same reload again"
-        );
+        for posted in [true, false] {
+            let (refresh, not_now, reload) = banner_text(Notice::RefreshTab { posted });
+            assert!(refresh.contains("Refresh this tab"), "{refresh}");
+            assert!(
+                !not_now && !reload,
+                "a failed reload must not offer the same reload again"
+            );
+            // Only a posted reload stops the page reconnecting, so only then
+            // may messages go undelivered.
+            assert_eq!(
+                refresh.contains("may not be delivered"),
+                posted,
+                "{refresh}"
+            );
+        }
     }
 
     #[test]
