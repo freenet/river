@@ -172,11 +172,11 @@ impl ChatRoomStateV1 {
         let config_delta = configuration_delta_for_merge(self, parameters, other_state);
         // The summary is read against the configuration the merge ends with,
         // derived once (a clone only when the configuration changes).
-        let (summary, cap) = {
+        let (summary, merged_config) = {
             let with_config = self.with_configuration(parameters, &config_delta);
             (
                 self.summarize(&with_config, parameters),
-                with_config.configuration.configuration.max_recent_messages,
+                with_config.configuration.configuration.clone(),
             )
         };
         // Field `delta`s never read their parent; pass the sender's own state,
@@ -198,9 +198,8 @@ impl ChatRoomStateV1 {
                 .delta(other_state, parameters, summary)
                 .unwrap_or_default();
             delta.configuration = config_delta.clone();
-            let mut delta = Some(delta);
-            trim_messages_to_work_bound(&mut delta, cap);
-            delta
+            trim_to_work_bounds(&mut delta, &merged_config, other_state, parameters);
+            Some(delta)
         };
         let mut merged = self.clone();
         merged.apply_delta(self, parameters, &delta_against(&summary))?;
@@ -809,17 +808,96 @@ fn configuration_delta_for_merge(
         })
 }
 
-/// Keep at most `messages_work_bound(cap)` of `delta`'s messages, the newest
-/// first. A whole-state merge builds its delta from a state that may hold
-/// more than one messages delta may carry (`verify` does not bound the
-/// count, and an older window can be larger); the merged room keeps only the
-/// newest `cap <= bound` anyway, so offering the rest only fails the merge.
-fn trim_messages_to_work_bound(delta: &mut Option<ChatRoomStateV1Delta>, cap: usize) {
-    let bound = crate::room_state::message::messages_work_bound(cap);
-    if let Some(msgs) = delta.as_mut().and_then(|d| d.recent_messages.as_mut()) {
+/// Trim each part of a whole-state merge's `delta` that one delta of the
+/// merged room may not carry to its work bound. The sender's state may hold
+/// more than one delta may carry (`verify` judges it by its own, possibly
+/// higher, caps, and an older message window can be larger); the merged room
+/// keeps fewer still, so offering the rest only fails the merge one way
+/// (freenet/river#703 review). Each part keeps what the merged room's caps
+/// keep first:
+/// - messages: the newest (the `max_recent_messages` trim keeps the newest);
+/// - bans: the owner's, then the newest (the `max_user_bans` cap never
+///   evicts an owner ban and evicts oldest first within a tier);
+/// - members: the shortest invite chains, then the lowest id (the
+///   `max_members` trim removes the longest chains, then the highest id);
+///   a member's inviter is always shallower, so no kept member loses its
+///   inviter to the trim;
+/// - ban evidence: the shallowest records (deeper ones are the first a
+///   lowered `max_members` drops), then by digest.
+///
+/// One exchange can still differ from the other direction when the merged
+/// caps' choice depends on records trimmed here; the records each peer kept
+/// travel in the next exchange, and the peers converge.
+fn trim_to_work_bounds(
+    delta: &mut ChatRoomStateV1Delta,
+    config: &crate::room_state::configuration::Configuration,
+    sender: &ChatRoomStateV1,
+    parameters: &ChatRoomParametersV1,
+) {
+    use crate::room_state::ban::{ban_digest, MIN_BANS_DELTA_BOUND};
+    use crate::room_state::ban_evidence::{evidence_bound, evidence_depth_cap, evidence_digest};
+    use crate::room_state::member::{members_work_bound, MembersDelta};
+    use crate::room_state::message::messages_work_bound;
+
+    if let Some(msgs) = delta.recent_messages.as_mut() {
+        let bound = messages_work_bound(config.max_recent_messages);
         if msgs.len() > bound {
             msgs.sort_by_key(|m| std::cmp::Reverse(m.order_key()));
             msgs.truncate(bound);
+        }
+    }
+
+    let owner_id = parameters.owner_id();
+    let bans_bound = config.max_user_bans.max(MIN_BANS_DELTA_BOUND);
+    if let Some(bans) = delta.bans.as_mut() {
+        if bans.len() > bans_bound {
+            bans.sort_by_cached_key(|b| {
+                (
+                    b.banned_by != owner_id,
+                    std::cmp::Reverse(b.ban.banned_at),
+                    ban_digest(b),
+                )
+            });
+            bans.truncate(bans_bound);
+        }
+    }
+
+    // Invite depth in the sender's state (members and evidence), the owner
+    // at 0; a record whose chain does not reach the owner sorts last.
+    let depth_in_sender = || {
+        let known = sender.ban_evidence.lookup(&sender.members, owner_id);
+        move |m: &AuthorizedMember| -> usize {
+            let mut depth = 1;
+            let mut inviter = m.member.invited_by;
+            let mut seen = HashSet::new();
+            while inviter != owner_id {
+                match known.get(&inviter) {
+                    Some(next) if seen.insert(inviter) => inviter = next.member.invited_by,
+                    _ => return usize::MAX,
+                }
+                depth += 1;
+            }
+            depth
+        }
+    };
+
+    let members_bound = members_work_bound(config.max_members);
+    if let Some(members) = delta.members.as_mut() {
+        if members.added().len() > members_bound {
+            let depth = depth_in_sender();
+            let mut added = members.added().to_vec();
+            added.sort_by_cached_key(|m| (depth(m), m.member.id()));
+            added.truncate(members_bound);
+            *members = MembersDelta::new(added);
+        }
+    }
+
+    let evidence_cap = evidence_bound(bans_bound, evidence_depth_cap(config.max_members));
+    if let Some(evidence) = delta.ban_evidence.as_mut() {
+        if evidence.len() > evidence_cap {
+            let depth = depth_in_sender();
+            evidence.sort_by_cached_key(|m| (depth(m), evidence_digest(m)));
+            evidence.truncate(evidence_cap);
         }
     }
 }
@@ -927,7 +1005,7 @@ impl ChatRoomParametersV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+    use crate::room_state::ban::{AuthorizedUserBan, UserBan, MIN_BANS_DELTA_BOUND};
     use crate::room_state::configuration::Configuration;
     use crate::room_state::member::{AuthorizedMember, Member};
     use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
@@ -935,6 +1013,92 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::fmt::Debug;
     use std::time::SystemTime;
+
+    /// Over its bound, a whole-state merge's ban evidence keeps the
+    /// shallowest records, and its bans keep the owner's and then the newest
+    /// (freenet/river#703 review).
+    #[test]
+    fn trim_to_work_bounds_keeps_what_the_merged_caps_keep() {
+        let owner_sk = SigningKey::from_bytes(&[1; 32]);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let config = Configuration {
+            owner_member_id: owner_id,
+            max_members: 1,
+            max_user_bans: 1,
+            ..Default::default()
+        };
+        // Evidence bound: 2 x max(1, MIN_BANS_DELTA_BOUND) x min(1, 4) = 200.
+        let invite = |inviter: MemberId, inviter_sk: &SigningKey, seed: u32| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&seed.to_le_bytes());
+            bytes[31] = 7;
+            let sk = SigningKey::from_bytes(&bytes);
+            let m = AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: inviter,
+                    member_vk: sk.verifying_key(),
+                },
+                inviter_sk,
+            );
+            (m, sk)
+        };
+        let mut shallow = Vec::new();
+        let mut deep = Vec::new();
+        for i in 0..150 {
+            let (m, sk) = invite(owner_id, &owner_sk, i);
+            let (child, _) = invite(m.member.id(), &sk, 1_000 + i);
+            shallow.push(m);
+            deep.push(child);
+        }
+        let mut sender = ChatRoomStateV1::default();
+        sender.ban_evidence.members = deep.iter().chain(&shallow).cloned().collect();
+
+        let ban = |by: &SigningKey, secs: u64| {
+            AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                    banned_user: MemberId::from(&SigningKey::from_bytes(&[9; 32]).verifying_key()),
+                },
+                MemberId::from(&by.verifying_key()),
+                by,
+            )
+        };
+        let member_sk = SigningKey::from_bytes(&[2; 32]);
+        let mut bans: Vec<_> = (0..MIN_BANS_DELTA_BOUND as u64 + 10)
+            .map(|t| ban(&member_sk, 100 + t))
+            .collect();
+        let owner_ban = ban(&owner_sk, 0);
+        bans.push(owner_ban.clone());
+
+        let mut delta = ChatRoomStateV1Delta {
+            ban_evidence: Some(sender.ban_evidence.members.clone()),
+            bans: Some(bans),
+            ..Default::default()
+        };
+        trim_to_work_bounds(&mut delta, &config, &sender, &parameters);
+
+        let evidence = delta.ban_evidence.unwrap();
+        assert_eq!(evidence.len(), 200);
+        assert!(shallow.iter().all(|m| evidence.contains(m)));
+        let bans = delta.bans.unwrap();
+        assert_eq!(bans.len(), MIN_BANS_DELTA_BOUND);
+        assert!(bans.contains(&owner_ban));
+        let oldest_kept = bans
+            .iter()
+            .filter(|b| b.banned_by != owner_id)
+            .map(|b| b.ban.banned_at)
+            .min()
+            .unwrap();
+        assert_eq!(
+            oldest_kept,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(111)
+        );
+    }
 
     #[test]
     fn test_state() {
@@ -2690,7 +2854,7 @@ mod tests {
     /// guard.
     #[test]
     fn test_banned_member_with_encrypted_secret_is_still_pruned() {
-        use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+        use crate::room_state::ban::{AuthorizedUserBan, UserBan, MIN_BANS_DELTA_BOUND};
         use std::time::SystemTime;
 
         let rng = &mut rand::thread_rng();
@@ -2884,7 +3048,7 @@ mod tests {
     /// "wrong" order.
     #[test]
     fn test_ban_race_with_encrypted_secret_converges_to_pruned() {
-        use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+        use crate::room_state::ban::{AuthorizedUserBan, UserBan, MIN_BANS_DELTA_BOUND};
         use std::time::SystemTime;
 
         let rng = &mut rand::thread_rng();

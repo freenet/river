@@ -142,7 +142,7 @@ impl ComposableState for MembersV1 {
             // record with the owner's id). Such a record in a delta is ignored
             // here rather than failing the delta, so the rest of the delta
             // applies the same way whatever else it carries.
-            let work_bound = max_members.max(MIN_MEMBERS_DELTA_BOUND);
+            let work_bound = members_work_bound(max_members);
             if delta.added.len() > self.members.len().saturating_add(work_bound) {
                 return Err(format!(
                     "Members delta of {} exceeds {}",
@@ -195,6 +195,11 @@ impl ComposableState for MembersV1 {
 /// One delta may add `max(max_members, MIN_MEMBERS_DELTA_BOUND)` members.
 /// See `MembersV1::apply_delta`.
 const MIN_MEMBERS_DELTA_BOUND: usize = 1_000;
+
+/// How many new members one delta may add in a room with `max_members`.
+pub fn members_work_bound(max_members: usize) -> usize {
+    max_members.max(MIN_MEMBERS_DELTA_BOUND)
+}
 
 impl MembersV1 {
     /// The member records to keep from the `held` ones plus the `added` ones:
