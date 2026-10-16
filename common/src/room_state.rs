@@ -286,6 +286,43 @@ impl ChatRoomStateV1 {
         Some(delta)
     }
 
+    /// This state's delta against a receiver's `summary`, trimmed to the
+    /// work bounds one delta may carry in the receiver's room: what a sender
+    /// that holds only the receiver's summary (the contract's network delta)
+    /// sends. The receiver's caps are this state's when the receiver's
+    /// configuration does not outrank this one (the receiver then ends with
+    /// this one), and the floors every room's bounds are at least otherwise
+    /// (the receiver's configuration is not known here). Without the trim, a
+    /// receiver on a lowered cap refuses the whole delta; trimmed, the rest
+    /// follows in later rounds (freenet/river#703).
+    pub fn delta_within_work_bounds(
+        &self,
+        parameters: &ChatRoomParametersV1,
+        summary: &ChatRoomStateV1Summary,
+    ) -> Option<ChatRoomStateV1Delta> {
+        let mut delta = self.delta(self, parameters, summary)?;
+        let own = &self.configuration;
+        // This state's configuration is the one the receiver's room ends
+        // with unless the receiver's outranks it.
+        let config = if !crate::room_state::member_info::outranks(
+            summary.configuration,
+            own.rank(parameters),
+        ) {
+            own.configuration.clone()
+        } else {
+            // The bounds' floors: `max(cap, floor)` with each cap at its
+            // least, and the evidence depth cap at its largest.
+            crate::room_state::configuration::Configuration {
+                max_recent_messages: 1,
+                max_user_bans: 1,
+                max_members: crate::room_state::ban_evidence::MAX_EVIDENCE_DEPTH,
+                ..own.configuration.clone()
+            }
+        };
+        trim_to_work_bounds(&mut delta, &config, None, self, parameters);
+        Some(delta)
+    }
+
     /// This state with `config_delta` applied to its configuration, borrowed
     /// unchanged when there is none.
     fn with_configuration(

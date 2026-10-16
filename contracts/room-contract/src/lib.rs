@@ -217,7 +217,9 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         let summary = from_reader::<ChatRoomStateV1Summary, &[u8]>(summary.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        let delta = chat_state.delta(&chat_state, &parameters, &summary);
+        // Trimmed to the receiver's work bounds, so a receiver on a lowered
+        // cap applies it rather than refusing it (freenet/river#703).
+        let delta = chat_state.delta_within_work_bounds(&parameters, &summary);
         let delta = delta
             .map(|d| ensure_members_for_message_authors(d, &chat_state, &parameters, &summary));
         match delta {
@@ -245,6 +247,78 @@ mod tests {
             into_writer($v, &mut out).unwrap();
             out
         }};
+    }
+
+    /// The network delta (`get_state_delta`) for a receiver whose summary
+    /// shows a newer configuration (a lowered `max_user_bans`) is trimmed to
+    /// the work bound one delta may carry, so the receiver applies it rather
+    /// than refusing it; the rest follows in later rounds (freenet/river#703).
+    #[test]
+    fn a_network_delta_is_trimmed_to_the_work_bound() {
+        let owner_sk = SigningKey::from_bytes(&[1; 32]);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let config = |version: u32, max_user_bans: usize| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    configuration_version: version,
+                    max_user_bans,
+                    ..Default::default()
+                },
+                &owner_sk,
+            )
+        };
+        let held = river_core::room_state::ban::MIN_BANS_DELTA_BOUND + 30;
+        let bans = (0..held as u64)
+            .map(|i| {
+                let target = SigningKey::from_bytes(&{
+                    let mut b = [9u8; 32];
+                    b[..8].copy_from_slice(&i.to_le_bytes());
+                    b
+                });
+                AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner_id,
+                        banned_at: std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(i),
+                        banned_user: MemberId::from(&target.verifying_key()),
+                    },
+                    owner_id,
+                    &owner_sk,
+                )
+            })
+            .collect();
+        let mut sender = ChatRoomStateV1 {
+            configuration: config(1, held),
+            bans: BansV1(bans),
+            ..Default::default()
+        };
+        sender.post_apply_cleanup(&parameters).unwrap();
+        let receiver = ChatRoomStateV1 {
+            configuration: config(2, 2),
+            ..Default::default()
+        };
+        let summary = Contract::summarize_state(
+            Parameters::from(cbor!(&parameters)),
+            State::from(cbor!(&receiver)),
+        )
+        .unwrap();
+        let delta = Contract::get_state_delta(
+            Parameters::from(cbor!(&parameters)),
+            State::from(cbor!(&sender)),
+            summary,
+        )
+        .unwrap();
+        let out = Contract::update_state(
+            Parameters::from(cbor!(&parameters)),
+            State::from(cbor!(&receiver)),
+            vec![UpdateData::Delta(delta)],
+        )
+        .expect("the receiver applies the network delta");
+        assert!(out.new_state.is_some());
     }
 
     /// A full-state update runs the room's own merge (`merge_from`), not the
