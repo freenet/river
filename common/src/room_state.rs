@@ -743,6 +743,17 @@ impl ChatRoomStateV1 {
         // `apply_delta` runs; the UI re-runs its private rebuild after apply.
         self.recent_messages.rebuild_actions_state();
 
+        // 5c. Drop the secret blobs of members removed above, by the same
+        //     rule `RoomSecretsV1::apply_delta` applies (a blob only for the
+        //     owner or a current member). That apply runs before this cleanup
+        //     in field order, so a member removed HERE would keep their blob
+        //     until the next apply dropped it, and the state this apply
+        //     produced would not be a fixpoint of `merge(S, S)`
+        //     (freenet/river#703).
+        self.secrets.encrypted_secrets.retain(|s| {
+            s.secret.member_id == owner_id || current_member_ids.contains(&s.secret.member_id)
+        });
+
         // 6. Sweep DMs whose participants are no longer current members
         //    or are ENFORCED-banned. Without this, a fresh ban (or member-prune)
         //    would leave the DMs in state but break `verify` because the
