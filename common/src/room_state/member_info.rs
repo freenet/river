@@ -50,10 +50,13 @@ impl MemberInfoV1 {
         // The rank is computed once per candidate rather than once per
         // comparison, because `member_info_rank` hashes (see [`SigDigest`]).
         let mut best: Option<(&AuthorizedMemberInfo, (u32, SigDigest))> = None;
+        // A record over the nickname ceiling is not one the room keeps; it is
+        // ignored here as the summary and `apply_delta` ignore it.
         for info in self
             .member_info
             .iter()
             .filter(|info| info.member_info.member_id == member_id)
+            .filter(|info| within_nickname_ceiling(info))
         {
             let rank = member_info_rank(info.member_info.version, &info.signature);
             let better = match &best {
@@ -120,49 +123,34 @@ impl MemberInfoV1 {
     }
 }
 
-/// The most bytes a nickname may declare in a record exempt from the room's
-/// `max_nickname_size` (see [`nickname_admissible`]): a fixed bound, so the
-/// exemption cannot be used to store an unbounded nickname.
-pub const EXEMPT_NICKNAME_CEILING: usize = 1_000;
-
-/// Whether the room admits `info`'s nickname. A record that lists deputies,
-/// or the owner's record, is held to [`EXEMPT_NICKNAME_CEILING`] instead of
-/// the configured `max_nickname_size`: lowering the limit must not drop a
-/// moderator's deputy grants (and with them the bans those grants make
-/// effective), or the owner's own record. Every other record must fit
-/// `max_nickname_size`.
+/// The most bytes a nickname may declare in any member_info record the room
+/// keeps. One fixed bound, the same for every record, held or arriving, and
+/// independent of the room's configuration: a record over it is skipped on
+/// arrival, dropped where held on every apply, left out of the summary, and
+/// ignored by [`MemberInfoV1::canonical`] (and so by `deputies_of`), so every
+/// reader sees the same records (freenet/river#703).
 ///
-/// One rule, applied to arrivals, to held records on every apply and to the
-/// summary, so whether a record is kept is a function of the record and the
-/// room's configuration alone, never of which peer held it
-/// (freenet/river#703).
-pub fn nickname_admissible(
-    info: &AuthorizedMemberInfo,
-    max_nickname_size: usize,
-    owner_id: MemberId,
-) -> bool {
-    let len = info.member_info.preferred_nickname.declared_len();
-    if info.member_info.member_id == owner_id || !info.member_info.deputies.is_empty() {
-        len <= EXEMPT_NICKNAME_CEILING
-    } else {
-        len <= max_nickname_size
-    }
+/// The room's `max_nickname_size` is a client rule: the UI and riverctl check
+/// a nickname against it before signing (see [`nickname_refusal`]). The
+/// contract does not enforce it, so changing it drops no record and cannot
+/// bring back a superseded one.
+pub const NICKNAME_CEILING: usize = 1_000;
+
+/// Whether `info`'s nickname is within [`NICKNAME_CEILING`].
+pub fn within_nickname_ceiling(info: &AuthorizedMemberInfo) -> bool {
+    info.member_info.preferred_nickname.declared_len() <= NICKNAME_CEILING
 }
 
-impl MemberInfoV1 {
-    /// How many held records a room with `max_nickname_size` would drop
-    /// (see [`nickname_admissible`]): what an owner lowering the limit is
-    /// warned about before signing the change.
-    pub fn records_dropped_by_nickname_limit(
-        &self,
-        max_nickname_size: usize,
-        owner_id: MemberId,
-    ) -> usize {
-        self.member_info
-            .iter()
-            .filter(|info| !nickname_admissible(info, max_nickname_size, owner_id))
-            .count()
-    }
+/// Why a client must not sign a nickname declaring `declared_len` bytes in a
+/// room with `config`, if it must not: over the room's `max_nickname_size`
+/// (a client rule) or over [`NICKNAME_CEILING`] (which the room enforces).
+pub fn nickname_refusal(
+    declared_len: usize,
+    config: &crate::room_state::configuration::Configuration,
+) -> Option<String> {
+    let limit = config.max_nickname_size.min(NICKNAME_CEILING);
+    (declared_len > limit)
+        .then(|| format!("Nickname is {declared_len} bytes; this room allows at most {limit}."))
 }
 
 /// Deterministic ordering used to pick the canonical `MemberInfo` when two
@@ -420,18 +408,14 @@ impl ComposableState for MemberInfoV1 {
         Ok(())
     }
 
-    /// Reads `parent_state`'s `max_nickname_size`: a record the room would
-    /// drop is not advertised, so a peer holding one is offered the record it
-    /// will keep instead. The whole-state merge summarizes against the
-    /// configuration the merge ends with, which makes this symmetric
+    /// A record over [`NICKNAME_CEILING`] is not advertised, so a peer
+    /// holding one is offered the record it will keep instead
     /// (freenet/river#703).
     fn summarize(
         &self,
-        parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        let max_nickname_size = parent_state.configuration.configuration.max_nickname_size;
-        let owner_id = parameters.owner_id();
         // Carry the signature DIGEST alongside the version so anti-entropy can
         // detect a SAME-version content difference and correct it (#411 round
         // 4 B).
@@ -447,7 +431,7 @@ impl ComposableState for MemberInfoV1 {
         for info in self
             .member_info
             .iter()
-            .filter(|info| nickname_admissible(info, max_nickname_size, owner_id))
+            .filter(|info| within_nickname_ceiling(info))
         {
             // The summary value IS the rank, so the fold compares tuples
             // directly rather than re-deriving a rank from a stored signature.
@@ -506,15 +490,11 @@ impl ComposableState for MemberInfoV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        let max_nickname_size = parent_state.configuration.configuration.max_nickname_size;
-
-        // A held record whose nickname the room does not admit is dropped
-        // first, so it neither outranks an arrival the room does admit nor
-        // stays: whether a record is kept is the same whichever side of a
-        // merge held it (the arrival check below applies the same rule).
-        let owner_id = parameters.owner_id();
-        self.member_info
-            .retain(|info| nickname_admissible(info, max_nickname_size, owner_id));
+        // A held record over the nickname ceiling is dropped first, so it
+        // neither outranks an arrival within it nor stays: whether a record is
+        // kept is the same whichever side of a merge held it (the arrival
+        // check below applies the same rule).
+        self.member_info.retain(within_nickname_ceiling);
 
         if let Some(delta) = delta {
             // Members plus ban evidence, built once for the whole delta.
@@ -524,12 +504,11 @@ impl ComposableState for MemberInfoV1 {
             for member_info in delta {
                 let member_id = &member_info.member_info.member_id;
 
-                // A record whose nickname the room does not admit (see
-                // `nickname_admissible`) is skipped, not an error, and one
-                // already held is dropped below: `verify` does not check the
-                // length, and an error here would fail every merge with a peer
-                // holding it.
-                if !nickname_admissible(member_info, max_nickname_size, parameters.owner_id()) {
+                // A record over the nickname ceiling is skipped, not an
+                // error, and one already held is dropped above: `verify` does
+                // not check the length, and an error here would fail every
+                // merge with a peer holding it.
+                if !within_nickname_ceiling(member_info) {
                     continue;
                 }
 
@@ -723,6 +702,27 @@ impl MemberInfo {
             ),
             deputies: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod nickname_refusal_tests {
+    use super::*;
+    use crate::room_state::configuration::Configuration;
+
+    /// A nickname up to the room's limit may be signed; one byte over is
+    /// refused; a limit over the ceiling is read as the ceiling.
+    #[test]
+    fn nickname_refusal_reads_the_room_limit_and_the_ceiling() {
+        let mut c = Configuration {
+            max_nickname_size: 10,
+            ..Configuration::default()
+        };
+        assert_eq!(nickname_refusal(10, &c), None);
+        assert!(nickname_refusal(11, &c).is_some());
+        c.max_nickname_size = NICKNAME_CEILING + 50;
+        assert_eq!(nickname_refusal(NICKNAME_CEILING, &c), None);
+        assert!(nickname_refusal(NICKNAME_CEILING + 1, &c).is_some());
     }
 }
 

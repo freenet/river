@@ -338,6 +338,21 @@ pub struct Configuration {
 pub const DEFAULT_MAX_DIRECT_MESSAGES: usize = 300;
 
 impl Configuration {
+    /// Why a client must not sign this configuration as the owner's next
+    /// one, if it must not: it fails [`Self::check_values`] (the room would
+    /// skip it, so the edit would silently not take), or its
+    /// `max_nickname_size` is over the nickname ceiling the room enforces
+    /// whatever the configuration says. The one check the UI and riverctl
+    /// both run before signing a configuration edit (freenet/river#703).
+    pub fn signing_refusal(&self, parameters: &ChatRoomParametersV1) -> Option<String> {
+        if let Err(e) = self.check_values(parameters) {
+            return Some(e);
+        }
+        let ceiling = crate::room_state::member_info::NICKNAME_CEILING;
+        (self.max_nickname_size > ceiling)
+            .then(|| format!("Max nickname size can be at most {ceiling} bytes."))
+    }
+
     /// The checks a configuration must pass to be adopted, other than its
     /// signature and rank; see [`AuthorizedConfigurationV1::check_values`].
     /// Clients run this before signing, because a configuration that fails it
@@ -389,6 +404,52 @@ impl Configuration {
     pub fn effective_max_direct_messages(&self) -> usize {
         self.max_direct_messages
             .unwrap_or(DEFAULT_MAX_DIRECT_MESSAGES)
+    }
+}
+
+#[cfg(test)]
+mod signing_refusal_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn params() -> (ChatRoomParametersV1, Configuration) {
+        let sk = SigningKey::from_bytes(&[5; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: sk.verifying_key(),
+        };
+        let config = Configuration {
+            owner_member_id: params.owner_id(),
+            ..Configuration::default()
+        };
+        (params, config)
+    }
+
+    /// A configuration passing the value checks, with a nickname limit up to
+    /// the ceiling, may be signed.
+    #[test]
+    fn a_valid_configuration_may_be_signed() {
+        let (params, mut c) = params();
+        assert_eq!(c.signing_refusal(&params), None);
+        c.max_nickname_size = crate::room_state::member_info::NICKNAME_CEILING;
+        assert_eq!(c.signing_refusal(&params), None);
+    }
+
+    /// Failing the value checks, naming another owner, or a nickname limit
+    /// over the ceiling is refused, judged against the room's parameters and
+    /// not the configuration's own owner field.
+    #[test]
+    fn an_unadoptable_configuration_is_refused() {
+        let (params, c) = params();
+        let mut zero = c.clone();
+        zero.max_recent_messages = 0;
+        assert!(zero.signing_refusal(&params).is_some());
+        let mut other_owner = c.clone();
+        other_owner.owner_member_id =
+            MemberId::from(&SigningKey::from_bytes(&[6; 32]).verifying_key());
+        assert!(other_owner.signing_refusal(&params).is_some());
+        let mut over = c;
+        over.max_nickname_size = crate::room_state::member_info::NICKNAME_CEILING + 1;
+        assert!(over.signing_refusal(&params).is_some());
     }
 }
 

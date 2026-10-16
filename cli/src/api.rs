@@ -6028,6 +6028,15 @@ impl ApiClient {
 
         let my_member_id = signing_key.verifying_key().into();
 
+        // The room's `max_nickname_size` is a client rule, checked before
+        // signing (the contract holds nicknames only to a fixed ceiling).
+        if let Some(reason) = river_core::room_state::member_info::nickname_refusal(
+            new_nickname.len(),
+            &room_state.configuration.configuration,
+        ) {
+            return Err(anyhow!(reason));
+        }
+
         // Seal the nickname for the room's privacy mode. In a PRIVATE room the
         // nickname MUST be AES-256-GCM sealed under the room secret — sending
         // it as plaintext (the previous unconditional `SealedBytes::public`)
@@ -6485,26 +6494,13 @@ impl ApiClient {
         let mut new_config = room_state.configuration.configuration.clone();
         new_config.configuration_version += 1;
         modify(&mut new_config);
-        // The room skips (does not reject) a configuration that fails these
-        // checks, so without this the edit would report success and do
-        // nothing.
-        new_config
-            .check_values(&ChatRoomParametersV1 {
-                owner: *room_owner_key,
-            })
-            .map_err(|e| anyhow!("Invalid configuration: {e}"))?;
-        // A lower nickname limit drops every held nickname record over it
-        // (records listing deputies, and the owner's, excepted).
-        let dropped = room_state.member_info.records_dropped_by_nickname_limit(
-            new_config.max_nickname_size,
-            new_config.owner_member_id,
-        );
-        if dropped > 0 {
-            return Err(anyhow!(
-                "{dropped} member nickname(s) are longer than {} bytes; \
-                 lowering the limit below them would remove those nicknames",
-                new_config.max_nickname_size
-            ));
+        // The same check the UI runs before signing: the room skips (does
+        // not reject) a configuration that fails it, so without this the edit
+        // would report success and do nothing.
+        if let Some(reason) = new_config.signing_refusal(&ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        }) {
+            return Err(anyhow!("Invalid configuration: {reason}"));
         }
 
         // Sign the new configuration

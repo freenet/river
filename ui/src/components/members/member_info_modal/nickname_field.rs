@@ -20,7 +20,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     // here: it can arrive after the modal opens, and `save_changes` re-reads
     // it fresh from ROOMS so the freenet/river#299 privacy guard sees the
     // current state, not a stale snapshot.
-    let (self_signing_key, room_secrets) = {
+    let (self_signing_key, room_secrets, room_config) = {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key.as_ref() {
             ROOMS
@@ -34,12 +34,16 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                         // degrades exactly like "no room" already did — the
                         // field renders read-only (`is_self` is false) and the
                         // existing guard in `save_changes` never fires a save.
-                        (room_data.signing_key().cloned(), room_data.secrets.clone())
+                        (
+                            room_data.signing_key().cloned(),
+                            room_data.secrets.clone(),
+                            Some(room_data.room_state.configuration.configuration.clone()),
+                        )
                     })
                 })
-                .unwrap_or((None, HashMap::new()))
+                .unwrap_or((None, HashMap::new(), None))
         } else {
-            (None, HashMap::new())
+            (None, HashMap::new(), None)
         }
     };
 
@@ -68,6 +72,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         let self_signing_key = self_signing_key.clone();
         let member_info = member_info.clone();
         let initial_nickname_for_revert = initial_nickname_for_revert.clone();
+        let room_config = room_config.clone();
 
         move |new_value: String| {
             if new_value.is_empty() {
@@ -93,6 +98,15 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             // gets told why instead.
             if contains_hidden_chars(&new_value) {
                 warn!("{EMOJI_REJECTION_MESSAGE}");
+                temp_nickname.set(initial_nickname_for_revert.clone());
+                return;
+            }
+
+            // Over the room's nickname limit: refused before signing, and the
+            // field reverted, like the emoji case above (the inline hint below
+            // says why while typing).
+            if let Some(reason) = length_refusal(&room_config, &new_value) {
+                warn!("{reason}");
                 temp_nickname.set(initial_nickname_for_revert.clone());
                 return;
             }
@@ -303,8 +317,10 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         }
     };
 
-    // Live validity of what is currently typed, for the inline hint below.
+    // Live validity of what is currently typed, for the inline hints below.
     let has_emoji = contains_hidden_chars(&temp_nickname());
+    let too_long = length_refusal(&room_config, &temp_nickname());
+    let invalid = has_emoji || too_long.is_some();
 
     rsx! {
         div {
@@ -313,12 +329,12 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             div {
                 class: "relative",
                 input {
-                    class: if has_emoji {
+                    class: if invalid {
                         "w-full px-3 py-2 bg-surface border border-red-500 rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent"
                     } else {
                         "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent"
                     },
-                    "aria-invalid": if has_emoji { "true" } else { "false" },
+                    "aria-invalid": if invalid { "true" } else { "false" },
                     value: "{temp_nickname}",
                     readonly: !is_self,
                     oninput: on_input,
@@ -341,6 +357,26 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                     "{EMOJI_REJECTION_MESSAGE}"
                 }
             }
+            if let Some(reason) = too_long {
+                p {
+                    "data-testid": "nickname-length-error",
+                    class: "mt-1 text-xs text-red-400",
+                    role: "alert",
+                    "{reason}"
+                }
+            }
         }
     }
+}
+
+/// Why `nickname` must not be signed in a room with `config`, if it must
+/// not. The room's `max_nickname_size` is checked here, before signing: the
+/// contract holds nicknames only to its fixed ceiling (freenet/river#703).
+fn length_refusal(
+    config: &Option<river_core::room_state::configuration::Configuration>,
+    nickname: &str,
+) -> Option<String> {
+    config
+        .as_ref()
+        .and_then(|c| river_core::room_state::member_info::nickname_refusal(nickname.len(), c))
 }

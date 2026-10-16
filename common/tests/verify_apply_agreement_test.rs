@@ -142,7 +142,7 @@ fn assert_merges_agree(
 }
 
 #[test]
-fn a_nickname_over_the_room_limit_is_dropped_in_both_directions() {
+fn a_nickname_over_the_ceiling_is_dropped_in_both_directions() {
     let r = room();
     let base = state(&r, public_config(&r));
     let mut holder = base.clone();
@@ -150,7 +150,11 @@ fn a_nickname_over_the_room_limit_is_dropped_in_both_directions() {
     holder.recent_messages.messages = vec![msg(&r, 1, RoomMessageBody::public("hi".into()))];
     holder.member_info = MemberInfoV1 {
         member_info: vec![AuthorizedMemberInfo::new_with_member_key(
-            MemberInfo::new_public(r.member.member.id(), 1, "a nickname far over ten".into()),
+            MemberInfo::new_public(
+                r.member.member.id(),
+                1,
+                "a".repeat(river_core::room_state::member_info::NICKNAME_CEILING + 1),
+            ),
             &r.member_sk,
         )],
     };
@@ -636,11 +640,11 @@ fn an_invalid_held_configuration_yields_to_a_valid_one_in_both_directions() {
 // Nickname limit (freenet/river#703)
 // ---------------------------------------------------------------------------
 
-/// Lowering `max_nickname_size` must not revoke a moderator's deputy grants:
-/// a record that lists deputies (or the owner's) is kept whatever the limit;
-/// a plain record over the limit is dropped.
+/// Lowering `max_nickname_size` drops no record: the room holds every
+/// record only to the fixed nickname ceiling, so deputy grants and plain
+/// records over the new limit are all kept (freenet/river#703).
 #[test]
-fn lowering_the_nickname_limit_keeps_records_that_carry_deputies() {
+fn lowering_the_nickname_limit_drops_no_record() {
     use river_core::room_state::ChatRoomStateV1Delta;
     let r = room();
     let e_sk = SigningKey::from_bytes(&[14; 32]);
@@ -698,13 +702,14 @@ fn lowering_the_nickname_limit_keeps_records_that_carry_deputies() {
         &[e.member.id()][..],
         "a deputy grant must survive a lowered nickname limit"
     );
-    assert!(after.member_info.canonical(e.member.id()).is_none());
+    assert!(after.member_info.canonical(e.member.id()).is_some());
 }
 
-/// A peer holding a newer record over the limit and one holding an older
-/// record within it end on the same record in both merge directions.
+/// A peer holding a newer record over the nickname ceiling and one holding
+/// an older record within it end on the same record in both merge
+/// directions.
 #[test]
-fn an_over_limit_record_and_an_older_valid_one_converge() {
+fn an_over_ceiling_record_and_an_older_valid_one_converge() {
     let r = room();
     let mut base = state(&r, public_config(&r));
     base.recent_messages.messages = vec![msg(&r, 1, RoomMessageBody::public("hi".into()))];
@@ -715,7 +720,10 @@ fn an_over_limit_record_and_an_older_valid_one_converge() {
         )],
     };
     let mut long = base.clone();
-    long.member_info = info(5, "far over ten bytes");
+    long.member_info = info(
+        5,
+        &"b".repeat(river_core::room_state::member_info::NICKNAME_CEILING + 1),
+    );
     let mut short = base.clone();
     short.member_info = info(1, "ok");
     let merged = assert_merges_agree(&r, &long, &short);

@@ -1,9 +1,9 @@
 import { test, expect, Page } from "@playwright/test";
 import { waitForApp, selectListedRoom } from "./example-room";
 
-// The owner's edit that the room would not take, or that would drop member
-// nicknames, is refused before it is signed, with the reason shown under the
-// field (freenet/river#703).
+// The owner's edit that the room would not take is refused before it is
+// signed, with the reason shown under the field (freenet/river#703). A
+// nickname limit over the room's fixed nickname ceiling (1000 bytes) is one.
 
 const OWNED_ROOM = "Your Private Room";
 
@@ -24,7 +24,7 @@ function nicknameLimitInput(page: Page) {
     .locator("input");
 }
 
-test("lowering the nickname limit below held nicknames is refused visibly", { tag: "@chromium-only" }, async ({
+test("a nickname limit over the ceiling is refused visibly", { tag: "@chromium-only" }, async ({
   page,
 }) => {
   await page.goto("/");
@@ -33,12 +33,12 @@ test("lowering the nickname limit below held nicknames is refused visibly", { ta
 
   const input = nicknameLimitInput(page);
   const before = await input.inputValue();
-  await input.fill("1");
+  await input.fill("1001");
   await input.press("Tab");
 
   const error = page.getByTestId("edit-room-modal").getByTestId("config-error");
   await expect(error).toBeVisible();
-  await expect(error).toContainText("longer than 1 bytes");
+  await expect(error).toContainText("at most 1000 bytes");
 
   // Back to the stored value: nothing to sign, and the refusal clears.
   await input.fill(before);
