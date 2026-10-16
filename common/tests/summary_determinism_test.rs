@@ -574,3 +574,116 @@ fn ban_evidence_summary_bytes_per_entry() {
          {before_per_entry:.2} B/entry)"
     );
 }
+
+/// The members summary carries each member's record digest (freenet/river#703),
+/// which grew it from an id set. Measured here against the id-only shape it
+/// replaced, rebuilt from the same records with real keys.
+#[test]
+fn members_summary_bytes_per_entry() {
+    use river_core::room_state::member::{AuthorizedMember, Member};
+    use std::collections::BTreeSet;
+    const MEMBERS: u64 = 470; // the official room's rough membership
+
+    let owner_sk = SigningKey::from_bytes(blake3::hash(b"owner").as_bytes());
+    let owner_id = MemberId::from(&owner_sk.verifying_key());
+    let members: Vec<AuthorizedMember> = (0..MEMBERS)
+        .map(|i| {
+            let sk = SigningKey::from_bytes(blake3::hash(&i.to_le_bytes()).as_bytes());
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        })
+        .collect();
+    let state = MembersV1 { members };
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+
+    let summary: MemberSummary = state.summarize(&ChatRoomStateV1::default(), &parameters);
+    assert_eq!(summary.len() as u64, MEMBERS, "one entry per member");
+    let bytes = cbor(&summary).len();
+    let per_entry = bytes as f64 / MEMBERS as f64;
+
+    let before: BTreeSet<MemberId> = state.members.iter().map(|m| m.member.id()).collect();
+    let before_bytes = cbor(&before).len();
+    let before_per_entry = before_bytes as f64 / MEMBERS as f64;
+
+    println!(
+        "members summary over {MEMBERS} members:\n  \
+         before (id only):    {before_bytes} B = {before_per_entry:.2} B/entry\n  \
+         after  (id, digest): {bytes} B = {per_entry:.2} B/entry"
+    );
+
+    // Measured 9.01 -> 26.01 B/entry at 470 members (12.2 KB per summary,
+    // from 4.2 KB): the digest adds exactly its 17-byte CBOR byte string to
+    // each entry. More means the digest lost its hand-written `Serialize` (a 16-element
+    // array is about 32 bytes) or the value grew.
+    assert!(
+        per_entry - before_per_entry < 18.0,
+        "each entry must cost the id plus a 17-byte digest (got {per_entry:.2} \
+         vs {before_per_entry:.2} B/entry)"
+    );
+    assert!(
+        per_entry < 28.0,
+        "members summary must stay under 28 bytes/entry (got {per_entry:.2})"
+    );
+}
+
+/// The bans summary is keyed by each ban's whole-record digest
+/// (freenet/river#703) instead of its signature-only `BanId`. Measured against
+/// the `BanId` shape it replaced, rebuilt from the same bans.
+#[test]
+fn bans_summary_bytes_per_entry() {
+    use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+    use std::collections::BTreeSet;
+    const BANS: u64 = 100;
+
+    let owner_sk = SigningKey::from_bytes(blake3::hash(b"owner").as_bytes());
+    let owner_id = MemberId::from(&owner_sk.verifying_key());
+    let bans: Vec<AuthorizedUserBan> = (0..BANS)
+        .map(|i| {
+            let target = SigningKey::from_bytes(blake3::hash(&i.to_le_bytes()).as_bytes());
+            AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + i),
+                    banned_user: MemberId::from(&target.verifying_key()),
+                },
+                owner_id,
+                &owner_sk,
+            )
+        })
+        .collect();
+    let state = BansV1(bans);
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+
+    let summary: BanSummary = state.summarize(&ChatRoomStateV1::default(), &parameters);
+    assert_eq!(summary.len() as u64, BANS, "one entry per ban");
+    let bytes = cbor(&summary).len();
+    let per_entry = bytes as f64 / BANS as f64;
+
+    let before: BTreeSet<river_core::room_state::ban::BanId> =
+        state.0.iter().map(|b| b.id()).collect();
+    let before_bytes = cbor(&before).len();
+    let before_per_entry = before_bytes as f64 / BANS as f64;
+
+    println!(
+        "bans summary over {BANS} bans:\n  \
+         before (BanId):         {before_bytes} B = {before_per_entry:.2} B/entry\n  \
+         after  (record digest): {bytes} B = {per_entry:.2} B/entry"
+    );
+
+    // Measured 9.02 -> 17.02 B/entry at 100 bans: a 16-byte digest is a
+    // 17-byte CBOR byte string per entry, where a `BanId` took about 9.
+    assert!(
+        (17.0..18.0).contains(&per_entry),
+        "each entry must be one 17-byte digest (got {per_entry:.2} B/entry)"
+    );
+}
