@@ -877,9 +877,13 @@ fn configuration_delta_for_merge(
 /// - ban evidence: the shallowest records (deeper ones are the first a
 ///   lowered `max_members` drops), then by digest.
 ///
-/// One exchange can still differ from the other direction when the merged
-/// caps' choice depends on records trimmed here; the records each peer kept
-/// travel in the next exchange, and the peers converge.
+/// The bans trim applies the ban cap's own rule, so it keeps what the
+/// merged cap keeps. The members and evidence trims rank by invite depth
+/// alone, not by what cleanup will then remove (banned members, the
+/// inactivity prune, unreferenced evidence), so one exchange can still
+/// differ from the other direction when the merged caps' choice depends on
+/// records trimmed here; the records each peer kept travel in the next
+/// exchange, and the peers converge.
 fn trim_to_work_bounds(
     delta: &mut ChatRoomStateV1Delta,
     config: &crate::room_state::configuration::Configuration,

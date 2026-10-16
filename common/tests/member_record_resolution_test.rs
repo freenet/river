@@ -541,3 +541,31 @@ fn a_delta_of_one_more_new_record_than_the_bound_is_refused_and_the_bound_itself
         "one more new ban than the bound is refused"
     );
 }
+
+/// Held records are kept as they are when new records are placed, reached
+/// from the owner or not: an apply never drops a held record for lack of an
+/// inviter (cleanup and `verify` judge chains; placing new records does not).
+#[test]
+fn placing_new_records_keeps_a_held_record_whose_inviter_is_not_held() {
+    let f = fx();
+    let orphan_sk = sk(20);
+    let missing_sk = sk(21);
+    let orphan = rec(
+        f.owner,
+        MemberId::from(&missing_sk.verifying_key()),
+        orphan_sk.verifying_key(),
+        &missing_sk,
+    );
+    let mut members = f.base.members.clone();
+    members.members.push(orphan.clone());
+    let newcomer = rec(f.owner, f.x, sk(22).verifying_key(), &f.x_sk);
+    members
+        .apply_delta(
+            &f.base,
+            &f.params,
+            &Some(MembersDelta::new(vec![newcomer.clone()])),
+        )
+        .expect("the new record is placed");
+    assert!(members.members.contains(&orphan), "the held record is kept");
+    assert!(members.members.contains(&newcomer));
+}
