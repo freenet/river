@@ -254,3 +254,59 @@ fn a_ban_judged_by_evidence_only_the_receiver_holds_is_trimmed_as_the_merged_roo
     assert_eq!(sender.bans.0.len(), 120, "premise");
     r.assert_one_exchange_agrees(&receiver, &sender);
 }
+
+/// A held ban attributed to a known member, whose key does not verify it
+/// (only a peer that did not know the member could have stored it), counts
+/// for nothing at the cap: it is dropped before the cap counts, as the same
+/// ban arriving at a peer that knows the member is skipped. So it cannot
+/// take a cap slot and evict a real ban one direction only (freenet/river#703
+/// review Q2).
+#[test]
+fn a_held_ban_its_issuers_key_does_not_verify_takes_no_cap_slot() {
+    let r = Room::new();
+    let (m0, m1, m2, m4, m5) = (sk(2), sk(3), sk(4), sk(5), sk(6));
+    let cfg = r.cfg(2, 3);
+    // A does not know M4, so it holds F, attributed to M4 but signed by M5.
+    let d = r.ban(&m2, id(&m0), 15);
+    let mut f = r.ban(&m5, id(&m5), 33);
+    f.banned_by = id(&m4);
+    let a = ChatRoomStateV1 {
+        configuration: cfg.clone(),
+        members: MembersV1 {
+            members: vec![r.rec(&m0, &r.o), r.rec(&m2, &m0)],
+        },
+        bans: BansV1(vec![d.clone(), f]),
+        recent_messages: MessagesV1 {
+            messages: vec![r.msg(&m0, 1), r.msg(&m2, 2)],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    a.verify(&a, &r.p)
+        .expect("premise: F's issuer is unknown in A");
+    let b = r.settle(ChatRoomStateV1 {
+        configuration: cfg,
+        members: MembersV1 {
+            members: vec![
+                r.rec(&m0, &r.o),
+                r.rec(&m1, &r.o),
+                r.rec(&m2, &m0),
+                r.rec(&m4, &m1),
+                r.rec(&m5, &m4),
+            ],
+        },
+        bans: BansV1(vec![r.ban(&m4, id(&m5), 13), r.ban(&m0, id(&sk(4242)), 18)]),
+        recent_messages: MessagesV1 {
+            messages: vec![
+                r.msg(&m0, 1),
+                r.msg(&m2, 2),
+                r.msg(&m1, 3),
+                r.msg(&m4, 4),
+                r.msg(&m5, 5),
+            ],
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    r.assert_one_exchange_agrees(&a, &b);
+}

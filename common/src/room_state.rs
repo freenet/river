@@ -363,6 +363,23 @@ impl ChatRoomStateV1 {
             .map(|(id, m)| (id, m.clone()))
             .collect();
 
+        // 0-sig. A ban whose known issuer's key does not verify it counts for
+        //     nothing: dropped before the cap counts it, as the same ban is
+        //     skipped on arrival at a peer that knows its issuer
+        //     (`BansV1::drop_bans_their_known_issuer_did_not_sign`; the DM
+        //     apply's enforced-ban set drops it the same way).
+        {
+            let known = self.ban_evidence.lookup(&self.members, owner_id);
+            let mut bans = std::mem::take(&mut self.bans.0);
+            BansV1::drop_bans_their_known_issuer_did_not_sign(
+                &mut bans,
+                &known,
+                owner_id,
+                &parameters.owner,
+            );
+            self.bans.0 = bans;
+        }
+
         // Snapshot for the equality assert below. Taken HERE, before step 0-cap
         // mutates `self.bans`, because this is the one point where `self` still
         // holds what `parent_state` held when the `direct_messages` field

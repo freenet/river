@@ -133,6 +133,29 @@ impl BansV1 {
         ban.verify_signature(&vk).is_ok()
     }
 
+    /// Drop every ban whose issuer is known here (the owner, or a record in
+    /// `members_by_id`) but whose key does not verify it. A peer that did not
+    /// know the issuer could store one (`verify` has no key to check it
+    /// against there); a peer that knows the issuer skips it on arrival. Both
+    /// `post_apply_cleanup` (before the cap counts) and the DM apply's
+    /// enforced-ban set run this, so such a ban never takes a cap slot one
+    /// way only (freenet/river#703). A ban whose issuer is known nowhere is
+    /// kept here; cleanup step 4 sweeps it. Returns whether anything was
+    /// dropped.
+    pub fn drop_bans_their_known_issuer_did_not_sign(
+        bans: &mut Vec<AuthorizedUserBan>,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        owner_id: MemberId,
+        owner_vk: &VerifyingKey,
+    ) -> bool {
+        let before = bans.len();
+        bans.retain(|b| {
+            let known = b.banned_by == owner_id || members_by_id.contains_key(&b.banned_by);
+            !known || Self::ban_signature_matches_current_key(b, members_by_id, owner_id, owner_vk)
+        });
+        bans.len() != before
+    }
+
     /// THE single definition of the `max_user_bans` eviction (#411 round 7).
     ///
     /// Two sites need to know which bans survive the cap: `post_apply_cleanup`
