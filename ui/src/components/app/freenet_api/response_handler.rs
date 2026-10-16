@@ -1202,8 +1202,8 @@ fn plan_load_from_keys(keys: &[ChatDelegateKey]) -> LoadPlan {
 /// Reconstruct an in-memory [`Rooms`] from decoded per-room slots plus the
 /// optional [`RoomsMeta`]. Pure (no I/O) so the per-room load round-trip is
 /// unit-testable: `Present` → `map`, `Tombstone` → `removed_rooms`, then
-/// `apply_meta` layers the view preferences (and prunes `room_order` to present
-/// rooms).
+/// `apply_meta` layers the view preferences (and drops left rooms from
+/// `room_order`).
 fn reconstruct_rooms(
     slots: Vec<(ed25519_dalek::VerifyingKey, RoomSlot)>,
     meta: Option<RoomsMeta>,
@@ -3938,8 +3938,9 @@ mod tests {
     }
 
     /// Reconstruct routes `Present` → `map`, `Tombstone` → `removed_rooms`, and
-    /// `apply_meta` layers the view prefs (pruning `room_order` to present
-    /// rooms). This is the load half of the per-room save/load round-trip.
+    /// `apply_meta` layers the view prefs (dropping left rooms from
+    /// `room_order`, keeping a not-loaded one, freenet/river#802). This is the
+    /// load half of the per-room save/load round-trip.
     #[test]
     fn reconstruct_rooms_splits_present_and_tombstone_and_applies_meta() {
         let present = vk(1);
@@ -3956,8 +3957,9 @@ mod tests {
         let meta = RoomsMeta {
             current_room_key: Some(present),
             notification_modes: std::collections::HashMap::new(),
-            // `ghost` is not a present room → must be pruned by apply_meta.
-            room_order: vec![ghost, present],
+            // `ghost` did not load (kept: it may load later); `left` is a
+            // tombstone (dropped).
+            room_order: vec![ghost, left, present],
             identity_sources: Vec::new(),
         };
 
@@ -3967,7 +3969,8 @@ mod tests {
         assert!(!rooms.map.contains_key(&left));
         assert!(rooms.removed_rooms.contains(&left));
         assert_eq!(rooms.current_room_key, Some(present));
-        assert_eq!(rooms.room_order, vec![present]);
+        assert_eq!(rooms.room_order, vec![ghost, present]);
+        assert_eq!(rooms.ordered_room_keys(), vec![present]);
     }
 
     /// No meta key → reconstruct still yields the slots, with default view prefs.
