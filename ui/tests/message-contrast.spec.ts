@@ -10,7 +10,7 @@ import { coarsePointer, colourOf, contrast, over, resolveColor, rowSurfaces, sel
 const AA_TEXT = 4.5;
 
 for (const scheme of ["light", "dark"] as const) {
-  test(`${scheme}: links, mentions and reply strips clear 4.5:1 at rest and on hover`, async ({ page }) => {
+  test(`${scheme}: links, mentions and reply strips clear 4.5:1 at rest and on hover`, { tag: "@chromium-only" }, async ({ page }) => {
     await page.emulateMedia({ colorScheme: scheme });
     await page.goto("/");
     await waitForApp(page);

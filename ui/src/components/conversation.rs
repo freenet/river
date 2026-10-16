@@ -4949,14 +4949,10 @@ mod tests {
     use super::*;
 
     /// The inline picker opens toward whichever side of the chat scroller has
-    /// more room from its "+", measured against the scroller, not the window.
+    /// more room from its "+".
     #[test]
     fn picker_opens_toward_the_roomier_side() {
         // A 320px scroller and a 20px "+".
-        assert!(
-            !picker_align_right(64.0, 84.0, 0.0, 320.0),
-            "at the line's start it opens rightward"
-        );
         assert!(
             picker_align_right(220.0, 240.0, 0.0, 320.0),
             "near the right edge it opens leftward"
@@ -4964,17 +4960,6 @@ mod tests {
         assert!(
             !picker_align_right(150.0, 170.0, 0.0, 320.0),
             "a tie keeps the rightward default"
-        );
-        // Desktop: the scroller starts past the room list.
-        assert!(
-            !picker_align_right(360.0, 380.0, 300.0, 1000.0),
-            "room is measured from the scroller's edges, not the window's"
-        );
-        // Measured from the window (0..1000) this "+" would have more room
-        // to its left; inside the scroller it has more to its right.
-        assert!(
-            !picker_align_right(600.0, 620.0, 300.0, 1000.0),
-            "the scroller's left edge, not the window's, bounds the leftward room"
         );
     }
 

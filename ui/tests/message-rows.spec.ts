@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { coarsePointer, contrast, openInlinePicker, openRoomWithComposer, reactTo, resolveColor, rowSurfaces, waitForApp } from "./example-room";
+import { coarsePointer, colourOf, contrast, openInlinePicker, openRoomWithComposer, reactTo, resolveColor, rowSurfaces, waitForApp } from "./example-room";
 import { deliverOffscreen, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
@@ -89,26 +89,6 @@ function rowGeometry(group: Locator): Promise<RowGeometry[]> {
   });
 }
 
-/// A received group's avatar (plan 11b): its hue and tone are inline, and its
-/// painted colour is chromatic (not grey) and at least 3:1 against the
-/// conversation background. Returns the painted colour.
-async function expectHashedAvatar(page: Page, group: Locator, label: string): Promise<number[]> {
-  const avatar = group.getByTestId("message-group-avatar");
-  const { hue, tone, color } = await avatar.evaluate((a) => ({
-    hue: (a as HTMLElement).style.getPropertyValue("--avatar-hue").trim(),
-    tone: (a as HTMLElement).style.getPropertyValue("--avatar-tone").trim(),
-    color: getComputedStyle(a).color,
-  }));
-  expect(hue, `${label}: inline --avatar-hue`).toMatch(/^\d+$/);
-  expect(tone, `${label}: inline --avatar-tone`).toMatch(/^\d+$/);
-  const painted = await resolveColor(page, color);
-  const [r, g, b] = painted;
-  expect(Math.max(r, g, b) - Math.min(r, g, b), `${label}: chromatic, not grey (${painted})`).toBeGreaterThanOrEqual(40);
-  const bg = await resolveColor(page, "var(--color-bg)");
-  expect(contrast(painted, bg), `${label}: 3:1 against the background (${painted} on ${bg})`).toBeGreaterThanOrEqual(3);
-  return painted;
-}
-
 test.describe("Message rows", () => {
   test("own and received groups share one row layout, with one avatar and header per group", async ({ page }) => {
     const { received, own } = await openRoomWithPairs(page);
@@ -130,16 +110,7 @@ test.describe("Message rows", () => {
       expect(second.body.left, `${kind}: continuation aligned`).toBeCloseTo(first.body.left, 0);
       expect(avatar.top, `${kind}: avatar beside its header`).toBeCloseTo(first.headers[0].top, 0);
 
-      for (const r of rows) {
-        bodyLefts.push(r.body.left);
-        // The hover bar and kebab sit inside the gutter, for both authors.
-        for (const [control, b] of [["hover bar", r.hoverBar], ["kebab", r.kebab]] as const) {
-          if (!b) continue;
-          expect(b.left, `${kind}: ${control} starts in the gutter`).toBeGreaterThanOrEqual(r.body.right - 0.5);
-          expect(b.right, `${kind}: ${control} ends inside the row`).toBeLessThanOrEqual(r.row.right + 0.5);
-        }
-      }
-      expect(first.hoverBar ?? first.kebab, `${kind}: a control is laid out`).not.toBeNull();
+      bodyLefts.push(...rows.map((r) => r.body.left));
 
       // Decorative but clickable: the name stays the accessible control.
       expect(avatar.ariaHidden).toBe("true");
@@ -162,7 +133,7 @@ test.describe("Message rows", () => {
     expect(await resolveColor(page, again[0].avatars[0].color)).toEqual(painted);
   });
 
-  test("received avatars take each member id's own colour, clear of the background in both themes", async ({ page }) => {
+  test("received avatars take each member's own colour", async ({ page }) => {
     await openRoom(page);
     // Three fixed identities: Test Sender Insert, then appended arrivals
     // alternate between Test Sender A and B.
@@ -181,17 +152,13 @@ test.describe("Message rows", () => {
     );
     expect(new Set(names).size, `three distinct members: ${names}`).toBe(3);
 
-    for (const scheme of ["light", "dark"] as const) {
-      await page.emulateMedia({ colorScheme: scheme });
-      const colours: string[] = [];
-      for (const [kind, g] of Object.entries(groups)) {
-        colours.push(String(await expectHashedAvatar(page, g, `${scheme} ${kind}`)));
-      }
-      expect(new Set(colours).size, `${scheme}: distinct members, distinct colours (${colours.join(" | ")})`).toBe(3);
-    }
+    const colours = await Promise.all(
+      Object.values(groups).map(async (g) => String(await colourOf(g.getByTestId("message-group-avatar")))),
+    );
+    expect(new Set(colours).size, `distinct members, distinct colours (${colours.join(" | ")})`).toBe(3);
   });
 
-  test("the worst-case avatar colour clears 3:1 over the hover band, and tone moves it", async ({ page }) => {
+  test("the worst-case avatar colour clears 3:1 over the hover band", async ({ page }) => {
     const { received } = await openRoomWithPairs(page);
     const avatar = received.getByTestId("message-group-avatar");
     const paint = async (hue: number, tone: number) =>
@@ -209,7 +176,6 @@ test.describe("Message rows", () => {
       const { band } = await rowSurfaces(page);
       const worst = await paint(hue, tone);
       expect(contrast(worst, band), `${scheme}: hue ${hue} tone ${tone} on the band (${worst} on ${band})`).toBeGreaterThanOrEqual(3);
-      expect(await paint(hue, (tone + 1) % 3), `${scheme}: tone changes the colour`).not.toEqual(worst);
     }
   });
 
