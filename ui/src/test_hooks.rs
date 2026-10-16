@@ -20,6 +20,13 @@
 //!   into a real room, or contract-invalid state where they do not verify.
 
 use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
+
+thread_local! {
+    /// The load worker `setRoomsLoadStateKeepingRooms("migrating")` holds open.
+    static HELD_LOAD_WORKER: std::cell::RefCell<
+        Option<crate::components::app::chat_delegate::LoadWorkerGuard>,
+    > = const { std::cell::RefCell::new(None) };
+}
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::{CurrentRoom, RoomData};
 use dioxus::prelude::*;
@@ -240,9 +247,27 @@ pub fn install_test_hooks() {
                 "loaded" => RoomsLoadState::Loaded,
                 other => wasm_bindgen::throw_str(&format!("unknown rooms load state {other:?}")),
             };
+            // The rail shows `Migrating` under a list only while a load worker
+            // runs (a stale `Migrating` must not keep the note up), so
+            // "migrating" holds a real worker guard until the next call.
+            HELD_LOAD_WORKER.with(|held| {
+                *held.borrow_mut() = (parsed == RoomsLoadState::Migrating)
+                    .then(crate::components::app::chat_delegate::LoadWorkerGuard::new);
+            });
             crate::util::defer(move || {
                 *ROOMS_LOAD_STATE.write() = parsed;
             });
+        })
+        .into_js_value(),
+    );
+
+    // A journaled walk that may still bring rooms back starts (`true`) or ends
+    // (`false`), through the same journal-session version counter a real walk
+    // bumps (freenet/river#802).
+    set_hook(
+        "setWalkRestoringRooms",
+        Closure::<dyn FnMut(bool)>::new(move |on: bool| {
+            crate::components::app::freenet_api::migration_journal::test_set_walk_restoring(on);
         })
         .into_js_value(),
     );

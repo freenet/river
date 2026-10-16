@@ -200,13 +200,36 @@ pub(crate) fn a_pending_predecessor_may_hold_data(status: &JournalStatus) -> boo
 /// requested or running, and the journal says a pending predecessor may hold
 /// data (it has not been found "not installed") or an import was interrupted.
 /// Drives the rail's "Restoring more rooms…" note while a partly restored list
-/// is already showing (freenet/river#802). A walk over predecessors this node
-/// has never had (the usual case once a migration is done) shows nothing.
+/// is already showing (freenet/river#802). A walk whose pending predecessors
+/// were all found "not installed" (the usual case once a migration is done)
+/// shows nothing. A predecessor not yet walked, or one that stays silent (it
+/// cannot run here, or the node predates typed absence) or was refused for a
+/// short index, may still hold rooms, so a walk over it shows the note for the
+/// walk's duration; after `SILENT_MIN_ATTEMPTS` walks those walk only on one
+/// load in `SILENT_WALK_EVERY_N_LOADS`.
 pub(crate) fn walk_may_restore_rooms(s: &JournalSession) -> bool {
     s.walk_in_flight
         && s.status
             .as_ref()
             .is_some_and(|st| a_pending_predecessor_may_hold_data(st) || st.interrupted_import())
+}
+
+/// Test hook (example-data + no-sync builds only): put the session in the
+/// state of a walk over predecessors that may still hold rooms (`true`), or
+/// end that walk (`false`), so a browser test can drive the rail's note
+/// through the same version counter a real walk bumps (freenet/river#802).
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub(crate) fn test_set_walk_restoring(on: bool) {
+    let status = freenet_migrate::MigrationJournal::new_pending(&LINEAGE).status(
+        &LINEAGE,
+        &freenet_migrate::JournalBinding::new(&super::delegate_migration::river_secret_policy(), 0),
+    );
+    update_session(move |s| {
+        s.walk_in_flight = on;
+        if on {
+            s.status = Some(status);
+        }
+    });
 }
 
 /// [`walk_may_restore_rooms`] as it stands now. Callers that render it read
@@ -1025,6 +1048,19 @@ mod tests {
             ..Default::default()
         };
         assert!(!walk_may_restore_rooms(&unknown), "no status read yet");
+        // The steady state once a migration is done on this node: every
+        // pending predecessor is typed "not installed". No note, or every
+        // user's rail would carry one on every walk.
+        let mut absent = known(all_absent_status());
+        absent.walk_in_flight = true;
+        assert!(
+            !walk_may_restore_rooms(&absent),
+            "absent predecessors bring nothing"
+        );
+        // An interrupted import is being finished: rooms may still arrive.
+        let mut interrupted = known(interrupted_status());
+        interrupted.walk_in_flight = true;
+        assert!(walk_may_restore_rooms(&interrupted));
     }
 
     #[test]

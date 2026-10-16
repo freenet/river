@@ -1966,9 +1966,13 @@ pub struct Rooms {
     ///   arrives before (or without) some of its rooms, and pruning the entry
     ///   sent that room to the bottom when it did arrive, after which the next
     ///   save persisted the reshuffled order (freenet/river#802). Entries are
-    ///   dropped only for rooms the user left (`leave_room`, and any room in
-    ///   `removed_rooms` on `merge`/`apply_meta`), so the list is bounded by
-    ///   the rooms the user has not left.
+    ///   dropped only for rooms this device knows the user left (`leave_room`,
+    ///   and any room in `removed_rooms` on `merge`/`apply_meta`). So an entry
+    ///   for a room that never arrives and is never tombstoned here (a slot
+    ///   that stays unreadable, a room lost to a refused predecessor) stays
+    ///   for good: never rendered, a few dozen bytes, and one extra slot probe
+    ///   when this delegate is later migrated from. That is the price of not
+    ///   guessing that a room which has not arrived yet never will.
     /// * On `merge`, this device's order is authoritative; keys seen only in
     ///   the incoming order are inserted next to their incoming neighbours
     ///   ([`merge_room_order`]; same local-wins rule as
@@ -6613,18 +6617,38 @@ mod tests {
             rooms.ordered_room_keys(),
             vec![keys[3], keys[0], keys[1], keys[2]]
         );
-        for mv in [
-            Rooms::move_room_to_end as fn(&mut Rooms, VerifyingKey),
-            Rooms::move_room_up,
-            Rooms::move_room_down,
+        // Every mover, on a room it really moves. keys[2] (absent) sits
+        // between keys[0] and keys[1], and stays right after keys[0].
+        type Mover = fn(&mut Rooms, VerifyingKey);
+        for (name, mv, room, expected) in [
+            (
+                "to_end",
+                Rooms::move_room_to_end as Mover,
+                keys[0],
+                vec![keys[1], keys[0], keys[2]],
+            ),
+            (
+                "up",
+                Rooms::move_room_up as Mover,
+                keys[1],
+                vec![keys[1], keys[0], keys[2]],
+            ),
+            (
+                "down",
+                Rooms::move_room_down as Mover,
+                keys[0],
+                vec![keys[1], keys[0], keys[2]],
+            ),
         ] {
             let mut rooms = rooms_with_keys(&[keys[0], keys[1]]);
-            rooms.room_order = vec![keys[2], keys[0], keys[1]];
-            mv(&mut rooms, keys[0]);
-            assert!(
-                rooms.room_order.contains(&keys[2]),
-                "a reorder must not drop a not-yet-arrived room's entry"
-            );
+            rooms.room_order = vec![keys[0], keys[2], keys[1]];
+            mv(&mut rooms, room);
+            assert_eq!(rooms.ordered_room_keys(), vec![keys[1], keys[0]], "{name}");
+            assert_eq!(rooms.room_order, expected, "{name}");
+            rooms
+                .merge(rooms_with_keys(&[keys[2]]))
+                .expect("merge late room");
+            assert_eq!(rooms.ordered_room_keys(), expected, "{name}");
         }
     }
 

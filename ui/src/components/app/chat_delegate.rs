@@ -281,6 +281,14 @@ pub(crate) fn pending_load_workers() -> u32 {
     PENDING_LOADS.load(Ordering::Relaxed)
 }
 
+/// Bumped when the last load worker of the current attempt settles, so a
+/// render that reads [`pending_load_workers`] (a plain atomic) re-renders when
+/// it drops to zero. The rail's "Restoring more rooms…" note shows `Migrating`
+/// only while a worker is still running (freenet/river#802): with rooms
+/// present nothing resolves `Migrating` back (`settle_terminal` leaves it,
+/// since the list renders anyway), so a stale one must not keep the note up.
+pub static LOAD_WORKERS_SETTLED: GlobalSignal<u64> = Global::new(|| 0);
+
 // =============================================================================
 // DELEGATE-GENERATION AUTHORITY (freenet/river#527)
 // =============================================================================
@@ -3759,7 +3767,14 @@ mod tests {
             ..Default::default()
         };
         let left: std::collections::HashSet<VerifyingKey> = left.iter().copied().collect();
-        let out = reconcile_meta(stored.as_deref(), &local, &Default::default(), &left)
+        // The tab holds the rooms it places, plus the ones it left.
+        let represents: std::collections::HashSet<VerifyingKey> = local
+            .room_order
+            .iter()
+            .chain(left.iter())
+            .copied()
+            .collect();
+        let out = reconcile_meta(stored.as_deref(), &local, &represents, &left)
             .unwrap()
             .expect("stores merged meta");
         ciborium::from_reader::<RoomsMeta, _>(out.as_slice())
@@ -3802,6 +3817,38 @@ mod tests {
             "the tab's own order wins for its rooms; the others keep their \
              stored neighbours"
         );
+    }
+
+    /// An entry this tab only carries for a room it never loaded (a ghost)
+    /// does not undo another tab's placement of that room; it is kept only
+    /// where the store lacks it.
+    #[test]
+    fn reconcile_meta_does_not_let_a_ghost_entry_undo_another_tabs_move() {
+        let k: Vec<VerifyingKey> = (1..=3u8)
+            .map(|i| SigningKey::from_bytes(&[i; 32]).verifying_key())
+            .collect();
+        // Another tab moved k[2] to the front.
+        let stored = meta_bytes(&RoomsMeta {
+            room_order: vec![k[2], k[0], k[1]],
+            ..Default::default()
+        });
+        // This tab holds k[0] and k[1]; k[2] is a ghost at its old position.
+        let local = RoomsMeta {
+            room_order: vec![k[0], k[1], k[2]],
+            ..Default::default()
+        };
+        let represents = std::collections::HashSet::from([k[0], k[1]]);
+        let out = reconcile_meta(Some(&stored), &local, &represents, &Default::default())
+            .unwrap()
+            .unwrap();
+        let merged: RoomsMeta = ciborium::from_reader(out.as_slice()).unwrap();
+        assert_eq!(merged.room_order, vec![k[2], k[0], k[1]]);
+        // With nothing stored, the ghost entry is kept where the tab had it.
+        let out = reconcile_meta(None, &local, &represents, &Default::default())
+            .unwrap()
+            .unwrap();
+        let merged: RoomsMeta = ciborium::from_reader(out.as_slice()).unwrap();
+        assert_eq!(merged.room_order, vec![k[0], k[1], k[2]]);
     }
 
     /// A room this tab left is dropped from the stored order, and a tab's own
@@ -8417,12 +8464,28 @@ fn reconcile_meta(
     if let Some(bytes) = current {
         if let Ok(remote) = ciborium::from_reader::<RoomsMeta, _>(bytes) {
             // Room order (freenet/river#802): this tab's order wins for the
-            // rooms it places, but it must not erase the stored position of a
-            // room it does not place — an empty order from a tab that has not
-            // loaded yet, or one from a tab whose room set is incomplete (a
+            // rooms it holds (`represents`), but it must not erase the stored
+            // position of a room it does not hold: an empty order from a tab
+            // that has not loaded yet, or one whose room set is incomplete (a
             // migration still restoring, a slot that failed to read). Those
-            // keep their stored neighbours. Only rooms this tab left go.
+            // keep their stored neighbours, and so does an entry this tab only
+            // carries for a room it never loaded, so another tab's move of that
+            // room is not undone. Then this tab's own such entries fill in
+            // whatever the store lacks. Only rooms this tab left go. A room
+            // this tab holds but never positioned takes its stored position,
+            // so the persisted order can differ from what this tab renders
+            // (key-byte tail) until it reloads: adopting a placement this
+            // device lacked, the same local-wins rule as `Rooms::merge`.
+            let local_order = std::mem::take(&mut merged.room_order);
+            merged.room_order = local_order
+                .iter()
+                .filter(|vk| represents.contains(vk))
+                .copied()
+                .collect();
             crate::room_data::merge_room_order(&mut merged.room_order, &remote.room_order, |vk| {
+                left.contains(vk)
+            });
+            crate::room_data::merge_room_order(&mut merged.room_order, &local_order, |vk| {
                 left.contains(vk)
             });
             for (vk, mode) in remote.notification_modes {
@@ -10916,6 +10979,12 @@ pub(crate) fn on_load_worker_settled() {
         // defer runs later.
         if !load_attempt_is_current(armed_attempt) {
             return;
+        }
+        // Natively `defer` runs at once with no Dioxus runtime, where a
+        // GlobalSignal write panics; nothing renders there.
+        #[cfg(not(test))]
+        {
+            *LOAD_WORKERS_SETTLED.write() += 1;
         }
         let room_count_zero = rooms_map_is_empty();
         let saw = SAW_FETCH_FAILURE.load(Ordering::Relaxed);
