@@ -275,7 +275,15 @@ impl ChatRoomStateV1 {
         let config_delta = configuration_delta_for_merge(self, parameters, other_state);
         let with_config = self.with_configuration(parameters, &config_delta);
         let summary = self.summarize(&with_config, parameters);
-        let mut delta = other_state.delta(other_state, parameters, &summary)?;
+        // The configuration the merge ends with is offered as `merge_from`
+        // offers it: the summary alone does not replace a placeholder that
+        // outranks the owner's configuration.
+        let mut delta = match other_state.delta(other_state, parameters, &summary) {
+            Some(delta) => delta,
+            None if config_delta.is_some() => ChatRoomStateV1Delta::default(),
+            None => return None,
+        };
+        delta.configuration = config_delta;
         trim_to_work_bounds(
             &mut delta,
             &with_config.configuration.configuration,

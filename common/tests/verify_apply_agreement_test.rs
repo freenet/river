@@ -917,3 +917,46 @@ fn an_unsigned_configuration_is_never_offered() {
         assert_eq!(b.configuration, invalid.configuration, "version {version}");
     }
 }
+
+/// A client's local placeholder configuration (not the owner's) is replaced
+/// by the owner's configuration whatever their ranks, by the whole-state
+/// merge and by the delta a client applies for an incoming state
+/// (`delta_from_merged_summary`) alike; two placeholders never replace each
+/// other, and merging them does not fail.
+#[test]
+fn a_placeholder_configuration_is_replaced_only_by_the_owners() {
+    let r = room();
+    let placeholder = |version: u32, key: u8| {
+        let mut c = public_config(&r);
+        c.configuration_version = version;
+        AuthorizedConfigurationV1::new(c, &SigningKey::from_bytes(&[key; 32]))
+    };
+    let local = ChatRoomStateV1 {
+        configuration: placeholder(9, 0x71),
+        ..Default::default()
+    };
+    let mut c = public_config(&r);
+    c.configuration_version = 1;
+    let owners = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(c, &r.owner_sk),
+        ..Default::default()
+    };
+    let mut merged = local.clone();
+    merged.merge(&local, &r.params, &owners).expect("merge");
+    assert_eq!(merged.configuration, owners.configuration);
+    let mut applied = local.clone();
+    let delta = local.delta_from_merged_summary(&r.params, &owners);
+    applied
+        .apply_delta(&ChatRoomStateV1::default(), &r.params, &delta)
+        .expect("apply");
+    assert_eq!(applied.configuration, owners.configuration);
+
+    let other = ChatRoomStateV1 {
+        configuration: placeholder(10, 0x72),
+        ..Default::default()
+    };
+    let mut kept = local.clone();
+    kept.merge(&local, &r.params, &other)
+        .expect("two placeholders merge");
+    assert_eq!(kept.configuration, local.configuration);
+}
