@@ -56,9 +56,13 @@
 //! pattern (one signed envelope per recipient, strictly-greater version
 //! replaces older); the drop-on-merge filtering effect matches `BansV1`'s
 //! treatment of banned members. Stale peers re-merging a purged message
-//! are blocked by the current `purges` state. Each new envelope MUST
-//! contain a superset of the previous version's tombstones (no
-//! un-purging) - enforced in [`ComposableState::apply_delta`].
+//! are blocked by the current `purges` state. Each envelope a client signs
+//! carries the previous version's tombstones forward
+//! ([`advance_recipient_purges`] unions them), but the contract does not
+//! require it: of two envelopes for one recipient, the higher
+//! [`PurgeRank`] (version, then signature digest) always wins, so every
+//! peer converges on the same envelope whatever order it sees them in
+//! (freenet/river#703).
 //!
 //! # Interaction with bans
 //!
@@ -306,9 +310,10 @@ pub struct RecipientPurges {
     /// Monotonically increasing per-recipient. `0` is reserved as the
     /// "no purge envelope yet" sentinel: the first envelope MUST use
     /// `version >= 1`, and each subsequent envelope MUST use a strictly
-    /// greater `version`. A version-bump MUST also be a superset of the
-    /// previous list - un-purging is not allowed (`apply_delta` rejects
-    /// any shrinking purge list).
+    /// greater `version`. Clients carry the previous list forward
+    /// ([`advance_recipient_purges`]); `apply_delta` keeps the
+    /// higher-ranked envelope whatever its list holds (freenet/river#703),
+    /// so a later envelope that omits a token lifts that tombstone.
     #[serde(default)]
     pub version: u64,
 
@@ -1205,8 +1210,11 @@ impl ComposableState for DirectMessagesV1 {
         //
         // The recipient is the sole signer of their own envelope, so
         // `PurgeRank` (version, then signature digest) is the entire
-        // ordering rule. Each new version's purge list MUST be a superset
-        // of the previous version's list (no un-purging).
+        // ordering rule: the higher-ranked envelope replaces the held one,
+        // whatever either lists. Any rule that also looks at the contents
+        // makes the choice depend on which envelope a peer saw first, and
+        // peers that saw them in different orders would never converge
+        // (freenet/river#703).
         for advance in &delta.advanced_purges {
             if advance.state.version == 0 {
                 return Err(format!(
@@ -1242,39 +1250,9 @@ impl ComposableState for DirectMessagesV1 {
                 .position(|p| p.recipient_id == advance.recipient_id);
             match pos {
                 Some(idx) => {
-                    let current = &self.purges[idx];
-                    if !outranks(advance.rank(), current.rank()) {
-                        continue; // already up to date, or a re-delivery
-                    }
-                    if current.state.version == advance.state.version {
-                        // Same-version-different-content: a multi-device
-                        // recipient who didn't coordinate version numbers,
-                        // or a malicious client. The greater signature
-                        // digest wins, on every peer and in either arrival
-                        // order (freenet/river#703). First-seen-wins, as
-                        // before, left two peers each keeping their own
-                        // envelope with no way to see the other's (the
-                        // summary carried only the version): a permanent
-                        // fork, and `merge(A, B) != merge(B, A)`, which any
-                        // member could trigger at will. The superset rule
-                        // below cannot apply between two envelopes at one
-                        // version, or the tie would not resolve.
+                    if outranks(advance.rank(), self.purges[idx].rank()) {
                         self.purges[idx] = advance.clone();
-                        continue;
                     }
-                    // Monotonic-content: new must be a superset of old.
-                    let current_set: HashSet<PurgeToken> =
-                        current.state.purged.iter().copied().collect();
-                    let advance_set: HashSet<PurgeToken> =
-                        advance.state.purged.iter().copied().collect();
-                    if !current_set.is_subset(&advance_set) {
-                        // Recipient is trying to un-purge tokens by
-                        // shrinking the list across a version bump.
-                        // Silent-drop the malformed envelope rather
-                        // than failing the whole delta.
-                        continue;
-                    }
-                    self.purges[idx] = advance.clone();
                 }
                 None => {
                     self.purges.push(advance.clone());

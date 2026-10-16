@@ -1074,12 +1074,12 @@ fn purge_envelope_same_version_resolves_to_the_higher_rank() {
     );
 }
 
+/// The higher-ranked envelope replaces the held one whatever either lists
+/// (freenet/river#703): ranking by (version, signature digest) alone is what
+/// makes every peer choose the same envelope regardless of arrival order.
+/// Clients still carry tombstones forward (`advance_recipient_purges`).
 #[test]
-fn purge_version_bump_must_be_superset_silent_drop() {
-    // Recipient tries to un-purge tokens via a shrinking version-bump
-    // - the malformed envelope is silently dropped (NOT a hard error),
-    // matching the rest of apply_delta's silent-drop policy. The v1
-    // envelope is retained so the original tombstones still apply.
+fn higher_ranked_purge_envelope_wins_whatever_it_lists() {
     let f = make_fixture();
     let mut state = f.state.clone();
 
@@ -1107,16 +1107,105 @@ fn purge_version_bump_must_be_superset_silent_drop() {
     .unwrap();
     let delta = DirectMessagesDelta {
         new_messages: vec![],
-        advanced_purges: vec![v2],
+        advanced_purges: vec![v2.clone()],
     };
     state
         .direct_messages
         .apply_delta(&state.clone(), &f.params, &Some(delta))
-        .expect("shrinking version-bump must be silently dropped, not error");
+        .expect("a purge envelope never fails the delta");
+    assert_eq!(state.direct_messages.purges, vec![v2.clone()]);
 
-    // v1 retained, v2 ignored.
-    assert_eq!(state.direct_messages.purges.len(), 1);
-    assert_eq!(state.direct_messages.purges[0], v1);
+    // And the lower-ranked one, arriving afterwards, changes nothing.
+    let delta = DirectMessagesDelta {
+        new_messages: vec![],
+        advanced_purges: vec![v1],
+    };
+    state
+        .direct_messages
+        .apply_delta(&state.clone(), &f.params, &Some(delta))
+        .unwrap();
+    assert_eq!(state.direct_messages.purges, vec![v2]);
+}
+
+/// Whole-state merges of peers holding different envelopes for one
+/// recipient: every pair must be one-shot commutative and the peers must
+/// converge, for envelopes at equal and at different versions with any
+/// relation between their lists (freenet/river#703). Exhaustive over a small
+/// set of envelopes, held as any single one per peer, so it does not depend
+/// on random draws.
+#[test]
+fn purge_envelope_merges_are_commutative_and_converge() {
+    let f = make_fixture();
+    let sign = |version: u64, purged: Vec<PurgeToken>| {
+        sign_recipient_purges(
+            &f.bob_sk,
+            f.bob_id,
+            &f.params.owner,
+            RecipientPurges { version, purged },
+        )
+        .unwrap()
+    };
+    let envelopes = vec![
+        sign(1, vec![tok(1)]),
+        sign(1, vec![tok(2)]),
+        sign(2, vec![tok(1), tok(2)]),
+        sign(2, vec![tok(3)]),
+        sign(2, vec![tok(2), tok(3)]),
+        sign(3, vec![tok(1)]),
+        sign(3, vec![]),
+    ];
+    let holding = |e: Option<&AuthorizedRecipientPurges>| {
+        let mut s = f.state.clone();
+        // Keeps Bob a member through cleanup, so his envelope survives it.
+        s.direct_messages
+            .messages
+            .push(dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 1, b"hi"));
+        if let Some(e) = e {
+            s.direct_messages.purges.push(e.clone());
+        }
+        s.post_apply_cleanup(&f.params).unwrap();
+        s.verify(&s, &f.params).unwrap();
+        s
+    };
+    let ser = |s: &ChatRoomStateV1| {
+        let mut v = Vec::new();
+        ciborium::ser::into_writer(s, &mut v).unwrap();
+        v
+    };
+    let peers: Vec<ChatRoomStateV1> = std::iter::once(None)
+        .chain(envelopes.iter().map(Some))
+        .map(holding)
+        .collect();
+    let mut failures = Vec::new();
+    for (i, a) in peers.iter().enumerate() {
+        for (j, b) in peers.iter().enumerate() {
+            let mut ab = a.clone();
+            ab.merge(a, &f.params, b).unwrap();
+            let mut ba = b.clone();
+            ba.merge(b, &f.params, a).unwrap();
+            if ser(&ab) != ser(&ba) {
+                failures.push(format!("peers {i} and {j}: merge(A, B) != merge(B, A)"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    // Every peer gossiping with every other ends on the highest-ranked
+    // envelope.
+    let best = envelopes.iter().max_by_key(|e| e.rank()).unwrap().clone();
+    let mut net = peers.clone();
+    for _ in 0..2 {
+        for i in 0..net.len() {
+            for j in 0..net.len() {
+                let other = net[j].clone();
+                let parent = net[i].clone();
+                net[i].merge(&parent, &f.params, &other).unwrap();
+            }
+        }
+    }
+    for p in &net {
+        assert_eq!(p.direct_messages.purges, vec![best.clone()]);
+    }
 }
 
 #[test]
