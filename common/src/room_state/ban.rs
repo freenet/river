@@ -348,6 +348,18 @@ impl ComposableState for BansV1 {
             // ban repeated identically inside one delta is stored once;
             // records that share an id but differ inside one delta are all
             // kept, so the checks here and at step 0 judge each of them.
+            let max_bans = parent_state.configuration.configuration.max_user_bans;
+            let bound = max_bans.max(MIN_BANS_DELTA_BOUND);
+            // A delta longer than everything held plus the bound cannot be
+            // within the bound however many it re-delivers: refused before
+            // any record is hashed.
+            if delta.len() > self.0.len().saturating_add(bound) {
+                return Err(format!(
+                    "Ban delta of {} exceeds {}; refusing to process a flood",
+                    delta.len(),
+                    bound
+                ));
+            }
             let held_ids: std::collections::HashSet<_> =
                 self.0.iter().map(|ban| ban.id()).collect();
             let mut in_delta = std::collections::HashSet::new();
@@ -371,8 +383,6 @@ impl ComposableState for BansV1 {
             // reject a ban delta from a peer still on the old, higher cap
             // (freenet/river#703 defect 2). The floor heals any reduction from
             // a cap at or below it in one exchange; cleanup trims the excess.
-            let max_bans = parent_state.configuration.configuration.max_user_bans;
-            let bound = max_bans.max(MIN_BANS_DELTA_BOUND);
             if new_bans.len() > bound {
                 return Err(format!(
                     "Ban delta of {} new bans exceeds {}; refusing to process a flood",
@@ -431,8 +441,18 @@ impl ComposableState for BansV1 {
 /// work bound, not a room rule: each new ban costs a signature check here and
 /// up to `2 x MAX_EVIDENCE_DEPTH` evidence chain checks. Kept well below the
 /// members and messages bounds (1000) because of that evidence fan-out: at 100
-/// the evidence floor is 800 records, inside the compute budget estimated on
-/// `MAX_EVIDENCE_DEPTH`.
+/// the evidence floor is 800 records.
+///
+/// The cost this admits, for a room on the default `max_user_bans` (10, so
+/// 10 bans / 80 evidence records before the floor): a 100-ban delta,
+/// including the cap eviction and cleanup it triggers, measured 15-18 ms
+/// natively (opt-level 3, 200 members, 2026-10-16); with the node's WASM
+/// runtime at 0.64-1.0 s per 2000 signature checks (see
+/// `ban_evidence::MAX_EVIDENCE_DEPTH`) that is about 0.03-0.05 s for the
+/// 100 ban checks, and at most 0.26-0.4 s for 800 evidence chain checks:
+/// under 0.5 s together, inside the 5 s compute limit. In exchange, a peer
+/// that has applied a `max_user_bans` reduction from any cap up to 100 no
+/// longer refuses a lagging peer's ban delta (freenet/river#703).
 pub const MIN_BANS_DELTA_BOUND: usize = 100;
 
 /// A user ban with authorization proof

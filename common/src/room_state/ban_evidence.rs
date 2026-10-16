@@ -408,6 +408,14 @@ impl ComposableState for BanEvidenceV1 {
                     .max(crate::room_state::ban::MIN_BANS_DELTA_BOUND),
                 evidence_depth_cap(config.max_members),
             );
+            // Refused before any record is hashed when it cannot be within
+            // the bound however many records it re-delivers.
+            if delta.len() > self.members.len().saturating_add(bound) {
+                return Err(format!(
+                    "Ban evidence delta of {} exceeds {bound}",
+                    delta.len()
+                ));
+            }
             let held_records: HashSet<(MemberId, EvidenceDigest)> = self
                 .members
                 .iter()
