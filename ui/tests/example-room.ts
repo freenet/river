@@ -158,6 +158,17 @@ export function contrast(a: number[], b: number[]): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
+/// `fg` (an [r, g, b, a] from `resolveColor`) composited over an opaque `bg`.
+export function over(fg: number[], bg: number[]): number[] {
+  const a = fg[3] ?? 1;
+  return [0, 1, 2].map((i) => fg[i] * a + bg[i] * (1 - a)).concat(1);
+}
+
+/// The element's computed text colour, as `resolveColor` returns it.
+export async function colourOf(locator: Locator): Promise<number[]> {
+  return resolveColor(locator.page(), await locator.evaluate((el) => getComputedStyle(el).color));
+}
+
 /// Whether a finger can be the pointer: the same query as main.css.
 export function coarsePointer(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none), (any-pointer: coarse)").matches);

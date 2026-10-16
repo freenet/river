@@ -3825,9 +3825,9 @@ fn MessageGroupComponent(
         )
     };
     let name_colour = if is_self {
-        "text-accent hover:text-accent-hover"
+        "text-link hover:text-link-hover"
     } else {
-        "text-text hover:text-accent"
+        "text-text hover:text-link"
     };
     let author_id = group.author_id;
     // Shared by the avatar and the name. `Copy`, since `MemberId` is.
@@ -4172,7 +4172,7 @@ fn MessageGroupComponent(
                                                             ReplyStrip::Unavailable => rsx! {
                                                                 div {
                                                                     "data-testid": "reply-strip-unavailable",
-                                                                    class: "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 py-1.5 mb-0.5 rounded-md italic bg-surface text-text-muted",
+                                                                    class: "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 py-1.5 mb-0.5 rounded-md italic bg-surface text-text-quote",
                                                                     // The arrow is decorative; the sentence
                                                                     // after it is what a screen reader needs.
                                                                     span { "aria-hidden": "true", "\u{21a9} " }
@@ -4187,7 +4187,7 @@ fn MessageGroupComponent(
                                                                 rsx! {
                                                                     div {
                                                                         "data-testid": "reply-strip",
-                                                                        class: "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 py-1.5 mb-0.5 rounded-md cursor-pointer bg-surface text-text-muted",
+                                                                        class: "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 py-1.5 mb-0.5 rounded-md cursor-pointer bg-surface text-text-quote",
                                                                         title: "Scroll to original message (Enter or Space to activate)",
                                                                         role: "button",
                                                                         tabindex: "0",

@@ -134,7 +134,7 @@
 
 /* @mention chips. Rendered as raw <span class="river-mention"> inside message
  * bodies (see conversation::message_to_html_with_mentions). Clickable via the
- * document-level mention click interceptor: an accent-coloured pill on a
+ * document-level mention click interceptor: link-coloured text on a
  * soft-accent fill, matching how `.prose a` links render.
  * `river-mention-self` (a mention of the local user) is a stronger fill so
  * you spot at a glance that you were tagged.
@@ -151,7 +151,7 @@
     white-space: normal;
     overflow-wrap: anywhere;
     cursor: pointer;
-    color: var(--color-accent, #0265e7);
+    color: var(--color-link);
     background-color: var(--color-accent-soft, rgba(2, 101, 231, 0.12));
 }
 
