@@ -762,3 +762,71 @@ fn two_invalid_held_configurations_converge_and_a_valid_one_beats_both() {
     let merged = assert_merges_agree(&r, &b, &valid);
     assert_eq!(merged.configuration, valid.configuration);
 }
+
+/// A state holding TWO blobs for one (version, member): the blob twin of
+/// `two_records_held_at_one_version_are_normalized_in_both_directions`.
+#[test]
+fn two_blobs_held_for_one_member_and_version_are_normalized_in_both_directions() {
+    let r = room();
+    let base = private_room(&r);
+    let mut holder = base.clone();
+    holder.secrets.encrypted_secrets = vec![
+        blob_for(&r, r.member.member.id(), 1, vec![1, 2, 3]),
+        blob_for(&r, r.member.member.id(), 1, vec![4, 5, 6]),
+    ];
+    let merged = assert_merges_agree(&r, &holder, &base);
+    assert_eq!(merged.secrets.encrypted_secrets.len(), 1);
+}
+
+/// A blob that does NOT outrank the held one is a no-op, in whichever order
+/// the pair arrives.
+#[test]
+fn a_lower_ranked_blob_never_replaces_a_held_one_in_either_order() {
+    use river_core::room_state::secret::SecretsDelta;
+    let r = room();
+    let base = private_room(&r);
+    let a = blob_for(&r, r.member.member.id(), 1, vec![1, 2, 3]);
+    let b = blob_for(&r, r.member.member.id(), 1, vec![4, 5, 6]);
+    let (low, high) = if a.digest() < b.digest() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    for (held, arriving) in [(&low, &high), (&high, &low)] {
+        let mut s = base.clone();
+        s.secrets.encrypted_secrets = vec![held.clone()];
+        let mut secrets = s.secrets.clone();
+        secrets
+            .apply_delta(
+                &s,
+                &r.params,
+                &Some(SecretsDelta {
+                    current_version: None,
+                    new_versions: vec![],
+                    new_encrypted_secrets: vec![arriving.clone()],
+                }),
+            )
+            .unwrap();
+        assert_eq!(secrets.encrypted_secrets, vec![high.clone()]);
+    }
+}
+
+/// The state version only moves up, and never past what this contract reads.
+#[test]
+fn the_state_version_ignores_lower_and_unreadable_deltas() {
+    use river_core::room_state::version::StateVersion;
+    let r = room();
+    let s = state(&r, public_config(&r));
+    let mut v = StateVersion(1);
+    v.apply_delta(&s, &r.params, &Some(0)).unwrap();
+    assert_eq!(v, StateVersion(1), "a lower version never lowers it");
+    v.apply_delta(&s, &r.params, &Some(99)).unwrap();
+    assert_eq!(
+        v,
+        StateVersion(1),
+        "a version this contract does not read is ignored"
+    );
+    let mut z = StateVersion(0);
+    z.apply_delta(&s, &r.params, &Some(1)).unwrap();
+    assert_eq!(z, StateVersion(1));
+}
