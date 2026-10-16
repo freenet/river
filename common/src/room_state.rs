@@ -2869,7 +2869,7 @@ mod tests {
     /// guard.
     #[test]
     fn test_banned_member_with_encrypted_secret_is_still_pruned() {
-        use crate::room_state::ban::{AuthorizedUserBan, UserBan, MIN_BANS_DELTA_BOUND};
+        use crate::room_state::ban::{AuthorizedUserBan, UserBan};
         use std::time::SystemTime;
 
         let rng = &mut rand::thread_rng();
@@ -3063,7 +3063,7 @@ mod tests {
     /// "wrong" order.
     #[test]
     fn test_ban_race_with_encrypted_secret_converges_to_pruned() {
-        use crate::room_state::ban::{AuthorizedUserBan, UserBan, MIN_BANS_DELTA_BOUND};
+        use crate::room_state::ban::{AuthorizedUserBan, UserBan};
         use std::time::SystemTime;
 
         let rng = &mut rand::thread_rng();
