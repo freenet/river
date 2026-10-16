@@ -143,12 +143,28 @@ impl ChatRoomStateV1 {
     /// would have been pruned on arrival and the open merge gives the same
     /// state. See [`merge_may_have_withheld_a_survivor`].
     ///
-    /// Both passes offer at most the messages work bound, newest first, so a
-    /// window larger than the bound cannot fail the merge; and if the open
-    /// pass fails anyway, the first pass's result stands
-    /// (freenet/river#703 review). Either case can leave the two merge
-    /// directions differing only in old messages, where failing would have
-    /// refused the merge outright.
+    /// Both passes trim what they offer to the work bounds (see
+    /// `trim_to_work_bounds`), so a sender holding more than one delta may
+    /// carry cannot fail the merge. Trimming can leave one exchange's two
+    /// directions differing in records the merged caps would drop anyway; the
+    /// next exchange carries the difference and they converge.
+    ///
+    /// The open pass's error is discarded and the first pass's result stands.
+    /// The open pass applies the first pass's delta plus older messages, so
+    /// any error it returns comes from those older messages; the first pass
+    /// is already a complete merge, and failing here would refuse a merge the
+    /// trait default completes. No test reaches that branch: it is defensive.
+    ///
+    /// # Normalization and `merge(S, S)`
+    ///
+    /// Every merge applies a delta, even an empty one, so the merged state is
+    /// always normalized: each field re-applies its admission rules and
+    /// `post_apply_cleanup` runs. A state stored by a full-state PUT (which
+    /// runs only `verify`) can hold records the rules drop, and
+    /// `merge(S, S)` then rewrites it once and is a fixpoint after: the merge
+    /// verifier reports that as `state_idempotence` settling after one
+    /// rewrite (`SettledAfter(1)`). On every state a merge or delta produced,
+    /// `merge(S, S) == S`.
     ///
     /// `_parent_state` is ignored: the receiver's own state is the only correct
     /// parent, and every caller passes it. The signature matches the trait's so
@@ -207,9 +223,8 @@ impl ChatRoomStateV1 {
             let open = summary.without_retention_horizons();
             let mut open_merged = self.clone();
             // If the open pass fails, keep the first pass's result rather
-            // than failing a merge the first pass completed: the first pass
-            // is a valid merge that may hold fewer old messages, and failing
-            // here would refuse states the trait merge accepted.
+            // than failing a merge the first pass completed (defensive; see
+            // the doc comment above).
             if open_merged
                 .apply_delta(self, parameters, &delta_against(&open))
                 .is_ok()
