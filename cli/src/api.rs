@@ -6493,6 +6493,19 @@ impl ApiClient {
                 owner: *room_owner_key,
             })
             .map_err(|e| anyhow!("Invalid configuration: {e}"))?;
+        // A lower nickname limit drops every held nickname record over it
+        // (records listing deputies, and the owner's, excepted).
+        let dropped = room_state.member_info.records_dropped_by_nickname_limit(
+            new_config.max_nickname_size,
+            new_config.owner_member_id,
+        );
+        if dropped > 0 {
+            return Err(anyhow!(
+                "{dropped} member nickname(s) are longer than {} bytes; \
+                 lowering the limit below them would remove those nicknames",
+                new_config.max_nickname_size
+            ));
+        }
 
         // Sign the new configuration
         let authorized_config = AuthorizedConfigurationV1::new(new_config, &signing_key);

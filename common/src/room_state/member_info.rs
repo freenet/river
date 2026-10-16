@@ -120,6 +120,51 @@ impl MemberInfoV1 {
     }
 }
 
+/// The most bytes a nickname may declare in a record exempt from the room's
+/// `max_nickname_size` (see [`nickname_admissible`]): a fixed bound, so the
+/// exemption cannot be used to store an unbounded nickname.
+pub const EXEMPT_NICKNAME_CEILING: usize = 1_000;
+
+/// Whether the room admits `info`'s nickname. A record that lists deputies,
+/// or the owner's record, is held to [`EXEMPT_NICKNAME_CEILING`] instead of
+/// the configured `max_nickname_size`: lowering the limit must not drop a
+/// moderator's deputy grants (and with them the bans those grants make
+/// effective), or the owner's own record. Every other record must fit
+/// `max_nickname_size`.
+///
+/// One rule, applied to arrivals, to held records on every apply and to the
+/// summary, so whether a record is kept is a function of the record and the
+/// room's configuration alone, never of which peer held it
+/// (freenet/river#703 review).
+pub fn nickname_admissible(
+    info: &AuthorizedMemberInfo,
+    max_nickname_size: usize,
+    owner_id: MemberId,
+) -> bool {
+    let len = info.member_info.preferred_nickname.declared_len();
+    if info.member_info.member_id == owner_id || !info.member_info.deputies.is_empty() {
+        len <= EXEMPT_NICKNAME_CEILING
+    } else {
+        len <= max_nickname_size
+    }
+}
+
+impl MemberInfoV1 {
+    /// How many held records a room with `max_nickname_size` would drop
+    /// (see [`nickname_admissible`]): what an owner lowering the limit is
+    /// warned about before signing the change.
+    pub fn records_dropped_by_nickname_limit(
+        &self,
+        max_nickname_size: usize,
+        owner_id: MemberId,
+    ) -> usize {
+        self.member_info
+            .iter()
+            .filter(|info| !nickname_admissible(info, max_nickname_size, owner_id))
+            .count()
+    }
+}
+
 /// Deterministic ordering used to pick the canonical `MemberInfo` when two
 /// signed records for the SAME member collide (#411 round 4 item B).
 ///
@@ -375,11 +420,18 @@ impl ComposableState for MemberInfoV1 {
         Ok(())
     }
 
+    /// Reads `parent_state`'s `max_nickname_size`: a record the room would
+    /// drop is not advertised, so a peer holding one is offered the record it
+    /// will keep instead. The whole-state merge summarizes against the
+    /// configuration the merge ends with, which makes this symmetric
+    /// (freenet/river#703 review).
     fn summarize(
         &self,
-        _parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
+        parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
     ) -> Self::Summary {
+        let max_nickname_size = parent_state.configuration.configuration.max_nickname_size;
+        let owner_id = parameters.owner_id();
         // Carry the signature DIGEST alongside the version so anti-entropy can
         // detect a SAME-version content difference and correct it (#411 round
         // 4 B).
@@ -392,7 +444,11 @@ impl ComposableState for MemberInfoV1 {
         // would advertise a different summary and anti-entropy would never
         // reconcile. Migration-safe: `verify` still accepts duplicates.
         let mut summary: Self::Summary = BTreeMap::new();
-        for info in &self.member_info {
+        for info in self
+            .member_info
+            .iter()
+            .filter(|info| nickname_admissible(info, max_nickname_size, owner_id))
+        {
             // The summary value IS the rank, so the fold compares tuples
             // directly rather than re-deriving a rank from a stored signature.
             let candidate = member_info_rank(info.member_info.version, &info.signature);
@@ -452,6 +508,14 @@ impl ComposableState for MemberInfoV1 {
     ) -> Result<(), String> {
         let max_nickname_size = parent_state.configuration.configuration.max_nickname_size;
 
+        // A held record whose nickname the room does not admit is dropped
+        // first, so it neither outranks an arrival the room does admit nor
+        // stays: whether a record is kept is the same whichever side of a
+        // merge held it (the arrival check below applies the same rule).
+        let owner_id = parameters.owner_id();
+        self.member_info
+            .retain(|info| nickname_admissible(info, max_nickname_size, owner_id));
+
         if let Some(delta) = delta {
             // Members plus ban evidence, built once for the whole delta.
             let known = parent_state
@@ -460,13 +524,12 @@ impl ComposableState for MemberInfoV1 {
             for member_info in delta {
                 let member_id = &member_info.member_info.member_id;
 
-                // A nickname longer than the room allows is skipped, not an
-                // error, and one already held is dropped below: `verify` does
-                // not check the length, so a state can hold such a record
-                // (and does whenever the owner lowers `max_nickname_size`), and
-                // an error here would fail every merge with a peer holding it
-                // (freenet/river#703 review).
-                if member_info.member_info.preferred_nickname.declared_len() > max_nickname_size {
+                // A record whose nickname the room does not admit (see
+                // `nickname_admissible`) is skipped, not an error, and one
+                // already held is dropped below: `verify` does not check the
+                // length, and an error here would fail every merge with a peer
+                // holding it.
+                if !nickname_admissible(member_info, max_nickname_size, parameters.owner_id()) {
                     continue;
                 }
 
@@ -538,10 +601,6 @@ impl ComposableState for MemberInfoV1 {
             parameters.owner_id() == info.member_info.member_id
                 || member_map.contains_key(&info.member_info.member_id)
         });
-        // The same nickname limit as for arrivals above, so a record is kept
-        // or dropped the same way whichever side of a merge held it.
-        self.member_info
-            .retain(|info| info.member_info.preferred_nickname.declared_len() <= max_nickname_size);
 
         // Write-side dedup (#411 round 8 Task 2 / item A): the update path above
         // uses first-match to locate the record to update, so if the state

@@ -1,4 +1,4 @@
-use super::edit_room_modal::sign_and_apply_configuration;
+use super::edit_room_modal::{sign_and_apply_configuration, ConfigError};
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::util::ecies::{seal_for_room, unseal_text_or_placeholder};
 use dioxus::logger::tracing::*;
@@ -51,6 +51,7 @@ fn stored_room_name(config: &Configuration) -> String {
 pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
     let seed_config = config.clone();
     let mut room_name = use_signal(move || stored_room_name(&seed_config));
+    let mut config_error = use_signal(|| None::<String>);
 
     // Save the room name. Takes the value as a `String` (rather than a raw
     // form event) so the same logic can be driven from both `onchange` (commit
@@ -108,7 +109,8 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                 description: new_config.display.description.clone(),
             };
 
-            sign_and_apply_configuration(owner_key, new_config, "Room name");
+            config_error
+                .set(sign_and_apply_configuration(owner_key, new_config, "Room name").err());
         } else {
             error!("Room name is empty");
         }
@@ -148,6 +150,7 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                     }
                 },
             }
+            ConfigError { error: config_error() }
         }
     }
 }

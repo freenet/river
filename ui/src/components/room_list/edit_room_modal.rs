@@ -568,6 +568,7 @@ fn stored_description(config: &Configuration) -> String {
 fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
     let seed_config = config.clone();
     let mut description = use_signal(move || stored_description(&seed_config));
+    let mut config_error = use_signal(|| None::<String>);
 
     let update_description = move |evt: Event<FormData>| {
         if !is_owner {
@@ -623,7 +624,8 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
             description: sealed_desc,
         };
 
-        sign_and_apply_configuration(owner_key, new_config, "Room description");
+        config_error
+            .set(sign_and_apply_configuration(owner_key, new_config, "Room description").err());
     };
 
     rsx! {
@@ -670,6 +672,7 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
                 },
                 onchange: update_description,
             }
+            ConfigError { error: config_error() }
         }
     }
 }
@@ -717,6 +720,7 @@ fn NumericConfigField(
     field: ConfigField,
 ) -> Element {
     let mut input_value = use_signal(|| value.to_string());
+    let mut config_error = use_signal(|| None::<String>);
 
     let update_value = move |evt: Event<FormData>| {
         let new_val_str = evt.value().to_string();
@@ -736,7 +740,7 @@ fn NumericConfigField(
         let mut new_config = config.clone();
         field.set(&mut new_config, new_val);
 
-        sign_and_apply_configuration(owner_key, new_config, label);
+        config_error.set(sign_and_apply_configuration(owner_key, new_config, label).err());
     };
 
     rsx! {
@@ -755,6 +759,7 @@ fn NumericConfigField(
                 oninput: move |evt: Event<FormData>| input_value.set(evt.value().to_string()),
                 onchange: update_value,
             }
+            ConfigError { error: config_error() }
         }
     }
 }
@@ -768,6 +773,7 @@ fn MaxMembersField(
     config: Configuration,
 ) -> Element {
     let mut max_members_input = use_signal(|| max_members.to_string());
+    let mut config_error = use_signal(|| None::<String>);
 
     let update_max_members = move |evt: Event<FormData>| {
         if !is_owner {
@@ -790,7 +796,7 @@ fn MaxMembersField(
         let mut new_config = config.clone();
         new_config.max_members = new_max;
 
-        sign_and_apply_configuration(owner_key, new_config, "Max members");
+        config_error.set(sign_and_apply_configuration(owner_key, new_config, "Max members").err());
     };
 
     rsx! {
@@ -817,6 +823,7 @@ fn MaxMembersField(
                     oninput: move |evt: Event<FormData>| max_members_input.set(evt.value().to_string()),
                     onchange: update_max_members,
                 }
+                ConfigError { error: config_error() }
             }
         }
     }
@@ -825,11 +832,14 @@ fn MaxMembersField(
 /// Bump `new_config`'s version, sign it with the room key, apply it locally and
 /// queue the sync. The room's state is snapshotted here, synchronously, as the
 /// parent for the delta.
+///
+/// Returns the reason when the change is refused before signing (see
+/// [`configuration_refusal`]), for the field to show the owner.
 pub(super) fn sign_and_apply_configuration(
     owner_key: VerifyingKey,
     mut new_config: Configuration,
     what: &'static str,
-) {
+) -> Result<(), String> {
     let signing_data = ROOMS.with(|rooms| {
         rooms.map.get(&owner_key).and_then(|room_data| {
             room_data
@@ -843,14 +853,12 @@ pub(super) fn sign_and_apply_configuration(
         // `user_can_edit`, so a key-less owner never gets an enabled field;
         // the modal explains the refusal up front instead (R4).
         warn!("Cannot update {what}: room or local signing key unavailable");
-        return;
+        return Ok(());
     };
     new_config.configuration_version += 1;
-    // The room skips (does not reject) a configuration that fails these
-    // checks, so signing one would log success and change nothing.
-    if let Err(e) = new_config.check_values(&ChatRoomParametersV1 { owner: owner_key }) {
-        error!("Not updating {what}: {e}");
-        return;
+    if let Some(reason) = configuration_refusal(&room_state, owner_key, &new_config) {
+        error!("Not updating {what}: {reason}");
+        return Err(reason);
     }
 
     spawn_local(async move {
@@ -895,6 +903,45 @@ pub(super) fn sign_and_apply_configuration(
             }
         });
     });
+    Ok(())
+}
+
+/// Why the owner's edit producing `new_config` must not be signed, if it
+/// must not:
+/// - it fails the configuration's value checks, which the room skips (does
+///   not reject), so signing it would change nothing;
+/// - it lowers `max_nickname_size` below a nickname the room holds, which
+///   would drop that member's nickname record from the room.
+pub(super) fn configuration_refusal(
+    room_state: &river_core::ChatRoomStateV1,
+    owner_key: VerifyingKey,
+    new_config: &Configuration,
+) -> Option<String> {
+    let params = ChatRoomParametersV1 { owner: owner_key };
+    if let Err(e) = new_config.check_values(&params) {
+        return Some(e);
+    }
+    let too_long = room_state
+        .member_info
+        .records_dropped_by_nickname_limit(new_config.max_nickname_size, params.owner_id());
+    (too_long > 0).then(|| {
+        format!(
+            "{too_long} member nickname(s) are longer than {} bytes. \
+             Lowering the limit below them would remove those nicknames.",
+            new_config.max_nickname_size
+        )
+    })
+}
+
+/// The refusal from [`sign_and_apply_configuration`], under the field that
+/// caused it.
+#[component]
+pub(super) fn ConfigError(error: Option<String>) -> Element {
+    rsx! {
+        if let Some(e) = error {
+            p { "data-testid": "config-error", class: "text-xs text-red-400 mt-1", "{e}" }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -936,6 +983,92 @@ mod tests {
         room.self_sk = None;
         room.self_vk = None;
         (room, owner_vk)
+    }
+
+    /// The owner's room with one other member whose nickname is `nick`
+    /// (`deputies` listed in it), for `configuration_refusal`.
+    fn room_with_nickname(
+        nick: &str,
+        deputies: bool,
+    ) -> (river_core::ChatRoomStateV1, VerifyingKey) {
+        use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+        let owner_sk = local_sk();
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let m_sk = SigningKey::from_bytes(&[8u8; 32]);
+        let mut state = river_core::ChatRoomStateV1::default();
+        let mut config = Configuration {
+            owner_member_id: owner_id,
+            ..Configuration::default()
+        };
+        config.max_nickname_size = 50;
+        state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
+        let m = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: m_sk.verifying_key(),
+            },
+            &owner_sk,
+        );
+        state.members.members.push(m.clone());
+        let mut info = MemberInfo::new_public(m.member.id(), 1, nick.to_string());
+        if deputies {
+            info.deputies = vec![owner_id];
+        }
+        state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(info, &m_sk));
+        (state, owner_vk)
+    }
+
+    fn with_nickname_limit(state: &river_core::ChatRoomStateV1, max: usize) -> Configuration {
+        let mut c = state.configuration.configuration.clone();
+        c.configuration_version += 1;
+        c.max_nickname_size = max;
+        c
+    }
+
+    /// Lowering the nickname limit below a nickname the room holds is
+    /// refused with a reason the owner sees; at or above it, it is not.
+    #[test]
+    fn lowering_the_nickname_limit_below_a_held_nickname_is_refused() {
+        let (state, owner_vk) = room_with_nickname("twelve chars", false);
+        let refusal = configuration_refusal(&state, owner_vk, &with_nickname_limit(&state, 11))
+            .expect("a limit below a held nickname must be refused");
+        assert!(refusal.contains("1 member nickname"), "{refusal}");
+        assert_eq!(
+            configuration_refusal(&state, owner_vk, &with_nickname_limit(&state, 12)),
+            None
+        );
+    }
+
+    /// A record listing deputies keeps its nickname whatever the limit, so
+    /// lowering the limit below it is not refused.
+    #[test]
+    fn a_nickname_in_a_record_with_deputies_does_not_block_lowering_the_limit() {
+        let (state, owner_vk) = room_with_nickname("twelve chars", true);
+        assert_eq!(
+            configuration_refusal(&state, owner_vk, &with_nickname_limit(&state, 3)),
+            None
+        );
+    }
+
+    /// A configuration that fails the value checks is refused with the
+    /// check's reason, before it is signed.
+    #[test]
+    fn a_configuration_failing_the_value_checks_is_refused() {
+        let (state, owner_vk) = room_with_nickname("ok", false);
+        let mut c = with_nickname_limit(&state, 50);
+        c.max_recent_messages = 0;
+        assert!(configuration_refusal(&state, owner_vk, &c).is_some());
+        let mut c = with_nickname_limit(&state, 50);
+        c.owner_member_id = river_core::room_state::member::MemberId::from(
+            &SigningKey::from_bytes(&[9u8; 32]).verifying_key(),
+        );
+        assert!(configuration_refusal(&state, owner_vk, &c).is_some());
     }
 
     /// The property the R4 fix exists for: a key-less owner still OWNS the room

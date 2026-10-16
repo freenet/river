@@ -631,3 +631,93 @@ fn an_invalid_held_configuration_yields_to_a_valid_one_in_both_directions() {
     let merged = assert_merges_agree(&r, &invalid, &valid);
     assert_eq!(merged.configuration, valid.configuration);
 }
+
+// ---------------------------------------------------------------------------
+// Nickname limit (freenet/river#703 review B4)
+// ---------------------------------------------------------------------------
+
+/// Lowering `max_nickname_size` must not revoke a moderator's deputy grants:
+/// a record that lists deputies (or the owner's) is kept whatever the limit;
+/// a plain record over the limit is dropped.
+#[test]
+fn lowering_the_nickname_limit_keeps_records_that_carry_deputies() {
+    use river_core::room_state::ChatRoomStateV1Delta;
+    let r = room();
+    let e_sk = SigningKey::from_bytes(&[14; 32]);
+    let e = AuthorizedMember::new(
+        Member {
+            owner_member_id: r.owner_id,
+            invited_by: r.owner_id,
+            member_vk: e_sk.verifying_key(),
+        },
+        &r.owner_sk,
+    );
+    let mut s = state(&r, public_config(&r));
+    s.members.members.push(e.clone());
+    s.recent_messages.messages = vec![
+        msg(&r, 1, RoomMessageBody::public("hi".into())),
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: r.owner_id,
+                author: e.member.id(),
+                time: at(2),
+                content: RoomMessageBody::public("hey".into()),
+            },
+            &e_sk,
+        ),
+    ];
+    let mut grant = MemberInfo::new_public(r.member.member.id(), 1, "moderator".into());
+    grant.deputies = vec![e.member.id()];
+    s.member_info = MemberInfoV1 {
+        member_info: vec![
+            AuthorizedMemberInfo::new_with_member_key(grant, &r.member_sk),
+            AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo::new_public(e.member.id(), 1, "plain long".into()),
+                &e_sk,
+            ),
+        ],
+    };
+    s.post_apply_cleanup(&r.params).unwrap();
+    s.verify(&s, &r.params).unwrap();
+    let mut c = s.configuration.configuration.clone();
+    c.configuration_version += 1;
+    c.max_nickname_size = 3;
+    let mut after = s.clone();
+    after
+        .apply_delta(
+            &s,
+            &r.params,
+            &Some(ChatRoomStateV1Delta {
+                configuration: Some(AuthorizedConfigurationV1::new(c, &r.owner_sk)),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        after.member_info.deputies_of(r.member.member.id()),
+        &[e.member.id()][..],
+        "a deputy grant must survive a lowered nickname limit"
+    );
+    assert!(after.member_info.canonical(e.member.id()).is_none());
+}
+
+/// A peer holding a newer record over the limit and one holding an older
+/// record within it end on the same record in both merge directions.
+#[test]
+fn an_over_limit_record_and_an_older_valid_one_converge() {
+    let r = room();
+    let mut base = state(&r, public_config(&r));
+    base.recent_messages.messages = vec![msg(&r, 1, RoomMessageBody::public("hi".into()))];
+    let info = |version, nick: &str| MemberInfoV1 {
+        member_info: vec![AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(r.member.member.id(), version, nick.into()),
+            &r.member_sk,
+        )],
+    };
+    let mut long = base.clone();
+    long.member_info = info(5, "far over ten bytes");
+    let mut short = base.clone();
+    short.member_info = info(1, "ok");
+    let merged = assert_merges_agree(&r, &long, &short);
+    assert_eq!(merged.member_info, short.member_info);
+}

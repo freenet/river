@@ -3413,12 +3413,14 @@ mod tests {
     fn a_failing_room_does_not_prevent_the_others_from_merging() {
         fn forged(owner: VerifyingKey, version: u32) -> RoomData {
             let mut room = test_minimal_room_data(owner);
-            let mut config = river_core::room_state::configuration::Configuration::default();
             // The room's real owner id, so the configuration passes the value
             // checks and fails only on its signature: a configuration that
             // fails the checks is not offered at all (freenet/river#703).
-            config.owner_member_id = owner.into();
-            config.configuration_version = version;
+            let config = river_core::room_state::configuration::Configuration {
+                owner_member_id: owner.into(),
+                configuration_version: version,
+                ..Default::default()
+            };
             room.room_state.configuration =
                 river_core::room_state::configuration::AuthorizedConfigurationV1::new(
                     config,
