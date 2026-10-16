@@ -241,3 +241,9 @@ version = "V34"
 description = "Before bans were resolved from converged state (freenet/river#423, PR #702)"
 date = "2026-10-15"
 code_hash = "b98f49cf853c6dc09976197fa00d9f1e4d5a32c0e3d5b06e7e5969f9aa3c4acb"
+
+[[entry]]
+version = "V35"
+description = "Before the max_user_bans cap evicted by age within owner and other pools (freenet/river#796)"
+date = "2026-10-16"
+code_hash = "eb2222c3f584231ee6f010b2802eae10d70f6bb0b6e48e2aa56be1cdef8b5396"

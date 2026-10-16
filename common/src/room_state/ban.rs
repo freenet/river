@@ -31,15 +31,18 @@ use std::time::SystemTime;
 /// member whom a stored ban still references), and its signature must verify
 /// against that record's key. [`crate::room_state::ChatRoomStateV1::post_apply_cleanup`]
 /// sweeps any ban whose issuer is known nowhere. The `max_user_bans` cap is
-/// enforced there too, by tier (owner bans, then bans that take effect, then
-/// mutual bans, then the rest; see [`Self::enforce_user_ban_cap`]), and
+/// enforced there too, by recency within an owner pool and an everyone-else
+/// pool, each guaranteed `max_user_bans / 2` (see
+/// [`Self::enforce_user_ban_cap`]), and
 /// [`ComposableState::apply_delta`] bounds a single delta to `max_user_bans`
 /// new bans so a forged flood cannot make signature verification unbounded.
 ///
-/// KNOWN, ACCEPTED, self-limiting residual (Ian confirmed, #411 round 3 D): a
-/// current member can flood bans against ABSENT targets (each such ban takes
-/// effect because its issuer is not removed), and `banned_at` is signed by the
-/// issuer, so they can evict older effective bans (never owner bans). The
+/// KNOWN, ACCEPTED, self-limiting residual (Ian confirmed, #411 round 3 D;
+/// widened by #796): a current member can flood bans against ABSENT targets
+/// (each such ban takes effect because its issuer is not removed), and
+/// `banned_at` is signed by the issuer, so they can evict older non-owner
+/// bans and owner bans beyond the newest `max_user_bans / 2` (see
+/// [`Self::enforce_user_ban_cap`]). The
 /// flooder is identifiable on every junk ban, and an OWNER ban makes all of
 /// their bans inert. The second #411 residual (slot-squatting through the
 /// banner prune exemption, which #702 keeps for fixpoint stability) remains.
@@ -142,33 +145,76 @@ impl BansV1 {
     /// construction; two copies of an almost-identical predicate is precisely
     /// what drifted in freenet/river#671 and in #411 round 4.
     ///
-    /// Ranks each ban by its tier in [`MembersV1::resolve_bans`] over the
-    /// uncapped set (freenet/river#702, Ian 2026-09-24), highest kept first:
+    /// Evicts by RECENCY within two pools (freenet/river#796, Ian
+    /// 2026-10-16). When the set is over the cap:
     ///
-    /// 1. owner bans ([`BanResolution::OWNER`]): a non-owner ban can never
-    ///    evict one;
-    /// 2. bans that take effect because their issuer is not removed
-    ///    ([`BanResolution::EFFECTIVE`]), and bans whose target's record is
-    ///    held nowhere, by a present member whose signature verifies and whom
-    ///    no ban removes (their authority cannot be judged without the
-    ///    target's record; this is how they ranked before ban evidence);
-    /// 3. bans that close a mutual-ban cycle ([`BanResolution::MUTUAL`]);
-    /// 4. everything else: bans that take no effect, by removed issuers, or
-    ///    unverifiable ([`BanResolution::INERT`]).
+    /// 1. Dead entries go first, oldest first: records whose own signature
+    ///    does not verify against their claimed issuer's key, bans that take
+    ///    no effect, and later duplicates of an `(issuer, target)` pair
+    ///    (below).
+    /// 2. Then live bans are split into OWNER bans and all OTHER bans (deputy,
+    ///    inviter and mutual bans alike). Each pool is guaranteed
+    ///    `max_bans / 2` slots. Only a pool's bans beyond its guarantee can be
+    ///    evicted, and among those the oldest by `(banned_at, id)` go first.
+    ///    With an odd cap and both pools over their share, the spare slot
+    ///    goes to the newest ban beyond either pool's share; with one pool
+    ///    under its share, the other keeps it. Within a pool
+    ///    nothing ranks above anything else.
     ///
-    /// Only one signature-verified ban per `(issuer, target)` pair keeps its
-    /// tier (the oldest by `(banned_at, id)`); later duplicates, owner bans
-    /// included, add nothing and rank inert. Within a tier it evicts oldest
-    /// before newest, then by ban id, and restores the canonical
-    /// `(banned_at, id)` stored order. A no-op when already within the cap.
+    /// Owner bans are often rare, so the guarantee is a floor, not an
+    /// allocation: slots one pool does not use are open to the other, and a
+    /// room with few owner bans gives other bans nearly the whole cap.
     ///
-    /// What this bounds: a member removed by a ban that takes effect, re-added
-    /// with a burst of bans, or a ring of sybils banning each other in pairs
-    /// under deputy grants with far-future dates, can only produce mutual or
-    /// inert bans, so it cannot evict an owner ban or a ban that takes effect.
-    /// A mutual-ban flood can still evict other mutual bans. The residual
-    /// #413 describes (a CURRENT member's effective bans on absent targets)
-    /// is unchanged.
+    /// Why two pools and not one. #702 ranked owner bans above every other
+    /// ban, so a list full of owner bans evicted each new deputy ban the
+    /// moment it was added, and the Official room's deputies could not ban
+    /// anyone. Pure recency over one pool would fix that but let any member
+    /// flush every ban, owner bans included: `banned_at` is signed by the
+    /// issuer and the contract has no clock, so far-future-dated bans always
+    /// count as newest.
+    ///
+    /// What the two pools do NOT bound, stated plainly. ANY current member can
+    /// mint live, far-future-dated bans without moderator rights: against
+    /// throwaway members they invited (an inviter may ban its invitees, and
+    /// sybils it deputizes may ban each other in mutual pairs), or against
+    /// random ids whose record is held nowhere (counted live, below). Such a
+    /// flood evicts:
+    ///
+    /// - every older OTHER ban, deputies' included, except in slots owner
+    ///   bans leave unused. This was already true under #702, where inviter
+    ///   bans ranked with deputy bans; only owner bans were immune. While the
+    ///   flood stands, a new deputy ban dated now is the oldest in its pool
+    ///   and is evicted at once, which is the #796 symptom on purpose
+    ///   (freenet/river#413);
+    /// - OWNER bans beyond the newest `max_bans / 2`. This is new: under #702
+    ///   no non-owner ban could evict an owner ban.
+    ///
+    /// An owner ban on the flooder makes all their bans dead, so the next cap
+    /// pass drops them first; bans already evicted stay evicted, and the
+    /// members they named can rejoin. A room that
+    /// wants every owner ban protected sets `max_user_bans` to at least twice
+    /// its owner-ban count.
+    ///
+    /// A ban takes no effect when [`MembersV1::resolve_bans`] over the uncapped
+    /// set gives it [`BanResolution::INERT`]: its issuer is removed, its
+    /// deputy grant is revoked, the issuer has no authority over the target,
+    /// or its signature cannot be checked. A ban whose target's record is held
+    /// nowhere cannot have its authority judged and removes nobody until the
+    /// target returns; it counts as live (in the other pool) when its issuer
+    /// is a present member whose signature verifies and whom no ban removes,
+    /// as such bans ranked before ban evidence, so bans stored before the
+    /// upgrade keep their place. Only one signature-verified ban per
+    /// `(issuer, target)` pair is live (the oldest by `(banned_at, id)`).
+    ///
+    /// Liveness is judged once, over the uncapped set. Evicting one half of a
+    /// mutual pair can make the surviving half take effect in the post-cap
+    /// resolution, as under #702.
+    ///
+    /// The result is in the canonical `(banned_at, id)` stored order and does
+    /// not depend on the order of `bans` as passed in. (It still depends on
+    /// `members`, which can differ between peers mid-merge; see the
+    /// CONVERGENCE HONESTY note at step 0-cap in `post_apply_cleanup`.) A
+    /// no-op when already within the cap.
     pub fn enforce_user_ban_cap(
         bans: &mut Vec<AuthorizedUserBan>,
         max_bans: usize,
@@ -180,14 +226,35 @@ impl BansV1 {
         if bans.len() <= max_bans {
             return;
         }
+        // Canonical stored order, oldest first; every pass below walks it, and
+        // the per-record indices below refer to it. Records can share
+        // `(banned_at, id)` (an id hashes the signature alone), so the record
+        // digest breaks the tie and the eviction never depends on arrival
+        // order.
+        bans.sort_by_cached_key(|b| (b.ban.banned_at, b.id(), crate::util::record_digest(b)));
         let resolution =
             members.resolve_bans(evidence, &BansV1(bans.clone()), member_info, parameters);
-        // Only signature-verified bans compete for their pair, so a forged
-        // earlier copy cannot displace the real one.
+        let owner_id = parameters.owner_id();
+        let present = members.members_by_member_id();
+        let known = evidence.lookup(members, owner_id);
+        // Each record is judged by its own signature against its claimed
+        // issuer's key; one that does not verify is dead. `resolution` is
+        // keyed by `BanId`, so its lookups below are used only for records
+        // whose own signature verifies.
+        let own_signature_ok: Vec<bool> = bans
+            .iter()
+            .map(|b| {
+                Self::ban_signature_matches_current_key(b, &known, owner_id, &parameters.owner)
+            })
+            .collect();
+        // Only bans whose own signature verifies compete for their pair, so a
+        // forged earlier copy cannot displace the real one.
         let mut first_of_pair: HashMap<(MemberId, MemberId), (SystemTime, BanId)> = HashMap::new();
         for ban in bans
             .iter()
-            .filter(|b| resolution.verified.contains(&b.id()))
+            .zip(&own_signature_ok)
+            .filter(|(_, ok)| **ok)
+            .map(|(b, _)| b)
         {
             let key = (ban.banned_by, ban.ban.banned_user);
             let rank = (ban.ban.banned_at, ban.id());
@@ -200,43 +267,75 @@ impl BansV1 {
                 })
                 .or_insert(rank);
         }
-        let owner_id = parameters.owner_id();
-        let present = members.members_by_member_id();
-        let known = evidence.lookup(members, owner_id);
-        let tier = |ban: &AuthorizedUserBan| {
+        // A dead entry: a record whose own signature does not verify, a later
+        // duplicate of its (issuer, target) pair, or a ban that takes no
+        // effect.
+        let live = |i: usize, ban: &AuthorizedUserBan| {
+            if !own_signature_ok[i] {
+                return false;
+            }
             let first = first_of_pair
                 .get(&(ban.banned_by, ban.ban.banned_user))
                 .is_some_and(|(at, id)| *at == ban.ban.banned_at && *id == ban.id());
             if !first {
-                return BanResolution::INERT;
+                return false;
             }
-            let tier = resolution.tier(&ban.id());
-            // A ban whose target's record is held nowhere cannot have its
-            // authority judged, and removes nobody until the target returns.
-            // It ranks as it did before ban evidence existed (`main`'s
-            // `ban_is_enforcing`): kept as a ban that takes effect when its
-            // issuer is a present member whose signature verifies and whom
-            // no ban removes. Bans stored before the upgrade, whose targets
-            // left before evidence was kept, keep their place at the cap.
-            if tier == BanResolution::INERT
-                && ban.banned_by != owner_id
+            if resolution.tier(&ban.id()) > BanResolution::INERT {
+                return true;
+            }
+            // A ban whose target's record is held nowhere: live when its
+            // issuer is a present member whose signature verifies and whom no
+            // ban removes (see the doc comment).
+            ban.banned_by != owner_id
                 && ban.ban.banned_user != owner_id
                 && present.contains_key(&ban.banned_by)
                 && !known.contains_key(&ban.ban.banned_user)
                 && !resolution.removed.contains(&ban.banned_by)
-            {
-                return BanResolution::EFFECTIVE;
-            }
-            tier
         };
-        bans.sort_by_cached_key(|ban| (tier(ban), ban.ban.banned_at, ban.id()));
-        let to_remove = bans.len() - max_bans;
-        bans.drain(0..to_remove);
-        bans.sort_by(|a, b| {
-            a.ban
-                .banned_at
-                .cmp(&b.ban.banned_at)
-                .then_with(|| a.id().cmp(&b.id()))
+
+        let mut to_remove = bans.len() - max_bans;
+        let mut evict = vec![false; bans.len()];
+        let mut owner_live = Vec::new();
+        let mut other_live = Vec::new();
+        for (i, ban) in bans.iter().enumerate() {
+            if !live(i, ban) {
+                if to_remove > 0 {
+                    evict[i] = true;
+                    to_remove -= 1;
+                }
+            } else if resolution.tier(&ban.id()) == BanResolution::OWNER {
+                owner_live.push(i);
+            } else {
+                other_live.push(i);
+            }
+        }
+        if to_remove > 0 {
+            // Each pool keeps at least `max_bans / 2`; only a pool's bans
+            // beyond that are candidates, and the oldest candidates go first.
+            // With an odd cap the remaining slot goes to the newer ban,
+            // whichever pool it is in. The live total exceeds the cap by
+            // `to_remove` and the two shares sum to at most the cap, so the
+            // pools' excesses sum to at least `to_remove`: the candidates
+            // suffice.
+            let share = max_bans / 2;
+            let owner_excess = owner_live.len().saturating_sub(share);
+            let other_excess = other_live.len().saturating_sub(share);
+            let mut candidates: Vec<usize> = owner_live[..owner_excess]
+                .iter()
+                .chain(&other_live[..other_excess])
+                .copied()
+                .collect();
+            // Indices follow the canonical order, so sorting them sorts by age.
+            candidates.sort_unstable();
+            for i in candidates.into_iter().take(to_remove) {
+                evict[i] = true;
+            }
+        }
+        let mut i = 0;
+        bans.retain(|_| {
+            let keep = !evict[i];
+            i += 1;
+            keep
         });
     }
 }

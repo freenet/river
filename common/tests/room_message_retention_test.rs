@@ -455,8 +455,9 @@ fn ban_evicted_case(privacy: PrivacyMode) {
     state.post_apply_cleanup(&room.params).unwrap();
     assert_eq!(state.bans.0.len(), 1, "the ban on x fits the cap");
 
-    // A newer, enforcing owner ban on an absent id: the cap keeps it and
-    // evicts the older ban on `x`.
+    // A newer, enforcing ban on an absent id by the same deputy: both share
+    // the non-owner pool, so the cap keeps the newer and evicts the older ban
+    // on `x` (freenet/river#796).
     let other = Peer::new();
     let mut delta = room.delta_with_x();
     delta.bans = Some(vec![AuthorizedUserBan::new(
@@ -465,8 +466,8 @@ fn ban_evicted_case(privacy: PrivacyMode) {
             banned_at: SystemTime::now() + Duration::from_secs(60),
             banned_user: other.id,
         },
-        room.owner.id,
-        &room.owner.sk,
+        room.d.id,
+        &room.d.sk,
     )]);
     apply(&mut state, &room.params, delta);
     state

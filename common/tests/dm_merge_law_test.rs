@@ -1100,8 +1100,10 @@ fn dm_ban_derivation_must_apply_the_user_ban_cap() {
         },
         bans: BansV1(vec![
             ban_at(q.id, &d, 1_000), // DEPUTY-issued, oldest -> evicted by the cap
-            ban_at(t1.id, &owner, 2_000),
-            ban_at(t2.id, &owner, 3_000),
+            // Also deputy-issued, so all three share the non-owner pool and
+            // recency alone picks Q's (freenet/river#796).
+            ban_at(t1.id, &d, 2_000),
+            ban_at(t2.id, &d, 3_000),
         ]),
         direct_messages: DirectMessagesV1 {
             messages: legit.iter().chain(&q_dms).cloned().collect(),
@@ -1126,6 +1128,145 @@ fn dm_ban_derivation_must_apply_the_user_ban_cap() {
     assert!(
         !state.bans.0.iter().any(|x| x.ban.banned_user == q.id),
         "test premise: the cap must be what evicts Q's ban"
+    );
+    assert!(
+        member_ids(&state).contains(&q.id),
+        "test premise: with its ban evicted, Q must still be a member"
+    );
+    let held: HashSet<[u8; 64]> = state
+        .direct_messages
+        .messages
+        .iter()
+        .map(|m| m.sender_signature.to_bytes())
+        .collect();
+    let lost: Vec<u64> = legit
+        .iter()
+        .chain(&q_dms)
+        .filter(|m| !held.contains(&m.sender_signature.to_bytes()))
+        .map(|m| m.message.timestamp - BASE_TS)
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "DMs at offsets {lost:?} were deleted at apply time against an UNCAPPED ban \
+         set, though step 0-cap evicts that ban and step 6 would have kept them; \
+         held now = {:?}",
+        held_offsets(&state)
+    );
+}
+
+/// As `dm_ban_derivation_must_apply_the_user_ban_cap`, with the surviving set
+/// decided by the POOLS rather than plain age (freenet/river#796): the oldest
+/// ban is an owner ban, kept by the owner pool's share, and the DM path must
+/// agree that Q's deputy ban is the one evicted. Pure recency would evict the
+/// owner ban instead and keep Q banned.
+#[test]
+fn dm_ban_derivation_applies_the_cap_pools() {
+    const CAP: usize = 20;
+    let owner = Peer::new(1);
+    let (a, b, q) = (Peer::new(10), Peer::new(11), Peer::new(20));
+    let d = Peer::new(13); // deputy
+    let (t1, t2) = (Peer::new(21), Peer::new(22));
+    let p = params(&owner);
+
+    let ban_at = |target: MemberId, banner: &Peer, secs: u64| {
+        AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner.id,
+                banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                banned_user: target,
+            },
+            banner.id,
+            &banner.sk,
+        )
+    };
+
+    let cfg = AuthorizedConfigurationV1::new(
+        Configuration {
+            max_members: 1000,
+            max_user_bans: 2,
+            max_direct_messages: Some(CAP),
+            ..Default::default()
+        },
+        &owner.sk,
+    );
+
+    let mut owner_info = MemberInfo::new_public(owner.id, 1, "owner".to_string());
+    owner_info.deputies = vec![d.id];
+
+    let q_dms: Vec<AuthorizedDirectMessage> =
+        (0..3u64).map(|i| dm(&a, &q, &owner, 100 + i)).collect();
+    let legit: Vec<AuthorizedDirectMessage> = (0..3u64).map(|i| dm(&a, &b, &owner, i)).collect();
+
+    let mut state = ChatRoomStateV1 {
+        configuration: cfg,
+        members: MembersV1 {
+            members: vec![
+                member(&a, &owner),
+                member(&b, &owner),
+                member(&d, &owner),
+                member(&q, &owner),
+                member(&t1, &owner),
+                member(&t2, &owner),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![
+                info(&a),
+                info(&b),
+                info(&d),
+                info(&q),
+                info(&t1),
+                info(&t2),
+                AuthorizedMemberInfo::new(owner_info, &owner.sk),
+            ],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![
+                join_msg(&a, owner.id),
+                join_msg(&b, owner.id),
+                join_msg(&d, owner.id),
+                join_msg(&q, owner.id),
+                join_msg(&t1, owner.id),
+                join_msg(&t2, owner.id),
+            ],
+            ..Default::default()
+        },
+        bans: BansV1(vec![
+            // OWNER-issued and OLDEST, but within the owner pool's share
+            // (1 of cap 2), so it is kept.
+            ban_at(t1.id, &owner, 1_000),
+            // DEPUTY-issued: the non-owner pool holds two against a share of
+            // one, so its oldest, Q's, is evicted (freenet/river#796).
+            ban_at(q.id, &d, 2_000),
+            ban_at(t2.id, &d, 3_000),
+        ]),
+        direct_messages: DirectMessagesV1 {
+            messages: legit.iter().chain(&q_dms).cloned().collect(),
+            purges: vec![],
+        },
+        ..Default::default()
+    };
+
+    let delta = ChatRoomStateV1Delta {
+        member_info: Some(vec![info(&a)]),
+        direct_messages: None,
+        ..Default::default()
+    };
+    let parent = state.clone();
+    state.apply_delta(&parent, &p, &Some(delta)).expect("apply");
+
+    assert_eq!(
+        state.bans.0.len(),
+        2,
+        "test premise: the ban cap must actually bite"
+    );
+    assert!(
+        !state.bans.0.iter().any(|x| x.ban.banned_user == q.id),
+        "test premise: the cap must be what evicts Q's ban"
+    );
+    assert!(
+        state.bans.0.iter().any(|x| x.ban.banned_user == t1.id),
+        "test premise: the older owner ban survives in its pool"
     );
     assert!(
         member_ids(&state).contains(&q.id),
