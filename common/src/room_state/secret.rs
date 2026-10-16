@@ -7,7 +7,7 @@ use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
 /// Room secrets state managing encrypted secret distribution
@@ -79,11 +79,20 @@ impl ComposableState for RoomSecretsV1 {
                 .or_insert(digest);
         }
 
-        let member_secrets: BTreeSet<(SecretVersion, MemberId)> = self
-            .encrypted_secrets
-            .iter()
-            .map(|s| (s.secret.secret_version, s.secret.member_id))
-            .collect();
+        // One entry per (version, member): the highest-ranked blob's digest,
+        // the one `apply_delta` keeps.
+        let mut member_secrets: BTreeMap<(SecretVersion, MemberId), SigDigest> = BTreeMap::new();
+        for b in &self.encrypted_secrets {
+            let digest = b.digest();
+            member_secrets
+                .entry((b.secret.secret_version, b.secret.member_id))
+                .and_modify(|held| {
+                    if outranks(digest, *held) {
+                        *held = digest;
+                    }
+                })
+                .or_insert(digest);
+        }
 
         SecretsSummary {
             current_version: self.current_version,
@@ -114,9 +123,10 @@ impl ComposableState for RoomSecretsV1 {
             .encrypted_secrets
             .iter()
             .filter(|s| {
-                !old_state_summary
+                old_state_summary
                     .member_secrets
-                    .contains(&(s.secret.secret_version, s.secret.member_id))
+                    .get(&(s.secret.secret_version, s.secret.member_id))
+                    .is_none_or(|held| outranks(s.digest(), *held))
             })
             .cloned()
             .collect();
@@ -196,61 +206,41 @@ impl ComposableState for RoomSecretsV1 {
             }
 
             // Verify and stage new encrypted secrets
-            let members_by_id = parent_state.members.members_by_member_id();
             for encrypted_secret in &delta.new_encrypted_secrets {
-                // Held byte for byte: a re-delivery, a no-op (freenet/river#703
-                // defect 2). Both rotation paths build blobs with the shared,
-                // deterministic `build_rotation_encrypted_secrets`, so a
-                // concurrent rotation also lands here. A DIFFERENT blob for a
-                // held (version, member) is still rejected below: it can only
-                // encrypt a different secret, there is no tie-break that keeps
-                // the blobs and the messages at that version consistent, and
-                // the summary carries only (version, member). Rejecting keeps
-                // the merge-law verifier at "inconclusive" for such a pair
-                // instead of a silent, non-commutative pick. Scoped out of
-                // #703.
-                if working.encrypted_secrets.contains(encrypted_secret) {
-                    continue;
+                let key = (
+                    encrypted_secret.secret.secret_version,
+                    encrypted_secret.secret.member_id,
+                );
+                // At a (version, member) this peer already holds a blob for,
+                // the blob with the greater signature digest wins and the
+                // other is a no-op, as for version records: a re-delivery is
+                // a no-op, and two different owner-signed blobs (only the
+                // owner can sign one) converge instead of each peer keeping
+                // its own, which the summary could not see before
+                // freenet/river#703's review.
+                let held = working
+                    .encrypted_secrets
+                    .iter()
+                    .position(|s| (s.secret.secret_version, s.secret.member_id) == key);
+                if let Some(idx) = held {
+                    if !outranks(
+                        encrypted_secret.digest(),
+                        working.encrypted_secrets[idx].digest(),
+                    ) {
+                        continue;
+                    }
                 }
 
                 encrypted_secret
                     .verify_signature(&parameters.owner)
                     .map_err(|e| format!("Invalid encrypted secret signature in delta: {}", e))?;
 
-                let member_id = encrypted_secret.secret.member_id;
-
-                // Skip secrets for removed members — they'll be pruned below.
-                if member_id != parameters.owner_id() && !members_by_id.contains_key(&member_id) {
-                    continue;
+                // Blobs for non-members and at versions without a record are
+                // not admitted; held ones are dropped below, on every apply.
+                match held {
+                    Some(idx) => working.encrypted_secrets[idx] = encrypted_secret.clone(),
+                    None => working.encrypted_secrets.push(encrypted_secret.clone()),
                 }
-
-                // A blob is admitted only at a version the room holds a
-                // record for (in the staged working copy, so a same-delta
-                // new_versions + new_encrypted_secrets pair resolves). One
-                // without is skipped, not an error, and one already held is
-                // dropped below: `verify` does not check it, and an error here
-                // would fail every merge with a peer holding one
-                // (freenet/river#703 review).
-                if !working
-                    .versions
-                    .iter()
-                    .any(|v| v.record.version == encrypted_secret.secret.secret_version)
-                {
-                    continue;
-                }
-
-                // Check for duplicate (version, member_id) pair
-                if working.encrypted_secrets.iter().any(|s| {
-                    s.secret.secret_version == encrypted_secret.secret.secret_version
-                        && s.secret.member_id == member_id
-                }) {
-                    return Err(format!(
-                        "Duplicate encrypted secret for member {:?} version {}",
-                        member_id, encrypted_secret.secret.secret_version
-                    ));
-                }
-
-                working.encrypted_secrets.push(encrypted_secret.clone());
             }
 
             // Update current version if provided. One at or below the held
@@ -275,20 +265,31 @@ impl ComposableState for RoomSecretsV1 {
 
                 working.current_version = new_version;
             }
-
-            // Prune encrypted secrets for removed members
-            let owner_id = parameters.owner_id();
-            working.encrypted_secrets.retain(|s| {
-                s.secret.member_id == owner_id || members_by_id.contains_key(&s.secret.member_id)
-            });
         }
 
-        // The same admission rule as for arrivals above, for blobs held.
+        // Normalize what is held, on every apply and not only one carrying a
+        // secrets delta, so a state `verify` accepts but no apply produces
+        // converges with its normal form (freenet/river#703 review):
+        // - one record per version, the greater signature digest;
+        // - one blob per (version, member), the greater signature digest;
+        // - blobs only for current members (and the owner), and only at a
+        //   version the room holds a record for.
+        working.versions = keep_best(std::mem::take(&mut working.versions), |v| {
+            (v.record.version, v.digest())
+        });
+        working.encrypted_secrets =
+            keep_best(std::mem::take(&mut working.encrypted_secrets), |b| {
+                ((b.secret.secret_version, b.secret.member_id), b.digest())
+            });
+        let owner_id = parameters.owner_id();
+        let members_by_id = parent_state.members.members_by_member_id();
         let versions: HashSet<SecretVersion> =
             working.versions.iter().map(|v| v.record.version).collect();
-        working
-            .encrypted_secrets
-            .retain(|s| versions.contains(&s.secret.secret_version));
+        working.encrypted_secrets.retain(|s| {
+            versions.contains(&s.secret.secret_version)
+                && (s.secret.member_id == owner_id
+                    || members_by_id.contains_key(&s.secret.member_id))
+        });
 
         // Sort for deterministic ordering (CRDT convergence requirement)
         working.versions.sort_by_key(|v| v.record.version);
@@ -300,6 +301,23 @@ impl ComposableState for RoomSecretsV1 {
         *self = working;
         Ok(())
     }
+}
+
+/// Of the items sharing a key, the one with the greatest rank, in a
+/// deterministic order (sorted by key): the same set of items gives the same
+/// result in any order.
+fn keep_best<T, K: Ord, R: Ord + Copy>(items: Vec<T>, key_rank: impl Fn(&T) -> (K, R)) -> Vec<T> {
+    let mut best: BTreeMap<K, (R, T)> = BTreeMap::new();
+    for item in items {
+        let (k, r) = key_rank(&item);
+        match best.get(&k) {
+            Some((held, _)) if !outranks(r, *held) => {}
+            _ => {
+                best.insert(k, (r, item));
+            }
+        }
+    }
+    best.into_values().map(|(_, item)| item).collect()
 }
 
 /// Summary of room secrets state for delta calculation
@@ -317,7 +335,11 @@ pub struct SecretsSummary {
     /// different records at one version are told apart and converge
     /// (freenet/river#703). Changing this type re-keys the contract.
     pub version_ids: BTreeMap<SecretVersion, SigDigest>,
-    pub member_secrets: BTreeSet<(SecretVersion, MemberId)>,
+    /// Each held (version, member) with its blob's signature digest, so two
+    /// different blobs for one member and version are told apart and
+    /// converge (freenet/river#703 review). Changing this type re-keys the
+    /// contract.
+    pub member_secrets: BTreeMap<(SecretVersion, MemberId), SigDigest>,
 }
 
 /// Delta for room secrets state
@@ -392,6 +414,12 @@ pub struct AuthorizedEncryptedSecretForMember {
 }
 
 impl AuthorizedEncryptedSecretForMember {
+    /// The signature digest that breaks a tie between two blobs for one
+    /// (version, member) (greater wins).
+    pub fn digest(&self) -> SigDigest {
+        sig_digest(&self.owner_signature)
+    }
+
     pub fn new(secret: EncryptedSecretForMemberV1, owner_signing_key: &SigningKey) -> Self {
         let signature = sign_struct(&secret, owner_signing_key);
         Self {
@@ -821,8 +849,8 @@ mod tests {
         assert!(summary.version_ids.contains_key(&1));
         assert!(summary.version_ids.contains_key(&2));
         assert_eq!(summary.member_secrets.len(), 2);
-        assert!(summary.member_secrets.contains(&(1, owner_id)));
-        assert!(summary.member_secrets.contains(&(2, owner_id)));
+        assert!(summary.member_secrets.contains_key(&(1, owner_id)));
+        assert!(summary.member_secrets.contains_key(&(2, owner_id)));
     }
 
     #[test]
@@ -852,7 +880,7 @@ mod tests {
         let old_summary = SecretsSummary {
             current_version: 0,
             version_ids: BTreeMap::new(),
-            member_secrets: BTreeSet::new(),
+            member_secrets: BTreeMap::new(),
         };
 
         let delta = secrets.delta(&state, &params, &old_summary).unwrap();
@@ -882,12 +910,14 @@ mod tests {
         let mut old_summary = SecretsSummary {
             current_version: 1,
             version_ids: BTreeMap::new(),
-            member_secrets: BTreeSet::new(),
+            member_secrets: BTreeMap::new(),
         };
         old_summary
             .version_ids
             .insert(1, secrets.versions[0].digest());
-        old_summary.member_secrets.insert((1, owner_id));
+        old_summary
+            .member_secrets
+            .insert((1, owner_id), secrets.encrypted_secrets[0].digest());
 
         let delta = secrets.delta(&state, &params, &old_summary).unwrap();
         assert_eq!(delta.current_version, Some(2));
@@ -1007,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_delta_rejects_duplicate_member_secret() {
+    fn test_apply_delta_resolves_a_second_blob_by_rank() {
         let (state, params, owner_sk) = create_test_state_and_params();
         let owner_id = params.owner_id();
 
@@ -1033,18 +1063,28 @@ mod tests {
             .expect("re-delivering a held blob must not fail");
         assert_eq!(secrets, before);
 
-        // A DIFFERENT blob for the same (version, member) is still rejected:
-        // there is no clean tie-break between two owner devices' secrets.
+        // A DIFFERENT owner-signed blob for the same (version, member) is
+        // resolved by signature digest, not rejected: the summary carries the
+        // blob's digest, so peers holding different ones converge
+        // (freenet/river#703 review).
         let mut other = create_encrypted_secret(owner_id, 1, &owner_sk).secret;
         other.ciphertext = vec![9, 9, 9];
+        let other = AuthorizedEncryptedSecretForMember::new(other, &owner_sk);
+        let held = secrets.encrypted_secrets[0].clone();
         let delta = SecretsDelta {
             current_version: None,
             new_versions: vec![],
-            new_encrypted_secrets: vec![AuthorizedEncryptedSecretForMember::new(other, &owner_sk)],
+            new_encrypted_secrets: vec![other.clone()],
         };
-        let result = secrets.apply_delta(&state, &params, &Some(delta));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Duplicate encrypted secret"));
+        secrets
+            .apply_delta(&state, &params, &Some(delta))
+            .expect("a second blob is resolved, not rejected");
+        let want = if other.digest() > held.digest() {
+            other
+        } else {
+            held
+        };
+        assert_eq!(secrets.encrypted_secrets, vec![want]);
     }
 
     /// A held version record re-delivered is a no-op; of two different

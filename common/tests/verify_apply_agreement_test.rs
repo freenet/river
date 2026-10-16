@@ -540,3 +540,73 @@ fn the_state_version_merges_to_the_higher() {
     let merged = assert_merges_agree(&r, &v0, &v1);
     assert_eq!(merged.version, StateVersion(1));
 }
+
+// ---------------------------------------------------------------------------
+// Secrets normalization (freenet/river#703 review B2)
+// ---------------------------------------------------------------------------
+
+fn blob_for(
+    r: &Room,
+    member: MemberId,
+    version: u32,
+    ciphertext: Vec<u8>,
+) -> river_core::room_state::secret::AuthorizedEncryptedSecretForMember {
+    use river_core::room_state::secret::{
+        AuthorizedEncryptedSecretForMember, EncryptedSecretForMemberV1,
+    };
+    AuthorizedEncryptedSecretForMember::new(
+        EncryptedSecretForMemberV1 {
+            member_id: member,
+            secret_version: version,
+            ciphertext,
+            nonce: [0; 12],
+            sender_ephemeral_public_key: [0; 32],
+            provider: r.owner_id,
+        },
+        &r.owner_sk,
+    )
+}
+
+/// A blob for someone who is not a member is dropped whether or not the
+/// apply carries a secrets delta.
+#[test]
+fn a_blob_for_a_non_member_is_dropped_in_both_directions() {
+    let r = room();
+    let base = private_room(&r);
+    let gone = MemberId::from(&SigningKey::from_bytes(&[13; 32]).verifying_key());
+    let mut holder = base.clone();
+    holder.secrets.encrypted_secrets = vec![blob_for(&r, gone, 1, vec![1, 2, 3])];
+    let merged = assert_merges_agree(&r, &holder, &base);
+    assert!(merged.secrets.encrypted_secrets.is_empty());
+}
+
+/// Two owner-signed records at one held version: one is kept, the same on
+/// both sides.
+#[test]
+fn two_records_held_at_one_version_are_normalized_in_both_directions() {
+    let r = room();
+    let base = private_room(&r);
+    let mut holder = base.clone();
+    let mut second = base.secrets.versions[0].record.clone();
+    second.created_at = at(77);
+    holder
+        .secrets
+        .versions
+        .push(AuthorizedSecretVersionRecord::new(second, &r.owner_sk));
+    let merged = assert_merges_agree(&r, &holder, &base);
+    assert_eq!(merged.secrets.versions.len(), 1);
+}
+
+/// Two different owner-signed blobs for one (version, member), each held by
+/// one peer: both sides end on the same blob.
+#[test]
+fn different_blobs_for_one_member_and_version_converge() {
+    let r = room();
+    let base = private_room(&r);
+    let mut a = base.clone();
+    a.secrets.encrypted_secrets = vec![blob_for(&r, r.member.member.id(), 1, vec![1, 2, 3])];
+    let mut b = base.clone();
+    b.secrets.encrypted_secrets = vec![blob_for(&r, r.member.member.id(), 1, vec![4, 5, 6])];
+    let merged = assert_merges_agree(&r, &a, &b);
+    assert_eq!(merged.secrets.encrypted_secrets.len(), 1);
+}
