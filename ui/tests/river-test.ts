@@ -11,6 +11,13 @@ type RiverTestHooks = {
   makeRoomPrivateWithoutSecret(): void;
   forgeNextSendSignature(): void;
   setRoomsLoadState(state: RoomsLoadState): void;
+  // Same, without clearing ROOMS: the rail's note under a partly restored list.
+  // "migrating" also holds a load worker open until the next call.
+  setRoomsLoadStateKeepingRooms(state: RoomsLoadState): void;
+  // A journaled walk that may still bring rooms back starts (true) or ends (false).
+  setWalkRestoringRooms(on: boolean): void;
+  // The held load worker settles; the load state is left as it is.
+  releaseHeldLoadWorker(): void;
   switchRoom(name: string): void;
   // Peer 0 and peer 1 are two fixed test identities, each with its own thread. Others throw.
   appendDmsForPeer(peerIndex: 0 | 1, count: number): void;

@@ -1967,10 +1967,22 @@ pub struct Rooms {
     ///   this list are appended after the ordered ones in a deterministic
     ///   (key-byte) order — see [`Rooms::ordered_room_keys`]. So an absent
     ///   entry just means "not yet manually positioned", never "hidden".
-    /// * Entries are pruned to keys present in `map` on `merge` and on
-    ///   `leave_room`, so the list never grows without bound.
+    /// * An entry may name a room not (yet) in `map`, and is then ignored by
+    ///   [`Rooms::ordered_room_keys`]. It is kept on purpose: during a
+    ///   migration, or a load where one room's slot failed to read, the order
+    ///   arrives before (or without) some of its rooms, and pruning the entry
+    ///   sent that room to the bottom when it did arrive, after which the next
+    ///   save persisted the reshuffled order (freenet/river#802). Entries are
+    ///   dropped only for rooms this device knows the user left (`leave_room`,
+    ///   and any room in `removed_rooms` on `merge`/`apply_meta`). So an entry
+    ///   for a room that never arrives and is never tombstoned here (a slot
+    ///   that stays unreadable, a room lost to a refused predecessor) stays
+    ///   for good: never rendered, a few dozen bytes, and one extra slot probe
+    ///   when this delegate is later migrated from. That is the price of not
+    ///   guessing that a room which has not arrived yet never will.
     /// * On `merge`, this device's order is authoritative; keys seen only in
-    ///   the incoming order are appended (same local-wins rule as
+    ///   the incoming order are inserted next to their incoming neighbours
+    ///   ([`merge_room_order`]; same local-wins rule as
     ///   `notification_modes`). Cross-device consequence: reordering rooms on
     ///   one device does NOT reorder the rooms another device already has —
     ///   each device keeps its own arrangement and only adopts the *positions*
@@ -2134,13 +2146,48 @@ impl Rooms {
     }
 
     /// Apply a loaded [`RoomsMeta`] onto this in-memory `Rooms` (the per-room
-    /// slots populate `map`/`removed_rooms` separately). `room_order` is pruned
-    /// to rooms actually present.
+    /// slots populate `map`/`removed_rooms` separately). `room_order` drops
+    /// rooms the user left, but keeps rooms that are merely not loaded: a slot
+    /// that failed to read this time must keep its place (freenet/river#802).
     pub fn apply_meta(&mut self, meta: RoomsMeta) {
         self.current_room_key = meta.current_room_key;
         self.notification_modes = meta.notification_modes;
         self.room_order = meta.room_order;
-        self.room_order.retain(|vk| self.map.contains_key(vk));
+        self.room_order
+            .retain(|vk| !self.removed_rooms.contains(vk));
+    }
+}
+
+/// Merge the room order `other` into `base`, keeping `base`'s order for every
+/// room it already places (freenet/river#802).
+///
+/// Each room `other` names that `base` lacks (and `skip` does not reject) is
+/// inserted next to its neighbours in `other`: right after the nearest
+/// preceding room of `other` that `base` already places, else right before the
+/// nearest following one, else at the end. So a room keeps the position the
+/// user gave it relative to the rooms around it, wherever it comes from (a
+/// rooms_meta merged before its rooms, another tab's stored order, a reorder
+/// made while some rooms had not arrived yet). Never introduces a duplicate.
+pub(crate) fn merge_room_order(
+    base: &mut Vec<VerifyingKey>,
+    other: &[VerifyingKey],
+    skip: impl Fn(&VerifyingKey) -> bool,
+) {
+    for (i, vk) in other.iter().enumerate() {
+        if base.contains(vk) || skip(vk) {
+            continue;
+        }
+        let after = other[..i]
+            .iter()
+            .rev()
+            .find_map(|p| base.iter().position(|b| b == p).map(|at| at + 1));
+        let at = after.unwrap_or_else(|| {
+            other[i + 1..]
+                .iter()
+                .find_map(|n| base.iter().position(|b| b == n))
+                .unwrap_or(base.len())
+        });
+        base.insert(at, *vk);
     }
 }
 
@@ -2875,15 +2922,17 @@ impl Rooms {
         }
 
         // Room display order: this device's order is authoritative (a local
-        // user setting, same rule as `notification_modes`). Adopt any keys the
-        // incoming order has that we don't, then prune to rooms actually in
-        // `map` so the list can't accumulate stale entries across merges.
-        for vk in other.room_order {
-            if !self.room_order.contains(&vk) {
-                self.room_order.push(vk);
-            }
-        }
-        self.room_order.retain(|vk| self.map.contains_key(vk));
+        // user setting, same rule as `notification_modes`). Adopt the keys the
+        // incoming order has that we don't, at their incoming position. An
+        // entry for a room not in `map` yet is KEPT: a migration can deliver
+        // the order before (or without) some of its rooms, and pruning it sent
+        // a late room to the bottom, after which the next save persisted that
+        // (freenet/river#802). Only rooms the user left are dropped.
+        let removed = &self.removed_rooms;
+        merge_room_order(&mut self.room_order, &other.room_order, |vk| {
+            removed.contains(vk)
+        });
+        self.room_order.retain(|vk| !removed.contains(vk));
 
         // Surface accumulated per-room failures as one aggregate: every OTHER
         // room has still been merged, but the caller must not be told this went
@@ -2935,6 +2984,15 @@ impl Rooms {
         result
     }
 
+    /// Persist a reordered list of the CURRENT rooms as the display order,
+    /// keeping the entries of ordered rooms not in `map` yet next to their old
+    /// neighbours, so reordering during a migration does not send the rooms
+    /// still to come to the bottom (freenet/river#802).
+    fn set_visible_order(&mut self, order: Vec<VerifyingKey>) {
+        let previous = std::mem::replace(&mut self.room_order, order);
+        merge_room_order(&mut self.room_order, &previous, |_| false);
+    }
+
     /// Move `dragged` so it sits immediately before `target` in the display
     /// order, persisting the resulting full order into `room_order`.
     ///
@@ -2944,7 +3002,8 @@ impl Rooms {
     /// current room or if the two keys are equal. If `target` is not a current
     /// room (unreachable from the UI, where the target is always a rendered
     /// row) the dragged room falls back to the end. After this call
-    /// `room_order` contains exactly the current `map` keys (no stale entries).
+    /// `room_order` holds every current `map` key, plus any entries for rooms
+    /// not in `map` yet, kept beside their old neighbours.
     pub fn move_room(&mut self, dragged: VerifyingKey, target: VerifyingKey) {
         if dragged == target {
             return;
@@ -2961,7 +3020,7 @@ impl Rooms {
             None => order.len(),
         };
         order.insert(insert_at, item);
-        self.room_order = order;
+        self.set_visible_order(order);
     }
 
     /// Move `dragged` to the very end of the display order, persisting the
@@ -2975,7 +3034,7 @@ impl Rooms {
         };
         let item = order.remove(from);
         order.push(item);
-        self.room_order = order;
+        self.set_visible_order(order);
     }
 
     /// Move `room` one position earlier in the display order, persisting the
@@ -2994,7 +3053,7 @@ impl Rooms {
             return;
         }
         order.swap(pos, pos - 1);
-        self.room_order = order;
+        self.set_visible_order(order);
     }
 
     /// Move `room` one position later in the display order, persisting the
@@ -3010,7 +3069,7 @@ impl Rooms {
             return;
         }
         order.swap(pos, pos + 1);
-        self.room_order = order;
+        self.set_visible_order(order);
     }
 }
 
@@ -6460,10 +6519,184 @@ mod tests {
         assert_eq!(rooms.room_order, vec![keys[0], keys[2]]);
     }
 
-    /// Merge keeps this device's order authoritative, adopts incoming-only
-    /// keys, and prunes any order entry not backed by a live room.
+    /// A source carrying only list-level prefs (a `rooms_meta`), no rooms.
+    fn meta_only(order: Vec<VerifyingKey>) -> Rooms {
+        let mut rooms = rooms_with_keys(&[]);
+        rooms.room_order = order;
+        rooms
+    }
+
+    /// freenet/river#802 cause 1: a room whose order entry arrives before the
+    /// room itself (a migration delivering the order first, or a room from an
+    /// older generation arriving after the newer one's `rooms_meta`) keeps the
+    /// user's position. Before the fix `merge` pruned the entry, so the room
+    /// was appended in key-byte order when it arrived and the next save
+    /// persisted the reshuffled order.
     #[test]
-    fn merge_unions_and_prunes_room_order() {
+    fn merge_keeps_position_of_a_room_that_arrives_after_its_order() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        // The user's order is deliberately not the key-byte order.
+        let mut user_order = keys.clone();
+        user_order.sort_by(|a, b| b.as_bytes().cmp(a.as_bytes()));
+
+        let mut rooms = rooms_with_keys(&[]);
+        rooms
+            .merge(meta_only(user_order.clone()))
+            .expect("merge meta");
+        // Rooms then arrive one at a time, in key-byte order (the order a walk
+        // fetches them in). At every step the rail shows the user's order.
+        let mut arrival = keys.clone();
+        arrival.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for (i, vk) in arrival.iter().enumerate() {
+            rooms.merge(rooms_with_keys(&[*vk])).expect("merge room");
+            let expected: Vec<VerifyingKey> = user_order
+                .iter()
+                .filter(|k| arrival[..=i].contains(k))
+                .copied()
+                .collect();
+            assert_eq!(rooms.ordered_room_keys(), expected, "after room {i}");
+        }
+        assert_eq!(rooms.room_order, user_order);
+    }
+
+    /// freenet/river#802 cause 1, the lasting form: the order arrives with
+    /// only some of its rooms, and the rest arrive later.
+    #[test]
+    fn merge_keeps_position_of_a_late_room() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let mut user_order = keys.clone();
+        user_order.sort_by(|a, b| b.as_bytes().cmp(a.as_bytes()));
+        // The newest generation has two of the rooms and the full order...
+        let mut newer = rooms_with_keys(&[user_order[1], user_order[2]]);
+        newer.room_order = user_order.clone();
+        let mut rooms = rooms_with_keys(&[]);
+        rooms.merge(newer).expect("merge newer");
+        // ...and the first room only arrives later (an older generation).
+        rooms
+            .merge(rooms_with_keys(&[user_order[0]]))
+            .expect("merge late room");
+        assert_eq!(rooms.ordered_room_keys(), user_order);
+    }
+
+    /// The per-room load path: `apply_meta` over a map missing a room (its
+    /// slot failed to load this time) keeps that room's entry, so it is in its
+    /// place when it does load and a save in between does not drop it.
+    #[test]
+    fn apply_meta_keeps_entries_for_rooms_not_loaded() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&[keys[0], keys[1]]);
+        rooms.apply_meta(RoomsMeta {
+            room_order: vec![keys[2], keys[1], keys[0]],
+            ..Default::default()
+        });
+        assert_eq!(rooms.room_order, vec![keys[2], keys[1], keys[0]]);
+        assert_eq!(rooms.ordered_room_keys(), vec![keys[1], keys[0]]);
+        rooms
+            .merge(rooms_with_keys(&[keys[2]]))
+            .expect("merge late room");
+        assert_eq!(rooms.ordered_room_keys(), vec![keys[2], keys[1], keys[0]]);
+    }
+
+    /// A room the user left loses its order entry on every path, so the list
+    /// cannot accumulate entries for rooms that are gone.
+    #[test]
+    fn tombstoned_rooms_lose_their_order_entry() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        // apply_meta over a load that read the room as a tombstone.
+        let mut loaded = rooms_with_keys(&[keys[0], keys[2]]);
+        loaded.removed_rooms.insert(keys[1]);
+        loaded.apply_meta(RoomsMeta {
+            room_order: vec![keys[2], keys[1], keys[0]],
+            ..Default::default()
+        });
+        assert_eq!(loaded.room_order, vec![keys[2], keys[0]]);
+
+        // merge: an incoming order naming a room this device left.
+        let mut local = rooms_with_keys(&[keys[0]]);
+        local.leave_room(keys[1]);
+        local
+            .merge(meta_only(vec![keys[1], keys[0]]))
+            .expect("merge");
+        assert_eq!(local.room_order, vec![keys[0]]);
+
+        // merge: an incoming tombstone for a room this device had ordered.
+        let mut local = rooms_with_keys(&keys);
+        local.room_order = vec![keys[2], keys[1], keys[0]];
+        let mut incoming = rooms_with_keys(&[]);
+        incoming.removed_rooms.insert(keys[1]);
+        local
+            .merge_from_source(
+                incoming,
+                SOURCE_RANK_AUTHORITATIVE,
+                MergeAuthority::Authoritative,
+                &mut MergeRanks::default(),
+            )
+            .expect("merge tombstone");
+        assert!(
+            !local.map.contains_key(&keys[1]),
+            "premise: the leave applied"
+        );
+        assert_eq!(local.room_order, vec![keys[2], keys[0]]);
+    }
+
+    /// Reordering while some ordered rooms have not arrived yet keeps those
+    /// rooms' entries next to their old neighbours, so a drag during a
+    /// migration does not send the rooms still to come to the bottom.
+    #[test]
+    fn reordering_keeps_entries_for_rooms_not_yet_arrived() {
+        let keys: Vec<VerifyingKey> = (1..=4).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&[keys[0], keys[1], keys[3]]);
+        // keys[2] is ordered between keys[1] and keys[3] but not here yet.
+        rooms.room_order = vec![keys[0], keys[1], keys[2], keys[3]];
+        rooms.move_room(keys[3], keys[0]);
+        assert_eq!(rooms.ordered_room_keys(), vec![keys[3], keys[0], keys[1]]);
+        rooms
+            .merge(rooms_with_keys(&[keys[2]]))
+            .expect("merge late room");
+        assert_eq!(
+            rooms.ordered_room_keys(),
+            vec![keys[3], keys[0], keys[1], keys[2]]
+        );
+        // Every mover, on a room it really moves. keys[2] (absent) sits
+        // between keys[0] and keys[1], and stays right after keys[0].
+        type Mover = fn(&mut Rooms, VerifyingKey);
+        for (name, mv, room, expected) in [
+            (
+                "to_end",
+                Rooms::move_room_to_end as Mover,
+                keys[0],
+                vec![keys[1], keys[0], keys[2]],
+            ),
+            (
+                "up",
+                Rooms::move_room_up as Mover,
+                keys[1],
+                vec![keys[1], keys[0], keys[2]],
+            ),
+            (
+                "down",
+                Rooms::move_room_down as Mover,
+                keys[0],
+                vec![keys[1], keys[0], keys[2]],
+            ),
+        ] {
+            let mut rooms = rooms_with_keys(&[keys[0], keys[1]]);
+            rooms.room_order = vec![keys[0], keys[2], keys[1]];
+            mv(&mut rooms, room);
+            assert_eq!(rooms.ordered_room_keys(), vec![keys[1], keys[0]], "{name}");
+            assert_eq!(rooms.room_order, expected, "{name}");
+            rooms
+                .merge(rooms_with_keys(&[keys[2]]))
+                .expect("merge late room");
+            assert_eq!(rooms.ordered_room_keys(), expected, "{name}");
+        }
+    }
+
+    /// Merge keeps this device's order authoritative and adopts incoming-only
+    /// keys. An entry for a room not in `map` is kept (it may still arrive,
+    /// freenet/river#802) and is never rendered.
+    #[test]
+    fn merge_unions_room_order() {
         let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
         // Local has all three rooms, ordered [k3, k1] (k2 unpositioned).
         let mut local = rooms_with_keys(&keys);
@@ -6475,8 +6708,35 @@ mod tests {
         incoming.room_order = vec![keys[1], ghost];
 
         local.merge(incoming).expect("merge");
-        // k3,k1 from local; k2 adopted from incoming; ghost pruned.
-        assert_eq!(local.room_order, vec![keys[2], keys[0], keys[1]]);
+        // k3,k1 from local; k2 adopted from incoming; the ghost kept after it
+        // (its incoming neighbour) but not rendered.
+        assert_eq!(local.room_order, vec![keys[2], keys[0], keys[1], ghost]);
+        assert_eq!(local.ordered_room_keys(), vec![keys[2], keys[0], keys[1]]);
+    }
+
+    /// `merge_room_order` keeps the base order and places each missing entry
+    /// beside its neighbours in the other order.
+    #[test]
+    fn merge_room_order_places_missing_entries_by_their_neighbours() {
+        let k: Vec<VerifyingKey> = (1..=6).map(vk_from_seed).collect();
+        // Empty base adopts the other order verbatim.
+        let mut base = Vec::new();
+        merge_room_order(&mut base, &[k[2], k[0], k[1]], |_| false);
+        assert_eq!(base, vec![k[2], k[0], k[1]]);
+        // A missing entry with no placed predecessor goes before its placed
+        // successor; one with a placed predecessor goes right after it.
+        let mut base = vec![k[1], k[3]];
+        merge_room_order(&mut base, &[k[0], k[1], k[2], k[3], k[4]], |_| false);
+        assert_eq!(base, vec![k[0], k[1], k[2], k[3], k[4]]);
+        // Base order wins for the rooms it places, even against `other`.
+        let mut base = vec![k[3], k[1]];
+        merge_room_order(&mut base, &[k[1], k[2], k[3]], |_| false);
+        assert_eq!(base, vec![k[3], k[1], k[2]]);
+        // No anchor at all: appended. Skipped entries are not inserted, and
+        // duplicates in `other` are not duplicated.
+        let mut base = vec![k[5]];
+        merge_room_order(&mut base, &[k[0], k[4], k[0], k[1]], |vk| *vk == k[4]);
+        assert_eq!(base, vec![k[5], k[0], k[1]]);
     }
 
     /// The tail drop zone path: `move_room_to_end` puts a room last regardless
@@ -6546,11 +6806,11 @@ mod tests {
     }
 
     /// `to_meta` → ciborium → `apply_meta` round-trips the list-level view
-    /// preferences, and `apply_meta` prunes `room_order` to rooms present in the
-    /// reconstructed `map` (a stale entry for a no-longer-present room is
-    /// dropped, mirroring the per-room load where slots populate `map` first).
+    /// preferences. An order entry for a room the reconstructed `map` lacks is
+    /// kept (its slot may have failed to load, freenet/river#802) and is not
+    /// rendered.
     #[test]
-    fn rooms_meta_round_trips_and_apply_meta_prunes_order() {
+    fn rooms_meta_round_trips_through_apply_meta() {
         let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
         let ghost = vk_from_seed(88);
         let mut source = rooms_with_keys(&keys);
@@ -6575,8 +6835,10 @@ mod tests {
             reconstructed.notification_modes.get(&keys[0]),
             Some(&NotificationMode::Muted)
         );
-        // Ghost pruned; real order preserved.
-        assert_eq!(reconstructed.room_order, vec![keys[2], keys[0]]);
+        // Order preserved, ghost included but not rendered.
+        assert_eq!(reconstructed.room_order, vec![keys[2], keys[0], ghost]);
+        assert_eq!(&reconstructed.ordered_room_keys()[..2], &[keys[2], keys[0]]);
+        assert!(!reconstructed.ordered_room_keys().contains(&ghost));
     }
 
     /// Backward-compat: a `rooms_data` blob serialised before this PR
