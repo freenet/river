@@ -67,6 +67,8 @@
 //!    it ([`Phase::Reloading`]); it never issues a second. A posted reload that
 //!    has not replaced the page after [`RELOAD_STUCK_MS`] ends in
 //!    [`Phase::ReloadFailed`], whose banner asks the reader to refresh the tab.
+//!    One that never got posted gives up after [`UNPOSTED_TIMEOUT_MS`] and
+//!    falls back to the manual banner.
 //!
 //! A reload always fetches the newest bundle the node has, so a loop could
 //! only persist if the newest build were itself broken, and the caps bound it
@@ -82,7 +84,9 @@
 //! page came from. No automatic reload happens while the reader is busy (see
 //! `user_is_busy`) or within a few seconds of it, or while the page has no
 //! connection to its node (a reload against a node that is down replaces the
-//! app with an error page); pending delegate writes are flushed first.
+//! app with an error page); pending delegate writes are flushed first. A
+//! reader who clicks Reload is not held for being busy (they decided), only
+//! for being offline, and gets the few seconds after a send.
 //!
 //! # How it reloads
 //!
@@ -94,9 +98,8 @@
 //! an id with the new page's and feed it stale notifications. For the same
 //! reason the page never reconnects once a reload is under way, and never at
 //! all once one has been posted, even if it fails; the synchronizer checks
-//! [`is_reloading`]. A top-level
-//! (unframed) dev build reloads itself. River's other self-navigation, on an
-//! expired auth token, is freenet/river#522.
+//! [`is_reloading`]. A top-level (unframed) dev build reloads itself. River's
+//! other self-navigation, on an expired auth token, is freenet/river#522.
 //!
 //! The shell's `navigate` always pushes a history entry, so each reload adds
 //! one, and Back reloads the previous frame path (with its older caps, which
@@ -128,6 +131,9 @@ pub(crate) const RELOAD_PARAM: &str = "_rgen";
 /// The connection manager's auth-reload parameter, dropped on our reloads so
 /// the URL does not accumulate both.
 const AUTH_RELOAD_PARAM: &str = "_reload";
+/// The node shell silently ignores a `navigate` href longer than this.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) const SHELL_HREF_MAX: usize = 4096;
 
 /// Most automatic reloads for one target generation.
 pub(crate) const MAX_TRIES_PER_TARGET: u32 = 5;
@@ -734,7 +740,9 @@ pub(crate) enum PostDecision {
 ///
 /// Offline always waits (a reload against a node that is down shows an error
 /// page). Busy waits only for an automatic reload: a reader who clicked Reload
-/// has decided, and must not be bounced back to a countdown.
+/// has decided, and must not be bounced back to a countdown. A click that
+/// finds the node gone returns to the manual banner rather than becoming an
+/// automatic plan the reader did not ask for.
 pub(crate) fn ready_to_post(
     phase: Phase,
     started_ms: u64,
@@ -748,7 +756,11 @@ pub(crate) fn ready_to_post(
         } if current == started_ms => {}
         _ => return PostDecision::Stale,
     }
-    if !i.connected || (i.busy && !manual) {
+    if manual {
+        if !i.connected {
+            return PostDecision::PutBack(Phase::ManualOnly);
+        }
+    } else if !i.connected || i.busy {
         return PostDecision::PutBack(start(i, 0));
     }
     PostDecision::Post
@@ -971,8 +983,8 @@ pub fn is_watched(id: &ContractInstanceId) -> bool {
 }
 
 pub use runtime::{
-    is_reloading, note_sync_queued, on_connected, on_page_visible, reload_now, snooze,
-    UPDATE_NOTICE,
+    is_reloading, note_sync_queued, on_connected, on_connection_changed, on_page_visible,
+    reload_now, snooze, UPDATE_NOTICE,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -995,6 +1007,7 @@ mod runtime {
     static RELOADING: AtomicBool = AtomicBool::new(false);
     static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(0);
     static LAST_BUSY_MS: AtomicU64 = AtomicU64::new(0);
+    static LAST_SYNC_MS: AtomicU64 = AtomicU64::new(0);
 
     /// Backstop re-check interval. The subscription is the primary signal;
     /// this catches a notification dropped on a full channel.
@@ -1104,7 +1117,24 @@ mod runtime {
     /// sampled once a tick, which a quick "ok⏎" can fall between; this starts
     /// the settle period at once. A network caller only costs a few seconds.
     pub fn note_sync_queued() {
-        LAST_BUSY_MS.store(now_ms(), Ordering::SeqCst);
+        let now = now_ms();
+        LAST_BUSY_MS.store(now, Ordering::SeqCst);
+        LAST_SYNC_MS.store(now, Ordering::SeqCst);
+    }
+
+    /// The connection came or went: recompute the banner, so it never offers
+    /// a Reload that cannot work offline, nor keeps saying "offline" after
+    /// reconnecting. Deferred, so it sees the state the caller is about to
+    /// leave (the synchronizer clears `WEB_API` later in the same arm).
+    pub fn on_connection_changed() {
+        crate::util::defer(|| {
+            let Ok(phase) = STATE.lock().map(|s| s.phase) else {
+                return;
+            };
+            if phase != Phase::Idle {
+                set_notice(notice(phase, current_inputs()));
+            }
+        });
     }
 
     /// A live connection to the node. `WEB_API` is set only once a socket is
@@ -1112,7 +1142,9 @@ mod runtime {
     /// is not a substitute (it reads `Error` through most of an outage, and
     /// also on a live socket).
     fn connected() -> bool {
-        WEB_API.try_read().map(|w| w.is_some()).unwrap_or(false)
+        // A failed borrow means a send holds the socket right now, so there
+        // is one.
+        WEB_API.try_read().map(|w| w.is_some()).unwrap_or(true)
     }
 
     pub(super) fn current_inputs() -> Inputs {
@@ -1179,6 +1211,12 @@ mod runtime {
             &hash,
             param,
         );
+        // The shell silently ignores a `navigate` href over 4096 bytes. Count
+        // that as never posted, so the page may reconnect.
+        if href.len() > SHELL_HREF_MAX {
+            warn!("generation watch: reload URL too long for the shell; not reloading");
+            return false;
+        }
         info!("generation watch: reloading to {href}");
         if is_framed() {
             let msg = js_sys::Object::new();
@@ -1236,6 +1274,15 @@ mod runtime {
     /// first check: the app clears it as soon as a sync is queued, not sent.
     /// What protects a just-sent message is the settle period before this.)
     async fn reload_after_flush(param: String, started_ms: u64, manual: bool) {
+        // A click can follow a send within the settle period the automatic
+        // path waits out; give that send its few seconds too.
+        if manual {
+            let settle_end = LAST_SYNC_MS.load(Ordering::SeqCst) + SETTLE_MS;
+            let wait = settle_end.saturating_sub(now_ms()).min(SETTLE_MS);
+            if wait > 0 {
+                crate::util::sleep(Duration::from_millis(wait)).await;
+            }
+        }
         let deadline = now_ms() + FLUSH_TIMEOUT_MS;
         while now_ms() < deadline && NEEDS_SYNC.try_read().map_or(true, |s| !s.is_empty()) {
             crate::util::sleep(Duration::from_millis(250)).await;
@@ -1352,7 +1399,12 @@ mod runtime {
             return;
         }
         // Against a node that is down, a reload only shows an error page.
-        if !state.observed.is_stale() || !connected() {
+        if !state.observed.is_stale() {
+            return;
+        }
+        if !connected() {
+            drop(state);
+            on_connection_changed(); // show why instead of doing nothing
             return;
         }
         let target = state.observed.target(&WATCHED);
@@ -1420,6 +1472,7 @@ mod runtime {
         if WATCHED.is_empty() {
             return;
         }
+        on_connection_changed();
         check_all(true);
         if !BACKSTOP_RUNNING.swap(true, Ordering::SeqCst) {
             crate::util::safe_spawn_local(async {
@@ -1473,6 +1526,7 @@ mod runtime {
         false
     }
     pub fn note_sync_queued() {}
+    pub fn on_connection_changed() {}
     pub fn on_connected() {}
     pub fn on_page_visible() {}
     pub fn reload_now() {}
@@ -2228,12 +2282,21 @@ mod tests {
             ready_to_post(attempt, 7, false, busy),
             PostDecision::PutBack(start(busy, 0))
         );
-        for manual in [false, true] {
-            assert_eq!(
-                ready_to_post(attempt, 7, manual, offline),
-                PostDecision::PutBack(start(offline, 0))
-            );
-        }
+        assert_eq!(
+            ready_to_post(attempt, 7, false, offline),
+            PostDecision::PutBack(start(offline, 0))
+        );
+        // A click that finds the node gone goes back to the manual banner, not
+        // to an automatic plan the reader did not ask for.
+        assert_eq!(
+            ready_to_post(attempt, 7, true, offline),
+            PostDecision::PutBack(Phase::ManualOnly)
+        );
+        // A put-back plan is a waiting phase, due in the future.
+        let PostDecision::PutBack(plan) = ready_to_post(attempt, 7, false, busy) else {
+            unreachable!()
+        };
+        assert!(plan.due_ms().is_some_and(|d| d > 1_000), "{plan:?}");
         // Another attempt, a timed-out one, or one already posted: stale.
         for phase in [
             Phase::Reloading {
@@ -2669,6 +2732,47 @@ mod tests {
             !drive.contains("RELOADING.store(false"),
             "drive() must never let a page with a posted reload reconnect"
         );
+
+        // Across the whole module (code, not tests), RELOADING is cleared only
+        // inside abandon_reload, which is reached only before posting: the
+        // drive() unposted arm, the pre-post put-back, and a navigate that
+        // could not post. Nowhere after a successful post.
+        let code = &me[..me.find("#[cfg(test)]\nmod tests").expect("tests")];
+        assert_eq!(
+            code.matches("abandon_reload()").count(),
+            4,
+            "1 def + 3 calls"
+        );
+        let body = hook_block(code, "fn abandon_reload()").expect("abandon_reload");
+        let clears = code.matches("RELOADING.swap(false").count()
+            + code.matches("RELOADING.store(false").count();
+        assert_eq!(clears, 1, "RELOADING is cleared in one place");
+        assert!(body.contains("RELOADING.swap(false"));
+        let flush = hook_block(code, "async fn reload_after_flush(").expect("flush");
+        let posted = flush.find("posted_ms: Some(now_ms())").expect("post");
+        let after_post = &flush[posted..];
+        let else_at = after_post.find("} else {").expect("navigate failure arm");
+        assert!(
+            !after_post[..else_at].contains("abandon_reload()"),
+            "nothing may reconnect after a successful post"
+        );
+
+        // The call sites pass the right flavour and attempt tag. drive() must
+        // never claim a manual click (that would reload over open drafts).
+        assert!(drive.contains("reload_after_flush(param, i.now_ms, false)"));
+        assert!(drive.contains("on_reload_due(decision, i.now_ms)"));
+        let reload_now = hook_block(code, "pub fn reload_now()").expect("reload_now");
+        assert!(reload_now.contains("reload_after_flush(param, started_ms, true)"));
+        assert_eq!(code.matches("reload_after_flush(param,").count(), 2);
+
+        // The banner follows the connection both ways.
+        let lost = hook_block(&sync, "SynchronizerMessage::ConnectionLost =>")
+            .expect("ConnectionLost arm");
+        assert!(lost.contains("generation_watch::on_connection_changed()"));
+        assert!(sync.contains("generation_watch::on_connection_changed();\n                                let armed = reconnect.on_connect_failed()")
+            || sync.matches("generation_watch::on_connection_changed()").count() >= 2);
+        let connected = hook_block(code, "pub fn on_connected()").expect("on_connected");
+        assert!(connected.contains("on_connection_changed()"));
     }
 
     /// `user_is_busy` finds the composers by these hooks. Renaming one would

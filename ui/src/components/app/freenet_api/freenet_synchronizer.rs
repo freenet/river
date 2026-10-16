@@ -413,6 +413,10 @@ impl FreenetSynchronizer {
                         }
                     }
                     SynchronizerMessage::ConnectionLost => {
+                        // Keep the update banner honest about the connection
+                        // (freenet/river#580). Deferred: runs after this arm
+                        // has cleared WEB_API.
+                        super::generation_watch::on_connection_changed();
                         // Coalesce: if a reconnect is already scheduled this is a
                         // duplicate loss — the socket we're about to drop will
                         // itself fire `onclose` → another ConnectionLost, and the
@@ -422,12 +426,6 @@ impl FreenetSynchronizer {
                         match reconnect.on_connection_lost() {
                             None => {
                                 info!("ConnectionLost ignored — a reconnect is already pending");
-                                // Still drop the dead socket. With a reconnect
-                                // pending, whatever WEB_API holds is not the live
-                                // connection (a failed attempt leaves the old one
-                                // in place), and "WEB_API set" must mean
-                                // connected (freenet/river#580 relies on it).
-                                WEB_API.write().take();
                             }
                             Some(armed) => {
                                 // Clear the web API so is_connected() returns false
@@ -753,6 +751,7 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Failed to initialize connection: {}", e);
+                                super::generation_watch::on_connection_changed();
                                 let armed = reconnect.on_connect_failed();
                                 warn!(
                                     "Connection failed (attempt {}), reconnecting in {}ms",
