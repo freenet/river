@@ -2427,13 +2427,14 @@ fn surplus_dead_entries_go_oldest_first_and_spare_live_bans() {
     assert!(has_ban(&after, &dup3), "only the overflow is evicted");
 }
 
-/// Both pools over their share with several evictions, interleaved by age
-/// across the pools. Cap 4 (share 2): owner bans at 10, 30, 40, 50 and deputy
-/// bans at 20, 60, 70. Seven live, three go. Candidates are the owner pool's
-/// two oldest (10, 30) and the other pool's oldest (20): exactly three, so
-/// all three go and the newest two of each pool survive.
+/// Both pools over their share with several evictions in one pass. Cap 4
+/// (share 2): owner bans at 10, 30, 40, 50 and deputy bans at 20, 60, 70.
+/// Seven live, three go: each pool's bans beyond its share, oldest first, so
+/// the newest two of each pool survive. (With an even cap the candidates
+/// always number exactly the overflow; the age choice between pools is pinned
+/// by `an_odd_caps_spare_slot_goes_to_the_newer_ban`.)
 #[test]
-fn several_evictions_across_both_pools_go_by_age() {
+fn several_evictions_take_each_pools_oldest_beyond_its_share() {
     let room = capped_room(20, 4);
     let d = room.person();
     let s = room.modded_state(&[&d], &[&d], vec![]);
@@ -2455,6 +2456,58 @@ fn several_evictions_across_both_pools_go_by_age() {
     assert!(!has_ban(&after, &db[0]));
     assert!(has_ban(&after, &o[2]) && has_ban(&after, &o[3]));
     assert!(has_ban(&after, &db[1]) && has_ban(&after, &db[2]));
+}
+
+/// A ban that takes no effect is dead and goes before any live ban, however
+/// new: a plain member B bans D, whom B has no authority over (D is present,
+/// so the ban can be judged, and it is inert). It is the NEWEST ban, yet it is
+/// the one evicted at the cap.
+#[test]
+fn an_inert_ban_goes_before_older_live_bans() {
+    let room = capped_room(20, 3);
+    let (b, d, x) = (room.person(), room.person(), room.person());
+    let s = room.modded_state(&[&b, &d, &x], &[&d], vec![]);
+    let gone: Vec<Person> = (0..2).map(|_| room.person()).collect();
+    let o = room.owner_ban(&gone[0], 10);
+    let d_ban = room.ban(&d, &gone[1], 11);
+    let d_bans_x = room.ban(&d, &x, 12);
+    let s = apply_checked(
+        &s,
+        bans_delta(vec![o.clone(), d_ban.clone(), d_bans_x.clone()]),
+        &room.params,
+    );
+    let inert = room.ban(&b, &d, 100);
+    let after = apply_checked(&s, bans_delta(vec![inert.clone()]), &room.params);
+    assert!(!has_ban(&after, &inert), "the inert ban is evicted");
+    for live in [&o, &d_ban, &d_bans_x] {
+        assert!(has_ban(&after, live), "no live ban is evicted");
+    }
+}
+
+/// A ban on an id held nowhere is live only when its issuer is a present
+/// member: one whose issuer is not present is dead, and is evicted before
+/// older live bans.
+#[test]
+fn an_absent_target_ban_by_an_absent_issuer_is_dead() {
+    let room = capped_room(20, 2);
+    let d = room.person();
+    let s = room.modded_state(&[&d], &[&d], vec![]);
+    let gone: Vec<Person> = (0..2).map(|_| room.person()).collect();
+    let o = room.owner_ban(&gone[0], 10);
+    let d_ban = room.ban(&d, &gone[1], 11);
+    let stranger = room.person();
+    let by_stranger = room.ban(&stranger, &room.person(), 100);
+    let mut bans = vec![by_stranger.clone(), d_ban.clone(), o.clone()];
+    BansV1::enforce_user_ban_cap(
+        &mut bans,
+        2,
+        &s.members,
+        &s.ban_evidence,
+        &s.member_info,
+        &room.params,
+    );
+    let ids: Vec<_> = bans.iter().map(|b| b.id()).collect();
+    assert_eq!(ids, vec![o.id(), d_ban.id()]);
 }
 
 /// The widened residual of freenet/river#796, pinned so a future fix flips it

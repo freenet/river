@@ -156,7 +156,9 @@ impl BansV1 {
     ///    inviter and mutual bans alike). Each pool is guaranteed
     ///    `max_bans / 2` slots. Only a pool's bans beyond its guarantee can be
     ///    evicted, and among those the oldest by `(banned_at, id)` go first.
-    ///    With an odd cap the spare slot goes to the newer ban. Within a pool
+    ///    With an odd cap and both pools over their share, the spare slot
+    ///    goes to the newer of the two pools' oldest candidates; with one
+    ///    pool under its share, the other keeps it. Within a pool
     ///    nothing ranks above anything else.
     ///
     /// Owner bans are often rare, so the guarantee is a floor, not an
@@ -209,7 +211,10 @@ impl BansV1 {
     /// resolution, as under #702.
     ///
     /// The result is in the canonical `(banned_at, id)` stored order and does
-    /// not depend on input order. A no-op when already within the cap.
+    /// not depend on the order of `bans` as passed in. (It still depends on
+    /// `members`, which can differ between peers mid-merge; see the
+    /// CONVERGENCE HONESTY note at step 0-cap in `post_apply_cleanup`.) A
+    /// no-op when already within the cap.
     pub fn enforce_user_ban_cap(
         bans: &mut Vec<AuthorizedUserBan>,
         max_bans: usize,

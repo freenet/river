@@ -205,7 +205,9 @@ impl ChatRoomStateV1 {
         //     anti-entropy always converges — pinned by
         //     `cap_eviction_reconciles_via_merge`; tracked in freenet/river#413,
         //     Limitation 1). Do NOT claim the eviction is order-independent per
-        //     delta.
+        //     delta. (`enforce_user_ban_cap` is independent of the order of the
+        //     ban list it is handed; the arrival-order dependence is in the
+        //     member set it judges against.)
         //     `verify`'s hard cap ceiling still rejects any stored state left over
         //     the cap. The signature sweep (step 4) still runs AFTER enforcement
         //     to drop bans orphaned by a banner's removal, and only removes bans,
