@@ -2,6 +2,14 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- `debug bans` judges each ban record by its own signature. A record that
+  copies another ban's signature was reported with that ban's status
+  (freenet/river#797 follow-up). Display only: the contract already drops
+  such records.
+
 ## [0.2.22] - 2026-10-16
 
 ### Changed
