@@ -1001,12 +1001,19 @@ mod runtime {
             }
         }
         // While disconnected, what the reader just did may not have left yet,
-        // and a reload would not make anything arrive either. Wait.
-        let connected = SYNC_STATUS
+        // and a reload would not make anything arrive either. Wait. (Only the
+        // two down states: `Error(..)` is also set on a live socket, e.g. for
+        // an unsupported operation, and must not hold a reload forever.)
+        let down = SYNC_STATUS
             .try_read()
-            .map(|s| matches!(*s, SynchronizerStatus::Connected))
-            .unwrap_or(false);
-        if !connected {
+            .map(|s| {
+                matches!(
+                    *s,
+                    SynchronizerStatus::Disconnected | SynchronizerStatus::Connecting
+                )
+            })
+            .unwrap_or(true);
+        if down {
             return true;
         }
         // An invitation being accepted. Only the in-flight states: a finished
