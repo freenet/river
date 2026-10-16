@@ -254,6 +254,31 @@ impl ChatRoomStateV1 {
         )
     }
 
+    /// What `other_state` offers this state against
+    /// [`Self::summarize_with_merged_configuration`], trimmed to the work
+    /// bounds of the room the merge ends with, as [`Self::merge_from`] trims
+    /// it: the delta a receiver that merges `other_state` through its own
+    /// summary (the UI's incoming-state path) applies. Without the trim, an
+    /// incoming state holding more than one delta may carry fails to merge
+    /// (freenet/river#703).
+    pub fn delta_from_merged_summary(
+        &self,
+        parameters: &ChatRoomParametersV1,
+        other_state: &ChatRoomStateV1,
+    ) -> Option<ChatRoomStateV1Delta> {
+        let config_delta = configuration_delta_for_merge(self, parameters, other_state);
+        let with_config = self.with_configuration(parameters, &config_delta);
+        let summary = self.summarize(&with_config, parameters);
+        let mut delta = other_state.delta(other_state, parameters, &summary)?;
+        trim_to_work_bounds(
+            &mut delta,
+            &with_config.configuration.configuration,
+            other_state,
+            parameters,
+        );
+        Some(delta)
+    }
+
     /// This state with `config_delta` applied to its configuration, borrowed
     /// unchanged when there is none.
     fn with_configuration(

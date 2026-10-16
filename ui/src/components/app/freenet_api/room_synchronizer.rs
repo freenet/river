@@ -45,7 +45,9 @@ use std::sync::Arc;
 ///
 /// * `summarize` must see the SUMMARIZING peer's own state, with the
 ///   configuration the merge will end with
-///   (`ChatRoomStateV1::summarize_with_merged_configuration`).
+///   (`ChatRoomStateV1::delta_from_merged_summary`, which summarizes as
+///   `summarize_with_merged_configuration` does and trims the delta to the
+///   merged room's work bounds).
 ///   `MessagesV1::summarize` reads `max_recent_messages` from it to size its
 ///   retention horizon (and the DM summary its global cap); hand it anything
 ///   else and the horizon is wrong. With the PRE-merge configuration, an
@@ -72,8 +74,10 @@ fn merge_incoming_state(
     params: &ChatRoomParametersV1,
     incoming: &ChatRoomStateV1,
 ) -> Result<Option<ChatRoomStateV1Delta>, String> {
-    let summary = local.summarize_with_merged_configuration(params, incoming);
-    let delta = incoming.delta(incoming, params, &summary);
+    // The summary is read with the incoming configuration merged in, and the
+    // delta is trimmed to the merged room's work bounds, as the room's own
+    // whole-state merge trims it (freenet/river#703).
+    let delta = local.delta_from_merged_summary(params, incoming);
     let parent_sentinel = ChatRoomStateV1::default();
     local.apply_delta(&parent_sentinel, params, &delta)?;
     Ok(delta)
@@ -1872,6 +1876,65 @@ mod tests {
         };
         let authorized = AuthorizedMessageV1::new(msg, author_sk);
         state.recent_messages.messages.push(authorized);
+    }
+
+    /// An incoming state that holds more bans than one delta may carry (its
+    /// owner's configuration was older, with a higher `max_user_bans`) merges
+    /// into a local state already on the lowered cap: the incoming path trims
+    /// what it takes to the work bound, as the whole-state merge does
+    /// (freenet/river#703).
+    #[test]
+    fn merge_incoming_state_trims_to_the_work_bound() {
+        use river_core::room_state::ban::{
+            AuthorizedUserBan, BansV1, UserBan, MIN_BANS_DELTA_BOUND,
+        };
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        let (_, params, owner_sk) = create_test_room();
+        let owner_id = params.owner_id();
+        let config = |version: u32, max_user_bans: usize| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    configuration_version: version,
+                    max_user_bans,
+                    ..Default::default()
+                },
+                &owner_sk,
+            )
+        };
+        let held = MIN_BANS_DELTA_BOUND + 3;
+        let bans = (0..held as u64)
+            .map(|i| {
+                let target = SigningKey::from_bytes(&{
+                    let mut b = [9u8; 32];
+                    b[..8].copy_from_slice(&i.to_le_bytes());
+                    b
+                });
+                AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner_id,
+                        banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i),
+                        banned_user: MemberId::from(&target.verifying_key()),
+                    },
+                    owner_id,
+                    &owner_sk,
+                )
+            })
+            .collect();
+        let mut incoming = ChatRoomStateV1 {
+            configuration: config(1, held),
+            bans: BansV1(bans),
+            ..Default::default()
+        };
+        incoming.post_apply_cleanup(&params).unwrap();
+        let mut local = ChatRoomStateV1 {
+            configuration: config(2, 2),
+            ..Default::default()
+        };
+        merge_incoming_state(&mut local, &params, &incoming)
+            .expect("an incoming state over the work bound merges");
+        assert_eq!(local.bans.0.len(), 2);
+        local.verify(&local, &params).unwrap();
     }
 
     #[test]
