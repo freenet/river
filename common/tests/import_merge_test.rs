@@ -22,8 +22,14 @@ fn test_default_state_has_placeholder_owner() {
     );
 }
 
+/// Since freenet/river#703 a configuration with a different owner_member_id
+/// is SKIPPED rather than failing the merge (an `Err` for an owner-signed
+/// record would freeze every other field of a whole-state merge too). The
+/// placeholder configuration therefore survives the merge and the room still
+/// reads as awaiting its initial sync (its configuration does not verify
+/// against the owner), which is why the UI replaces such a state wholesale.
 #[test]
-fn test_merge_fails_when_owner_member_id_differs() {
+fn test_merge_does_not_adopt_config_when_owner_member_id_differs() {
     let owner_sk = SigningKey::generate(&mut OsRng);
     let owner_vk = owner_sk.verifying_key();
     let params = ChatRoomParametersV1 { owner: owner_vk };
@@ -40,19 +46,27 @@ fn test_merge_fails_when_owner_member_id_differs() {
     };
     let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
     let network_state = ChatRoomStateV1 {
-        configuration: auth_config,
+        configuration: auth_config.clone(),
         ..Default::default()
     };
 
-    // Merge should fail because owner_member_id differs
-    let result = local_state.merge(&current, &params, &network_state);
-    assert!(
-        result.is_err(),
-        "Merge should fail due to owner_member_id mismatch"
+    assert_eq!(
+        auth_config.check_values(&current.configuration.configuration),
+        Err("Cannot change the owner_member_id".to_string())
+    );
+    local_state
+        .merge(&current, &params, &network_state)
+        .expect("the merge skips the configuration rather than failing");
+    assert_eq!(
+        local_state.configuration, current.configuration,
+        "the placeholder configuration must not be replaced through a merge"
     );
     assert!(
-        result.unwrap_err().contains("owner_member_id"),
-        "Error should mention owner_member_id"
+        local_state
+            .configuration
+            .verify_signature(&owner_vk)
+            .is_err(),
+        "the room still reads as awaiting its initial sync"
     );
 }
 

@@ -223,7 +223,7 @@ fn json_round_trip_of_full_chat_room_state_preserves_dms() {
 fn json_round_trip_of_summary_does_not_drop_fields() {
     // Companion to json_round_trip_with_populated_purges: the Summary
     // is the wire-boundary type traversed by delta computation.
-    // `purge_versions: Vec<(MemberId, u64)>` must survive JSON round-trip.
+    // `purge_versions: Vec<(MemberId, PurgeRank)>` must survive JSON round-trip.
     let f = make_fixture();
     let msg = dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 1, b"hi");
     let purges = sign_recipient_purges(
@@ -1019,53 +1019,59 @@ fn purge_envelope_monotonic_version_apply_delta() {
 }
 
 #[test]
-fn purge_envelope_same_version_different_content_silently_dropped() {
+fn purge_envelope_same_version_resolves_to_the_higher_rank() {
     // A buggy / multi-device recipient might sign two envelopes at the
-    // same version with different content. We silent-drop the incoming
-    // (later-arriving) envelope rather than poisoning the whole delta
-    // merge - first-seen wins. The other deltas in the same batch must
-    // still apply cleanly.
+    // same version with different content. The envelope with the greater
+    // signature digest wins in either arrival order, and the summary tells
+    // the two apart, so peers converge (freenet/river#703). Until then the
+    // first-seen one won and peers stayed forked. Neither conflict may
+    // poison the rest of the delta.
     let f = make_fixture();
-    let mut state = f.state.clone();
-
-    let env_a = sign_recipient_purges(
-        &f.bob_sk,
-        f.bob_id,
-        &f.params.owner,
-        RecipientPurges {
-            version: 2,
-            purged: vec![tok(10)],
-        },
-    )
-    .unwrap();
-    state.direct_messages.purges.push(env_a.clone());
-
-    let env_b = sign_recipient_purges(
-        &f.bob_sk,
-        f.bob_id,
-        &f.params.owner,
-        RecipientPurges {
-            version: 2,
-            purged: vec![tok(20)],
-        },
-    )
-    .unwrap();
-    let msg = dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 1, b"unrelated");
-    let delta = DirectMessagesDelta {
-        new_messages: vec![msg.clone()],
-        advanced_purges: vec![env_b],
+    let sign = |purged: Vec<PurgeToken>| {
+        sign_recipient_purges(
+            &f.bob_sk,
+            f.bob_id,
+            &f.params.owner,
+            RecipientPurges { version: 2, purged },
+        )
+        .unwrap()
     };
-    state
-        .direct_messages
-        .apply_delta(&state.clone(), &f.params, &Some(delta))
-        .expect("conflicting same-version must NOT poison the whole delta");
+    let (x, y) = (sign(vec![tok(10)]), sign(vec![tok(20)]));
+    let (hi, lo) = if x.rank() > y.rank() { (x, y) } else { (y, x) };
 
-    // env_a is retained (first-seen wins).
-    assert_eq!(state.direct_messages.purges.len(), 1);
-    assert_eq!(state.direct_messages.purges[0], env_a);
-    // Unrelated message in the same delta was still applied.
-    assert_eq!(state.direct_messages.messages.len(), 1);
-    assert_eq!(state.direct_messages.messages[0], msg);
+    for (held, incoming) in [(lo.clone(), hi.clone()), (hi.clone(), lo.clone())] {
+        let mut state = f.state.clone();
+        state.direct_messages.purges.push(held);
+        let msg = dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 1, b"unrelated");
+        let delta = DirectMessagesDelta {
+            new_messages: vec![msg.clone()],
+            advanced_purges: vec![incoming],
+        };
+        state
+            .direct_messages
+            .apply_delta(&state.clone(), &f.params, &Some(delta))
+            .expect("conflicting same-version must NOT poison the whole delta");
+        assert_eq!(state.direct_messages.purges, vec![hi.clone()]);
+        assert_eq!(state.direct_messages.messages, vec![msg]);
+    }
+
+    let mut on_lo = DirectMessagesV1::default();
+    on_lo.purges.push(lo.clone());
+    let mut on_hi = DirectMessagesV1::default();
+    on_hi.purges.push(hi.clone());
+    assert_ne!(
+        on_lo.summarize(&f.state, &f.params),
+        on_hi.summarize(&f.state, &f.params),
+        "the summary must tell equal-version envelopes apart"
+    );
+    let offered = on_hi
+        .delta(&f.state, &f.params, &on_lo.summarize(&f.state, &f.params))
+        .expect("the higher-ranked envelope is offered");
+    assert_eq!(offered.advanced_purges, vec![hi.clone()]);
+    assert_eq!(
+        on_lo.delta(&f.state, &f.params, &on_hi.summarize(&f.state, &f.params)),
+        None
+    );
 }
 
 #[test]

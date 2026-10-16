@@ -117,6 +117,7 @@
 
 use crate::room_state::ban::{AuthorizedUserBan, BansV1};
 use crate::room_state::member::{AuthorizedMember, MemberId};
+use crate::room_state::member_info::{outranks, sig_digest, SigDigest};
 use crate::room_state::ChatRoomParametersV1;
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -281,6 +282,11 @@ pub struct DirectMessage {
     /// Opaque ciphertext, ECIES-encrypted to recipient's `member_vk`.
     pub ciphertext: Vec<u8>,
 }
+
+/// A purge envelope's place in the order peers resolve it by: higher
+/// `version` wins, and at an equal version the greater signature digest
+/// wins, as for the configuration and `member_info` (freenet/river#703).
+pub type PurgeRank = (u64, SigDigest);
 
 /// A recipient-signed purge envelope.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -661,6 +667,11 @@ impl AuthorizedDirectMessage {
 }
 
 impl AuthorizedRecipientPurges {
+    /// This envelope's [`PurgeRank`].
+    pub fn rank(&self) -> PurgeRank {
+        (self.state.version, sig_digest(&self.recipient_signature))
+    }
+
     /// Verify the recipient signature against the resolved recipient
     /// verifying key.
     pub fn verify_signature(
@@ -1068,11 +1079,11 @@ impl ComposableState for DirectMessagesV1 {
             .map(|m| SignatureBytes(m.sender_signature.to_bytes()))
             .collect();
 
-        let purge_versions: Vec<(MemberId, u64)> = {
-            let mut v: Vec<(MemberId, u64)> = self
+        let purge_versions: Vec<(MemberId, PurgeRank)> = {
+            let mut v: Vec<(MemberId, PurgeRank)> = self
                 .purges
                 .iter()
-                .map(|p| (p.recipient_id, p.state.version))
+                .map(|p| (p.recipient_id, p.rank()))
                 .collect();
             v.sort_by_key(|(k, _)| *k);
             v
@@ -1097,7 +1108,7 @@ impl ComposableState for DirectMessagesV1 {
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let prior_versions: HashMap<MemberId, u64> =
+        let prior_ranks: HashMap<MemberId, PurgeRank> =
             old_state_summary.purge_versions.iter().copied().collect();
 
         // A DM the receiver's per-pair cap would discard the instant it applied
@@ -1140,12 +1151,10 @@ impl ComposableState for DirectMessagesV1 {
             .purges
             .iter()
             .filter_map(|p| {
-                let prior = prior_versions.get(&p.recipient_id).copied().unwrap_or(0);
-                if p.state.version > prior {
-                    Some(p.clone())
-                } else {
-                    None
-                }
+                let advanced = prior_ranks
+                    .get(&p.recipient_id)
+                    .is_none_or(|prior| outranks(p.rank(), *prior));
+                advanced.then(|| p.clone())
             })
             .collect();
 
@@ -1195,11 +1204,9 @@ impl ComposableState for DirectMessagesV1 {
         // ---- 1. Apply purge advances first ----
         //
         // The recipient is the sole signer of their own envelope, so
-        // strict-monotonic `version` is the entire ordering rule. A
-        // duplicate-version with different content is a protocol error
-        // (the same signer wouldn't sign two different envelopes at
-        // the same version). Each new version's purge list MUST be a
-        // superset of the previous version's list (no un-purging).
+        // `PurgeRank` (version, then signature digest) is the entire
+        // ordering rule. Each new version's purge list MUST be a superset
+        // of the previous version's list (no un-purging).
         for advance in &delta.advanced_purges {
             if advance.state.version == 0 {
                 return Err(format!(
@@ -1236,19 +1243,23 @@ impl ComposableState for DirectMessagesV1 {
             match pos {
                 Some(idx) => {
                     let current = &self.purges[idx];
-                    if current.state.version > advance.state.version {
-                        continue; // already up to date
+                    if !outranks(advance.rank(), current.rank()) {
+                        continue; // already up to date, or a re-delivery
                     }
                     if current.state.version == advance.state.version {
-                        // Same-version-different-content is a recipient
-                        // signing bug (a multi-device user who didn't
-                        // coordinate version numbers, or a malicious
-                        // client). Drop the incoming envelope silently
-                        // - first-seen wins. Returning Err here would
-                        // poison the whole delta merge, taking
-                        // unrelated `new_messages` and other recipients'
-                        // `advanced_purges` with it. The recipient is
-                        // expected to bump the version to converge.
+                        // Same-version-different-content: a multi-device
+                        // recipient who didn't coordinate version numbers,
+                        // or a malicious client. The greater signature
+                        // digest wins, on every peer and in either arrival
+                        // order (freenet/river#703). First-seen-wins, as
+                        // before, left two peers each keeping their own
+                        // envelope with no way to see the other's (the
+                        // summary carried only the version): a permanent
+                        // fork, and `merge(A, B) != merge(B, A)`, which any
+                        // member could trigger at will. The superset rule
+                        // below cannot apply between two envelopes at one
+                        // version, or the tie would not resolve.
+                        self.purges[idx] = advance.clone();
                         continue;
                     }
                     // Monotonic-content: new must be a superset of old.
@@ -1534,12 +1545,14 @@ pub struct DirectMessagesSummary {
     #[serde(default)]
     pub message_signatures: BTreeSet<SignatureBytes>,
 
-    /// Per-recipient purge-envelope version known locally. Stored as a
+    /// Per-recipient purge-envelope [`PurgeRank`] known locally: the
+    /// version and the envelope's signature digest, so two envelopes at the
+    /// same version are told apart (freenet/river#703). Stored as a
     /// sorted `Vec` (not `HashMap`) so the type round-trips through
     /// `serde_json` - `MemberId` is a struct and `serde_json` rejects
     /// it as a map key.
     #[serde(default)]
-    pub purge_versions: Vec<(MemberId, u64)>,
+    pub purge_versions: Vec<(MemberId, PurgeRank)>,
 
     /// One entry per ordered `(sender, recipient)` pair that has reached
     /// [`MAX_DM_MESSAGES_PER_PAIR`], carrying the oldest message that pair

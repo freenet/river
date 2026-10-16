@@ -1071,9 +1071,18 @@ fn colliding_owner_configurations_converge() {
     );
 }
 
-/// A rejection reason with its numbers blanked, so counts group by cause.
+/// A rejection reason with its ids and numbers blanked, so counts group by
+/// cause.
 fn reason_class(e: &str) -> String {
-    let blanked: String = e
+    let mut out = String::new();
+    let mut rest = e;
+    while let Some(i) = rest.find("MemberId(") {
+        out.push_str(&rest[..i]);
+        out.push_str("MemberId(_)");
+        rest = rest[i..].split_once(')').map_or("", |(_, r)| r);
+    }
+    out.push_str(rest);
+    let blanked: String = out
         .chars()
         .map(|c| if c.is_ascii_digit() { '#' } else { c })
         .collect();

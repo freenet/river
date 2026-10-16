@@ -170,7 +170,12 @@ fn member_info_rank(version: u32, signature: &Signature) -> (u32, SigDigest) {
 /// Routing all five through here means the rule has one definition and one test
 /// (`outranks_keeps_the_incumbent_on_a_tie`) rather than five prose assertions.
 /// Strict `>` is the rule: **ties keep the incumbent.**
-fn outranks(candidate: (u32, SigDigest), incumbent: (u32, SigDigest)) -> bool {
+///
+/// The other owner- or self-signed singletons that resolve an equal-version
+/// collision by `(version, signature digest)` use it too, with their own
+/// version type: the room configuration, the upgrade pointer and DM purge
+/// envelopes (freenet/river#703).
+pub(crate) fn outranks<R: Ord>(candidate: R, incumbent: R) -> bool {
     candidate > incumbent
 }
 
@@ -284,7 +289,7 @@ impl<'de> Deserialize<'de> for SigDigest {
 
 /// The [`SigDigest`] of `signature`. See that type for the threat model, why the
 /// width is 128 bits, and the wire-format commitments this function makes.
-fn sig_digest(signature: &Signature) -> SigDigest {
+pub(crate) fn sig_digest(signature: &Signature) -> SigDigest {
     let digest = blake3::hash(signature.to_bytes().as_ref());
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest.as_bytes()[..16]);

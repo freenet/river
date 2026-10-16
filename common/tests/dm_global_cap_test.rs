@@ -1184,20 +1184,26 @@ fn verify_accepts_state_over_the_global_cap_so_the_migration_put_survives() {
     );
 }
 
-/// A zero cap is rejected at configuration-update time, alongside the other
-/// zero-valued limits.
+/// A zero cap is refused at configuration-update time, alongside the other
+/// zero-valued limits. Refused means not adopted: an owner-signed
+/// configuration is skipped rather than failing the whole delta
+/// (freenet/river#703).
 #[test]
 fn zero_max_direct_messages_is_rejected_by_configuration_apply_delta() {
     let r = room(4, Some(40));
     let mut cfg = r.state.configuration.clone();
+    let before = cfg.clone();
 
     let mut bad = cfg.configuration.clone();
     bad.configuration_version += 1;
     bad.max_direct_messages = Some(0);
     let bad = AuthorizedConfigurationV1::new(bad, &r.owner_sk);
 
-    let err = cfg
-        .apply_delta(&r.state, &r.params, &Some(bad))
-        .expect_err("a zero DM cap must be rejected");
-    assert_eq!(err, "Invalid configuration values");
+    assert_eq!(
+        bad.check_values(&cfg.configuration),
+        Err("Invalid configuration values".to_string())
+    );
+    cfg.apply_delta(&r.state, &r.params, &Some(bad))
+        .expect("an owner-signed configuration is skipped, not rejected");
+    assert_eq!(cfg, before, "a zero DM cap must not be adopted");
 }

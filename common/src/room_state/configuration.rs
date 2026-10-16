@@ -1,4 +1,5 @@
 use crate::room_state::member::MemberId;
+use crate::room_state::member_info::{outranks, sig_digest, SigDigest};
 use crate::room_state::privacy::{PrivacyMode, RoomDisplayMetadata};
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::truncated_base64;
@@ -15,9 +16,21 @@ pub struct AuthorizedConfigurationV1 {
     pub signature: Signature,
 }
 
+/// A configuration's place in the order every peer resolves collisions by:
+/// higher `configuration_version` wins, and at an equal version the greater
+/// signature digest wins (freenet/river#703 defect 1). Same rule, same
+/// [`outranks`], as `member_info`'s rank.
+pub type ConfigurationRank = (u32, SigDigest);
+
 impl ComposableState for AuthorizedConfigurationV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = u32;
+    /// The [`ConfigurationRank`], not just the version. Two owner devices can
+    /// each sign a DIFFERENT configuration at the SAME version; with only the
+    /// version in the summary, neither peer could tell the other held
+    /// something else, `delta` sent nothing, and the room stayed forked for
+    /// good. The digest lets anti-entropy see the difference and both peers
+    /// keep the higher-ranked one. Changing this type re-keys the contract.
+    type Summary = ConfigurationRank;
     type Delta = AuthorizedConfigurationV1;
     type Parameters = ChatRoomParametersV1;
 
@@ -35,22 +48,39 @@ impl ComposableState for AuthorizedConfigurationV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        self.configuration.configuration_version
+        self.rank()
     }
 
     fn delta(
         &self,
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
-        old_version: &Self::Summary,
+        old_rank: &Self::Summary,
     ) -> Option<Self::Delta> {
-        if self.configuration.configuration_version > *old_version {
+        if outranks(self.rank(), *old_rank) {
             Some(self.clone())
         } else {
             None
         }
     }
 
+    /// Adopt the delta's configuration if it OUTRANKS the held one.
+    ///
+    /// A delta that does not outrank (a re-delivery, an older version, or the
+    /// losing side of an equal-version tie) is a no-op, not an error: a delta
+    /// computed against a stale summary of this peer legitimately carries one,
+    /// and rejecting it rejected every other field of the same delta
+    /// (freenet/river#703 defect 2, `delta_idempotence`).
+    ///
+    /// An outranking configuration with a bad signature is a forgery and is
+    /// rejected. One that is owner-signed but fails the checks below (a zero
+    /// cap, a changed `owner_member_id`, oversized or public display metadata
+    /// in a private room) is SKIPPED, not rejected: an `Err` for a validly
+    /// signed record would fail every whole-state merge with a peer holding
+    /// it, freezing every other field between them too. `verify` only checks
+    /// the signature, so such a configuration can only arrive through a
+    /// full-state PUT from a buggy or hostile owner client; a peer holding it
+    /// then keeps offering it and the others keep declining it.
     fn apply_delta(
         &mut self,
         _parent_state: &Self::ParentState,
@@ -58,65 +88,16 @@ impl ComposableState for AuthorizedConfigurationV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(delta) = delta {
-            // Verify the delta's signature
+            if !outranks(delta.rank(), self.rank()) {
+                return Ok(());
+            }
             delta
                 .verify_signature(&parameters.owner)
                 .map_err(|e| format!("Invalid signature: {}", e))?;
-
-            // Check if the new version is greater than the current version
-            if delta.configuration.configuration_version <= self.configuration.configuration_version
-            {
-                return Err(
-                    "New configuration version must be greater than the current version"
-                        .to_string(),
-                );
+            if delta.check_values(&self.configuration).is_err() {
+                // Skipped, deliberately not an error: see the doc comment.
+                return Ok(());
             }
-
-            // Verify that the owner_member_id hasn't changed
-            if delta.configuration.owner_member_id != self.configuration.owner_member_id {
-                return Err("Cannot change the owner_member_id".to_string());
-            }
-
-            // Verify that the new configuration is valid
-            if delta.configuration.max_recent_messages == 0
-                || delta.configuration.max_user_bans == 0
-                || delta.configuration.max_message_size == 0
-                || delta.configuration.max_nickname_size == 0
-                || delta.configuration.max_members == 0
-                || delta.configuration.max_room_name == 0
-                || delta.configuration.max_room_description == 0
-                || delta.configuration.max_direct_messages == Some(0)
-            {
-                return Err("Invalid configuration values".to_string());
-            }
-
-            // Validate display metadata declared lengths
-            if delta.configuration.display.name.declared_len() > delta.configuration.max_room_name {
-                return Err(format!(
-                    "Room name declared length {} exceeds max_room_name {}",
-                    delta.configuration.display.name.declared_len(),
-                    delta.configuration.max_room_name
-                ));
-            }
-
-            if let Some(desc) = &delta.configuration.display.description {
-                if desc.declared_len() > delta.configuration.max_room_description {
-                    return Err(format!(
-                        "Room description declared length {} exceeds max_room_description {}",
-                        desc.declared_len(),
-                        delta.configuration.max_room_description
-                    ));
-                }
-            }
-
-            // In private mode, ensure display metadata is encrypted
-            if delta.configuration.privacy_mode == PrivacyMode::Private
-                && delta.configuration.display.name.is_public()
-            {
-                return Err("Private room must have encrypted display metadata".to_string());
-            }
-
-            // If all checks pass, apply the delta
             self.configuration = delta.configuration.clone();
             self.signature = delta.signature;
         }
@@ -126,6 +107,54 @@ impl ComposableState for AuthorizedConfigurationV1 {
 }
 
 impl AuthorizedConfigurationV1 {
+    /// This configuration's [`ConfigurationRank`].
+    pub fn rank(&self) -> ConfigurationRank {
+        (
+            self.configuration.configuration_version,
+            sig_digest(&self.signature),
+        )
+    }
+
+    /// The checks a configuration must pass to replace `current`, other than
+    /// its signature and rank. `Err` names the first one it fails.
+    pub fn check_values(&self, current: &Configuration) -> Result<(), String> {
+        let c = &self.configuration;
+        if c.owner_member_id != current.owner_member_id {
+            return Err("Cannot change the owner_member_id".to_string());
+        }
+        if c.max_recent_messages == 0
+            || c.max_user_bans == 0
+            || c.max_message_size == 0
+            || c.max_nickname_size == 0
+            || c.max_members == 0
+            || c.max_room_name == 0
+            || c.max_room_description == 0
+            || c.max_direct_messages == Some(0)
+        {
+            return Err("Invalid configuration values".to_string());
+        }
+        if c.display.name.declared_len() > c.max_room_name {
+            return Err(format!(
+                "Room name declared length {} exceeds max_room_name {}",
+                c.display.name.declared_len(),
+                c.max_room_name
+            ));
+        }
+        if let Some(desc) = &c.display.description {
+            if desc.declared_len() > c.max_room_description {
+                return Err(format!(
+                    "Room description declared length {} exceeds max_room_description {}",
+                    desc.declared_len(),
+                    c.max_room_description
+                ));
+            }
+        }
+        if c.privacy_mode == PrivacyMode::Private && c.display.name.is_public() {
+            return Err("Private room must have encrypted display metadata".to_string());
+        }
+        Ok(())
+    }
+
     pub fn new(configuration: Configuration, owner_signing_key: &SigningKey) -> Self {
         let mut serialized_config = Vec::new();
         ciborium::ser::into_writer(&configuration, &mut serialized_config)
@@ -402,7 +431,10 @@ mod tests {
 
         assert_eq!(
             authorized_configuration.summarize(&parent_state, &parameters),
-            configuration.configuration_version
+            (
+                configuration.configuration_version,
+                sig_digest(&authorized_configuration.signature)
+            )
         );
     }
 
@@ -429,8 +461,9 @@ mod tests {
         let new_authorized_configuration =
             AuthorizedConfigurationV1::new(new_configuration.clone(), &owner_signing_key);
 
+        let old_rank = authorized_configuration.rank();
         assert_eq!(
-            new_authorized_configuration.delta(&parent_state, &parameters, &1),
+            new_authorized_configuration.delta(&parent_state, &parameters, &old_rank),
             Some(new_authorized_configuration)
         );
     }
@@ -458,8 +491,15 @@ mod tests {
 
         // Test against a newer version (2)
         // The delta should return None since our configuration is older
+        let newer = AuthorizedConfigurationV1::new(
+            Configuration {
+                configuration_version: 2,
+                ..Configuration::default()
+            },
+            &owner_signing_key,
+        );
         assert_eq!(
-            old_authorized_configuration.delta(&parent_state, &parameters, &2),
+            old_authorized_configuration.delta(&parent_state, &parameters, &newer.rank()),
             None
         );
     }
@@ -523,17 +563,15 @@ mod tests {
         let new_authorized_configuration =
             AuthorizedConfigurationV1::new(new_configuration.clone(), &owner_signing_key);
 
-        let result = authorized_configuration.apply_delta(
-            &parent_state,
-            &parameters,
-            &Some(new_authorized_configuration),
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "New configuration version must be greater than the current version"
-        );
+        // An older configuration is a no-op, not an error: a delta computed
+        // against a stale summary carries one (freenet/river#703).
+        authorized_configuration
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(new_authorized_configuration),
+            )
+            .unwrap();
         assert_eq!(authorized_configuration, orig_authorized_configuration);
     }
 
@@ -562,14 +600,20 @@ mod tests {
         let new_authorized_configuration =
             AuthorizedConfigurationV1::new(new_configuration, &owner_signing_key);
 
-        let result = authorized_configuration.apply_delta(
-            &parent_state,
-            &parameters,
-            &Some(new_authorized_configuration),
+        assert_eq!(
+            new_authorized_configuration.check_values(&configuration),
+            Err("Cannot change the owner_member_id".to_string())
         );
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Cannot change the owner_member_id");
+        // Owner-signed, so skipped rather than rejected (freenet/river#703).
+        let before = authorized_configuration.clone();
+        authorized_configuration
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(new_authorized_configuration),
+            )
+            .unwrap();
+        assert_eq!(authorized_configuration, before);
     }
 
     #[test]
@@ -594,13 +638,94 @@ mod tests {
         let new_authorized_configuration =
             AuthorizedConfigurationV1::new(new_configuration, &owner_signing_key);
 
-        let result = authorized_configuration.apply_delta(
-            &parent_state,
-            &parameters,
-            &Some(new_authorized_configuration),
+        assert_eq!(
+            new_authorized_configuration.check_values(&configuration),
+            Err("Invalid configuration values".to_string())
         );
+        // Owner-signed, so skipped rather than rejected (freenet/river#703).
+        let before = authorized_configuration.clone();
+        authorized_configuration
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(new_authorized_configuration),
+            )
+            .unwrap();
+        assert_eq!(authorized_configuration, before);
+    }
 
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Invalid configuration values");
+    /// freenet/river#703 defect 1: two owner devices sign different
+    /// configurations at the same version. Both summaries tell them apart,
+    /// the higher-ranked one is offered and adopted in both directions, and
+    /// re-delivering either afterwards changes nothing.
+    #[test]
+    fn equal_version_configurations_resolve_to_the_higher_rank() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_signing_key.verifying_key(),
+        };
+        let parent_state = ChatRoomStateV1::default();
+        let at_v2 = |max_members: usize| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    configuration_version: 2,
+                    max_members,
+                    ..Configuration::default()
+                },
+                &owner_signing_key,
+            )
+        };
+        let (x, y) = (at_v2(7), at_v2(9));
+        let (hi, lo) = if outranks(x.rank(), y.rank()) {
+            (x, y)
+        } else {
+            (y, x)
+        };
+        assert_ne!(
+            hi.summarize(&parent_state, &parameters),
+            lo.summarize(&parent_state, &parameters),
+            "equal-version configurations must summarize differently"
+        );
+        assert_eq!(
+            hi.delta(&parent_state, &parameters, &lo.rank()),
+            Some(hi.clone())
+        );
+        assert_eq!(lo.delta(&parent_state, &parameters, &hi.rank()), None);
+
+        let mut on_lo = lo.clone();
+        on_lo
+            .apply_delta(&parent_state, &parameters, &Some(hi.clone()))
+            .unwrap();
+        assert_eq!(on_lo, hi);
+        let mut on_hi = hi.clone();
+        on_hi
+            .apply_delta(&parent_state, &parameters, &Some(lo.clone()))
+            .unwrap();
+        assert_eq!(on_hi, hi, "the lower-ranked one is a no-op");
+        on_hi
+            .apply_delta(&parent_state, &parameters, &Some(hi.clone()))
+            .unwrap();
+        assert_eq!(on_hi, hi, "re-delivery is a no-op");
+    }
+
+    /// An outranking configuration whose signature does not verify is a
+    /// forgery and still rejects the delta.
+    #[test]
+    fn forged_outranking_configuration_is_rejected() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_signing_key.verifying_key(),
+        };
+        let mut held = AuthorizedConfigurationV1::new(Configuration::default(), &owner_signing_key);
+        let forged = AuthorizedConfigurationV1::new(
+            Configuration {
+                configuration_version: 9,
+                ..Configuration::default()
+            },
+            &SigningKey::generate(&mut OsRng),
+        );
+        assert!(held
+            .apply_delta(&ChatRoomStateV1::default(), &parameters, &Some(forged))
+            .is_err());
     }
 }

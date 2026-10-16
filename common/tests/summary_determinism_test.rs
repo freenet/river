@@ -222,7 +222,9 @@ fn direct_messages_summary_serialization_is_order_independent() {
     let sigs_fwd: Vec<SignatureBytes> = (0..N).map(|i| SignatureBytes([i as u8; 64])).collect();
     let sigs_rev: Vec<SignatureBytes> = sigs_fwd.iter().rev().copied().collect();
     // purge_versions is already a sorted Vec in `summarize`; identical on both.
-    let purge_versions: Vec<(MemberId, u64)> = (0..N).map(|i| (member_id(i), i as u64)).collect();
+    let purge_versions: Vec<(MemberId, (u64, SigDigest))> = (0..N)
+        .map(|i| (member_id(i), (i as u64, sig_rank(i))))
+        .collect();
 
     // pair_horizons is already a sorted Vec in `summarize`; identical on both.
     let pair_horizons: Vec<DmPairHorizon> = (0..N)
@@ -315,7 +317,9 @@ fn top_level_summary_serialization_is_order_independent() {
             message_signatures: (0..N)
                 .map(|i| SignatureBytes([order(i) as u8; 64]))
                 .collect(),
-            purge_versions: (0..N).map(|i| (member_id(i), i as u64)).collect(),
+            purge_versions: (0..N)
+                .map(|i| (member_id(i), (i as u64, sig_rank(i))))
+                .collect(),
             pair_horizons: (0..N)
                 .map(|i| DmPairHorizon {
                     sender: member_id(i),
@@ -333,7 +337,7 @@ fn top_level_summary_serialization_is_order_independent() {
         };
 
         ChatRoomStateV1Summary {
-            configuration: 7,
+            configuration: (7, sig_rank(7)),
             bans,
             members,
             ban_evidence,

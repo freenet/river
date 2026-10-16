@@ -996,8 +996,11 @@ fn issue_318_member_info_apply_delta_has_no_contract_privacy_guard() {
     );
 
     // Part 2: the analogous Configuration write (public display metadata into
-    // a private room) IS rejected at the contract level. This is why the leak
+    // a private room) IS refused at the contract level. This is why the leak
     // only ever affected member_info, and is the guard the UI fix mirrors.
+    // Refused means not adopted: since freenet/river#703 an owner-signed
+    // configuration that fails a check is skipped rather than failing the
+    // whole delta, so the unrelated member delta still applies.
     let bad_config = Configuration {
         privacy_mode: PrivacyMode::Private,
         owner_member_id: owner_id,
@@ -1009,29 +1012,35 @@ fn issue_318_member_info_apply_delta_has_no_contract_privacy_guard() {
         configuration_version: state.configuration.configuration.configuration_version + 1,
         ..Default::default()
     };
+    let bad_config = AuthorizedConfigurationV1::new(bad_config, &owner_sk);
+    // Pin the SPECIFIC reason, not just "refused": the version bump,
+    // signature, and non-zero `max_*` all pass, so the privacy guard in
+    // `configuration.rs` is the only check that should refuse it. If some
+    // unrelated validation starts failing first, this stops passing rather
+    // than silently no longer testing the privacy guard.
+    let reason = bad_config
+        .check_values(&state.configuration.configuration)
+        .expect_err("Configuration MUST refuse public display metadata in a private room");
+    assert!(
+        reason.contains("encrypted display metadata"),
+        "expected the configuration privacy guard to refuse this configuration, but got \
+         a different reason ({reason:?}). The existing contract-level guard \
+         (#318's UI fix mirrors it) may have regressed or moved.",
+    );
     let config_delta = ChatRoomStateV1Delta {
-        configuration: Some(AuthorizedConfigurationV1::new(bad_config, &owner_sk)),
-        // include an unrelated member delta to prove it's the config that's rejected
+        configuration: Some(bad_config),
+        // include an unrelated member delta to prove only the config is refused
         members: Some(MembersDelta::new(vec![])),
         ..Default::default()
     };
     let mut state_for_config = state.clone();
     let old = state_for_config.clone();
-    let config_result = state_for_config.apply_delta(&old, &params, &Some(config_delta));
-    // Assert the SPECIFIC rejection reason, not just `is_err()`: the version
-    // bump, signature, and non-zero `max_*` all pass, so the privacy guard at
-    // `configuration.rs` is the only thing that should reject this delta. If
-    // some unrelated future validation starts erroring first, a bare
-    // `is_err()` would keep passing while silently no longer testing the
-    // privacy guard. Pinning the message keeps the test honest.
-    let config_err = config_result.expect_err(
-        "Configuration::apply_delta MUST reject public display metadata in a private room",
-    );
-    assert!(
-        config_err.contains("encrypted display metadata"),
-        "expected the configuration privacy guard to reject this delta, but got \
-         a different error ({config_err:?}). The existing contract-level guard \
-         (#318's UI fix mirrors it) may have regressed or moved.",
+    state_for_config
+        .apply_delta(&old, &params, &Some(config_delta))
+        .expect("an owner-signed configuration is skipped, not rejected");
+    assert_eq!(
+        state_for_config.configuration, old.configuration,
+        "public display metadata must never be adopted in a private room"
     );
 }
 
