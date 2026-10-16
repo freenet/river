@@ -43,6 +43,31 @@ test.describe("Restoring more rooms note", { tag: "@chromium-only" }, () => {
     await expect(rows).toHaveCount(roomCount);
   });
 
+  test("a Migrating state left behind by settled workers shows no note", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+
+    const rows = page.locator('[data-testid^="room-item-"]');
+    const note = page.getByTestId("room-list-restoring-more");
+    await expect(rows.first()).toBeVisible({ timeout: 10_000 });
+
+    await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "migrating");
+    await expect(note).toBeVisible({ timeout: 5_000 });
+
+    // The production shape: the last worker settles and nothing resolves
+    // `Migrating` while rooms are present. Only the worker counter changes,
+    // so the note going proves the rail re-renders on it.
+    await callRiverTest(page, "releaseHeldLoadWorker");
+    await expect(note).toHaveCount(0, { timeout: 5_000 });
+
+    // A later worker starts with the state already `Migrating` (another
+    // generation's probe): the note comes back on the worker alone.
+    await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "migrating");
+    await expect(note).toBeVisible({ timeout: 5_000 });
+    await callRiverTest(page, "releaseHeldLoadWorker");
+    await expect(note).toHaveCount(0, { timeout: 5_000 });
+  });
+
   test("shows while a journaled walk may still bring rooms, and goes when it ends", async ({
     page,
   }) => {

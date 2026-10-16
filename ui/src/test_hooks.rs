@@ -20,13 +20,6 @@
 //!   into a real room, or contract-invalid state where they do not verify.
 
 use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
-
-thread_local! {
-    /// The load worker `setRoomsLoadStateKeepingRooms("migrating")` holds open.
-    static HELD_LOAD_WORKER: std::cell::RefCell<
-        Option<crate::components::app::chat_delegate::LoadWorkerGuard>,
-    > = const { std::cell::RefCell::new(None) };
-}
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::{CurrentRoom, RoomData};
 use dioxus::prelude::*;
@@ -43,6 +36,14 @@ use river_core::room_state::{
 };
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsValue;
+
+thread_local! {
+    /// The load worker `setRoomsLoadStateKeepingRooms("migrating")` holds open
+    /// (until the next call, or `releaseHeldLoadWorker`).
+    static HELD_LOAD_WORKER: std::cell::RefCell<
+        Option<crate::components::app::chat_delegate::LoadWorkerGuard>,
+    > = const { std::cell::RefCell::new(None) };
+}
 
 pub fn install_test_hooks() {
     let Some(window) = web_sys::window() else {
@@ -222,7 +223,11 @@ pub fn install_test_hooks() {
                 "loaded" => RoomsLoadState::Loaded,
                 other => wasm_bindgen::throw_str(&format!("unknown rooms load state {other:?}")),
             };
+            // A worker `setRoomsLoadStateKeepingRooms("migrating")` held
+            // must not outlive the switch to an empty account.
+            let held = HELD_LOAD_WORKER.with(|held| held.borrow_mut().take());
             crate::util::defer(move || {
+                drop(held);
                 ROOMS.with_mut(|rooms| {
                     rooms.map.clear();
                     rooms.room_order.clear();
@@ -254,9 +259,26 @@ pub fn install_test_hooks() {
                 *held.borrow_mut() = (parsed == RoomsLoadState::Migrating)
                     .then(crate::components::app::chat_delegate::LoadWorkerGuard::new);
             });
+            // Written only on a change, as production does
+            // (`set_rooms_load_state`), so a repeated "migrating" re-renders
+            // through the worker counter alone.
             crate::util::defer(move || {
-                *ROOMS_LOAD_STATE.write() = parsed;
+                if *ROOMS_LOAD_STATE.peek() != parsed {
+                    *ROOMS_LOAD_STATE.write() = parsed;
+                }
             });
+        })
+        .into_js_value(),
+    );
+
+    // The held load worker settles while the load state stays as it is: the
+    // stale-`Migrating` case, whose note must go (freenet/river#802 review).
+    set_hook(
+        "releaseHeldLoadWorker",
+        Closure::<dyn FnMut()>::new(move || {
+            // Dropped inside `defer`, like a real worker settling off a task.
+            let held = HELD_LOAD_WORKER.with(|held| held.borrow_mut().take());
+            crate::util::defer(move || drop(held));
         })
         .into_js_value(),
     );

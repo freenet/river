@@ -96,9 +96,10 @@ pub(crate) fn room_list_display_state(
 /// migration was still bringing rooms back. `walk_restoring` is the journaled
 /// walk's answer ([`migration_journal::walk_may_restore_rooms`]). The sweep is
 /// `Migrating` while a load worker is still running (`workers_pending`):
-/// `Migrating` alone is not enough, because with rooms present nothing
-/// resolves it (the list renders regardless), so a probe that set it and then
-/// found nothing would leave the note up. With no rooms the full-size
+/// `Migrating` alone is not enough, because with rooms present a settling
+/// worker leaves it until the load backstop fires (or for good, when it was
+/// set after that), so a probe that set it and then found nothing would leave
+/// the note up. With no rooms the full-size
 /// `Migrating` state shows instead, so this is false there.
 ///
 /// [`migration_journal::walk_may_restore_rooms`]:
@@ -118,7 +119,7 @@ pub(crate) fn restoring_more_rooms(
 /// contended read cannot leave the rail unsubscribed and the note stuck. An
 /// unreadable signal shows no note this render (the nudge re-renders).
 fn current_restoring_more_rooms() -> bool {
-    use crate::components::app::chat_delegate::{pending_load_workers, LOAD_WORKERS_SETTLED};
+    use crate::components::app::chat_delegate::{pending_load_workers, LOAD_WORKERS_CHANGED};
     use crate::components::app::freenet_api::migration_journal;
     crate::util::signal_guard::anchor();
     // The journal session and the worker count are not signals; these
@@ -126,7 +127,7 @@ fn current_restoring_more_rooms() -> bool {
     if migration_journal::JOURNAL_GATE_VERSION.try_read().is_err() {
         crate::util::signal_guard::schedule_nudge();
     }
-    if LOAD_WORKERS_SETTLED.try_read().is_err() {
+    if LOAD_WORKERS_CHANGED.try_read().is_err() {
         crate::util::signal_guard::schedule_nudge();
     }
     let Ok(load_state) = ROOMS_LOAD_STATE.try_read().map(|g| *g) else {
@@ -480,6 +481,16 @@ pub fn RoomList() -> Element {
                 }
             }
 
+            // Announces the "Restoring more rooms…" note to screen readers.
+            // Always mounted, with only its text toggled: a live region
+            // inserted together with its content is not reliably announced.
+            div {
+                class: "sr-only",
+                role: "status",
+                "aria-live": "polite",
+                if restoring_more { "Restoring more rooms…" }
+            }
+
             // Room list
             ul {
                 "data-testid": "room-list",
@@ -794,8 +805,6 @@ pub fn RoomList() -> Element {
                     li {
                         key: "{RESTORING_MORE_KEY}",
                         "data-testid": "room-list-restoring-more",
-                        role: "status",
-                        "aria-live": "polite",
                         class: "flex items-center gap-2 px-3 py-2 text-xs text-text-muted",
                         div {
                             class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0",

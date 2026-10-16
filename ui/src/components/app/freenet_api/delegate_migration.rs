@@ -1439,14 +1439,15 @@ pub(crate) struct RiverSuccessorIo<'a, C: RiverDelegateChannel, S: RiverImportSe
     /// supplied has merged (#768 round 2 item 4; deferred since #802 moved
     /// `rooms_meta` ahead of the rooms).
     pending_provenance: Vec<(Vec<(ed25519_dalek::VerifyingKey, u32)>, u32)>,
-    /// A predecessor's `rooms_meta` order, as `(order, generation)`, merged
-    /// AGAIN at its flush. It is merged first so the rooms render in order
-    /// (#802), but a room still tombstoned at that moment is skipped, and a
-    /// slot of this predecessor can then resurrect it (a strictly newer rank
-    /// than the tombstone, freenet/river#590). The second merge, after the
-    /// rooms, gives that room back its position; for every other room it is a
-    /// no-op.
-    pending_order: Vec<(Vec<ed25519_dalek::VerifyingKey>, u32)>,
+    /// Every `rooms_meta` order this walk has merged, as `(order, generation)`,
+    /// newest generation first, merged AGAIN at each predecessor's flush. An
+    /// order is merged before its rooms so they render in order (#802), but a
+    /// room still tombstoned at that moment is skipped, and a slot of this or
+    /// an OLDER predecessor can later resurrect it (a strictly newer rank than
+    /// the tombstone, freenet/river#590). Re-merging after each predecessor's
+    /// rooms gives that room back its position; `merge_room_order` only fills
+    /// gaps, so for every other room it is a no-op.
+    walk_orders: Vec<(Vec<ed25519_dalek::VerifyingKey>, u32)>,
 }
 
 impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S> {
@@ -1459,7 +1460,7 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
             journal: None,
             walk_answers: WalkAnswers::default(),
             pending_provenance: Vec::new(),
-            pending_order: Vec::new(),
+            walk_orders: Vec::new(),
         }
     }
 
@@ -1770,7 +1771,7 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
                 // written FIRST (#802), so the lowering waits for the flush.
                 if let RecoveredItem::Meta(meta) = &decoded {
                     if !meta.room_order.is_empty() {
-                        self.pending_order
+                        self.walk_orders
                             .push((meta.room_order.clone(), item.generation));
                     }
                     let provenance = crate::room_data::identity_source_ranks(
@@ -1810,14 +1811,20 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
     /// `write_secret`), then persist. The lowering precedes the save, which records the lowered
     /// ranks in this delegate's `identity_sources`.
     async fn flush_predecessor(&mut self, _predecessor: &DelegateKey) -> Result<(), Self::Error> {
-        // The predecessor's order once more, now that its rooms merged: a room
-        // one of its slots resurrected was skipped by the first merge.
-        for (order, generation) in std::mem::take(&mut self.pending_order) {
+        let provenances = std::mem::take(&mut self.pending_provenance);
+        // The walk's orders once more, now that this predecessor's rooms
+        // merged: a room one of its slots resurrected was skipped by an
+        // earlier merge. Only a position is at stake, so a failure here is
+        // logged and does not block the lowering or the flush (whose own
+        // checks still decide whether this predecessor's import is durable).
+        for (order, generation) in self.walk_orders.clone() {
             let mut rooms = empty_rooms();
             rooms.room_order = order;
-            self.seam.merge_rooms(rooms, generation).await?;
+            if let Err(e) = self.seam.merge_rooms(rooms, generation).await {
+                warn!("migration walk: re-merging gen {generation}'s room order failed ({e})");
+            }
         }
-        for (provenance, from_rank) in std::mem::take(&mut self.pending_provenance) {
+        for (provenance, from_rank) in provenances {
             self.seam.lower_identity_ranks(provenance, from_rank).await;
         }
         self.seam.flush().await
@@ -2937,6 +2944,11 @@ mod tests {
         /// The rail's order after every rooms merge: what the user would see
         /// render, one merge at a time (freenet/river#802).
         orders_seen: Vec<Vec<VerifyingKey>>,
+        /// Lowerings and flushes, in call order.
+        events: Vec<&'static str>,
+        /// With `Some(n)`, order-only merges (no rooms, no tombstones) after
+        /// the first `n` fail.
+        order_only_merges_allowed: Option<usize>,
     }
 
     impl MemorySeam {
@@ -2950,6 +2962,8 @@ mod tests {
                 fail_flush: false,
                 fail_merge: None,
                 orders_seen: Vec::new(),
+                events: Vec::new(),
+                order_only_merges_allowed: None,
             }
         }
     }
@@ -2958,6 +2972,14 @@ mod tests {
         async fn merge_rooms(&mut self, rooms: Rooms, source_rank: u32) -> Result<(), String> {
             if let Some(e) = &self.fail_merge {
                 return Err(e.clone());
+            }
+            if rooms.map.is_empty() && rooms.removed_rooms.is_empty() {
+                if let Some(allowed) = self.order_only_merges_allowed.as_mut() {
+                    if *allowed == 0 {
+                        return Err("order-only merge refused".to_string());
+                    }
+                    *allowed -= 1;
+                }
             }
             let merged =
                 apply_recovered_rooms(&mut self.rooms, rooms, source_rank, &mut self.ranks);
@@ -2988,6 +3010,7 @@ mod tests {
             provenance: Vec<(VerifyingKey, u32)>,
             from_rank: u32,
         ) {
+            self.events.push("lower");
             crate::room_data::lower_identity_ranks(
                 &mut self.ranks.identity,
                 &provenance,
@@ -3003,6 +3026,7 @@ mod tests {
                 .collect()
         }
         async fn flush(&mut self) -> Result<(), String> {
+            self.events.push("flush");
             self.flushes += 1;
             if self.fail_flush {
                 Err("coalesced save failed".to_string())
@@ -3281,6 +3305,12 @@ mod tests {
 
         assert!(report.is_complete(), "{report:?}");
         assert_eq!(seam.rooms.ordered_room_keys(), user_order);
+        assert!(
+            seam.orders_seen
+                .iter()
+                .any(|o| !o.is_empty() && !o.contains(&user_order[0])),
+            "premise: the list rendered before the older generation's room arrived"
+        );
         for seen in &seam.orders_seen {
             let expected: Vec<VerifyingKey> = user_order
                 .iter()
@@ -3342,6 +3372,88 @@ mod tests {
         assert!(seam.rooms.map.contains_key(&first), "premise: resurrected");
         assert_eq!(seam.rooms.ordered_room_keys(), vec![first, second]);
         assert_eq!(seam.rooms.room_order, vec![first, second]);
+    }
+
+    /// The same, when an OLDER predecessor's slot resurrects the room a newer
+    /// predecessor's order placed (the newer one lacked its slot).
+    #[test]
+    fn a_room_resurrected_by_an_older_generation_keeps_its_position() {
+        let (r, a) = (vk(1), vk(2));
+        let (first, second) = if r.as_bytes() < a.as_bytes() {
+            (a, r)
+        } else {
+            (r, a)
+        };
+        let mut seam = MemorySeam::new();
+        let mut oldest = empty_rooms();
+        oldest.removed_rooms.insert(first);
+        apply_recovered_rooms(&mut seam.rooms, oldest, 0, &mut seam.ranks).unwrap();
+        let slot = |room: VerifyingKey, seed: u8| {
+            cbor(&RoomSlot::Present(Box::new(room_with_identity(room, seed))))
+        };
+        // gen2 (newest): the order and `second`, but no slot for `first`.
+        let mut gen2 = DelegateSim::default();
+        gen2.store
+            .insert(chat_delegate::room_storage_key(&second), slot(second, 22));
+        gen2.store.insert(
+            ROOMS_META_KEY.to_vec(),
+            cbor(&RoomsMeta {
+                room_order: vec![first, second],
+                ..Default::default()
+            }),
+        );
+        // gen1 (older): `first`'s slot, no order of its own.
+        let mut gen1 = DelegateSim::default();
+        gen1.store
+            .insert(chat_delegate::room_storage_key(&first), slot(first, 21));
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), gen1)
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+
+        let (report, seam) = walk(&channel, seam);
+
+        assert!(report.is_complete(), "{report:?}");
+        assert!(seam.rooms.map.contains_key(&first), "premise: resurrected");
+        assert_eq!(seam.rooms.ordered_room_keys(), vec![first, second]);
+    }
+
+    /// The flush-time order re-merge only restores positions: its failure
+    /// must not fail the predecessor (its rooms merged and must be sealed).
+    #[test]
+    fn a_failed_order_re_merge_does_not_fail_the_predecessor() {
+        let room = vk(1);
+        let mut gen1 = DelegateSim::default();
+        gen1.store.insert(
+            chat_delegate::room_storage_key(&room),
+            cbor(&RoomSlot::Present(Box::new(room_with_identity(room, 21)))),
+        );
+        gen1.store.insert(
+            ROOMS_META_KEY.to_vec(),
+            cbor(&RoomsMeta {
+                room_order: vec![room],
+                ..Default::default()
+            }),
+        );
+        let mut seam = MemorySeam::new();
+        // The `rooms_meta` item's own merge goes through; the flush-time
+        // re-merge of its order is refused.
+        seam.order_only_merges_allowed = Some(1);
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), gen1)
+            .with_delegate(&pred_key(2), DelegateSim::default())
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let (report, seam) = walk(&channel, seam);
+        assert_eq!(
+            seam.order_only_merges_allowed,
+            Some(0),
+            "premise: the re-merge ran"
+        );
+        assert!(report.is_complete(), "{report:?}");
+        assert!(seam.rooms.map.contains_key(&room));
+        assert!(seam.flushes >= 1);
     }
 
     /// freenet/river#802 cause 2: the walk merges a predecessor's rooms one at
@@ -6531,6 +6643,15 @@ mod tests {
             seam.rooms.map[&room].self_verifying_key().unwrap(),
             SigningKey::from_bytes(&[51; 32]).verifying_key(),
             "gen1's identity is newer than the gen0 identity gen2 carried"
+        );
+        // The lowering precedes the save that persists the lowered ranks.
+        let lower = seam.events.iter().position(|e| *e == "lower");
+        assert!(lower.is_some(), "premise: the provenance was lowered");
+        assert_eq!(
+            seam.events.get(lower.unwrap() + 1),
+            Some(&"flush"),
+            "lowered, then flushed: {:?}",
+            seam.events
         );
     }
 }

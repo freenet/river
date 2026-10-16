@@ -281,13 +281,16 @@ pub(crate) fn pending_load_workers() -> u32 {
     PENDING_LOADS.load(Ordering::Relaxed)
 }
 
-/// Bumped when the last load worker of the current attempt settles, so a
-/// render that reads [`pending_load_workers`] (a plain atomic) re-renders when
-/// it drops to zero. The rail's "Restoring more rooms…" note shows `Migrating`
-/// only while a worker is still running (freenet/river#802): with rooms
-/// present nothing resolves `Migrating` back (`settle_terminal` leaves it,
-/// since the list renders anyway), so a stale one must not keep the note up.
-pub static LOAD_WORKERS_SETTLED: GlobalSignal<u64> = Global::new(|| 0);
+/// Bumped when a load worker starts and when the last one of the current
+/// attempt settles, so a render that reads [`pending_load_workers`] (a plain
+/// atomic) re-renders when it changes between zero and non-zero. The rail's
+/// "Restoring more rooms…" note shows `Migrating` only while a worker is
+/// still running (freenet/river#802): with rooms present, a worker settling
+/// leaves `Migrating` as it is (`settle_terminal`, since the list renders
+/// anyway) until the hard-max backstop turns it into `LoadFailed`, so a stale
+/// one would otherwise keep the note up for up to that long, or for good when
+/// it is set after the backstop fired (the recovery path).
+pub static LOAD_WORKERS_CHANGED: GlobalSignal<u64> = Global::new(|| 0);
 
 // =============================================================================
 // DELEGATE-GENERATION AUTHORITY (freenet/river#527)
@@ -8471,7 +8474,10 @@ fn reconcile_meta(
             // keep their stored neighbours, and so does an entry this tab only
             // carries for a room it never loaded, so another tab's move of that
             // room is not undone. Then this tab's own such entries fill in
-            // whatever the store lacks. Only rooms this tab left go. A room
+            // whatever the store lacks (including a room another tab left that
+            // this tab has not seen the tombstone for: unrendered, and dropped
+            // by `apply_meta` once the tombstone loads). Only rooms this tab
+            // left go. A room
             // this tab holds but never positioned takes its stored position,
             // so the persisted order can differ from what this tab renders
             // (key-byte tail) until it reloads: adopting a placement this
@@ -10808,6 +10814,13 @@ impl LoadWorkerGuard {
         let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
         PENDING_LOADS.fetch_add(1, Ordering::Relaxed);
         LOAD_ACTIVITY_GEN.fetch_add(1, Ordering::Relaxed);
+        // Re-render what reads `pending_load_workers` (freenet/river#802).
+        // Deferred: workers start inside tasks. Only in the browser: natively
+        // `defer` runs at once with no Dioxus runtime.
+        #[cfg(target_arch = "wasm32")]
+        crate::util::defer(|| {
+            *LOAD_WORKERS_CHANGED.write() += 1;
+        });
         LoadWorkerGuard { attempt }
     }
 
@@ -10980,11 +10993,11 @@ pub(crate) fn on_load_worker_settled() {
         if !load_attempt_is_current(armed_attempt) {
             return;
         }
-        // Natively `defer` runs at once with no Dioxus runtime, where a
-        // GlobalSignal write panics; nothing renders there.
-        #[cfg(not(test))]
+        // Only in the browser: natively `defer` runs at once with no Dioxus
+        // runtime, where a GlobalSignal write panics; nothing renders there.
+        #[cfg(target_arch = "wasm32")]
         {
-            *LOAD_WORKERS_SETTLED.write() += 1;
+            *LOAD_WORKERS_CHANGED.write() += 1;
         }
         let room_count_zero = rooms_map_is_empty();
         let saw = SAW_FETCH_FAILURE.load(Ordering::Relaxed);
