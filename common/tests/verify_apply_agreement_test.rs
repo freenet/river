@@ -444,3 +444,99 @@ fn redelivered_messages_do_not_count_toward_the_work_bound() {
         .apply_delta(&parent, &r.params, &Some(delta))
         .expect("held messages re-delivered with one new must apply");
 }
+
+// ---------------------------------------------------------------------------
+// Normalization of held state (freenet/river#703 review B1): a state `verify`
+// accepts but no apply would produce converges with its normal form.
+// ---------------------------------------------------------------------------
+
+fn member_ban(
+    r: &Room,
+    target: MemberId,
+    t: u64,
+) -> river_core::room_state::ban::AuthorizedUserBan {
+    river_core::room_state::ban::AuthorizedUserBan::new(
+        river_core::room_state::ban::UserBan {
+            owner_member_id: r.owner_id,
+            banned_at: at(t),
+            banned_user: target,
+        },
+        r.member.member.id(),
+        &r.member_sk,
+    )
+}
+
+#[test]
+fn a_duplicated_message_entry_is_normalized_in_both_directions() {
+    let r = room();
+    let base = state(&r, public_config(&r));
+    let m = msg(&r, 1, RoomMessageBody::public("hi".into()));
+    let mut holder = base.clone();
+    holder.recent_messages.messages = vec![m.clone(), m.clone()];
+    let mut other = base.clone();
+    other.recent_messages.messages = vec![m.clone()];
+    let merged = assert_merges_agree(&r, &holder, &other);
+    assert_eq!(merged.recent_messages.messages, vec![m]);
+}
+
+#[test]
+fn a_duplicated_ban_entry_is_normalized_in_both_directions() {
+    let r = room();
+    let mut base = state(&r, public_config(&r));
+    base.recent_messages.messages = vec![msg(&r, 1, RoomMessageBody::public("hi".into()))];
+    let ban = member_ban(
+        &r,
+        MemberId::from(&SigningKey::from_bytes(&[8; 32]).verifying_key()),
+        2,
+    );
+    let mut holder = base.clone();
+    holder.bans.0 = vec![ban.clone(), ban.clone()];
+    let mut other = base.clone();
+    other.bans.0 = vec![ban.clone()];
+    let merged = assert_merges_agree(&r, &holder, &other);
+    assert_eq!(merged.bans.0, vec![ban]);
+}
+
+/// Two ban entries that share a signature but name different issuers are
+/// different records: the bans summary must tell a state holding both from
+/// one holding only the genuine one, or anti-entropy never reconciles them.
+#[test]
+fn ban_records_sharing_a_signature_are_told_apart_by_the_summary() {
+    use river_core::room_state::ban::AuthorizedUserBan;
+    let r = room();
+    let mut base = state(&r, public_config(&r));
+    base.recent_messages.messages = vec![msg(&r, 1, RoomMessageBody::public("hi".into()))];
+    let ban = member_ban(
+        &r,
+        MemberId::from(&SigningKey::from_bytes(&[8; 32]).verifying_key()),
+        2,
+    );
+    let unknown = MemberId::from(&SigningKey::from_bytes(&[12; 32]).verifying_key());
+    let copy = AuthorizedUserBan::with_signature(ban.ban.clone(), unknown, ban.signature);
+    let mut holder = base.clone();
+    holder.bans.0 = vec![ban.clone(), copy];
+    let mut other = base.clone();
+    other.bans.0 = vec![ban.clone()];
+    assert_ne!(
+        holder.bans.summarize(&holder, &r.params),
+        other.bans.summarize(&other, &r.params),
+        "the summary must cover the whole ban record"
+    );
+    let merged = assert_merges_agree(&r, &holder, &other);
+    assert_eq!(merged.bans.0, vec![ban]);
+}
+
+/// The state format version merges to the higher of the two (both are
+/// formats this contract reads).
+#[test]
+fn the_state_version_merges_to_the_higher() {
+    use river_core::room_state::version::StateVersion;
+    let r = room();
+    let base = state(&r, public_config(&r));
+    let mut v0 = base.clone();
+    v0.version = StateVersion(0);
+    let mut v1 = base.clone();
+    v1.version = StateVersion(1);
+    let merged = assert_merges_agree(&r, &v0, &v1);
+    assert_eq!(merged.version, StateVersion(1));
+}

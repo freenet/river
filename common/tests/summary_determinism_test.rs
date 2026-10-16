@@ -18,7 +18,7 @@
 use ed25519_dalek::{Signature, SigningKey};
 use freenet_scaffold::util::FastHash;
 use freenet_scaffold::ComposableState;
-use river_core::room_state::ban::{BanId, BansV1};
+use river_core::room_state::ban::BansV1;
 use river_core::room_state::direct_messages::{
     DirectMessagesSummary, DmOrderKey, DmPairHorizon, DmRetentionHorizon, SignatureBytes,
 };
@@ -53,8 +53,10 @@ fn cbor<T: serde::Serialize>(v: &T) -> Vec<u8> {
 /// FAILS if a summary field regresses back to `HashSet`/`HashMap`.
 const N: i64 = 24;
 
-fn ban_id(i: i64) -> BanId {
-    BanId(FastHash(i))
+/// A distinct ban-record digest per index (the bans summary is keyed by
+/// whole-record digest since freenet/river#703).
+fn ban_id(i: i64) -> river_core::room_state::ban_evidence::EvidenceDigest {
+    river_core::room_state::ban_evidence::EvidenceDigest(sig_rank(i).0)
 }
 fn member_id(i: i64) -> MemberId {
     MemberId(FastHash(i))

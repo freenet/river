@@ -273,29 +273,28 @@ impl ComposableState for MessagesV1 {
                     new_count, work_bound
                 ));
             }
-            let signed: Vec<&AuthorizedMessageV1> =
-                delta.iter().filter(|msg| signed_by_author(msg)).collect();
-
-            // A message this room cannot admit (see `admissible_in_room`) is
-            // skipped, not an error, and one already held is dropped below.
-            let signed: Vec<&AuthorizedMessageV1> = signed
-                .into_iter()
+            // Held messages (by id, as the summary and `delta` compare them)
+            // and repeats inside this delta are filtered before any
+            // signature is checked; a message this room cannot admit (see
+            // `admissible_in_room`) is skipped, not an error, and one already
+            // held is dropped below.
+            let mut in_delta = std::collections::HashSet::new();
+            let admitted: Vec<&AuthorizedMessageV1> = delta
+                .iter()
+                .filter(|msg| !held_ids.contains(&msg.id()))
+                .filter(|msg| in_delta.insert(crate::util::record_digest(*msg)))
+                .filter(|msg| signed_by_author(msg))
                 .filter(|msg| admissible_in_room(msg, parent_state))
                 .collect();
-
-            // Deduplicate by message ID against held messages. A message
-            // repeated identically inside this delta is stored once.
-            let existing_ids: std::collections::HashSet<_> =
-                self.messages.iter().map(|m| m.id()).collect();
-            let mut in_delta = std::collections::HashSet::new();
-            self.messages.extend(
-                signed
-                    .into_iter()
-                    .filter(|msg| !existing_ids.contains(&msg.id()))
-                    .filter(|msg| in_delta.insert(crate::util::record_digest(*msg)))
-                    .cloned(),
-            );
+            self.messages.extend(admitted.into_iter().cloned());
         }
+
+        // A message held twice (a state `verify` accepts but no apply
+        // produces) is kept once, so a peer holding the copy and one that
+        // does not end in the same state (freenet/river#703 review).
+        let mut seen = std::collections::HashSet::new();
+        self.messages
+            .retain(|m| seen.insert(crate::util::record_digest(m)));
 
         // Always enforce message constraints
         // Ensure there are no messages over the size limit

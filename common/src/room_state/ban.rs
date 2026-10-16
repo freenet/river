@@ -1,4 +1,4 @@
-use crate::room_state::ban_evidence::BanEvidenceV1;
+use crate::room_state::ban_evidence::{BanEvidenceV1, EvidenceDigest};
 use crate::room_state::member::{AuthorizedMember, BanResolution, MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
@@ -249,7 +249,13 @@ impl ComposableState for BansV1 {
     // two identical ban sets summarize to different bytes → spurious
     // anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
     // and freenet/freenet-core#4857.
-    type Summary = BTreeSet<BanId>;
+    //
+    // Keyed by each ban's whole-record digest, not its `BanId` (which hashes
+    // the signature alone): two records that share a signature but differ
+    // elsewhere are different bans, and a summary that cannot tell them apart
+    // leaves peers holding different ones unreconciled (freenet/river#703
+    // review). Changing this type re-keys the contract.
+    type Summary = BTreeSet<EvidenceDigest>;
     type Delta = Vec<AuthorizedUserBan>;
     type Parameters = ChatRoomParametersV1;
 
@@ -284,7 +290,7 @@ impl ComposableState for BansV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        self.0.iter().map(|ban| ban.id()).collect()
+        self.0.iter().map(ban_digest).collect()
     }
 
     /// Computes the difference between current ban state and old state
@@ -301,7 +307,7 @@ impl ComposableState for BansV1 {
         let delta = self
             .0
             .iter()
-            .filter(|ban| !old_state_summary.contains(&ban.id()))
+            .filter(|ban| !old_state_summary.contains(&ban_digest(ban)))
             .cloned()
             .collect::<Vec<_>>();
         if delta.is_empty() {
@@ -339,15 +345,15 @@ impl ComposableState for BansV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(delta) = delta {
-            // A ban this peer already holds (same id, which is what the
-            // summary and `delta` compare) is skipped. A delta computed
+            // A ban this peer already holds (the same record, which is what
+            // the summary and `delta` compare) is skipped. A delta computed
             // against a stale summary of this peer re-delivers such bans, and
             // freenet-core sends exactly those; rejecting the whole delta over
             // them cost a full-state resync each time and broke the
             // `delta_idempotence` merge law (freenet/river#703 defect 2). A
             // ban repeated identically inside one delta is stored once;
-            // records that share an id but differ inside one delta are all
-            // kept, so the checks here and at step 0 judge each of them.
+            // records that share an id but differ are all kept, so the checks
+            // here and at step 0 judge each of them.
             let max_bans = parent_state.configuration.configuration.max_user_bans;
             let bound = max_bans.max(MIN_BANS_DELTA_BOUND);
             // A delta longer than everything held plus the bound cannot be
@@ -360,13 +366,15 @@ impl ComposableState for BansV1 {
                     bound
                 ));
             }
-            let held_ids: std::collections::HashSet<_> =
-                self.0.iter().map(|ban| ban.id()).collect();
+            let held: std::collections::HashSet<EvidenceDigest> =
+                self.0.iter().map(ban_digest).collect();
             let mut in_delta = std::collections::HashSet::new();
             let new_bans: Vec<&AuthorizedUserBan> = delta
                 .iter()
-                .filter(|ban| !held_ids.contains(&ban.id()))
-                .filter(|ban| in_delta.insert(crate::util::record_digest(*ban)))
+                .filter(|ban| {
+                    let d = ban_digest(ban);
+                    !held.contains(&d) && in_delta.insert(d)
+                })
                 .collect();
 
             // Bound the number of NEW bans a single delta may carry (#411 round
@@ -424,6 +432,12 @@ impl ComposableState for BansV1 {
             self.0 = temp_bans.0;
         }
 
+        // A ban held twice (a state `verify` accepts but no apply produces)
+        // is kept once, so peers holding the copy and not converge
+        // (freenet/river#703 review).
+        let mut seen = std::collections::HashSet::new();
+        self.0.retain(|ban| seen.insert(ban_digest(ban)));
+
         // Sort for deterministic ordering (CRDT convergence requirement)
         self.0.sort_by(|a, b| {
             a.ban
@@ -454,6 +468,16 @@ impl ComposableState for BansV1 {
 /// that has applied a `max_user_bans` reduction from any cap up to 100 no
 /// longer refuses a lagging peer's ban delta (freenet/river#703).
 pub const MIN_BANS_DELTA_BOUND: usize = 100;
+
+/// The digest of a whole ban record: what the bans summary, `delta` and the
+/// held-ban checks compare (16 bytes of BLAKE3 over its CBOR, serialized as a
+/// byte string like [`EvidenceDigest`]).
+pub fn ban_digest(ban: &AuthorizedUserBan) -> EvidenceDigest {
+    let full = crate::util::record_digest(ban);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    EvidenceDigest(out)
+}
 
 /// A user ban with authorization proof
 ///
@@ -799,8 +823,8 @@ mod tests {
         let summary = bans.summarize(&state, &params);
 
         assert_eq!(summary.len(), 2);
-        assert!(summary.contains(&ban1.id()));
-        assert!(summary.contains(&ban2.id()));
+        assert!(summary.contains(&ban_digest(&ban1)));
+        assert!(summary.contains(&ban_digest(&ban2)));
     }
 
     #[test]
@@ -839,12 +863,15 @@ mod tests {
         assert_eq!(delta, Some(vec![ban1.clone(), ban2.clone()]));
 
         // Test 2: Partial old summary
-        let partial_summary: BTreeSet<BanId> = vec![ban1.id()].into_iter().collect();
+        let partial_summary: BTreeSet<EvidenceDigest> =
+            vec![ban_digest(&ban1)].into_iter().collect();
         let delta = bans.delta(&state, &params, &partial_summary);
         assert_eq!(delta, Some(vec![ban2.clone()]));
 
         // Test 3: Full old summary
-        let full_summary: BTreeSet<BanId> = vec![ban1.id(), ban2.id()].into_iter().collect();
+        let full_summary: BTreeSet<EvidenceDigest> = vec![ban_digest(&ban1), ban_digest(&ban2)]
+            .into_iter()
+            .collect();
         let delta = bans.delta(&state, &params, &full_summary);
         assert_eq!(delta, None);
     }
