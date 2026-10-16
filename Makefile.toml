@@ -326,6 +326,18 @@ description = "Run tests for chat-delegate"
 command = "cargo"
 args = ["test", "--package", "chat-delegate", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
 
+# The river-ui crate's native unit tests. build-tailwind first: the crate's
+# `asset!("/assets/styles.css")` fails to compile without the generated,
+# gitignored ui/assets/styles.css ("Asset at /assets/styles.css doesn't
+# exist"). CI's build job generates it in its `cargo make build` step.
+[tasks.test-ui]
+description = "Run river-ui unit tests (featureless, then example-data,no-sync)"
+dependencies = ["build-tailwind"]
+script = '''
+cargo test -p river-ui --bins
+cargo test -p river-ui --bins --features example-data,no-sync
+'''
+
 [tasks.test]
 description = "Run all tests"
 dependencies = ["test-web-container", "test-web-container-integration", "test-room-contract", "test-scaffold", "test-common", "test-chat-delegate"]
