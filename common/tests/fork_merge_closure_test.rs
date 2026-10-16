@@ -819,6 +819,23 @@ fn differing_fields(a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> Vec<&'static st
     out
 }
 
+/// Associativity (`merge(merge(A, B), C) == merge(A, merge(B, C))`) is NOT
+/// checked, deliberately: a room keeps a bounded window (newest
+/// `max_recent_messages`, `max_members`, `max_user_bans`), and a bounded
+/// window cannot be associative once anything can later free a slot. Two
+/// minimal cases, cap 1, each peer holding one record:
+///
+/// * A = {P's message @1}, B = {Q's message @2}, C = {owner's ban on Q}.
+///   `(AB)C` drops P's message when AB keeps only @2, then the ban empties
+///   the window; `A(BC)` keeps P's message. No merge rule can recover a record
+///   an earlier merge discarded.
+/// * No removal: A = {msg @1}, B = {msg @2}, C raises the cap to 2. `(AB)C`
+///   holds {@2}; `A(BC)` holds {@1, @2}.
+///
+/// Both are structural, not a River bug; the law is being revisited in
+/// freenet-core (freenet/river#703 review). Commutativity, which these tests
+/// do assert, holds.
+///
 /// Gossip both ways until the two peers agree. A peer whose merge fails keeps
 /// its own state, exactly as a node does.
 ///
