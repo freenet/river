@@ -331,6 +331,26 @@ pub struct Configuration {
 pub const DEFAULT_MAX_DIRECT_MESSAGES: usize = 300;
 
 impl Configuration {
+    /// Correct, before signing, what an owner's edit to another field must
+    /// not be refused over, because the edit cannot fix it: the
+    /// `owner_member_id` is set to the room owner's (the only value the room
+    /// takes), and a `max_nickname_size` over the nickname ceiling that this
+    /// edit leaves as `held` had it is lowered to the ceiling (the room holds
+    /// nicknames to the ceiling whatever the configuration says, so this
+    /// changes nothing it enforces). A limit the edit itself sets over the
+    /// ceiling is left for [`Self::signing_refusal`] to refuse.
+    pub fn normalize_for_signing(
+        &mut self,
+        held: &Configuration,
+        parameters: &ChatRoomParametersV1,
+    ) {
+        self.owner_member_id = parameters.owner_id();
+        let ceiling = crate::room_state::member_info::NICKNAME_CEILING;
+        if self.max_nickname_size > ceiling && self.max_nickname_size == held.max_nickname_size {
+            self.max_nickname_size = ceiling;
+        }
+    }
+
     /// Why a client must not sign this configuration as the owner's next
     /// one, if it must not: it fails [`Self::check_values`] (the room would
     /// skip it, so the edit would silently not take), or its
@@ -356,16 +376,19 @@ impl Configuration {
         if c.owner_member_id != parameters.owner_id() {
             return Err("owner_member_id is not the room owner's".to_string());
         }
-        if c.max_recent_messages == 0
-            || c.max_user_bans == 0
-            || c.max_message_size == 0
-            || c.max_nickname_size == 0
-            || c.max_members == 0
-            || c.max_room_name == 0
-            || c.max_room_description == 0
-            || c.max_direct_messages == Some(0)
-        {
-            return Err("Invalid configuration values".to_string());
+        for (name, value) in [
+            ("max_recent_messages", c.max_recent_messages),
+            ("max_user_bans", c.max_user_bans),
+            ("max_message_size", c.max_message_size),
+            ("max_nickname_size", c.max_nickname_size),
+            ("max_members", c.max_members),
+            ("max_room_name", c.max_room_name),
+            ("max_room_description", c.max_room_description),
+            ("max_direct_messages", c.max_direct_messages.unwrap_or(1)),
+        ] {
+            if value == 0 {
+                return Err(format!("Invalid configuration values: {name} is 0"));
+            }
         }
         if c.display.name.declared_len() > c.max_room_name {
             return Err(format!(
@@ -425,6 +448,41 @@ mod signing_refusal_tests {
         assert_eq!(c.signing_refusal(&params), None);
         c.max_nickname_size = crate::room_state::member_info::NICKNAME_CEILING;
         assert_eq!(c.signing_refusal(&params), None);
+    }
+
+    /// An edit to another field is not refused over values the held
+    /// configuration already had that the edit cannot fix (another owner id,
+    /// a nickname limit over the ceiling); a limit the edit sets over the
+    /// ceiling still is (freenet/river#703).
+    #[test]
+    fn an_edit_is_not_refused_over_a_held_value_it_cannot_fix() {
+        let (params, c) = params();
+        let mut held = c.clone();
+        held.max_nickname_size = crate::room_state::member_info::NICKNAME_CEILING + 500;
+        held.owner_member_id = MemberId::from(&SigningKey::from_bytes(&[6; 32]).verifying_key());
+        let mut edit = held.clone();
+        edit.max_members = 99;
+        edit.normalize_for_signing(&held, &params);
+        assert_eq!(edit.signing_refusal(&params), None);
+        assert_eq!(
+            edit.max_nickname_size,
+            crate::room_state::member_info::NICKNAME_CEILING
+        );
+        assert_eq!(edit.owner_member_id, params.owner_id());
+
+        let mut raise = c.clone();
+        raise.max_nickname_size = crate::room_state::member_info::NICKNAME_CEILING + 1;
+        raise.normalize_for_signing(&c, &params);
+        assert!(raise.signing_refusal(&params).is_some());
+    }
+
+    /// A zero limit is refused naming the field.
+    #[test]
+    fn a_zero_limit_is_refused_naming_the_field() {
+        let (params, mut c) = params();
+        c.max_user_bans = 0;
+        let refusal = c.signing_refusal(&params).unwrap();
+        assert!(refusal.contains("max_user_bans"), "{refusal}");
     }
 
     /// Failing the value checks, naming another owner, or a nickname limit
@@ -750,7 +808,7 @@ mod tests {
 
         assert_eq!(
             new_authorized_configuration.check_values(&parameters),
-            Err("Invalid configuration values".to_string())
+            Err("Invalid configuration values: max_recent_messages is 0".to_string())
         );
         // Owner-signed, so skipped rather than rejected (freenet/river#703).
         let before = authorized_configuration.clone();

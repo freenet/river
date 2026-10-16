@@ -860,7 +860,9 @@ pub(super) fn sign_and_apply_configuration(
         return Ok(());
     };
     new_config.configuration_version += 1;
-    if let Some(reason) = new_config.signing_refusal(&ChatRoomParametersV1 { owner: owner_key }) {
+    let params = ChatRoomParametersV1 { owner: owner_key };
+    new_config.normalize_for_signing(&room_state.configuration.configuration, &params);
+    if let Some(reason) = new_config.signing_refusal(&params) {
         error!("Not updating {what}: {reason}");
         return Err(reason);
     }

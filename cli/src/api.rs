@@ -6497,9 +6497,11 @@ impl ApiClient {
         // The same check the UI runs before signing: the room skips (does
         // not reject) a configuration that fails it, so without this the edit
         // would report success and do nothing.
-        if let Some(reason) = new_config.signing_refusal(&ChatRoomParametersV1 {
+        let params = ChatRoomParametersV1 {
             owner: *room_owner_key,
-        }) {
+        };
+        new_config.normalize_for_signing(&room_state.configuration.configuration, &params);
+        if let Some(reason) = new_config.signing_refusal(&params) {
             return Err(anyhow!("Invalid configuration: {reason}"));
         }
 

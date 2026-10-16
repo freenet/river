@@ -1204,7 +1204,7 @@ fn zero_max_direct_messages_is_rejected_by_configuration_apply_delta() {
 
     assert_eq!(
         bad.check_values(&r.params),
-        Err("Invalid configuration values".to_string())
+        Err("Invalid configuration values: max_direct_messages is 0".to_string())
     );
     cfg.apply_delta(&r.state, &r.params, &Some(bad))
         .expect("an owner-signed configuration is skipped, not rejected");
