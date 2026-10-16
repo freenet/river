@@ -569,3 +569,39 @@ fn placing_new_records_keeps_a_held_record_whose_inviter_is_not_held() {
     assert!(members.members.contains(&orphan), "the held record is kept");
     assert!(members.members.contains(&newcomer));
 }
+
+/// Two new records for one id naming the same key, at different invite
+/// depths: the nearer one is kept in either delta order (the key rule only
+/// narrows records naming different keys).
+#[test]
+fn two_new_records_naming_one_key_keep_the_nearer_in_either_order() {
+    let f = fx();
+    let m_sk = sk(4);
+    let m_id = MemberId::from(&m_sk.verifying_key());
+    let z_sk = sk(91);
+    let deep = rec(f.owner, m_id, z_sk.verifying_key(), &m_sk);
+    let near = rec(f.owner, f.x, z_sk.verifying_key(), &f.x_sk);
+    let z = near.member.id();
+    for order in [
+        vec![deep.clone(), near.clone()],
+        vec![near.clone(), deep.clone()],
+    ] {
+        let s = apply(
+            &f,
+            &f.base,
+            ChatRoomStateV1Delta {
+                members: Some(MembersDelta::new(order)),
+                recent_messages: Some(vec![msg(f.owner, z, &z_sk, 41)]),
+                ..Default::default()
+            },
+        );
+        let got: Vec<_> = s
+            .members
+            .members
+            .iter()
+            .filter(|m| m.member.id() == z)
+            .cloned()
+            .collect();
+        assert_eq!(got, vec![near.clone()]);
+    }
+}

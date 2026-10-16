@@ -1003,9 +1003,28 @@ fn trim_to_work_bounds(
     if let Some(members) = delta.members.as_mut() {
         if members.added().len() > members_bound {
             let depth = depth_in_sender();
-            let mut added = members.added().to_vec();
-            added.sort_by_cached_key(|m| (depth(m), m.member.id()));
-            added.truncate(members_bound);
+            // Rank by (depth, id), but keep the kept records in the order
+            // the delta lists them: placing new records reads that order
+            // (the last record for an id names the sender's key).
+            let mut ranked: Vec<(usize, MemberId, usize)> = members
+                .added()
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (depth(m), m.member.id(), i))
+                .collect();
+            ranked.sort();
+            let keep: HashSet<usize> = ranked
+                .into_iter()
+                .take(members_bound)
+                .map(|(_, _, i)| i)
+                .collect();
+            let added: Vec<AuthorizedMember> = members
+                .added()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| keep.contains(i))
+                .map(|(_, m)| m.clone())
+                .collect();
             *members = MembersDelta::new(added);
         }
     }

@@ -231,8 +231,21 @@ impl MembersV1 {
                 .or_default()
                 .push(m);
         }
-        let mut added_by_inviter: HashMap<MemberId, Vec<&AuthorizedMember>> = HashMap::new();
+        // Of new records for one id that name different keys, only those
+        // naming the key of the LAST one in the delta compete: a delta lists
+        // a sender's records in the order it stores them, and that last
+        // record is the one the sender's `verify` reads and its
+        // normalization keeps (see `normalize_held_records`), so this peer
+        // keeps the record the sender keeps.
+        let mut sender_key: HashMap<MemberId, VerifyingKey> = HashMap::new();
         for m in added {
+            sender_key.insert(m.member.id(), m.member.member_vk);
+        }
+        let mut added_by_inviter: HashMap<MemberId, Vec<&AuthorizedMember>> = HashMap::new();
+        for m in added
+            .iter()
+            .filter(|m| sender_key.get(&m.member.id()) == Some(&m.member.member_vk))
+        {
             added_by_inviter
                 .entry(m.member.invited_by)
                 .or_default()
