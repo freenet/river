@@ -1105,6 +1105,8 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
             "bans1+members",
             "bans1+members+msgs",
             "members+info+msgs",
+            // Only `random_op_ext`'s second-record shape (op 9) produces it.
+            "members+msgs",
         ],
         false,
     );

@@ -1588,12 +1588,34 @@ pub(crate) mod tests {
         assert!(apply(held, vec![r.y.clone()]).is_ok());
     }
 
+    /// `members.apply_delta(added)` on a separate thread, failing the test if
+    /// it does not finish within 30 seconds: a looping invite chain must fail
+    /// a test with a message, not hang the suite.
+    fn apply_within_seconds(
+        mut members: MembersV1,
+        parent_state: &ChatRoomStateV1,
+        parameters: &ChatRoomParametersV1,
+        added: Vec<AuthorizedMember>,
+    ) -> MembersV1 {
+        let (parent_state, parameters) = (parent_state.clone(), parameters.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = members
+                .apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(added)))
+                .map(|()| members);
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("apply_delta did not finish: a looping invite chain was followed forever")
+            .unwrap()
+    }
+
     /// A second record for a member's key, validly signed by a member
     /// further down that member's own subtree, would make the chain return to
     /// its own id. It is never stored: the member keeps the record nearest
     /// the owner, and a record reachable only through itself is never
-    /// reached. Until freenet/river#703's review a delta carrying it without
-    /// the member held was rejected outright.
+    /// reached. Until freenet/river#703 a delta carrying it without the
+    /// member held was rejected outright.
     #[test]
     fn a_record_whose_chain_returns_to_its_own_id_is_never_stored() {
         let owner_sk = SigningKey::generate(&mut OsRng);
@@ -1632,12 +1654,14 @@ pub(crate) mod tests {
             vec![s.clone(), y.clone()],
             vec![s.clone()],
         ] {
-            let mut members = MembersV1 {
-                members: held.clone(),
-            };
-            members
-                .apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(added)))
-                .unwrap();
+            let members = apply_within_seconds(
+                MembersV1 {
+                    members: held.clone(),
+                },
+                &parent_state,
+                &parameters,
+                added,
+            );
             assert!(!members.members.contains(&s), "never stored while held");
         }
         // Not held: x's genuine record and the looping one arrive together,
@@ -1649,10 +1673,8 @@ pub(crate) mod tests {
             (vec![s.clone(), e_rec.clone(), x_rec.clone()], 2),
             (vec![e_rec.clone(), s.clone()], 0),
         ] {
-            let mut members = MembersV1::default();
-            members
-                .apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(added)))
-                .unwrap();
+            let members =
+                apply_within_seconds(MembersV1::default(), &parent_state, &parameters, added);
             assert!(!members.members.contains(&s));
             assert_eq!(members.members.len(), kept);
         }
