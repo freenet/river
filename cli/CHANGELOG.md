@@ -2,6 +2,16 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.22] - 2026-10-16
+
+### Changed
+- Built against river-core 0.2.1 and the new room contract (freenet/river#796).
+  Rooms migrate to the new contract automatically.
+- When the ban list is over `max_user_bans`, bans that take no effect are
+  removed first, then the oldest. Owner bans and all other bans each keep at
+  least half the cap, and either can use slots the other leaves free. Before,
+  a list full of owner bans removed every new deputy ban as soon as it was made.
+
 ## [0.2.21] - 2026-10-15
 
 ### Changed
