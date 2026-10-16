@@ -44,7 +44,8 @@ mod tests {
         }
     }
 
-    /// One theme's avatar tokens and the surfaces an avatar sits on.
+    /// One theme's avatar tokens and the surfaces an avatar sits on, as
+    /// `tailwind.css` declares them.
     struct Theme {
         name: &'static str,
         /// `--avatar-l`: lightness at tone 0.
@@ -55,27 +56,65 @@ mod tests {
         c: f64,
         /// `--color-bg`.
         bg: [u8; 3],
-        /// `--color-surface`; the hover band is this at 40% over `bg`.
+        /// `--color-surface`.
         surface: [u8; 3],
+        /// `--color-row-hover`'s share of `--color-surface` over `bg`.
+        hover_mix: f64,
     }
 
-    const LIGHT: Theme = Theme {
-        name: "light",
-        l: 0.48,
-        l_step: 0.05,
-        c: 0.15,
-        bg: [0xf5, 0xf5, 0xf7],
-        surface: [0xeb, 0xeb, 0xeb],
-    };
+    const TAILWIND_CSS: &str = include_str!("../../../assets/tailwind.css");
 
-    const DARK: Theme = Theme {
-        name: "dark",
-        l: 0.68,
-        l_step: 0.07,
-        c: 0.14,
-        bg: [0x0a, 0x0a, 0x0b],
-        surface: [0x1e, 0x1e, 0x21],
-    };
+    /// The value of `token` in a `:root` block, up to its `;`.
+    fn token<'a>(block: &'a str, theme: &str, token: &str) -> &'a str {
+        let decl = format!("{token}: ");
+        let from = block
+            .find(&decl)
+            .unwrap_or_else(|| panic!("{theme} :root is missing `{token}`"))
+            + decl.len();
+        block[from..][..block[from..].find(';').expect("declaration ends")].trim()
+    }
+
+    fn number(block: &str, theme: &str, name: &str) -> f64 {
+        let value = token(block, theme, name);
+        value
+            .parse()
+            .unwrap_or_else(|_| panic!("{theme} `{name}: {value}` is not a number"))
+    }
+
+    fn hex(block: &str, theme: &str, name: &str) -> [u8; 3] {
+        let value = token(block, theme, name);
+        let digits = value
+            .strip_prefix('#')
+            .filter(|d| d.len() == 6)
+            .unwrap_or_else(|| panic!("{theme} `{name}: {value}` is not #rrggbb"));
+        std::array::from_fn(|i| u8::from_str_radix(&digits[2 * i..2 * i + 2], 16).unwrap())
+    }
+
+    /// Both themes, read from `tailwind.css`. The dark block inherits the
+    /// light `--color-row-hover`, which resolves against the dark surface.
+    fn themes() -> [Theme; 2] {
+        let light = block_after(TAILWIND_CSS, "/* Light mode colors (default) */\n:root");
+        let dark = block_after(
+            TAILWIND_CSS,
+            "@media (prefers-color-scheme: dark) {\n  :root",
+        );
+        let row_hover = token(light, "light", "--color-row-hover");
+        let hover_mix = row_hover
+            .strip_prefix("color-mix(in srgb, var(--color-surface) ")
+            .and_then(|rest| rest.strip_suffix("%, transparent)"))
+            .and_then(|pct| pct.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("unexpected `--color-row-hover: {row_hover}`"))
+            / 100.0;
+        [("light", light), ("dark", dark)].map(|(name, block)| Theme {
+            name,
+            l: number(block, name, "--avatar-l"),
+            l_step: number(block, name, "--avatar-l-step"),
+            c: number(block, name, "--avatar-c"),
+            bg: hex(block, name, "--color-bg"),
+            surface: hex(block, name, "--color-surface"),
+            hover_mix,
+        })
+    }
 
     /// WCAG 1.4.11 minimum for non-text graphics.
     const MIN_CONTRAST: f64 = 3.0;
@@ -141,10 +180,11 @@ mod tests {
     /// every hue and tone, against the background and the hover band.
     fn worst_case(theme: &Theme) -> ((f64, u16, u8), (f64, u16, u8)) {
         let bg = theme.bg.map(f64::from);
-        // `color-mix(in srgb, surface 40%, transparent)` over bg: an alpha
+        // `color-mix(in srgb, surface N%, transparent)` over bg: an alpha
         // composite of the encoded channels.
-        let hover: [f64; 3] =
-            std::array::from_fn(|i| 0.4 * f64::from(theme.surface[i]) + 0.6 * bg[i]);
+        let hover: [f64; 3] = std::array::from_fn(|i| {
+            theme.hover_mix * f64::from(theme.surface[i]) + (1.0 - theme.hover_mix) * bg[i]
+        });
         let surfaces = [srgb8_luminance(bg), srgb8_luminance(hover)];
         let mut worst_contrast = (f64::INFINITY, 0, 0);
         let mut worst_chroma = (f64::INFINITY, 0, 0);
@@ -175,7 +215,7 @@ mod tests {
     /// token values, not the hash: any hash output is covered.
     #[test]
     fn every_avatar_colour_clears_contrast_and_stays_chromatic() {
-        for theme in [&LIGHT, &DARK] {
+        for theme in &themes() {
             let ((ratio, hue, tone), (chroma, c_hue, c_tone)) = worst_case(theme);
             assert!(
                 ratio >= MIN_CONTRAST,
@@ -194,33 +234,22 @@ mod tests {
     fn block_after<'a>(css: &'a str, start: &str) -> &'a str {
         let from = css
             .find(start)
-            .unwrap_or_else(|| panic!("missing `{start}` in tailwind.css"));
+            .unwrap_or_else(|| panic!("missing `{start}`"));
         let open = from + css[from..].find('{').expect("block opens") + 1;
         let close = open + css[open..].find('}').expect("block closes");
         &css[open..close]
     }
 
-    /// `tailwind.css` carries exactly the token values the contrast test
-    /// checks, in the light `:root` and the dark one, so CSS and test can't
-    /// drift.
+    /// The formula `worst_case` models; change both together.
     #[test]
-    fn tailwind_tokens_match_the_tested_values() {
-        let css = include_str!("../../../assets/tailwind.css");
-        let light = block_after(css, "/* Light mode colors (default) */\n:root");
-        let dark = block_after(css, "@media (prefers-color-scheme: dark) {\n  :root");
-        for (block, theme) in [(light, &LIGHT), (dark, &DARK)] {
-            for (token, value) in [
-                ("--avatar-l", theme.l),
-                ("--avatar-l-step", theme.l_step),
-                ("--avatar-c", theme.c),
-            ] {
-                let decl = format!("{token}: {value};");
-                assert!(
-                    block.contains(&decl),
-                    "{} :root is missing `{decl}`",
-                    theme.name
-                );
-            }
-        }
+    fn main_css_paints_the_modelled_formula() {
+        let css = include_str!("../../../assets/main.css");
+        let block = block_after(css, ".msg-avatar-hashed {");
+        assert!(
+            block.contains(
+                "color: oklch(calc(var(--avatar-l) + var(--avatar-tone) * var(--avatar-l-step)) var(--avatar-c) var(--avatar-hue));"
+            ),
+            "`.msg-avatar-hashed` no longer paints the colour the contrast sweep checks:\n{block}"
+        );
     }
 }

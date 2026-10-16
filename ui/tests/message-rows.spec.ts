@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { coarsePointer, contrast, openRoomWithComposer, reactTo, resolveColor, waitForApp } from "./example-room";
+import { coarsePointer, contrast, openRoomWithComposer, over, reactTo, resolveColor, waitForApp } from "./example-room";
 import { readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
@@ -9,6 +9,10 @@ import { callRiverTest } from "./river-test";
 // kebab sit in.
 
 const GUTTER_PX = 72;
+
+/// The lowest-contrast (hue, tone) per theme, from `worst_case` in
+/// avatar_colour.rs (light 3.29:1, dark 6.06:1); update both together.
+const WORST_AVATAR = { light: [191, 2], dark: [352, 0] } as const;
 
 /// The history item (a group of one author's rows) holding `text`.
 function groupWith(page: Page, text: string): Locator {
@@ -184,6 +188,29 @@ test.describe("Message rows", () => {
         colours.push(String(await expectHashedAvatar(page, g, `${scheme} ${kind}`)));
       }
       expect(new Set(colours).size, `${scheme}: distinct members, distinct colours (${colours.join(" | ")})`).toBe(3);
+    }
+  });
+
+  test("the worst-case avatar colour clears 3:1 over the hover band, and tone moves it", async ({ page }) => {
+    const { received } = await openRoomWithPairs(page);
+    const avatar = received.getByTestId("message-group-avatar");
+    const paint = async (hue: number, tone: number) =>
+      resolveColor(
+        page,
+        await avatar.evaluate((a, [h, t]) => {
+          (a as HTMLElement).style.setProperty("--avatar-hue", String(h));
+          (a as HTMLElement).style.setProperty("--avatar-tone", String(t));
+          return getComputedStyle(a).color;
+        }, [hue, tone]),
+      );
+    for (const scheme of ["light", "dark"] as const) {
+      await page.emulateMedia({ colorScheme: scheme });
+      const [hue, tone] = WORST_AVATAR[scheme];
+      const bg = await resolveColor(page, "var(--color-bg)");
+      const band = over(await resolveColor(page, "var(--color-row-hover)"), bg);
+      const worst = await paint(hue, tone);
+      expect(contrast(worst, band), `${scheme}: hue ${hue} tone ${tone} on the band (${worst} on ${band})`).toBeGreaterThanOrEqual(3);
+      expect(await paint(hue, (tone + 1) % 3), `${scheme}: tone changes the colour`).not.toEqual(worst);
     }
   });
 
