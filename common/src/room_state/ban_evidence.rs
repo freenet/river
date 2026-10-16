@@ -451,17 +451,26 @@ impl ComposableState for BanEvidenceV1 {
                 for m in delta {
                     combined.entry(m.member.id()).or_insert(m);
                 }
+                // A held record competes only while its own chain still
+                // reaches the owner within the cap through the records known
+                // here; one that no longer does (its inviter was removed by
+                // this merge) is replaced by any incoming record that does,
+                // as cleanup would drop it anyway. Otherwise a peer holding
+                // the stale record and a peer holding the resolvable one
+                // ended a merge differently (freenet/river#703 review).
                 let held: HashMap<MemberId, EvidenceDigest> = self
                     .members
                     .iter()
+                    .filter(|m| within_depth(m, &combined, owner_id, depth_cap))
                     .map(|m| (m.member.id(), evidence_digest(m)))
                     .collect();
                 // Two valid records for one id resolve the same way on every
-                // peer, whatever order they arrive in: the lower digest wins.
-                // Per id only the lowest-digest record that passes the cheap
-                // checks is considered, and only if it would replace what is
-                // held, so an id costs at most one chain check. If it fails,
-                // a peer holding a valid record offers it on the next sync.
+                // peer, whatever order they arrive in: of those whose chains
+                // resolve, the lower digest wins. Per id only the
+                // lowest-digest record that passes the cheap checks is
+                // considered, and only if it would replace what is held, so an
+                // id costs at most one chain check. If it fails, a peer holding
+                // a valid record offers it on the next sync.
                 let mut best: BTreeMap<MemberId, (EvidenceDigest, &AuthorizedMember)> =
                     BTreeMap::new();
                 for m in delta {
@@ -575,10 +584,13 @@ pub(crate) mod tests {
             combined.entry(m.member.id()).or_insert(m);
         }
         // Per id, the lowest-digest eligible record, if it is lower than the
-        // held one; then a full walk of its chain.
+        // held one (a held record whose chain no longer resolves within the
+        // cap does not count); then a full walk of its chain.
+        let cap = evidence_depth_cap(parent_state.configuration.configuration.max_members);
         let held: HashMap<MemberId, EvidenceDigest> = evidence
             .members
             .iter()
+            .filter(|m| within_depth(m, &combined, owner_id, cap))
             .map(|m| (m.member.id(), evidence_digest(m)))
             .collect();
         let mut best: BTreeMap<MemberId, (EvidenceDigest, &AuthorizedMember)> = BTreeMap::new();

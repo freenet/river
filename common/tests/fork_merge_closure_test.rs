@@ -448,7 +448,7 @@ fn random_op_ext(
         bans: Some(v),
         ..Default::default()
     };
-    match rng.gen_range(0..9) {
+    match rng.gen_range(0..10) {
         // A ban chain in one delta: A bans T and T bans Y, preferring an
         // ancestor A of T (ancestor authority) and T an ancestor of Y.
         0 => {
@@ -564,6 +564,34 @@ fn random_op_ext(
                 members: Some(MembersDelta::new(members)),
                 recent_messages: Some(msgs),
                 bans: Some(vec![sign_ban(w, Some(a), b, t)]),
+                ..Default::default()
+            }
+        }
+        // A second member record for an existing member, issued by a
+        // different (present) inviter, with the inviter's chain and a message
+        // by the member. Two validly signed records for one member must
+        // resolve the same way on every peer (freenet/river#703 review M4).
+        9 => {
+            let Some(p) = pick(rng, &present) else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let m = rng.gen_range(0..n);
+            if m == p {
+                return ChatRoomStateV1Delta::default();
+            }
+            let mut members: Vec<AuthorizedMember> =
+                w.chain(p).iter().map(|&c| w.pool[c].auth.clone()).collect();
+            members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: w.owner_id,
+                    invited_by: w.pool[p].id,
+                    member_vk: w.pool[m].sk.verifying_key(),
+                },
+                &w.pool[p].sk,
+            ));
+            ChatRoomStateV1Delta {
+                members: Some(MembersDelta::new(members)),
+                recent_messages: Some(vec![w.msg(Some(m), t, &format!("reinvited {m}@{t}"))]),
                 ..Default::default()
             }
         }
@@ -1027,7 +1055,13 @@ fn adversarial_forks_never_permanently_reject_each_other() {
 /// after every apply and merge.
 #[test]
 fn extended_forks_converge_and_cleanup_is_idempotent() {
-    let seeds = default_seeds(seeds_from_env(3));
+    let mut seeds = default_seeds(seeds_from_env(3));
+    // Two ban-evidence records for one member from different inviters, one
+    // whose inviter the merge removes: not one-shot commutative before
+    // `BanEvidenceV1::apply_delta` stopped letting an unresolvable held
+    // record block a resolvable one (freenet/river#703 review). Only
+    // meaningful while `random_op_ext` draws as it does today.
+    seeds.push((272, 2));
     let failures = endings(Mode::Extended, &seeds);
     let stats = take_stats();
     assert_floors(

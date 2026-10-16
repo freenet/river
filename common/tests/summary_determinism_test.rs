@@ -91,8 +91,14 @@ fn bans_summary_serialization_is_order_independent() {
 
 #[test]
 fn members_summary_serialization_is_order_independent() {
-    let s_fwd: MemberSummary = (0..N).map(member_id).collect();
-    let s_rev: MemberSummary = (0..N).rev().map(member_id).collect();
+    let entry = |i: i64| {
+        (
+            member_id(i),
+            river_core::room_state::ban_evidence::EvidenceDigest(sig_rank(i).0),
+        )
+    };
+    let s_fwd: MemberSummary = (0..N).map(entry).collect();
+    let s_rev: MemberSummary = (0..N).rev().map(entry).collect();
 
     assert_eq!(
         cbor(&s_fwd),
@@ -274,7 +280,15 @@ fn top_level_summary_serialization_is_order_independent() {
     fn build(reversed: bool) -> ChatRoomStateV1Summary {
         let order = |i: i64| if reversed { N - 1 - i } else { i };
         let bans = (0..N).map(|i| ban_id(order(i))).collect();
-        let members = (0..N).map(|i| member_id(order(i))).collect();
+        let members = (0..N)
+            .map(|i| {
+                let j = order(i);
+                (
+                    member_id(j),
+                    river_core::room_state::ban_evidence::EvidenceDigest(sig_rank(j).0),
+                )
+            })
+            .collect();
         // freenet/river#702: the ban-evidence summary is a BTreeMap of
         // record digests.
         let ban_evidence = (0..N)

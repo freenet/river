@@ -3274,3 +3274,78 @@ fn a_deep_ban_evidence_chain_merges_into_a_fresh_peer() {
     assert!(ser(&a) == ser(&deep));
     a.verify(&a, &parameters).unwrap();
 }
+
+/// freenet/river#703 review M4: two validly signed member records for one
+/// member id, issued by different inviters, held on different peers. Both
+/// merge directions must end in the same state, whichever record each peer
+/// held, and the result must verify. Also covered for a member invited by two
+/// members at the same depth, and with the records arriving in one delta.
+#[test]
+fn two_records_for_one_member_resolve_the_same_way_in_both_directions() {
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    let owner_sk = SigningKey::from_bytes(&[11; 32]);
+    let owner_id: MemberId = owner_sk.verifying_key().into();
+    let params = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+    let (p, p_sk) = create_test_member(owner_id, owner_id);
+    let (q, q_sk) = create_test_member(owner_id, owner_id);
+    let (m, m_sk) = create_test_member(owner_id, owner_id);
+    let p_rec = create_authorized_member(p.clone(), &owner_sk);
+    let q_rec = create_authorized_member(q.clone(), &owner_sk);
+    let by = |inviter: MemberId, sk: &SigningKey| {
+        create_authorized_member(
+            Member {
+                invited_by: inviter,
+                ..m.clone()
+            },
+            sk,
+        )
+    };
+    let by_owner = by(owner_id, &owner_sk);
+    let by_p = by(p.id(), &p_sk);
+    let by_q = by(q.id(), &q_sk);
+    let base = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: owner_id,
+                ..Default::default()
+            },
+            &owner_sk,
+        ),
+        ..Default::default()
+    };
+    let holding = |m_rec: &AuthorizedMember| {
+        let mut s = base.clone();
+        s.members.members = vec![p_rec.clone(), q_rec.clone(), m_rec.clone()];
+        s.recent_messages.messages = vec![
+            create_test_msg(owner_id, p.id(), &p_sk, 1),
+            create_test_msg(owner_id, q.id(), &q_sk, 2),
+            create_test_msg(owner_id, m.id(), &m_sk, 3),
+        ];
+        s.post_apply_cleanup(&params).unwrap();
+        s.verify(&s, &params).unwrap();
+        s
+    };
+    let ser = |s: &ChatRoomStateV1| {
+        let mut v = Vec::new();
+        ciborium::ser::into_writer(s, &mut v).unwrap();
+        v
+    };
+    let mut failures = Vec::new();
+    for (x, y, what) in [
+        (&by_owner, &by_p, "owner vs member"),
+        (&by_p, &by_q, "member vs member"),
+    ] {
+        let (a, b) = (holding(x), holding(y));
+        let mut ab = a.clone();
+        ab.merge(&a, &params, &b).unwrap();
+        let mut ba = b.clone();
+        ba.merge(&b, &params, &a).unwrap();
+        if ser(&ab) != ser(&ba) {
+            failures.push(format!("{what}: merge(A, B) != merge(B, A)"));
+        }
+        ab.verify(&ab, &params).unwrap();
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
