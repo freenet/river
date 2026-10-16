@@ -182,7 +182,8 @@
  * always shows a single ellipsized line; on devices with a real pointer
  * (mouse) it expands to full text on hover. Touch devices skip the hover
  * expansion because (a) they have no reliable hover state and (b) tapping
- * the strip already scrolls to the quoted original message. */
+ * the strip already scrolls to the quoted original message. The expanded
+ * preview breaks anywhere, so a long URL wraps instead of being clipped. */
 .reply-strip {
     white-space: nowrap;
     overflow: hidden;
@@ -193,6 +194,7 @@
     .reply-strip:hover {
         white-space: normal;
         text-overflow: clip;
+        overflow-wrap: anywhere;
     }
 }
 
@@ -202,6 +204,7 @@
 .reply-strip:focus-visible {
     white-space: normal;
     text-overflow: clip;
+    overflow-wrap: anywhere;
     outline: 2px solid currentColor;
     outline-offset: 1px;
 }
