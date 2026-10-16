@@ -1440,7 +1440,11 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
 /// fixpoint of cleanup and of `merge(S, S)` (`check_idempotent`).
 #[test]
 fn rich_forks_converge() {
-    let seeds = default_seeds(seeds_from_env(3));
+    let mut seeds = default_seeds(seeds_from_env(3));
+    // A pair whose apply removes a member in cleanup while their secret blob
+    // is held: red without cleanup dropping that blob in the same apply.
+    // Only meaningful while `random_op_rich` draws as it does today.
+    seeds.push((30, 1));
     let failures = endings(Mode::Rich, &seeds);
     let stats = take_stats();
     assert_floors(
