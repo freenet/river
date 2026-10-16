@@ -33,6 +33,10 @@ test.describe("Restoring more rooms note", { tag: "@chromium-only" }, () => {
     await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "migrating");
     await expect(note).toBeVisible({ timeout: 5_000 });
     await expect(note.getByText("Restoring more rooms…")).toBeVisible();
+    // Screen readers hear it through the always-mounted live region.
+    const status = page.getByTestId("room-list-restoring-status");
+    await expect(status).toHaveAttribute("role", "status");
+    await expect(status).toHaveText("Restoring more rooms…");
     // The list itself still shows, unchanged, and the full-size empty-list
     // state does not.
     await expect(rows).toHaveCount(roomCount);
@@ -40,6 +44,7 @@ test.describe("Restoring more rooms note", { tag: "@chromium-only" }, () => {
 
     await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "loaded");
     await expect(note).toHaveCount(0, { timeout: 5_000 });
+    await expect(status).toHaveText("");
     await expect(rows).toHaveCount(roomCount);
   });
 

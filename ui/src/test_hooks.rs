@@ -223,11 +223,11 @@ pub fn install_test_hooks() {
                 "loaded" => RoomsLoadState::Loaded,
                 other => wasm_bindgen::throw_str(&format!("unknown rooms load state {other:?}")),
             };
-            // A worker `setRoomsLoadStateKeepingRooms("migrating")` held
-            // must not outlive the switch to an empty account.
-            let held = HELD_LOAD_WORKER.with(|held| held.borrow_mut().take());
+            // A worker `setRoomsLoadStateKeepingRooms("migrating")` holds is
+            // deliberately NOT released here: settling it over the emptied
+            // ROOMS would arm the idle resolution, which rewrites this state to
+            // `Loaded` 1.5 s later. Do not mix the two hooks on one page.
             crate::util::defer(move || {
-                drop(held);
                 ROOMS.with_mut(|rooms| {
                     rooms.map.clear();
                     rooms.room_order.clear();

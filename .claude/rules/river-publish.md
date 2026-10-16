@@ -438,8 +438,10 @@ thread the user replied to and then archived.
 **`rooms_meta` is the first item the walk writes** (freenet/river#802), so
 the room order is in place before the rooms render one at a time. Two things
 that need the predecessor's rooms merged first run at its flush instead
-(`flush_predecessor`): the order is merged once more (a room still tombstoned
-at the first merge, then resurrected by a newer slot, gets its place back), and
+(`flush_predecessor`): every order the walk has seen so far is merged once more
+(a room still tombstoned when its order was first merged, then resurrected by
+this or an older generation's slot, gets its place back; per-predecessor is not
+enough), and
 the identity ranks its `identity_sources` record are lowered (below). Do not
 move `rooms_meta` back to the end: the rail then shows key-byte order until it
 lands.

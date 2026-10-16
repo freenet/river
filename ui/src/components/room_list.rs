@@ -488,6 +488,7 @@ pub fn RoomList() -> Element {
                 class: "sr-only",
                 role: "status",
                 "aria-live": "polite",
+                "data-testid": "room-list-restoring-status",
                 if restoring_more { "Restoring more rooms…" }
             }
 
