@@ -3824,16 +3824,21 @@ fn MessageGroupComponent(
             Some(format!("--avatar-hue: {hue}; --avatar-tone: {tone};")),
         )
     };
-    let name_class = if is_self {
-        "text-sm font-medium min-w-0 [overflow-wrap:anywhere] text-accent hover:text-accent-hover cursor-pointer transition-colors"
+    let name_colour = if is_self {
+        "text-accent hover:text-accent-hover"
     } else {
-        "text-sm font-medium min-w-0 [overflow-wrap:anywhere] text-text cursor-pointer hover:text-accent transition-colors"
+        "text-text hover:text-accent"
     };
     let author_id = group.author_id;
+    // Shared by the avatar and the name. `Copy`, since `MemberId` is.
+    let open_author_info = move |_: MouseEvent| {
+        crate::util::defer(move || {
+            MEMBER_INFO_MODAL.with_mut(|signal| signal.member = Some(author_id));
+        });
+    };
 
     rsx! {
         div {
-            class: "msg-group",
             {
                 group.messages.into_iter().enumerate().map(move |(idx, msg)| {
                         let is_first = idx == 0;
@@ -3863,15 +3868,7 @@ fn MessageGroupComponent(
                                         "aria-hidden": "true",
                                         class: "msg-avatar {avatar_class}",
                                         style: avatar_style.clone(),
-                                        onclick: move |_| {
-                                            crate::util::defer(move || {
-                                                MEMBER_INFO_MODAL.with_mut(|signal| {
-                                                    signal.member = Some(author_id);
-                                                });
-                                            });
-                                        },
-                                        // The logo as an alpha mask, filled with
-                                        // the avatar's `currentColor`.
+                                        onclick: open_author_info,
                                         span {
                                             class: "msg-avatar-glyph",
                                             style: "-webkit-mask-image: url({RIVER_LOGO}); mask-image: url({RIVER_LOGO});",
@@ -3887,15 +3884,9 @@ fn MessageGroupComponent(
                                             "data-testid": "message-group-header",
                                             class: "flex flex-wrap items-baseline gap-x-2 mb-0.5",
                                             span {
-                                                class: name_class,
+                                                class: "text-sm font-medium min-w-0 [overflow-wrap:anywhere] cursor-pointer transition-colors {name_colour}",
                                                 title: "Member ID: {author_id}",
-                                                onclick: move |_| {
-                                                    crate::util::defer(move || {
-                                                        MEMBER_INFO_MODAL.with_mut(|signal| {
-                                                            signal.member = Some(author_id);
-                                                        });
-                                                    });
-                                                },
+                                                onclick: open_author_info,
                                                 "{group.author_name}"
                                             }
                                             // Impersonation warning. Sits immediately after the
@@ -3977,7 +3968,6 @@ fn MessageGroupComponent(
                                             rsx! {
                                                 div {
                                                     class: "p-3 rounded-2xl bg-surface",
-                                                    style: "width: 100%; overflow: visible;",
                                                     tabindex: "0",
                                                     // Scroll into view when edit dialog appears (#93),
                                                     // only as far as needed. Instant: the textarea's
@@ -4182,7 +4172,7 @@ fn MessageGroupComponent(
                                                             ReplyStrip::Unavailable => rsx! {
                                                                 div {
                                                                     "data-testid": "reply-strip-unavailable",
-                                                                    class: "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 mb-0.5 rounded-md italic bg-surface text-text-muted",
+                                                                    class: "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 py-1.5 mb-0.5 rounded-md italic bg-surface text-text-muted",
                                                                     // The arrow is decorative; the sentence
                                                                     // after it is what a screen reader needs.
                                                                     span { "aria-hidden": "true", "\u{21a9} " }
@@ -4197,7 +4187,7 @@ fn MessageGroupComponent(
                                                                 rsx! {
                                                                     div {
                                                                         "data-testid": "reply-strip",
-                                                                        class: "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 mb-0.5 rounded-md cursor-pointer bg-surface text-text-muted",
+                                                                        class: "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 py-1.5 mb-0.5 rounded-md cursor-pointer bg-surface text-text-muted",
                                                                         title: "Scroll to original message (Enter or Space to activate)",
                                                                         role: "button",
                                                                         tabindex: "0",
@@ -4241,7 +4231,7 @@ fn MessageGroupComponent(
                                                 // otherwise overflow the column.
                                                 div {
                                                     "data-testid": "message-body",
-                                                    class: "text-sm text-text min-w-0",
+                                                    class: "text-sm text-text",
                                                     div {
                                                         class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
                                                         dangerous_inner_html: "{msg.content_html}"
@@ -4544,7 +4534,7 @@ fn MessageGroupComponent(
                                     rsx! {
                                         div {
                                             "data-testid": "message-reaction-row",
-                                            class: "flex flex-wrap items-center justify-start gap-1 mt-0.5",
+                                            class: "flex flex-wrap items-center gap-1 mt-0.5",
                                             // Existing reactions (clickable to toggle if user has reacted)
                                             {
                                                 let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
