@@ -1,8 +1,6 @@
 //! Which member record a room keeps for a member id (freenet/river#703).
 //!
-//! A member record is signed by its inviter alone, so a second, validly
-//! signed record for a member's id can be issued by someone other than the
-//! inviter the room already holds. The room keeps the record it holds:
+//! The room keeps one member record per member id, the one it holds:
 //!
 //! - a record for an id already held is skipped, never an error, whatever
 //!   its inviter; a record naming a different key for a held id is skipped;
@@ -140,9 +138,8 @@ fn members_delta(added: Vec<AuthorizedMember>) -> ChatRoomStateV1Delta {
     }
 }
 
-/// A member nearer the owner issues a second record for a deeper member. The
-/// room keeps the record it holds, so that member's later ban on the deeper
-/// one has no authority behind it and removes nobody.
+/// A record for a held id is skipped, whatever its inviter: the held record
+/// is kept, and a ban is judged against the held record's invite chain.
 #[test]
 fn a_held_record_is_kept_over_one_issued_by_another_inviter() {
     let f = fx();

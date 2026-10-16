@@ -290,10 +290,9 @@ impl MembersV1 {
                     tests::count_invite_signature_check();
                     if let Err(e) = record.verify_signature(inviter_vk) {
                         // Signed by the key another record for its inviter's
-                        // id names (records for one id can name different
-                        // keys): skipped, as a record for an inviter this
-                        // peer does not keep. Otherwise a forgery: the
-                        // delta fails.
+                        // id names: skipped, as a record whose inviter record
+                        // this peer does not keep. Otherwise the delta
+                        // fails.
                         let other_key_signed = by_id_keys
                             .get(inviter_id)
                             .into_iter()
@@ -335,12 +334,11 @@ impl MembersV1 {
     /// without this the record such a state used, and its summary, would
     /// depend on the order the records happen to be stored in.
     ///
-    /// Only records naming the key `verify` judges the state's other records
+    /// Only records naming the key `verify` checks the state's other records
     /// against compete (the key of the last record stored for the id, as
-    /// [`Self::members_by_member_id`] reads it): everything else the state
-    /// holds for that member, its invitees included, is signed by that key,
-    /// so keeping a record naming another key would leave a valid state
-    /// invalid. Among those, the record kept is the one at the least invite
+    /// [`Self::members_by_member_id`] reads it), so normalization keeps the
+    /// record `verify` checks the member's invitees against and a valid state
+    /// stays valid. Among those, the record kept is the one at the least invite
     /// depth through the held records (a record whose chain does not reach
     /// the owner counts as deepest), then the lower record digest. Depth
     /// first, because the shallowest record depends on the fewest others to
