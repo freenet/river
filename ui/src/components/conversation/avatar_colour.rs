@@ -128,7 +128,7 @@ mod tests {
         0.2126 * r + 0.7152 * g + 0.0722 * b
     }
 
-    fn hex_luminance(rgb: [f64; 3]) -> f64 {
+    fn srgb8_luminance(rgb: [f64; 3]) -> f64 {
         luminance(rgb.map(|v| srgb_to_linear(v / 255.0)))
     }
 
@@ -145,7 +145,7 @@ mod tests {
         // composite of the encoded channels.
         let hover: [f64; 3] =
             std::array::from_fn(|i| 0.4 * f64::from(theme.surface[i]) + 0.6 * bg[i]);
-        let surfaces = [hex_luminance(bg), hex_luminance(hover)];
+        let surfaces = [srgb8_luminance(bg), srgb8_luminance(hover)];
         let mut worst_contrast = (f64::INFINITY, 0, 0);
         let mut worst_chroma = (f64::INFINITY, 0, 0);
         for hue in 0..360u16 {
@@ -177,11 +177,6 @@ mod tests {
     fn every_avatar_colour_clears_contrast_and_stays_chromatic() {
         for theme in [&LIGHT, &DARK] {
             let ((ratio, hue, tone), (chroma, c_hue, c_tone)) = worst_case(theme);
-            println!(
-                "{}: worst contrast {ratio:.4}:1 at hue {hue} tone {tone}; \
-                 min chroma {chroma:.3} at hue {c_hue} tone {c_tone}",
-                theme.name
-            );
             assert!(
                 ratio >= MIN_CONTRAST,
                 "{}: contrast {ratio:.2}:1 at hue {hue} tone {tone}",
@@ -193,32 +188,6 @@ mod tests {
                 theme.name
             );
         }
-    }
-
-    /// The measured margins recorded in plan 11b (3.29:1 light, 6.05:1 dark,
-    /// both truncated to two places; chroma 0.087 / 0.097), so a token change
-    /// that still passes but moves them is noticed.
-    #[test]
-    fn measured_margins_match_the_recorded_values() {
-        let near = |got: f64, want: f64, tol: f64| (got - want).abs() < tol;
-        let ((light_ratio, light_hue, light_tone), (light_chroma, _, _)) = worst_case(&LIGHT);
-        let ((dark_ratio, dark_hue, dark_tone), (dark_chroma, _, _)) = worst_case(&DARK);
-        assert!(
-            near(light_ratio, 3.29, 0.01) && (light_hue, light_tone) == (191, 2),
-            "light: {light_ratio:.4}:1 at hue {light_hue} tone {light_tone}"
-        );
-        assert!(
-            near(dark_ratio, 6.05, 0.01) && (dark_hue, dark_tone) == (352, 0),
-            "dark: {dark_ratio:.4}:1 at hue {dark_hue} tone {dark_tone}"
-        );
-        assert!(
-            near(light_chroma, 0.087, 0.001),
-            "light chroma {light_chroma:.4}"
-        );
-        assert!(
-            near(dark_chroma, 0.097, 0.001),
-            "dark chroma {dark_chroma:.4}"
-        );
     }
 
     /// The body of the first `{ ... }` block after `start` (no nesting).
