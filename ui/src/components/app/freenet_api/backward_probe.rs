@@ -1796,19 +1796,15 @@ mod tests {
         let before = room_with_messages(&sk, &["m1", "m2"]);
         let mut room = room_data(&sk, before.clone());
         room.rekey_merge.owed = vec![contract_key_with_id(88)];
-        // A newer configuration makes the room private while the recovered
-        // state still carries a public message: the merge applies the
-        // configuration, then rejects the message, part-way through. The
-        // display name is sealed: a private configuration with a public name
-        // is skipped rather than applied (freenet/river#703), and the merge
-        // would then succeed.
+        // The recovered state carries a newer configuration whose signature
+        // does not verify against the owner, so the merge fails. (It used a
+        // public message in a room made private until freenet/river#703's
+        // review, which now drops such a message instead of failing.)
         let mut bad = room_with_messages(&sk, &["m1", "m9"]);
         let mut config = bad.configuration.configuration.clone();
         config.configuration_version += 1;
-        config.privacy_mode = river_core::room_state::privacy::PrivacyMode::Private;
-        config.display.name =
-            river_core::room_state::privacy::SealedBytes::private(vec![7; 8], [0; 12], 0, 8);
-        bad.configuration = AuthorizedConfigurationV1::new(config, &sk);
+        bad.configuration =
+            AuthorizedConfigurationV1::new(config, &SigningKey::from_bytes(&[0x5b; 32]));
         let mut probe = before.clone();
         assert!(
             probe

@@ -1180,9 +1180,10 @@ fn message_at_older_or_newer_known_secret_version_is_accepted() {
     );
 
     // Conversely, a message at a version that does NOT have a signed
-    // record must still be rejected (defense in depth: an attacker could
+    // record must still not be stored (defense in depth: an attacker could
     // not otherwise be ruled out from injecting ciphertext at a fabricated
-    // version).
+    // version). It is skipped rather than failing the delta
+    // (freenet/river#703 review).
     let msg_at_v99 = AuthorizedMessageV1::new(
         MessageV1 {
             room_owner: owner_id,
@@ -1192,17 +1193,17 @@ fn message_at_older_or_newer_known_secret_version_is_accepted() {
         },
         &owner_sk,
     );
-    let result =
-        state
+    state
+        .recent_messages
+        .apply_delta(&state.clone(), &params, &Some(vec![msg_at_v99.clone()]))
+        .expect("a message at an unknown version is skipped");
+    assert!(
+        !state
             .recent_messages
-            .apply_delta(&state.clone(), &params, &Some(vec![msg_at_v99.clone()]));
-    assert!(
-        result.is_err(),
-        "message at unknown secret_version 99 must be rejected"
-    );
-    assert!(
-        result.unwrap_err().contains("unknown secret version"),
-        "error should mention unknown secret version"
+            .messages
+            .iter()
+            .any(|m| m.id() == msg_at_v99.id()),
+        "message at unknown secret_version 99 must not be stored"
     );
 }
 
@@ -1356,11 +1357,14 @@ fn secrets_apply_delta_is_transactional_on_failure() {
     let mut secrets = RoomSecretsV1::default();
 
     // Build a delta where:
-    //   - new_versions: [v1]                            (passes)
-    //   - new_encrypted_secrets: [secret_for_owner_at_v99]  (FAILS: version 99 not in working.versions)
+    //   - new_versions: [v1]                    (passes)
+    //   - new_encrypted_secrets: [forged blob]  (FAILS: not signed by the owner)
     //
-    // Pre-fix: versions.push(v1) succeeds, then the v99 check returns
-    // Err — but `self.versions` is now `[v1]`, a partial mutation.
+    // Pre-fix: versions.push(v1) succeeds, then the blob check returns
+    // Err — but `self.versions` is now `[v1]`, a partial mutation. (This
+    // used a blob at an unknown version until freenet/river#703's review
+    // made that a skip rather than an error; a forged signature is still an
+    // error, so the transactional property is tested the same way.)
     let v1_record = SecretVersionRecordV1 {
         version: 1,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
@@ -1370,13 +1374,14 @@ fn secrets_apply_delta_is_transactional_on_failure() {
 
     let bad_secret = EncryptedSecretForMemberV1 {
         member_id: owner_id,
-        secret_version: 99, // version 99 not in `new_versions`
+        secret_version: 1,
         ciphertext: vec![1, 2, 3],
         nonce: [0u8; 12],
         sender_ephemeral_public_key: [0u8; 32],
         provider: owner_id,
     };
-    let auth_bad_secret = AuthorizedEncryptedSecretForMember::new(bad_secret, &owner_sk);
+    let auth_bad_secret =
+        AuthorizedEncryptedSecretForMember::new(bad_secret, &SigningKey::generate(&mut OsRng));
 
     let bad_delta = SecretsDelta {
         current_version: None,
@@ -1390,8 +1395,10 @@ fn secrets_apply_delta_is_transactional_on_failure() {
     let result = secrets.apply_delta(&state, &params, &Some(bad_delta));
     assert!(result.is_err(), "bad delta must fail");
     assert!(
-        result.unwrap_err().contains("non-existent version"),
-        "expected the v99 check to be the one that fires"
+        result
+            .unwrap_err()
+            .contains("Invalid encrypted secret signature"),
+        "expected the blob's signature check to be the one that fires"
     );
 
     // POST-FIX REQUIREMENT: `secrets` is unchanged. Pre-fix this would have

@@ -173,7 +173,7 @@ All three helpers share `resolve_current_secret` (one secret-resolution
 decision for every message kind, so no kind leaks as an unsealed public body)
 and `guard_message_size`. **Deliberate divergence from the UI:** when no secret
 is available for the current version the UI logs a warning and falls back to a
-**public** body (`conversation.rs`, which the contract then rejects); the CLI
+**public** body (`conversation.rs`, which the contract then drops); the CLI
 helpers instead **error** — never sending a public body into a private room,
 and never sealing under a stale (non-current) version. They also error on an
 over-`max_message_size` body, which the contract would otherwise silently

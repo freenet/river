@@ -221,7 +221,6 @@ impl ComposableState for MessagesV1 {
     ) -> Result<(), String> {
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
         let max_message_size = parent_state.configuration.configuration.max_message_size;
-        let privacy_mode = &parent_state.configuration.configuration.privacy_mode;
 
         // A new message is kept only if its signature verifies against its
         // author's key: the owner's for the owner, otherwise the member's in
@@ -277,85 +276,12 @@ impl ComposableState for MessagesV1 {
             let signed: Vec<&AuthorizedMessageV1> =
                 delta.iter().filter(|msg| signed_by_author(msg)).collect();
 
-            for msg in &signed {
-                let content = &msg.message.content;
-
-                match content {
-                    RoomMessageBody::Private { secret_version, .. } => {
-                        // In private mode, accept any secret_version that has a
-                        // corresponding signed record in `parent_state.secrets.versions`.
-                        //
-                        // Previously this required `secret_version == current_version`
-                        // AND `has_complete_distribution` to be true for every current
-                        // member. That was too strict in two ways:
-                        //
-                        // 1. **Strict-version mismatch (Bug #3, Ivvor's repro):** if the
-                        //    owner has rotated to v_new (e.g. after a ban or membership
-                        //    churn) and sends a message at v_new, but the invitee's
-                        //    secrets-state hasn't caught up yet (still at v_old, or has
-                        //    v_old + v_new but `current_version` is still v_old), the
-                        //    composable `apply_delta` short-circuited via `?` and dropped
-                        //    the entire delta — including the message itself,
-                        //    membership updates, and any secrets-delta in the same
-                        //    payload. The invitee's UI would never even see the
-                        //    encrypted message; back-fill became impossible.
-                        //
-                        // 2. **Complete-distribution freeze:** a single member missing a
-                        //    blob at `current_version` froze the entire room for
-                        //    messages, with no recovery path unless that member came
-                        //    online and the owner re-issued blobs.
-                        //
-                        // Author safety is already enforced by `MessagesV1::verify`'s
-                        // member-or-owner signature check (see lines 47-66 above) and by
-                        // `ChatRoomStateV1::post_apply_cleanup`'s ban sweep. The
-                        // secret_version → version-record cross-check below ensures
-                        // the message references a real, owner-signed version, so a
-                        // malicious peer can't inject ciphertext at a fabricated
-                        // version number.
-                        //
-                        // **Trade-off acknowledged (Codex review, 2026-05-17):** this
-                        // relaxation permits a member with a stale client to send a
-                        // message encrypted at an older `secret_version` AFTER the
-                        // room has rotated. Members previously holding that older
-                        // secret (e.g. banned members) could still decrypt such a
-                        // message. We accept this because:
-                        //   - banned members already hold the plaintext of ALL
-                        //     messages sent during the old version's tenure, so the
-                        //     marginal post-rotation exposure is small and bounded
-                        //     by how quickly senders catch up to the latest version;
-                        //   - the alternative (`secret_version == current_version`,
-                        //     i.e. the pre-fix rule) is what produced Bug #3 in the
-                        //     first place — receivers whose own state lagged the
-                        //     sender's `current_version` dropped every message they
-                        //     received, including legitimate ones from non-stale
-                        //     senders;
-                        //   - confidentiality of post-rotation messages is properly
-                        //     enforced at the SENDER, not the contract: senders
-                        //     should always encrypt with the latest secret they
-                        //     have. PR B will add the UI back-fill needed for
-                        //     stragglers to rotate forward.
-                        if *privacy_mode == PrivacyMode::Private
-                            && !parent_state
-                                .secrets
-                                .versions
-                                .iter()
-                                .any(|v| v.record.version == *secret_version)
-                        {
-                            return Err(format!(
-                                "Private message references unknown secret version {}",
-                                secret_version
-                            ));
-                        }
-                    }
-                    RoomMessageBody::Public { .. } => {
-                        // In private mode, reject public messages (everything must be encrypted)
-                        // Exception: event messages (joins, etc.) contain no sensitive content
-                        if *privacy_mode == PrivacyMode::Private && !content.is_event() {
-                            return Err("Cannot send public messages in private room".to_string());
-                        }
-                    }
-                }
-            }
+            // A message this room cannot admit (see `admissible_in_room`) is
+            // skipped, not an error, and one already held is dropped below.
+            let signed: Vec<&AuthorizedMessageV1> = signed
+                .into_iter()
+                .filter(|msg| admissible_in_room(msg, parent_state))
+                .collect();
 
             // Deduplicate by message ID against held messages. A message
             // repeated identically inside this delta is stored once.
@@ -380,6 +306,10 @@ impl ComposableState for MessagesV1 {
         self.messages.retain(|m| {
             members_by_id.contains_key(&m.message.author) || m.message.author == owner_id
         });
+
+        // The same admission rule as for arrivals above.
+        self.messages
+            .retain(|m| admissible_in_room(m, parent_state));
 
         // Drop messages whose authors `post_apply_cleanup` removes in this
         // apply before applying the cap below; `enforced_ban_set_of` computes
@@ -422,6 +352,38 @@ impl ComposableState for MessagesV1 {
         self.rebuild_actions_state();
 
         Ok(())
+    }
+}
+
+/// Whether `msg`'s body is one this room admits. In a private room: a private
+/// body must cite a secret version the room holds an owner-signed record
+/// for, and a public body must be an event (joins and the like carry nothing
+/// sensitive). A public room admits every body.
+///
+/// `apply_delta` skips arrivals that fail this and drops held messages that
+/// fail it, rather than rejecting the delta. `verify` does not check it, so a
+/// state can hold such a message, and an error on arrival would fail every
+/// merge with a peer holding one (freenet/river#703 review). Dropping it
+/// where held makes both sides of a merge agree.
+///
+/// History of the private-version rule (Bug #3, Ivvor's repro, and the
+/// Codex review of 2026-05-17): any version with a record is accepted, not
+/// only the current one, because a receiver whose secrets lagged the
+/// sender's otherwise dropped every legitimate message; confidentiality of
+/// post-rotation messages is enforced at the SENDER, which encrypts with the
+/// newest secret it has. The version check stops a message citing a version
+/// that has no owner-signed record.
+fn admissible_in_room(msg: &AuthorizedMessageV1, room: &ChatRoomStateV1) -> bool {
+    if room.configuration.configuration.privacy_mode != PrivacyMode::Private {
+        return true;
+    }
+    match &msg.message.content {
+        RoomMessageBody::Private { secret_version, .. } => room
+            .secrets
+            .versions
+            .iter()
+            .any(|v| v.record.version == *secret_version),
+        content @ RoomMessageBody::Public { .. } => content.is_event(),
     }
 }
 

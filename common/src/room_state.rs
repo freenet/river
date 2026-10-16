@@ -143,9 +143,9 @@ impl ChatRoomStateV1 {
     /// would have been pruned on arrival and the open merge gives the same
     /// state. See [`merge_may_have_withheld_a_survivor`].
     ///
-    /// The open pass offers at most the messages work bound, newest first,
-    /// so an older window larger than the bound cannot fail the merge; and
-    /// if the open pass fails anyway, the first pass's result stands
+    /// Both passes offer at most the messages work bound, newest first, so a
+    /// window larger than the bound cannot fail the merge; and if the open
+    /// pass fails anyway, the first pass's result stands
     /// (freenet/river#703 review). Either case can leave the two merge
     /// directions differing only in old messages, where failing would have
     /// refused the merge outright.
@@ -164,27 +164,37 @@ impl ChatRoomStateV1 {
         // as `get_state_delta` does on the network path. The macro's
         // `apply_delta` ignores its parent (it re-reads `self` per field), so
         // `self` itself is passed rather than a clone.
-        let delta = other_state.delta(other_state, parameters, &summary);
+        //
+        // An empty delta is still applied (`Some` with every field `None`)
+        // rather than skipped, so the merged state is always normalized: every
+        // field re-applies its own admission rules and `post_apply_cleanup`
+        // runs. Skipping it left a state holding records the rules drop (one
+        // that arrived by a full-state PUT, which runs only `verify`)
+        // unchanged when merged with a state holding nothing new, while the
+        // other direction dropped them: merge(A, B) != merge(B, A)
+        // (freenet/river#703 review). On a state a merge or delta produced,
+        // the extra pass is a no-op.
+        let mut delta = Some(
+            other_state
+                .delta(other_state, parameters, &summary)
+                .unwrap_or_default(),
+        );
+        let cap = self
+            .with_configuration_merged_from(parameters, other_state)
+            .configuration
+            .configuration
+            .max_recent_messages;
+        trim_messages_to_work_bound(&mut delta, cap);
         let mut merged = self.clone();
         merged.apply_delta(self, parameters, &delta)?;
         if merge_may_have_withheld_a_survivor(&summary, &merged) {
             let open = summary.without_retention_horizons();
-            let mut delta = other_state.delta(other_state, parameters, &open);
-            // Offer at most as many messages as one messages delta may carry,
-            // the newest first: a sender's older window can be larger than
-            // the work bound, and the merged room keeps only the newest
-            // anyway (`max_recent_messages` <= the bound).
-            if let Some(d) = delta.as_mut() {
-                let bound = crate::room_state::message::messages_work_bound(
-                    merged.configuration.configuration.max_recent_messages,
-                );
-                if let Some(msgs) = d.recent_messages.as_mut() {
-                    if msgs.len() > bound {
-                        msgs.sort_by_key(|m| std::cmp::Reverse(m.order_key()));
-                        msgs.truncate(bound);
-                    }
-                }
-            }
+            let mut delta = Some(
+                other_state
+                    .delta(other_state, parameters, &open)
+                    .unwrap_or_default(),
+            );
+            trim_messages_to_work_bound(&mut delta, cap);
             let mut open_merged = self.clone();
             // If the open pass fails, keep the first pass's result rather
             // than failing a merge the first pass completed: the first pass
@@ -209,21 +219,34 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
     ) -> ChatRoomStateV1Summary {
+        self.summarize(
+            &self.with_configuration_merged_from(parameters, other_state),
+            parameters,
+        )
+    }
+
+    /// This state with `other_state`'s configuration merged in, borrowed
+    /// unchanged when that does not change it.
+    fn with_configuration_merged_from(
+        &self,
+        parameters: &ChatRoomParametersV1,
+        other_state: &ChatRoomStateV1,
+    ) -> std::borrow::Cow<'_, ChatRoomStateV1> {
         let config_summary = self.configuration.summarize(self, parameters);
         let config_delta =
             other_state
                 .configuration
                 .delta(other_state, parameters, &config_summary);
         if config_delta.is_none() {
-            return self.summarize(self, parameters);
+            return std::borrow::Cow::Borrowed(self);
         }
-        let mut parent = self.clone();
-        // A delta the configuration does not take leaves `parent` as it was,
+        let mut merged = self.clone();
+        // A delta the configuration does not take leaves `merged` as it was,
         // which is exactly the configuration the merge ends with.
-        let _ = parent
+        let _ = merged
             .configuration
             .apply_delta(self, parameters, &config_delta);
-        self.summarize(&parent, parameters)
+        std::borrow::Cow::Owned(merged)
     }
 
     /// Post-apply cleanup: prune members who have no recent messages, clean up
@@ -730,6 +753,21 @@ impl ChatRoomStateV1 {
             .sort_by_key(|info| info.member_info.member_id);
 
         Ok(())
+    }
+}
+
+/// Keep at most `messages_work_bound(cap)` of `delta`'s messages, the newest
+/// first. A whole-state merge builds its delta from a state that may hold
+/// more than one messages delta may carry (`verify` does not bound the
+/// count, and an older window can be larger); the merged room keeps only the
+/// newest `cap <= bound` anyway, so offering the rest only fails the merge.
+fn trim_messages_to_work_bound(delta: &mut Option<ChatRoomStateV1Delta>, cap: usize) {
+    let bound = crate::room_state::message::messages_work_bound(cap);
+    if let Some(msgs) = delta.as_mut().and_then(|d| d.recent_messages.as_mut()) {
+        if msgs.len() > bound {
+            msgs.sort_by_key(|m| std::cmp::Reverse(m.order_key()));
+            msgs.truncate(bound);
+        }
     }
 }
 

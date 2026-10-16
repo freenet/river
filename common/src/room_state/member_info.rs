@@ -459,13 +459,14 @@ impl ComposableState for MemberInfoV1 {
             for member_info in delta {
                 let member_id = &member_info.member_info.member_id;
 
-                // Validate nickname declared length
+                // A nickname longer than the room allows is skipped, not an
+                // error, and one already held is dropped below: `verify` does
+                // not check the length, so a state can hold such a record
+                // (and does whenever the owner lowers `max_nickname_size`), and
+                // an error here would fail every merge with a peer holding it
+                // (freenet/river#703 review).
                 if member_info.member_info.preferred_nickname.declared_len() > max_nickname_size {
-                    return Err(format!(
-                        "Nickname declared length {} exceeds max_nickname_size {}",
-                        member_info.member_info.preferred_nickname.declared_len(),
-                        max_nickname_size
-                    ));
+                    continue;
                 }
 
                 // Enforce the deputy-list cap at the DELTA boundary too — `verify`
@@ -536,6 +537,10 @@ impl ComposableState for MemberInfoV1 {
             parameters.owner_id() == info.member_info.member_id
                 || member_map.contains_key(&info.member_info.member_id)
         });
+        // The same nickname limit as for arrivals above, so a record is kept
+        // or dropped the same way whichever side of a merge held it.
+        self.member_info
+            .retain(|info| info.member_info.preferred_nickname.declared_len() <= max_nickname_size);
 
         // Write-side dedup (#411 round 8 Task 2 / item A): the update path above
         // uses first-match to locate the record to update, so if the state

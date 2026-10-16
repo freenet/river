@@ -4270,9 +4270,8 @@ mod tests {
 
     /// A FAILING fold must leave the room exactly as it was.
     ///
-    /// `ChatRoomStateV1::merge` is genuinely fallible — "Private message
-    /// references unknown secret version N", "Cannot send public messages in
-    /// private room", unresolvable invite chains. An earlier version of the
+    /// `ChatRoomStateV1::merge` is genuinely fallible — a record whose
+    /// signature does not verify, a work bound exceeded. An earlier version of the
     /// adopt path did `map.remove()` FIRST and merged second, so any such Err
     /// propagated out with the room already gone from the map: it vanished from
     /// the UI, every room later in the iteration was dropped from that pass,
@@ -4280,9 +4279,8 @@ mod tests {
     /// room was never written there and legacy is never probed again — a
     /// permanently stranded room, on the exact path this fix exists to protect.
     ///
-    /// Here the incoming copy is a PRIVATE room whose secrets do not carry the
-    /// version the older copy's message is sealed under, which is what makes
-    /// the fold fail.
+    /// Here the local copy carries an owner ban whose signature does not
+    /// verify, which is what makes the fold of the newer copy fail.
     #[test]
     fn a_failing_fold_leaves_the_existing_room_untouched() {
         let mut rng = rand::thread_rng();
@@ -4304,6 +4302,18 @@ mod tests {
             &owner,
         );
         old_room.room_state.recent_messages.messages.push(msg);
+        // A ban attributed to the owner but signed by another key.
+        old_room.room_state.bans.0.push(
+            river_core::room_state::ban::AuthorizedUserBan::with_signature(
+                river_core::room_state::ban::UserBan {
+                    owner_member_id: vk.into(),
+                    banned_at: get_current_system_time(),
+                    banned_user: MemberId::from(&current_identity.verifying_key()),
+                },
+                vk.into(),
+                ed25519_dalek::Signature::from_bytes(&[0; 64]),
+            ),
+        );
 
         let mut local = empty_rooms_for_merge();
         let mut ranks = MergeRanks::default();
@@ -4317,23 +4327,15 @@ mod tests {
             .expect("seeding the local copy must succeed");
         assert!(local.map.contains_key(&vk), "precondition: room is present");
 
-        // The newer generation has flipped the room to PRIVATE. Folding the
-        // older copy's PUBLIC message into it hits
-        // "Cannot send public messages in private room"
-        // (common/src/room_state/message.rs), so the fold genuinely fails.
-        // An earlier version of this test used an ordinary public room, where
-        // the fold SUCCEEDS — and it therefore passed even with the map mutated
-        // before the merge, i.e. it was vacuous for the bug it exists to catch.
-        let mut newer = make_rejoin_test_room(&owner, &current_identity, true);
-        newer.room_state.configuration = AuthorizedConfigurationV1::new(
-            Configuration {
-                owner_member_id: vk.into(),
-                configuration_version: 2,
-                privacy_mode: PrivacyMode::Private,
-                ..Configuration::default()
-            },
-            &owner,
-        );
+        // Folding the newer copy merges the local copy's forged ban into it,
+        // and the ban's signature check fails the fold. (Until
+        // freenet/river#703's review this used a public message in a room
+        // flipped to private; such a message is now dropped rather than
+        // failing the merge.) An earlier version of this test used an
+        // ordinary public room, where the fold SUCCEEDS, and it therefore
+        // passed even with the map mutated before the merge, i.e. it was
+        // vacuous for the bug it exists to catch.
+        let newer = make_rejoin_test_room(&owner, &current_identity, true);
         let result = local.merge_from_source(
             rooms_holding(vk, newer),
             30,

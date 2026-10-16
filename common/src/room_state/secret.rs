@@ -224,18 +224,19 @@ impl ComposableState for RoomSecretsV1 {
                     continue;
                 }
 
-                // Verify secret version exists (in the staged working copy,
-                // so a same-delta new_versions + new_encrypted_secrets pair
-                // resolves correctly).
+                // A blob is admitted only at a version the room holds a
+                // record for (in the staged working copy, so a same-delta
+                // new_versions + new_encrypted_secrets pair resolves). One
+                // without is skipped, not an error, and one already held is
+                // dropped below: `verify` does not check it, and an error here
+                // would fail every merge with a peer holding one
+                // (freenet/river#703 review).
                 if !working
                     .versions
                     .iter()
                     .any(|v| v.record.version == encrypted_secret.secret.secret_version)
                 {
-                    return Err(format!(
-                        "Encrypted secret references non-existent version: {}",
-                        encrypted_secret.secret.secret_version
-                    ));
+                    continue;
                 }
 
                 // Check for duplicate (version, member_id) pair
@@ -281,6 +282,13 @@ impl ComposableState for RoomSecretsV1 {
                 s.secret.member_id == owner_id || members_by_id.contains_key(&s.secret.member_id)
             });
         }
+
+        // The same admission rule as for arrivals above, for blobs held.
+        let versions: HashSet<SecretVersion> =
+            working.versions.iter().map(|v| v.record.version).collect();
+        working
+            .encrypted_secrets
+            .retain(|s| versions.contains(&s.secret.secret_version));
 
         // Sort for deterministic ordering (CRDT convergence requirement)
         working.versions.sort_by_key(|v| v.record.version);
@@ -977,8 +985,10 @@ mod tests {
         );
     }
 
+    /// A blob at a version with no record is not admitted, and does not
+    /// fail the delta (freenet/river#703 review).
     #[test]
-    fn test_apply_delta_rejects_secret_for_nonexistent_version() {
+    fn test_apply_delta_skips_secret_for_nonexistent_version() {
         let (state, params, owner_sk) = create_test_state_and_params();
         let owner_id = params.owner_id();
 
@@ -990,9 +1000,10 @@ mod tests {
             new_encrypted_secrets: vec![create_encrypted_secret(owner_id, 99, &owner_sk)], // Version 99 doesn't exist!
         };
 
-        let result = secrets.apply_delta(&state, &params, &Some(delta));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("non-existent version"));
+        secrets
+            .apply_delta(&state, &params, &Some(delta))
+            .expect("a blob at an unknown version is skipped");
+        assert!(secrets.encrypted_secrets.is_empty());
     }
 
     #[test]
