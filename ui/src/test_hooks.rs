@@ -314,18 +314,13 @@ fn test_author(delivery: Delivery) -> (SigningKey, &'static str) {
         Delivery::Append => {
             let seq = APPEND_SEQ.with(|s| s.replace(s.get() + 1));
             if seq % 2 == 0 {
-                test_sender_a()
+                (SigningKey::from_bytes(&[0x5A; 32]), "Test Sender A")
             } else {
                 (SigningKey::from_bytes(&[0x6A; 32]), "Test Sender B")
             }
         }
         Delivery::BeforeLast => (SigningKey::from_bytes(&[0x7B; 32]), "Test Sender Insert"),
     }
-}
-
-/// One of the appended arrivals' two authors.
-fn test_sender_a() -> (SigningKey, &'static str) {
-    (SigningKey::from_bytes(&[0x5A; 32]), "Test Sender A")
 }
 
 /// Admit `member_vk` to `room` as a member invited by self, so its messages
@@ -464,7 +459,7 @@ fn remove_messages(needle: &str) {
 }
 
 /// One reaction per emoji on the current room's newest message, in ONE mutation,
-/// all held by Test Sender A. A send drops the example data's reactions, so a
+/// all held by Test Sender Insert. A send drops the example data's reactions, so a
 /// spec that needs a row's chips to fill the line sets them here.
 fn add_reactions_to_newest(emojis: Vec<String>) {
     with_current_room_mut(|room, room_key| {
@@ -478,7 +473,7 @@ fn add_reactions_to_newest(emojis: Vec<String>) {
             web_sys::console::error_1(&"__riverTest.addReactionsToNewest: no messages".into());
             return;
         };
-        let (sk, nickname) = test_sender_a();
+        let (sk, nickname) = test_author(Delivery::BeforeLast);
         admit_with_nickname(room, room_key, &sk, nickname);
         let reactor = MemberId::from(&sk.verifying_key());
         // One member holding several reactions breaks the one-per-member rule
