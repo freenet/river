@@ -239,6 +239,14 @@ impl MembersV1 {
                 .push(m);
         }
         let held_ids: HashSet<MemberId> = held.iter().map(|m| m.member.id()).collect();
+        // Every key some held or added record names for each id.
+        let mut by_id_keys: HashMap<MemberId, Vec<VerifyingKey>> = HashMap::new();
+        for m in held.iter().chain(added.iter().copied()) {
+            let keys = by_id_keys.entry(m.member.id()).or_default();
+            if !keys.contains(&m.member.member_vk) {
+                keys.push(m.member.member_vk);
+            }
+        }
         let mut reached: HashSet<MemberId> = HashSet::from([owner_id]);
         let mut kept: BTreeMap<MemberId, &AuthorizedMember> = BTreeMap::new();
         let mut frontier: Vec<(MemberId, VerifyingKey)> = vec![(owner_id, parameters.owner)];
@@ -267,9 +275,22 @@ impl MembersV1 {
                     // depend on which records it competes with.
                     #[cfg(test)]
                     tests::count_invite_signature_check();
-                    record
-                        .verify_signature(inviter_vk)
-                        .map_err(|e| format!("Invalid signature for member {:?}: {}", id, e))?;
+                    if let Err(e) = record.verify_signature(inviter_vk) {
+                        // Signed by the key another record for its inviter's
+                        // id names (records for one id can name different
+                        // keys): skipped, as a record for an inviter this
+                        // peer does not keep. Otherwise a forgery: the
+                        // delta fails.
+                        let other_key_signed = by_id_keys
+                            .get(inviter_id)
+                            .into_iter()
+                            .flatten()
+                            .any(|vk| vk != inviter_vk && record.verify_signature(vk).is_ok());
+                        if other_key_signed {
+                            continue;
+                        }
+                        return Err(format!("Invalid signature for member {:?}: {}", id, e));
+                    }
                     if reached.contains(&id) {
                         continue;
                     }
@@ -301,15 +322,20 @@ impl MembersV1 {
     /// without this the record such a state used, and its summary, would
     /// depend on the order the records happen to be stored in.
     ///
-    /// The record kept is the one at the least invite depth through the held
-    /// records (a record whose chain does not reach the owner counts as
-    /// deepest), then the lower record digest. Depth first, because the
-    /// shallowest record depends on the fewest others to stay valid; the
-    /// digest breaks a tie. Both are functions of the held records alone, so
-    /// every peer holding the same records keeps the same one. Applied only
-    /// among duplicates one state already holds: an arriving record never
-    /// replaces a held one (see `resolve_records`). A no-op, after one pass
-    /// over the ids, when no id is held twice.
+    /// Only records naming the key `verify` judges the state's other records
+    /// against compete (the key of the last record stored for the id, as
+    /// [`Self::members_by_member_id`] reads it): everything else the state
+    /// holds for that member, its invitees included, is signed by that key,
+    /// so keeping a record naming another key would leave a valid state
+    /// invalid. Among those, the record kept is the one at the least invite
+    /// depth through the held records (a record whose chain does not reach
+    /// the owner counts as deepest), then the lower record digest. Depth
+    /// first, because the shallowest record depends on the fewest others to
+    /// stay valid; the digest breaks a tie. Records for one id that name one
+    /// key are kept the same way whatever order they are stored in. Applied
+    /// only among duplicates one state already holds: an arriving record
+    /// never replaces a held one (see `resolve_records`). A no-op, after one
+    /// pass over the ids, when no id is held twice.
     fn normalize_held_records(&mut self, parameters: &ChatRoomParametersV1) {
         let mut seen = HashSet::new();
         if self.members.iter().all(|m| seen.insert(m.member.id())) {
@@ -340,8 +366,16 @@ impl MembersV1 {
             frontier = next;
             level += 1;
         }
+        let verify_key: HashMap<MemberId, VerifyingKey> = self
+            .members
+            .iter()
+            .map(|m| (m.member.id(), m.member.member_vk))
+            .collect();
         let mut best: BTreeMap<MemberId, (usize, EvidenceDigest, usize)> = BTreeMap::new();
         for (i, m) in self.members.iter().enumerate() {
+            if verify_key.get(&m.member.id()) != Some(&m.member.member_vk) {
+                continue;
+            }
             let rank = (depth[i], evidence_digest(m), i);
             best.entry(m.member.id())
                 .and_modify(|b| {
