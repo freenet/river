@@ -102,8 +102,23 @@ fn shape_of(d: &ChatRoomStateV1Delta) -> String {
     if d.member_info.is_some() {
         parts.push("info".to_string());
     }
-    if d.recent_messages.is_some() {
-        parts.push("msgs".to_string());
+    if d.secrets.is_some() {
+        parts.push("secrets".to_string());
+    }
+    if let Some(m) = &d.recent_messages {
+        let private = m.iter().any(|m| m.message.content.is_private());
+        parts.push(if private { "pmsgs" } else { "msgs" }.to_string());
+    }
+    if let Some(dm) = &d.direct_messages {
+        if !dm.new_messages.is_empty() {
+            parts.push("dms".to_string());
+        }
+        if !dm.advanced_purges.is_empty() {
+            parts.push("purges".to_string());
+        }
+    }
+    if d.upgrade.is_some() {
+        parts.push("upgrade".to_string());
     }
     if parts.is_empty() {
         "empty".to_string()
@@ -227,6 +242,229 @@ struct ForkClock {
     config_offset: u32,
 }
 
+/// One rich-mode operation (`Mode::Rich`): what an honest owner or member
+/// client sends for the fields the other modes never touch. Fork B's owner
+/// device uses a disjoint version stream for purges and pointers, as for the
+/// configuration, except that secret rotations always go to the next
+/// version, so the two forks can hold different records and blobs at one
+/// version (as a UI and delegate rotating at once do).
+fn random_op_rich(
+    w: &World,
+    rng: &mut StdRng,
+    state: &ChatRoomStateV1,
+    clock: &mut ForkClock,
+    t: u64,
+) -> ChatRoomStateV1Delta {
+    use river_core::room_state::direct_messages::{
+        sign_direct_message, sign_recipient_purges, DirectMessagesDelta, RecipientPurges,
+    };
+    use river_core::room_state::privacy::{
+        PrivacyMode, RoomCipherSpec, RoomDisplayMetadata, SealedBytes,
+    };
+    use river_core::room_state::secret::{
+        AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord,
+        EncryptedSecretForMemberV1, SecretVersionRecordV1, SecretsDelta,
+    };
+    use river_core::room_state::upgrade::{AuthorizedUpgradeV1, UpgradeV1};
+
+    let present: Vec<usize> = (0..w.pool.len())
+        .filter(|&i| {
+            state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.id() == w.pool[i].id)
+        })
+        .collect();
+    let bump = if clock.config_offset > 0 {
+        clock.config_offset as u64
+    } else {
+        1
+    };
+    let id_sk = |p: Option<usize>| match p {
+        None => (w.owner_id, &w.owner_sk),
+        Some(i) => (w.pool[i].id, &w.pool[i].sk),
+    };
+    match rng.gen_range(0..100) {
+        // Secret rotation: the next version's record and a blob for the
+        // owner and every present member.
+        0..=24 => {
+            let v = state.secrets.current_version + 1;
+            let record = AuthorizedSecretVersionRecord::new(
+                SecretVersionRecordV1 {
+                    version: v,
+                    cipher_spec: RoomCipherSpec::Aes256Gcm,
+                    created_at: w.base_time + Duration::from_secs(t),
+                },
+                &w.owner_sk,
+            );
+            let fill: u8 = rng.gen();
+            let blob = |member: MemberId| {
+                AuthorizedEncryptedSecretForMember::new(
+                    EncryptedSecretForMemberV1 {
+                        member_id: member,
+                        secret_version: v,
+                        ciphertext: vec![fill; 48],
+                        nonce: [fill; 12],
+                        sender_ephemeral_public_key: [fill; 32],
+                        provider: w.owner_id,
+                    },
+                    &w.owner_sk,
+                )
+            };
+            let mut blobs = vec![blob(w.owner_id)];
+            blobs.extend(present.iter().map(|&i| blob(w.pool[i].id)));
+            ChatRoomStateV1Delta {
+                secrets: Some(SecretsDelta {
+                    current_version: Some(v),
+                    new_versions: vec![record],
+                    new_encrypted_secrets: blobs,
+                }),
+                ..Default::default()
+            }
+        }
+        // The owner makes the room private (sealed display name).
+        25..=34 => {
+            let mut c = state.configuration.configuration.clone();
+            if c.privacy_mode == PrivacyMode::Private {
+                return ChatRoomStateV1Delta::default();
+            }
+            c.configuration_version += bump as u32;
+            c.privacy_mode = PrivacyMode::Private;
+            c.display = RoomDisplayMetadata {
+                name: SealedBytes::private(vec![7; 8], [0; 12], 1, 8),
+                description: None,
+            };
+            ChatRoomStateV1Delta {
+                configuration: Some(AuthorizedConfigurationV1::new(c, &w.owner_sk)),
+                ..Default::default()
+            }
+        }
+        // A private message from the owner or a present member at the
+        // current secret version.
+        35..=54 => {
+            if state.secrets.versions.is_empty() {
+                return ChatRoomStateV1Delta::default();
+            }
+            let author = if present.is_empty() || rng.gen_bool(0.3) {
+                None
+            } else {
+                Some(present[rng.gen_range(0..present.len())])
+            };
+            let (author_id, sk) = id_sk(author);
+            let fill: u8 = rng.gen();
+            let msg = AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: w.owner_id,
+                    author: author_id,
+                    time: w.base_time + Duration::from_secs(t),
+                    content: RoomMessageBody::private(
+                        1,
+                        1,
+                        vec![fill; 24],
+                        [fill; 12],
+                        state.secrets.current_version,
+                    ),
+                },
+                sk,
+            );
+            ChatRoomStateV1Delta {
+                recent_messages: Some(vec![msg]),
+                ..Default::default()
+            }
+        }
+        // A direct message between two of the owner and present members.
+        55..=74 => {
+            let mut people: Vec<Option<usize>> = vec![None];
+            people.extend(present.iter().map(|&i| Some(i)));
+            if people.len() < 2 {
+                return ChatRoomStateV1Delta::default();
+            }
+            let a = rng.gen_range(0..people.len());
+            let mut b = rng.gen_range(0..people.len() - 1);
+            if b >= a {
+                b += 1;
+            }
+            let (from_id, from_sk) = id_sk(people[a]);
+            let (to_id, _) = id_sk(people[b]);
+            let dm = sign_direct_message(
+                from_sk,
+                from_id,
+                to_id,
+                &w.params.owner,
+                1_800_000_000 + t,
+                vec![rng.gen(); 16],
+            )
+            .expect("sign dm");
+            ChatRoomStateV1Delta {
+                direct_messages: Some(DirectMessagesDelta {
+                    new_messages: vec![dm],
+                    advanced_purges: vec![],
+                }),
+                ..Default::default()
+            }
+        }
+        // A recipient purges one of the DMs addressed to them, carrying
+        // their earlier tombstones forward.
+        75..=87 => {
+            let held = &state.direct_messages.messages;
+            if held.is_empty() {
+                return ChatRoomStateV1Delta::default();
+            }
+            let target = &held[rng.gen_range(0..held.len())];
+            let recipient = target.message.recipient;
+            let sk = if recipient == w.owner_id {
+                &w.owner_sk
+            } else {
+                match w.pool.iter().find(|p| p.id == recipient) {
+                    Some(p) => &p.sk,
+                    None => return ChatRoomStateV1Delta::default(),
+                }
+            };
+            let prior = state
+                .direct_messages
+                .purges
+                .iter()
+                .find(|p| p.recipient_id == recipient);
+            let mut purged = prior.map(|p| p.state.purged.clone()).unwrap_or_default();
+            purged.push(target.purge_token());
+            let version = prior.map_or(0, |p| p.state.version) + bump;
+            let envelope = sign_recipient_purges(
+                sk,
+                recipient,
+                &w.params.owner,
+                RecipientPurges { version, purged },
+            )
+            .expect("sign purges");
+            ChatRoomStateV1Delta {
+                direct_messages: Some(DirectMessagesDelta {
+                    new_messages: vec![],
+                    advanced_purges: vec![envelope],
+                }),
+                ..Default::default()
+            }
+        }
+        // The owner's upgrade pointer, at the next version.
+        _ => {
+            let held = state.upgrade.0.as_ref().map_or(0, |u| u.upgrade.version);
+            let version = held.saturating_add(if bump > 1 { 100 } else { 1 });
+            let mut address = [0u8; 32];
+            rng.fill(&mut address);
+            ChatRoomStateV1Delta {
+                upgrade: Some(AuthorizedUpgradeV1::new(
+                    UpgradeV1 {
+                        owner_member_id: w.owner_id,
+                        version,
+                        new_chatroom_address: blake3::Hash::from(address),
+                    },
+                    &w.owner_sk,
+                )),
+                ..Default::default()
+            }
+        }
+    }
+}
+
 /// Build one random, individually valid operation for `state` as a delta.
 ///
 /// The ORDER of RNG draws here is load-bearing for the seeds pinned in
@@ -343,7 +581,7 @@ fn random_op(
         // to ban IN THIS FORK'S VIEW -- what an honest client would send.
         // ADVERSARIAL mode: any pool member may sign a ban on anyone.
         _ => {
-            let honest = matches!(mode, Mode::Honest | Mode::Collide);
+            let honest = matches!(mode, Mode::Honest | Mode::Collide | Mode::Rich);
             let by_id = state.members.members_by_member_id();
             let (banner, target) = if honest {
                 let mut cands: Vec<(Option<usize>, usize)> = Vec::new();
@@ -417,6 +655,8 @@ fn op_for(
 ) -> ChatRoomStateV1Delta {
     if mode == Mode::Extended && rng.gen_bool(0.5) {
         random_op_ext(w, rng, state, clock, t)
+    } else if mode == Mode::Rich && rng.gen_bool(0.5) {
+        random_op_rich(w, rng, state, clock, t)
     } else {
         random_op(w, rng, state, clock, t, mode)
     }
@@ -725,6 +965,11 @@ enum Mode {
     /// different owner-signed configurations at an EQUAL version
     /// (freenet/river#703 defect 1).
     Collide,
+    /// Honest operations plus the fields the other modes never touch:
+    /// secret rotations (version records and per-member blobs), the owner
+    /// making the room private, private messages, direct messages and
+    /// recipient purges, and upgrade pointers. See `random_op_rich`.
+    Rich,
 }
 
 /// Shapes: (pool size, common-prefix ops, ops per fork, max_recent_messages,
@@ -1188,6 +1433,35 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
     );
 }
 
+/// Honest forks that also rotate secrets, make the room private, post
+/// private messages, exchange and purge direct messages and publish upgrade
+/// pointers: every pair converges, the first exchange is commutative, no
+/// merge is rejected, and every state an apply or merge produces is a
+/// fixpoint of cleanup and of `merge(S, S)` (`check_idempotent`).
+#[test]
+fn rich_forks_converge() {
+    let seeds = default_seeds(seeds_from_env(3));
+    let failures = endings(Mode::Rich, &seeds);
+    let stats = take_stats();
+    assert_floors(
+        Mode::Rich,
+        &stats,
+        &[
+            "secrets", "config", "pmsgs", "dms", "purges", "upgrade", "bans1",
+        ],
+        false,
+    );
+    assert!(
+        failures.is_empty(),
+        "{}",
+        failures.report("rich", seeds.len())
+    );
+    assert_eq!(
+        stats.merge_rejections, 0,
+        "a rich-mode merge was rejected: {stats:?}"
+    );
+}
+
 /// freenet/river#703 defect 1: two owner devices sign DIFFERENT
 /// configurations at the SAME version. Every pair must converge, and the
 /// first exchange must already be commutative.
@@ -1261,6 +1535,7 @@ fn stale_summary_deltas_apply() {
         Mode::Adversarial,
         Mode::Collide,
         Mode::Extended,
+        Mode::Rich,
     ] {
         for &(seed, shape) in &seeds {
             drain_not_idempotent();
