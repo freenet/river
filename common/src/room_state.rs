@@ -1,4 +1,5 @@
 pub mod ban;
+pub mod ban_evidence;
 pub mod configuration;
 pub mod content;
 pub mod direct_messages;
@@ -13,9 +14,10 @@ pub mod upgrade;
 pub mod version;
 
 use crate::room_state::ban::BansV1;
+use crate::room_state::ban_evidence::BanEvidenceV1;
 use crate::room_state::configuration::AuthorizedConfigurationV1;
 use crate::room_state::direct_messages::DirectMessagesV1;
-use crate::room_state::member::{MemberId, MembersV1};
+use crate::room_state::member::{AuthorizedMember, MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::message::MessagesV1;
 use crate::room_state::secret::RoomSecretsV1;
@@ -52,6 +54,19 @@ pub struct ChatRoomStateV1 {
 
     /// The members in the chat room along with who invited them
     pub members: MembersV1,
+
+    /// The `AuthorizedMember` records of absent members that a stored ban
+    /// still needs to be verified and judged (freenet/river#702). NOT
+    /// membership: see [`BanEvidenceV1`]. Must come after `members` (its
+    /// apply reads the updated member set) and before `member_info` (whose
+    /// records for evidenced members it keeps valid). `#[serde(default)]`
+    /// keeps states written before this field backwards-compatible, and an
+    /// empty field is not serialized at all, so a state without evidence
+    /// keeps the exact bytes it had before this field existed: an old state
+    /// re-serialized by the new contract is byte-identical, and merging it
+    /// with itself does not rewrite it (merge-law `state_idempotence`).
+    #[serde(default, skip_serializing_if = "BanEvidenceV1::is_empty")]
+    pub ban_evidence: BanEvidenceV1,
 
     /// Metadata about members like their nickname, can be updated by members themselves.
     pub member_info: MemberInfoV1,
@@ -90,16 +105,21 @@ impl ChatRoomStateV1 {
     /// or are in the invite chain of someone who qualifies. The owner is
     /// never in the members list (they're implicit via parameters).
     ///
-    /// Bans are only removed if the banner was themselves BANNED (orphaned ban).
-    /// If the banner was merely pruned for inactivity, their bans persist.
+    /// A member who leaves `members` (banned or pruned) while a stored ban
+    /// still references them moves to `ban_evidence`, so the ban stays
+    /// verifiable and its validity does not change with the removal it caused
+    /// (freenet/river#702). A ban is swept only when its issuer's record is
+    /// known nowhere.
     ///
     /// IDEMPOTENCE / CONVERGENCE INVARIANT: this function MUST be idempotent
     /// (`cleanup(S) == cleanup(cleanup(S))`) and a pure function of the converged
     /// state, because Freenet runs it a variable number of times across peers
     /// (and full-state PUTs bypass it via `verify`). The `max_user_bans` cap is
     /// therefore applied at the TOP (step 0-cap) so ban enforcement and the
-    /// banner-prune exemption read the FINAL surviving ban set — see the block
-    /// comments below and #411 round 7 / Codex P1 #1+#2.
+    /// ban evidence read the FINAL surviving ban set — see the block comments
+    /// below and #411 round 7 / Codex P1 #1+#2. Ban validity reads members plus
+    /// `ban_evidence`, which removal moves records into rather than deleting
+    /// them, so a pass cannot change the next pass's answer (freenet/river#702).
     ///
     /// Direct-message sweep: after pruning, any DM whose sender or
     /// recipient is now non-member or banned is dropped. Without this,
@@ -109,13 +129,38 @@ impl ChatRoomStateV1 {
     /// `direct_messages.rs` module docs, "Interaction with bans".
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
+        let depth_cap = crate::room_state::ban_evidence::evidence_depth_cap(
+            self.configuration.configuration.max_members,
+        );
+        // A lowered `max_members` can leave held evidence deeper than the
+        // cap. Drop it before anything reads it, so every step of this pass
+        // (and `enforced_ban_set_of`, which drops it the same way) judges the
+        // same records the next pass will.
+        if let Some(pruned) = self
+            .ban_evidence
+            .without_too_deep(&self.members, owner_id, depth_cap)
+        {
+            self.ban_evidence = pruned;
+        }
+        // Every record known at the start of this pass: members plus ban
+        // evidence. Step 5 and the evidence recomputation read THIS, never the
+        // pruned member set, so nothing this pass removes can change which
+        // bans stay verifiable (freenet/river#702 review round 5).
+        let known_at_start: std::collections::HashMap<MemberId, AuthorizedMember> = self
+            .ban_evidence
+            .lookup(&self.members, owner_id)
+            .into_iter()
+            .map(|(id, m)| (id, m.clone()))
+            .collect();
 
         // Snapshot for the equality assert below. Taken HERE, before step 0-cap
         // mutates `self.bans`, because this is the one point where `self` still
-        // holds exactly what `parent_state` held when the `direct_messages`
-        // field applied — the four inputs `enforced_ban_set_of` reads
-        // (`configuration`, `bans`, `members`, `member_info`) are all final by
-        // then and none is touched between there and here.
+        // holds what `parent_state` held when the `direct_messages` field
+        // applied: the five inputs `enforced_ban_set_of` reads
+        // (`configuration`, `bans`, `members`, `ban_evidence`, `member_info`)
+        // are all final by then, and the only change since is the evidence
+        // deeper than the cap dropped above, which `enforced_ban_set_of` drops
+        // the same way.
         #[cfg(debug_assertions)]
         let dm_apply_time_ban_set = {
             let snapshot = self.clone();
@@ -123,7 +168,7 @@ impl ChatRoomStateV1 {
         };
 
         // 0-cap. Enforce `max_user_bans` FIRST — BEFORE ban enforcement (step 0)
-        //     and the banner inactivity-prune exemption (step 2) — so both read
+        //     and the ban evidence (step 4a) — so both read
         //     the FINAL surviving (post-cap) ban set (#411 round 7 / Codex P1
         //     #1+#2). Running the cap here, on the converged pre-enforcement
         //     state, is what keeps `post_apply_cleanup` IDEMPOTENT and identical
@@ -133,23 +178,20 @@ impl ChatRoomStateV1 {
         //         cannot reproduce — a peer that only ever sees the capped state
         //         (e.g. via a full-state PUT that bypasses cleanup) would keep
         //         that member, so removing it here would diverge the member set.
-        //       * #2: a banner whose ban the cap evicts must NOT be exempted
-        //         from inactivity-prune at step 2. If it were (as when the cap
-        //         ran last), the banner is kept on pass 1 but its ban is then
-        //         evicted, so pass 2 prunes it — `cleanup(S) != cleanup(cleanup(S))`,
-        //         which permanently diverges peers that run cleanup a different
-        //         number of times.
-        //     Eviction drops INERT (currently-unauthorized) bans before
-        //     enforcing ones (#410 review round 1). This bounds an INERT flood
-        //     (forged / revoked-deputy bans, which `verify` accepts) — those are
-        //     evicted first, so a flood of them cannot push real moderator bans
-        //     out of the cap. It does NOT fully defend the un-ban DoS: an
-        //     ENFORCING-absent-target flood still evicts real bans, because a ban
-        //     by a current member of an ABSENT target classifies "enforcing"
-        //     WITHOUT any authorization check (`ban_is_enforcing` returns true for
-        //     a member-banner + absent target), and `banned_at` is an
-        //     attacker-signed, future-datable field — so a member can mint many
-        //     newest-dated "enforcing" bans that outrank and evict genuine ones.
+        //       * #2: a record the evicted ban was the only reference to must
+        //         not survive in `ban_evidence` on pass 1 and vanish on pass 2
+        //         (`cleanup(S) != cleanup(cleanup(S))`, which permanently
+        //         diverges peers that run cleanup a different number of times).
+        //     Eviction drops bans that take no effect before those that do,
+        //     judged by `MembersV1::resolve_bans` over the uncapped set, one per
+        //     (issuer, target) (#410 review round 1, freenet/river#702). This
+        //     bounds a flood of forged, revoked-deputy or banned-issuer bans,
+        //     which `verify` accepts: those are evicted first, so they cannot
+        //     push real moderator bans out of the cap. It does NOT fully defend
+        //     the un-ban DoS: a CURRENT member's ban on an ABSENT target takes
+        //     effect, and `banned_at` is an attacker-signed, future-datable
+        //     field, so a member can mint many newest-dated effective bans that
+        //     outrank and evict genuine ones.
         //     The substantive fix (an authorization-aware / non-attacker-ordered
         //     cap) is deferred pending Ian's decision; tracked in
         //     freenet/river#413 (Limitation 2).
@@ -167,7 +209,7 @@ impl ChatRoomStateV1 {
         //     Limitation 1). Do NOT claim the eviction is order-independent per
         //     delta.
         //     `verify`'s hard cap ceiling still rejects any stored state left over
-        //     the cap. The signature sweep (step 5) still runs AFTER enforcement
+        //     the cap. The signature sweep (step 4) still runs AFTER enforcement
         //     to drop bans orphaned by a banner's removal, and only removes bans,
         //     so the ban count stays <= the cap.
         let max_bans = self.configuration.configuration.max_user_bans;
@@ -180,35 +222,39 @@ impl ChatRoomStateV1 {
             // data loss, so the two must agree by construction rather than by
             // two copies happening to match — which is exactly what drifted in
             // #671 and in #411 round 4.
-            let members_by_id = self.members.members_by_member_id();
             BansV1::enforce_user_ban_cap(
                 &mut self.bans.0,
                 max_bans,
-                &members_by_id,
+                &self.members,
+                &self.ban_evidence,
                 &self.member_info,
-                owner_id,
-                &parameters.owner,
+                parameters,
             );
         }
 
         // 0. Enforce bans from the CONVERGED (now capped) state, deputy-aware (#410).
         //
-        // `MembersV1::apply_delta` already removed members banned by the owner
-        // or an ancestor, but it ran BEFORE the sibling `member_info` field
-        // (which carries deputy grants) was applied, so it could not evaluate
-        // deputy authority. This pass runs after every field has been applied,
-        // so `self.member_info` is converged: it removes members banned by a
-        // currently-authorized deputy, and — crucially — does NOT remove
-        // members whose deputy was revoked (the deputizer removed them from
-        // `MemberInfo.deputies` at a higher version). Because the removal set
-        // is a pure function of the converged (members + deputies + bans)
-        // state, and bans stay an add-only CRDT (never pruned here), every peer
-        // converges to the same member set regardless of delta order. Kept in
-        // post_apply_cleanup (NOT verify) so verify stays stable across
-        // ban/deputy changes — mirrors the DM ban-sweep precedent.
-        let enforced_banned_ids =
-            self.members
-                .banned_member_ids(&self.bans, &self.member_info, parameters);
+        // `MembersV1::apply_delta` already removed the members an owner ban
+        // removes, which never affects the answer here (an owner-removed
+        // member has no ban authority). It ran BEFORE the sibling
+        // `member_info` field (which carries deputy grants) was applied, so it
+        // left every other ban to this step. This pass runs after every field
+        // has been applied, so
+        // `self.member_info` is converged. `MembersV1::resolve_bans` decides
+        // which bans take effect (a ban whose issuer is removed does not,
+        // except the bans of a mutual-ban cycle, whose members are all
+        // removed: freenet/river#423, #702). Because the result is a pure
+        // function of the converged (members + deputies + bans) state, every
+        // peer converges to the same member set regardless of delta order.
+        // Kept in post_apply_cleanup (NOT verify) so verify stays stable
+        // across ban/deputy changes, mirroring the DM ban-sweep precedent.
+        let resolution = self.members.resolve_bans(
+            &self.ban_evidence,
+            &self.bans,
+            &self.member_info,
+            parameters,
+        );
+        let enforced_banned_ids = resolution.removed.clone();
 
         // THE load-bearing invariant of the freenet/river#675 remedy: the ban
         // set `DirectMessagesV1::apply_delta` derived, before this function
@@ -283,18 +329,10 @@ impl ChatRoomStateV1 {
         // see for every id this loop can add: a counted participant lands in
         // `required_ids` and therefore survives step 3 unchanged.
         //
-        // `enforced_banned_ids` is passed but is PROVABLY INERT here, and that
-        // is deliberate rather than an oversight: step 0 has already removed
-        // every enforced-banned id from `self.members`, so
-        // `members_after_ban_enforcement` and `enforced_banned_ids` are
-        // disjoint and `dm_endpoint_is_live` never reaches the ban check at
-        // this site. Verified by a disjointness `debug_assert!` run in debug
-        // profile across the whole suite and all 25 captured live states — it
-        // never fired. It is kept because passing it makes this predicate
-        // IDENTICAL to step 6's by construction, which is the entire property
-        // this fix is about; dropping it would restore the two-copies shape
-        // that drifted apart in the first place. It also means this call site
-        // adds NO new coupling to freenet/river#413's cap eviction.
+        // `enforced_banned_ids` is passed so this predicate is IDENTICAL to
+        // step 6's by construction, which is the entire property this fix is
+        // about. Step 0 has already removed every enforced-banned member, so
+        // the ban check is inert here; it is kept for that identity.
         let members_after_ban_enforcement: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
         let dm_participants: HashSet<MemberId> =
@@ -336,35 +374,19 @@ impl ChatRoomStateV1 {
                 }
             }
 
-            // A member who is the BANNER of a ban that will SURVIVE the step-5
-            // sweep is exempt from inactivity-prune (#411 round 3 item B).
-            // Otherwise an inactive moderator's bans would vanish (a banner pruned
-            // to non-member has their bans swept in step 5). Mirrors the
-            // `encrypted_secrets` exemption and is a pure function of converged
-            // state. `self.bans.0` was ALREADY capped to `max_user_bans` at step
-            // 0-cap (top of this function), so this loop iterates only the
-            // surviving bans: a banner whose ban the cap evicted is NOT exempted
-            // here, so it is not kept on pass 1 and then pruned on pass 2 (#411
-            // round 7 / Codex P1 #2 — the cap MUST precede this exemption).
-            // Runs BEFORE the invite-chain walk so the banner's ancestors are
-            // kept too (a kept member needs a valid chain). The owner can still
-            // explicitly ban an abusive banner — banning is separate from
-            // inactivity-prune, and a banned banner's bans are then swept in step 5.
-            //
-            // IDEMPOTENCE (#411 round 4/5): the exemption MUST use the SAME
-            // predicate as the step-5 sweep — `ban_signature_matches_current_key`,
-            // NOT a bare `contains_key`. Round 4 made the sweep drop a
-            // current-member-banner ban whose signature FAILS; if the exemption
-            // still kept the banner on a bare membership check, a content-free
-            // member P held solely by a garbage-sig ban Z would be KEPT on pass 1
-            // (exempted) while Z is swept, then PRUNED on pass 2 (no ban left) —
-            // so `cleanup(S) != cleanup(cleanup(S))`. Because Freenet runs
-            // post_apply_cleanup a variable number of times (and full-state PUTs
-            // bypass it via verify), that non-idempotence diverges the member set
-            // permanently. Gating on the sweep predicate makes exemption ⟺
-            // retention: a banner is exempted iff its ban actually survives. No
-            // circularity — a sig-matching banner is added to `required_ids`, so it
-            // survives step 3 to step 5, where the same predicate keeps its ban.
+            // A current member who is the ISSUER of a stored ban with a
+            // matching signature is exempt from inactivity-prune (#411 round 3
+            // item B). Since freenet/river#702 this is no longer what keeps
+            // such a ban verifiable (a pruned issuer's record would become ban
+            // evidence), but it is kept deliberately: every room stored today
+            // was produced with it, so dropping it would make those states
+            // stop being fixpoints of this function and rewrite them on their
+            // first merge (fdev verify-merge `transition_path_agreement` on the
+            // real Official-room corpus). `self.bans.0` was already capped at
+            // step 0-cap, and step 0 has already removed every banned member,
+            // so this exempts exactly the present issuers of surviving bans.
+            // It uses the step-5 predicate, so exemption <=> retention (#411
+            // round 4/5).
             for ban in &self.bans.0 {
                 let banner = ban.banned_by;
                 if banner != owner_id
@@ -399,13 +421,104 @@ impl ChatRoomStateV1 {
             .members
             .retain(|m| required_ids.contains(&m.member.id()));
 
-        // 4. Clean member_info for pruned members
-        self.member_info.member_info.retain(|info| {
-            info.member_info.member_id == owner_id
-                || required_ids.contains(&info.member_info.member_id)
+        // 4. Sweep any ban whose issuer is unknown or whose signature does
+        //    not match the issuer's key (#411 round 3 item A.3, round 4 item
+        //    A; AGENTS.md State Authorization Rule), and every ban by a member
+        //    an owner ban removes: the owner's ban wins over everything, so
+        //    such a ban can never take effect while it stands.
+        //    "Known" means present in `members` now, or known at the START of
+        //    this pass and within the evidence depth cap, so a ban whose
+        //    issuer this pass removes or prunes stays exactly when the
+        //    issuer's record moves to evidence just below (freenet/river#702).
+        //    This runs before the evidence recomputation, which reads the
+        //    swept ban set, and it only removes bans, so the count stays <=
+        //    the cap.
+        let all_known: std::collections::HashMap<MemberId, &AuthorizedMember> =
+            known_at_start.iter().map(|(id, m)| (*id, m)).collect();
+        let present: HashSet<MemberId> =
+            self.members.members.iter().map(|m| m.member.id()).collect();
+        let known_by_id: std::collections::HashMap<MemberId, &AuthorizedMember> = all_known
+            .iter()
+            .filter(|(id, m)| {
+                present.contains(*id)
+                    || crate::room_state::ban_evidence::within_depth(
+                        m, &all_known, owner_id, depth_cap,
+                    )
+            })
+            .map(|(id, m)| (*id, *m))
+            .collect();
+        self.bans.0.retain(|ban| {
+            !resolution.owner_removed.contains(&ban.banned_by)
+                && BansV1::ban_signature_matches_current_key(
+                    ban,
+                    &known_by_id,
+                    owner_id,
+                    &parameters.owner,
+                )
         });
 
-        // 4a. Collapse duplicate member_info records to the single canonical
+        // 4a. Recompute the ban evidence (freenet/river#702): every record
+        //     known at the start of this pass whose member a stored ban
+        //     references (issuer or target, and their invite ancestors), and
+        //     who is no longer in `members`. Ban resolution reads members plus
+        //     this set, so a ban judged on this pass is judged identically on
+        //     the next one, whoever left `members` in between: that is what
+        //     keeps this function idempotent. A record no stored ban needs is
+        //     dropped here, and a member re-added to `members` leaves it.
+        {
+            // An owner ban needs no record: the owner's key and authority
+            // are always available, and it removes its target whatever else
+            // is known. So an owner-banned member's record (and with it their
+            // `member_info`) is only kept if another ban needs it.
+            // `BanEvidenceV1::verify` checks stored evidence against the
+            // same function.
+            let referenced =
+                crate::room_state::ban_evidence::referenced_by_bans(&self.bans, owner_id, |id| {
+                    known_by_id.get(&id).map(|m| m.member.invited_by)
+                });
+            let mut evidence: Vec<AuthorizedMember> = known_by_id
+                .iter()
+                .filter(|(id, _)| referenced.contains(*id) && !present.contains(*id))
+                .map(|(_, m)| (*m).clone())
+                .collect();
+            evidence.sort_by_key(|m| m.member.id());
+            self.ban_evidence.members = evidence;
+        }
+
+        // 5. Clean member_info for members who are gone. A member held only
+        //    as ban evidence keeps its record where a stored ban may read it:
+        //    `is_ban_authorized` rule 4 reads the `deputies` of the target's
+        //    strict ancestors, so for each stored non-owner ban every evidence
+        //    ancestor of its target, up to the first present ancestor, keeps
+        //    its `member_info` whatever it holds. Keeping it regardless of
+        //    content is what makes the choice independent of which version of
+        //    the record a peer holds: a newer record (a revoked grant) is never
+        //    dropped and then outranked by an older one supplied again. The
+        //    depth cap bounds this to `cap - 1` records per ban. No reader shows
+        //    an evidence-only member's nickname. They keep merging like any other
+        //    record (highest rank wins); see `BanEvidenceV1`.
+        let needed_grantors: HashSet<MemberId> = {
+            let known = self.ban_evidence.lookup(&self.members, owner_id);
+            let present_ids: HashSet<MemberId> =
+                self.members.members.iter().map(|m| m.member.id()).collect();
+            let mut needed = HashSet::new();
+            for ban in self.bans.0.iter().filter(|b| b.banned_by != owner_id) {
+                let mut ancestor = known.get(&ban.ban.banned_user).map(|m| m.member.invited_by);
+                while let Some(a) = ancestor {
+                    if a == owner_id || present_ids.contains(&a) || !needed.insert(a) {
+                        break;
+                    }
+                    ancestor = known.get(&a).map(|m| m.member.invited_by);
+                }
+            }
+            needed
+        };
+        self.member_info.member_info.retain(|info| {
+            let id = info.member_info.member_id;
+            id == owner_id || required_ids.contains(&id) || needed_grantors.contains(&id)
+        });
+
+        // 5a. Collapse duplicate member_info records to the single canonical
         //     (highest-rank) one per member (#411 round 8 item C / security
         //     FINDING 2+3). `verify` accepts duplicate records (migration-safety),
         //     so a peer can hold several records for one member; without this,
@@ -418,7 +531,7 @@ impl ChatRoomStateV1 {
         //     permissionless migration PUT is unaffected.
         self.member_info.dedup_to_canonical();
 
-        // 4b. Sweep recent messages authored by members removed above (deputy-
+        // 5b. Sweep recent messages authored by members removed above (deputy-
         //     authorized ban cascade or inactivity prune).
         //     `MessagesV1::apply_delta` already drops non-member-authored
         //     messages, but it runs BEFORE this cleanup in field order — so a
@@ -443,40 +556,6 @@ impl ChatRoomStateV1 {
         // room, so nothing else recomputes it. This is the same public-only rebuild
         // `apply_delta` runs; the UI re-runs its private rebuild after apply.
         self.recent_messages.rebuild_actions_state();
-
-        // 5. Sweep any ban that is not backed by a signature-verified authority
-        //    (#411 round 3 item A.3 + round 4 item A). Nothing unvalidated stays
-        //    in state (AGENTS.md State Authorization Rule). A ban is kept only if
-        //    `ban_signature_matches_current_key` holds: the banner is the OWNER or
-        //    a CURRENT member AND the stored signature verifies against that
-        //    banner's CURRENT converged key. This drops two classes:
-        //    (a) non-member banners — a stale/pruned deputy ID or forged banner,
-        //        whose signature `verify` skipped and whom `is_ban_authorized`
-        //        grants nothing (round 3); and
-        //    (b) current-member banners whose signature does NOT match the
-        //        converged key — the same-delta pruned-deputy REPLAY forgery,
-        //        where a public `AuthorizedMember` was replayed to make the banner
-        //        a member while `verify` skipped the garbage ban signature at
-        //        apply time (round 4). Enforcement (step 0 / `banned_member_ids`)
-        //        already refuses to act on such a ban; this sweeps it from state.
-        //    Real member-banners with valid signatures were kept present by the
-        //    item-B exemption above, so their bans survive. Runs against CONVERGED
-        //    state, keeping `verify` stable (migration-safe). `members_by_id` is
-        //    rebuilt here because the sweep needs each banner's `member_vk`.
-        let members_by_id_for_ban_sweep = self.members.members_by_member_id();
-        self.bans.0.retain(|ban| {
-            BansV1::ban_signature_matches_current_key(
-                ban,
-                &members_by_id_for_ban_sweep,
-                owner_id,
-                &parameters.owner,
-            )
-        });
-
-        // (The `max_user_bans` cap runs at the TOP of this function now — step
-        // "0-cap" — so ban enforcement and the banner exemption read the final
-        // surviving ban set. This signature sweep only shrinks the set further,
-        // so the count stays <= the cap. See #411 round 7 / Codex P1 #1+#2.)
 
         // 6. Sweep DMs whose participants are no longer current members
         //    or are ENFORCED-banned. Without this, a fresh ban (or member-prune)
@@ -1254,10 +1333,11 @@ mod tests {
     }
 
     /// #411 round 7 / Codex P1 #2: a banner whose ban the `max_user_bans` cap
-    /// evicts must lose their prune exemption on the SAME pass. If the cap ran
-    /// AFTER the exemption (the bug), the banner is kept on pass 1 and pruned on
-    /// pass 2 — `cleanup(S) != cleanup(cleanup(S))` — permanently diverging peers
-    /// that run cleanup a different number of times.
+    /// evicts must not be kept for that ban on the SAME pass (originally as a
+    /// prune exemption, since freenet/river#702 as ban evidence). If the cap
+    /// ran after that decision, pass 1 and pass 2 would differ —
+    /// `cleanup(S) != cleanup(cleanup(S))` — permanently diverging peers that
+    /// run cleanup a different number of times.
     #[test]
     fn cleanup_is_idempotent_over_cap_evicted_ban() {
         let rng = &mut rand::thread_rng();
@@ -1274,8 +1354,8 @@ mod tests {
         };
         let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
 
-        // Member B: a current member with NO message/DM/secret — only being a
-        // retained banner could keep them from the inactivity prune.
+        // Member B: a current member with NO message/DM/secret, so B is pruned;
+        // only a surviving ban of B's keeps B's record, as ban evidence.
         let b_sk = SigningKey::generate(rng);
         let b_vk = b_sk.verifying_key();
         let b_id = MemberId::from(&b_vk);
@@ -1749,9 +1829,21 @@ mod tests {
     /// message names the reason and the issue number.
     #[test]
     fn field_declaration_order_puts_members_before_direct_messages() {
+        // An empty `ban_evidence` is not serialized, so give it one record.
+        let mut state = ChatRoomStateV1::default();
+        let owner_sk = SigningKey::from_bytes(&[1u8; 32]);
+        let member_sk = SigningKey::from_bytes(&[2u8; 32]);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        state.ban_evidence.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member_sk.verifying_key(),
+            },
+            &owner_sk,
+        ));
         let mut bytes = Vec::new();
-        ciborium::ser::into_writer(&ChatRoomStateV1::default(), &mut bytes)
-            .expect("default state serializes");
+        ciborium::ser::into_writer(&state, &mut bytes).expect("state serializes");
         let value: ciborium::value::Value =
             ciborium::de::from_reader(&bytes[..]).expect("round-trips as a CBOR value");
         let map = value
@@ -1771,7 +1863,13 @@ mod tests {
         // `MessagesV1::apply_delta` calls `enforced_ban_set_of(parent_state)`,
         // which equals post_apply_cleanup's step-0 set only if every field it
         // reads is applied before `recent_messages`.
-        for input in ["configuration", "bans", "members", "member_info"] {
+        for input in [
+            "configuration",
+            "bans",
+            "members",
+            "ban_evidence",
+            "member_info",
+        ] {
             assert!(
                 index_of(input) < index_of("recent_messages"),
                 "`{input}` must be declared BEFORE `recent_messages`: \

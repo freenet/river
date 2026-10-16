@@ -6225,14 +6225,19 @@ mod tests {
     /// fixes and the crash-safe key-value writes change the delegate WASM;
     /// V33 (the river-core 0.1.22 delegate from freenet/river#772) is the
     /// outgoing generation.
+    ///
+    /// Updated for V34 (the freenet/river#423 ban resolution, PR #702): the
+    /// delegate links the room-state code that change rewrites, and the
+    /// mandatory `river-core` 0.1.22 -> 0.2.0 bump would move it regardless.
+    /// V34 (`cea989c8…`, from freenet/river#768) is the outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "cea989c88db1a0ebc3558f2c33f90ab491473388e3f80319d8a09450b13a5d81",
-            "chat_delegate.wasm changed — this branch must not alter the delegate WASM; \
-             if the change is intentional, follow .claude/rules/delegate-migration.md \
+            "49a3122b2de64a62d56a2254518277d6ed8247faf3abb5325e722587a03b2ee5",
+            "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
+             intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
         );
     }

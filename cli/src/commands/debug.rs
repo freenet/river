@@ -4,10 +4,9 @@ use crate::output::OutputFormat;
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use ed25519_dalek::VerifyingKey;
-use river_core::room_state::ban::{AuthorizedUserBan, BansV1};
-use river_core::room_state::member::{AuthorizedMember, MemberId, MembersV1};
-use river_core::room_state::member_info::MemberInfoV1;
-use river_core::room_state::ChatRoomStateV1;
+use river_core::room_state::ban::AuthorizedUserBan;
+use river_core::room_state::member::{AuthorizedMember, BanResolution, MemberId};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -63,18 +62,18 @@ pub enum DebugCommands {
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum BanEnforcement {
-    /// This ban is not keeping its target out. Reached three ways: the target is
-    /// a current member the ban fails to exclude (so that person is in the room
-    /// right now); the signature does not verify against the banner's current
-    /// key; or it names the room OWNER, whom `is_ban_authorized` refuses as a
-    /// target unconditionally.
+    /// This ban is not keeping its target out. Reached when the target's record
+    /// is known but the ban takes no effect (the banner lacks authority over
+    /// them, or another ban removed the banner); when the signature was not
+    /// verified against the banner's key; or when it names the room OWNER, whom
+    /// `is_ban_authorized` refuses as a target unconditionally.
     ///
-    /// Only the owner case is permanently dead. The other two can revive, so do
+    /// Only the owner case is permanently dead. The others can revive, so do
     /// NOT read this as "this row can be ignored forever":
-    /// - `ban_signature_matches_current_key` fails for TWO reasons, and the more
-    ///   common one is benign — the banner is not a current member, so their key
-    ///   is simply unavailable to check against. A pruned moderator who rejoins
-    ///   with the same key makes every such ban verify again. Genuine
+    /// - the signature check fails for several reasons, and the commonest is
+    ///   benign: the banner's record is held nowhere (not in members, not in
+    ///   ban evidence), so their key is simply unavailable. A moderator who
+    ///   rejoins with the same key makes every such ban verify again. Genuine
     ///   mis-signature is the rarer, adversarial case.
     /// - a present-but-unauthorized target re-arms if the banner's authority is
     ///   restored. Losing enforcement does not drop a ban: cleanup only sweeps
@@ -86,24 +85,23 @@ enum BanEnforcement {
     /// The ban currently excludes its target: the banner's authority over them
     /// holds against the state as it stands.
     ///
-    /// Note exactly what this does and does not promise. Reached with the target
-    /// ABSENT, it implies an ABSOLUTE grant (the banner is the owner, or an
-    /// owner-appointed global moderator), because only those re-derive without
-    /// the target's invite chain — so the ban re-applies wherever they reattach.
-    /// Reached with the target still PRESENT, the grant may instead be positional
-    /// (a strict ancestor), which is valid now but lapses if that ancestor
-    /// leaves. So this always means "excluding them today", and additionally
-    /// means "durable across their return" only in the absent case.
+    /// Note exactly what this does and does not promise. It means "excluding
+    /// them today", as the contract's ban resolution decides it, a mutual-ban
+    /// cycle's bans included. Reached with the target absent, either the grant
+    /// is ABSOLUTE (the banner is the owner, or an owner-appointed global
+    /// moderator) or the target's record is held as ban evidence, so a
+    /// positional grant (a strict ancestor) is still checked against it.
     Enforcing,
-    /// The target is not in the room, but the banner's authority came from their
-    /// POSITION relative to the target (strict ancestor, or deputy of a non-owner
-    /// ancestor) or from no grant at all. An absent member has no invite chain to
-    /// walk, so that authority cannot be re-derived now. Not a promise either way.
+    /// The target's record is held nowhere (not in members, not in ban
+    /// evidence), and the banner's authority came from their POSITION relative
+    /// to the target (strict ancestor, or deputy of a non-owner ancestor) or
+    /// from no grant at all. With no invite chain to walk, that authority
+    /// cannot be re-derived now. Not a promise either way.
     ///
     /// This state deliberately does NOT say which of those applies, because the
     /// classifier cannot tell and neither can any function with these inputs.
-    /// Given `(ban, members_by_id, member_info, owner_id, owner_vk)` and an absent
-    /// target, "the banner was their inviter", "the banner was an owner-appointed
+    /// Given the room state and a target whose record is held nowhere, "the
+    /// banner was their inviter", "the banner was an owner-appointed
     /// moderator whose grant was revoked", and "the banner never had authority"
     /// are the SAME input: the `invited_by` edge died with the target's
     /// `AuthorizedMember`, and a revoked grant is invisible because `deputies_of`
@@ -155,62 +153,37 @@ struct BanInfo {
     enforcement: BanEnforcement,
 }
 
-/// Classify one ban against the converged `(members + member_info)` state.
+/// Classify one ban from the room's ban resolution (`MembersV1::resolve_bans`,
+/// the function cleanup enforces), so this listing and the contract cannot
+/// disagree. `known` is every record the resolution reads: members plus ban
+/// evidence.
 ///
-/// Order matters: the two definitive-dead cases are settled before any authority
-/// question, then a positive authority answer wins, and only a NEGATIVE authority
-/// answer is split by whether the target is present (definitive) or absent
-/// (contingent). That split is the whole point of the three states.
+/// - A ban naming the owner is `Inert` and permanently dead: the owner can
+///   never be a target.
+/// - A ban whose signature was not verified against its issuer's key is
+///   `Inert`. That covers a forgery (the check must come FIRST, since the
+///   authority check knows nothing about who signed: pinned by
+///   `ban_signed_by_someone_other_than_its_attributed_banner_is_inert`), an
+///   issuer whose record is held nowhere (reversible: if they rejoin with the
+///   same key their bans verify again), and an issuer the owner has banned.
+/// - A ban the resolution ranks owner, effective or mutual is `Enforcing`:
+///   it removes its target, a mutual-ban cycle's bans included.
+/// - Any other ban takes no effect today. With its target's record known it
+///   is `Inert`; with the target's record held nowhere, its authority cannot
+///   be re-derived and it is `Undetermined`.
 fn classify_ban(
     ban: &AuthorizedUserBan,
-    members_by_id: &HashMap<MemberId, &AuthorizedMember>,
-    member_info: &MemberInfoV1,
+    resolution: &BanResolution,
+    known: &HashMap<MemberId, &AuthorizedMember>,
     owner_id: MemberId,
-    owner_vk: &VerifyingKey,
 ) -> BanEnforcement {
-    // A ban whose signature does not verify against the banner's CURRENT key
-    // never excludes anyone: `banned_member_ids` skips it before asking about
-    // authority, and cleanup step 5 sweeps it.
-    //
-    // LOAD-BEARING, not defensive, and NOT redundant — do not delete it on the
-    // reasoning that cleanup step 5 makes it unconditionally true. That holds
-    // only on the CLEANED path, and a full-state PUT reaches a client without
-    // cleanup having run (`verify` accepts it, and `verify` deliberately skips a
-    // ban's signature when the banner was absent at bans-apply time, since bans
-    // apply before members). So a fetched state really can carry a ban attributed
-    // to a current, fully-authorized member but signed by somebody else.
-    //
-    // It must also come FIRST. The authority check knows nothing about who
-    // actually signed, so for a forged ban attributed to, say, an owner-appointed
-    // global moderator it answers yes — and this would report a forgery as
-    // Enforcing. Pinned by
-    // `ban_signed_by_someone_other_than_its_attributed_banner_is_inert`.
-    //
-    // Note this gate fails for TWO reasons, and forgery is the rarer one: it also
-    // returns false whenever the banner is not a current member, because their key
-    // is then unavailable to check against (`ban_signature_matches_current_key`).
-    // Most rows reaching it are that benign case — a pruned or departed moderator
-    // — which is reversible: if they rejoin with the same key, their bans verify
-    // again. Both belong in `Inert` (neither is excluding anyone now), so do not
-    // read this branch as "forgery detected".
-    if !BansV1::ban_signature_matches_current_key(ban, members_by_id, owner_id, owner_vk) {
+    if ban.ban.banned_user == owner_id || !resolution.verified.contains(&ban.id()) {
         return BanEnforcement::Inert;
     }
-    let target = ban.ban.banned_user;
-    // The owner is never a valid ban target (`is_ban_authorized` denies it
-    // outright, before any grant). Permanently dead, not contingent: the owner
-    // cannot be re-invited into a position that would make it apply, so this
-    // must not fall through to `Undetermined` merely because the owner is not
-    // in the members list.
-    if target == owner_id {
-        return BanEnforcement::Inert;
-    }
-    if MembersV1::is_ban_authorized(ban.banned_by, target, members_by_id, member_info, owner_id) {
+    if resolution.tier(&ban.id()) > BanResolution::INERT {
         return BanEnforcement::Enforcing;
     }
-    if members_by_id.contains_key(&target) {
-        // Present AND unauthorized: the actionable #472 case. This person is in
-        // the room and the ban is not stopping them.
+    if known.contains_key(&ban.ban.banned_user) {
         BanEnforcement::Inert
     } else {
         BanEnforcement::Undetermined
@@ -222,7 +195,16 @@ fn classify_ban(
 /// node — see the tests at the bottom of this file.
 fn collect_ban_infos(room_state: &ChatRoomStateV1, owner_vk: &VerifyingKey) -> Vec<BanInfo> {
     let owner_id = MemberId::from(owner_vk);
-    let members_by_id = room_state.members.members_by_member_id();
+    let params = ChatRoomParametersV1 { owner: *owner_vk };
+    let resolution = room_state.members.resolve_bans(
+        &room_state.ban_evidence,
+        &room_state.bans,
+        &room_state.member_info,
+        &params,
+    );
+    let known = room_state
+        .ban_evidence
+        .lookup(&room_state.members, owner_id);
     room_state
         .bans
         .0
@@ -238,13 +220,7 @@ fn collect_ban_infos(room_state: &ChatRoomStateV1, owner_vk: &VerifyingKey) -> V
                 banned_user_id: ban.ban.banned_user.to_string(),
                 banned_by_id: ban.banned_by.to_string(),
                 banned_at_secs,
-                enforcement: classify_ban(
-                    ban,
-                    &members_by_id,
-                    &room_state.member_info,
-                    owner_id,
-                    owner_vk,
-                ),
+                enforcement: classify_ban(ban, &resolution, &known, owner_id),
             }
         })
         .collect()
@@ -299,10 +275,10 @@ fn ban_list_lines(bans: &[BanInfo]) -> Vec<String> {
         lines.push(String::new());
         lines.push(format!(
             "Note: {} ban(s) marked NOT ENFORCING are not keeping their target \
-             out. A ban lands here when its banner is no longer a member, when \
-             the deputy authority it was issued under was revoked, when the \
-             banned user had themselves deputized the banner, or when the ban \
-             names the room owner (who can never be banned). Run `riverctl \
+             out. A ban lands here when the room no longer holds its banner's \
+             record, when the deputy authority it was issued under was revoked, \
+             when another ban removed its banner, or when the ban names the room \
+             owner (who can never be banned). Run `riverctl \
              member deputized-by <room> <banned_by_id>` to see whether the \
              banner still holds a grant, and from whom.",
             inert
@@ -961,7 +937,11 @@ mod tests {
         // since a ban's success is exactly what removes its target.
         //
         // The honest verdict is Undetermined: bob's grant re-derives only if
-        // alice comes back under him. Pair with
+        // alice comes back under him. Since freenet/river#702 cleanup keeps
+        // alice's record as ban evidence, which keeps the verdict decidable
+        // (`an_ancestor_ban_stays_enforcing_once_cleanup_holds_the_target_as_evidence`);
+        // this state, with the record gone, is what a room stored before
+        // that holds. Pair with
         // `absolute_grants_stay_enforcing_with_the_target_absent`, which stops
         // the opposite shortcut of calling every absent target Undetermined.
         let owner = key(1);
@@ -984,9 +964,12 @@ mod tests {
         let params = ChatRoomParametersV1 {
             owner: owner.verifying_key(),
         };
-        let excluded = state
-            .members
-            .banned_member_ids(&state.bans, &state.member_info, &params);
+        let excluded = state.members.banned_member_ids(
+            &state.ban_evidence,
+            &state.bans,
+            &state.member_info,
+            &params,
+        );
         state
             .members
             .members
@@ -1120,7 +1103,12 @@ mod tests {
         assert!(
             !state
                 .members
-                .banned_member_ids(&state.bans, &state.member_info, &params)
+                .banned_member_ids(
+                    &state.ban_evidence,
+                    &state.bans,
+                    &state.member_info,
+                    &params
+                )
                 .contains(&id(&alice)),
             "precondition: the contract refuses to enforce a mis-signed ban"
         );
@@ -1213,7 +1201,12 @@ mod tests {
 
             let actually_excluded = state
                 .members
-                .banned_member_ids(&state.bans, &state.member_info, &params)
+                .banned_member_ids(
+                    &state.ban_evidence,
+                    &state.bans,
+                    &state.member_info,
+                    &params,
+                )
                 .contains(&target);
 
             assert_eq!(
@@ -1475,5 +1468,57 @@ mod tests {
             "the Bans arm must not construct `BanInfo` itself — that bypasses \
              `classify_ban` and can reintroduce a hardcoded verdict."
         );
+    }
+
+    #[test]
+    fn an_ancestor_ban_stays_enforcing_once_cleanup_holds_the_target_as_evidence() {
+        // owner -> bob -> alice; bob bans alice as her strict ancestor, and
+        // cleanup removes her, keeping her record as ban evidence.
+        let owner = key(1);
+        let alice = key(2);
+        let bob = key(3);
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &bob);
+        push_member(&mut state, &owner, &bob, &alice);
+        push_ban(&mut state, &owner, &bob, &alice);
+        let params = ChatRoomParametersV1 {
+            owner: owner.verifying_key(),
+        };
+        state.post_apply_cleanup(&params).unwrap();
+        assert!(
+            state
+                .ban_evidence
+                .members
+                .iter()
+                .any(|m| m.member.id() == id(&alice)),
+            "precondition: alice's record is held as ban evidence"
+        );
+        assert_eq!(verdict(&state, &owner), BanEnforcement::Enforcing);
+    }
+
+    #[test]
+    fn both_bans_of_a_mutual_ban_are_enforcing() {
+        // bob and carol, both owner-appointed moderators, ban each other. The
+        // contract removes both (freenet/river#423), so both bans are doing
+        // their job.
+        let owner = key(1);
+        let bob = key(3);
+        let carol = key(4);
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &bob);
+        push_member(&mut state, &owner, &owner, &carol);
+        push_info(&mut state, &owner, 0, vec![id(&bob), id(&carol)]);
+        push_ban(&mut state, &owner, &bob, &carol);
+        push_ban(&mut state, &owner, &carol, &bob);
+        let params = ChatRoomParametersV1 {
+            owner: owner.verifying_key(),
+        };
+        state.post_apply_cleanup(&params).unwrap();
+        assert!(state.members.members.is_empty(), "both are removed");
+        let bans = collect_ban_infos(&state, &owner.verifying_key());
+        assert_eq!(bans.len(), 2);
+        assert!(bans
+            .iter()
+            .all(|b| b.enforcement == BanEnforcement::Enforcing));
     }
 }

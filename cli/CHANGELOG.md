@@ -2,6 +2,20 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.21] - 2026-10-15
+
+### Changed
+- Built against river-core 0.2.0 and the new room contract (freenet/river#702).
+  Rooms migrate to the new contract automatically.
+- Ban rules follow the new contract: in a mutual ban between moderators both
+  bans stand and both are removed, an owner ban overrides everything, and a ban
+  that would remove its own issuer has no effect.
+- Every send path, including accepting an invitation, refuses to post as a
+  banned member and reports a message the room would drop. A refused accept
+  stores nothing, so it can be retried.
+- `member list` shows only current members, and `member deputies` reports a
+  removed moderator whose ban authority the room still honours as active.
+
 ## [0.2.20] - 2026-10-15
 
 ### Fixed

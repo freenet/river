@@ -830,9 +830,10 @@ fn member_ids_of(members_by_id: &HashMap<MemberId, &AuthorizedMember>) -> HashSe
 ///
 /// This is the SAME set, not an approximation, and that is structural rather
 /// than lucky: the `#[composable]` macro applies fields in DECLARATION order,
-/// so `configuration`, `bans`, `members` and `member_info` — every input to
-/// step 0-cap and step 0 — are already final when the `direct_messages` field
-/// applies, and no later field mutates a sibling. (That ordering is itself
+/// so `configuration`, `bans`, `members`, `ban_evidence` and `member_info` —
+/// every input to step 0-cap and step 0 — are already final when the
+/// `direct_messages` and `recent_messages` fields apply, and no later field
+/// mutates a sibling. (That ordering is itself
 /// pinned by `field_declaration_order_puts_members_before_direct_messages`.)
 ///
 /// Nothing is re-implemented: the eviction ORDERING is
@@ -863,29 +864,41 @@ pub(crate) fn enforced_ban_set_of(
     parent_state: &ChatRoomStateV1,
     parameters: &ChatRoomParametersV1,
 ) -> HashSet<MemberId> {
-    let owner_id = parameters.owner_id();
     let max_bans = parent_state.configuration.configuration.max_user_bans;
+    // The evidence `post_apply_cleanup` reads: without records deeper than
+    // the cap, which it drops first.
+    let pruned = parent_state.ban_evidence.without_too_deep(
+        &parent_state.members,
+        parameters.owner_id(),
+        crate::room_state::ban_evidence::evidence_depth_cap(
+            parent_state.configuration.configuration.max_members,
+        ),
+    );
+    let evidence = pruned.as_ref().unwrap_or(&parent_state.ban_evidence);
 
     if parent_state.bans.0.len() <= max_bans {
         return parent_state.members.banned_member_ids(
+            evidence,
             &parent_state.bans,
             &parent_state.member_info,
             parameters,
         );
     }
-    let members_by_id = parent_state.members.members_by_member_id();
     let mut capped: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
     BansV1::enforce_user_ban_cap(
         &mut capped,
         max_bans,
-        &members_by_id,
+        &parent_state.members,
+        evidence,
         &parent_state.member_info,
-        owner_id,
-        &parameters.owner,
+        parameters,
     );
-    parent_state
-        .members
-        .banned_member_ids(&BansV1(capped), &parent_state.member_info, parameters)
+    parent_state.members.banned_member_ids(
+        evidence,
+        &BansV1(capped),
+        &parent_state.member_info,
+        parameters,
+    )
 }
 
 /// Whether a DM endpoint is still a live participant: the room owner (implicit,

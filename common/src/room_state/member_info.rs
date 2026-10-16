@@ -319,7 +319,12 @@ impl ComposableState for MemberInfoV1 {
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
-        let members_by_id = parent_state.members.members_by_member_id();
+        // A record may belong to a member OR to a ban-evidence record
+        // (freenet/river#702): ban authority reads an evidenced member's
+        // `deputies`, so their record is kept while the evidence is.
+        let members_by_id = parent_state
+            .ban_evidence
+            .lookup(&parent_state.members, parameters.owner_id());
         let owner_id = parameters.owner_id();
 
         // NOTE (#411 round 7 / Codex P1 #3): `verify` deliberately does NOT reject
@@ -442,6 +447,10 @@ impl ComposableState for MemberInfoV1 {
         let max_nickname_size = parent_state.configuration.configuration.max_nickname_size;
 
         if let Some(delta) = delta {
+            // Members plus ban evidence, built once for the whole delta.
+            let known = parent_state
+                .ban_evidence
+                .lookup(&parent_state.members, parameters.owner_id());
             for member_info in delta {
                 let member_id = &member_info.member_info.member_id;
 
@@ -475,9 +484,11 @@ impl ComposableState for MemberInfoV1 {
                 } else {
                     // For non-owners, verify they exist and check their signature.
                     // If the member was removed (e.g. banned or max_members), skip
-                    // this entry — retention cleanup below will handle it.
-                    let members = parent_state.members.members_by_member_id();
-                    let member = match members.get(member_id) {
+                    // this entry — retention cleanup below will handle it. A
+                    // member held in ban evidence counts (freenet/river#702): its
+                    // record keeps merging by rank like any other. Freezing it
+                    // at removal cannot converge, see `BanEvidenceV1`.
+                    let member = match known.get(member_id) {
                         Some(m) => m,
                         None => continue,
                     };
@@ -512,7 +523,10 @@ impl ComposableState for MemberInfoV1 {
             }
         }
         // Always remove any member info that is not in parent_state.members
-        let member_map = parent_state.members.members_by_member_id();
+        // (or held in its ban evidence, freenet/river#702)
+        let member_map = parent_state
+            .ban_evidence
+            .lookup(&parent_state.members, parameters.owner_id());
         self.member_info.retain(|info| {
             parameters.owner_id() == info.member_info.member_id
                 || member_map.contains_key(&info.member_info.member_id)

@@ -118,8 +118,13 @@ mod tests {
         //
         // V33 registers the generation before the river-core 0.1.22
         // room-contract fixes.
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 33);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "99df10ade9fcb201");
+        //
+        // V34 registers the generation before bans were resolved from
+        // converged state (freenet/river#423, PR #702): `BansV1::apply_delta`
+        // rejected a WHOLE delta on the orphaned-ban rule judged against the
+        // pre-update member set, which could fork a room permanently.
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 34);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "2ae50081f1b74c3a");
     }
 
     #[test]
