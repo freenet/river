@@ -6235,12 +6235,17 @@ mod tests {
     /// room-state code that change touches, and the river-core 0.2.0 -> 0.2.1
     /// bump moves it regardless. V35 (`49a3122b…`, from PR #702) is the
     /// outgoing generation.
+    ///
+    /// Updated for V36 (the freenet/river#703 merge-law fixes): the delegate
+    /// links the room-state code they change, and the river-core 0.2.1 ->
+    /// 0.3.0 bump would move it regardless. V36 (`eca06ace…`, from PR #797)
+    /// is the outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "eca06ace26857393b0c0ef283b560e06839b2c97b29d40d64b3909e9f9ead0aa",
+            "c415d92aacdd0ca7f4bcc6512a0cd45c36837a3fc6691214b80743cb5be9472b",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
