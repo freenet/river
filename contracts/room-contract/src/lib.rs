@@ -231,3 +231,101 @@ impl ContractInterface for Contract {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+
+    macro_rules! cbor {
+        ($v:expr) => {{
+            let mut out = Vec::new();
+            into_writer($v, &mut out).unwrap();
+            out
+        }};
+    }
+
+    /// A full-state update runs the room's own merge (`merge_from`), not the
+    /// trait default. The witness: after the owner lowers `max_user_bans`
+    /// from above the bans work bound, merging a peer that still holds the
+    /// old ban set trims what it offers to the bound, where the trait default
+    /// offers everything and fails (freenet/river#703).
+    #[test]
+    fn a_full_state_update_runs_the_rooms_own_merge() {
+        let owner_sk = SigningKey::from_bytes(&[1; 32]);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let config = |version: u32, max_user_bans: usize| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    configuration_version: version,
+                    max_user_bans,
+                    ..Default::default()
+                },
+                &owner_sk,
+            )
+        };
+        let held = river_core::room_state::ban::MIN_BANS_DELTA_BOUND + 3;
+        let bans = (0..held as u64)
+            .map(|i| {
+                let target = SigningKey::from_bytes(&{
+                    let mut b = [9u8; 32];
+                    b[..8].copy_from_slice(&i.to_le_bytes());
+                    b
+                });
+                AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner_id,
+                        banned_at: std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(i),
+                        banned_user: MemberId::from(&target.verifying_key()),
+                    },
+                    owner_id,
+                    &owner_sk,
+                )
+            })
+            .collect();
+        let mut stale = ChatRoomStateV1 {
+            configuration: config(1, held),
+            bans: BansV1(bans),
+            ..Default::default()
+        };
+        stale.post_apply_cleanup(&parameters).unwrap();
+        assert_eq!(stale.bans.0.len(), held, "premise: every ban is kept");
+        let mut updated = stale.clone();
+        updated
+            .apply_delta(
+                &stale,
+                &parameters,
+                &Some(ChatRoomStateV1Delta {
+                    configuration: Some(config(2, 2)),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+
+        let mut by_trait = updated.clone();
+        assert!(
+            ComposableState::merge(&mut by_trait, &updated, &parameters, &stale).is_err(),
+            "premise: the trait default fails this merge"
+        );
+        let mut expected = updated.clone();
+        expected.merge_from(&parameters, &stale).unwrap();
+
+        let out = Contract::update_state(
+            Parameters::from(cbor!(&parameters)),
+            State::from(cbor!(&updated)),
+            vec![UpdateData::State(State::from(cbor!(&stale)))],
+        )
+        .expect("the room's merge trims to the work bound");
+        assert_eq!(
+            out.new_state.expect("a new state").as_ref(),
+            cbor!(&expected).as_slice()
+        );
+    }
+}
