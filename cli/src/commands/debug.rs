@@ -161,13 +161,14 @@ struct BanInfo {
 /// - A ban naming the owner is `Inert` and permanently dead: the owner can
 ///   never be a target.
 /// - A ban whose own signature does not verify against its issuer's key is
-///   `Inert`. Each record is checked itself: `resolution` is keyed by `BanId`,
-///   a hash of the signature alone, so a record copying another ban's
-///   signature would otherwise read that ban's verdict. That covers a forgery (the check must come FIRST, since the
+///   `Inert`. That covers a forgery (the check must come FIRST, since the
 ///   authority check knows nothing about who signed: pinned by
 ///   `ban_signed_by_someone_other_than_its_attributed_banner_is_inert`), an
 ///   issuer whose record is held nowhere (reversible: if they rejoin with the
 ///   same key their bans verify again), and an issuer the owner has banned.
+///   Each record is checked itself: `resolution` is keyed by `BanId`, a hash
+///   of the signature alone, so a record copying another ban's signature
+///   would otherwise read that ban's verdict.
 /// - A ban the resolution ranks owner, effective or mutual is `Enforcing`:
 ///   it removes its target, a mutual-ban cycle's bans included.
 /// - Any other ban takes no effect today. With its target's record known it

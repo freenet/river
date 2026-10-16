@@ -3161,9 +3161,14 @@ fn evidence_member_info_is_kept_up_to_the_first_present_ancestor() {
 // same id: a record whose own signature does not verify against its claimed
 // issuer is dead. Each case is run in two input orders and compares whole
 // records, since the forged record and the genuine one share an id.
-type BanRecord = (MemberId, std::time::SystemTime, MemberId);
+type BanRecord = (MemberId, std::time::SystemTime, MemberId, MemberId);
 fn ban_record(b: &AuthorizedUserBan) -> BanRecord {
-    (b.banned_by, b.ban.banned_at, b.ban.banned_user)
+    (
+        b.banned_by,
+        b.ban.banned_at,
+        b.ban.banned_user,
+        b.ban.owner_member_id,
+    )
 }
 fn copy_signature(
     sig_of: &AuthorizedUserBan,
@@ -3220,15 +3225,44 @@ fn a_record_copying_an_owner_bans_signature_is_dead_at_the_cap() {
 }
 #[test]
 fn a_record_copying_a_bans_signature_cannot_take_its_pair() {
+    // An older live ban H competes for the one slot, so the result depends on
+    // the first-of-pair filter alone: with it, the copy is dead and goes,
+    // then H (older than G) goes, leaving G. Without it, the copy takes G's
+    // pair, G and the copy both go as dead, and H is left.
     let room = capped_room(20, 1);
     let a = room.person();
     let s = room.modded_state(&[&a], &[], vec![]);
-    let t = room.person();
+    let (t, t2) = (room.person(), room.person());
     let g = room.ban(&a, &t, 20);
+    let h = room.ban(&a, &t2, 15);
     let forged = copy_signature(&g, a.id, t.id, 10, room.owner_id);
-    let got = cap_both_orders(&room, &s, vec![g.clone(), forged], 1);
+    let got = cap_both_orders(&room, &s, vec![g.clone(), h, forged], 1);
     assert_eq!(got, vec![ban_record(&g)]);
 }
+
+/// A copy identical to a genuine ban in issuer, target and date, differing
+/// only in `owner_member_id`, matches the genuine ban's first-of-pair rank
+/// exactly. Only the per-record signature check in `live` makes it dead.
+#[test]
+fn a_record_differing_only_in_owner_member_id_is_dead_at_the_cap() {
+    let room = capped_room(20, 2);
+    let s = room.modded_state(&[], &[], vec![]);
+    let (x, y) = (room.person(), room.person());
+    let b1 = room.owner_ban(&x, 10);
+    let b2 = room.owner_ban(&y, 11);
+    let forged = AuthorizedUserBan::with_signature(
+        UserBan {
+            owner_member_id: room.person().id,
+            banned_at: b1.ban.banned_at,
+            banned_user: x.id,
+        },
+        room.owner_id,
+        b1.signature,
+    );
+    let got = cap_both_orders(&room, &s, vec![b1.clone(), b2.clone(), forged], 2);
+    assert_eq!(got, vec![ban_record(&b1), ban_record(&b2)]);
+}
+
 #[test]
 fn a_record_copying_a_bans_signature_is_not_live_on_an_unknown_target() {
     let room = capped_room(20, 2);
