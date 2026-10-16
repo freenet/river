@@ -264,8 +264,9 @@ instead of pinning a key that re-keys weekly, and OUR users' already-open tabs,
 which reload into the new build only when a newer record lands
 (freenet/river#580). Run `cargo make sign-pointer-records` alongside
 `add-migration`, and `cargo make publish-pointer-records` from main after the
-merge and after the UI publish (`.claude/rules/river-publish.md`, step 7). CI's `check-pointer-freshness` fails the PR if a pointed-at WASM changed
-and no new record was signed. See `pointer-records.toml` and `FREENET.md`.
+merge and after the UI publish (`.claude/rules/river-publish.md`, step 7).
+CI's `check-pointer-freshness` fails the PR if a pointed-at WASM changed and no
+new record was signed. See `pointer-records.toml` and `FREENET.md`.
 
 A pointer solves **addressing only** — it says nothing about whether state or
 secrets under the old key survived, which is what the migration registries are

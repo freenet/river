@@ -133,13 +133,14 @@ Order matters. The pre-flight below refuses unless the UI carrying the new WASM
 is live **as seen from the node you publish through**; it cannot see other
 nodes, so the wait is advice, not enforcement. Nothing enforces that this step
 runs at all (CI checks signing, not publishing), so do not skip it. Do the UI
-publish (step 5) first, then **wait ~2 minutes** before this step. Measured over publishes 30000397-403
-(2026-10-12..16): the ~1.2 MB web container reached a median peer in ~20 s,
-71% within 60 s and 80% within 5 min, with a tail of reconnecting peers out to
-~2 h, while a 100-byte pointer arrives in under 0.5 s. Two minutes clears the
-fast cluster; waiting longer buys little. A tab whose node does not yet hold
-the new UI reloads into the old one and spends a retry; the UI retries with
-backoff over ~67 minutes and then falls back to a banner.
+publish (step 5) first, then **wait ~2 minutes** before this step.
+
+Why two minutes: the ~1.2 MB web container reaches most peers within a minute
+or two, while the 100-byte pointer arrives in under a second (measured figures
+are with `RETRY_DELAYS_MS` in `generation_watch.rs`). Waiting longer buys
+little. A tab whose node does not yet hold the new UI reloads into the old one
+and spends a retry; the UI retries with backoff for about an hour, then falls
+back to a banner.
 
 ```bash
 POINTER_NODE_PORT=<a network node of yours, NOT 7509> \

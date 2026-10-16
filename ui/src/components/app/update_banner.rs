@@ -33,15 +33,16 @@ fn banner_text(notice: Notice) -> (String, bool, bool) {
             true,
         ),
         // A reload against a node that is down would only show an error page.
-        Notice::WaitingForConnection => (
-            "River has been updated and will reload once it reconnects to your node.".to_string(),
+        Notice::Offline => (
+            "River has been updated. It will reload once it reconnects to your node.".to_string(),
             false,
             false,
         ),
-        // The Reload button would fail the same way the automatic one did.
+        // The Reload button would fail the same way the automatic one did, and
+        // this page no longer reconnects (see `Phase::ReloadFailed`).
         Notice::RefreshTab => (
             "River has been updated but could not reload itself. Refresh this tab to keep \
-             receiving messages."
+             receiving messages; anything sent before you do may not be delivered."
                 .to_string(),
             false,
             false,
@@ -123,6 +124,12 @@ mod tests {
         assert_eq!(banner_text(Notice::Reloading).1, false);
         assert_eq!(banner_text(Notice::Reloading).2, false);
         assert!(banner_text(Notice::Manual).2);
+        let (offline, not_now, reload) = banner_text(Notice::Offline);
+        assert!(offline.contains("reconnects"), "{offline}");
+        assert!(
+            !not_now && !reload,
+            "offline, a Reload button would do nothing"
+        );
         let (refresh, not_now, reload) = banner_text(Notice::RefreshTab);
         assert!(refresh.contains("Refresh this tab"), "{refresh}");
         assert!(

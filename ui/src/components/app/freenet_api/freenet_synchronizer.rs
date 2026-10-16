@@ -422,6 +422,12 @@ impl FreenetSynchronizer {
                         match reconnect.on_connection_lost() {
                             None => {
                                 info!("ConnectionLost ignored — a reconnect is already pending");
+                                // Still drop the dead socket. With a reconnect
+                                // pending, whatever WEB_API holds is not the live
+                                // connection (a failed attempt leaves the old one
+                                // in place), and "WEB_API set" must mean
+                                // connected (freenet/river#580 relies on it).
+                                WEB_API.write().take();
                             }
                             Some(armed) => {
                                 // Clear the web API so is_connected() returns false
