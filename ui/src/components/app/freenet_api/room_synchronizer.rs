@@ -2825,6 +2825,7 @@ mod tests {
         // BASELINE: cap 3, exactly 3 messages, so it publishes a real horizon.
         let mut baseline = room_state.clone();
         let mut cfg = baseline.configuration.configuration.clone();
+        cfg.owner_member_id = MemberId::from(&owner_sk.verifying_key());
         cfg.max_recent_messages = 3;
         baseline.configuration = AuthorizedConfigurationV1::new(cfg.clone(), &owner_sk);
         for i in 0..3u64 {

@@ -3414,6 +3414,10 @@ mod tests {
         fn forged(owner: VerifyingKey, version: u32) -> RoomData {
             let mut room = test_minimal_room_data(owner);
             let mut config = river_core::room_state::configuration::Configuration::default();
+            // The room's real owner id, so the configuration passes the value
+            // checks and fails only on its signature: a configuration that
+            // fails the checks is not offered at all (freenet/river#703).
+            config.owner_member_id = owner.into();
             config.configuration_version = version;
             room.room_state.configuration =
                 river_core::room_state::configuration::AuthorizedConfigurationV1::new(
