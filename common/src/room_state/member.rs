@@ -132,6 +132,14 @@ impl ComposableState for MembersV1 {
             // record with the owner's id). Such a record in a delta is ignored
             // here rather than failing the delta, so the rest of the delta
             // applies the same way whatever else it carries.
+            let work_bound = max_members.max(MIN_MEMBERS_DELTA_BOUND);
+            if delta.added.len() > self.members.len().saturating_add(work_bound) {
+                return Err(format!(
+                    "Members delta of {} exceeds {}",
+                    delta.added.len(),
+                    work_bound
+                ));
+            }
             let owner_id = parameters.owner_id();
             let held_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
             let added: Vec<&AuthorizedMember> = delta
@@ -139,7 +147,6 @@ impl ComposableState for MembersV1 {
                 .iter()
                 .filter(|m| m.member.id() != owner_id && !held_ids.contains(&m.member.id()))
                 .collect();
-            let work_bound = max_members.max(MIN_MEMBERS_DELTA_BOUND);
             if added.len() > work_bound {
                 return Err(format!(
                     "Members delta of {} new members exceeds {}",
@@ -169,9 +176,10 @@ impl ComposableState for MembersV1 {
             // peer's summary still lacks the skipped members, so the next delta
             // re-sends them, with the inviter. A broken chain of any other kind
             // (a bad signature, a cycle, a self-invitation) still rejects.
+            let mut memo = HashMap::new();
             let added: Vec<&AuthorizedMember> = added
                 .into_iter()
-                .filter(|m| Self::chain_is_known(m, &combined_members_by_id, owner_id))
+                .filter(|m| Self::chain_is_known(m, &combined_members_by_id, owner_id, &mut memo))
                 .collect();
 
             // Verify that all new members have valid invites
@@ -216,23 +224,42 @@ impl MembersV1 {
     /// Whether every inviter on `member`'s chain up to the owner is a record in
     /// `members_by_id`. Says nothing about signatures; a chain that loops is
     /// reported as known, so that `verify_invite_chain` rejects it as before.
+    ///
+    /// `memo` holds the answer for every inviter id already walked, and every
+    /// walk records its answer for each id on its path, so across one delta
+    /// each id is walked once: work linear in the records, however they chain
+    /// (freenet/river#703 review).
     fn chain_is_known(
         member: &AuthorizedMember,
         members_by_id: &HashMap<MemberId, &AuthorizedMember>,
         owner_id: MemberId,
+        memo: &mut HashMap<MemberId, bool>,
     ) -> bool {
-        let mut seen = HashSet::new();
+        let mut path: Vec<MemberId> = Vec::new();
+        let mut on_path = HashSet::new();
         let mut inviter = member.member.invited_by;
-        while inviter != owner_id {
-            if !seen.insert(inviter) {
-                return true;
+        let known = loop {
+            #[cfg(test)]
+            tests::count_chain_step();
+            if inviter == owner_id {
+                break true;
             }
+            if let Some(answer) = memo.get(&inviter) {
+                break *answer;
+            }
+            if !on_path.insert(inviter) {
+                break true;
+            }
+            path.push(inviter);
             match members_by_id.get(&inviter) {
                 Some(m) => inviter = m.member.invited_by,
-                None => return false,
+                None => break false,
             }
+        };
+        for id in path {
+            memo.insert(id, known);
         }
-        true
+        known
     }
 
     /// Verify the invite chain of every member in `added` against a lookup
@@ -1170,6 +1197,15 @@ pub(crate) mod tests {
 
     thread_local! {
         static INVITE_SIGNATURE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static CHAIN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_chain_step() {
+        CHAIN_STEPS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn chain_steps() -> usize {
+        CHAIN_STEPS.with(|c| c.get())
     }
 
     pub(super) fn count_invite_signature_check() {
@@ -1691,6 +1727,55 @@ pub(crate) mod tests {
                 &Some(MembersDelta::new(vec![forged])),
             )
             .is_err());
+    }
+
+    /// freenet/river#703 review M1: deciding whether new members' invite
+    /// chains are known must cost work linear in the delta, not quadratic:
+    /// each record's chain is resolved once, however many records chain
+    /// through it. Here a long chain of records ends at an inviter nobody
+    /// holds, so all of it is skipped; the walk must stay within a small
+    /// multiple of its length. A delta longer than held + bound is refused
+    /// before any per-record work.
+    #[test]
+    fn unknown_chains_are_resolved_in_linear_work() {
+        let (parent_state, parameters, _, _) = invite_chain(1, 5_000);
+        let owner_id = parameters.owner_id();
+        let unknown = MemberId::from(&SigningKey::generate(&mut OsRng).verifying_key());
+        let any_signature = ed25519_dalek::Signature::from_bytes(&[0; 64]);
+        let n = 2_000;
+        let mut records = Vec::with_capacity(n);
+        let mut inviter = unknown;
+        for _ in 0..n {
+            let (m, _) = create_test_member(owner_id, inviter);
+            inviter = m.id();
+            records.push(AuthorizedMember {
+                member: m,
+                signature: any_signature,
+            });
+        }
+        records.reverse();
+        let mut members = MembersV1::default();
+        let before = chain_steps();
+        members
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(MembersDelta::new(records.clone())),
+            )
+            .expect("members with an unknown inviter are skipped");
+        assert!(members.members.is_empty());
+        let steps = chain_steps() - before;
+        assert!(steps <= 3 * n, "{steps} chain steps for {n} records");
+
+        // Past held + bound, refused before any chain is walked.
+        let mut big = records.clone();
+        big.extend(records.iter().cloned());
+        big.extend(records.iter().cloned());
+        let before = chain_steps();
+        assert!(MembersV1::default()
+            .apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(big)))
+            .is_err());
+        assert_eq!(chain_steps() - before, 0);
     }
 
     /// The bound is `max(max_members, MIN_MEMBERS_DELTA_BOUND)`. It is checked
