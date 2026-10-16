@@ -124,11 +124,13 @@ room looks quiet, and their delegate writes are stranded.
 
 Order matters, and it is enforced: the pre-flight below refuses unless the UI
 carrying the new WASM is already live. Do the UI publish (step 5) first, then
-**wait ~10 minutes** before this step. The pointer is 100 bytes and the web
-container ~1.2 MB, so the pointer reaches nodes first; a tab whose node does
-not yet hold the new UI reloads into the old one and spends a retry. The UI
-retries with backoff for ~20 minutes and then falls back to a banner, so a
-short gap is not fatal, but a gap means fewer wasted reloads.
+**wait ~2 minutes** before this step. Measured over publishes 30000397-403
+(2026-10-12..16): the ~1.2 MB web container reached a median peer in ~20 s,
+71% within 60 s and 80% within 5 min, with a tail of reconnecting peers out to
+~2 h, while a 100-byte pointer arrives in under 0.5 s. Two minutes clears the
+fast cluster; waiting longer buys little. A tab whose node does not yet hold
+the new UI reloads into the old one and spends a retry; the UI retries with
+backoff over ~67 minutes and then falls back to a banner.
 
 ```bash
 POINTER_NODE_PORT=<a network node of yours, NOT 7509> \

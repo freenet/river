@@ -423,7 +423,7 @@ fdev network publish \
 if [ "$publish_rc" -eq 0 ]; then
     echo "Publish OK. Remember to commit $version_file."
     echo "If this publish re-keyed the room contract or chat delegate, run"
-    echo "\`cargo make publish-pointer-records\` from main ~10 minutes from now:"
+    echo "\`cargo make publish-pointer-records\` from main ~2 minutes from now:"
     echo "open River tabs reload only when the new pointer lands (river-publish.md, step 7)."
 else
     # The counter is NOT rolled back — see the lifecycle note in

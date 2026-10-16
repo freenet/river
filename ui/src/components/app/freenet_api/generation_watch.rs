@@ -97,11 +97,18 @@ pub(crate) const RELOAD_PARAM: &str = "_rgen";
 const AUTH_RELOAD_PARAM: &str = "_reload";
 
 /// Most automatic reloads for one target generation.
-pub(crate) const MAX_TRIES_PER_TARGET: u32 = 4;
-/// The least wait before the 2nd, 3rd and 4th try for one target. A reload
-/// that landed on the old bundle means the node does not hold the new one
-/// yet; these spread the remaining tries over ~20 minutes of propagation.
-pub(crate) const RETRY_DELAYS_MS: [u64; 3] = [2 * 60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000];
+pub(crate) const MAX_TRIES_PER_TARGET: u32 = 5;
+/// The least wait before each retry for one target. A reload that landed on
+/// the old bundle means the node does not hold the new one yet.
+///
+/// Sized from production telemetry over River UI publishes 30000397-403
+/// (2026-10-12..16, 41 sampled deliveries of the ~1.2 MB web container):
+/// median ~20 s, 71% within 60 s, 80% within 5 min, p90 ~10 min, max ~2 h.
+/// The 100-byte pointer reached subscribers in under 0.5 s. The slow tail
+/// looked like peers reconnecting rather than slow transfers. These delays
+/// span ~67 minutes: past the p90 with room to spare, then the banner.
+pub(crate) const RETRY_DELAYS_MS: [u64; 4] =
+    [2 * 60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
 /// Most automatic reloads in one [`AUTO_RELOAD_WINDOW_MS`], whatever the
 /// target. A backstop over the per-target bound.
 pub(crate) const MAX_AUTO_RELOADS_PER_WINDOW: u32 = 6;
@@ -1121,7 +1128,8 @@ mod tests {
                 0,
                 RETRY_DELAYS_MS[0],
                 RETRY_DELAYS_MS[1],
-                RETRY_DELAYS_MS[2]
+                RETRY_DELAYS_MS[2],
+                RETRY_DELAYS_MS[3]
             ]
         );
         assert_eq!(
@@ -1135,12 +1143,13 @@ mod tests {
         );
     }
 
-    /// The tries cover at least the ~20 minutes a slow web container may take
-    /// to reach a node after the pointer did.
+    /// The tries outlast the measured p90 (~10 min) of web-container delivery
+    /// with a wide margin; see `RETRY_DELAYS_MS`.
     #[test]
     fn retries_span_web_container_propagation() {
         let span: u64 = RETRY_DELAYS_MS.iter().sum();
-        assert!(span >= 20 * 60 * 1000, "retries span only {span} ms");
+        assert!(span >= 60 * 60 * 1000, "retries span only {span} ms");
+        assert_eq!(RETRY_DELAYS_MS.len() as u32, MAX_TRIES_PER_TARGET - 1);
         assert!(
             RETRY_DELAYS_MS.windows(2).all(|w| w[0] <= w[1]),
             "backoff must not shrink"
