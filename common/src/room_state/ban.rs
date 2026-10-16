@@ -32,15 +32,17 @@ use std::time::SystemTime;
 /// against that record's key. [`crate::room_state::ChatRoomStateV1::post_apply_cleanup`]
 /// sweeps any ban whose issuer is known nowhere. The `max_user_bans` cap is
 /// enforced there too, by recency within an owner pool and an everyone-else
-/// pool, each guaranteed half the cap (see [`Self::enforce_user_ban_cap`]), and
+/// pool, each guaranteed `max_user_bans / 2` (see
+/// [`Self::enforce_user_ban_cap`]), and
 /// [`ComposableState::apply_delta`] bounds a single delta to `max_user_bans`
 /// new bans so a forged flood cannot make signature verification unbounded.
 ///
-/// KNOWN, ACCEPTED, self-limiting residual (Ian confirmed, #411 round 3 D): a
-/// current member can flood bans against ABSENT targets (each such ban takes
-/// effect because its issuer is not removed), and `banned_at` is signed by the
-/// issuer, so they can evict older effective non-owner bans (owner bans keep
-/// their half of the cap; see [`Self::enforce_user_ban_cap`]). The
+/// KNOWN, ACCEPTED, self-limiting residual (Ian confirmed, #411 round 3 D;
+/// widened by #796): a current member can flood bans against ABSENT targets
+/// (each such ban takes effect because its issuer is not removed), and
+/// `banned_at` is signed by the issuer, so they can evict older non-owner
+/// bans and owner bans beyond the newest `max_user_bans / 2` (see
+/// [`Self::enforce_user_ban_cap`]). The
 /// flooder is identifiable on every junk ban, and an OWNER ban makes all of
 /// their bans inert. The second #411 residual (slot-squatting through the
 /// banner prune exemption, which #702 keeps for fixpoint stability) remains.
@@ -149,25 +151,44 @@ impl BansV1 {
     /// 1. Dead entries go first, oldest first: bans that take no effect and
     ///    later duplicates of an `(issuer, target)` pair (below).
     /// 2. Then live bans are split into OWNER bans and all OTHER bans (deputy,
-    ///    inviter and mutual bans alike). Each pool is guaranteed half the cap
-    ///    (`max_bans / 2` for owner bans, the rest for others). Only a pool's
-    ///    bans beyond its guarantee can be evicted, and among those the oldest
-    ///    by `(banned_at, id)` go first. Within a pool nothing ranks above
-    ///    anything else.
+    ///    inviter and mutual bans alike). Each pool is guaranteed
+    ///    `max_bans / 2` slots. Only a pool's bans beyond its guarantee can be
+    ///    evicted, and among those the oldest by `(banned_at, id)` go first.
+    ///    With an odd cap the spare slot goes to the newer ban. Within a pool
+    ///    nothing ranks above anything else.
     ///
     /// Owner bans are often rare, so the guarantee is a floor, not an
     /// allocation: slots one pool does not use are open to the other, and a
-    /// room with few owner bans gives deputies nearly the whole cap.
+    /// room with few owner bans gives other bans nearly the whole cap.
     ///
     /// Why two pools and not one. #702 ranked owner bans above every other
     /// ban, so a list full of owner bans evicted each new deputy ban the
     /// moment it was added, and the Official room's deputies could not ban
     /// anyone. Pure recency over one pool would fix that but let any member
     /// flush every ban, owner bans included: `banned_at` is signed by the
-    /// issuer and the contract has no clock, so far-future-dated bans (from a
-    /// ring of invited sybils, for instance) always count as newest. With two
-    /// pools such a flood churns only the other pool's surplus and the newest
-    /// half-cap of owner bans always survives.
+    /// issuer and the contract has no clock, so far-future-dated bans always
+    /// count as newest.
+    ///
+    /// What the two pools do NOT bound, stated plainly. ANY current member can
+    /// mint live, far-future-dated bans without moderator rights: against
+    /// throwaway members they invited (an inviter may ban its invitees, and
+    /// sybils it deputizes may ban each other in mutual pairs), or against
+    /// random ids whose record is held nowhere (counted live, below). Such a
+    /// flood evicts:
+    ///
+    /// - every older OTHER ban, deputies' included, except in slots owner
+    ///   bans leave unused. This was already true under #702, where inviter
+    ///   bans ranked with deputy bans; only owner bans were immune. While the
+    ///   flood stands, a new deputy ban dated now is the oldest in its pool
+    ///   and is evicted at once, which is the #796 symptom on purpose
+    ///   (freenet/river#413);
+    /// - OWNER bans beyond the newest `max_bans / 2`. This is new: under #702
+    ///   no non-owner ban could evict an owner ban.
+    ///
+    /// An owner ban on the flooder makes all their bans dead, so the next cap
+    /// pass drops them first; bans already evicted stay evicted. A room that
+    /// wants every owner ban protected sets `max_user_bans` to at least twice
+    /// its owner-ban count.
     ///
     /// A ban takes no effect when [`MembersV1::resolve_bans`] over the uncapped
     /// set gives it [`BanResolution::INERT`]: its issuer is removed, its
@@ -180,13 +201,12 @@ impl BansV1 {
     /// upgrade keep their place. Only one signature-verified ban per
     /// `(issuer, target)` pair is live (the oldest by `(banned_at, id)`).
     ///
-    /// The result is in the canonical `(banned_at, id)` stored order. A no-op
-    /// when already within the cap.
+    /// Liveness is judged once, over the uncapped set. Evicting one half of a
+    /// mutual pair can make the surviving half take effect in the post-cap
+    /// resolution, as under #702.
     ///
-    /// What this does not bound: a current member with ban authority can
-    /// still mint future-dated bans that evict every OTHER-pool ban beyond
-    /// the owner bans' unused share, deputies' bans included
-    /// (freenet/river#413). An owner ban on that member makes their bans dead.
+    /// The result is in the canonical `(banned_at, id)` stored order and does
+    /// not depend on input order. A no-op when already within the cap.
     pub fn enforce_user_ban_cap(
         bans: &mut Vec<AuthorizedUserBan>,
         max_bans: usize,
@@ -267,14 +287,16 @@ impl BansV1 {
             }
         }
         if to_remove > 0 {
-            // Each pool keeps at least its share; only a pool's bans beyond
-            // its share are candidates, and the oldest candidates go first.
-            // The live total exceeds the cap by `to_remove`, so the pools'
-            // excesses sum to at least that and the candidates suffice.
-            let owner_share = max_bans / 2;
-            let other_share = max_bans - owner_share;
-            let owner_excess = owner_live.len().saturating_sub(owner_share);
-            let other_excess = other_live.len().saturating_sub(other_share);
+            // Each pool keeps at least `max_bans / 2`; only a pool's bans
+            // beyond that are candidates, and the oldest candidates go first.
+            // With an odd cap the remaining slot goes to the newer ban,
+            // whichever pool it is in. The live total exceeds the cap by
+            // `to_remove` and the two shares sum to at most the cap, so the
+            // pools' excesses sum to at least `to_remove`: the candidates
+            // suffice.
+            let share = max_bans / 2;
+            let owner_excess = owner_live.len().saturating_sub(share);
+            let other_excess = other_live.len().saturating_sub(share);
             let mut candidates: Vec<usize> = owner_live[..owner_excess]
                 .iter()
                 .chain(&other_live[..other_excess])

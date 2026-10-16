@@ -182,20 +182,16 @@ impl ChatRoomStateV1 {
         //         not survive in `ban_evidence` on pass 1 and vanish on pass 2
         //         (`cleanup(S) != cleanup(cleanup(S))`, which permanently
         //         diverges peers that run cleanup a different number of times).
-        //     Eviction drops bans that take no effect before those that do,
-        //     judged by `MembersV1::resolve_bans` over the uncapped set, one per
+        //     Eviction drops bans that take no effect first, judged by
+        //     `MembersV1::resolve_bans` over the uncapped set, one per
         //     (issuer, target) (#410 review round 1, freenet/river#702), then
-        //     evicts the oldest first within two pools, owner bans and the
-        //     rest, each guaranteed half the cap (freenet/river#796). This
-        //     bounds a flood of forged, revoked-deputy or banned-issuer bans,
-        //     which `verify` accepts: those are evicted first, so they cannot
-        //     push real moderator bans out of the cap. It does NOT fully defend
-        //     the un-ban DoS: a CURRENT member's ban on an ABSENT target takes
-        //     effect, and `banned_at` is an attacker-signed, future-datable
-        //     field, so a member can mint many newest-dated effective bans that
-        //     outrank and evict genuine ones.
-        //     The substantive fix (an authorization-aware / non-attacker-ordered
-        //     cap) is deferred pending Ian's decision; tracked in
+        //     evicts the oldest within two pools, owner bans and the rest, each
+        //     guaranteed `max_user_bans / 2` (freenet/river#796). A flood of
+        //     forged, revoked-deputy or banned-issuer bans, which `verify`
+        //     accepts, is dead and goes first. A flood of LIVE far-future-dated
+        //     bans, which any member can mint against its own invitees or
+        //     against ids known nowhere, evicts older non-owner bans and owner
+        //     bans beyond the guaranteed half; see `enforce_user_ban_cap` and
         //     freenet/river#413 (Limitation 2).
         //
         //     CONVERGENCE HONESTY: the enforcing/inert classification is a

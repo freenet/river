@@ -2027,10 +2027,10 @@ fn empty_ban_evidence_is_not_serialized() {
     assert_eq!(ser(&back), bytes);
 }
 
-/// A ban that closes a mutual-ban cycle ranks with the mutual bans at the
-/// `max_user_bans` cap even when an earlier ban already removed its issuer
-/// (Ian, 2026-09-24: both bans of a mutual ban stand). Under cap pressure the
-/// cycle's bans are kept and other bans that take no effect go first.
+/// A ban that closes a mutual-ban cycle is live at the `max_user_bans` cap
+/// even when an earlier ban already removed its issuer (Ian, 2026-09-24: both
+/// bans of a mutual ban stand). Under cap pressure the cycle's bans are kept
+/// and bans that take no effect go first.
 #[test]
 fn cycle_bans_rank_mutual_after_an_earlier_removal() {
     let room = capped_room(20, 4);
@@ -2285,6 +2285,142 @@ fn a_new_owner_ban_evicts_the_oldest_ban_of_the_pool_over_its_share() {
         "the oldest other ban goes, its pool being over its share"
     );
     assert!(has_ban(&after, &d_bans[1]) && has_ban(&after, &d_bans[2]));
+}
+
+/// An odd cap's spare slot goes to the newer ban, whichever pool it is in.
+/// Cap 3: each pool is guaranteed one slot and the third is shared by age.
+#[test]
+fn an_odd_caps_spare_slot_goes_to_the_newer_ban() {
+    for owner_older in [true, false] {
+        let room = capped_room(20, 3);
+        let d = room.person();
+        let s = room.modded_state(&[&d], &[&d], vec![]);
+        let gone: Vec<Person> = (0..4).map(|_| room.person()).collect();
+        let (o_at, d_at) = if owner_older { (10, 15) } else { (15, 10) };
+        let o1 = room.owner_ban(&gone[0], o_at);
+        let o2 = room.owner_ban(&gone[1], 20);
+        let d1 = room.ban(&d, &gone[2], d_at);
+        let d2 = room.ban(&d, &gone[3], 30);
+        let s = apply_checked(
+            &s,
+            bans_delta(vec![o1.clone(), o2.clone(), d1.clone()]),
+            &room.params,
+        );
+        let after = apply_checked(&s, bans_delta(vec![d2.clone()]), &room.params);
+        assert_eq!(after.bans.0.len(), 3);
+        assert!(has_ban(&after, &o2) && has_ban(&after, &d2));
+        if owner_older {
+            assert!(!has_ban(&after, &o1) && has_ban(&after, &d1));
+        } else {
+            assert!(has_ban(&after, &o1) && !has_ban(&after, &d1));
+        }
+    }
+}
+
+/// At cap 1 neither pool is guaranteed a slot, so the newer ban wins.
+#[test]
+fn cap_one_keeps_the_newer_ban_whatever_its_pool() {
+    for owner_newer in [true, false] {
+        let room = capped_room(20, 1);
+        let d = room.person();
+        let s = room.modded_state(&[&d], &[&d], vec![]);
+        let (x, y) = (room.person(), room.person());
+        let (o_at, d_at) = if owner_newer { (20, 10) } else { (10, 20) };
+        let o = room.owner_ban(&x, o_at);
+        let db = room.ban(&d, &y, d_at);
+        let s = apply_checked(&s, bans_delta(vec![o.clone()]), &room.params);
+        let after = apply_checked(&s, bans_delta(vec![db.clone()]), &room.params);
+        assert_eq!(after.bans.0.len(), 1);
+        assert_eq!(has_ban(&after, &o), owner_newer);
+        assert_eq!(has_ban(&after, &db), !owner_newer);
+    }
+}
+
+/// One cap pass that drops a dead entry AND then evicts from a pool: cap 4,
+/// three owner bans, a deputy's ban plus a later duplicate of it, and another
+/// deputy ban. Six bans, two to go: the duplicate (dead) first, then the
+/// oldest owner ban, the owner pool being the only one over its share. The
+/// result does not depend on input order, and a second pass changes nothing.
+#[test]
+fn a_dead_entry_and_a_pool_eviction_in_one_pass() {
+    let room = capped_room(20, 4);
+    let (d, x, y) = (room.person(), room.person(), room.person());
+    let s = room.modded_state(&[&d, &x, &y], &[&d], vec![]);
+    let gone: Vec<Person> = (0..3).map(|_| room.person()).collect();
+    let owner_bans: Vec<AuthorizedUserBan> = gone
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.owner_ban(p, 10 + i as u64))
+        .collect();
+    let d_bans_x = room.ban(&d, &x, 20);
+    let d_bans_x_again = room.ban(&d, &x, 40);
+    let d_bans_y = room.ban(&d, &y, 21);
+    let mut input = owner_bans.clone();
+    input.extend([d_bans_x.clone(), d_bans_x_again.clone(), d_bans_y.clone()]);
+
+    let cap = |bans: &[AuthorizedUserBan]| {
+        let mut bans = bans.to_vec();
+        BansV1::enforce_user_ban_cap(
+            &mut bans,
+            4,
+            &s.members,
+            &s.ban_evidence,
+            &s.member_info,
+            &room.params,
+        );
+        bans
+    };
+    let out = cap(&input);
+    let ids: Vec<_> = out.iter().map(|b| b.id()).collect();
+    let want: Vec<_> = [&owner_bans[1], &owner_bans[2], &d_bans_x, &d_bans_y]
+        .iter()
+        .map(|b| b.id())
+        .collect();
+    assert_eq!(
+        ids, want,
+        "duplicate and oldest owner ban evicted, in stored order"
+    );
+
+    let mut reversed = input.clone();
+    reversed.reverse();
+    let mut rotated = input.clone();
+    rotated.rotate_left(2);
+    assert_eq!(cap(&reversed), out, "input order does not matter");
+    assert_eq!(cap(&rotated), out, "input order does not matter");
+    assert_eq!(cap(&out), out, "a second pass changes nothing");
+}
+
+/// The widened residual of freenet/river#796, pinned so a future fix flips it
+/// deliberately: a plain member with no deputy grant and no invitees floods
+/// far-future bans against random ids whose record is held nowhere (each
+/// counts as live). With three owner bans at cap 4 the oldest owner ban is
+/// evicted; the newest two (the owner pool's share) survive.
+#[test]
+fn a_plain_members_random_target_flood_evicts_owner_bans_down_to_the_share() {
+    let room = capped_room(20, 4);
+    let m = room.person();
+    let s = room.modded_state(&[&m], &[], vec![]);
+    let gone: Vec<Person> = (0..3).map(|_| room.person()).collect();
+    let owner_bans: Vec<AuthorizedUserBan> = gone
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.owner_ban(p, 10 + i as u64))
+        .collect();
+    let s = apply_checked(&s, bans_delta(owner_bans.clone()), &room.params);
+    let far = 3_000_000_000;
+    let flood: Vec<AuthorizedUserBan> = (0..4)
+        .map(|i| room.ban(&m, &room.person(), far + i))
+        .collect();
+    let after = apply_checked(&s, bans_delta(flood.clone()), &room.params);
+    assert!(
+        !has_ban(&after, &owner_bans[0]),
+        "the oldest owner ban goes"
+    );
+    assert!(has_ban(&after, &owner_bans[1]) && has_ban(&after, &owner_bans[2]));
+    assert!(
+        has_ban(&after, &flood[2]) && has_ban(&after, &flood[3]),
+        "the newest flood bans fill the other pool"
+    );
 }
 
 /// An evidence record whose inviter leaves `members` at the `max_members` trim
