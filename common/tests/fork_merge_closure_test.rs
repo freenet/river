@@ -73,6 +73,9 @@ struct Stats {
     /// runs the two-pool cap eviction over bans the forks judge apart
     /// (freenet/river#796).
     runs_over_ban_cap_with_both_pools: usize,
+    /// Fork pairs that hold different records for one member id: the
+    /// accepted residual, counted apart (freenet/river#703).
+    runs_with_two_records_for_one_member: usize,
 }
 
 thread_local! {
@@ -956,15 +959,36 @@ impl Failures {
     }
 }
 
+/// Whether the two states hold DIFFERENT records for one member id: the
+/// accepted residual of `MembersV1::resolve_records`. Each peer keeps the
+/// record it holds, so such a pair never converges on that member, and the
+/// tests count it apart instead of as a failure (freenet/river#703).
+fn hold_different_records_for_one_member(a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> bool {
+    let held: std::collections::HashMap<MemberId, &AuthorizedMember> = a
+        .members
+        .members
+        .iter()
+        .map(|m| (m.member.id(), m))
+        .collect();
+    b.members
+        .members
+        .iter()
+        .any(|m| held.get(&m.member.id()).is_some_and(|h| *h != m))
+}
+
 fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
     let mut out = Failures::default();
     for &(seed, shape) in seeds {
         drain_not_idempotent();
         let (w, a, b) = fork_pair(seed, SHAPES[shape], mode);
         let (end, not_commutative) = ending(&w, &a, &b);
+        let residual = hold_different_records_for_one_member(&a, &b);
         STATS.with(|s| {
             let mut s = s.borrow_mut();
             s.runs += 1;
+            if residual {
+                s.runs_with_two_records_for_one_member += 1;
+            }
             if !a.ban_evidence.is_empty() || !b.ban_evidence.is_empty() {
                 s.runs_with_evidence += 1;
             }
@@ -987,6 +1011,18 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
                 broken[0],
                 broken.len()
             ));
+            continue;
+        }
+        // The residual pair keeps its own member record on each side (see
+        // `hold_different_records_for_one_member`). It must still never be
+        // refused or leave cleanup unsettled; it is not required to converge.
+        if residual {
+            if let Ending::Rejecting(e) = end {
+                out.rejecting.push(format!(
+                    "seed {seed} shape {shape}: {}",
+                    &e[..e.len().min(200)]
+                ));
+            }
             continue;
         }
         if let Some(fields) = not_commutative {
@@ -1138,6 +1174,12 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
         stats.runs_with_evidence > 0,
         "no run held ban evidence: {stats:?}"
     );
+    // Op 9 still produces the residual: forks holding different records for
+    // one member, which must merge without a refusal (checked in `endings`).
+    assert!(
+        stats.runs_with_two_records_for_one_member > 0,
+        "no run held two records for one member: {stats:?}"
+    );
     assert!(
         failures.is_empty(),
         "{}",
@@ -1244,7 +1286,16 @@ fn stale_summary_deltas_apply() {
                         // a delta that applied by silently dropping records
                         // would pass the checks above and fail here.
                         let (end, not_commutative) = ending(&w, &r, sender);
-                        if !matches!(end, Ending::Converged) || not_commutative.is_some() {
+                        let residual = hold_different_records_for_one_member(&r, sender);
+                        if residual && matches!(end, Ending::Rejecting(_)) {
+                            *rejected
+                                .entry(
+                                    "after a stale apply, a residual pair was refused".to_string(),
+                                )
+                                .or_default() += 1;
+                        } else if !residual
+                            && (!matches!(end, Ending::Converged) || not_commutative.is_some())
+                        {
                             *rejected
                                 .entry(format!(
                                     "after a stale apply, no clean convergence ({})",

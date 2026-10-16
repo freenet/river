@@ -93,14 +93,8 @@ fn bans_summary_serialization_is_order_independent() {
 
 #[test]
 fn members_summary_serialization_is_order_independent() {
-    let entry = |i: i64| {
-        (
-            member_id(i),
-            river_core::room_state::ban_evidence::EvidenceDigest(sig_rank(i).0),
-        )
-    };
-    let s_fwd: MemberSummary = (0..N).map(entry).collect();
-    let s_rev: MemberSummary = (0..N).rev().map(entry).collect();
+    let s_fwd: MemberSummary = (0..N).map(member_id).collect();
+    let s_rev: MemberSummary = (0..N).rev().map(member_id).collect();
 
     assert_eq!(
         cbor(&s_fwd),
@@ -283,15 +277,7 @@ fn top_level_summary_serialization_is_order_independent() {
     fn build(reversed: bool) -> ChatRoomStateV1Summary {
         let order = |i: i64| if reversed { N - 1 - i } else { i };
         let bans = (0..N).map(|i| ban_id(order(i))).collect();
-        let members = (0..N)
-            .map(|i| {
-                let j = order(i);
-                (
-                    member_id(j),
-                    river_core::room_state::ban_evidence::EvidenceDigest(sig_rank(j).0),
-                )
-            })
-            .collect();
+        let members = (0..N).map(|i| member_id(order(i))).collect();
         // freenet/river#702: the ban-evidence summary is a BTreeMap of
         // record digests.
         let ban_evidence = (0..N)
@@ -575,13 +561,14 @@ fn ban_evidence_summary_bytes_per_entry() {
     );
 }
 
-/// The members summary carries each member's record digest (freenet/river#703),
-/// which grew it from an id set. Measured here against the id-only shape it
-/// replaced, rebuilt from the same records with real keys.
+/// The members summary carries member ids only (main's shape): a peer keeps
+/// the record it holds for an id, so the summary need not tell two records
+/// apart (freenet/river#703). Measured against the `(id, record digest)`
+/// shape this branch used before that decision, rebuilt from the same
+/// records with real keys.
 #[test]
 fn members_summary_bytes_per_entry() {
     use river_core::room_state::member::{AuthorizedMember, Member};
-    use std::collections::BTreeSet;
     const MEMBERS: u64 = 470; // the official room's rough membership
 
     let owner_sk = SigningKey::from_bytes(blake3::hash(b"owner").as_bytes());
@@ -609,28 +596,37 @@ fn members_summary_bytes_per_entry() {
     let bytes = cbor(&summary).len();
     let per_entry = bytes as f64 / MEMBERS as f64;
 
-    let before: BTreeSet<MemberId> = state.members.iter().map(|m| m.member.id()).collect();
-    let before_bytes = cbor(&before).len();
-    let before_per_entry = before_bytes as f64 / MEMBERS as f64;
+    let with_digest: BTreeMap<MemberId, river_core::room_state::ban_evidence::EvidenceDigest> =
+        state
+            .members
+            .iter()
+            .map(|m| {
+                (
+                    m.member.id(),
+                    river_core::room_state::ban_evidence::evidence_digest(m),
+                )
+            })
+            .collect();
+    let digest_bytes = cbor(&with_digest).len();
+    let digest_per_entry = digest_bytes as f64 / MEMBERS as f64;
 
     println!(
         "members summary over {MEMBERS} members:\n  \
-         before (id only):    {before_bytes} B = {before_per_entry:.2} B/entry\n  \
-         after  (id, digest): {bytes} B = {per_entry:.2} B/entry"
+         ids only:     {bytes} B = {per_entry:.2} B/entry\n  \
+         (id, digest): {digest_bytes} B = {digest_per_entry:.2} B/entry"
     );
 
-    // Measured 9.01 -> 26.01 B/entry at 470 members (12.2 KB per summary,
-    // from 4.2 KB): the digest adds exactly its 17-byte CBOR byte string to
-    // each entry. More means the digest lost its hand-written `Serialize` (a 16-element
-    // array is about 32 bytes) or the value grew.
+    // Measured 9.01 B/entry (4.2 KB at 470 members), against 26.01 for the
+    // (id, digest) shape (12.2 KB): a real key's `MemberId` is about 9 CBOR
+    // bytes, and nothing else goes in an entry.
     assert!(
-        per_entry - before_per_entry < 18.0,
-        "each entry must cost the id plus a 17-byte digest (got {per_entry:.2} \
-         vs {before_per_entry:.2} B/entry)"
+        per_entry < 9.5,
+        "members summary must carry ids only (got {per_entry:.2} B/entry)"
     );
     assert!(
-        per_entry < 28.0,
-        "members summary must stay under 28 bytes/entry (got {per_entry:.2})"
+        digest_per_entry - per_entry >= 17.0,
+        "the comparison shape must carry a 17-byte digest per entry (got \
+         {digest_per_entry:.2} vs {per_entry:.2} B/entry)"
     );
 }
 

@@ -42,7 +42,7 @@ fn ensure_members_for_message_authors(
     let missing: Vec<MemberId> = msg_authors
         .iter()
         .filter(|id| {
-            **id != owner_id && !summary.members.contains_key(id) && !already_in_delta.contains(id)
+            **id != owner_id && !summary.members.contains(id) && !already_in_delta.contains(id)
         })
         .cloned()
         .collect();
@@ -65,7 +65,7 @@ fn ensure_members_for_message_authors(
             if let Some(m) = members_by_id.get(&mid) {
                 let inviter = m.member.invited_by;
                 if inviter != owner_id
-                    && !summary.members.contains_key(&inviter)
+                    && !summary.members.contains(&inviter)
                     && !already_in_delta.contains(&inviter)
                     && !to_add.contains(&inviter)
                 {

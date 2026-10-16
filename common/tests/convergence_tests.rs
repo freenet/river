@@ -3279,12 +3279,16 @@ fn a_deep_ban_evidence_chain_merges_into_a_fresh_peer() {
 }
 
 /// freenet/river#703: two validly signed member records for one
-/// member id, issued by different inviters, held on different peers. Both
-/// merge directions must end in the same state, whichever record each peer
-/// held, and the result must verify. Also covered for a member invited by two
-/// members at the same depth, and with the records arriving in one delta.
+/// member id, issued by different inviters, held on different peers. Each
+/// peer keeps the record it holds (an arriving record never replaces a held
+/// one), so the merge is not commutative here: the accepted residual,
+/// pending an invitee-consent design, and only someone issuing a second
+/// record for an existing member produces it. Pinned so a change to it is
+/// deliberate: each direction keeps its own record, neither merge fails, and
+/// both results verify. Covered for an owner-issued record against a
+/// member-issued one and for two members at the same depth.
 #[test]
-fn two_records_for_one_member_resolve_the_same_way_in_both_directions() {
+fn two_records_for_one_member_each_peer_keeps_its_own() {
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     let owner_sk = SigningKey::from_bytes(&[11; 32]);
     let owner_id: MemberId = owner_sk.verifying_key().into();
@@ -3330,11 +3334,6 @@ fn two_records_for_one_member_resolve_the_same_way_in_both_directions() {
         s.verify(&s, &params).unwrap();
         s
     };
-    let ser = |s: &ChatRoomStateV1| {
-        let mut v = Vec::new();
-        ciborium::ser::into_writer(s, &mut v).unwrap();
-        v
-    };
     let mut failures = Vec::new();
     for (x, y, what) in [
         (&by_owner, &by_p, "owner vs member"),
@@ -3345,10 +3344,18 @@ fn two_records_for_one_member_resolve_the_same_way_in_both_directions() {
         ab.merge(&a, &params, &b).unwrap();
         let mut ba = b.clone();
         ba.merge(&b, &params, &a).unwrap();
-        if ser(&ab) != ser(&ba) {
-            failures.push(format!("{what}: merge(A, B) != merge(B, A)"));
+        let held = |s: &ChatRoomStateV1| {
+            s.members
+                .members
+                .iter()
+                .find(|r| r.member.id() == m.id())
+                .cloned()
+        };
+        if held(&ab).as_ref() != Some(x) || held(&ba).as_ref() != Some(y) {
+            failures.push(format!("{what}: a peer did not keep the record it held"));
         }
         ab.verify(&ab, &params).unwrap();
+        ba.verify(&ba, &params).unwrap();
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
