@@ -1,16 +1,12 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { coarsePointer, colourOf, contrast, openInlinePicker, openRoomWithComposer, reactTo, resolveColor, rowSurfaces, waitForApp } from "./example-room";
+import { coarsePointer, openInlinePicker, openRoomWithComposer, reactTo, resolveColor, waitForApp } from "./example-room";
 import { deliverOffscreen, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
-// Full-width chat rows (plan 11): one avatar and header per group, one content
-// column for every row, and a 72px right gutter for the hover bar and kebab.
+// Full-width chat rows (plan 11): one header per group, one content column for
+// every row, and a 72px right gutter for the hover bar and kebab.
 
 const GUTTER_PX = 72;
-
-/// The lowest-contrast (hue, tone) per theme, from `worst_case` in
-/// avatar_colour.rs (light 3.29:1, dark 6.06:1); update both together.
-const WORST_AVATAR = { light: [191, 2], dark: [352, 0] } as const;
 
 /// The history item (a group of one author's rows) holding `text`.
 function groupWith(page: Page, text: string): Locator {
@@ -55,12 +51,7 @@ function rowGeometry(group: Locator) {
     return Array.from(el.querySelectorAll('[data-testid="message-row"]')).map((row) => ({
       self: row.getAttribute("data-message-self"),
       contentLeft: row.getBoundingClientRect().left + parseFloat(getComputedStyle(row).paddingLeft),
-      avatars: Array.from(row.querySelectorAll('[data-testid="message-group-avatar"]')).map((a) => ({
-        ...box(a),
-        background: getComputedStyle(a).backgroundColor,
-        ariaHidden: a.getAttribute("aria-hidden"),
-        tabIndex: (a as HTMLElement).tabIndex,
-      })),
+      avatars: row.querySelectorAll('[data-testid="message-group-avatar"]').length,
       headers: Array.from(row.querySelectorAll('[data-testid="message-group-header"]')).map(box),
       body: box(row.querySelector('[data-testid="message-body"]')!),
     }));
@@ -68,7 +59,7 @@ function rowGeometry(group: Locator) {
 }
 
 test.describe("Message rows", () => {
-  test("own and received groups share one row layout, with one avatar and header per group", async ({ page }) => {
+  test("own and received groups share one left-aligned row layout, with one header per group", async ({ page }) => {
     const { received, own } = await openRoomWithPairs(page);
     const groups = { received: await rowGeometry(received), own: await rowGeometry(own) };
 
@@ -76,82 +67,20 @@ test.describe("Message rows", () => {
     for (const [kind, rows] of Object.entries(groups)) {
       expect(rows, `${kind}: a two-message group`).toHaveLength(2);
       expect(rows.map((r) => r.self)).toEqual(Array(2).fill(kind === "own" ? "true" : "false"));
-      // One avatar and one header, both in the first row.
-      expect(rows.map((r) => r.avatars.length), `${kind}: avatars per row`).toEqual([1, 0]);
+      // No avatar, and one header, in the first row.
+      expect(rows.map((r) => r.avatars), `${kind}: avatars per row`).toEqual([0, 0]);
       expect(rows.map((r) => r.headers.length), `${kind}: headers per row`).toEqual([1, 0]);
 
+      // The header and every body start at the row's content edge.
       const [first, second] = rows;
-      const avatar = first.avatars[0];
-      expect(avatar.left, `${kind}: avatar at the row's start`).toBeCloseTo(first.contentLeft, 0);
-      // The header starts the content column, and the continuation row keeps it.
-      expect(first.headers[0].left).toBeCloseTo(first.body.left, 0);
+      expect(first.headers[0].left, `${kind}: header at the row's start`).toBeCloseTo(first.contentLeft, 0);
+      expect(first.body.left, `${kind}: body at the row's start`).toBeCloseTo(first.contentLeft, 0);
       expect(second.body.left, `${kind}: continuation aligned`).toBeCloseTo(first.body.left, 0);
-      expect(avatar.top, `${kind}: avatar beside its header`).toBeCloseTo(first.headers[0].top, 0);
 
       bodyLefts.push(...rows.map((r) => r.body.left));
-
-      // Decorative but clickable: the name stays the accessible control.
-      expect(avatar.ariaHidden).toBe("true");
-      expect(avatar.tabIndex).toBe(-1);
     }
     // Same left edge for both authors: no right-aligned own group.
     expect(Math.max(...bodyLefts) - Math.min(...bodyLefts)).toBeLessThanOrEqual(0.5);
-
-    // The own avatar is set apart: a disc where a received avatar has none.
-    expect(groups.own[0].avatars[0].background, "own avatar looks different").not.toBe(groups.received[0].avatars[0].background);
-
-    // The colour comes from the member id, so the same author gets it again after a reload.
-    const avatarOf = (g: Locator) => colourOf(g.getByTestId("message-group-avatar"));
-    const painted = await avatarOf(received);
-    await openRoom(page);
-    await callRiverTest(page, "insertMessageBeforeLast", "received after reload");
-    expect(await avatarOf(groupWith(page, "received after reload"))).toEqual(painted);
-  });
-
-  test("received avatars take each member's own colour", async ({ page }) => {
-    await openRoom(page);
-    // Three fixed identities: Test Sender Insert, then appended arrivals
-    // alternate between Test Sender A and B.
-    await callRiverTest(page, "insertMessageBeforeLast", "hashed colour insert");
-    for (const text of ["hashed colour arrival one", "hashed colour arrival two"]) {
-      await deliverOffscreen(page, text);
-    }
-    const groups = {
-      insert: groupWith(page, "hashed colour insert"),
-      first: groupWith(page, "hashed colour arrival one"),
-      second: groupWith(page, "hashed colour arrival two"),
-    };
-    await expect(groups.insert).toBeAttached();
-    const names = await Promise.all(
-      Object.values(groups).map((g) => g.getByTestId("message-group-header").getByTestId("message-author-name").getAttribute("title")),
-    );
-    expect(new Set(names).size, `three distinct members: ${names}`).toBe(3);
-
-    const colours = await Promise.all(
-      Object.values(groups).map(async (g) => String(await colourOf(g.getByTestId("message-group-avatar")))),
-    );
-    expect(new Set(colours).size, `distinct members, distinct colours (${colours.join(" | ")})`).toBe(3);
-  });
-
-  test("the worst-case avatar colour clears 3:1 over the hover band", async ({ page }) => {
-    const { received } = await openRoomWithPairs(page);
-    const avatar = received.getByTestId("message-group-avatar");
-    const paint = async (hue: number, tone: number) =>
-      resolveColor(
-        page,
-        await avatar.evaluate((a, [h, t]) => {
-          (a as HTMLElement).style.setProperty("--avatar-hue", String(h));
-          (a as HTMLElement).style.setProperty("--avatar-tone", String(t));
-          return getComputedStyle(a).color;
-        }, [hue, tone]),
-      );
-    for (const scheme of ["light", "dark"] as const) {
-      await page.emulateMedia({ colorScheme: scheme });
-      const [hue, tone] = WORST_AVATAR[scheme];
-      const { band } = await rowSurfaces(page);
-      const worst = await paint(hue, tone);
-      expect(contrast(worst, band), `${scheme}: hue ${hue} tone ${tone} on the band (${worst} on ${band})`).toBeGreaterThanOrEqual(3);
-    }
   });
 
   for (const [how, open] of [
@@ -161,7 +90,7 @@ test.describe("Message rows", () => {
       await expect(name).toBeFocused();
       await page.keyboard.press("Enter");
     }],
-    ["a click on the avatar", (group: Locator) => group.getByTestId("message-group-avatar").click()],
+    ["a click on the name", (group: Locator) => group.getByTestId("message-author-name").click()],
   ] as const) {
     test(`${how} opens that member's info`, async ({ page }) => {
       const { received } = await openRoomWithPairs(page);
@@ -330,9 +259,9 @@ test.describe("Reaction picker at 320px", () => {
   });
 });
 
-// The hover band (fine pointers only): hovering anywhere in a message row,
-// avatar included, fills that row and only that row; it stays while a control
-// the row opened is expanded.
+// The hover band (fine pointers only): hovering anywhere in a message row
+// fills that row and only that row; it stays while a control the row opened
+// is expanded.
 function background(row: Locator) {
   return row.evaluate(async (el) => {
     // Let the band's fade settle: a poll would pass on a sample mid-fade.
@@ -355,14 +284,14 @@ async function bandedRows(page: Page): Promise<string[]> {
 test.describe("Message row hover band", () => {
   test.beforeEach(async ({ page }) => test.skip(await coarsePointer(page), "no hover band on a touch pointer"));
 
-  test("only the hovered row lights, from its avatar or its body", async ({ page }) => {
+  test("only the hovered row lights, from its header or a continuation row", async ({ page }) => {
     const { received } = await openRoomWithPairs(page);
     const [first, second] = [received.getByTestId("message-row").first(), received.getByTestId("message-row").nth(1)];
     const band = await resolveColor(page, "var(--color-row-hover)");
     expect(band[3], "premise: the band token resolves to a visible colour").toBeGreaterThan(0);
 
     for (const [what, target, row] of [
-      ["the avatar", received.getByTestId("message-group-avatar"), first],
+      ["the header", received.getByTestId("message-group-header"), first],
       ["a continuation row", second.getByTestId("message-body"), second],
     ] as const) {
       await page.mouse.move(0, 0);

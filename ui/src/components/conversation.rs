@@ -27,7 +27,6 @@ use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
     get_current_system_time, local_message_date, local_today,
 };
-mod avatar_colour;
 mod emoji_picker;
 mod history_scroll;
 mod history_window;
@@ -601,7 +600,7 @@ fn group_messages(
     member_info: &MemberInfoV1,
     // `None` when this build holds no locally-known identity for the room.
     // Every message still renders; the identity-relative cosmetics (the
-    // own name and avatar colours, the "mention of you" chip highlight)
+    // own name colour, the "mention of you" chip highlight)
     // degrade to "not me". Never a mis-attribution: an unknown identity
     // matches nobody.
     self_member_id: Option<MemberId>,
@@ -3638,9 +3637,6 @@ fn reaction_owner_marks(
     )
 }
 
-/// The avatar: the River logo as an alpha mask, painted in `currentColor`.
-const RIVER_LOGO: Asset = asset!("/assets/river_logo.svg");
-
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -3858,16 +3854,10 @@ fn MessageGroupComponent(
         }
     });
 
-    // Once per group: the own disc, or the member id's hue and tone.
-    let (avatar_class, avatar_style, name_colour) = if is_self {
-        ("msg-avatar-self", None, "text-link hover:text-link-hover")
+    let name_colour = if is_self {
+        "text-link hover:text-link-hover"
     } else {
-        let (hue, tone) = avatar_colour::avatar_hue_tone(group.author_id);
-        (
-            "msg-avatar-hashed",
-            Some(format!("--avatar-hue: {hue}; --avatar-tone: {tone};")),
-            "text-text hover:text-link",
-        )
+        "text-text hover:text-link"
     };
     let author_id = group.author_id;
     let open_author_info = move |_: MouseEvent| {
@@ -3885,7 +3875,7 @@ fn MessageGroupComponent(
                         let reply_strip_val = msg.reply_strip.clone();
 
                         rsx! {
-                            // One grid row per message (`.msg-row` in main.css).
+                            // One row per message (`.msg-row` in main.css).
                             div {
                                 key: "{msg.id}",
                                 id: "msg-{msg.id}",
@@ -3895,20 +3885,6 @@ fn MessageGroupComponent(
                                 "data-testid": "message-row",
                                 "data-message-self": "{is_self}",
                                 class: "msg-row group",
-                                if is_first {
-                                    // aria-hidden: the name button opens the same info from the keyboard.
-                                    span {
-                                        "data-testid": "message-group-avatar",
-                                        "aria-hidden": "true",
-                                        class: "msg-avatar {avatar_class}",
-                                        style: avatar_style.clone(),
-                                        onclick: open_author_info,
-                                        span {
-                                            class: "msg-avatar-glyph",
-                                            style: "-webkit-mask-image: url({RIVER_LOGO}); mask-image: url({RIVER_LOGO});",
-                                        }
-                                    }
-                                }
                                 div {
                                     // `relative` anchors the hover bar and the
                                     // kebab, which sit just past its right edge.

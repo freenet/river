@@ -47,12 +47,6 @@
   /* Message-row hover band. Derived from the surface token, so the dark
      value follows the dark --color-surface below. */
   --color-row-hover: color-mix(in srgb, var(--color-surface) 40%, transparent);
-  /* Another member's avatar: oklch(L + tone * step, C, hue), with hue and
-     tone from the member id (`avatar_colour.rs`, whose test checks every
-     hue and tone against these values). */
-  --avatar-l: 0.48;
-  --avatar-l-step: 0.05;
-  --avatar-c: 0.15;
 }
 
 /* Dark mode colors */
@@ -74,9 +68,6 @@
     --color-warning-bg: #422006;
     --color-error-bg: #450a0a;
     --color-accent-soft: oklch(from #0265e7 l c h / 20%);
-    --avatar-l: 0.68;
-    --avatar-l-step: 0.07;
-    --avatar-c: 0.14;
   }
 }
 
