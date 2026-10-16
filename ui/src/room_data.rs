@@ -1096,6 +1096,13 @@ impl RoomData {
 
     /// Check if the user can participate in the room (send messages, edit profile).
     /// Returns Ok if user is not banned AND (is owner OR has self_authorized_member OR is in members list).
+    /// A private room whose current secret this device does not hold: a
+    /// message it sends could not be encrypted, and the room does not admit
+    /// a public body in a private room.
+    pub fn missing_room_secret(&self) -> bool {
+        self.is_private() && self.get_secret().is_none()
+    }
+
     pub fn can_participate(&self) -> Result<(), SendMessageError> {
         // Participating means publishing a signed record, so the same rule as
         // `can_send_message` applies: the PRIVATE key is required, not just a
@@ -3390,6 +3397,29 @@ mod tests {
         let mut rooms = empty_rooms_for_merge();
         rooms.map.insert(vk, room);
         rooms
+    }
+
+    /// A private room is missing its secret until this device holds the
+    /// secret at the current version; a public room never is (D2 of the
+    /// freenet/river#703).
+    #[test]
+    fn missing_room_secret_is_private_and_without_the_current_secret() {
+        use river_core::room_state::privacy::PrivacyMode;
+        let owner_sk = SigningKey::from_bytes(&[1u8; 32]);
+        let mut room = test_minimal_room_data(owner_sk.verifying_key());
+        assert!(!room.missing_room_secret(), "a public room");
+        let mut config = room.room_state.configuration.configuration.clone();
+        config.privacy_mode = PrivacyMode::Private;
+        room.room_state.configuration =
+            river_core::room_state::configuration::AuthorizedConfigurationV1::new(
+                config, &owner_sk,
+            );
+        room.secrets.clear();
+        room.current_secret_version = None;
+        assert!(room.missing_room_secret());
+        room.secrets.insert(1, [7u8; 32]);
+        room.current_secret_version = Some(1);
+        assert!(!room.missing_room_secret());
     }
 
     /// freenet/river#591 — one room's merge failure must not drop the others.

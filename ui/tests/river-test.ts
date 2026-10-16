@@ -9,6 +9,7 @@ type RiverTestHooks = {
   appendMessages(count: number): void;
   removeMessages(containing: string): void;
   makeRoomPrivateWithoutSecret(): void;
+  forgeNextSendSignature(): void;
   setRoomsLoadState(state: RoomsLoadState): void;
   switchRoom(name: string): void;
   // Peer 0 and peer 1 are two fixed test identities, each with its own thread. Others throw.
