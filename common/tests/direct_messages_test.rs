@@ -1145,7 +1145,7 @@ fn purge_envelope_merges_are_commutative_and_converge() {
         )
         .unwrap()
     };
-    let envelopes = vec![
+    let envelopes = [
         sign(1, vec![tok(1)]),
         sign(1, vec![tok(2)]),
         sign(2, vec![tok(1), tok(2)]),
