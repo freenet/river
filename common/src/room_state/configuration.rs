@@ -126,41 +126,7 @@ impl AuthorizedConfigurationV1 {
     /// valid one fail (freenet/river#703 review). Clients run the same checks
     /// before signing.
     pub fn check_values(&self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
-        let c = &self.configuration;
-        if c.owner_member_id != parameters.owner_id() {
-            return Err("owner_member_id is not the room owner's".to_string());
-        }
-        if c.max_recent_messages == 0
-            || c.max_user_bans == 0
-            || c.max_message_size == 0
-            || c.max_nickname_size == 0
-            || c.max_members == 0
-            || c.max_room_name == 0
-            || c.max_room_description == 0
-            || c.max_direct_messages == Some(0)
-        {
-            return Err("Invalid configuration values".to_string());
-        }
-        if c.display.name.declared_len() > c.max_room_name {
-            return Err(format!(
-                "Room name declared length {} exceeds max_room_name {}",
-                c.display.name.declared_len(),
-                c.max_room_name
-            ));
-        }
-        if let Some(desc) = &c.display.description {
-            if desc.declared_len() > c.max_room_description {
-                return Err(format!(
-                    "Room description declared length {} exceeds max_room_description {}",
-                    desc.declared_len(),
-                    c.max_room_description
-                ));
-            }
-        }
-        if c.privacy_mode == PrivacyMode::Private && c.display.name.is_public() {
-            return Err("Private room must have encrypted display metadata".to_string());
-        }
-        Ok(())
+        self.configuration.check_values(parameters)
     }
 
     pub fn new(configuration: Configuration, owner_signing_key: &SigningKey) -> Self {
@@ -353,6 +319,49 @@ pub struct Configuration {
 pub const DEFAULT_MAX_DIRECT_MESSAGES: usize = 300;
 
 impl Configuration {
+    /// The checks a configuration must pass to be adopted, other than its
+    /// signature and rank; see [`AuthorizedConfigurationV1::check_values`].
+    /// Clients run this before signing, because a configuration that fails it
+    /// is not adopted (it is skipped, not rejected), so nothing else would
+    /// tell the owner the edit did not take.
+    pub fn check_values(&self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
+        let c = self;
+        if c.owner_member_id != parameters.owner_id() {
+            return Err("owner_member_id is not the room owner's".to_string());
+        }
+        if c.max_recent_messages == 0
+            || c.max_user_bans == 0
+            || c.max_message_size == 0
+            || c.max_nickname_size == 0
+            || c.max_members == 0
+            || c.max_room_name == 0
+            || c.max_room_description == 0
+            || c.max_direct_messages == Some(0)
+        {
+            return Err("Invalid configuration values".to_string());
+        }
+        if c.display.name.declared_len() > c.max_room_name {
+            return Err(format!(
+                "Room name declared length {} exceeds max_room_name {}",
+                c.display.name.declared_len(),
+                c.max_room_name
+            ));
+        }
+        if let Some(desc) = &c.display.description {
+            if desc.declared_len() > c.max_room_description {
+                return Err(format!(
+                    "Room description declared length {} exceeds max_room_description {}",
+                    desc.declared_len(),
+                    c.max_room_description
+                ));
+            }
+        }
+        if c.privacy_mode == PrivacyMode::Private && c.display.name.is_public() {
+            return Err("Private room must have encrypted display metadata".to_string());
+        }
+        Ok(())
+    }
+
     /// The global DM cap in force for this room: the owner's explicit
     /// [`Self::max_direct_messages`], or [`DEFAULT_MAX_DIRECT_MESSAGES`] when
     /// unset. Every retention and horizon decision MUST read the cap through

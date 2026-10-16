@@ -846,6 +846,12 @@ pub(super) fn sign_and_apply_configuration(
         return;
     };
     new_config.configuration_version += 1;
+    // The room skips (does not reject) a configuration that fails these
+    // checks, so signing one would log success and change nothing.
+    if let Err(e) = new_config.check_values(&ChatRoomParametersV1 { owner: owner_key }) {
+        error!("Not updating {what}: {e}");
+        return;
+    }
 
     spawn_local(async move {
         let mut config_bytes = Vec::new();

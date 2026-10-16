@@ -6485,6 +6485,14 @@ impl ApiClient {
         let mut new_config = room_state.configuration.configuration.clone();
         new_config.configuration_version += 1;
         modify(&mut new_config);
+        // The room skips (does not reject) a configuration that fails these
+        // checks, so without this the edit would report success and do
+        // nothing.
+        new_config
+            .check_values(&ChatRoomParametersV1 {
+                owner: *room_owner_key,
+            })
+            .map_err(|e| anyhow!("Invalid configuration: {e}"))?;
 
         // Sign the new configuration
         let authorized_config = AuthorizedConfigurationV1::new(new_config, &signing_key);
