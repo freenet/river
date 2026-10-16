@@ -305,6 +305,144 @@ test.describe("Message rows at 320px", () => {
   });
 });
 
+// The inline reaction picker hangs off the "+" at the end of a row's reaction
+// chips, and the history scroller clips anything past its sides. At 320px a
+// few chips push "+" far enough right that a rightward picker loses its
+// right-hand emoji, so the picker opens toward the side of the scroller with
+// more room. Each case checks every emoji is inside the scroller and is the
+// element a tap at its centre lands on.
+type PickerReport = {
+  scroller: Box;
+  anchor: Box;
+  picker: Box & { width: number };
+  buttons: Array<{ emoji: string; inside: boolean; hit: boolean }>;
+};
+
+/// Open `row`'s inline picker from its "+" and measure it.
+async function openPickerFromPlus(page: Page, row: Locator): Promise<PickerReport> {
+  if (!(await coarsePointer(page))) await row.hover();
+  await row.getByTestId("add-reaction-button").click();
+  return measurePicker(page);
+}
+
+/// The open picker, its "+" wrapper (the picker's containing block) and the
+/// scroller, with no click in between: a click elsewhere would close it.
+async function measurePicker(page: Page): Promise<PickerReport> {
+  await expect(page.getByTestId("emoji-picker")).toBeVisible();
+  return page.evaluate(() => {
+    const box = (e: Element) => {
+      const r = e.getBoundingClientRect();
+      return { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
+    };
+    const scroller = box(document.getElementById("chat-scroll-container")!);
+    const picker = document.querySelector('[data-testid="emoji-picker"]')!;
+    const plus = picker.parentElement!.querySelector('[data-testid="add-reaction-button"]')!;
+    const buttons = Array.from(picker.querySelectorAll("button")).map((b) => {
+      const r = b.getBoundingClientRect();
+      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return {
+        emoji: (b.textContent || "").trim(),
+        inside:
+          r.left >= scroller.left - 0.5 &&
+          r.right <= scroller.right + 0.5 &&
+          r.top >= scroller.top - 0.5 &&
+          r.bottom <= scroller.bottom + 0.5,
+        hit: at !== null && (at === b || b.contains(at)),
+      };
+    });
+    return {
+      scroller,
+      anchor: box(plus.parentElement!),
+      picker: { ...box(picker), width: picker.getBoundingClientRect().width },
+      buttons,
+    };
+  });
+}
+
+function expectEveryEmojiTappable(report: PickerReport) {
+  expect(report.buttons.length, "the picker has emoji").toBeGreaterThan(0);
+  const outside = report.buttons.find((b) => !b.inside);
+  expect(outside, `${outside?.emoji} is clipped by the scroller (picker ${report.picker.left}..${report.picker.right}, scroller ${report.scroller.left}..${report.scroller.right})`).toBeUndefined();
+  const covered = report.buttons.find((b) => !b.hit);
+  expect(covered, `${covered?.emoji} is not the element a tap at its centre lands on`).toBeUndefined();
+}
+
+/// The newest message, "picker edge", with as many reaction chips as leave its
+/// "+" on their line, so "+" ends near the column's right edge. A fixed count
+/// does not do it: four chips left "+" at 160px in Chromium, where a 140px
+/// picker still fit, and six wrapped "+" to the line's start in WebKit, whose
+/// emoji chips are 3px wider.
+async function nearEdgeRow(page: Page): Promise<Locator> {
+  const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"];
+  await openRoom(page);
+  await callRiverTest(page, "appendMessage", "picker edge");
+  await expect(page.getByTestId("conversation-history")).toContainText("picker edge");
+  const row = page.getByTestId("message-row").filter({ hasText: "picker edge" });
+  const chips = row.getByTestId("reaction-chip");
+  await callRiverTest(page, "addReactionsToNewest", emojis.slice(0, 1));
+  await expect(chips).toHaveCount(1);
+  const fit = await row.evaluate((el) => {
+    const chip = el.querySelector('[data-testid="reaction-chip"]')!.getBoundingClientRect();
+    const plus = el.querySelector('[data-testid="add-reaction-button"]')!.getBoundingClientRect();
+    const line = el.querySelector('[data-testid="message-reaction-row"]')!.getBoundingClientRect();
+    // Each chip moves "+" one chip and its gap further right.
+    return Math.floor((line.right - plus.right) / (plus.left - chip.left)) + 1;
+  });
+  expect(fit, "chips that fit one line").toBeLessThanOrEqual(emojis.length);
+  await callRiverTest(page, "addReactionsToNewest", emojis.slice(1, fit));
+  await expect(chips).toHaveCount(fit);
+  await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+  return row;
+}
+
+/// What `left-0` would do: a rightward picker from this "+" ends past the scroller.
+function expectRightwardWouldClip(report: PickerReport) {
+  expect(
+    report.anchor.left + report.picker.width,
+    `a full line of chips no longer pushes + past the point where a rightward picker clips (+ at ${report.anchor.left}, picker ${report.picker.width} wide, scroller ends at ${report.scroller.right})`,
+  ).toBeGreaterThan(report.scroller.right);
+}
+
+test.describe("Reaction picker at 320px", () => {
+  test.use({ viewport: { width: 320, height: 700 } });
+
+  test("near the right edge, the picker opens leftward and every emoji is tappable", async ({ page }) => {
+    const row = await nearEdgeRow(page);
+    const report = await openPickerFromPlus(page, row);
+    expectRightwardWouldClip(report);
+    expectEveryEmojiTappable(report);
+  });
+
+  test("at the start of the line, the picker opens rightward", async ({ page }) => {
+    await openRoom(page);
+    await callRiverTest(page, "appendMessage", "picker start");
+    await expect(page.getByTestId("conversation-history")).toContainText("picker start");
+    const row = page.getByTestId("message-row").filter({ hasText: "picker start" });
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    const report = await openPickerFromPlus(page, row);
+    // What an unconditional `right-0` would do: a leftward picker from this "+" starts before the scroller.
+    expect(
+      report.anchor.right - report.picker.width,
+      `+ no longer starts the line (+ ends at ${report.anchor.right}, picker ${report.picker.width} wide)`,
+    ).toBeLessThan(report.scroller.left);
+    expectEveryEmojiTappable(report);
+  });
+
+  test("the kebab's React opens the picker on the same side", async ({ page }) => {
+    test.skip(!(await coarsePointer(page)), "the kebab shows only on a coarse pointer");
+    const row = await nearEdgeRow(page);
+    await row.getByTestId("message-kebab").click();
+    // The menu fills in a tick after it opens.
+    const react = page.getByTestId("message-action-menu").getByRole("button", { name: "React" });
+    await expect(react).toBeVisible();
+    await react.click();
+    const report = await measurePicker(page);
+    expectRightwardWouldClip(report);
+    expectEveryEmojiTappable(report);
+  });
+});
+
 // The hover band (fine pointers only): hovering anywhere in a message row,
 // avatar included, fills that row and only that row; it stays while a control
 // the row opened is expanded.

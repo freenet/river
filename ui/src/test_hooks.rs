@@ -1,6 +1,7 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
 //! INBOUND messages, remove messages, drive the no-room screen's load states,
-//! and complete an own DM while another thread is open.
+//! complete an own DM while another thread is open, and put reactions on the
+//! newest message.
 //!
 //! The composer is not a substitute: an own send is an explicit request to go
 //! to the newest message, so a message sent through the UI
@@ -148,6 +149,19 @@ pub fn install_test_hooks() {
             crate::util::defer(move || {
                 deliver((0..count).map(|i| (format!("batched arrival {i:02}"), Delivery::Append)))
             });
+        })
+        .into_js_value(),
+    );
+
+    // Put each emoji on the current room's newest message, all held by one
+    // test author, in ONE mutation. A send rebuilds `actions_state` and drops
+    // the example data's reactions, and those sit on random rows, so a spec
+    // that needs a row's reaction chips to fill the line sets them here.
+    set_hook(
+        "addReactionsToNewest",
+        Closure::<dyn FnMut(js_sys::Array)>::new(move |emojis: js_sys::Array| {
+            let emojis: Vec<String> = emojis.iter().filter_map(|e| e.as_string()).collect();
+            crate::util::defer(move || add_reactions_to_newest(emojis));
         })
         .into_js_value(),
     );
@@ -445,6 +459,39 @@ fn remove_messages(needle: &str) {
                 .as_public_string()
                 .is_some_and(|text| text.contains(needle))
         });
+    });
+}
+
+/// Give the current room's newest message one reaction per emoji, every one
+/// held by Test Sender A (one of the appended arrivals' authors, admitted
+/// here in case it has not spoken yet).
+fn add_reactions_to_newest(emojis: Vec<String>) {
+    with_current_room_mut(|room, room_key| {
+        let Some(newest) = room
+            .room_state
+            .recent_messages
+            .messages
+            .last()
+            .map(|m| m.id())
+        else {
+            web_sys::console::error_1(&"__riverTest.addReactionsToNewest: no messages".into());
+            return;
+        };
+        let sk = SigningKey::from_bytes(&[0x5A; 32]);
+        admit_with_nickname(room, room_key, &sk, "Test Sender A");
+        let reactor = MemberId::from(&sk.verifying_key());
+        // One member holding several reactions breaks the one-per-member rule
+        // on purpose: only the chips' geometry matters here.
+        let reactions = room
+            .room_state
+            .recent_messages
+            .actions_state
+            .reactions
+            .entry(newest)
+            .or_default();
+        for emoji in emojis {
+            reactions.insert(emoji, vec![reactor]);
+        }
     });
 }
 
