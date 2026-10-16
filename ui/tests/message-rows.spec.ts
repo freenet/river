@@ -84,6 +84,40 @@ function computedColor(page: Page, color: string) {
   return resolveColor(page, color);
 }
 
+// WCAG contrast of two 8-bit sRGB colours.
+function contrast(a: number[], b: number[]): number {
+  const lum = (c: number[]) => {
+    const [r, g, bl] = c.slice(0, 3).map((v) => {
+      const s = v / 255;
+      return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/// A received group's avatar (plan 11b): its hue (0-359) and tone (0-2) are
+/// inline, and its painted colour is chromatic (not grey) and at least 3:1
+/// against the conversation background. Returns the painted colour.
+async function expectHashedAvatar(page: Page, group: Locator, label: string): Promise<number[]> {
+  const avatar = group.getByTestId("message-group-avatar");
+  const { hue, tone, color } = await avatar.evaluate((a) => ({
+    hue: (a as HTMLElement).style.getPropertyValue("--avatar-hue").trim(),
+    tone: (a as HTMLElement).style.getPropertyValue("--avatar-tone").trim(),
+    color: getComputedStyle(a).color,
+  }));
+  expect(hue, `${label}: inline --avatar-hue`).toMatch(/^\d+$/);
+  expect(Number(hue), `${label}: hue in range`).toBeLessThan(360);
+  expect(tone, `${label}: inline --avatar-tone`).toMatch(/^[012]$/);
+  const painted = await computedColor(page, color);
+  const [r, g, b] = painted;
+  expect(Math.max(r, g, b) - Math.min(r, g, b), `${label}: chromatic, not grey (${painted})`).toBeGreaterThanOrEqual(40);
+  const bg = await computedColor(page, "var(--color-bg)");
+  expect(contrast(painted, bg), `${label}: 3:1 against the background (${painted} on ${bg})`).toBeGreaterThanOrEqual(3);
+  return painted;
+}
+
 test.describe("Message rows", () => {
   test("own and received groups share one row layout, with one avatar and header per group", async ({ page }) => {
     const { received, own } = await openRoomWithPairs(page);
@@ -140,8 +174,8 @@ test.describe("Message rows", () => {
     expect(ownAvatar.radius, "own avatar is round").toBe("9999px");
     expect(receivedFirst.avatars[0].background, "received avatar has no disc").toBe("rgba(0, 0, 0, 0)");
     expect(await computedColor(page, receivedFirst.nameColor!), "received name unchanged").toEqual(text);
-    const receivedAvatar = await computedColor(page, receivedFirst.avatars[0].color);
-    expect(receivedAvatar, "received avatar from the palette").not.toEqual(text);
+    const receivedAvatar = await expectHashedAvatar(page, received, "received avatar");
+    expect(receivedAvatar).not.toEqual(text);
     expect(receivedAvatar).not.toEqual(accent);
 
     // The colour comes from the member id, so the same author gets it again after a reload.
@@ -151,6 +185,30 @@ test.describe("Message rows", () => {
     await callRiverTest(page, "insertMessageBeforeLast", "received after reload");
     const again = await rowGeometry(page.locator("[data-item-key]").filter({ hasText: "received after reload" }));
     expect(await computedColor(page, again[0].avatars[0].color)).toEqual(receivedAvatar);
+  });
+
+  test("received avatars take each member id's own colour, clear of the background in both themes", async ({ page }) => {
+    const { received } = await openRoomWithPairs(page);
+    // Two more fixed identities: appended arrivals alternate between Test Sender A and B.
+    for (const text of ["hashed colour arrival one", "hashed colour arrival two"]) {
+      await callRiverTest(page, "appendMessage", text);
+      await expect(page.getByTestId("conversation-history")).toContainText(text);
+    }
+    const group = (text: string) => page.locator("[data-item-key]").filter({ hasText: text });
+    const groups = { insert: received, first: group("hashed colour arrival one"), second: group("hashed colour arrival two") };
+    const names = await Promise.all(
+      Object.values(groups).map((g) => g.getByTestId("message-group-header").locator('span[title^="Member ID"]').getAttribute("title")),
+    );
+    expect(new Set(names).size, `three distinct members: ${names}`).toBe(3);
+
+    for (const scheme of ["light", "dark"] as const) {
+      await page.emulateMedia({ colorScheme: scheme });
+      const colours: string[] = [];
+      for (const [kind, g] of Object.entries(groups)) {
+        colours.push(String(await expectHashedAvatar(page, g, `${scheme} ${kind}`)));
+      }
+      expect(new Set(colours).size, `${scheme}: distinct members, distinct colours (${colours.join(" | ")})`).toBe(3);
+    }
   });
 
   test("clicking a group's avatar opens that member's info, like the name", async ({ page }) => {

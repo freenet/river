@@ -100,8 +100,15 @@
     cursor: pointer;
 }
 
+/* Another member's avatar: the hue and tone the row sets inline from the
+ * member id, at the theme's lightness band and chroma (`--avatar-*` in
+ * tailwind.css), so it is never grey and never close to the background. */
+.msg-avatar-hashed {
+    color: oklch(calc(var(--avatar-l) + var(--avatar-tone) * var(--avatar-l-step)) var(--avatar-c) var(--avatar-hue));
+}
+
 /* The own group's avatar: a text-coloured disc with the glyph cut out in the
- * page background colour, so it reads apart from the palette silhouettes in
+ * page background colour, so it reads apart from the hashed silhouettes in
  * both themes. */
 .msg-avatar-self {
     border-radius: 9999px;
