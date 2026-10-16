@@ -4586,7 +4586,7 @@ mod tests {
             room_state: _,         // CRDT-merged, so the older copy's messages survive
             invitation_secrets: _, // unioned; adopted copy wins on collision
             self_nickname: _,      // local kept when the adopted copy has none
-            last_read_message_id: _, // furthest along in the folded buffer wins (#801)
+            last_read_message_id: _, // NOT carried over: furthest of local and adopted wins (#801)
 
             // --- `#[serde(skip)]`: not persisted, so the local values are
             // runtime-only and are rebuilt after the merge —

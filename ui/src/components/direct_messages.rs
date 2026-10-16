@@ -788,18 +788,23 @@ pub(crate) struct DmCutoffPlan {
 /// seeded or advanced under the replaced identity would otherwise hide the
 /// adopted identity's unread DMs. ALL of the replaced room's cutoffs are reset
 /// to the adopted copy's landed DMs (none, if nothing landed) — never DMs the
-/// room already held from the network. That is the seed the adopting copy
-/// would have produced had it arrived first. Adoption needs a strictly
-/// higher-ranked copy arriving after a lower one; legacy probes fire only when
-/// the current delegate holds nothing, so in practice the adopting copy is a
-/// newer legacy generation (`OlderSnapshot`). An `Authoritative` adoption is
+/// room already held from the network. That is, approximately, the seed the
+/// adopting copy would have produced had it arrived first (it omits DMs the
+/// merge dropped). Adoption needs a strictly higher-ranked copy arriving after
+/// a lower one. Legacy probes fire when the current delegate holds nothing, or
+/// (interrupted-migration recovery) after its rooms have already merged at
+/// the current delegate's rank, above every legacy generation; and the walk
+/// imports only once the current load has merged. So in practice the adopting
+/// copy is a newer legacy generation (`OlderSnapshot`). An `Authoritative` adoption is
 /// handled the same way for completeness, which is the one case an
 /// `Authoritative` copy can mark DMs seen: the cutoffs it replaces belonged to
 /// another identity and carry no information about this one.
 ///
 /// Ordering: the plan is committed through `crate::util::defer`
-/// (`setTimeout(0)`, FIFO) from inside the merge, so plans apply in merge
-/// order. If the one-shot first-hydration seed reads `ROOMS` after an
+/// (`setTimeout(0)`) from inside the merge. Same-delay timers run in the
+/// order queued, so plans apply in merge order. (Browsers clamp timers nested
+/// more than 5 deep to 4 ms, which could reorder a deeply nested write; none of
+/// these chains nest that deep.) If the one-shot first-hydration seed reads `ROOMS` after an
 /// adoption, it max-merges the adopted room's DMs (network-held ones too) as
 /// seen, exactly as it does on main. If it read before, its write is queued
 /// first and the re-seed then replaces it.
@@ -963,9 +968,10 @@ pub fn seed_dm_last_seen_if_needed() {
     drop(rooms);
 
     // The flag is latched in the SAME deferred closure as the write, so the
-    // two land together. A re-run of this effect before that closure runs
-    // computes another seed from a later `ROOMS` and queues it too; that is
-    // harmless, because every write here max-merges.
+    // two land together. That leaves a one-macrotask window: a re-run of this
+    // effect before the closure runs seeds again from the later `ROOMS`, so
+    // anything that arrived in between also counts as seen. Same as before
+    // #801; the writes max-merge, so the second seed never lowers the first.
     //
     // `updates` is computed now, from the rooms snapshot just read, and
     // captured into the closure, so a later `ROOMS` change cannot alter it.
