@@ -842,9 +842,9 @@ fn configuration_delta_for_merge(
 /// (freenet/river#703). Each part keeps what the merged room's caps
 /// keep first:
 /// - messages: the newest (the `max_recent_messages` trim keeps the newest);
-/// - bans: the newest of each pool in turn, owner bans and the rest (the
-///   `max_user_bans` cap guarantees each pool half the cap and evicts the
-///   oldest beyond that, see `BansV1::enforce_user_ban_cap`);
+/// - bans: what `BansV1::enforce_user_ban_cap` keeps at the bound, judged in
+///   the sender's state (dead bans first out, then each pool's oldest beyond
+///   its half), the rule the merged room's cap applies;
 /// - members: the shortest invite chains, then the lowest id (the
 ///   `max_members` trim removes the longest chains, then the highest id);
 ///   a member's inviter is always shallower, so no kept member loses its
@@ -861,7 +861,7 @@ fn trim_to_work_bounds(
     sender: &ChatRoomStateV1,
     parameters: &ChatRoomParametersV1,
 ) {
-    use crate::room_state::ban::{ban_digest, MIN_BANS_DELTA_BOUND};
+    use crate::room_state::ban::MIN_BANS_DELTA_BOUND;
     use crate::room_state::ban_evidence::{evidence_bound, evidence_depth_cap, evidence_digest};
     use crate::room_state::member::{members_work_bound, MembersDelta};
     use crate::room_state::message::messages_work_bound;
@@ -878,29 +878,19 @@ fn trim_to_work_bounds(
     let bans_bound = config.max_user_bans.max(MIN_BANS_DELTA_BOUND);
     if let Some(bans) = delta.bans.as_mut() {
         if bans.len() > bans_bound {
-            // Newest first within each pool, then the pools interleaved by
-            // that rank, so the kept bans hold the newest `bans_bound / 2` of
-            // each pool and fill the rest from whichever pool has more.
-            bans.sort_by_cached_key(|b| {
-                (
-                    b.banned_by != owner_id,
-                    std::cmp::Reverse(b.ban.banned_at),
-                    ban_digest(b),
-                )
-            });
-            let owners = bans.iter().filter(|b| b.banned_by == owner_id).count();
-            let rank: Vec<usize> = (0..bans.len())
-                .map(|i| if i < owners { i } else { i - owners })
-                .collect();
-            let mut ranked: Vec<(usize, bool, crate::room_state::ban::AuthorizedUserBan)> =
-                std::mem::take(bans)
-                    .into_iter()
-                    .zip(rank)
-                    .map(|(b, r)| (r, b.banned_by != owner_id, b))
-                    .collect();
-            ranked.sort_by_key(|(r, other, _)| (*r, *other));
-            ranked.truncate(bans_bound);
-            *bans = ranked.into_iter().map(|(_, _, b)| b).collect();
+            // The cap's own eviction, at the bound and judged in the sender's
+            // state: dead bans go first, then each pool keeps its newest
+            // `bans_bound / 2` and the spare slot goes to the newest beyond
+            // them, exactly as the merged room's `max_user_bans` cap
+            // (<= the bound) keeps them.
+            crate::room_state::ban::BansV1::enforce_user_ban_cap(
+                bans,
+                bans_bound,
+                &sender.members,
+                &sender.ban_evidence,
+                &sender.member_info,
+                parameters,
+            );
         }
     }
 
@@ -1057,8 +1047,10 @@ mod tests {
     use std::time::SystemTime;
 
     /// Over its bound, a whole-state merge's ban evidence keeps the
-    /// shallowest records, and its bans keep the newest of each pool (owner
-    /// bans and the rest) in turn (freenet/river#703).
+    /// shallowest records, and its bans keep what the ban cap keeps at the
+    /// bound (here the owner's live ban and the newest of the rest); the
+    /// pools are covered through the public merge in `bans_trim_test`
+    /// (freenet/river#703).
     #[test]
     fn trim_to_work_bounds_keeps_what_the_merged_caps_keep() {
         let owner_sk = SigningKey::from_bytes(&[1; 32]);
@@ -1140,22 +1132,6 @@ mod tests {
             oldest_kept,
             SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(111)
         );
-
-        // Both pools over half the bound: each keeps its newest half.
-        let mut bans: Vec<_> = (0..60).map(|t| ban(&owner_sk, t)).collect();
-        bans.extend((0..110).map(|t| ban(&member_sk, 1_000 + t)));
-        let mut delta = ChatRoomStateV1Delta {
-            bans: Some(bans),
-            ..Default::default()
-        };
-        trim_to_work_bounds(&mut delta, &config, &sender, &parameters);
-        let bans = delta.bans.unwrap();
-        let (owner, other): (Vec<_>, Vec<_>) = bans.iter().partition(|b| b.banned_by == owner_id);
-        assert_eq!((owner.len(), other.len()), (50, 50));
-        let oldest = |v: &[&AuthorizedUserBan]| v.iter().map(|b| b.ban.banned_at).min().unwrap();
-        let secs = |n| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(n);
-        assert_eq!(oldest(&owner), secs(10));
-        assert_eq!(oldest(&other), secs(1_060));
     }
 
     #[test]
