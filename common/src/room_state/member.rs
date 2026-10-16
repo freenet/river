@@ -823,9 +823,10 @@ pub struct BanResolution {
     /// invite subtree. Their bans never take effect, and `post_apply_cleanup`
     /// sweeps them.
     pub owner_removed: HashSet<MemberId>,
-    /// How strongly the `max_user_bans` eviction keeps each ban, highest
-    /// first ([`Self::OWNER`], [`Self::EFFECTIVE`], [`Self::MUTUAL`]). A ban
-    /// that is absent here ranks [`Self::INERT`].
+    /// Why each ban takes effect ([`Self::OWNER`], [`Self::EFFECTIVE`],
+    /// [`Self::MUTUAL`]). A ban absent here takes no effect ([`Self::INERT`]);
+    /// the `max_user_bans` eviction drops those first, then evicts by age
+    /// within an owner pool and an everyone-else pool (freenet/river#796).
     pub ban_tiers: HashMap<BanId, u8>,
     /// The bans whose signature was checked against their issuer's key and
     /// verified. Bans by owner-removed issuers are not checked.
@@ -839,7 +840,7 @@ impl BanResolution {
     pub const MUTUAL: u8 = 1;
     /// A ban that takes effect because its issuer is not removed.
     pub const EFFECTIVE: u8 = 2;
-    /// A verifiable owner ban. Never evicted in favour of a non-owner ban.
+    /// A verifiable owner ban.
     pub const OWNER: u8 = 3;
 
     /// The tier of `ban` ([`Self::INERT`] if it has none).

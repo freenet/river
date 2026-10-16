@@ -1100,8 +1100,10 @@ fn dm_ban_derivation_must_apply_the_user_ban_cap() {
         },
         bans: BansV1(vec![
             ban_at(q.id, &d, 1_000), // DEPUTY-issued, oldest -> evicted by the cap
-            ban_at(t1.id, &owner, 2_000),
-            ban_at(t2.id, &owner, 3_000),
+            // Also deputy-issued, so all three share the non-owner pool and
+            // recency alone picks Q's (freenet/river#796).
+            ban_at(t1.id, &d, 2_000),
+            ban_at(t2.id, &d, 3_000),
         ]),
         direct_messages: DirectMessagesV1 {
             messages: legit.iter().chain(&q_dms).cloned().collect(),

@@ -1808,12 +1808,15 @@ fn a_mutual_ban_removes_only_the_cycle_members() {
     );
 }
 
-/// Round 5 Must Fix 2: an ordinary member X deputizes sybils it invited and
-/// has them ban each other in pairs with far-future dates. Every pair is a
-/// cycle, but mutual bans rank below the owner's ban and below a moderator's
-/// ban that takes effect, so the cap evicts sybil bans instead.
+/// Round 5 Must Fix 2, revised for freenet/river#796: an ordinary member X
+/// deputizes sybils it invited and has them ban each other in pairs with
+/// far-future dates. Every pair is a cycle, so the bans are live and compete
+/// on recency in the non-owner pool. The owner pool keeps its half of the cap,
+/// so the owner's ban survives the flood. A moderator's older ban in the
+/// non-owner pool is evicted: that is the accepted future-dating residual
+/// (freenet/river#413), and the evicted ban's target is back.
 #[test]
-fn a_sybil_deputy_cycle_flood_cannot_evict_real_bans() {
+fn a_sybil_deputy_cycle_flood_cannot_evict_owner_bans() {
     let room = capped_room(20, 4);
     let (v, w, d, x) = (room.person(), room.person(), room.person(), room.person());
     let sybils: Vec<Person> = (0..4).map(|_| room.person_invited_by(&x)).collect();
@@ -1839,9 +1842,55 @@ fn a_sybil_deputy_cycle_flood_cannot_evict_real_bans() {
     ];
     let after = apply_checked(&s, bans_delta(flood), &room.params);
     assert!(has_ban(&after, &owner_bans_v), "the owner's ban survives");
-    assert!(has_ban(&after, &d_bans_w), "the moderator's ban survives");
-    let ids = member_ids(&after);
-    assert!(!ids.contains(&v.id) && !ids.contains(&w.id));
+    assert!(
+        !member_ids(&after).contains(&v.id),
+        "the owner's ban still takes effect"
+    );
+    assert!(
+        !has_ban(&after, &d_bans_w),
+        "accepted residual (#413): the older non-owner ban is evicted"
+    );
+}
+
+/// The owner pool's guarantee holds under a flood even when the owner has more
+/// bans than its share: with a cap of 4 and three owner bans, a flood of
+/// far-future non-owner bans evicts only the OLDEST owner ban, and the newest
+/// two (half the cap) survive.
+#[test]
+fn a_flood_leaves_the_newest_half_cap_of_owner_bans() {
+    let room = capped_room(20, 4);
+    let x = room.person();
+    let sybils: Vec<Person> = (0..4).map(|_| room.person_invited_by(&x)).collect();
+    let mut members: Vec<&Person> = vec![&x];
+    members.extend(sybils.iter());
+    let mut s = room.modded_state(&members, &[], vec![]);
+    s.member_info
+        .member_info
+        .push(deputies_record(&x, 1, &sybils.iter().collect::<Vec<_>>()));
+    s.verify(&s, &room.params).expect("fixture");
+    let gone: Vec<Person> = (0..3).map(|_| room.person()).collect();
+    let owner_bans: Vec<AuthorizedUserBan> = gone
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.owner_ban(p, 10 + i as u64))
+        .collect();
+    let s = apply_checked(&s, bans_delta(owner_bans.clone()), &room.params);
+    let far = 3_000_000_000;
+    let flood = vec![
+        room.ban(&sybils[0], &sybils[1], far),
+        room.ban(&sybils[1], &sybils[0], far),
+        room.ban(&sybils[2], &sybils[3], far + 1),
+        room.ban(&sybils[3], &sybils[2], far + 1),
+    ];
+    let after = apply_checked(&s, bans_delta(flood), &room.params);
+    assert!(
+        !has_ban(&after, &owner_bans[0]),
+        "the oldest owner ban goes"
+    );
+    assert!(
+        has_ban(&after, &owner_bans[1]) && has_ban(&after, &owner_bans[2]),
+        "the newest half-cap of owner bans survives"
+    );
 }
 
 /// Round 5 Must Fix 2: a member removed by a moderator's ban re-adds
@@ -2115,11 +2164,11 @@ fn a_pruned_moderator_held_as_evidence_keeps_ban_authority() {
     );
 }
 
-/// The owner ranks above everything at the `max_user_bans` cap, and only one
-/// ban per (issuer, target) keeps its tier: a later duplicate of an effective
-/// ban is evicted before a different effective ban.
+/// Only one ban per (issuer, target) is live at the `max_user_bans` cap: a
+/// later duplicate of an effective ban is a dead entry, evicted before any
+/// live ban however old.
 #[test]
-fn cap_keeps_owner_bans_first_and_one_ban_per_pair() {
+fn cap_evicts_a_duplicate_before_any_live_ban() {
     let room = capped_room(20, 3);
     let (d, x, y, z) = (room.person(), room.person(), room.person(), room.person());
     let s = room.modded_state(&[&d, &x, &y, &z], &[&d], vec![]);
@@ -2143,6 +2192,99 @@ fn cap_keeps_owner_bans_first_and_one_ban_per_pair() {
         !has_ban(&after, &d_bans_y_again),
         "the duplicate goes first"
     );
+}
+
+/// freenet/river#796: with the ban list full of OWNER bans, a deputy's new ban
+/// used to rank lowest and be evicted the moment it arrived, so the deputy
+/// could ban nobody. Owner bans are guaranteed only half the cap, so the
+/// oldest owner ban beyond that half goes instead and the deputy's ban takes
+/// effect.
+#[test]
+fn a_full_list_of_owner_bans_does_not_evict_a_new_deputy_ban() {
+    let room = capped_room(20, 4);
+    let (d, x) = (room.person(), room.person());
+    let s = room.modded_state(&[&d, &x], &[&d], vec![]);
+    let gone: Vec<Person> = (0..4).map(|_| room.person()).collect();
+    let owner_bans: Vec<AuthorizedUserBan> = gone
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.owner_ban(p, 10 + i as u64))
+        .collect();
+    let s = apply_checked(&s, bans_delta(owner_bans.clone()), &room.params);
+    assert_eq!(s.bans.0.len(), 4, "the list is full of owner bans");
+
+    let d_bans_x = room.ban(&d, &x, 100);
+    let after = apply_checked(&s, bans_delta(vec![d_bans_x.clone()]), &room.params);
+    assert!(has_ban(&after, &d_bans_x), "the deputy's ban is kept");
+    assert!(
+        !member_ids(&after).contains(&x.id),
+        "the deputy's ban takes effect"
+    );
+    assert!(
+        !has_ban(&after, &owner_bans[0]),
+        "the oldest owner ban is evicted"
+    );
+    for ban in &owner_bans[1..] {
+        assert!(has_ban(&after, ban), "the newer owner bans are kept");
+    }
+}
+
+/// Owner bans are often rare, so their half of the cap is a floor, not an
+/// allocation: with no owner bans, the other pool uses the whole cap and
+/// evicts strictly by age.
+#[test]
+fn rare_owner_bans_leave_the_whole_cap_to_other_bans() {
+    let room = capped_room(20, 4);
+    let d = room.person();
+    let s = room.modded_state(&[&d], &[&d], vec![]);
+    let gone: Vec<Person> = (0..5).map(|_| room.person()).collect();
+    let d_bans: Vec<AuthorizedUserBan> = gone
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.ban(&d, p, 10 + i as u64))
+        .collect();
+    // A single delta may carry at most `max_user_bans` bans.
+    let s = apply_checked(&s, bans_delta(d_bans[..4].to_vec()), &room.params);
+    let after = apply_checked(&s, bans_delta(vec![d_bans[4].clone()]), &room.params);
+    assert_eq!(after.bans.0.len(), 4, "the whole cap is used");
+    assert!(!has_ban(&after, &d_bans[0]), "the oldest is evicted");
+    for ban in &d_bans[1..] {
+        assert!(has_ban(&after, ban));
+    }
+}
+
+/// The two pools trade unused slots by age: with one owner ban and a cap of 4,
+/// three other bans fit, and a newer owner ban evicts the oldest OTHER ban
+/// once the owner pool is within its share, because the other pool is then
+/// the one over its share.
+#[test]
+fn a_new_owner_ban_evicts_the_oldest_ban_of_the_pool_over_its_share() {
+    let room = capped_room(20, 4);
+    let d = room.person();
+    let s = room.modded_state(&[&d], &[&d], vec![]);
+    let gone: Vec<Person> = (0..5).map(|_| room.person()).collect();
+    let old_owner = room.owner_ban(&gone[0], 5);
+    let d_bans: Vec<AuthorizedUserBan> = gone[1..4]
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.ban(&d, p, 10 + i as u64))
+        .collect();
+    let mut first = vec![old_owner.clone()];
+    first.extend(d_bans.iter().cloned());
+    let s = apply_checked(&s, bans_delta(first), &room.params);
+    assert_eq!(s.bans.0.len(), 4);
+
+    let new_owner = room.owner_ban(&gone[4], 100);
+    let after = apply_checked(&s, bans_delta(vec![new_owner.clone()]), &room.params);
+    assert!(
+        has_ban(&after, &old_owner) && has_ban(&after, &new_owner),
+        "both owner bans fit the owner pool's share, so the older one is kept"
+    );
+    assert!(
+        !has_ban(&after, &d_bans[0]),
+        "the oldest other ban goes, its pool being over its share"
+    );
+    assert!(has_ban(&after, &d_bans[1]) && has_ban(&after, &d_bans[2]));
 }
 
 /// An evidence record whose inviter leaves `members` at the `max_members` trim
