@@ -17,7 +17,10 @@
 //! every re-key. This module watches both and, when either names a generation
 //! newer than this build's, reloads the app. riverctl's long-running
 //! `message stream` does the same and exits to be restarted (freenet/river#694,
-//! `cli/src/pointer.rs`).
+//! `cli/src/pointer.rs`). It reloads rather than following the new key in
+//! place for the same reason: a new generation can change the state format and
+//! validation, and a delegate cannot be followed without the new build's
+//! migration. A fresh load already does everything a re-key needs.
 //!
 //! # Why the pointer and not the web container
 //!
@@ -49,14 +52,19 @@
 //! is retrying forever. The caps live in the iframe URL's [`RELOAD_PARAM`]
 //! rather than in storage: storage in the sandboxed iframe is not reliable,
 //! and a cap that silently resets fails open (the node shell's `_freload` cap
-//! makes the same choice).
+//! makes the same choice). A top-level refresh of the tab starts afresh, which
+//! is the reader's own action, not a loop.
 //!
-//! 1. At most [`MAX_TRIES_PER_TARGET`] automatic reloads per target
-//!    generation, spaced by [`RETRY_DELAYS_MS`] so a slow bundle has time to
-//!    arrive.
+//! 1. At most [`MAX_TRIES_PER_TARGET`] automatic reloads per [`Target`],
+//!    spaced by [`RETRY_DELAYS_MS`] so a slow bundle has time to arrive. A
+//!    target that is no newer in any artifact than the one already being
+//!    retried counts as the same target, so a page that has so far heard only
+//!    one of the two pointers cannot reset the count.
 //! 2. At most [`MAX_AUTO_RELOADS_PER_WINDOW`] automatic reloads per
 //!    [`AUTO_RELOAD_WINDOW_MS`], whatever the target.
 //! 3. Past either cap, only a banner with a manual Reload.
+//! 4. One reload per page: once a reload is under way the page only waits for
+//!    it ([`Phase::Reloading`]); it never issues a second.
 //!
 //! A reload always fetches the newest bundle the node has, so a loop could
 //! only persist if the newest build were itself broken, and the caps bound it
@@ -64,11 +72,25 @@
 //!
 //! # When to reload
 //!
-//! A hidden tab reloads after [`HIDDEN_DELAY_MIN_MS`] plus jitter. The floor
-//! outlasts the node's 30 s web-bundle refresh window, and the jitter keeps
-//! every open tab from re-keying at the same moment. A visible tab shows a
-//! banner counting down [`COUNTDOWN_MS`] with "Reload now" and "Not now". No
-//! automatic reload ever happens while the reader has unsent text.
+//! A hidden tab reloads after [`HIDDEN_DELAY_MIN_MS`] plus jitter, so every
+//! open tab does not re-key at the same moment. A visible tab shows a banner
+//! counting down [`COUNTDOWN_MS`] with "Reload now" and "Not now". Nothing
+//! reloads within [`MIN_PAGE_AGE_MS`] of the page loading: until the node's
+//! 30 s bundle-refresh window has passed, a reload is served the bundle this
+//! page came from. No automatic reload happens while the reader is busy (see
+//! `user_is_busy`) or within a few seconds of it, and pending delegate writes
+//! are flushed first.
+//!
+//! # How it reloads
+//!
+//! The app runs in the node shell's sandboxed iframe, which may not navigate
+//! the top window, and the shell refuses app-initiated reloads. It does honour
+//! a same-contract `navigate`, which closes every WebSocket it proxied for the
+//! old document before replacing it. That matters: the shim numbers sockets
+//! from 1 in each document, so a socket left open by the old page would share
+//! an id with the new page's and feed it stale notifications. A top-level
+//! (unframed) dev build reloads itself. River's other self-navigation, on an
+//! expired auth token, is freenet/river#522.
 
 use dioxus::logger::tracing::{info, warn};
 use ed25519_dalek::VerifyingKey;
@@ -116,13 +138,19 @@ pub(crate) const AUTO_RELOAD_WINDOW_MS: u64 = 60 * 60 * 1000;
 
 /// How long a visible tab's banner counts down before reloading.
 pub(crate) const COUNTDOWN_MS: u64 = 15_000;
-/// A hidden tab waits at least this long. It must exceed the node's 30 s
-/// `CONTRACT_CACHE_REFRESH_TTL`, after which the iframe path re-reads the web
-/// container instead of serving the bundle it extracted last.
+/// A hidden tab waits at least this long, plus jitter.
 pub(crate) const HIDDEN_DELAY_MIN_MS: u64 = 30_000;
 /// Upper bound of the random extra wait for a hidden tab.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) const HIDDEN_DELAY_JITTER_MS: u64 = 90_000;
+/// No reload before the page is this old. It must exceed the node's 30 s
+/// `CONTRACT_CACHE_REFRESH_TTL`: within that window the iframe path serves the
+/// bundle it extracted last (this page's) without re-reading the container,
+/// so an earlier reload is a try spent for nothing.
+pub(crate) const MIN_PAGE_AGE_MS: u64 = 35_000;
+/// A reload that has not replaced the page by now did not happen (an old node
+/// without the shell's `navigate`, say). Fall back to the banner.
+pub(crate) const RELOAD_STUCK_MS: u64 = 20_000;
 
 /// The two artifacts whose re-key strands an open tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,9 +288,48 @@ pub(crate) fn evaluate(watched: &Watched, state: &[u8]) -> Verdict {
         return Verdict::NoSignal;
     }
     match resolver.take_outcome() {
-        Some(Ok(PointerOutcome::Resolved(r))) => Verdict::Newer(r.version()),
+        // `Resolved` also covers a different record at the build's OWN version
+        // that wins the lower-code-hash tiebreak (the author signed twice at
+        // one version). That is not a newer generation, and no build could
+        // satisfy it, so only a strictly higher version counts.
+        Some(Ok(PointerOutcome::Resolved(r))) if r.version() > watched.build_version() => {
+            Verdict::Newer(r.version())
+        }
         Some(Ok(PointerOutcome::Unchanged(_))) => Verdict::Current,
         _ => Verdict::NoSignal,
+    }
+}
+
+/// The generation a reload is for: one version per artifact, written `r5d6`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Target {
+    pub room: u32,
+    pub delegate: u32,
+}
+
+impl Target {
+    fn encode(self) -> String {
+        format!("r{}d{}", self.room, self.delegate)
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        let (room, delegate) = s.strip_prefix('r')?.split_once('d')?;
+        Some(Self {
+            room: room.parse().ok()?,
+            delegate: delegate.parse().ok()?,
+        })
+    }
+
+    /// Nothing in `self` is newer than in `other`.
+    fn within(self, other: Self) -> bool {
+        self.room <= other.room && self.delegate <= other.delegate
+    }
+
+    fn max(self, other: Self) -> Self {
+        Self {
+            room: self.room.max(other.room),
+            delegate: self.delegate.max(other.delegate),
+        }
     }
 }
 
@@ -291,9 +358,12 @@ impl Observed {
         self.newer.iter().any(Option::is_some)
     }
 
-    /// Identifies the generation a reload is for, e.g. `r5d5`. An artifact the
-    /// network has not moved is named by this build's version (0 if unwatched).
-    pub(crate) fn target_key(&self, watched: &[Watched]) -> String {
+    /// The generation to reload for. An artifact the network has not moved,
+    /// or not answered for yet, is named by this build's version (0 if
+    /// unwatched). Such a partial target is never newer than the full one in
+    /// that artifact, which is what lets [`cap_decision`] treat it as the same
+    /// target.
+    pub(crate) fn target(&self, watched: &[Watched]) -> Target {
         let version = |artifact: Artifact| {
             self.newer[artifact.index()].unwrap_or_else(|| {
                 watched
@@ -302,21 +372,18 @@ impl Observed {
                     .map_or(0, Watched::build_version)
             })
         };
-        format!(
-            "r{}d{}",
-            version(Artifact::RoomContract),
-            version(Artifact::ChatDelegate)
-        )
+        Target {
+            room: version(Artifact::RoomContract),
+            delegate: version(Artifact::ChatDelegate),
+        }
     }
 }
-
-static OBSERVED: LazyLock<Mutex<Observed>> = LazyLock::new(Default::default);
 
 /// The reload caps carried in [`RELOAD_PARAM`]:
 /// `<target>-<window start ms>-<reloads in window>-<tries for target>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapState {
-    target: String,
+    target: Target,
     window_start_ms: u64,
     count: u32,
     tries: u32,
@@ -325,7 +392,7 @@ struct CapState {
 impl CapState {
     fn parse(raw: &str) -> Option<Self> {
         let mut parts = raw.splitn(4, '-');
-        let target = parts.next()?.to_string();
+        let target = Target::parse(parts.next()?)?;
         let window_start_ms = parts.next()?.parse().ok()?;
         let count = parts.next()?.parse().ok()?;
         let tries = parts.next()?.parse().ok()?;
@@ -340,15 +407,23 @@ impl CapState {
     fn encode(&self) -> String {
         format!(
             "{}-{}-{}-{}",
-            self.target, self.window_start_ms, self.count, self.tries
+            self.target.encode(),
+            self.window_start_ms,
+            self.count,
+            self.tries
         )
     }
 
-    /// Tries already spent on `target` by the reloads that led to this page.
-    fn tries_for(existing: Option<&Self>, target: &str) -> u32 {
-        existing
-            .filter(|c| c.target == target)
-            .map_or(0, |c| c.tries)
+    /// The target to record and the tries already spent on it. A target no
+    /// newer in any artifact than the one carried is the same target: a page
+    /// that so far heard one pointer (`r2d1`) is still retrying `r2d2`. Only a
+    /// strictly newer artifact starts the count again.
+    fn target_and_tries(existing: Option<&Self>, target: Target) -> (Target, u32) {
+        match existing {
+            Some(c) if target.within(c.target) => (c.target, c.tries),
+            Some(c) => (c.target.max(target), 0),
+            None => (target, 0),
+        }
     }
 
     /// The `(window start, count)` still in force at `now_ms`, or a fresh
@@ -386,9 +461,9 @@ pub(crate) enum CapDecision {
 /// A malformed value (reachable only by hand-editing the URL) starts afresh.
 /// The bound still holds, because every reload writes a well-formed value that
 /// the next load reads back.
-pub(crate) fn cap_decision(existing: Option<&str>, target: &str, now_ms: u64) -> CapDecision {
+pub(crate) fn cap_decision(existing: Option<&str>, target: Target, now_ms: u64) -> CapDecision {
     let existing = existing.and_then(CapState::parse);
-    let tries = CapState::tries_for(existing.as_ref(), target);
+    let (target, tries) = CapState::target_and_tries(existing.as_ref(), target);
     if tries >= MAX_TRIES_PER_TARGET {
         return CapDecision::TriesExhausted;
     }
@@ -402,7 +477,7 @@ pub(crate) fn cap_decision(existing: Option<&str>, target: &str, now_ms: u64) ->
     };
     CapDecision::Allow {
         param: CapState {
-            target: target.to_string(),
+            target,
             window_start_ms,
             count: count + 1,
             tries: tries + 1,
@@ -415,20 +490,21 @@ pub(crate) fn cap_decision(existing: Option<&str>, target: &str, now_ms: u64) ->
 /// The [`RELOAD_PARAM`] value for a reload the reader asked for. It spends
 /// neither budget, because a reader clicking Reload is not a loop. It keeps
 /// the target's tries, so automatic retries after it carry on where they were.
-pub(crate) fn manual_param(existing: Option<&str>, target: &str, now_ms: u64) -> String {
+pub(crate) fn manual_param(existing: Option<&str>, target: Target, now_ms: u64) -> String {
     let existing = existing.and_then(CapState::parse);
+    let (target, tries) = CapState::target_and_tries(existing.as_ref(), target);
     let (window_start_ms, count) = CapState::live_window(existing.as_ref(), now_ms);
     CapState {
-        target: target.to_string(),
+        target,
         window_start_ms,
         count,
-        tries: CapState::tries_for(existing.as_ref(), target),
+        tries,
     }
     .encode()
 }
 
-/// The URL to reload to: this document's own path, query and fragment, with
-/// [`RELOAD_PARAM`] replaced and the auth-reload marker dropped.
+/// The URL to reload to: this document's own path and query, with
+/// [`RELOAD_PARAM`] replaced and the auth-reload marker dropped, and `hash`.
 ///
 /// Keeping the query matters: the node serves the app into the shell's iframe
 /// at `?__sandbox=1`, and a reload without it would load the shell inside the
@@ -445,6 +521,20 @@ pub(crate) fn reload_href(pathname: &str, search: &str, hash: &str, param: &str)
     let ours = format!("{RELOAD_PARAM}={param}");
     pairs.push(&ours);
     format!("{pathname}?{}{hash}", pairs.join("&"))
+}
+
+/// The fragment to reload with. The iframe's own `location.hash` is stale once
+/// River has recorded a processed invitation (the shell updates the top-level
+/// URL with `replaceState`, which never reaches the iframe; see
+/// `PROCESSED_CACHE` in `receive_invitation_modal.rs`). Reloading with it
+/// would replay an invitation the reader already handled, so the in-memory
+/// list wins whenever it has anything.
+pub(crate) fn reload_fragment(location_hash: &str, processed_hash: &str) -> String {
+    if processed_hash.is_empty() {
+        location_hash.to_string()
+    } else {
+        processed_hash.to_string()
+    }
 }
 
 /// Read [`RELOAD_PARAM`] out of a `location.search` string.
@@ -465,22 +555,50 @@ pub(crate) enum Phase {
     /// Visible tab: banner counting down to `due_ms`, never before
     /// `not_before_ms`.
     Countdown { due_ms: u64, not_before_ms: u64 },
-    /// The reader said "Not now". No countdown while visible; an automatic
-    /// reload resumes once the tab is hidden.
-    Snoozed { not_before_ms: u64 },
+    /// The reader said "Not now". It sticks for the page: no countdown while
+    /// visible. Once the tab has been hidden long enough (`hidden_due_ms`) it
+    /// reloads; showing the tab again cancels that wait, not the snooze.
+    Snoozed {
+        not_before_ms: u64,
+        hidden_due_ms: Option<u64>,
+    },
     /// A cap refused an automatic reload. Banner with a manual Reload only.
     ManualOnly,
+    /// A reload was issued at `since_ms`. Nothing else happens until the page
+    /// is replaced, or [`RELOAD_STUCK_MS`] passes.
+    Reloading { since_ms: u64 },
+}
+
+impl Phase {
+    /// When the next automatic reload could happen, if one is planned.
+    pub(crate) fn due_ms(self) -> Option<u64> {
+        match self {
+            Phase::Hidden { due_ms, .. } | Phase::Countdown { due_ms, .. } => Some(due_ms),
+            Phase::Snoozed { hidden_due_ms, .. } => hidden_due_ms,
+            _ => None,
+        }
+    }
 }
 
 /// What the page looks like at one tick.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Inputs {
     pub now_ms: u64,
+    /// Time since this document started loading.
+    pub page_age_ms: u64,
     pub visible: bool,
-    /// Unsent text in a composer, or a message being edited.
-    pub composing: bool,
+    /// The reader is in the middle of something a reload would lose: unsent
+    /// text, an edit, an open dialog, an invitation being accepted, or was
+    /// within the last few seconds.
+    pub busy: bool,
     /// Uniform in `0..=HIDDEN_DELAY_JITTER_MS`.
     pub jitter_ms: u64,
+}
+
+/// The earliest a reload may happen: past the cap's delay, and past
+/// [`MIN_PAGE_AGE_MS`] of page age.
+fn earliest(i: Inputs, min_delay_ms: u64) -> u64 {
+    i.now_ms + min_delay_ms.max(MIN_PAGE_AGE_MS.saturating_sub(i.page_age_ms))
 }
 
 fn countdown(i: Inputs, not_before_ms: u64) -> Phase {
@@ -490,9 +608,13 @@ fn countdown(i: Inputs, not_before_ms: u64) -> Phase {
     }
 }
 
+fn hidden_due(i: Inputs, not_before_ms: u64) -> u64 {
+    (i.now_ms + HIDDEN_DELAY_MIN_MS + i.jitter_ms).max(not_before_ms)
+}
+
 fn hidden_wait(i: Inputs, not_before_ms: u64) -> Phase {
     Phase::Hidden {
-        due_ms: (i.now_ms + HIDDEN_DELAY_MIN_MS + i.jitter_ms).max(not_before_ms),
+        due_ms: hidden_due(i, not_before_ms),
         not_before_ms,
     }
 }
@@ -500,7 +622,7 @@ fn hidden_wait(i: Inputs, not_before_ms: u64) -> Phase {
 /// The phase a newer generation starts, once the caps allow a reload no
 /// sooner than `min_delay_ms` from now.
 pub(crate) fn start(i: Inputs, min_delay_ms: u64) -> Phase {
-    let not_before_ms = i.now_ms + min_delay_ms;
+    let not_before_ms = earliest(i, min_delay_ms);
     if i.visible {
         countdown(i, not_before_ms)
     } else {
@@ -512,18 +634,19 @@ pub(crate) fn start(i: Inputs, min_delay_ms: u64) -> Phase {
 ///
 /// Called on every move, not only the first. Both pointers usually move
 /// together, and their answers arrive milliseconds apart: the first names a
-/// partial target (`r2d1`) that has spent no tries, so it plans no delay, and
-/// the second names the real one (`r2d2`), which may be a retry owed a
-/// backoff. Keeping the first plan would retry every countdown and spend every
-/// try in under a minute. So a running plan takes the later of its own wait
-/// and the new delay, and never gets shorter.
+/// partial target, the second the real one, which may be a retry owed a
+/// backoff. So a running plan takes the later of its own wait and the new
+/// delay, and never gets shorter.
 pub(crate) fn replan(phase: Phase, decision: &CapDecision, i: Inputs) -> Phase {
+    if let Phase::Reloading { .. } = phase {
+        return phase;
+    }
     let CapDecision::Allow { min_delay_ms, .. } = decision else {
         return Phase::ManualOnly;
     };
-    let floor = i.now_ms + min_delay_ms;
+    let floor = earliest(i, *min_delay_ms);
     match phase {
-        // ManualOnly too: a new target is a new decision, and this one allows.
+        // ManualOnly too: a newer target is a new decision, and this one allows.
         Phase::Idle | Phase::ManualOnly => start(i, *min_delay_ms),
         Phase::Countdown {
             due_ms,
@@ -545,26 +668,60 @@ pub(crate) fn replan(phase: Phase, decision: &CapDecision, i: Inputs) -> Phase {
                 not_before_ms,
             }
         }
-        Phase::Snoozed { not_before_ms } => Phase::Snoozed {
-            not_before_ms: not_before_ms.max(floor),
-        },
+        Phase::Snoozed {
+            not_before_ms,
+            hidden_due_ms,
+        } => {
+            let not_before_ms = not_before_ms.max(floor);
+            Phase::Snoozed {
+                not_before_ms,
+                hidden_due_ms: hidden_due_ms.map(|d| d.max(not_before_ms)),
+            }
+        }
+        Phase::Reloading { .. } => phase,
     }
 }
 
 /// Advance the plan one tick. Returns the next phase and whether to reload now.
 ///
-/// Never reloads while `composing`: the reload waits for the draft to go.
+/// Never reloads while `busy`: the reload waits for the reader.
 pub(crate) fn step(phase: Phase, i: Inputs) -> (Phase, bool) {
     match phase {
         Phase::Idle | Phase::ManualOnly => (phase, false),
-        Phase::Snoozed { .. } if i.visible => (phase, false),
-        Phase::Snoozed { not_before_ms } => (hidden_wait(i, not_before_ms), false),
+        Phase::Reloading { since_ms } => {
+            if i.now_ms.saturating_sub(since_ms) >= RELOAD_STUCK_MS {
+                (Phase::ManualOnly, false)
+            } else {
+                (phase, false)
+            }
+        }
+        Phase::Snoozed { not_before_ms, .. } if i.visible => (
+            Phase::Snoozed {
+                not_before_ms,
+                hidden_due_ms: None,
+            },
+            false,
+        ),
+        Phase::Snoozed {
+            not_before_ms,
+            hidden_due_ms: None,
+        } => (
+            Phase::Snoozed {
+                not_before_ms,
+                hidden_due_ms: Some(hidden_due(i, not_before_ms)),
+            },
+            false,
+        ),
+        Phase::Snoozed {
+            hidden_due_ms: Some(due_ms),
+            ..
+        } => (phase, i.now_ms >= due_ms && !i.busy),
         Phase::Hidden { not_before_ms, .. } if i.visible => (countdown(i, not_before_ms), false),
         Phase::Countdown { not_before_ms, .. } if !i.visible => {
             (hidden_wait(i, not_before_ms), false)
         }
         Phase::Hidden { due_ms, .. } | Phase::Countdown { due_ms, .. } => {
-            (phase, i.now_ms >= due_ms && !i.composing)
+            (phase, i.now_ms >= due_ms && !i.busy)
         }
     }
 }
@@ -574,10 +731,12 @@ pub(crate) fn step(phase: Phase, i: Inputs) -> (Phase, bool) {
 pub enum Notice {
     /// "Reloading in N s", with Reload now / Not now.
     Countdown { secs: u64 },
-    /// The countdown ran out while the reader has unsent text.
-    WaitingForDraft,
+    /// The countdown ran out while the reader is busy.
+    WaitingForReader,
     /// No automatic reload is coming; Reload only.
     Manual,
+    /// A reload is under way.
+    Reloading,
 }
 
 /// The banner for a phase. A hidden tab needs none; it gets one on the tick
@@ -585,8 +744,9 @@ pub enum Notice {
 pub(crate) fn notice(phase: Phase, i: Inputs) -> Option<Notice> {
     match phase {
         Phase::Idle | Phase::Hidden { .. } => None,
-        Phase::Countdown { due_ms, .. } if i.now_ms >= due_ms && i.composing => {
-            Some(Notice::WaitingForDraft)
+        Phase::Reloading { .. } => Some(Notice::Reloading),
+        Phase::Countdown { due_ms, .. } if i.now_ms >= due_ms && i.busy => {
+            Some(Notice::WaitingForReader)
         }
         Phase::Countdown { due_ms, .. } => Some(Notice::Countdown {
             secs: due_ms.saturating_sub(i.now_ms).div_ceil(1000),
@@ -595,49 +755,110 @@ pub(crate) fn notice(phase: Phase, i: Inputs) -> Option<Notice> {
     }
 }
 
-/// Route a GET response. Returns `true` if `id` is a watched pointer, in
-/// which case the caller must not treat it as a room.
-pub fn deliver_state(id: &ContractInstanceId, state: &[u8]) -> bool {
-    let Some(watched) = WATCHED.iter().find(|w| &w.pointer_id == id) else {
-        return false;
-    };
-    let verdict = evaluate(watched, state);
-    let app_id = watched.artifact.app_id();
+/// Everything this module remembers for the page load.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WatchState {
+    pub observed: Observed,
+    pub phase: Phase,
+}
+
+impl Default for WatchState {
+    fn default() -> Self {
+        Self {
+            observed: Observed::default(),
+            phase: Phase::Idle,
+        }
+    }
+}
+
+static STATE: LazyLock<Mutex<WatchState>> = LazyLock::new(Default::default);
+
+/// Handle one served pointer state: judge it, and re-plan if the target moved.
+/// Returns `None` if `id` is not a watched pointer.
+///
+/// Pure over its inputs so the whole path from response to plan is testable;
+/// [`deliver_state`] supplies the live values.
+pub(crate) fn on_pointer_state(
+    watched: &[Watched],
+    state: &mut WatchState,
+    id: &ContractInstanceId,
+    bytes: &[u8],
+    reload_param: Option<&str>,
+    i: Inputs,
+) -> Option<Verdict> {
+    let w = watched.iter().find(|w| &w.pointer_id == id)?;
+    let verdict = evaluate(w, bytes);
+    let app_id = w.artifact.app_id();
     match verdict {
         Verdict::Current => info!(
             "generation watch: {app_id} is current (v{})",
-            watched.build_version()
+            w.build_version()
         ),
         Verdict::Newer(v) => warn!(
             "generation watch: {app_id} moved to v{v}; this build is v{}",
-            watched.build_version()
+            w.build_version()
         ),
         Verdict::NoSignal => info!("generation watch: {app_id}: no usable record in response"),
     }
-    let moved = OBSERVED
-        .lock()
-        .map(|mut o| o.record(watched.artifact, verdict))
-        .unwrap_or(false);
-    if moved {
-        runtime::on_newer_generation();
+    if state.observed.record(w.artifact, verdict) {
+        let target = state.observed.target(watched);
+        let decision = cap_decision(reload_param, target, i.now_ms);
+        match &decision {
+            CapDecision::Allow { min_delay_ms, .. } => info!(
+                "generation watch: reload planned for {} (no sooner than {min_delay_ms} ms)",
+                target.encode()
+            ),
+            refused => warn!(
+                "generation watch: automatic reload for {} refused ({refused:?}); banner only",
+                target.encode()
+            ),
+        }
+        state.phase = replan(state.phase, &decision, i);
+    }
+    Some(verdict)
+}
+
+/// The record bytes an update notification carries. The pointer contract's
+/// delta is the whole 100-byte record, so a `Delta` is judged like a `State`.
+pub(crate) fn update_bytes<'a>(update: &'a UpdateData<'_>) -> Option<&'a [u8]> {
+    match update {
+        UpdateData::State(state) => Some(state.as_ref()),
+        UpdateData::Delta(delta) => Some(delta.as_ref()),
+        UpdateData::StateAndDelta { state, .. } => Some(state.as_ref()),
+        _ => None,
+    }
+}
+
+/// Route a GET response. Returns `true` if `id` is a watched pointer, in
+/// which case the caller must not treat it as a room.
+pub fn deliver_state(id: &ContractInstanceId, bytes: &[u8]) -> bool {
+    if !is_watched(id) {
+        return false;
+    }
+    let i = runtime::current_inputs();
+    let param = runtime::current_reload_param();
+    let planned = match STATE.lock() {
+        Ok(mut state) => {
+            on_pointer_state(&WATCHED, &mut state, id, bytes, param.as_deref(), i);
+            state.phase != Phase::Idle
+        }
+        Err(_) => false,
+    };
+    if planned {
+        runtime::ensure_driver();
     }
     true
 }
 
 /// Route an update notification. Returns `true` if `id` is a watched pointer.
-///
-/// The pointer contract's delta is the whole 100-byte record, so a `Delta`
-/// is judged exactly like a `State`.
 pub fn deliver_update(id: &ContractInstanceId, update: &UpdateData) -> bool {
     if !is_watched(id) {
         return false;
     }
-    match update {
-        UpdateData::State(state) => deliver_state(id, state.as_ref()),
-        UpdateData::Delta(delta) => deliver_state(id, delta.as_ref()),
-        UpdateData::StateAndDelta { state, .. } => deliver_state(id, state.as_ref()),
-        _ => true,
+    if let Some(bytes) = update_bytes(update) {
+        deliver_state(id, bytes);
     }
+    true
 }
 
 /// Whether `id` is one of the watched pointers.
@@ -645,33 +866,37 @@ pub fn is_watched(id: &ContractInstanceId) -> bool {
     WATCHED.iter().any(|w| &w.pointer_id == id)
 }
 
-pub use runtime::{on_connected, on_page_visible, reload_now, snooze, UPDATE_NOTICE};
+pub use runtime::{is_reloading, on_connected, on_page_visible, reload_now, snooze, UPDATE_NOTICE};
 
 #[cfg(target_arch = "wasm32")]
 mod runtime {
     use super::*;
-    use crate::components::app::WEB_API;
+    use crate::components::app::{NEEDS_SYNC, PENDING_INVITES, WEB_API};
     use dioxus::prelude::*;
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
-    use wasm_bindgen::JsCast;
+    use wasm_bindgen::{JsCast, JsValue};
 
     /// What the update banner shows, if anything.
     pub static UPDATE_NOTICE: GlobalSignal<Option<Notice>> = Signal::global(|| None);
 
-    static PLAN: Mutex<Phase> = Mutex::new(Phase::Idle);
     static DRIVER_RUNNING: AtomicBool = AtomicBool::new(false);
     static BACKSTOP_RUNNING: AtomicBool = AtomicBool::new(false);
+    static RELOADING: AtomicBool = AtomicBool::new(false);
     static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+    static LAST_BUSY_MS: AtomicU64 = AtomicU64::new(0);
 
     /// Backstop re-check interval. The subscription is the primary signal;
     /// this catches a notification dropped on a full channel.
     const BACKSTOP_INTERVAL_MS: f64 = 15.0 * 60.0 * 1000.0;
     /// Least time between visibility-triggered re-checks.
     const VISIBLE_RECHECK_MIN_MS: u64 = 2 * 60 * 1000;
-    /// Driver tick.
-    const TICK: Duration = Duration::from_secs(1);
+    /// The reader counts as busy for this long after the last busy sign, so a
+    /// message just sent has time to leave before the page goes.
+    const SETTLE_MS: u64 = 5_000;
+    /// Longest a reload waits for pending writes before it goes anyway.
+    const FLUSH_TIMEOUT_MS: u64 = 5_000;
 
     fn now_ms() -> u64 {
         js_sys::Date::now() as u64
@@ -681,57 +906,91 @@ mod runtime {
         (js_sys::Math::random() * HIDDEN_DELAY_JITTER_MS as f64) as u64
     }
 
+    fn page_age_ms() -> u64 {
+        web_sys::window()
+            .and_then(|w| w.performance())
+            .map_or(u64::MAX, |p| p.now() as u64)
+    }
+
     fn location() -> Option<web_sys::Location> {
         web_sys::window().map(|w| w.location())
     }
 
-    fn existing_param() -> Option<String> {
+    pub(super) fn current_reload_param() -> Option<String> {
         let search = location()?.search().ok()?;
         reload_param_of(&search).map(str::to_string)
     }
 
-    fn target_key() -> Option<String> {
-        let observed = *OBSERVED.lock().ok()?;
-        observed.is_stale().then(|| observed.target_key(&WATCHED))
+    /// Whether a reload is under way. The synchronizer does not reconnect
+    /// then: a socket opened by the departing page would outlive it in the
+    /// shell.
+    pub fn is_reloading() -> bool {
+        RELOADING.load(Ordering::SeqCst)
     }
 
-    /// Unsent text in the room composer or a DM thread, or a message edit.
-    fn user_is_composing() -> bool {
+    /// Whether the reader is in the middle of something a reload would lose.
+    ///
+    /// Deliberately broad. Every modal in this app renders a full-screen
+    /// `fixed inset-0` overlay only while it is open, so any visible overlay
+    /// means a dialog, picker or menu is up (with whatever is typed in it).
+    /// Beyond that: unsent text in the room composer, a message being edited,
+    /// any focused text field with something in it, and an invitation being
+    /// accepted.
+    fn user_is_busy() -> bool {
         let Some(document) = web_sys::window().and_then(|w| w.document()) else {
             return false;
         };
-        let has_text = |el: &web_sys::Element| {
+        let value_of = |el: &web_sys::Element| {
             el.dyn_ref::<web_sys::HtmlTextAreaElement>()
                 .map(|t| t.value())
                 .or_else(|| el.dyn_ref::<web_sys::HtmlInputElement>().map(|i| i.value()))
-                .is_some_and(|v| !v.trim().is_empty())
         };
+        let has_text = |el: &web_sys::Element| value_of(el).is_some_and(|v| !v.trim().is_empty());
+
         if let Ok(Some(el)) = document.query_selector("#message-input") {
             if has_text(&el) {
                 return true;
             }
         }
-        if let Ok(list) = document.query_selector_all("[data-testid=\"dm-thread-modal\"] textarea")
-        {
-            for i in 0..list.length() {
-                if let Some(el) = list
+        if matches!(document.query_selector("[id^=\"edit-msg-\"]"), Ok(Some(_))) {
+            return true;
+        }
+        if let Ok(overlays) = document.query_selector_all(".fixed.inset-0") {
+            for i in 0..overlays.length() {
+                let visible = overlays
                     .item(i)
                     .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
-                {
-                    if has_text(&el) {
-                        return true;
-                    }
+                    // `display: none` gives zero size; a shown overlay
+                    // covers the viewport.
+                    .is_some_and(|el| el.client_width() > 0 || el.client_height() > 0);
+                if visible {
+                    return true;
                 }
             }
         }
-        matches!(document.query_selector("[id^=\"edit-msg-\"]"), Ok(Some(_)))
+        if let Some(active) = document.active_element() {
+            if has_text(&active) {
+                return true;
+            }
+        }
+        // Unreadable means "cannot tell": treat as busy, it only delays.
+        PENDING_INVITES
+            .try_read()
+            .map(|p| !p.map.is_empty())
+            .unwrap_or(true)
     }
 
-    fn inputs() -> Inputs {
+    pub(super) fn current_inputs() -> Inputs {
+        let now = now_ms();
+        if user_is_busy() {
+            LAST_BUSY_MS.store(now, Ordering::SeqCst);
+        }
+        let last_busy = LAST_BUSY_MS.load(Ordering::SeqCst);
         Inputs {
-            now_ms: now_ms(),
+            now_ms: now,
+            page_age_ms: page_age_ms(),
             visible: crate::components::app::document_title::get_visibility_state(),
-            composing: user_is_composing(),
+            busy: last_busy != 0 && now.saturating_sub(last_busy) < SETTLE_MS,
             jitter_ms: jitter_ms(),
         }
     }
@@ -745,53 +1004,94 @@ mod runtime {
     }
 
     fn set_phase(phase: Phase) {
-        if let Ok(mut p) = PLAN.lock() {
-            *p = phase;
+        if let Ok(mut s) = STATE.lock() {
+            s.phase = phase;
         }
     }
 
-    fn navigate(param: &str) {
-        let Some(location) = location() else { return };
+    fn current_target() -> Option<Target> {
+        let state = *STATE.lock().ok()?;
+        state
+            .observed
+            .is_stale()
+            .then(|| state.observed.target(&WATCHED))
+    }
+
+    fn is_framed() -> bool {
+        let Some(window) = web_sys::window() else {
+            return false;
+        };
+        match window.parent() {
+            Ok(Some(parent)) => !js_sys::Object::is(parent.as_ref(), window.as_ref()),
+            _ => false,
+        }
+    }
+
+    /// Hand the reload to the shell (framed) or do it (top level). Returns
+    /// whether it was issued.
+    fn navigate(param: &str) -> bool {
+        let Some(location) = location() else {
+            return false;
+        };
+        let hash = reload_fragment(
+            &location.hash().unwrap_or_default(),
+            &crate::components::room_list::receive_invitation_modal::processed_hash_for_reload(),
+        );
         let href = reload_href(
             &location.pathname().unwrap_or_default(),
             &location.search().unwrap_or_default(),
-            &location.hash().unwrap_or_default(),
+            &hash,
             param,
         );
         info!("generation watch: reloading to {href}");
-        if let Err(e) = location.replace(&href) {
-            warn!("generation watch: reload failed: {e:?}");
-        }
-    }
-
-    /// An automatic reload, if the caps allow it; otherwise fall back to the
-    /// manual banner.
-    fn auto_reload(target: &str) {
-        match cap_decision(existing_param().as_deref(), target, now_ms()) {
-            CapDecision::Allow { param, .. } => navigate(&param),
-            refused => {
-                warn!("generation watch: automatic reload refused ({refused:?}); banner only");
-                set_phase(Phase::ManualOnly);
-                set_notice(Some(Notice::Manual));
+        if is_framed() {
+            let msg = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&msg, &"__freenet_shell__".into(), &JsValue::TRUE);
+            let _ = js_sys::Reflect::set(&msg, &"type".into(), &"navigate".into());
+            let _ = js_sys::Reflect::set(&msg, &"href".into(), &href.as_str().into());
+            let posted = web_sys::window()
+                .and_then(|w| w.parent().ok().flatten())
+                .map(|parent| parent.post_message(&msg, "*").is_ok())
+                .unwrap_or(false);
+            if !posted {
+                warn!("generation watch: could not reach the shell to reload");
+            }
+            posted
+        } else {
+            match location.replace(&href) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("generation watch: reload failed: {e:?}");
+                    false
+                }
             }
         }
     }
 
-    /// A newer generation was just seen.
-    pub(super) fn on_newer_generation() {
-        let Some(target) = target_key() else { return };
-        let decision = cap_decision(existing_param().as_deref(), &target, now_ms());
-        match &decision {
-            CapDecision::Allow { min_delay_ms, .. } => info!(
-                "generation watch: reload planned for {target} (no sooner than {min_delay_ms} ms)"
-            ),
-            refused => warn!(
-                "generation watch: automatic reload for {target} refused ({refused:?}); banner only"
-            ),
+    /// Let pending writes out, then reload. Waits at most
+    /// [`FLUSH_TIMEOUT_MS`] for room syncs to drain and the delegate to
+    /// acknowledge the flush; a reload that never happens strands the tab,
+    /// which is worse than a snapshot a few minutes stale.
+    async fn reload_after_flush(param: String) {
+        RELOADING.store(true, Ordering::SeqCst);
+        let deadline = now_ms() + FLUSH_TIMEOUT_MS;
+        while now_ms() < deadline && NEEDS_SYNC.try_read().map_or(true, |s| !s.is_empty()) {
+            crate::util::sleep(Duration::from_millis(250)).await;
         }
-        if let Ok(mut phase) = PLAN.lock() {
-            *phase = replan(*phase, &decision, inputs());
+        let remaining = deadline.saturating_sub(now_ms()).max(500);
+        let flush = Box::pin(crate::components::app::chat_delegate::flush_rooms_to_delegate());
+        let timeout = Box::pin(crate::util::sleep(Duration::from_millis(remaining)));
+        if let futures::future::Either::Right(_) = futures::future::select(flush, timeout).await {
+            warn!("generation watch: delegate flush did not finish in time; reloading anyway");
         }
+        if !navigate(&param) {
+            RELOADING.store(false, Ordering::SeqCst);
+            set_phase(Phase::ManualOnly);
+            set_notice(Some(Notice::Manual));
+        }
+    }
+
+    pub(super) fn ensure_driver() {
         if !DRIVER_RUNNING.swap(true, Ordering::SeqCst) {
             crate::util::safe_spawn_local(drive());
         }
@@ -799,43 +1099,73 @@ mod runtime {
 
     async fn drive() {
         loop {
-            let i = inputs();
-            let Ok(current) = PLAN.lock().map(|p| *p) else {
+            let i = current_inputs();
+            let Ok((next, reload)) = STATE.lock().map(|mut s| {
+                let (next, reload) = step(s.phase, i);
+                s.phase = next;
+                (next, reload)
+            }) else {
                 break;
             };
-            let (next, reload) = step(current, i);
-            set_phase(next);
+            if next == Phase::ManualOnly {
+                RELOADING.store(false, Ordering::SeqCst);
+            }
             set_notice(notice(next, i));
             if reload {
-                if let Some(target) = target_key() {
-                    auto_reload(&target);
+                match current_target()
+                    .map(|t| cap_decision(current_reload_param().as_deref(), t, i.now_ms))
+                {
+                    Some(CapDecision::Allow { param, .. }) => {
+                        // One reload per page: from here the page only waits.
+                        set_phase(Phase::Reloading { since_ms: i.now_ms });
+                        set_notice(Some(Notice::Reloading));
+                        crate::util::safe_spawn_local(reload_after_flush(param));
+                    }
+                    other => {
+                        warn!(
+                            "generation watch: automatic reload refused ({other:?}); banner only"
+                        );
+                        set_phase(Phase::ManualOnly);
+                        set_notice(Some(Notice::Manual));
+                    }
                 }
             }
-            if matches!(next, Phase::Idle | Phase::ManualOnly) && !reload {
+            let phase = STATE.lock().map(|s| s.phase).unwrap_or(Phase::Idle);
+            if matches!(phase, Phase::Idle | Phase::ManualOnly) {
                 break;
             }
-            crate::util::sleep(TICK).await;
+            // Tick fast only when something is about to happen.
+            let soon = phase
+                .due_ms()
+                .is_none_or(|due| due.saturating_sub(i.now_ms) <= 60_000);
+            let tick = if soon { 1 } else { 5 };
+            crate::util::sleep(Duration::from_secs(tick)).await;
         }
         DRIVER_RUNNING.store(false, Ordering::SeqCst);
     }
 
     /// The banner's Reload button.
     pub fn reload_now() {
-        let Some(target) = target_key() else { return };
-        navigate(&manual_param(
-            existing_param().as_deref(),
-            &target,
-            now_ms(),
-        ));
+        let Some(target) = current_target() else {
+            return;
+        };
+        let param = manual_param(current_reload_param().as_deref(), target, now_ms());
+        set_phase(Phase::Reloading { since_ms: now_ms() });
+        set_notice(Some(Notice::Reloading));
+        ensure_driver();
+        crate::util::safe_spawn_local(reload_after_flush(param));
     }
 
     /// The banner's "Not now" button.
     pub fn snooze() {
-        if let Ok(mut phase) = PLAN.lock() {
+        if let Ok(mut s) = STATE.lock() {
             if let Phase::Countdown { not_before_ms, .. } | Phase::Hidden { not_before_ms, .. } =
-                *phase
+                s.phase
             {
-                *phase = Phase::Snoozed { not_before_ms };
+                s.phase = Phase::Snoozed {
+                    not_before_ms,
+                    hidden_due_ms: None,
+                };
             }
         }
         set_notice(Some(Notice::Manual));
@@ -902,12 +1232,27 @@ mod runtime {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod runtime {
-    use super::Notice;
+    use super::{Inputs, Notice};
     use dioxus::prelude::*;
 
     pub static UPDATE_NOTICE: GlobalSignal<Option<Notice>> = Signal::global(|| None);
 
-    pub(super) fn on_newer_generation() {}
+    pub(super) fn current_inputs() -> Inputs {
+        Inputs {
+            now_ms: 0,
+            page_age_ms: 0,
+            visible: true,
+            busy: false,
+            jitter_ms: 0,
+        }
+    }
+    pub(super) fn current_reload_param() -> Option<String> {
+        None
+    }
+    pub(super) fn ensure_driver() {}
+    pub fn is_reloading() -> bool {
+        false
+    }
     pub fn on_connected() {}
     pub fn on_page_visible() {}
     pub fn reload_now() {}
@@ -918,11 +1263,15 @@ mod runtime {
 mod tests {
     use super::*;
 
+    /// A page old enough that [`MIN_PAGE_AGE_MS`] does not bind.
+    const OLD: u64 = 10 * MIN_PAGE_AGE_MS;
+
     fn visible(now_ms: u64) -> Inputs {
         Inputs {
             now_ms,
+            page_age_ms: OLD,
             visible: true,
-            composing: false,
+            busy: false,
             jitter_ms: 0,
         }
     }
@@ -934,11 +1283,16 @@ mod tests {
         }
     }
 
+    fn t(room: u32, delegate: u32) -> Target {
+        Target { room, delegate }
+    }
+
     // ---- build identity --------------------------------------------------
 
     /// The shipped build must be able to watch both pointers. If this fails,
     /// `pointer-records.toml` no longer names the WASM the UI embeds, and the
-    /// UI would never notice a re-key.
+    /// UI would never notice a re-key. (Fails by design when the tests are
+    /// built with `RIVER_POINTER_RECORDS` pointing at test records.)
     #[test]
     fn shipped_build_watches_both_pointers() {
         let watched = watched_pointers(POINTER_AUTHOR_VK, POINTER_RECORDS, Artifact::embedded_wasm);
@@ -1002,9 +1356,74 @@ mod tests {
         .to_vec()
     }
 
-    /// A watched room-contract pointer at build version 4, signed by a test key.
-    fn test_watch() -> (ed25519_dalek::SigningKey, Watched, [u8; 32]) {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    fn test_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// Both pointers watched at build version 1, signed by a test key.
+    fn test_watched() -> Vec<Watched> {
+        let author = format!(
+            "{AUTHOR_VK_PREFIX}{}",
+            bs58::encode(test_key().verifying_key().as_bytes()).into_string()
+        );
+        let room: &'static [u8] = b"room contract v1";
+        let delegate: &'static [u8] = b"chat delegate v1";
+        let records = [
+            BuildPointerRecord {
+                app_id: "river.room-contract",
+                version: 1,
+                code_hash: *blake3::hash(room).as_bytes(),
+            },
+            BuildPointerRecord {
+                app_id: "river.chat-delegate",
+                version: 1,
+                code_hash: *blake3::hash(delegate).as_bytes(),
+            },
+        ];
+        let watched = watched_pointers(&author, &records, |a| match a {
+            Artifact::RoomContract => room,
+            Artifact::ChatDelegate => delegate,
+        });
+        assert_eq!(watched.len(), 2);
+        watched
+    }
+
+    fn room_state(version: u32) -> Vec<u8> {
+        let code_hash = if version == 1 {
+            *blake3::hash(b"room contract v1").as_bytes()
+        } else {
+            [version as u8; 32]
+        };
+        signed_state(&test_key(), "river.room-contract", version, code_hash)
+    }
+
+    fn delegate_state(version: u32) -> Vec<u8> {
+        let code_hash = if version == 1 {
+            *blake3::hash(b"chat delegate v1").as_bytes()
+        } else {
+            [0x40 + version as u8; 32]
+        };
+        signed_state(&test_key(), "river.chat-delegate", version, code_hash)
+    }
+
+    #[test]
+    fn same_record_as_the_build_is_current() {
+        let w = test_watched()[0];
+        assert_eq!(evaluate(&w, &room_state(1)), Verdict::Current);
+    }
+
+    #[test]
+    fn a_newer_signed_record_is_newer() {
+        let w = test_watched()[0];
+        assert_eq!(evaluate(&w, &room_state(5)), Verdict::Newer(5));
+    }
+
+    /// The pointer is published after the UI, so a fresh build sees it lag.
+    /// That must never read as a reason to reload (it would reload into the
+    /// same build forever, bounded only by the caps).
+    #[test]
+    fn a_pointer_behind_the_build_is_no_signal() {
+        let sk = test_key();
         let author = format!(
             "{AUTHOR_VK_PREFIX}{}",
             bs58::encode(sk.verifying_key().as_bytes()).into_string()
@@ -1015,60 +1434,61 @@ mod tests {
             version: 4,
             code_hash: *blake3::hash(wasm).as_bytes(),
         }];
-        let watched = watched_pointers(&author, &records, |_| wasm);
-        assert_eq!(watched.len(), 1);
-        (sk, watched[0], records[0].code_hash)
-    }
-
-    #[test]
-    fn same_record_as_the_build_is_current() {
-        let (sk, w, hash) = test_watch();
-        let state = signed_state(&sk, "river.room-contract", 4, hash);
-        assert_eq!(evaluate(&w, &state), Verdict::Current);
-    }
-
-    #[test]
-    fn a_newer_signed_record_is_newer() {
-        let (sk, w, _) = test_watch();
-        let state = signed_state(&sk, "river.room-contract", 5, [0x55; 32]);
-        assert_eq!(evaluate(&w, &state), Verdict::Newer(5));
-    }
-
-    /// The pointer is published after the UI, so a fresh build sees it lag.
-    /// That must never read as a reason to reload (it would reload into the
-    /// same build forever, bounded only by the caps).
-    #[test]
-    fn a_pointer_behind_the_build_is_no_signal() {
-        let (sk, w, _) = test_watch();
-        let state = signed_state(&sk, "river.room-contract", 3, [0x33; 32]);
-        assert_eq!(evaluate(&w, &state), Verdict::NoSignal);
+        let w = watched_pointers(&author, &records, |_| wasm)[0];
+        let behind = signed_state(&sk, "river.room-contract", 3, [0x33; 32]);
+        assert_eq!(evaluate(&w, &behind), Verdict::NoSignal);
     }
 
     #[test]
     fn unsigned_or_foreign_records_are_no_signal() {
-        let (_, w, _) = test_watch();
+        let w = test_watched()[0];
         let stranger = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let forged = signed_state(&stranger, "river.room-contract", 9, [0x99; 32]);
         assert_eq!(evaluate(&w, &forged), Verdict::NoSignal);
-        let (sk, _, _) = test_watch();
-        let other_app = signed_state(&sk, "river.chat-delegate", 9, [0x99; 32]);
+        let other_app = signed_state(&test_key(), "river.chat-delegate", 9, [0x99; 32]);
         assert_eq!(evaluate(&w, &other_app), Verdict::NoSignal);
         assert_eq!(evaluate(&w, &[]), Verdict::NoSignal);
         assert_eq!(evaluate(&w, &[0u8; 7]), Verdict::NoSignal);
     }
 
+    /// Only the author can sign two records at one version. Whichever side of
+    /// the tiebreak the rival lands on, it is not a newer generation, and a
+    /// reload could never satisfy it.
+    #[test]
+    fn a_competing_record_at_the_build_version_is_no_signal() {
+        let w = test_watched()[0];
+        // One rival below the build's hash (wins the tiebreak), one above.
+        for rival_hash in [[0x01; 32], [0xFF; 32]] {
+            let rival = signed_state(&test_key(), "river.room-contract", 1, rival_hash);
+            assert_eq!(evaluate(&w, &rival), Verdict::NoSignal, "{rival_hash:?}");
+        }
+    }
+
     #[test]
     fn a_withdrawal_is_no_signal() {
-        let (sk, w, _) = test_watch();
-        let state = signed_state(&sk, "river.room-contract", 5, [0u8; 32]);
+        let w = test_watched()[0];
+        let state = signed_state(&test_key(), "river.room-contract", 5, [0u8; 32]);
         assert_eq!(evaluate(&w, &state), Verdict::NoSignal);
     }
 
-    // ---- observed target -------------------------------------------------
+    // ---- targets ---------------------------------------------------------
+
+    #[test]
+    fn targets_round_trip_and_compare_per_artifact() {
+        assert_eq!(Target::parse("r5d6"), Some(t(5, 6)));
+        assert_eq!(t(5, 6).encode(), "r5d6");
+        for junk in ["", "r", "5d6", "r5", "r5d", "rxd6", "r5d6x"] {
+            assert_eq!(Target::parse(junk), None, "{junk:?}");
+        }
+        assert!(t(2, 1).within(t(2, 2)));
+        assert!(t(2, 2).within(t(2, 2)));
+        assert!(!t(3, 1).within(t(2, 2)));
+        assert_eq!(t(3, 1).max(t(2, 2)), t(3, 2));
+    }
 
     #[test]
     fn observed_tracks_the_newest_version_and_names_the_target() {
-        let (_, w, _) = test_watch();
+        let watched = test_watched();
         let mut o = Observed::default();
         assert!(!o.is_stale());
         assert!(!o.record(Artifact::RoomContract, Verdict::Current));
@@ -1083,9 +1503,9 @@ mod tests {
             !o.record(Artifact::RoomContract, Verdict::Newer(4)),
             "older"
         );
-        assert_eq!(o.target_key(&[w]), "r5d0");
+        assert_eq!(o.target(&watched), t(5, 1), "delegate named by the build");
         assert!(o.record(Artifact::ChatDelegate, Verdict::Newer(6)));
-        assert_eq!(o.target_key(&[w]), "r5d6");
+        assert_eq!(o.target(&watched), t(5, 6));
     }
 
     // ---- caps ------------------------------------------------------------
@@ -1099,7 +1519,10 @@ mod tests {
 
     #[test]
     fn first_reload_is_immediate_and_counted() {
-        assert_eq!(cap_decision(None, "r5d5", 1_000), allow("r5d5-1000-1-1", 0));
+        assert_eq!(
+            cap_decision(None, t(5, 5), 1_000),
+            allow("r5d5-1000-1-1", 0)
+        );
     }
 
     /// A reload that lands on the old bundle (the node has the 100-byte
@@ -1111,7 +1534,7 @@ mod tests {
         let mut param: Option<String> = None;
         let mut delays = Vec::new();
         for i in 0..MAX_TRIES_PER_TARGET {
-            match cap_decision(param.as_deref(), "r5d5", 1_000 + u64::from(i)) {
+            match cap_decision(param.as_deref(), t(5, 5), 1_000 + u64::from(i)) {
                 CapDecision::Allow {
                     param: p,
                     min_delay_ms,
@@ -1122,24 +1545,113 @@ mod tests {
                 other => panic!("try {i} refused: {other:?}"),
             }
         }
+        let mut expected = vec![0];
+        expected.extend(RETRY_DELAYS_MS);
+        assert_eq!(delays, expected);
         assert_eq!(
-            delays,
-            [
-                0,
-                RETRY_DELAYS_MS[0],
-                RETRY_DELAYS_MS[1],
-                RETRY_DELAYS_MS[2],
-                RETRY_DELAYS_MS[3]
-            ]
-        );
-        assert_eq!(
-            cap_decision(param.as_deref(), "r5d5", 2_000),
+            cap_decision(param.as_deref(), t(5, 5), 2_000),
             CapDecision::TriesExhausted
         );
         // Not even a fresh hour revives a target whose tries are spent.
         assert_eq!(
-            cap_decision(param.as_deref(), "r5d5", 1_000 + 10 * AUTO_RELOAD_WINDOW_MS),
+            cap_decision(
+                param.as_deref(),
+                t(5, 5),
+                1_000 + 10 * AUTO_RELOAD_WINDOW_MS
+            ),
             CapDecision::TriesExhausted
+        );
+    }
+
+    /// Regression (review of #792): tries were keyed on the exact target
+    /// string, so a page that so far heard only the room pointer (`r2d1`) had
+    /// spent no tries even when it was the third reload for `r2d2`. If the
+    /// delegate answer was late or lost, alternate loads reset the count and
+    /// only the hourly ceiling held, renewed every hour.
+    #[test]
+    fn a_partial_target_cannot_reset_the_tries() {
+        let mut param: Option<String> = None;
+        let mut tries = 0;
+        // Loads alternate between hearing both pointers and only the room one.
+        for load in 0.. {
+            let target = if load % 2 == 0 { t(2, 2) } else { t(2, 1) };
+            match cap_decision(param.as_deref(), target, 1_000 + load) {
+                CapDecision::Allow { param: p, .. } => {
+                    assert!(p.starts_with("r2d2-"), "the full target is kept: {p}");
+                    param = Some(p);
+                    tries += 1;
+                }
+                CapDecision::TriesExhausted => break,
+                other => panic!("load {load}: {other:?}"),
+            }
+            assert!(load < 50, "never exhausted");
+        }
+        assert_eq!(tries, MAX_TRIES_PER_TARGET);
+    }
+
+    #[test]
+    fn a_newer_artifact_starts_its_own_tries() {
+        let after_two = "r5d5-1000-2-2";
+        assert_eq!(
+            cap_decision(Some(after_two), t(5, 6), 2_000),
+            allow("r5d6-1000-3-1", 0)
+        );
+        // Newer in one artifact, behind in the other: the record keeps the max.
+        assert_eq!(
+            cap_decision(Some(after_two), t(6, 1), 2_000),
+            allow("r6d5-1000-3-1", 0)
+        );
+    }
+
+    #[test]
+    fn the_hourly_ceiling_holds_across_targets() {
+        let mut param: Option<String> = None;
+        for i in 0..MAX_AUTO_RELOADS_PER_WINDOW {
+            match cap_decision(param.as_deref(), t(10 + i, 5), 1_000 + u64::from(i)) {
+                CapDecision::Allow { param: p, .. } => param = Some(p),
+                other => panic!("reload {i} refused: {other:?}"),
+            }
+        }
+        assert_eq!(
+            cap_decision(param.as_deref(), t(99, 5), 2_000),
+            CapDecision::RateLimited
+        );
+        // A fresh window once the old one has passed.
+        assert!(matches!(
+            cap_decision(param.as_deref(), t(99, 5), 1_000 + AUTO_RELOAD_WINDOW_MS),
+            CapDecision::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn a_future_or_malformed_window_starts_fresh() {
+        assert_eq!(
+            cap_decision(Some("r5d5-99999-6-1"), t(6, 5), 1_000),
+            allow("r6d5-1000-1-1", 0)
+        );
+        for junk in ["garbage", "r5d5-1-1", "r5d5-x-1-1", "x5d5-1-1-1", ""] {
+            assert_eq!(
+                cap_decision(Some(junk), t(6, 5), 1_000),
+                allow("r6d5-1000-1-1", 0),
+                "{junk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_manual_reload_spends_no_budget() {
+        // Tries and the window count are carried, not incremented.
+        assert_eq!(
+            manual_param(Some("r6d5-1000-2-2"), t(6, 5), 2_000),
+            "r6d5-1000-2-2"
+        );
+        // A newer target has no tries yet, so the page it loads may still
+        // retry automatically from the start.
+        let param = manual_param(Some("r5d5-1000-2-2"), t(6, 5), 2_000);
+        assert_eq!(param, "r6d5-1000-2-0");
+        assert_eq!(
+            cap_decision(Some(&param), t(6, 5), 3_000),
+            allow("r6d5-1000-3-1", 0)
         );
     }
 
@@ -1156,67 +1668,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_new_target_starts_its_own_tries() {
-        let after_two = "r5d5-1000-2-2";
-        assert_eq!(
-            cap_decision(Some(after_two), "r5d6", 2_000),
-            allow("r5d6-1000-3-1", 0)
-        );
-    }
-
-    #[test]
-    fn the_hourly_ceiling_holds_across_targets() {
-        let mut param: Option<String> = None;
-        for i in 0..MAX_AUTO_RELOADS_PER_WINDOW {
-            let target = format!("r{}d5", 10 + i);
-            match cap_decision(param.as_deref(), &target, 1_000 + u64::from(i)) {
-                CapDecision::Allow { param: p, .. } => param = Some(p),
-                other => panic!("reload {i} refused: {other:?}"),
-            }
-        }
-        assert_eq!(
-            cap_decision(param.as_deref(), "r99d5", 2_000),
-            CapDecision::RateLimited
-        );
-        // A fresh window once the old one has passed.
-        assert!(matches!(
-            cap_decision(param.as_deref(), "r99d5", 1_000 + AUTO_RELOAD_WINDOW_MS),
-            CapDecision::Allow { .. }
-        ));
-    }
-
-    #[test]
-    fn a_future_or_malformed_window_starts_fresh() {
-        assert_eq!(
-            cap_decision(Some("r5d5-99999-6-1"), "r6d5", 1_000),
-            allow("r6d5-1000-1-1", 0)
-        );
-        for junk in ["garbage", "r5d5-1-1", "r5d5-x-1-1", ""] {
-            assert_eq!(
-                cap_decision(Some(junk), "r6d5", 1_000),
-                allow("r6d5-1000-1-1", 0)
-            );
-        }
-    }
-
-    #[test]
-    fn a_manual_reload_spends_no_budget() {
-        // Tries and the window count are carried, not incremented.
-        assert_eq!(
-            manual_param(Some("r6d5-1000-2-2"), "r6d5", 2_000),
-            "r6d5-1000-2-2"
-        );
-        // A target with no tries yet keeps zero, so the page it loads may
-        // still retry automatically from the start.
-        let param = manual_param(Some("r5d5-1000-2-2"), "r6d5", 2_000);
-        assert_eq!(param, "r6d5-1000-2-0");
-        assert_eq!(
-            cap_decision(Some(&param), "r6d5", 3_000),
-            allow("r6d5-1000-3-1", 0)
-        );
-    }
-
     // ---- URL -------------------------------------------------------------
 
     #[test]
@@ -1225,10 +1676,10 @@ mod tests {
             reload_href(
                 "/v1/contract/web/abc/",
                 "?__sandbox=1&invitation=xyz",
-                "#room",
-                "r5d5-1-1"
+                "#river-processed=a",
+                "r5d5-1-1-1"
             ),
-            "/v1/contract/web/abc/?__sandbox=1&invitation=xyz&_rgen=r5d5-1-1#room"
+            "/v1/contract/web/abc/?__sandbox=1&invitation=xyz&_rgen=r5d5-1-1-1#river-processed=a"
         );
     }
 
@@ -1237,11 +1688,11 @@ mod tests {
         assert_eq!(
             reload_href(
                 "/p/",
-                "?__sandbox=1&_rgen=r4d4-1-1&_reload=123",
+                "?__sandbox=1&_rgen=r4d4-1-1-1&_reload=123",
                 "",
-                "r5d5-1-2"
+                "r5d5-1-2-1"
             ),
-            "/p/?__sandbox=1&_rgen=r5d5-1-2"
+            "/p/?__sandbox=1&_rgen=r5d5-1-2-1"
         );
         assert_eq!(reload_href("/p/", "", "", "x-1-1"), "/p/?_rgen=x-1-1");
     }
@@ -1253,6 +1704,18 @@ mod tests {
         assert_eq!(reload_param_of(search), Some("r5d5-10-1-1"));
         assert_eq!(reload_param_of("?__sandbox=1"), None);
         assert_eq!(reload_param_of("?_rgenx=1"), None);
+    }
+
+    /// Regression (review of #792): the iframe's own hash is stale after an
+    /// invitation is processed, so reloading with it replays that invitation.
+    #[test]
+    fn the_reload_fragment_comes_from_the_processed_list() {
+        assert_eq!(
+            reload_fragment("#river-processed=old", "#river-processed=old,new"),
+            "#river-processed=old,new"
+        );
+        assert_eq!(reload_fragment("#something", ""), "#something");
+        assert_eq!(reload_fragment("", ""), "");
     }
 
     // ---- timing ----------------------------------------------------------
@@ -1276,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_tab_waits_past_the_node_refresh_window() {
+    fn a_hidden_tab_waits_then_reloads() {
         let i = Inputs {
             jitter_ms: 500,
             ..hidden(0)
@@ -1290,13 +1753,29 @@ mod tests {
                 not_before_ms: 0
             }
         );
-        assert!(
-            due > 30_000,
-            "must outlast the node's 30 s bundle refresh TTL"
-        );
         assert_eq!(notice(phase, i), None);
         assert_eq!(step(phase, hidden(due - 1)), (phase, false));
         assert_eq!(step(phase, hidden(due)), (phase, true));
+    }
+
+    /// Review of #792: within the node's 30 s bundle-refresh window, a reload
+    /// is served the bundle this page came from. A fresh page must not spend a
+    /// try there, visible or hidden.
+    #[test]
+    fn a_fresh_page_waits_out_the_node_refresh_window() {
+        assert!(MIN_PAGE_AGE_MS > 30_000);
+        for base in [visible(1_000), hidden(1_000)] {
+            let i = Inputs {
+                page_age_ms: 2_000,
+                ..base
+            };
+            let due = start(i, 0).due_ms().unwrap();
+            assert!(
+                due >= 1_000 + MIN_PAGE_AGE_MS - 2_000,
+                "reload at {due} for a page {} ms old",
+                i.page_age_ms
+            );
+        }
     }
 
     /// A retry's delay holds whatever the tab does: visible, hidden, snoozed.
@@ -1317,6 +1796,7 @@ mod tests {
 
         let snoozed = Phase::Snoozed {
             not_before_ms: delay,
+            hidden_due_ms: None,
         };
         let (resumed, _) = step(snoozed, hidden(30));
         assert_eq!(step(resumed, hidden(delay - 1)), (resumed, false));
@@ -1324,28 +1804,34 @@ mod tests {
     }
 
     #[test]
-    fn never_reloads_over_a_draft() {
+    fn never_reloads_while_the_reader_is_busy() {
         let phase = Phase::Countdown {
             due_ms: 10,
             not_before_ms: 0,
         };
-        let typing = Inputs {
-            composing: true,
+        let busy = Inputs {
+            busy: true,
             ..visible(1_000_000)
         };
-        assert_eq!(step(phase, typing), (phase, false));
-        assert_eq!(notice(phase, typing), Some(Notice::WaitingForDraft));
+        assert_eq!(step(phase, busy), (phase, false));
+        assert_eq!(notice(phase, busy), Some(Notice::WaitingForReader));
         assert_eq!(step(phase, visible(1_000_001)), (phase, true));
 
         let phase = Phase::Hidden {
             due_ms: 10,
             not_before_ms: 0,
         };
-        let typing = Inputs {
-            composing: true,
+        let busy = Inputs {
+            busy: true,
             ..hidden(1_000_000)
         };
-        assert_eq!(step(phase, typing), (phase, false));
+        assert_eq!(step(phase, busy), (phase, false));
+
+        let phase = Phase::Snoozed {
+            not_before_ms: 0,
+            hidden_due_ms: Some(10),
+        };
+        assert_eq!(step(phase, busy), (phase, false));
     }
 
     #[test]
@@ -1380,69 +1866,67 @@ mod tests {
         );
     }
 
+    /// Review of #792: "Not now" used to become a plain hidden wait on the
+    /// first tab switch, and the countdown came back on the next.
     #[test]
-    fn not_now_holds_while_visible_and_resumes_when_hidden() {
-        let snoozed = Phase::Snoozed { not_before_ms: 0 };
+    fn not_now_sticks_across_tab_switches() {
+        let snoozed = Phase::Snoozed {
+            not_before_ms: 0,
+            hidden_due_ms: None,
+        };
         assert_eq!(step(snoozed, visible(5)), (snoozed, false));
         assert_eq!(notice(snoozed, visible(5)), Some(Notice::Manual));
+
+        let (away, reload) = step(snoozed, hidden(5));
+        assert!(!reload);
         assert_eq!(
-            step(snoozed, hidden(5)),
-            (
-                Phase::Hidden {
-                    due_ms: 5 + HIDDEN_DELAY_MIN_MS,
-                    not_before_ms: 0
-                },
-                false
-            )
+            away,
+            Phase::Snoozed {
+                not_before_ms: 0,
+                hidden_due_ms: Some(5 + HIDDEN_DELAY_MIN_MS)
+            }
         );
+        // Back before the hidden wait ran out: still snoozed, no countdown.
+        let (back, reload) = step(away, visible(10));
+        assert!(!reload);
+        assert_eq!(back, snoozed);
+        assert_eq!(notice(back, visible(10)), Some(Notice::Manual));
+        // Away long enough: it reloads.
+        let (away, _) = step(back, hidden(20));
+        assert_eq!(step(away, hidden(20 + HIDDEN_DELAY_MIN_MS)).1, true);
     }
 
-    /// Regression, found end to end: both pointers move, the reload lands on
-    /// the old build, and the reloaded page hears the room pointer ~7 ms
-    /// before the delegate's. The partial target `r2d1` has spent no tries
-    /// (they were recorded against `r2d2`), so it plans no delay; unless the
-    /// second answer re-plans, every retry fires after the 15 s countdown and
-    /// all four are gone in under a minute.
+    /// Review of #792: the driver re-issued the reload every tick until the
+    /// page went, each one aborting the navigation before it. Once reloading,
+    /// nothing else is ever issued; a reload that never lands falls back to
+    /// the banner.
     #[test]
-    fn the_second_pointer_answer_restores_the_retry_backoff() {
-        let (_, w, _) = test_watch();
-        let delegate = Watched {
-            artifact: Artifact::ChatDelegate,
-            ..w
-        };
-        let watched = [w, delegate];
-        let landed_with = "r2d2-1000-1-1"; // one try already spent on r2d2
-        let now = 5_000;
-
-        let mut observed = Observed::default();
-        assert!(observed.record(Artifact::RoomContract, Verdict::Newer(2)));
-        let partial = observed.target_key(&watched);
-        assert_eq!(partial, "r2d4", "delegate still at the build's version");
-        let first = cap_decision(Some(landed_with), &partial, now);
-        let phase = replan(Phase::Idle, &first, visible(now));
+    fn a_page_reloads_at_most_once() {
+        let reloading = Phase::Reloading { since_ms: 100 };
+        for now in [100, 1_000, 100 + RELOAD_STUCK_MS - 1] {
+            for i in [visible(now), hidden(now)] {
+                assert_eq!(step(reloading, i), (reloading, false));
+            }
+        }
         assert_eq!(
-            phase,
-            start(visible(now), 0),
-            "partial target: no delay yet"
+            step(reloading, visible(100 + RELOAD_STUCK_MS)),
+            (Phase::ManualOnly, false)
         );
+        assert_eq!(notice(reloading, visible(200)), Some(Notice::Reloading));
+        // A newer target arriving mid-reload does not restart anything.
+        let allowed = cap_decision(None, t(9, 9), 200);
+        assert_eq!(replan(reloading, &allowed, visible(200)), reloading);
+    }
 
-        assert!(observed.record(Artifact::ChatDelegate, Verdict::Newer(2)));
-        let full = observed.target_key(&watched);
-        assert_eq!(full, "r2d2");
-        let second = cap_decision(Some(landed_with), &full, now + 7);
-        assert!(matches!(
-            second,
-            CapDecision::Allow { min_delay_ms, .. } if min_delay_ms == RETRY_DELAYS_MS[0]
-        ));
-        let phase = replan(phase, &second, visible(now + 7));
-        let Phase::Countdown { due_ms, .. } = phase else {
-            panic!("expected a countdown, got {phase:?}");
-        };
-        assert!(
-            due_ms >= now + 7 + RETRY_DELAYS_MS[0],
-            "backoff lost: due {due_ms}"
-        );
-        assert_eq!(step(phase, visible(now + COUNTDOWN_MS)), (phase, false));
+    #[test]
+    fn manual_only_and_idle_never_reload() {
+        for phase in [Phase::Idle, Phase::ManualOnly] {
+            for i in [visible(u64::MAX / 2), hidden(u64::MAX / 2)] {
+                assert_eq!(step(phase, i), (phase, false));
+            }
+        }
+        assert_eq!(notice(Phase::Idle, visible(0)), None);
+        assert_eq!(notice(Phase::ManualOnly, visible(0)), Some(Notice::Manual));
     }
 
     #[test]
@@ -1451,10 +1935,11 @@ mod tests {
             due_ms: 900_000,
             not_before_ms: 600_000,
         };
-        let no_delay = cap_decision(None, "r9d9", 1_000);
+        let no_delay = cap_decision(None, t(9, 9), 1_000);
         assert_eq!(replan(long, &no_delay, hidden(1_000)), long);
         let snoozed = Phase::Snoozed {
             not_before_ms: 600_000,
+            hidden_due_ms: Some(700_000),
         };
         assert_eq!(replan(snoozed, &no_delay, visible(1_000)), snoozed);
     }
@@ -1470,28 +1955,162 @@ mod tests {
             replan(running, &CapDecision::TriesExhausted, visible(0)),
             Phase::ManualOnly
         );
-        let allowed = cap_decision(None, "r3d3", 50);
+        let allowed = cap_decision(None, t(3, 3), 50);
         assert_eq!(
             replan(Phase::ManualOnly, &allowed, visible(50)),
             start(visible(50), 0)
         );
     }
 
+    // ---- routing: response to plan -------------------------------------
+
+    /// Regression, found end to end and pinned at the call site (review of
+    /// #792): both pointers move, the reload lands on the old build, and the
+    /// reloaded page hears the room pointer just before the delegate's. The
+    /// partial target must not plan away the retry backoff the full one is
+    /// owed.
     #[test]
-    fn manual_only_and_idle_never_reload() {
-        for phase in [Phase::Idle, Phase::ManualOnly] {
-            for i in [visible(u64::MAX / 2), hidden(u64::MAX / 2)] {
-                assert_eq!(step(phase, i), (phase, false));
-            }
+    fn the_second_pointer_answer_keeps_the_retry_backoff() {
+        let watched = test_watched();
+        let (room_id, delegate_id) = (watched[0].pointer_id, watched[1].pointer_id);
+        let landed_with = "r2d2-1000-1-1"; // one try already spent on r2d2
+        let mut state = WatchState::default();
+
+        let v = on_pointer_state(
+            &watched,
+            &mut state,
+            &room_id,
+            &room_state(2),
+            Some(landed_with),
+            visible(5_000),
+        );
+        assert_eq!(v, Some(Verdict::Newer(2)));
+        let after_room = state.phase.due_ms().expect("a plan");
+        assert!(
+            after_room >= 5_000 + RETRY_DELAYS_MS[0],
+            "the partial target r2d1 already owes r2d2's backoff: due {after_room}"
+        );
+
+        on_pointer_state(
+            &watched,
+            &mut state,
+            &delegate_id,
+            &delegate_state(2),
+            Some(landed_with),
+            visible(5_007),
+        );
+        let due = state.phase.due_ms().expect("a plan");
+        assert!(due >= 5_007 + RETRY_DELAYS_MS[0], "backoff lost: due {due}");
+        assert_eq!(step(state.phase, visible(5_000 + COUNTDOWN_MS)).1, false);
+    }
+
+    /// Every target move re-plans, not only the first. A page that has spent
+    /// its tries on `r2d2` goes manual on the room answer; when the delegate
+    /// answer then names a NEWER generation, that is a new decision and must
+    /// plan a reload again.
+    #[test]
+    fn a_newer_generation_after_exhaustion_plans_again() {
+        let watched = test_watched();
+        let (room_id, delegate_id) = (watched[0].pointer_id, watched[1].pointer_id);
+        let exhausted = format!("r2d2-1000-5-{MAX_TRIES_PER_TARGET}");
+        let mut state = WatchState::default();
+
+        on_pointer_state(
+            &watched,
+            &mut state,
+            &room_id,
+            &room_state(2),
+            Some(&exhausted),
+            visible(5_000),
+        );
+        assert_eq!(state.phase, Phase::ManualOnly);
+
+        on_pointer_state(
+            &watched,
+            &mut state,
+            &delegate_id,
+            &delegate_state(3),
+            Some(&exhausted),
+            visible(5_010),
+        );
+        assert!(
+            matches!(state.phase, Phase::Countdown { .. }),
+            "a newer delegate generation must plan again, got {:?}",
+            state.phase
+        );
+    }
+
+    #[test]
+    fn routing_ignores_what_it_does_not_watch_and_what_says_nothing() {
+        let watched = test_watched();
+        let mut state = WatchState::default();
+        let stranger = ContractInstanceId::new([3u8; 32]);
+        assert_eq!(
+            on_pointer_state(
+                &watched,
+                &mut state,
+                &stranger,
+                &room_state(9),
+                None,
+                visible(0)
+            ),
+            None
+        );
+        let room_id = watched[0].pointer_id;
+        for bytes in [room_state(1), Vec::new(), vec![1, 2, 3]] {
+            on_pointer_state(&watched, &mut state, &room_id, &bytes, None, visible(0));
         }
-        assert_eq!(notice(Phase::Idle, visible(0)), None);
-        assert_eq!(notice(Phase::ManualOnly, visible(0)), Some(Notice::Manual));
+        assert_eq!(state.phase, Phase::Idle);
+        assert!(!state.observed.is_stale());
+
+        let forged = signed_state(
+            &ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
+            "river.room-contract",
+            9,
+            [9; 32],
+        );
+        assert_eq!(
+            on_pointer_state(&watched, &mut state, &room_id, &forged, None, visible(0)),
+            Some(Verdict::NoSignal)
+        );
+        assert_eq!(state.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn every_carrying_update_variant_yields_the_record() {
+        use freenet_stdlib::prelude::{State, StateDelta};
+        let bytes = room_state(3);
+        let state = UpdateData::State(State::from(bytes.clone()));
+        let delta = UpdateData::Delta(StateDelta::from(bytes.clone()));
+        let both = UpdateData::StateAndDelta {
+            state: State::from(bytes.clone()),
+            delta: StateDelta::from(Vec::new()),
+        };
+        for update in [&state, &delta, &both] {
+            assert_eq!(update_bytes(update), Some(bytes.as_slice()));
+        }
+        let related = UpdateData::RelatedState {
+            related_to: ContractInstanceId::new([1; 32]),
+            state: State::from(bytes.clone()),
+        };
+        assert_eq!(update_bytes(&related), None);
     }
 
     // ---- wiring ----------------------------------------------------------
 
-    /// Each hook must run BEFORE the room lookup, or a pointer response is
-    /// logged as an unknown contract and dropped.
+    /// Whether a `return` (or `continue`) follows `needle` within `window`
+    /// bytes, i.e. the hook leaves the handler when it claims the response.
+    fn returns_soon_after(src: &str, needle: &str, window: usize) -> bool {
+        let Some(at) = src.find(needle) else {
+            return false;
+        };
+        let tail = &src[at..];
+        let tail = &tail[..tail.len().min(window)];
+        tail.contains("return") || tail.contains("continue")
+    }
+
+    /// Each hook must run BEFORE the room lookup and RETURN when it claims the
+    /// id, or a pointer response is treated as an unknown room.
     #[test]
     fn response_hooks_are_wired_before_room_lookup() {
         let src = |s: &str| crate::util::strip_comments(s);
@@ -1504,6 +2123,11 @@ mod tests {
             get_hook < probe,
             "pointer GET hook must precede the probe hook"
         );
+        assert!(returns_soon_after(
+            &get,
+            "generation_watch::deliver_state(",
+            120
+        ));
         let nf_hook = get
             .find("generation_watch::is_watched(")
             .expect("NotFound hook");
@@ -1514,14 +2138,25 @@ mod tests {
             nf_hook < nf_probe,
             "pointer NotFound hook must precede the probe hook"
         );
+        assert!(returns_soon_after(
+            &get,
+            "generation_watch::is_watched(",
+            200
+        ));
 
         let upd = src(include_str!("response_handler/update_notification.rs"));
         let upd_fn = upd.find("pub fn handle_update_notification").unwrap();
-        let upd_hook = upd[upd_fn..]
+        let body = &upd[upd_fn..];
+        let upd_hook = body
             .find("generation_watch::deliver_update(")
             .expect("update hook");
-        let upd_lookup = upd[upd_fn..].find("get_owner_vk_for_instance_id").unwrap();
+        let upd_lookup = body.find("get_owner_vk_for_instance_id").unwrap();
         assert!(upd_hook < upd_lookup);
+        assert!(returns_soon_after(
+            body,
+            "generation_watch::deliver_update(",
+            120
+        ));
 
         let sub = src(include_str!("response_handler/subscribe_response.rs"));
         let sub_hook = sub
@@ -1529,9 +2164,69 @@ mod tests {
             .expect("subscribe hook");
         let sub_lookup = sub.find("get_owner_vk_for_instance_id").unwrap();
         assert!(sub_hook < sub_lookup);
+        assert!(returns_soon_after(
+            &sub,
+            "generation_watch::is_watched(",
+            120
+        ));
+
+        let dispatch = src(include_str!("response_handler.rs"));
+        assert!(
+            dispatch.contains("subscribed && !is_pointer"),
+            "a pointer subscribe must not trigger the room re-GET"
+        );
 
         let sync = src(include_str!("freenet_synchronizer.rs"));
         assert!(sync.contains("generation_watch::on_connected()"));
         assert!(sync.contains("generation_watch::on_page_visible()"));
+        let connect = sync
+            .find("SynchronizerMessage::Connect =>")
+            .expect("Connect arm");
+        assert!(
+            returns_soon_after(&sync[connect..], "generation_watch::is_reloading()", 300),
+            "Connect must not reconnect while a reload is under way"
+        );
+    }
+
+    /// `user_is_busy` finds the composers by these hooks. Renaming one would
+    /// fail OPEN (reload over unsent text) without anything else noticing.
+    #[test]
+    fn busy_detection_selectors_still_exist() {
+        let src = |s: &str| crate::util::strip_comments(s);
+        assert!(src(include_str!("../../conversation/message_input.rs"))
+            .contains("id: \"message-input\""));
+        assert!(src(include_str!("../../conversation.rs")).contains("\"edit-msg-{"));
+        for (file, body) in [
+            (
+                "invite_via_dm_picker_modal.rs",
+                include_str!("../../direct_messages/invite_via_dm_picker_modal.rs"),
+            ),
+            (
+                "dm_thread_modal.rs",
+                include_str!("../../direct_messages/dm_thread_modal.rs"),
+            ),
+            (
+                "edit_room_modal.rs",
+                include_str!("../../room_list/edit_room_modal.rs"),
+            ),
+            (
+                "create_room_modal.rs",
+                include_str!("../../room_list/create_room_modal.rs"),
+            ),
+            (
+                "join_with_code_modal.rs",
+                include_str!("../../room_list/join_with_code_modal.rs"),
+            ),
+            (
+                "invite_member_modal.rs",
+                include_str!("../../members/invite_member_modal.rs"),
+            ),
+        ] {
+            assert!(
+                src(body).contains("fixed inset-0"),
+                "{file} no longer renders a `fixed inset-0` overlay, so an open \
+                 dialog there would not count as busy"
+            );
+        }
     }
 }

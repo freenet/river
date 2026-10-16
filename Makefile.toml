@@ -234,6 +234,12 @@ script = '''
 # runs on the same workstation — they would race the read-modify-write.
 # Wrap in `flock` if you need that:
 #     flock published-contract/contract-version.txt cargo make publish-river
+#
+# Before anything is bumped: refuse a UI that does not watch River's real
+# pointer records (built with RIVER_POINTER_RECORDS for a test). Its open tabs
+# would never reload after a re-key (freenet/river#580). Checked on the
+# archive itself, since what matters is what was built, not this shell's env.
+./scripts/check-webapp-pointer-author.sh target/webapp/webapp.tar.xz pointer-records.toml || exit 1
 version_file="published-contract/contract-version.txt"
 if [ ! -f "$version_file" ]; then
     echo "ERROR: $version_file missing. Seed it with the current on-network version."
@@ -370,13 +376,14 @@ echo "Please commit the changes to git"
 # the new WASM would silently re-key the on-network contract with NO CI
 # trip-wire and orphan every user's room data.
 #
-# The same republish also invalidates our POINTER RECORDS, which are what third
-# parties resolve instead of pinning a key (FREENET.md, pointer-records.toml).
+# The same republish also invalidates our POINTER RECORDS, which third parties
+# resolve instead of pinning a key (FREENET.md, pointer-records.toml), and which
+# our users' already-open tabs watch to know they must reload (#580).
 # Run `cargo make sign-pointer-records` in the same PR — CI's
 # check-pointer-freshness demands it — and `cargo make publish-pointer-records`
-# from main after the merge. Migration entries carry OUR users forward; the
-# pointer tells everyone ELSE where the artifact went. Same trigger, two
-# different sets of people who lose if it is skipped.
+# from main after the merge and after this UI publish (river-publish.md step 7).
+# Migration entries carry our users' DATA forward; the pointer carries their
+# open tabs and everyone else. Skipped, open tabs stay on the old keys.
 description = "Publish River to Freenet using the committed contract version"
 dependencies = ["sign-webapp"]
 script = '''
@@ -386,13 +393,6 @@ if [ ! -f "published-contract/contract-id.txt" ]; then
 fi
 contract_id=$(cat published-contract/contract-id.txt)
 echo "Publishing using committed contract: $contract_id"
-# A UI built with RIVER_POINTER_RECORDS watches TEST pointer records, so its
-# open tabs would never reload after a re-key (freenet/river#580). dx build
-# hides the cargo warning, so refuse here.
-if [ -n "${RIVER_POINTER_RECORDS:-}" ]; then
-    echo "RIVER_POINTER_RECORDS is set: this shell builds test UIs. Unset it, rebuild, then publish." >&2
-    exit 1
-fi
 version_file="published-contract/contract-version.txt"
 version=$(tr -d '[:space:]' < "$version_file")
 
@@ -446,11 +446,6 @@ if [ ! -f "published-contract/contract-id.txt" ]; then
 fi
 contract_id=$(cat published-contract/contract-id.txt)
 echo "Publishing using committed contract in debug mode: $contract_id"
-# See [tasks.publish-river]: never publish a test-pointer build.
-if [ -n "${RIVER_POINTER_RECORDS:-}" ]; then
-    echo "RIVER_POINTER_RECORDS is set: this shell builds test UIs. Unset it, rebuild, then publish." >&2
-    exit 1
-fi
 # Same production contract and same production counter as
 # [tasks.publish-river], so the same forward-only rule and the same
 # advisory read-back apply. See [tasks.sign-webapp] for why.

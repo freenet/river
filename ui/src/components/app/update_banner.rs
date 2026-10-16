@@ -5,6 +5,43 @@
 use super::freenet_api::generation_watch::{reload_now, snooze, Notice, UPDATE_NOTICE};
 use dioxus::prelude::*;
 
+/// `(message, show "Not now", show "Reload")` for a notice.
+fn banner_text(notice: Notice) -> (String, bool, bool) {
+    match notice {
+        // A first try counts down seconds; only a retry waits minutes, and a
+        // retry means the new version has not reached this node yet.
+        Notice::Countdown { secs } if secs > 60 => (
+            format!(
+                "River has been updated, but the new version hasn't reached your node yet. \
+                 Trying again in {}.",
+                countdown_text(secs)
+            ),
+            true,
+            true,
+        ),
+        Notice::Countdown { secs } => (
+            format!(
+                "River has been updated. Reloading in {} so you keep receiving messages.",
+                countdown_text(secs)
+            ),
+            true,
+            true,
+        ),
+        Notice::WaitingForReader => (
+            "River has been updated. It will reload when you've finished what you're doing."
+                .to_string(),
+            false,
+            true,
+        ),
+        Notice::Manual => (
+            "River has been updated. Reload to keep receiving messages.".to_string(),
+            false,
+            true,
+        ),
+        Notice::Reloading => ("Reloading River…".to_string(), false, false),
+    }
+}
+
 fn countdown_text(secs: u64) -> String {
     if secs >= 120 {
         format!("{} min", secs.div_ceil(60))
@@ -26,24 +63,7 @@ pub fn UpdateBanner() -> Element {
         return rsx! {};
     };
 
-    let (message, show_not_now) = match notice {
-        Notice::Countdown { secs } => (
-            format!(
-                "River has been updated. Reloading in {} so you keep receiving messages.",
-                countdown_text(secs)
-            ),
-            true,
-        ),
-        Notice::WaitingForDraft => (
-            "River has been updated. It will reload once you send or clear your message."
-                .to_string(),
-            false,
-        ),
-        Notice::Manual => (
-            "River has been updated. Reload to keep receiving messages.".to_string(),
-            false,
-        ),
-    };
+    let (message, show_not_now, show_reload) = banner_text(notice);
 
     rsx! {
         div {
@@ -64,11 +84,13 @@ pub fn UpdateBanner() -> Element {
                         "Not now"
                     }
                 }
-                button {
-                    "data-testid": "update-banner-reload",
-                    class: "px-3 py-1.5 rounded-md bg-accent text-white font-medium",
-                    onclick: move |_| reload_now(),
-                    "Reload"
+                if show_reload {
+                    button {
+                        "data-testid": "update-banner-reload",
+                        class: "px-3 py-1.5 rounded-md bg-accent text-white font-medium",
+                        onclick: move |_| reload_now(),
+                        "Reload"
+                    }
                 }
             }
         }
@@ -77,7 +99,18 @@ pub fn UpdateBanner() -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::countdown_text;
+    use super::{banner_text, countdown_text, Notice};
+
+    #[test]
+    fn a_long_wait_explains_itself_and_reloading_offers_no_buttons() {
+        let (retry, ..) = banner_text(Notice::Countdown { secs: 300 });
+        assert!(retry.contains("hasn't reached your node"), "{retry}");
+        let (first, ..) = banner_text(Notice::Countdown { secs: 15 });
+        assert!(first.contains("Reloading in 15s"), "{first}");
+        assert_eq!(banner_text(Notice::Reloading).1, false);
+        assert_eq!(banner_text(Notice::Reloading).2, false);
+        assert!(banner_text(Notice::Manual).2);
+    }
 
     #[test]
     fn short_countdowns_in_seconds_long_ones_in_minutes() {

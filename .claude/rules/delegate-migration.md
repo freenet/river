@@ -109,13 +109,15 @@ every read comes back looking like "this user has nothing stored".
 
 That half is `pointer-records.toml`: a record at a FIXED address naming the
 artifact's current code hash, signed by River's author key, which integrators
-resolve instead of pinning. Same trigger as a migration entry, different
-beneficiary.
+resolve instead of pinning. Our own users' already-open tabs watch it too, and
+reload into the new build only when a newer record lands (freenet/river#580),
+so it is not optional for us either.
 
 ```bash
 cargo make sign-pointer-records      # after sync-wasm, BEFORE committing
 cargo make check-pointer-freshness   # what CI runs
-# then, from main after the PR merges:
+# then, from main after the PR merges AND the UI publish is live
+# (~2 minutes after it; see river-publish.md Step 7):
 cargo make publish-pointer-records
 ```
 

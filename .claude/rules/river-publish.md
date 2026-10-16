@@ -51,16 +51,17 @@ cargo make sync-wasm
 
 The WASM you just rebuilt has a new code hash, so River's **pointer records**
 now name a key that no longer exists. Those records are what third parties
-resolve instead of pinning a key — see `pointer-records.toml` and FREENET.md.
+resolve instead of pinning a key — see `pointer-records.toml` and FREENET.md —
+and what our users' already-open tabs watch to know they must reload (step 7).
 
 ```bash
 cargo make sign-pointer-records   # re-signs against the WASM you just built
 ```
 
 Step 2's migration entry carries **our own users'** data forward. This carries
-**everyone else** forward. Same trigger, different set of people who lose if it
-is skipped — and their failure is quieter, because a stale pointer answers
-confidently with a dead key rather than erroring.
+their **open tabs** and **everyone else** forward. Skip it and both fail
+quietly: a stale pointer answers integrators confidently with a dead key, and
+open tabs never learn they are on the old one.
 
 CI's `check-pointer-freshness` fails the PR if you skip this, so it is not
 possible to publish a stale pointer through the normal flow. That is the
@@ -122,9 +123,11 @@ when a record newer than its own lands (freenet/river#580,
 those tabs stay on the old room contract and old delegate with no signal: the
 room looks quiet, and their delegate writes are stranded.
 
-Order matters, and it is enforced: the pre-flight below refuses unless the UI
-carrying the new WASM is already live. Do the UI publish (step 5) first, then
-**wait ~2 minutes** before this step. Measured over publishes 30000397-403
+Order matters. The pre-flight below refuses unless the UI carrying the new WASM
+is live **as seen from the node you publish through**; it cannot see other
+nodes, so the wait is advice, not enforcement. Nothing enforces that this step
+runs at all (CI checks signing, not publishing), so do not skip it. Do the UI
+publish (step 5) first, then **wait ~2 minutes** before this step. Measured over publishes 30000397-403
 (2026-10-12..16): the ~1.2 MB web container reached a median peer in ~20 s,
 71% within 60 s and 80% within 5 min, with a tail of reconnecting peers out to
 ~2 h, while a 100-byte pointer arrives in under 0.5 s. Two minutes clears the

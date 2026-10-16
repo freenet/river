@@ -562,6 +562,14 @@ impl FreenetSynchronizer {
                         }
                     }
                     SynchronizerMessage::Connect => {
+                        // A generation reload is under way (freenet/river#580):
+                        // the shell is closing this document's sockets and
+                        // replacing it. A socket opened now would outlive the
+                        // page in the shell, under an id the next page reuses.
+                        if super::generation_watch::is_reloading() {
+                            info!("Reload under way; not reconnecting");
+                            continue;
+                        }
                         // A reconnect (or the first connect) is now being
                         // attempted; clear the pending latch so the next loss can
                         // arm a fresh reconnect. A redundant Connect — from
