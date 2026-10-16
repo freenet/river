@@ -26,10 +26,9 @@ use freenet_stdlib::{
         Parameters, UpdateData, WrappedContract, WrappedState,
     },
 };
-use river_core::room_state::direct_messages::{DirectMessagesSummary, DmRetentionHorizon};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
-use river_core::room_state::message::{AuthorizedMessageV1, MessagesSummary, RetentionHorizon};
+use river_core::room_state::message::AuthorizedMessageV1;
 use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{
     ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary,
@@ -44,9 +43,14 @@ use std::sync::Arc;
 /// `merge` passes ONE `parent_state` to all three legs, and the three legs want
 /// different things.
 ///
-/// * `summarize` must see the SUMMARIZING peer's own state.
+/// * `summarize` must see the SUMMARIZING peer's own state, with the
+///   configuration the merge will end with
+///   (`ChatRoomStateV1::summarize_with_merged_configuration`).
 ///   `MessagesV1::summarize` reads `max_recent_messages` from it to size its
-///   retention horizon; hand it anything else and the horizon is wrong.
+///   retention horizon (and the DM summary its global cap); hand it anything
+///   else and the horizon is wrong. With the PRE-merge configuration, an
+///   incoming configuration that raises a cap withheld messages the merged
+///   room keeps (freenet/river#703).
 /// * `delta` deliberately reads nothing from it (the default `merge` would hand
 ///   the SENDER's `delta` the RECEIVER's state, so anything read there would be
 ///   the wrong peer's), but passing `incoming` keeps the argument honest.
@@ -54,6 +58,11 @@ use std::sync::Arc;
 ///   `#[composable]` macro clones `self` per field — so the cheap default
 ///   sentinel stays, saving a full-state clone per network event
 ///   (freenet/river#246).
+///
+/// Unlike `ChatRoomStateV1::merge`, this keeps the retention horizons: it runs
+/// on every network event, and a horizon that occasionally costs an extra
+/// round is cheaper here than re-verifying older messages on each one. The
+/// local copy is not what the merge laws judge; the contract's merge is.
 ///
 /// Returning the delta lets tests assert on what was actually pulled over,
 /// which is the only way to catch a regression that produces the right final
@@ -63,7 +72,7 @@ fn merge_incoming_state(
     params: &ChatRoomParametersV1,
     incoming: &ChatRoomStateV1,
 ) -> Result<Option<ChatRoomStateV1Delta>, String> {
-    let summary = local.summarize(local, params);
+    let summary = local.summarize_with_merged_configuration(params, incoming);
     let delta = incoming.delta(incoming, params, &summary);
     let parent_sentinel = ChatRoomStateV1::default();
     local.apply_delta(&parent_sentinel, params, &delta)?;
@@ -138,89 +147,17 @@ fn outbound_summary(
     baseline: &ChatRoomStateV1,
     params: &ChatRoomParametersV1,
 ) -> ChatRoomStateV1Summary {
-    // EXHAUSTIVE DESTRUCTURE, deliberately — do not replace this with
-    // `let mut summary = ...; summary.x = ...`.
-    //
-    // This function is a hand-maintained mirror of "which summary fields are
-    // horizon-shaped", and nothing else in the codebase links it to the horizon
-    // definitions. Binding every field by name makes adding a field to
-    // `ChatRoomStateV1Summary` a COMPILE ERROR *at exactly the site that has to
-    // make the keep-or-clear decision*, instead of a silent default-to-keep.
-    //
-    // That is not hypothetical. `MembersV1` (`remove_excess_members`) and
-    // `BansV1` (`max_user_bans`) have the same non-monotonic defect and are
-    // deferred to a follow-up — see "Not fixed here".
-    //
-    // Scope of the guard, stated precisely because overstating it is what let
-    // freenet/river#519 through: the top-level destructure catches a new field
-    // on `ChatRoomStateV1Summary` ITSELF, and the two leaf destructures below
-    // catch one added to `MessagesSummary` or `DirectMessagesSummary`. The other
-    // eight leaf summaries — `members`, `bans`, `ban_evidence`, `member_info`,
-    // `secrets`, `configuration`, `upgrade`, `version` — are bound whole and are NOT
-    // guarded. So when the `MembersV1` follow-up adds `MembersSummary.horizon`,
-    // nothing here will fail to compile; whoever writes it must remember to
-    // neutralise it and destructure that leaf too.
-    let ChatRoomStateV1Summary {
-        configuration,
-        bans,
-        members,
-        ban_evidence,
-        member_info,
-        secrets,
-        recent_messages,
-        direct_messages,
-        upgrade,
-        version,
-    } = baseline.summarize(baseline, params);
-
-    // The LEAF summaries are destructured too, for the same reason and against
-    // a failure that already happened: freenet/river#519 added a THIRD
-    // horizon-shaped field, `DirectMessagesSummary::global_horizon`. Because it
-    // was nested one level below `ChatRoomStateV1Summary`, the top-level
-    // destructure above bound it inside `direct_messages` and this file
-    // compiled clean — silently reintroducing the exact bug the guard exists to
-    // prevent, on the new field. Binding leaf fields by name makes the next
-    // nested horizon a compile error here as well.
-    //
-    // "Horizon-shaped" means the field makes the SENDER withhold something it
-    // holds and the receiver lacks; every other field is a pure have-statement
-    // (an id set, a version, a digest map), which is safe — indeed required —
-    // to feed from the sender's own baseline, because that is what makes the
-    // delta "what changed since I last synced".
-    let MessagesSummary {
-        message_ids,
-        horizon: _drop_message_horizon,
-    } = recent_messages;
-    let recent_messages = MessagesSummary {
-        message_ids,
-        horizon: RetentionHorizon::Open,
-    };
-
-    let DirectMessagesSummary {
-        message_signatures,
-        purge_versions,
-        pair_horizons: _drop_pair_horizons,
-        global_horizon: _drop_global_horizon,
-    } = direct_messages;
-    let direct_messages = DirectMessagesSummary {
-        message_signatures,
-        purge_versions,
-        pair_horizons: Vec::new(),
-        global_horizon: DmRetentionHorizon::Open,
-    };
-
-    ChatRoomStateV1Summary {
-        configuration,
-        bans,
-        members,
-        ban_evidence,
-        member_info,
-        secrets,
-        recent_messages,
-        direct_messages,
-        upgrade,
-        version,
-    }
+    // The keep-or-clear decision for each summary field, and the exhaustive
+    // destructure that makes a new horizon-shaped field a compile error,
+    // live in `ChatRoomStateV1Summary::without_retention_horizons` (shared
+    // with the contract's whole-state merge, freenet/river#703). Note what it
+    // does NOT guard: only `MessagesSummary` and `DirectMessagesSummary` are
+    // destructured leaf by leaf, so when the `MembersV1` follow-up adds
+    // `MembersSummary.horizon` (see "Not fixed here"), nothing will fail to
+    // compile; whoever writes it must neutralise it there (freenet/river#519).
+    baseline
+        .summarize(baseline, params)
+        .without_retention_horizons()
 }
 
 /// Send a member-info self-heal as a standalone, member_info-only UPDATE.
@@ -1850,6 +1787,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use freenet_scaffold::util::FastHash;
+    use river_core::room_state::direct_messages::DmRetentionHorizon;
     use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
     use std::time::SystemTime;
 

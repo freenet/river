@@ -139,6 +139,9 @@ impl ContractInterface for Contract {
                 UpdateData::State(new_state) => {
                     let new_state = from_reader::<ChatRoomStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
+                    // `ChatRoomStateV1::merge` (inherent), not the trait
+                    // default: it opens the retention horizons so the merge
+                    // is commutative (freenet/river#703).
                     chat_state
                         .merge(&chat_state.clone(), &parameters, &new_state)
                         .map_err(|e| ContractError::InvalidUpdateWithInfo {

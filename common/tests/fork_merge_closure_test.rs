@@ -639,6 +639,16 @@ fn merge(
     s.verify(&s, p)
         .map_err(|e| format!("merged state fails verify: {e}"))?;
     check_idempotent(&s, p, "merge");
+    // `ChatRoomStateV1::merge` skips the open-horizon pass when it cannot
+    // change the result; check that claim against the open pass itself.
+    let open = a.summarize(a, p).without_retention_horizons();
+    let mut o = a.clone();
+    if o.apply_delta(a, p, &b.delta(b, p, &open)).is_ok() && ser(&o) != ser(&s) {
+        NOT_IDEMPOTENT.with(|v| {
+            v.borrow_mut()
+                .push("merge differs from the open-horizon merge".to_string())
+        });
+    }
     Ok(s)
 }
 

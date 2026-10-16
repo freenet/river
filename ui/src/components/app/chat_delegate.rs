@@ -3,7 +3,6 @@ use crate::room_data::{RoomData, RoomSlot, RoomsMeta};
 use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{

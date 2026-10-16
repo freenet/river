@@ -21,7 +21,6 @@ use crate::util::{
 };
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
-use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
@@ -1830,6 +1829,7 @@ pub(crate) fn build_state_for_put(
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use freenet_scaffold::ComposableState;
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::member::{AuthorizedMember, Member};
     use river_core::room_state::privacy::SealedBytes;

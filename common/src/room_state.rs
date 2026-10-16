@@ -95,6 +95,108 @@ pub struct ChatRoomStateV1 {
 }
 
 impl ChatRoomStateV1 {
+    /// Whole-state merge: fold `other_state` into `self`.
+    ///
+    /// This deliberately SHADOWS [`ComposableState::merge`]. Rust resolves
+    /// `room.merge(..)` to an inherent method before a trait method, so every
+    /// method-call site (the contract's `update_state`, the UI, riverctl,
+    /// tests) runs this one; only an explicit `ComposableState::merge(..)`
+    /// reaches the trait default, which is wrong for rooms. Do NOT rename it.
+    /// Pinned by `room_merge_reads_the_merged_configuration` and
+    /// `room_merge_keeps_what_a_removal_frees_room_for`.
+    ///
+    /// # Why the trait default is wrong for a room (freenet/river#703)
+    ///
+    /// The default summarizes the receiver, asks the sender for a delta against
+    /// that summary, then applies it. Two summaries carry RETENTION HORIZONS
+    /// (recent messages, and the DM per-pair and global caps): "do not offer
+    /// me anything older than my oldest, I would prune it". That is right for
+    /// delta gossip, where it is what stops the resend loop, and wrong for a
+    /// one-shot merge of two whole states, for two reasons:
+    ///
+    /// * The horizon is computed from the receiver's PRE-merge cap. When the
+    ///   sender's configuration outranks it and raises the cap, the merged room
+    ///   keeps fewer messages than the merged cap allows.
+    /// * The horizon assumes everything the receiver holds survives. When the
+    ///   merge removes some of it (a ban from the sender, an inactivity prune),
+    ///   the room drops below its cap, and the withheld messages would have
+    ///   been kept.
+    ///
+    /// Either way `merge(A, B)` held fewer messages than `merge(B, A)`: an
+    /// enforceable `state_commutativity` violation, even though the next
+    /// exchange heals it.
+    ///
+    /// # What this does instead
+    ///
+    /// The result must be what applying EVERYTHING the receiver lacks gives
+    /// (horizons open): then it is the same function of the union of both
+    /// states whichever side merges. Doing that unconditionally costs, on every
+    /// merge with a peer holding an older window, a signature check per older
+    /// message that is then pruned, and can push a delta over the messages work
+    /// bound (`lowering_max_recent_messages_from_above_the_work_bound_converges`).
+    /// So the merge first runs with the horizons computed against the MERGED
+    /// configuration, and repeats with them open only when that result may
+    /// differ: when some capped set it withheld from ended BELOW its cap. A set
+    /// that ended AT its cap holds that many messages all newer than anything
+    /// withheld (withheld messages order at or below the receiver's oldest held
+    /// one, and everything delivered orders above it), so the withheld ones
+    /// would have been pruned on arrival and the open merge gives the same
+    /// state. See [`merge_may_have_withheld_a_survivor`].
+    ///
+    /// `_parent_state` is ignored: the receiver's own state is the only correct
+    /// parent, and every caller passes it. The signature matches the trait's so
+    /// existing call sites keep compiling and pick this up.
+    pub fn merge(
+        &mut self,
+        _parent_state: &ChatRoomStateV1,
+        parameters: &ChatRoomParametersV1,
+        other_state: &ChatRoomStateV1,
+    ) -> Result<(), String> {
+        let parent = self.clone();
+        let summary = self.summarize_with_merged_configuration(parameters, other_state);
+        // Field `delta`s never read their parent; pass the sender's own state,
+        // as `get_state_delta` does on the network path.
+        let delta = other_state.delta(other_state, parameters, &summary);
+        let mut merged = self.clone();
+        merged.apply_delta(&parent, parameters, &delta)?;
+        if merge_may_have_withheld_a_survivor(&summary, &merged) {
+            let open = summary.without_retention_horizons();
+            let delta = other_state.delta(other_state, parameters, &open);
+            merged = self.clone();
+            merged.apply_delta(&parent, parameters, &delta)?;
+        }
+        *self = merged;
+        Ok(())
+    }
+
+    /// This state's summary, computed against itself with `other_state`'s
+    /// configuration merged in: what a receiver that is about to merge
+    /// `other_state` and still wants the delta trimmed to its retention
+    /// horizons should publish (the UI's incoming-state path). Without the
+    /// merged configuration, a cap the merge raises is read at its old value
+    /// and the horizon withholds messages the merged room keeps.
+    pub fn summarize_with_merged_configuration(
+        &self,
+        parameters: &ChatRoomParametersV1,
+        other_state: &ChatRoomStateV1,
+    ) -> ChatRoomStateV1Summary {
+        let config_summary = self.configuration.summarize(self, parameters);
+        let config_delta =
+            other_state
+                .configuration
+                .delta(other_state, parameters, &config_summary);
+        if config_delta.is_none() {
+            return self.summarize(self, parameters);
+        }
+        let mut parent = self.clone();
+        // A delta the configuration does not take leaves `parent` as it was,
+        // which is exactly the configuration the merge ends with.
+        let _ = parent
+            .configuration
+            .apply_delta(self, parameters, &config_delta);
+        self.summarize(&parent, parameters)
+    }
+
     /// Post-apply cleanup: prune members who have no recent messages, clean up
     /// member_info for pruned members, remove orphaned bans, and sweep
     /// direct messages whose participants are no longer in the room.
@@ -602,6 +704,95 @@ impl ChatRoomStateV1 {
     }
 }
 
+/// Whether a merge that sent `summary` (horizons intact) and ended in `merged`
+/// may have withheld a message the merged room would keep: some capped set
+/// whose horizon withheld anything ended BELOW its cap. See
+/// [`ChatRoomStateV1::merge`] for why a set that ended AT its cap is safe.
+fn merge_may_have_withheld_a_survivor(
+    summary: &ChatRoomStateV1Summary,
+    merged: &ChatRoomStateV1,
+) -> bool {
+    use crate::room_state::direct_messages::{DmRetentionHorizon, MAX_DM_MESSAGES_PER_PAIR};
+    use crate::room_state::message::RetentionHorizon;
+    let config = &merged.configuration.configuration;
+    let messages = !matches!(summary.recent_messages.horizon, RetentionHorizon::Open)
+        && merged.recent_messages.messages.len() < config.max_recent_messages;
+    let dms = &merged.direct_messages.messages;
+    let dm_global = !matches!(
+        summary.direct_messages.global_horizon,
+        DmRetentionHorizon::Open
+    ) && dms.len() < config.effective_max_direct_messages();
+    let dm_pair = summary.direct_messages.pair_horizons.iter().any(|h| {
+        dms.iter()
+            .filter(|m| m.message.sender == h.sender && m.message.recipient == h.recipient)
+            .count()
+            < MAX_DM_MESSAGES_PER_PAIR
+    });
+    messages || dm_global || dm_pair
+}
+
+impl ChatRoomStateV1Summary {
+    /// This summary with every retention horizon opened, so a `delta` against
+    /// it is the plain id-set difference: everything the summarizing state
+    /// lacks, whether or not its caps would keep it.
+    ///
+    /// Used where the horizons must not filter: a one-shot whole-state merge
+    /// ([`ChatRoomStateV1::merge`]) and an outgoing update computed against the
+    /// sender's OWN baseline (the UI's `outbound_summary`).
+    ///
+    /// EXHAUSTIVE DESTRUCTURE, deliberately: adding a field to this summary,
+    /// to `MessagesSummary` or to `DirectMessagesSummary` is a compile error
+    /// here, at the one place that has to decide whether it is horizon-shaped
+    /// (makes a sender withhold something it holds and the receiver lacks).
+    /// The other leaf summaries are bound whole and are not guarded.
+    pub fn without_retention_horizons(self) -> Self {
+        use crate::room_state::direct_messages::{DirectMessagesSummary, DmRetentionHorizon};
+        use crate::room_state::message::{MessagesSummary, RetentionHorizon};
+        let ChatRoomStateV1Summary {
+            configuration,
+            bans,
+            members,
+            ban_evidence,
+            member_info,
+            secrets,
+            recent_messages,
+            direct_messages,
+            upgrade,
+            version,
+        } = self;
+        let MessagesSummary {
+            message_ids,
+            horizon: _open,
+        } = recent_messages;
+        let DirectMessagesSummary {
+            message_signatures,
+            purge_versions,
+            pair_horizons: _cleared,
+            global_horizon: _opened,
+        } = direct_messages;
+        ChatRoomStateV1Summary {
+            configuration,
+            bans,
+            members,
+            ban_evidence,
+            member_info,
+            secrets,
+            recent_messages: MessagesSummary {
+                message_ids,
+                horizon: RetentionHorizon::Open,
+            },
+            direct_messages: DirectMessagesSummary {
+                message_signatures,
+                purge_versions,
+                pair_horizons: Vec::new(),
+                global_horizon: DmRetentionHorizon::Open,
+            },
+            upgrade,
+            version,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomParametersV1 {
     pub owner: VerifyingKey,
@@ -706,6 +897,205 @@ mod tests {
             },
             owner_signing_key,
         )
+    }
+
+    /// freenet/river#703 defect 3, and the pin for the inherent
+    /// `ChatRoomStateV1::merge` shadowing `ComposableState::merge`.
+    ///
+    /// A holds 2 messages at cap 2; B's newer configuration raises the cap to
+    /// 4 and B holds 4 older messages. The merge ends with cap 4, so A must
+    /// keep the 4 newest of the 6. The trait default summarized A against its
+    /// own cap 2, withheld B's messages older than A's oldest, and kept only
+    /// A's 2 plus whatever was newer: `merge(A, B) != merge(B, A)`.
+    ///
+    /// The method-call form is asserted to differ from the trait default, so
+    /// renaming or deleting the inherent `merge` (which would make
+    /// `a.merge(..)` silently resolve to the trait) fails here.
+    #[test]
+    fn room_merge_reads_the_merged_configuration() {
+        let (base, params, owner_sk) = create_empty_chat_room_state();
+        let owner_id = params.owner_id();
+        let msg = |t: u64| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: owner_id,
+                    time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + t),
+                    content: RoomMessageBody::public(format!("m{t}")),
+                },
+                &owner_sk,
+            )
+        };
+        let with_cap = |cap: usize, version: u32| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    configuration_version: version,
+                    max_recent_messages: cap,
+                    ..base.configuration.configuration.clone()
+                },
+                &owner_sk,
+            )
+        };
+        let mut a = base.clone();
+        a.configuration = with_cap(2, 2);
+        a.recent_messages.messages = vec![msg(10), msg(11)];
+        let mut b = base.clone();
+        b.configuration = with_cap(4, 3);
+        b.recent_messages.messages = vec![msg(1), msg(2), msg(3), msg(4)];
+
+        let held = |s: &ChatRoomStateV1| -> Vec<String> {
+            s.recent_messages
+                .messages
+                .iter()
+                .map(|m| format!("{:?}", m.message.time))
+                .collect()
+        };
+
+        let mut ab = a.clone();
+        ab.merge(&a, &params, &b).unwrap();
+        let mut ba = b.clone();
+        ba.merge(&b, &params, &a).unwrap();
+        assert_eq!(ab, ba, "merge(A, B) must equal merge(B, A)");
+        assert_eq!(ab.recent_messages.messages.len(), 4);
+        assert_eq!(
+            ab.recent_messages.messages,
+            vec![msg(3), msg(4), msg(10), msg(11)]
+        );
+
+        let mut trait_ab = a.clone();
+        ComposableState::merge(&mut trait_ab, &a, &params, &b).unwrap();
+        assert_ne!(
+            held(&trait_ab),
+            held(&ab),
+            "the trait default no longer differs here, so this test no longer \
+             proves `a.merge(..)` resolves to the inherent room merge"
+        );
+    }
+
+    /// The UI's incoming-state merge keeps the horizons but must read them
+    /// against the configuration the merge ends with: a cap the incoming
+    /// configuration raises opens a horizon the receiver's own cap would close.
+    #[test]
+    fn summary_with_merged_configuration_reads_the_raised_cap() {
+        use crate::room_state::message::RetentionHorizon;
+        let (base, params, owner_sk) = create_empty_chat_room_state();
+        let owner_id = params.owner_id();
+        let with_cap = |cap: usize, version: u32| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    configuration_version: version,
+                    max_recent_messages: cap,
+                    ..base.configuration.configuration.clone()
+                },
+                &owner_sk,
+            )
+        };
+        let mut a = base.clone();
+        a.configuration = with_cap(2, 2);
+        a.recent_messages.messages = (10..12u64)
+            .map(|t| {
+                AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: owner_id,
+                        author: owner_id,
+                        time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t),
+                        content: RoomMessageBody::public(format!("m{t}")),
+                    },
+                    &owner_sk,
+                )
+            })
+            .collect();
+        let mut raised = base.clone();
+        raised.configuration = with_cap(4, 3);
+        let mut lower_rank = base.clone();
+        lower_rank.configuration = with_cap(4, 1);
+
+        assert!(matches!(
+            a.summarize(&a, &params).recent_messages.horizon,
+            RetentionHorizon::OldestRetained(_)
+        ));
+        assert_eq!(
+            a.summarize_with_merged_configuration(&params, &raised)
+                .recent_messages
+                .horizon,
+            RetentionHorizon::Open
+        );
+        assert!(matches!(
+            a.summarize_with_merged_configuration(&params, &lower_rank)
+                .recent_messages
+                .horizon,
+            RetentionHorizon::OldestRetained(_)
+        ));
+    }
+
+    /// freenet/river#703: the retention horizon assumes everything the
+    /// receiver holds survives the merge. Here A is at its cap with two
+    /// messages by member P, and B carries the owner's ban on P plus an older
+    /// owner message. The ban removes P's messages, so the merged room has
+    /// room for the owner message, and both merge directions must keep it.
+    #[test]
+    fn room_merge_keeps_what_a_removal_frees_room_for() {
+        let (mut base, params, owner_sk) = create_empty_chat_room_state();
+        let owner_id = params.owner_id();
+        let mut cfg = base.configuration.configuration.clone();
+        cfg.owner_member_id = owner_id;
+        cfg.max_recent_messages = 2;
+        base.configuration = AuthorizedConfigurationV1::new(cfg, &owner_sk);
+        let p_sk = SigningKey::generate(&mut rand::thread_rng());
+        let p = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: p_sk.verifying_key(),
+            },
+            &owner_sk,
+        );
+        let at = |t: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + t);
+        let msg = |author: MemberId, sk: &SigningKey, t: u64| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author,
+                    time: at(t),
+                    content: RoomMessageBody::public(format!("m{t}")),
+                },
+                sk,
+            )
+        };
+        let mut a = base.clone();
+        a.members.members = vec![p.clone()];
+        a.recent_messages.messages =
+            vec![msg(p.member.id(), &p_sk, 10), msg(p.member.id(), &p_sk, 11)];
+        let mut b = base.clone();
+        b.recent_messages.messages = vec![msg(owner_id, &owner_sk, 1)];
+        b.bans = BansV1(vec![AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: at(2),
+                banned_user: p.member.id(),
+            },
+            owner_id,
+            &owner_sk,
+        )]);
+        a.verify(&a, &params).unwrap();
+        b.verify(&b, &params).unwrap();
+
+        let mut ab = a.clone();
+        ab.merge(&a, &params, &b).unwrap();
+        let mut ba = b.clone();
+        ba.merge(&b, &params, &a).unwrap();
+        assert_eq!(ab, ba, "merge(A, B) must equal merge(B, A)");
+        assert_eq!(
+            ab.recent_messages.messages,
+            vec![msg(owner_id, &owner_sk, 1)]
+        );
+
+        let mut trait_ab = a.clone();
+        ComposableState::merge(&mut trait_ab, &a, &params, &b).unwrap();
+        assert!(
+            trait_ab.recent_messages.messages.is_empty(),
+            "premise: the trait default withholds the owner message"
+        );
     }
 
     /// Regression test: when a member who issued bans is subsequently banned themselves,

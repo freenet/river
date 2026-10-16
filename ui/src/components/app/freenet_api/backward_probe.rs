@@ -127,7 +127,6 @@ use freenet_migrate::{
     FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeStateOps, RollbackRiskAck, SelectionPolicy,
     Step, DEFAULT_MAX_PROBE_HOPS,
 };
-use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::room_state::member::MemberId;
