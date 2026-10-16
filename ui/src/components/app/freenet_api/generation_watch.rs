@@ -2890,7 +2890,16 @@ mod tests {
         let lost = hook_block(&sync, "Some(armed) =>").expect("armed ConnectionLost arm");
         assert!(lost.contains("WEB_API.write().take()"), "the teardown arm");
         assert!(lost.contains("generation_watch::on_disconnected()"));
-        let duplicate = hook_block(&sync, "None =>").expect("duplicate-loss arm");
+        // (Scoped to the ConnectionLost arm: the file has other `None =>`
+        // arms, and the first one is in an unrelated function.)
+        let lost_arm = &sync[sync
+            .find("SynchronizerMessage::ConnectionLost =>")
+            .expect("ConnectionLost arm")..];
+        let duplicate = hook_block(lost_arm, "None =>").expect("duplicate-loss arm");
+        assert!(
+            duplicate.contains("a reconnect is already pending"),
+            "found the wrong `None` arm"
+        );
         assert!(!duplicate.contains("on_disconnected"));
         // Teardown arm, before a Connect proceeds, and a failed Connect.
         assert_eq!(
@@ -2932,10 +2941,10 @@ mod tests {
         // A Connect that goes ahead (no prior loss: the status can read Error
         // on a live socket) replaces the socket and catches up again; the page
         // is not ready meanwhile.
-        let connecting = connect_arm
-            .find("generation_watch::on_disconnected();\n                        info!(\"Connecting to Freenet\")");
+        let compact_connect: String = connect_arm.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            connecting.is_some(),
+            compact_connect
+                .contains("generation_watch::on_disconnected();info!(\"ConnectingtoFreenet\")"),
             "a Connect that proceeds must mark the page not ready first"
         );
         // reload_now captures the pre-click phase before replacing it.
