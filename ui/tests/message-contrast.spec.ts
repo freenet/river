@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { coarsePointer, colourOf, contrast, over, resolveColor, selectRoom, waitForApp } from "./example-room";
+import { coarsePointer, colourOf, contrast, over, resolveColor, rowSurfaces, selectRoom, waitForApp } from "./example-room";
 
 // Text in a message row sits on the conversation background, the row's hover
 // band, or a mention chip's fill over either. Links, mentions and the own
@@ -28,8 +28,7 @@ for (const scheme of ["light", "dark"] as const) {
         }, cls),
       );
 
-    const bg = await c("var(--color-bg)");
-    const band = over(await c("var(--color-row-hover)"), bg);
+    const { bg, band } = await rowSurfaces(page);
     const surfaces: Record<string, number[]> = { bg, band };
     for (const cls of ["river-mention", "river-mention river-mention-self"]) {
       const fill = await fillOf(cls);

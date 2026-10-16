@@ -164,6 +164,12 @@ export function over(fg: number[], bg: number[]): number[] {
   return [0, 1, 2].map((i) => fg[i] * a + bg[i] * (1 - a)).concat(1);
 }
 
+/// The conversation background and the row hover band composited over it.
+export async function rowSurfaces(page: Page): Promise<{ bg: number[]; band: number[] }> {
+  const bg = await resolveColor(page, "var(--color-bg)");
+  return { bg, band: over(await resolveColor(page, "var(--color-row-hover)"), bg) };
+}
+
 /// The element's computed text colour, as `resolveColor` returns it.
 export async function colourOf(locator: Locator): Promise<number[]> {
   return resolveColor(locator.page(), await locator.evaluate((el) => getComputedStyle(el).color));
@@ -174,12 +180,17 @@ export function coarsePointer(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none), (any-pointer: coarse)").matches);
 }
 
-/// React to `row` with the picker's first emoji: hover the row unless a
-/// finger is the pointer, open the picker, pick. Expects the row to end with
-/// exactly one reaction chip, so pass a row that has none.
-export async function reactTo(page: Page, row: Locator): Promise<Locator> {
+/// Open `row`'s inline reaction picker from its "+": hover the row unless a
+/// finger is the pointer, then click "+".
+export async function openInlinePicker(page: Page, row: Locator) {
   if (!(await coarsePointer(page))) await row.hover();
   await row.getByTestId("add-reaction-button").click();
+}
+
+/// React to `row` with the picker's first emoji. Expects the row to end with
+/// exactly one reaction chip, so pass a row that has none.
+export async function reactTo(page: Page, row: Locator): Promise<Locator> {
+  await openInlinePicker(page, row);
   await page.getByTestId("emoji-picker").getByRole("button").first().click();
   const chip = row.getByTestId("reaction-chip");
   await expect(chip).toHaveCount(1);

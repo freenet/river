@@ -1,6 +1,6 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { coarsePointer, contrast, openRoomWithComposer, over, reactTo, resolveColor, waitForApp } from "./example-room";
-import { readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
+import { coarsePointer, contrast, openInlinePicker, openRoomWithComposer, reactTo, resolveColor, rowSurfaces, waitForApp } from "./example-room";
+import { deliverOffscreen, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
 // Full-width chat rows (plan 11): every author's group gets one River-logo
@@ -47,6 +47,7 @@ async function openRoomWithPairs(page: Page): Promise<{ received: Locator; own: 
 }
 
 type Box = { left: number; right: number; top: number; bottom: number };
+const width = (b: Box) => b.right - b.left;
 type RowGeometry = {
   self: string | null;
   row: Box;
@@ -167,8 +168,7 @@ test.describe("Message rows", () => {
     // alternate between Test Sender A and B.
     await callRiverTest(page, "insertMessageBeforeLast", "hashed colour insert");
     for (const text of ["hashed colour arrival one", "hashed colour arrival two"]) {
-      await callRiverTest(page, "appendMessage", text);
-      await expect(page.getByTestId("conversation-history")).toContainText(text);
+      await deliverOffscreen(page, text);
     }
     const groups = {
       insert: groupWith(page, "hashed colour insert"),
@@ -206,8 +206,7 @@ test.describe("Message rows", () => {
     for (const scheme of ["light", "dark"] as const) {
       await page.emulateMedia({ colorScheme: scheme });
       const [hue, tone] = WORST_AVATAR[scheme];
-      const bg = await resolveColor(page, "var(--color-bg)");
-      const band = over(await resolveColor(page, "var(--color-row-hover)"), bg);
+      const { band } = await rowSurfaces(page);
       const worst = await paint(hue, tone);
       expect(contrast(worst, band), `${scheme}: hue ${hue} tone ${tone} on the band (${worst} on ${band})`).toBeGreaterThanOrEqual(3);
       expect(await paint(hue, (tone + 1) % 3), `${scheme}: tone changes the colour`).not.toEqual(worst);
@@ -314,14 +313,13 @@ test.describe("Message rows at 320px", () => {
 type PickerReport = {
   scroller: Box;
   anchor: Box;
-  picker: Box & { width: number };
+  picker: Box;
   buttons: Array<{ emoji: string; inside: boolean; hit: boolean }>;
 };
 
 /// Open `row`'s inline picker from its "+" and measure it.
 async function openPickerFromPlus(page: Page, row: Locator): Promise<PickerReport> {
-  if (!(await coarsePointer(page))) await row.hover();
-  await row.getByTestId("add-reaction-button").click();
+  await openInlinePicker(page, row);
   return measurePicker(page);
 }
 
@@ -353,7 +351,7 @@ async function measurePicker(page: Page): Promise<PickerReport> {
     return {
       scroller,
       anchor: box(plus.parentElement!),
-      picker: { ...box(picker), width: picker.getBoundingClientRect().width },
+      picker: box(picker),
       buttons,
     };
   });
@@ -375,8 +373,7 @@ function expectEveryEmojiTappable(report: PickerReport) {
 async function nearEdgeRow(page: Page): Promise<Locator> {
   const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"];
   await openRoom(page);
-  await callRiverTest(page, "appendMessage", "picker edge");
-  await expect(page.getByTestId("conversation-history")).toContainText("picker edge");
+  await deliverOffscreen(page, "picker edge");
   const row = page.getByTestId("message-row").filter({ hasText: "picker edge" });
   const chips = row.getByTestId("reaction-chip");
   await callRiverTest(page, "addReactionsToNewest", emojis.slice(0, 1));
@@ -398,8 +395,8 @@ async function nearEdgeRow(page: Page): Promise<Locator> {
 /// What `left-0` would do: a rightward picker from this "+" ends past the scroller.
 function expectRightwardWouldClip(report: PickerReport) {
   expect(
-    report.anchor.left + report.picker.width,
-    `a full line of chips no longer pushes + past the point where a rightward picker clips (+ at ${report.anchor.left}, picker ${report.picker.width} wide, scroller ends at ${report.scroller.right})`,
+    report.anchor.left + width(report.picker),
+    `a full line of chips no longer pushes + past the point where a rightward picker clips (+ at ${report.anchor.left}, picker ${width(report.picker)} wide, scroller ends at ${report.scroller.right})`,
   ).toBeGreaterThan(report.scroller.right);
 }
 
@@ -415,16 +412,15 @@ test.describe("Reaction picker at 320px", () => {
 
   test("at the start of the line, the picker opens rightward", async ({ page }) => {
     await openRoom(page);
-    await callRiverTest(page, "appendMessage", "picker start");
-    await expect(page.getByTestId("conversation-history")).toContainText("picker start");
+    await deliverOffscreen(page, "picker start");
     const row = page.getByTestId("message-row").filter({ hasText: "picker start" });
     await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
     const report = await openPickerFromPlus(page, row);
     // What an unconditional `right-0` would do: a leftward picker from this "+" starts before the scroller.
     expect(
-      report.anchor.right - report.picker.width,
-      `+ no longer starts the line (+ ends at ${report.anchor.right}, picker ${report.picker.width} wide)`,
+      report.anchor.right - width(report.picker),
+      `+ no longer starts the line (+ ends at ${report.anchor.right}, picker ${width(report.picker)} wide)`,
     ).toBeLessThan(report.scroller.left);
     expectEveryEmojiTappable(report);
   });
