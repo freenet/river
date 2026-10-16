@@ -442,7 +442,7 @@ that need the predecessor's rooms merged first run at its flush instead
 
 - the identity ranks its `identity_sources` record are lowered (below), before
   the save that persists them;
-- if the predecessor merged any rooms, every order the walk has seen so far is
+- if the predecessor merged (or attempted to merge) any rooms, every order the walk has seen so far is
   merged once more, folded into one merge, newest generation first. A room
   still tombstoned when its order was first merged, then resurrected by this
   or an older generation's slot, gets its place back (re-merging only the
