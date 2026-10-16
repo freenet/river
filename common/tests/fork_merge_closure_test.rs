@@ -68,6 +68,11 @@ struct Stats {
     other_merge_rejections: usize,
     runs: usize,
     runs_with_evidence: usize,
+    /// Runs whose two forks together hold more bans than either fork's
+    /// `max_user_bans`, owner bans and other bans among them: the merge
+    /// runs the two-pool cap eviction over bans the forks judge apart
+    /// (freenet/river#796).
+    runs_over_ban_cap_with_both_pools: usize,
 }
 
 thread_local! {
@@ -963,6 +968,17 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
             if !a.ban_evidence.is_empty() || !b.ban_evidence.is_empty() {
                 s.runs_with_evidence += 1;
             }
+            let mut union: Vec<_> = a.bans.0.clone();
+            union.extend(b.bans.0.iter().filter(|x| !a.bans.0.contains(x)).cloned());
+            let cap = a
+                .configuration
+                .configuration
+                .max_user_bans
+                .min(b.configuration.configuration.max_user_bans);
+            let owner_bans = union.iter().filter(|x| x.banned_by == w.owner_id).count();
+            if union.len() > cap && owner_bans > 0 && owner_bans < union.len() {
+                s.runs_over_ban_cap_with_both_pools += 1;
+            }
         });
         let broken = drain_not_idempotent();
         if !broken.is_empty() {
@@ -1020,6 +1036,10 @@ fn honest_forks_always_converge() {
         &["bans1", "config", "info", "members+info+msgs", "msgs"],
         true,
     );
+    assert!(
+        stats.runs_over_ban_cap_with_both_pools > 0,
+        "no run put both ban pools over the cap: {stats:?}"
+    );
     // The full report first: it names every failing pair and its cause,
     // which a bare rejection count does not.
     assert!(
@@ -1068,6 +1088,10 @@ fn adversarial_forks_never_permanently_reject_each_other() {
     assert!(
         stats.runs_with_evidence > 0,
         "no run held ban evidence: {stats:?}"
+    );
+    assert!(
+        stats.runs_over_ban_cap_with_both_pools > 0,
+        "no run put both ban pools over the cap: {stats:?}"
     );
     assert!(
         failures.is_empty(),
