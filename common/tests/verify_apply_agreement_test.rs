@@ -254,3 +254,64 @@ fn a_state_holding_more_messages_than_one_delta_may_carry_merges() {
     let merged = assert_merges_agree(&r, &holder, &other);
     assert_eq!(merged.recent_messages.messages.len(), 100);
 }
+
+/// Two secret version records at one version, as the UI's rotation (wall
+/// clock `created_at`) and the delegate's (`UNIX_EPOCH`) sign them: whole-state
+/// merges end on the same record in both directions. A record at a higher
+/// version that is not owner-signed fails the merge.
+#[test]
+fn equal_version_secret_records_merge_the_same_way_and_forgeries_fail() {
+    let r = room();
+    let base = private_room(&r);
+    let record = |created_at: SystemTime, sk: &SigningKey, version: u32| {
+        AuthorizedSecretVersionRecord::new(
+            SecretVersionRecordV1 {
+                version,
+                cipher_spec: RoomCipherSpec::Aes256Gcm,
+                created_at,
+            },
+            sk,
+        )
+    };
+    let with_v2 = |rec: AuthorizedSecretVersionRecord| {
+        let mut s = base.clone();
+        s.secrets.versions.push(rec);
+        s.secrets.current_version = 2;
+        s
+    };
+    let ui = with_v2(record(at(500), &r.owner_sk, 2));
+    let delegate = with_v2(record(SystemTime::UNIX_EPOCH, &r.owner_sk, 2));
+    let merged = assert_merges_agree(&r, &ui, &delegate);
+    assert_eq!(merged.secrets.versions.len(), 2);
+
+    let forged = with_v2(record(at(500), &SigningKey::from_bytes(&[9; 32]), 2));
+    let mut m = base.clone();
+    assert!(m.merge(&base, &r.params, &forged).is_err());
+}
+
+/// Two upgrade pointers at one version, signed by the owner for different
+/// successors: whole-state merges keep the same one in both directions. A
+/// pointer that is not owner-signed fails the merge.
+#[test]
+fn equal_version_upgrade_pointers_merge_the_same_way_and_forgeries_fail() {
+    use river_core::room_state::upgrade::{AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1};
+    let r = room();
+    let base = state(&r, public_config(&r));
+    let pointer = |byte: u8, sk: &SigningKey| {
+        let mut s = base.clone();
+        s.upgrade = OptionalUpgradeV1(Some(AuthorizedUpgradeV1::new(
+            UpgradeV1 {
+                owner_member_id: r.owner_id,
+                version: 1,
+                new_chatroom_address: blake3::Hash::from([byte; 32]),
+            },
+            sk,
+        )));
+        s
+    };
+    let (a, b) = (pointer(1, &r.owner_sk), pointer(2, &r.owner_sk));
+    assert_merges_agree(&r, &a, &b);
+    let forged = pointer(3, &SigningKey::from_bytes(&[9; 32]));
+    let mut m = base.clone();
+    assert!(m.merge(&base, &r.params, &forged).is_err());
+}

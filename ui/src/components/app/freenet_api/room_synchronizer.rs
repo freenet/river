@@ -2523,6 +2523,61 @@ mod tests {
         );
     }
 
+    /// freenet/river#703: the incoming state's configuration outranks the
+    /// room's and raises `max_recent_messages` from 5 to 10. The room is at
+    /// its old cap with newer messages; the incoming state holds older ones.
+    /// The merged room has room for them, so `merge_incoming_state` must pull
+    /// them over: its horizon is read against the MERGED configuration
+    /// (`summarize_with_merged_configuration`). Read against the room's own
+    /// cap, the horizon withholds them and the delta carries no messages.
+    #[test]
+    fn merge_incoming_state_reads_a_raised_cap_from_the_incoming_configuration() {
+        use river_core::room_state::configuration::AuthorizedConfigurationV1;
+
+        let (mut room_state, params, owner_sk) = create_test_room();
+        let mut cfg = room_state.configuration.configuration.clone();
+        cfg.owner_member_id = params.owner_id();
+        cfg.max_recent_messages = 5;
+        room_state.configuration = AuthorizedConfigurationV1::new(cfg.clone(), &owner_sk);
+        let at = |state: &mut ChatRoomStateV1, secs: u64| {
+            let msg = MessageV1 {
+                room_owner: params.owner_id(),
+                author: params.owner_id(),
+                content: RoomMessageBody::public(format!("m{secs}")),
+                time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            };
+            state
+                .recent_messages
+                .messages
+                .push(AuthorizedMessageV1::new(msg, &owner_sk));
+        };
+        let mut incoming = room_state.clone();
+        cfg.configuration_version += 1;
+        cfg.max_recent_messages = 10;
+        incoming.configuration = AuthorizedConfigurationV1::new(cfg, &owner_sk);
+        for i in 0..3u64 {
+            at(&mut incoming, 1_000 + i);
+        }
+        for i in 0..5u64 {
+            at(&mut room_state, 2_000 + i);
+        }
+
+        let applied =
+            merge_incoming_state(&mut room_state, &params, &incoming).expect("merge must succeed");
+        assert!(
+            applied
+                .as_ref()
+                .and_then(|d| d.recent_messages.as_ref())
+                .is_some_and(|m| m.len() == 3),
+            "the merge withheld older messages the raised cap keeps"
+        );
+        assert_eq!(room_state.recent_messages.messages.len(), 8);
+        assert_eq!(
+            room_state.configuration.configuration.max_recent_messages,
+            10
+        );
+    }
+
     /// Pin the OTHER leg: `apply_delta` may still be handed a cheap
     /// `ChatRoomStateV1::default()` sentinel.
     ///
