@@ -87,6 +87,12 @@ cargo make compress-webapp
 cargo make publish-river  # bumps published-contract/contract-version.txt
 ```
 
+`sign-webapp` (run by `publish-river`) first checks that the built UI carries
+River's pointer author key (`scripts/check-webapp-pointer-author.sh`), before
+the counter moves. If it refuses, the UI was built with `RIVER_POINTER_RECORDS`
+set (an end-to-end test build, whose tabs would never reload after a re-key):
+unset it, rebuild, and publish again.
+
 ### Step 6: Commit the version bump through a PR, and verify
 
 `main` is protected by a ruleset requiring four status checks (`build`,

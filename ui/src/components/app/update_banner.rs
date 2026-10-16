@@ -32,6 +32,12 @@ fn banner_text(notice: Notice) -> (String, bool, bool) {
             false,
             true,
         ),
+        // A reload against a node that is down would only show an error page.
+        Notice::WaitingForConnection => (
+            "River has been updated and will reload once it reconnects to your node.".to_string(),
+            false,
+            false,
+        ),
         // The Reload button would fail the same way the automatic one did.
         Notice::RefreshTab => (
             "River has been updated but could not reload itself. Refresh this tab to keep \

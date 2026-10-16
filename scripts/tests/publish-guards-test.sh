@@ -381,6 +381,24 @@ if [[ "$status" -eq 2 ]]; then
 else
     fail "an archive that cannot be read is reported as uncheckable (exit 2)" "exited $status"
 fi
+printf 'pointer_code_hash = "x"\n' >"$guard_dir/no-author.toml"
+"$author_check" "$guard_dir/real.tar.xz" "$guard_dir/no-author.toml" >/dev/null 2>&1
+status=$?
+if [[ "$status" -eq 2 ]]; then
+    ok "a records file without an author key is reported as uncheckable"
+else
+    fail "a records file without an author key is reported as uncheckable" "exited $status"
+fi
+mkdir -p "$guard_dir/contracts-only/contracts"
+printf 'river:v1:vk:REAL' >"$guard_dir/contracts-only/contracts/room_contract.wasm"
+tar -cJf "$guard_dir/contracts-only.tar.xz" -C "$guard_dir/contracts-only" contracts
+"$author_check" "$guard_dir/contracts-only.tar.xz" "$guard_dir/records.toml" >/dev/null 2>&1
+status=$?
+if [[ "$status" -eq 2 ]]; then
+    ok "an archive with no UI WASM is reported as uncheckable, not accepted"
+else
+    fail "an archive with no UI WASM is reported as uncheckable, not accepted" "exited $status"
+fi
 rm -rf "$guard_dir"
 
 # The call must sit in sign-webapp, uncommented, before the counter is bumped.
