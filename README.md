@@ -145,7 +145,7 @@ and run the UI locally:
 
    # Install build tools
    cargo install dioxus-cli
-   cargo install cargo-make
+   cargo install --locked cargo-make
    ```
 
 2. Build and run with example data:
