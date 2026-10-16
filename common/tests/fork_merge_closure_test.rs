@@ -304,10 +304,10 @@ fn random_op(
         // removes members / messages / bans on every peer that applies it).
         80..=84 => {
             let mut c = state.configuration.configuration.clone();
-            // Fork B's owner device uses a disjoint version stream. Two owner
-            // devices bumping the SAME version concurrently is a separate
-            // defect with a different cause (equal-version configurations are
-            // never exchanged); it is tracked on its own issue, not here.
+            // Fork B's owner device uses a disjoint version stream, except in
+            // `Mode::Collide`, where both devices bump from the same base and
+            // so sign DIFFERENT configurations at the SAME version
+            // (freenet/river#703 defect 1).
             let bump = if clock.config_offset > 0 {
                 clock.config_offset
             } else {
@@ -327,7 +327,7 @@ fn random_op(
         // to ban IN THIS FORK'S VIEW -- what an honest client would send.
         // ADVERSARIAL mode: any pool member may sign a ban on anyone.
         _ => {
-            let honest = mode == Mode::Honest;
+            let honest = matches!(mode, Mode::Honest | Mode::Collide);
             let by_id = state.members.members_by_member_id();
             let (banner, target) = if honest {
                 let mut cands: Vec<(Option<usize>, usize)> = Vec::new();
@@ -664,13 +664,26 @@ enum Mode {
     /// `max_members` together with a ban, and a removed member replaying their
     /// own record with a counter-ban. See `random_op_ext`.
     Extended,
+    /// Honest operations, but fork B's owner device bumps the configuration
+    /// version from the same base as fork A's, so the two forks can hold
+    /// different owner-signed configurations at an EQUAL version
+    /// (freenet/river#703 defect 1).
+    Collide,
 }
 
 /// Shapes: (pool size, common-prefix ops, ops per fork, max_recent_messages,
 /// max_user_bans). Small caps force inactivity pruning and ban-cap eviction,
-/// which is where divergence comes from.
-const SHAPES: [(usize, usize, usize, usize, usize); 3] =
-    [(6, 8, 8, 4, 3), (8, 12, 12, 3, 2), (5, 4, 16, 2, 5)];
+/// which is where divergence comes from. The last shape starts at
+/// `max_recent_messages = 1`, so nearly every configuration change RAISES the
+/// cap: the case where a receiver's retention horizon, computed against its
+/// own pre-merge cap, withholds messages the merged cap keeps
+/// (freenet/river#703 defect 3).
+const SHAPES: [(usize, usize, usize, usize, usize); 4] = [
+    (6, 8, 8, 4, 3),
+    (8, 12, 12, 3, 2),
+    (5, 4, 16, 2, 5),
+    (6, 8, 8, 1, 3),
+];
 
 /// Build two forks from a common prefix.
 fn fork_pair(
@@ -678,6 +691,16 @@ fn fork_pair(
     shape: (usize, usize, usize, usize, usize),
     mode: Mode,
 ) -> (World, ChatRoomStateV1, ChatRoomStateV1) {
+    let (w, _base, a, b) = fork_pair_with_base(seed, shape, mode);
+    (w, a, b)
+}
+
+/// [`fork_pair`], also returning the common state the forks split from.
+fn fork_pair_with_base(
+    seed: u64,
+    shape: (usize, usize, usize, usize, usize),
+    mode: Mode,
+) -> (World, ChatRoomStateV1, ChatRoomStateV1, ChatRoomStateV1) {
     let (pool, prefix, fork_ops, cap, bans) = shape;
     let mut rng = StdRng::seed_from_u64(seed);
     let w = World::new(&mut rng, pool);
@@ -689,7 +712,7 @@ fn fork_pair(
         let d = op_for(&w, &mut rng, &base, &mut clock, t, mode);
         apply(&mut base, &w.params, d);
     }
-    let (mut a, mut b) = (base.clone(), base);
+    let (mut a, mut b) = (base.clone(), base.clone());
     let (mut ca, mut cb) = (clock.clone(), clock);
     // Offset fork B's member_info and configuration versions so the two
     // forks' re-signed records differ, as two devices' would. Only members
@@ -698,7 +721,7 @@ fn fork_pair(
     for v in cb.info_version.values_mut() {
         *v += 1000;
     }
-    cb.config_offset = 1000;
+    cb.config_offset = if mode == Mode::Collide { 0 } else { 1000 };
     for _ in 0..fork_ops {
         t += 1;
         let d = op_for(&w, &mut rng, &a, &mut ca, t, mode);
@@ -707,7 +730,7 @@ fn fork_pair(
         let d = op_for(&w, &mut rng, &b, &mut cb, t, mode);
         apply(&mut b, &w.params, d);
     }
-    (w, a, b)
+    (w, base, a, b)
 }
 
 /// How a fork pair ends after gossiping both ways.
@@ -721,30 +744,77 @@ enum Ending {
     SilentlyDiverged,
 }
 
+/// The top-level fields on which two states differ.
+fn differing_fields(a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> Vec<&'static str> {
+    fn f<T: serde::Serialize>(t: &T) -> Vec<u8> {
+        let mut v = vec![];
+        ciborium::ser::into_writer(t, &mut v).unwrap();
+        v
+    }
+    let mut out = Vec::new();
+    let checks: [(&str, bool); 10] = [
+        ("configuration", f(&a.configuration) != f(&b.configuration)),
+        ("bans", f(&a.bans) != f(&b.bans)),
+        ("members", f(&a.members) != f(&b.members)),
+        ("ban_evidence", f(&a.ban_evidence) != f(&b.ban_evidence)),
+        ("member_info", f(&a.member_info) != f(&b.member_info)),
+        ("secrets", f(&a.secrets) != f(&b.secrets)),
+        (
+            "recent_messages",
+            f(&a.recent_messages) != f(&b.recent_messages),
+        ),
+        (
+            "direct_messages",
+            f(&a.direct_messages) != f(&b.direct_messages),
+        ),
+        ("upgrade", f(&a.upgrade) != f(&b.upgrade)),
+        ("version", f(&a.version) != f(&b.version)),
+    ];
+    for (name, differs) in checks {
+        if differs {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// Gossip both ways until the two peers agree. A peer whose merge fails keeps
 /// its own state, exactly as a node does.
 ///
-/// One-shot commutativity is deliberately NOT asserted here. Under these small
-/// caps a single exchange can legitimately leave the peers differing (the
-/// message retention horizon trades an extra round for never re-offering a
-/// message the receiver would prune, freenet/river#703), and every such case
-/// converges on the next exchange.
-fn ending(w: &World, a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> Ending {
+/// Also returns whether the FIRST exchange was commutative: freenet-core's
+/// merge-law verifier compares `merge(A, B)` with `merge(B, A)` after ONE
+/// exchange (`state_commutativity`), and a difference there is an
+/// enforceable violation even when the next exchange heals it
+/// (freenet/river#703). `Some(fields)` names the fields that differed.
+fn ending(w: &World, a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> (Ending, Option<String>) {
     let (mut x, mut y) = (a.clone(), b.clone());
     let mut last_err = None;
-    for _ in 0..6 {
+    let mut not_commutative = None;
+    for round in 0..6 {
         if ser(&x) == ser(&y) {
-            return Ending::Converged;
+            return (Ending::Converged, not_commutative);
         }
         last_err = None;
-        let nx = match merge(&x, &y, &w.params) {
+        let (rx, ry) = (merge(&x, &y, &w.params), merge(&y, &x, &w.params));
+        if round == 0 {
+            match (&rx, &ry) {
+                (Ok(nx), Ok(ny)) if ser(nx) != ser(ny) => {
+                    not_commutative = Some(differing_fields(nx, ny).join("+"));
+                }
+                (Err(_), _) | (_, Err(_)) => {
+                    not_commutative = Some("rejected".to_string());
+                }
+                _ => {}
+            }
+        }
+        let nx = match rx {
             Ok(s) => s,
             Err(e) => {
                 last_err = Some(e);
                 x.clone()
             }
         };
-        let ny = match merge(&y, &x, &w.params) {
+        let ny = match ry {
             Ok(s) => s,
             Err(e) => {
                 last_err = Some(e);
@@ -754,14 +824,15 @@ fn ending(w: &World, a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> Ending {
         x = nx;
         y = ny;
     }
-    if ser(&x) == ser(&y) {
+    let end = if ser(&x) == ser(&y) {
         Ending::Converged
     } else {
         match last_err {
             Some(e) => Ending::Rejecting(e),
             None => Ending::SilentlyDiverged,
         }
-    }
+    };
+    (end, not_commutative)
 }
 
 fn seeds_from_env(default: u64) -> u64 {
@@ -777,15 +848,51 @@ fn default_seeds(n: u64) -> Vec<(u64, usize)> {
         .collect()
 }
 
-/// Returns (permanent rejections, silent divergences), each as a readable
-/// line. A pair whose cleanup was not idempotent at some apply or merge counts
-/// as silently diverged, with the reason.
-fn endings(mode: Mode, seeds: &[(u64, usize)]) -> (Vec<String>, Vec<String>) {
-    let (mut rejecting, mut silent) = (Vec::new(), Vec::new());
+/// Every way a set of fork pairs failed, each as a readable line.
+#[derive(Default)]
+struct Failures {
+    /// Permanent rejections (#423).
+    rejecting: Vec<String>,
+    /// Silent divergence, or cleanup that was not idempotent at some apply or
+    /// merge (with the reason).
+    silent: Vec<String>,
+    /// First exchanges where `merge(A, B) != merge(B, A)` (freenet/river#703).
+    not_commutative: Vec<String>,
+}
+
+impl Failures {
+    fn is_empty(&self) -> bool {
+        self.rejecting.is_empty() && self.silent.is_empty() && self.not_commutative.is_empty()
+    }
+
+    /// How many first exchanges were not commutative, per differing-field set.
+    fn not_commutative_by_cause(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut by = std::collections::BTreeMap::new();
+        for line in &self.not_commutative {
+            let cause = line.rsplit(": ").next().unwrap_or("").to_string();
+            *by.entry(cause).or_default() += 1;
+        }
+        by
+    }
+
+    fn report(&self, what: &str, runs: usize) -> String {
+        format!(
+            "{what} fork pairs that fail, of {runs}:\nPERMANENTLY REJECTING:\n{}\nsilent or non-idempotent:\n{}\nnot one-shot commutative ({} by cause {:?}):\n{}",
+            self.rejecting.join("\n"),
+            self.silent.join("\n"),
+            self.not_commutative.len(),
+            self.not_commutative_by_cause(),
+            self.not_commutative.join("\n"),
+        )
+    }
+}
+
+fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
+    let mut out = Failures::default();
     for &(seed, shape) in seeds {
         drain_not_idempotent();
         let (w, a, b) = fork_pair(seed, SHAPES[shape], mode);
-        let end = ending(&w, &a, &b);
+        let (end, not_commutative) = ending(&w, &a, &b);
         STATS.with(|s| {
             let mut s = s.borrow_mut();
             s.runs += 1;
@@ -795,23 +902,27 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> (Vec<String>, Vec<String>) {
         });
         let broken = drain_not_idempotent();
         if !broken.is_empty() {
-            silent.push(format!(
+            out.silent.push(format!(
                 "seed {seed} shape {shape}: cleanup not idempotent after {} ({} times)",
                 broken[0],
                 broken.len()
             ));
             continue;
         }
+        if let Some(fields) = not_commutative {
+            out.not_commutative
+                .push(format!("seed {seed} shape {shape}: {fields}"));
+        }
         match end {
             Ending::Converged => {}
-            Ending::Rejecting(e) => rejecting.push(format!(
+            Ending::Rejecting(e) => out.rejecting.push(format!(
                 "seed {seed} shape {shape}: {}",
                 &e[..e.len().min(200)]
             )),
-            Ending::SilentlyDiverged => silent.push(format!("seed {seed} shape {shape}")),
+            Ending::SilentlyDiverged => out.silent.push(format!("seed {seed} shape {shape}")),
         }
     }
-    (rejecting, silent)
+    out
 }
 
 /// The run produced, and the contract accepted, every shape in `required`;
@@ -836,7 +947,7 @@ fn assert_floors(mode: Mode, stats: &Stats, required: &[&str], all_accepted: boo
 #[test]
 fn honest_forks_always_converge() {
     let seeds = default_seeds(seeds_from_env(3));
-    let (rejecting, silent) = endings(Mode::Honest, &seeds);
+    let failures = endings(Mode::Honest, &seeds);
     let stats = take_stats();
     assert_floors(
         Mode::Honest,
@@ -849,11 +960,9 @@ fn honest_forks_always_converge() {
         "an honest merge was rejected other than by the flood guard: {stats:?}"
     );
     assert!(
-        rejecting.is_empty() && silent.is_empty(),
-        "honest fork pairs that never converge, of {}:\nrejecting:\n{}\nsilent:\n{}",
-        seeds.len(),
-        rejecting.join("\n"),
-        silent.join("\n")
+        failures.is_empty(),
+        "{}",
+        failures.report("honest", seeds.len())
     );
 }
 
@@ -879,7 +988,7 @@ fn honest_forks_always_converge() {
 fn adversarial_forks_never_permanently_reject_each_other() {
     let mut seeds = default_seeds(seeds_from_env(3));
     seeds.extend([(40, 1), (60, 2), (83, 2), (201, 2), (252, 2), (292, 2)]);
-    let (rejecting, silent) = endings(Mode::Adversarial, &seeds);
+    let failures = endings(Mode::Adversarial, &seeds);
     let stats = take_stats();
     assert_floors(
         Mode::Adversarial,
@@ -892,11 +1001,9 @@ fn adversarial_forks_never_permanently_reject_each_other() {
         "no run held ban evidence: {stats:?}"
     );
     assert!(
-        rejecting.is_empty() && silent.is_empty(),
-        "adversarial fork pairs that never converge, of {}:\nPERMANENTLY REJECTING (#423):\n{}\nsilently diverged:\n{}",
-        seeds.len(),
-        rejecting.join("\n"),
-        silent.join("\n")
+        failures.is_empty(),
+        "{}",
+        failures.report("adversarial", seeds.len())
     );
 }
 
@@ -906,7 +1013,7 @@ fn adversarial_forks_never_permanently_reject_each_other() {
 #[test]
 fn extended_forks_converge_and_cleanup_is_idempotent() {
     let seeds = default_seeds(seeds_from_env(3));
-    let (rejecting, silent) = endings(Mode::Extended, &seeds);
+    let failures = endings(Mode::Extended, &seeds);
     let stats = take_stats();
     assert_floors(
         Mode::Extended,
@@ -927,11 +1034,106 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
         "no run held ban evidence: {stats:?}"
     );
     assert!(
-        rejecting.is_empty() && silent.is_empty(),
-        "extended fork pairs that fail, of {}:\nPERMANENTLY REJECTING:\n{}\nsilent or non-idempotent:\n{}",
-        seeds.len(),
-        rejecting.join("\n"),
-        silent.join("\n")
+        failures.is_empty(),
+        "{}",
+        failures.report("extended", seeds.len())
+    );
+}
+
+/// freenet/river#703 defect 1: two owner devices sign DIFFERENT
+/// configurations at the SAME version. Every pair must converge, and the
+/// first exchange must already be commutative.
+#[test]
+fn colliding_owner_configurations_converge() {
+    let seeds = default_seeds(seeds_from_env(3));
+    let failures = endings(Mode::Collide, &seeds);
+    let stats = take_stats();
+    assert_floors(
+        Mode::Collide,
+        &stats,
+        &["bans1", "config", "info", "members+info+msgs", "msgs"],
+        true,
+    );
+    assert!(
+        failures.is_empty(),
+        "{}",
+        failures.report("colliding", seeds.len())
+    );
+}
+
+/// A rejection reason with its numbers blanked, so counts group by cause.
+fn reason_class(e: &str) -> String {
+    let blanked: String = e
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect();
+    blanked.chars().take(90).collect()
+}
+
+/// freenet/river#703 defect 2 (the `delta_idempotence` law): freenet-core
+/// sends a delta computed against its cached belief of the receiver's
+/// summary, which may predate changes the receiver has since made. Here the
+/// belief is the summary of the state both forks split from, so the delta
+/// re-delivers records the receiver already holds, or has since pruned,
+/// alongside new ones. Every such delta from a validly-evolved peer must
+/// apply, and the result must verify with cleanup at its fixpoint.
+#[test]
+fn stale_summary_deltas_apply() {
+    let seeds = default_seeds(seeds_from_env(3));
+    let mut rejected: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut examples: Vec<String> = Vec::new();
+    let mut applied = 0usize;
+    for mode in [
+        Mode::Honest,
+        Mode::Adversarial,
+        Mode::Collide,
+        Mode::Extended,
+    ] {
+        for &(seed, shape) in &seeds {
+            drain_not_idempotent();
+            let (w, base, a, b) = fork_pair_with_base(seed, SHAPES[shape], mode);
+            let base_summary = base.summarize(&base, &w.params);
+            for (sender, receiver, dir) in [(&a, &b, "a->b"), (&b, &a, "b->a")] {
+                let Some(d) = sender.delta(sender, &w.params, &base_summary) else {
+                    continue;
+                };
+                let mut r = receiver.clone();
+                let parent = r.clone();
+                let outcome = r
+                    .apply_delta(&parent, &w.params, &Some(d))
+                    .and_then(|()| r.verify(&r, &w.params).map_err(|e| format!("verify: {e}")));
+                match outcome {
+                    Ok(()) => {
+                        applied += 1;
+                        check_idempotent(&r, &w.params, "stale apply");
+                    }
+                    Err(e) => {
+                        *rejected.entry(reason_class(&e)).or_default() += 1;
+                        if examples.len() < 20 {
+                            examples.push(format!(
+                                "{mode:?} seed {seed} shape {shape} {dir}: {}",
+                                &e[..e.len().min(160)]
+                            ));
+                        }
+                    }
+                }
+            }
+            let broken = drain_not_idempotent();
+            if !broken.is_empty() {
+                *rejected
+                    .entry("cleanup not idempotent after a stale apply".to_string())
+                    .or_default() += 1;
+            }
+        }
+    }
+    let _ = take_stats();
+    assert!(applied > 0, "no stale delta was produced");
+    assert!(
+        rejected.is_empty(),
+        "stale-summary deltas rejected ({} applied), by cause: {:#?}\nexamples:\n{}",
+        applied,
+        rejected,
+        examples.join("\n")
     );
 }
 
