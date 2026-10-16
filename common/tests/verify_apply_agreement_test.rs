@@ -729,3 +729,36 @@ fn an_over_ceiling_record_and_an_older_valid_one_converge() {
     let merged = assert_merges_agree(&r, &long, &short);
     assert_eq!(merged.member_info, short.member_info);
 }
+
+/// Two different owner-signed configurations that both fail the value
+/// checks, held by two peers with no valid one between them: the summaries
+/// tell them apart, and both merge directions settle on the same one; a
+/// valid configuration still outranks both (freenet/river#703 review R3).
+#[test]
+fn two_invalid_held_configurations_converge_and_a_valid_one_beats_both() {
+    let r = room();
+    let base = state(&r, public_config(&r));
+    let invalid = |version: u32| {
+        let mut s = base.clone();
+        let mut c = public_config(&r);
+        c.configuration_version = version;
+        c.max_recent_messages = 0;
+        s.configuration = AuthorizedConfigurationV1::new(c, &r.owner_sk);
+        s
+    };
+    let (a, b) = (invalid(4), invalid(6));
+    assert_ne!(
+        a.summarize(&a, &r.params).configuration,
+        b.summarize(&b, &r.params).configuration,
+        "the summaries tell two invalid configurations apart"
+    );
+    let merged = assert_merges_agree(&r, &a, &b);
+    assert_eq!(merged.configuration, b.configuration);
+
+    let mut valid = base.clone();
+    let mut c = public_config(&r);
+    c.configuration_version = 2;
+    valid.configuration = AuthorizedConfigurationV1::new(c, &r.owner_sk);
+    let merged = assert_merges_agree(&r, &b, &valid);
+    assert_eq!(merged.configuration, valid.configuration);
+}

@@ -17,10 +17,14 @@ pub struct AuthorizedConfigurationV1 {
 }
 
 /// A configuration's place in the order every peer resolves collisions by:
-/// higher `configuration_version` wins, and at an equal version the greater
-/// signature digest wins (freenet/river#703 defect 1). Same rule, same
-/// [`outranks`], as `member_info`'s rank.
-pub type ConfigurationRank = (u32, SigDigest);
+/// one that passes [`AuthorizedConfigurationV1::check_values`] outranks any
+/// that does not; then the higher `configuration_version` wins, and at an
+/// equal version the greater signature digest wins (freenet/river#703).
+/// Same [`outranks`] as `member_info`'s rank. Configurations that fail the
+/// value checks are ordered among themselves the same way, so two peers
+/// holding two different ones (only a full-state PUT carries one) tell them
+/// apart and settle on one, while any valid configuration replaces both.
+pub type ConfigurationRank = (bool, u32, SigDigest);
 
 impl ComposableState for AuthorizedConfigurationV1 {
     type ParentState = ChatRoomStateV1;
@@ -29,7 +33,9 @@ impl ComposableState for AuthorizedConfigurationV1 {
     /// version in the summary, neither peer could tell the other held
     /// something else, `delta` sent nothing, and the room stayed forked for
     /// good. The digest lets anti-entropy see the difference and both peers
-    /// keep the higher-ranked one. Changing this type re-keys the contract.
+    /// keep the higher-ranked one; the validity flag puts every valid
+    /// configuration above every invalid one. Changing this type re-keys the
+    /// contract.
     type Summary = ConfigurationRank;
     type Delta = AuthorizedConfigurationV1;
     type Parameters = ChatRoomParametersV1;
@@ -45,19 +51,14 @@ impl ComposableState for AuthorizedConfigurationV1 {
 
     /// A held configuration that fails [`Self::check_values`] (only a
     /// full-state PUT can carry one: `verify` checks only the signature)
-    /// does not compete. It summarizes as the lowest rank, so any valid
-    /// configuration is offered to the peer holding it, and it is never
-    /// offered itself (freenet/river#703).
+    /// ranks below every valid one, so any valid configuration is offered to
+    /// the peer holding it (freenet/river#703).
     fn summarize(
         &self,
         _parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Self::Summary {
-        if self.check_values(parameters).is_ok() {
-            self.rank()
-        } else {
-            (0, SigDigest([0; 16]))
-        }
+        self.rank(parameters)
     }
 
     fn delta(
@@ -66,7 +67,7 @@ impl ComposableState for AuthorizedConfigurationV1 {
         parameters: &Self::Parameters,
         old_rank: &Self::Summary,
     ) -> Option<Self::Delta> {
-        if self.check_values(parameters).is_ok() && outranks(self.rank(), *old_rank) {
+        if outranks(self.rank(parameters), *old_rank) {
             Some(self.clone())
         } else {
             None
@@ -84,13 +85,10 @@ impl ComposableState for AuthorizedConfigurationV1 {
     /// An outranking configuration with a bad signature is a forgery and is
     /// rejected. One that is owner-signed but fails [`Self::check_values`] (a
     /// zero cap, an `owner_member_id` that is not the room owner's, oversized
-    /// or public display metadata
-    /// in a private room) is SKIPPED, not rejected: an `Err` for a validly
-    /// signed record would fail every whole-state merge with a peer holding
-    /// it, freezing every other field between them too. `verify` only checks
-    /// the signature, so such a configuration can only arrive through a
-    /// full-state PUT from a buggy or hostile owner client; a peer holding it
-    /// then keeps offering it and the others keep declining it.
+    /// or public display metadata in a private room) ranks below every valid
+    /// one (see [`ConfigurationRank`]), so it replaces only another invalid
+    /// configuration, never a valid one. `verify` only checks the signature,
+    /// so such a configuration can only arrive through a full-state PUT.
     fn apply_delta(
         &mut self,
         _parent_state: &Self::ParentState,
@@ -104,20 +102,13 @@ impl ComposableState for AuthorizedConfigurationV1 {
             // placeholder could outrank the room's real configuration on the
             // signature-digest tie-break and survive a merge with it.
             //
-            // Likewise a held configuration that fails the value checks does
-            // not compete (see `summarize`).
-            let held_competes = self.check_values(parameters).is_ok()
-                && self.verify_signature(&parameters.owner).is_ok();
-            if held_competes && !outranks(delta.rank(), self.rank()) {
+            let held_competes = self.verify_signature(&parameters.owner).is_ok();
+            if held_competes && !outranks(delta.rank(parameters), self.rank(parameters)) {
                 return Ok(());
             }
             delta
                 .verify_signature(&parameters.owner)
                 .map_err(|e| format!("Invalid signature: {}", e))?;
-            if delta.check_values(parameters).is_err() {
-                // Skipped, deliberately not an error: see the doc comment.
-                return Ok(());
-            }
             self.configuration = delta.configuration.clone();
             self.signature = delta.signature;
         }
@@ -127,9 +118,11 @@ impl ComposableState for AuthorizedConfigurationV1 {
 }
 
 impl AuthorizedConfigurationV1 {
-    /// This configuration's [`ConfigurationRank`].
-    pub fn rank(&self) -> ConfigurationRank {
+    /// This configuration's [`ConfigurationRank`] in a room with
+    /// `parameters`.
+    pub fn rank(&self, parameters: &ChatRoomParametersV1) -> ConfigurationRank {
         (
+            self.check_values(parameters).is_ok(),
             self.configuration.configuration_version,
             sig_digest(&self.signature),
         )
@@ -532,6 +525,7 @@ mod tests {
         assert_eq!(
             authorized_configuration.summarize(&parent_state, &parameters),
             (
+                true,
                 configuration.configuration_version,
                 sig_digest(&authorized_configuration.signature)
             )
@@ -564,7 +558,7 @@ mod tests {
         let new_authorized_configuration =
             AuthorizedConfigurationV1::new(new_configuration.clone(), &owner_signing_key);
 
-        let old_rank = authorized_configuration.rank();
+        let old_rank = authorized_configuration.rank(&parameters);
         assert_eq!(
             new_authorized_configuration.delta(&parent_state, &parameters, &old_rank),
             Some(new_authorized_configuration)
@@ -602,7 +596,11 @@ mod tests {
             &owner_signing_key,
         );
         assert_eq!(
-            old_authorized_configuration.delta(&parent_state, &parameters, &newer.rank()),
+            old_authorized_configuration.delta(
+                &parent_state,
+                &parameters,
+                &newer.rank(&parameters)
+            ),
             None
         );
     }
@@ -685,8 +683,11 @@ mod tests {
     fn test_apply_delta_change_owner() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        // The held configuration is valid, so the invalid one below ranks
+        // under it (an invalid configuration replaces only another invalid
+        // one).
         let configuration = Configuration {
-            owner_member_id: MemberId(FastHash(1)),
+            owner_member_id: owner_verifying_key.into(),
             ..Configuration::default()
         };
         let mut authorized_configuration =
@@ -786,7 +787,7 @@ mod tests {
             )
         };
         let (x, y) = (at_v2(7), at_v2(9));
-        let (hi, lo) = if outranks(x.rank(), y.rank()) {
+        let (hi, lo) = if outranks(x.rank(&parameters), y.rank(&parameters)) {
             (x, y)
         } else {
             (y, x)
@@ -797,10 +798,13 @@ mod tests {
             "equal-version configurations must summarize differently"
         );
         assert_eq!(
-            hi.delta(&parent_state, &parameters, &lo.rank()),
+            hi.delta(&parent_state, &parameters, &lo.rank(&parameters)),
             Some(hi.clone())
         );
-        assert_eq!(lo.delta(&parent_state, &parameters, &hi.rank()), None);
+        assert_eq!(
+            lo.delta(&parent_state, &parameters, &hi.rank(&parameters)),
+            None
+        );
 
         let mut on_lo = lo.clone();
         on_lo

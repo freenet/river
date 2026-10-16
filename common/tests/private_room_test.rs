@@ -939,17 +939,27 @@ fn issue_318_member_info_apply_delta_has_no_contract_privacy_guard() {
     let member_vk = member_sk.verifying_key();
     let member_id = MemberId::from(&member_vk);
 
+    // A configuration that passes the value checks (sealed display name),
+    // so the refused one below competes with a valid held configuration.
     let mut state = ChatRoomStateV1 {
         configuration: AuthorizedConfigurationV1::new(
             Configuration {
                 privacy_mode: PrivacyMode::Private,
                 owner_member_id: owner_id,
+                display: RoomDisplayMetadata {
+                    name: SealedBytes::private(vec![1; 8], [0; 12], 1, 8),
+                    description: None,
+                },
                 ..Default::default()
             },
             &owner_sk,
         ),
         ..Default::default()
     };
+    state
+        .configuration
+        .check_values(&params)
+        .expect("premise: the held configuration is valid");
     state.members.members.push(AuthorizedMember::new(
         Member {
             owner_member_id: owner_id,

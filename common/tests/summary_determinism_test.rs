@@ -343,7 +343,7 @@ fn top_level_summary_serialization_is_order_independent() {
         };
 
         ChatRoomStateV1Summary {
-            configuration: (7, sig_rank(7)),
+            configuration: (true, 7, sig_rank(7)),
             bans,
             members,
             ban_evidence,
