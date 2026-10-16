@@ -985,7 +985,13 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
     // `crate::util::display_name`). Emoji would be stripped at render time
     // anyway; telling the user up front beats silently losing characters.
     let nickname_has_emoji = contains_hidden_chars(&nickname());
-    let accept_disabled = nickname.read().trim().is_empty() || nickname_has_emoji;
+    // The room's own nickname limit is known only once its state arrives
+    // (checked then, before signing); the ceiling every room holds nicknames
+    // to is checked here.
+    let ceiling = river_core::room_state::member_info::NICKNAME_CEILING;
+    let nickname_too_long = nickname.read().len() > ceiling;
+    let accept_disabled =
+        nickname.read().trim().is_empty() || nickname_has_emoji || nickname_too_long;
 
     rsx! {
         p { class: "text-text mb-2", "You have been invited to join a new room." }
@@ -1028,6 +1034,14 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
                     class: "mt-1 text-xs text-red-400",
                     role: "alert",
                     "{EMOJI_REJECTION_MESSAGE}"
+                }
+            }
+            if nickname_too_long {
+                p {
+                    "data-testid": "receive-invitation-nickname-length-error",
+                    class: "mt-1 text-xs text-red-400",
+                    role: "alert",
+                    "A display name can be at most {ceiling} bytes."
                 }
             }
         }

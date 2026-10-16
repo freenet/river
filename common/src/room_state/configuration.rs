@@ -330,6 +330,30 @@ pub struct Configuration {
 /// it would have to be kept and ignored, not dropped.
 pub const DEFAULT_MAX_DIRECT_MESSAGES: usize = 300;
 
+/// Why a client must not create a room named `name` with the creator's
+/// nickname `nickname`, if it must not: the first configuration (the
+/// defaults, with that name) must pass [`Configuration::signing_refusal`],
+/// and the nickname must fit its `max_nickname_size`
+/// ([`crate::room_state::member_info::nickname_refusal`]). The one check the
+/// UI and riverctl run before creating a room (freenet/river#703).
+pub fn new_room_refusal(
+    parameters: &ChatRoomParametersV1,
+    name: &str,
+    nickname: &str,
+) -> Option<String> {
+    let config = Configuration {
+        owner_member_id: parameters.owner_id(),
+        display: RoomDisplayMetadata {
+            name: crate::room_state::privacy::SealedBytes::public(name.as_bytes().to_vec()),
+            description: None,
+        },
+        ..Configuration::default()
+    };
+    config
+        .signing_refusal(parameters)
+        .or_else(|| crate::room_state::member_info::nickname_refusal(nickname.len(), &config))
+}
+
 impl Configuration {
     /// Correct, before signing, what an owner's edit to another field must
     /// not be refused over, because the edit cannot fix it: the
@@ -474,6 +498,19 @@ mod signing_refusal_tests {
         raise.max_nickname_size = crate::room_state::member_info::NICKNAME_CEILING + 1;
         raise.normalize_for_signing(&c, &params);
         assert!(raise.signing_refusal(&params).is_some());
+    }
+
+    /// A new room is refused for a name over the default room-name limit or
+    /// a creator nickname over the default nickname limit, and allowed at
+    /// both limits.
+    #[test]
+    fn a_new_room_is_refused_over_the_default_limits() {
+        let (params, c) = params();
+        let name = "n".repeat(c.max_room_name);
+        let nick = "k".repeat(c.max_nickname_size);
+        assert_eq!(new_room_refusal(&params, &name, &nick), None);
+        assert!(new_room_refusal(&params, &format!("{name}n"), &nick).is_some());
+        assert!(new_room_refusal(&params, &name, &format!("{nick}k")).is_some());
     }
 
     /// A zero limit is refused naming the field.

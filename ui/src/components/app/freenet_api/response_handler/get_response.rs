@@ -356,6 +356,29 @@ pub async fn handle_get_response(
             // secret has arrived. (The heal runs only on GET, not on the
             // UPDATE that typically delivers the secret — tracked as issue
             // #295.)
+            // The room's `max_nickname_size` is a client rule, checked here
+            // before the invitee's member_info is signed: over it, the join
+            // stops with the reason, and the user accepts the invitation
+            // again with a shorter name (freenet/river#703).
+            if let Some(reason) = river_core::room_state::member_info::nickname_refusal(
+                preferred_nickname.len(),
+                &retrieved_state.configuration.configuration,
+            ) {
+                let msg = format!("{reason} Accept the invitation again with a shorter name.");
+                warn!(
+                    "Invitation not completed for room {:?}: {msg}",
+                    MemberId::from(owner_vk)
+                );
+                crate::util::defer(move || {
+                    PENDING_INVITES.with_mut(|pending| {
+                        if let Some(join) = pending.map.get_mut(&owner_vk) {
+                            join.status = PendingRoomStatus::Error(msg.clone());
+                        }
+                    });
+                });
+                return Ok(());
+            }
+
             let authorized_member_info: Option<AuthorizedMemberInfo> = {
                 // Seal the invitee's nickname against the room secret —
                 // taken from the contract state if the owner has already

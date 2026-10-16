@@ -2293,6 +2293,39 @@ fn rejoin_preferred_nickname(
 /// v0, never derived) → `encrypt_secret_for_member` for the owner →
 /// `AuthorizedSecretVersionRecord` + `AuthorizedEncryptedSecretForMember`, then
 /// name + nickname sealed with `encrypt_with_symmetric_key` under that secret.
+/// The check riverctl runs before signing a nickname for `state`'s room
+/// (setting it, or joining with it): the room's `max_nickname_size` is a
+/// client rule, and the room holds nicknames to a fixed ceiling regardless.
+fn nickname_edit_refusal(state: &ChatRoomStateV1, nickname: &str) -> Result<()> {
+    match river_core::room_state::member_info::nickname_refusal(
+        nickname.len(),
+        &state.configuration.configuration,
+    ) {
+        Some(reason) => Err(anyhow!(reason)),
+        None => Ok(()),
+    }
+}
+
+/// `held` with `modify` applied as the owner's next configuration, ready to
+/// sign, or the reason it must not be signed: the same normalization and
+/// check the UI runs (`Configuration::normalize_for_signing`,
+/// `Configuration::signing_refusal`).
+fn prepare_config_edit(
+    held: &Configuration,
+    owner: &VerifyingKey,
+    modify: impl FnOnce(&mut Configuration),
+) -> Result<Configuration> {
+    let mut new_config = held.clone();
+    new_config.configuration_version += 1;
+    modify(&mut new_config);
+    let params = ChatRoomParametersV1 { owner: *owner };
+    new_config.normalize_for_signing(held, &params);
+    if let Some(reason) = new_config.signing_refusal(&params) {
+        return Err(anyhow!("Invalid configuration: {reason}"));
+    }
+    Ok(new_config)
+}
+
 fn build_new_room_state(
     signing_key: &SigningKey,
     name: &str,
@@ -2747,6 +2780,15 @@ impl ApiClient {
         let signing_key =
             SigningKey::from_bytes(&rand::Rng::gen::<[u8; 32]>(&mut rand::thread_rng()));
         let owner_vk = signing_key.verifying_key();
+        // The room's first configuration and the creator's nickname must
+        // pass the checks the room applies (freenet/river#703).
+        if let Some(reason) = river_core::room_state::configuration::new_room_refusal(
+            &ChatRoomParametersV1 { owner: owner_vk },
+            &name,
+            &nickname,
+        ) {
+            return Err(anyhow!("Cannot create the room: {reason}"));
+        }
 
         // Build the initial room state (owner config + member_info), plus the v0
         // secret for a private room. Extracted as a pure helper so the
@@ -3917,6 +3959,10 @@ impl ApiClient {
         // see the UI's `build_member_info_heal` in
         // `ui/src/room_data.rs` for the eventual remediation
         // path (CLI counterpart filed as freenet/river#304).
+        // The room's nickname limit, checked before the invitee's
+        // member_info is signed (freenet/river#703).
+        nickname_edit_refusal(&room_state, nickname)
+            .map_err(|e| anyhow!("{e} Accept the invitation again with a shorter --nickname."))?;
         let sealed_nickname = crate::private_room::seal_invitee_nickname(
             &room_state,
             signing_key,
@@ -6030,12 +6076,7 @@ impl ApiClient {
 
         // The room's `max_nickname_size` is a client rule, checked before
         // signing (the contract holds nicknames only to a fixed ceiling).
-        if let Some(reason) = river_core::room_state::member_info::nickname_refusal(
-            new_nickname.len(),
-            &room_state.configuration.configuration,
-        ) {
-            return Err(anyhow!(reason));
-        }
+        nickname_edit_refusal(&room_state, &new_nickname)?;
 
         // Seal the nickname for the room's privacy mode. In a PRIVATE room the
         // nickname MUST be AES-256-GCM sealed under the room secret — sending
@@ -6490,20 +6531,14 @@ impl ApiClient {
         // Fetch fresh room state from the network
         let room_state = self.get_room(room_owner_key, false).await?;
 
-        // Clone current config and apply modifications
-        let mut new_config = room_state.configuration.configuration.clone();
-        new_config.configuration_version += 1;
-        modify(&mut new_config);
         // The same check the UI runs before signing: the room skips (does
         // not reject) a configuration that fails it, so without this the edit
         // would report success and do nothing.
-        let params = ChatRoomParametersV1 {
-            owner: *room_owner_key,
-        };
-        new_config.normalize_for_signing(&room_state.configuration.configuration, &params);
-        if let Some(reason) = new_config.signing_refusal(&params) {
-            return Err(anyhow!("Invalid configuration: {reason}"));
-        }
+        let new_config = prepare_config_edit(
+            &room_state.configuration.configuration,
+            room_owner_key,
+            modify,
+        )?;
 
         // Sign the new configuration
         let authorized_config = AuthorizedConfigurationV1::new(new_config, &signing_key);
@@ -9000,6 +9035,45 @@ mod create_room_tests {
         assert_eq!(
             river_core::ecies::unseal_bytes_with_secrets(nick_field, &secrets).unwrap(),
             b"Alice"
+        );
+    }
+
+    /// `member set-nickname` and `invite accept` refuse a nickname over the
+    /// room's limit before signing; one at the limit is allowed.
+    #[test]
+    fn a_nickname_over_the_room_limit_is_refused_before_signing() {
+        let owner = SigningKey::from_bytes(&[3u8; 32]);
+        let (state, _) = build_new_room_state(&owner, "Room", "Owner", false);
+        let limit = state.configuration.configuration.max_nickname_size;
+        assert!(nickname_edit_refusal(&state, &"n".repeat(limit)).is_ok());
+        let err = nickname_edit_refusal(&state, &"n".repeat(limit + 1)).unwrap_err();
+        assert!(err.to_string().contains(&limit.to_string()), "{err}");
+    }
+
+    /// `room config` signs only a configuration the room takes: a zero limit
+    /// or a nickname limit over the ceiling is refused, an unrelated edit is
+    /// not refused over a held value it cannot fix, and the owner id is the
+    /// room owner's.
+    #[test]
+    fn a_config_edit_is_checked_before_signing() {
+        let owner = SigningKey::from_bytes(&[3u8; 32]);
+        let owner_vk = owner.verifying_key();
+        let (state, _) = build_new_room_state(&owner, "Room", "Owner", false);
+        let held = state.configuration.configuration.clone();
+        let edit = prepare_config_edit(&held, &owner_vk, |c| c.max_members = 7).unwrap();
+        assert_eq!(edit.max_members, 7);
+        assert_eq!(edit.configuration_version, held.configuration_version + 1);
+        assert!(prepare_config_edit(&held, &owner_vk, |c| c.max_user_bans = 0).is_err());
+        assert!(prepare_config_edit(&held, &owner_vk, |c| {
+            c.max_nickname_size = river_core::room_state::member_info::NICKNAME_CEILING + 1
+        })
+        .is_err());
+        let mut odd = held.clone();
+        odd.max_nickname_size = river_core::room_state::member_info::NICKNAME_CEILING + 9;
+        let edit = prepare_config_edit(&odd, &owner_vk, |c| c.max_members = 7).unwrap();
+        assert_eq!(
+            edit.max_nickname_size,
+            river_core::room_state::member_info::NICKNAME_CEILING
         );
     }
 
