@@ -4,7 +4,7 @@ use crate::output::OutputFormat;
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use ed25519_dalek::VerifyingKey;
-use river_core::room_state::ban::AuthorizedUserBan;
+use river_core::room_state::ban::{AuthorizedUserBan, BansV1};
 use river_core::room_state::member::{AuthorizedMember, BanResolution, MemberId};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use serde::Serialize;
@@ -160,8 +160,10 @@ struct BanInfo {
 ///
 /// - A ban naming the owner is `Inert` and permanently dead: the owner can
 ///   never be a target.
-/// - A ban whose signature was not verified against its issuer's key is
-///   `Inert`. That covers a forgery (the check must come FIRST, since the
+/// - A ban whose own signature does not verify against its issuer's key is
+///   `Inert`. Each record is checked itself: `resolution` is keyed by `BanId`,
+///   a hash of the signature alone, so a record copying another ban's
+///   signature would otherwise read that ban's verdict. That covers a forgery (the check must come FIRST, since the
 ///   authority check knows nothing about who signed: pinned by
 ///   `ban_signed_by_someone_other_than_its_attributed_banner_is_inert`), an
 ///   issuer whose record is held nowhere (reversible: if they rejoin with the
@@ -176,8 +178,12 @@ fn classify_ban(
     resolution: &BanResolution,
     known: &HashMap<MemberId, &AuthorizedMember>,
     owner_id: MemberId,
+    owner_vk: &VerifyingKey,
 ) -> BanEnforcement {
-    if ban.ban.banned_user == owner_id || !resolution.verified.contains(&ban.id()) {
+    if ban.ban.banned_user == owner_id
+        || !BansV1::ban_signature_matches_current_key(ban, known, owner_id, owner_vk)
+        || !resolution.verified.contains(&ban.id())
+    {
         return BanEnforcement::Inert;
     }
     if resolution.tier(&ban.id()) > BanResolution::INERT {
@@ -220,7 +226,7 @@ fn collect_ban_infos(room_state: &ChatRoomStateV1, owner_vk: &VerifyingKey) -> V
                 banned_user_id: ban.ban.banned_user.to_string(),
                 banned_by_id: ban.banned_by.to_string(),
                 banned_at_secs,
-                enforcement: classify_ban(ban, &resolution, &known, owner_id),
+                enforcement: classify_ban(ban, &resolution, &known, owner_id, owner_vk),
             }
         })
         .collect()
@@ -1114,6 +1120,45 @@ mod tests {
         );
 
         assert_eq!(verdict(&state, &owner), BanEnforcement::Inert);
+    }
+
+    #[test]
+    fn record_copying_a_genuine_bans_signature_is_inert() {
+        // A `BanId` hashes the signature alone, so a record that reuses a
+        // genuine ban's signature with a different target shares its id. The
+        // classifier must judge each record by its own signature, not read
+        // the genuine ban's verdict through the shared id.
+        let owner = key(1);
+        let alice = key(2);
+        let bob = key(3);
+
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_member(&mut state, &owner, &owner, &bob);
+        push_ban(&mut state, &owner, &owner, &alice);
+        let genuine = state.bans.0[0].clone();
+        let copy = AuthorizedUserBan::with_signature(
+            UserBan {
+                owner_member_id: id(&owner),
+                banned_at: genuine.ban.banned_at + std::time::Duration::from_secs(1),
+                banned_user: id(&bob),
+            },
+            id(&owner),
+            genuine.signature,
+        );
+        assert_eq!(copy.id(), genuine.id(), "precondition: the ids collide");
+        state.bans.0.push(copy);
+
+        let infos = collect_ban_infos(&state, &owner.verifying_key());
+        let of = |target: &SigningKey| {
+            infos
+                .iter()
+                .find(|i| i.banned_user_id == id(target).to_string())
+                .expect("ban listed")
+                .enforcement
+        };
+        assert_eq!(of(&alice), BanEnforcement::Enforcing);
+        assert_eq!(of(&bob), BanEnforcement::Inert);
     }
 
     #[test]
