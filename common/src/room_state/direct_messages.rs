@@ -18,7 +18,8 @@
 //!   recipient. Each recipient signs a single, monotonically-versioned
 //!   list of [`PurgeToken`] entries identifying messages they've purged.
 //!   The recipient is the sole signer of their own purge envelope;
-//!   concurrent updates are resolved by strict-monotonic `version`. A
+//!   concurrent updates are resolved by [`PurgeRank`]: the higher
+//!   `version`, then the greater signature digest (freenet/river#703). A
 //!   `Vec` (rather than `HashMap<MemberId, _>`) is used so the state
 //!   round-trips through `serde_json` - `MemberId` is a struct and is
 //!   rejected as a JSON object key (see bug-prevention-patterns
@@ -53,8 +54,8 @@
 //! [`PurgeToken`] of a sender's signature, ANY incoming message whose
 //! signature hashes to the same token is dropped on merge. Versioning of
 //! the purge envelope follows the `Configuration` monotonic-version
-//! pattern (one signed envelope per recipient, strictly-greater version
-//! replaces older); the drop-on-merge filtering effect matches `BansV1`'s
+//! pattern (one signed envelope per recipient, the higher-ranked one
+//! replaces the other); the drop-on-merge filtering effect matches `BansV1`'s
 //! treatment of banned members. Stale peers re-merging a purged message
 //! are blocked by the current `purges` state. Each envelope a client signs
 //! carries the previous version's tombstones forward

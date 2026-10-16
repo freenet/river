@@ -996,12 +996,12 @@ pub async fn handle_get_response(
                         // capture the true arrival moment.
 
                         if room_data.is_awaiting_initial_sync() {
-                            // Imported rooms have a placeholder default state with
-                            // owner_member_id: FastHash(0). Merging fails because
-                            // the retrieved state has the real owner's member ID
-                            // and apply_delta rejects owner_member_id changes.
-                            // Replace the state wholesale — the default has no
-                            // useful data to preserve.
+                            // Imported rooms have a placeholder default state
+                            // whose configuration is not signed by the owner.
+                            // A merge would now adopt the network's
+                            // configuration (freenet/river#703), but the
+                            // placeholder holds nothing worth keeping, so the
+                            // state is replaced wholesale.
                             info!(
                                 "Replacing placeholder state for imported room {:?} with network state",
                                 MemberId::from(owner_vk)

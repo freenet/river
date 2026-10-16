@@ -103,3 +103,34 @@ fn test_wholesale_replacement_works_for_imported_rooms() {
         MemberId::from(owner_vk),
     );
 }
+
+/// The placeholder's configuration is at version 1, as is a room whose owner
+/// never edited its settings, so the two tie on version. The real
+/// configuration must still replace the placeholder, whichever wins the
+/// signature-digest tie-break: the placeholder is not signed by the owner.
+#[test]
+fn test_placeholder_configuration_never_outranks_the_owners() {
+    for seed in 0..16u8 {
+        let owner_sk = SigningKey::from_bytes(&[seed.wrapping_add(40); 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let mut local_state = ChatRoomStateV1::default();
+        let current = local_state.clone();
+        let auth_config = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: owner_vk.into(),
+                configuration_version: current.configuration.configuration.configuration_version,
+                ..Default::default()
+            },
+            &owner_sk,
+        );
+        let network_state = ChatRoomStateV1 {
+            configuration: auth_config.clone(),
+            ..Default::default()
+        };
+        local_state
+            .merge(&current, &params, &network_state)
+            .unwrap();
+        assert_eq!(local_state.configuration, auth_config, "seed {seed}");
+    }
+}

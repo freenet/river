@@ -89,7 +89,13 @@ impl ComposableState for AuthorizedConfigurationV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(delta) = delta {
-            if !outranks(delta.rank(), self.rank()) {
+            // A held configuration that is not the owner's (an imported
+            // room's unsigned placeholder) does not compete: any valid
+            // configuration replaces it, whatever their ranks. Otherwise a
+            // placeholder could outrank the room's real configuration on the
+            // signature-digest tie-break and survive a merge with it.
+            let held_is_the_owners = self.verify_signature(&parameters.owner).is_ok();
+            if held_is_the_owners && !outranks(delta.rank(), self.rank()) {
                 return Ok(());
             }
             delta

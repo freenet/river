@@ -19,9 +19,11 @@ live in `common/src/room_state/direct_messages.rs`.
 
 - Each DM is sender-signed over canonical bytes prefixed by domain tag
   `b'M'`; recipient purge envelopes use `b'P'`. Per-recipient purge
-  envelopes are monotonically versioned (Configuration pattern) and the
-  tombstone set is BLAKE3-derived `PurgeToken`s, which prevents
-  signature-grinding attacks against tombstones.
+  envelopes are resolved by `PurgeRank` (the higher `version`, then the
+  greater signature digest), as the configuration is, and the summary
+  carries that rank, so peers holding different envelopes converge on one
+  (freenet/river#703). The tombstone set is BLAKE3-derived `PurgeToken`s,
+  which prevents signature-grinding attacks against tombstones.
 - Bans are NOT enforced in `DirectMessagesV1::verify` — instead,
   `ChatRoomStateV1::post_apply_cleanup` sweeps DMs whose sender or
   recipient is now banned or no longer a member. Mirrors `MessagesV1`'s

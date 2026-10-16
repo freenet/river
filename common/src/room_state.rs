@@ -179,6 +179,9 @@ impl ChatRoomStateV1 {
                 .delta(other_state, parameters, &summary)
                 .unwrap_or_default(),
         );
+        if let Some(d) = delta.as_mut() {
+            d.configuration = configuration_delta_for_merge(self, parameters, other_state);
+        }
         let cap = self
             .with_configuration_merged_from(parameters, other_state)
             .configuration
@@ -194,6 +197,9 @@ impl ChatRoomStateV1 {
                     .delta(other_state, parameters, &open)
                     .unwrap_or_default(),
             );
+            if let Some(d) = delta.as_mut() {
+                d.configuration = configuration_delta_for_merge(self, parameters, other_state);
+            }
             trim_messages_to_work_bound(&mut delta, cap);
             let mut open_merged = self.clone();
             // If the open pass fails, keep the first pass's result rather
@@ -232,11 +238,7 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
     ) -> std::borrow::Cow<'_, ChatRoomStateV1> {
-        let config_summary = self.configuration.summarize(self, parameters);
-        let config_delta =
-            other_state
-                .configuration
-                .delta(other_state, parameters, &config_summary);
+        let config_delta = configuration_delta_for_merge(self, parameters, other_state);
         if config_delta.is_none() {
             return std::borrow::Cow::Borrowed(self);
         }
@@ -754,6 +756,41 @@ impl ChatRoomStateV1 {
 
         Ok(())
     }
+}
+
+/// The configuration `other_state` offers `receiver` in a whole-state merge:
+/// its configuration if that outranks the receiver's, as the summary decides,
+/// and also whenever the receiver's own configuration is not signed by the
+/// room owner (an imported room's placeholder) while the other's is. Such a
+/// placeholder can win the signature-digest tie-break against a real
+/// configuration at the same version, and must never survive a merge with
+/// one; `AuthorizedConfigurationV1::apply_delta` then replaces it. Only a
+/// client's local state can hold one: the contract's `validate_state`
+/// rejects it.
+fn configuration_delta_for_merge(
+    receiver: &ChatRoomStateV1,
+    parameters: &ChatRoomParametersV1,
+    other_state: &ChatRoomStateV1,
+) -> Option<AuthorizedConfigurationV1> {
+    let summary = receiver.configuration.summarize(receiver, parameters);
+    other_state
+        .configuration
+        .delta(other_state, parameters, &summary)
+        .or_else(|| {
+            if receiver.configuration == other_state.configuration {
+                return None;
+            }
+            let receiver_is_placeholder = receiver
+                .configuration
+                .verify_signature(&parameters.owner)
+                .is_err();
+            let other_is_the_owners = other_state
+                .configuration
+                .verify_signature(&parameters.owner)
+                .is_ok();
+            (receiver_is_placeholder && other_is_the_owners)
+                .then(|| other_state.configuration.clone())
+        })
 }
 
 /// Keep at most `messages_work_bound(cap)` of `delta`'s messages, the newest

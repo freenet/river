@@ -103,6 +103,14 @@ survives review while being wrong (see the encoding trap in History below). See
   `BTreeMap`/`BTreeSet`. `bincode` (the old wire path) doesn't care about key
   order, so this survived undetected until freenet-core added the
   summary-byte-compare staleness check.
+- **freenet/river#703** (2026-10): several summaries gained a signature or
+  record digest beside the version they carried, so two DIFFERENT records at
+  one version are told apart and converge: the configuration summary is now
+  `(u32, SigDigest)`, the upgrade pointer `Option<(u8, SigDigest)>`, DM purge
+  versions `(u64, SigDigest)` per recipient, secret version ids a
+  `BTreeMap<SecretVersion, SigDigest>`, and `MembersV1::Summary` a
+  `BTreeMap<MemberId, EvidenceDigest>` (one record digest per member). The
+  same value-side rules apply to each; collections stayed `BTreeMap`.
 - **freenet/river#571** (2026-07): the same summary's VALUE then shrank,
   `(u32, Signature)` → `(u32, SigDigest)`, where `SigDigest` is a 128-bit BLAKE3
   digest of the signature serialized as a CBOR byte string. Measured 134.08 →

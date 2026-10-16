@@ -156,8 +156,8 @@ fn member_info_rank(version: u32, signature: &Signature) -> (u32, SigDigest) {
 
 /// Whether `candidate` beats `incumbent` under [`member_info_rank`]'s order.
 ///
-/// THE SINGLE IMPLEMENTATION OF THE TIE RULE. Five sites choose between two
-/// ranked records — [`MemberInfoV1::canonical`],
+/// THE SINGLE IMPLEMENTATION OF THE TIE RULE. Five `member_info` sites choose
+/// between two ranked records — [`MemberInfoV1::canonical`],
 /// [`MemberInfoV1::dedup_to_canonical`], `summarize`, `delta`, and `apply_delta`
 /// — and every one of them must break a tie the SAME way, keeping the incumbent.
 /// They previously each spelled `>` inline, which is one edit away from silent
@@ -168,7 +168,8 @@ fn member_info_rank(version: u32, signature: &Signature) -> (u32, SigDigest) {
 /// branch behaviorally needs a genuine [`SigDigest`] collision.
 ///
 /// Routing all five through here means the rule has one definition and one test
-/// (`outranks_keeps_the_incumbent_on_a_tie`) rather than five prose assertions.
+/// (`outranks_keeps_the_incumbent_on_a_tie`) rather than five prose assertions;
+/// the other ranked records listed below route through it too.
 /// Strict `>` is the rule: **ties keep the incumbent.**
 ///
 /// The other owner- or self-signed singletons that resolve an equal-version
@@ -781,8 +782,10 @@ mod tests {
     /// Left disagreeing, a state holding duplicates would answer `deputies_of`
     /// one way on a freshly-GET'd full state and the other way after the next
     /// `apply_delta` ran dedup.
-    /// [`outranks`] is the single definition of the tie rule that all five rank
-    /// consumers share, so this is the one place it is pinned.
+    /// [`outranks`] is the single definition of the tie rule that every rank
+    /// consumer shares (the five `member_info` sites, and the configuration,
+    /// upgrade pointer and DM purge ranks), so this is the one place it is
+    /// pinned.
     ///
     /// Relaxing `>` to `>=` at any individual call site used to leave the entire
     /// suite green: reaching the tie branch behaviorally needs a genuine
@@ -798,7 +801,7 @@ mod tests {
         // The load-bearing case: equal rank must NOT outrank. `>=` fails here.
         assert!(
             !outranks((1, lo), (1, lo)),
-            "a tie must keep the INCUMBENT — all five consumers depend on this"
+            "a tie must keep the INCUMBENT — every rank consumer depends on this"
         );
 
         // Version dominates the digest in both directions.
