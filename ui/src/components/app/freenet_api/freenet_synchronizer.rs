@@ -413,11 +413,6 @@ impl FreenetSynchronizer {
                         }
                     }
                     SynchronizerMessage::ConnectionLost => {
-                        // No generation reload until the reconnect has caught
-                        // up, and keep the update banner honest about it
-                        // (freenet/river#580). Its banner recompute is deferred
-                        // past this arm.
-                        super::generation_watch::on_disconnected();
                         // Coalesce: if a reconnect is already scheduled this is a
                         // duplicate loss — the socket we're about to drop will
                         // itself fire `onclose` → another ConnectionLost, and the
@@ -432,6 +427,12 @@ impl FreenetSynchronizer {
                                 // Clear the web API so is_connected() returns false
                                 WEB_API.write().take();
                                 *SYNC_STATUS.write() = SynchronizerStatus::Disconnected;
+                                // No generation reload until the reconnect has
+                                // caught up, and keep the update banner honest
+                                // about it (freenet/river#580). Only here, where
+                                // the connection is actually torn down: a
+                                // coalesced duplicate loss changes nothing.
+                                super::generation_watch::on_disconnected();
                                 warn!(
                                     "Connection lost (attempt {}), reconnecting in {}ms",
                                     reconnect.attempt(),
@@ -600,8 +601,16 @@ impl FreenetSynchronizer {
                         reconnect.note_connect_attempt();
                         if connection_manager.is_connected() && WEB_API.read().is_some() {
                             info!("Connect ignored — already connected");
+                            // The connect that made this connection has
+                            // finished (this loop handles one message at a
+                            // time), so the page is caught up (#580).
+                            super::generation_watch::mark_ready();
                             continue;
                         }
+                        // This replaces whatever socket there is and catches up
+                        // again, even with no loss before it (the status can
+                        // read Error on a live socket): not ready until done.
+                        super::generation_watch::on_disconnected();
                         info!("Connecting to Freenet");
                         match connection_manager
                             .initialize_connection(message_tx.clone())

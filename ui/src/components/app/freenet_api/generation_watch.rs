@@ -1001,8 +1001,8 @@ pub fn is_watched(id: &ContractInstanceId) -> bool {
 }
 
 pub use runtime::{
-    is_reloading, note_sync_queued, on_connected, on_disconnected, on_page_visible, reload_now,
-    snooze, UPDATE_NOTICE,
+    is_reloading, mark_ready, note_sync_queued, on_connected, on_disconnected, on_page_visible,
+    reload_now, snooze, UPDATE_NOTICE,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -1161,6 +1161,14 @@ mod runtime {
     pub fn on_disconnected() {
         READY.store(false, Ordering::SeqCst);
         refresh_notice();
+    }
+
+    /// The synchronizer found its connection live and caught up (a Connect it
+    /// skipped as redundant).
+    pub fn mark_ready() {
+        if !READY.swap(true, Ordering::SeqCst) {
+            refresh_notice();
+        }
     }
 
     /// Connected AND caught up. `READY` is set by [`on_connected`], which the
@@ -1571,6 +1579,7 @@ mod runtime {
     }
     pub fn note_sync_queued() {}
     pub fn on_disconnected() {}
+    pub fn mark_ready() {}
     pub fn on_connected() {}
     pub fn on_page_visible() {}
     pub fn reload_now() {}
@@ -2321,7 +2330,7 @@ mod tests {
     fn a_countdown_restarts_after_an_outage() {
         let due = Phase::Countdown {
             due_ms: 1_000,
-            not_before_ms: 0,
+            not_before_ms: 500,
         };
         let offline = Inputs {
             connected: false,
@@ -2329,7 +2338,14 @@ mod tests {
         };
         let (held, reload) = step(due, offline);
         assert!(!reload);
-        assert_eq!(held.due_ms(), Some(50_000 + COUNTDOWN_MS));
+        assert_eq!(
+            held,
+            Phase::Countdown {
+                due_ms: 50_000 + COUNTDOWN_MS,
+                not_before_ms: 500
+            },
+            "pushed out, retry floor kept"
+        );
         // Back online a moment later: still a full countdown to go.
         assert_eq!(step(held, visible(50_001)), (held, false));
         assert_eq!(
@@ -2437,9 +2453,13 @@ mod tests {
             } else {
                 offline(hidden(1_000))
             };
-            // (An offline countdown also keeps its due time ahead of now; see
-            // a_countdown_restarts_after_an_outage.)
-            assert!(!step(phase, i).1, "{phase:?}");
+            let (next, reload) = step(phase, i);
+            assert!(!reload, "{phase:?}");
+            // An offline countdown also keeps its due time ahead of now (see
+            // a_countdown_restarts_after_an_outage); everything else is as it was.
+            if !matches!(phase, Phase::Countdown { .. }) {
+                assert_eq!(next, phase);
+            }
         }
         let due = Phase::Countdown {
             due_ms: 10,
@@ -2864,10 +2884,19 @@ mod tests {
         assert_eq!(code.matches("SynchronizerMessage::Connect").count(), 1);
         assert!(body.contains("SynchronizerMessage::Connect"));
 
-        // Ready only after a reconnect has caught up; not ready on any loss.
-        let lost = hook_block(&sync, "SynchronizerMessage::ConnectionLost =>")
-            .expect("ConnectionLost arm");
+        // Ready only after a reconnect has caught up; not ready on a real loss.
+        // A coalesced duplicate loss (the `None` arm) tears nothing down and
+        // must not clear READY, or nothing would set it again.
+        let lost = hook_block(&sync, "Some(armed) =>").expect("armed ConnectionLost arm");
+        assert!(lost.contains("WEB_API.write().take()"), "the teardown arm");
         assert!(lost.contains("generation_watch::on_disconnected()"));
+        let duplicate = hook_block(&sync, "None =>").expect("duplicate-loss arm");
+        assert!(!duplicate.contains("on_disconnected"));
+        // Teardown arm, before a Connect proceeds, and a failed Connect.
+        assert_eq!(
+            sync.matches("generation_watch::on_disconnected()").count(),
+            3
+        );
         let connect_arm = &sync[connect..];
         let failed = hook_block(connect_arm, "Err(e) =>").expect("failed Connect arm");
         assert!(
@@ -2875,18 +2904,49 @@ mod tests {
                 && failed.contains("generation_watch::on_disconnected()"),
             "a failed Connect must mark the page not ready"
         );
+        let skip = hook_block(
+            connect_arm,
+            "if connection_manager.is_connected() && WEB_API.read().is_some()",
+        )
+        .expect("already-connected skip");
+        assert!(skip.contains("generation_watch::mark_ready()"));
+        let disconnected = hook_block(code, "pub fn on_disconnected()").expect("on_disconnected");
+        assert!(disconnected.contains("READY.store(false"));
+        // on_connected sets READY first, before any early return.
         let connected = hook_block(code, "pub fn on_connected()").expect("on_connected");
-        assert!(connected.contains("READY.store(true"));
-        assert_eq!(
-            code.matches("READY.store(true").count(),
-            1,
-            "set only on_connected"
-        );
-        let ready_ok = hook_block(code, "fn connected()").expect("connected");
+        let set = connected.find("READY.store(true").expect("READY set");
+        let early = connected.find("return").expect("early return");
         assert!(
-            ready_ok.contains("READY.load("),
-            "connected() must require READY"
+            set < early,
+            "READY must be set before on_connected can return"
         );
+        let ready_ok: String = hook_block(code, "fn connected()")
+            .expect("connected")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            ready_ok.contains("{READY.load(Ordering::SeqCst)&&WEB_API.try_read()"),
+            "connected() must require READY AND a socket: {ready_ok}"
+        );
+        // A Connect that goes ahead (no prior loss: the status can read Error
+        // on a live socket) replaces the socket and catches up again; the page
+        // is not ready meanwhile.
+        let connecting = connect_arm
+            .find("generation_watch::on_disconnected();\n                        info!(\"Connecting to Freenet\")");
+        assert!(
+            connecting.is_some(),
+            "a Connect that proceeds must mark the page not ready first"
+        );
+        // reload_now captures the pre-click phase before replacing it.
+        let reload_now_src = hook_block(code, "pub fn reload_now()").expect("reload_now");
+        let captured = reload_now_src
+            .find("let before = state.phase")
+            .expect("capture");
+        let replaced = reload_now_src
+            .find("state.phase = Phase::Reloading")
+            .expect("replace");
+        assert!(captured < replaced);
         // on_connected runs after the rooms are processed, not on socket open.
         let on_conn = sync
             .find("generation_watch::on_connected()")

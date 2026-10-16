@@ -48,9 +48,11 @@ fn banner_text(notice: Notice) -> (String, bool, bool) {
             false,
             false,
         ),
+        // Nothing was posted, so this page keeps working; refreshing only
+        // brings the update.
         Notice::RefreshTab { posted: false } => (
-            "River has been updated but could not reload itself. Refresh this tab to keep \
-             receiving messages."
+            "River has been updated but could not reload itself. Refresh this tab to get the \
+             update."
                 .to_string(),
             false,
             false,
