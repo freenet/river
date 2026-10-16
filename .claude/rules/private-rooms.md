@@ -41,9 +41,13 @@ Two converging paths:
 - Both paths derive the new secret deterministically via
   `river_core::key_derivation::derive_room_secret(seed, owner_vk, new_version)`,
   so they produce **byte-identical** secrets for the same target version.
-  Concurrent rotation by both paths therefore converges via the contract's
-  duplicate-version dedup in `RoomSecretsV1::apply_delta`
-  (`secret.rs:140-145`).
+  Concurrent rotation by both paths therefore converges in
+  `RoomSecretsV1::apply_delta`: the encrypted blobs are byte-identical (a
+  held blob is a no-op), and the two version RECORDS are not (the UI stamps
+  `created_at` with the wall clock, the delegate with `UNIX_EPOCH`), so the
+  record with the greater signature digest wins at that version. Until
+  freenet/river#703 the second record was rejected as "Duplicate secret
+  version", failing the whole delta.
 
 ## Shared rotation back-fill helper (issue #110)
 

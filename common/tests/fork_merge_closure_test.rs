@@ -626,10 +626,12 @@ fn merge(
         STATS.with(|st| {
             let mut st = st.borrow_mut();
             st.merge_rejections += 1;
-            // The one rejection honest peers produce: a ban delta over a
-            // `max_user_bans` the receiver has already lowered (the
-            // `BansV1::apply_delta` flood guard), which ends once the sender
-            // takes the new configuration.
+            // Until freenet/river#703 honest peers produced one rejection: a
+            // ban delta over a `max_user_bans` the receiver had already
+            // lowered (the `BansV1::apply_delta` flood guard). The guard now
+            // has a floor above every shape's cap, so honest merges are never
+            // rejected; the split is kept to name a flood-guard rejection if
+            // one comes back.
             if !e.contains("refusing to process a flood") {
                 st.other_merge_rejections += 1;
             }
@@ -966,8 +968,10 @@ fn honest_forks_always_converge() {
         true,
     );
     assert_eq!(
-        stats.other_merge_rejections, 0,
-        "an honest merge was rejected other than by the flood guard: {stats:?}"
+        stats.merge_rejections,
+        0,
+        "an honest merge was rejected ({} by the flood guard): {stats:?}",
+        stats.merge_rejections - stats.other_merge_rejections
     );
     assert!(
         failures.is_empty(),

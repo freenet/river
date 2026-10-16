@@ -122,8 +122,8 @@ fn member_info_summary_serialization_is_order_independent() {
 
 #[test]
 fn secrets_summary_serialization_is_order_independent() {
-    let version_ids_fwd: Vec<u32> = (0..N as u32).collect();
-    let version_ids_rev: Vec<u32> = (0..N as u32).rev().collect();
+    let version_ids_fwd: Vec<(u32, SigDigest)> = (0..N).map(|i| (i as u32, sig_rank(i))).collect();
+    let version_ids_rev: Vec<(u32, SigDigest)> = version_ids_fwd.iter().rev().copied().collect();
     let member_secrets_fwd: Vec<(u32, MemberId)> =
         (0..N).map(|i| (i as u32, member_id(i))).collect();
     let member_secrets_rev: Vec<(u32, MemberId)> =
@@ -294,8 +294,11 @@ fn top_level_summary_serialization_is_order_independent() {
             .collect();
         let secrets = SecretsSummary {
             current_version: N as u32,
-            version_ids: (0..N as u32)
-                .map(|i| if reversed { N as u32 - 1 - i } else { i })
+            version_ids: (0..N)
+                .map(|i| {
+                    let j = order(i);
+                    (j as u32, sig_rank(j))
+                })
                 .collect(),
             member_secrets: (0..N)
                 .map(|i| {

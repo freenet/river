@@ -3175,14 +3175,22 @@ fn lower_max_user_bans_with_a_stale_peer(held: usize, new_max: usize) -> usize {
     rejected
 }
 
-/// The stale peer's ban delta is over the new `max_user_bans`, which
-/// `BansV1::apply_delta` refuses as a flood, so the updated peer rejects the
-/// stale peer's first merge, as it does on `main`. Once the stale peer has
-/// taken the new configuration and trimmed its bans and evidence, the peers
-/// converge. The evidence itself is never the reason for a rejection.
+/// The stale peer's ban delta is over the new `max_user_bans` but within
+/// `MIN_BANS_DELTA_BOUND`, so the updated peer accepts it and trims it to the
+/// new cap, and the peers converge without a rejection. Until
+/// freenet/river#703 the delta was refused as a flood and the first merge
+/// failed. The evidence itself is never the reason for a rejection.
 #[test]
 fn lowering_max_user_bans_converges_with_a_stale_peer() {
-    assert_eq!(lower_max_user_bans_with_a_stale_peer(6, 2), 1);
+    assert_eq!(lower_max_user_bans_with_a_stale_peer(6, 2), 0);
+}
+
+/// From above `MIN_BANS_DELTA_BOUND` the stale peer's delta is still
+/// refused once, until it takes the new configuration and trims its own set.
+#[test]
+fn lowering_max_user_bans_from_above_the_floor_is_refused_once() {
+    let held = river_core::room_state::ban::MIN_BANS_DELTA_BOUND + 3;
+    assert_eq!(lower_max_user_bans_with_a_stale_peer(held, 2), 1);
 }
 
 /// A member bans the head and the tail of a 1003-deep invite chain under

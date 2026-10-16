@@ -371,8 +371,9 @@ pub(crate) fn handle_contract_notification(
 
     // Determine the new version. We always derive from the notification's
     // current_version + 1 so concurrent rotations across replicas at least
-    // converge on the highest observed version+1; the contract rejects
-    // replays of an existing version with `Duplicate secret version`.
+    // converge on the highest observed version+1; at a version both paths
+    // signed, the contract keeps the record with the greater signature digest
+    // (freenet/river#703).
     //
     // Hard-error and bail on overflow: silently wrapping `u32::MAX -> 0` would
     // collide with the existing version-0 record and reuse a key the

@@ -1,4 +1,5 @@
 use crate::room_state::member::MemberId;
+use crate::room_state::member_info::{outranks, sig_digest, SigDigest};
 use crate::room_state::privacy::{RoomCipherSpec, SecretVersion};
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, verify_struct};
@@ -6,7 +7,7 @@ use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::SystemTime;
 
 /// Room secrets state managing encrypted secret distribution
@@ -62,8 +63,21 @@ impl ComposableState for RoomSecretsV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        let version_ids: BTreeSet<SecretVersion> =
-            self.versions.iter().map(|v| v.record.version).collect();
+        // One entry per version: the highest-ranked record's digest, the one
+        // `apply_delta` keeps (a stored state holds one record per version,
+        // but `verify` does not require it).
+        let mut version_ids: BTreeMap<SecretVersion, SigDigest> = BTreeMap::new();
+        for v in &self.versions {
+            let digest = v.digest();
+            version_ids
+                .entry(v.record.version)
+                .and_modify(|held| {
+                    if outranks(digest, *held) {
+                        *held = digest;
+                    }
+                })
+                .or_insert(digest);
+        }
 
         let member_secrets: BTreeSet<(SecretVersion, MemberId)> = self
             .encrypted_secrets
@@ -87,7 +101,12 @@ impl ComposableState for RoomSecretsV1 {
         let new_versions: Vec<AuthorizedSecretVersionRecord> = self
             .versions
             .iter()
-            .filter(|v| !old_state_summary.version_ids.contains(&v.record.version))
+            .filter(|v| {
+                old_state_summary
+                    .version_ids
+                    .get(&v.record.version)
+                    .is_none_or(|held| outranks(v.digest(), *held))
+            })
             .cloned()
             .collect();
 
@@ -140,30 +159,60 @@ impl ComposableState for RoomSecretsV1 {
         let mut working = self.clone();
 
         if let Some(delta) = delta {
-            // Verify and stage new version records
+            // Verify and stage new version records.
+            //
+            // At a version this peer already holds, the record with the
+            // greater signature digest wins and the other is a no-op
+            // (freenet/river#703). A re-delivery (the identical record, from a
+            // delta computed against a stale summary) is therefore a no-op,
+            // and two records at one version converge. That happens without
+            // any fault: the UI's rotation stamps `created_at` with the wall
+            // clock and the delegate's with `UNIX_EPOCH`, so the two paths
+            // sign different records for the same version, and this used to
+            // reject the whole delta ("Duplicate secret version"). The record
+            // carries no secret material (the secret is derived from the owner
+            // key and the version, and travels in the encrypted blobs), so
+            // which record wins changes nothing a member can read.
             for version_record in &delta.new_versions {
+                let version = version_record.record.version;
+                let held = working
+                    .versions
+                    .iter()
+                    .position(|v| v.record.version == version);
+                if let Some(idx) = held {
+                    if !outranks(version_record.digest(), working.versions[idx].digest()) {
+                        continue;
+                    }
+                }
+
                 version_record
                     .verify_signature(&parameters.owner)
                     .map_err(|e| format!("Invalid version record signature in delta: {}", e))?;
 
-                // Check for duplicate version
-                if working
-                    .versions
-                    .iter()
-                    .any(|v| v.record.version == version_record.record.version)
-                {
-                    return Err(format!(
-                        "Duplicate secret version: {}",
-                        version_record.record.version
-                    ));
+                match held {
+                    Some(idx) => working.versions[idx] = version_record.clone(),
+                    None => working.versions.push(version_record.clone()),
                 }
-
-                working.versions.push(version_record.clone());
             }
 
             // Verify and stage new encrypted secrets
             let members_by_id = parent_state.members.members_by_member_id();
             for encrypted_secret in &delta.new_encrypted_secrets {
+                // Held byte for byte: a re-delivery, a no-op (freenet/river#703
+                // defect 2). Both rotation paths build blobs with the shared,
+                // deterministic `build_rotation_encrypted_secrets`, so a
+                // concurrent rotation also lands here. A DIFFERENT blob for a
+                // held (version, member) is still rejected below: it can only
+                // encrypt a different secret, there is no tie-break that keeps
+                // the blobs and the messages at that version consistent, and
+                // the summary carries only (version, member). Rejecting keeps
+                // the merge-law verifier at "inconclusive" for such a pair
+                // instead of a silent, non-commutative pick. Scoped out of
+                // #703.
+                if working.encrypted_secrets.contains(encrypted_secret) {
+                    continue;
+                }
+
                 encrypted_secret
                     .verify_signature(&parameters.owner)
                     .map_err(|e| format!("Invalid encrypted secret signature in delta: {}", e))?;
@@ -203,15 +252,14 @@ impl ComposableState for RoomSecretsV1 {
                 working.encrypted_secrets.push(encrypted_secret.clone());
             }
 
-            // Update current version if provided
-            if let Some(new_version) = delta.current_version {
-                if new_version <= working.current_version {
-                    return Err(format!(
-                        "New current version {} must be greater than existing version {}",
-                        new_version, working.current_version
-                    ));
-                }
-
+            // Update current version if provided. One at or below the held
+            // version is a no-op: `current_version` only moves up, and a delta
+            // computed against a stale summary of this peer carries an older
+            // one (freenet/river#703 defect 2).
+            if let Some(new_version) = delta
+                .current_version
+                .filter(|v| *v > working.current_version)
+            {
                 // Verify the new version exists in versions
                 if !working
                     .versions
@@ -256,7 +304,11 @@ pub struct SecretsSummary {
     // two identical secret sets summarize to different bytes → spurious
     // anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
     // and freenet/freenet-core#4857.
-    pub version_ids: BTreeSet<SecretVersion>,
+    ///
+    /// Each held version with its record's signature digest, so two
+    /// different records at one version are told apart and converge
+    /// (freenet/river#703). Changing this type re-keys the contract.
+    pub version_ids: BTreeMap<SecretVersion, SigDigest>,
     pub member_secrets: BTreeSet<(SecretVersion, MemberId)>,
 }
 
@@ -284,6 +336,12 @@ pub struct AuthorizedSecretVersionRecord {
 }
 
 impl AuthorizedSecretVersionRecord {
+    /// The signature digest that breaks a tie between two records at one
+    /// version (greater wins).
+    pub fn digest(&self) -> SigDigest {
+        sig_digest(&self.owner_signature)
+    }
+
     pub fn new(record: SecretVersionRecordV1, owner_signing_key: &SigningKey) -> Self {
         let signature = sign_struct(&record, owner_signing_key);
         Self {
@@ -752,8 +810,8 @@ mod tests {
         let summary = secrets.summarize(&state, &params);
         assert_eq!(summary.current_version, 2);
         assert_eq!(summary.version_ids.len(), 2);
-        assert!(summary.version_ids.contains(&1));
-        assert!(summary.version_ids.contains(&2));
+        assert!(summary.version_ids.contains_key(&1));
+        assert!(summary.version_ids.contains_key(&2));
         assert_eq!(summary.member_secrets.len(), 2);
         assert!(summary.member_secrets.contains(&(1, owner_id)));
         assert!(summary.member_secrets.contains(&(2, owner_id)));
@@ -785,7 +843,7 @@ mod tests {
 
         let old_summary = SecretsSummary {
             current_version: 0,
-            version_ids: BTreeSet::new(),
+            version_ids: BTreeMap::new(),
             member_secrets: BTreeSet::new(),
         };
 
@@ -815,10 +873,12 @@ mod tests {
 
         let mut old_summary = SecretsSummary {
             current_version: 1,
-            version_ids: BTreeSet::new(),
+            version_ids: BTreeMap::new(),
             member_secrets: BTreeSet::new(),
         };
-        old_summary.version_ids.insert(1);
+        old_summary
+            .version_ids
+            .insert(1, secrets.versions[0].digest());
         old_summary.member_secrets.insert((1, owner_id));
 
         let delta = secrets.delta(&state, &params, &old_summary).unwrap();
@@ -849,25 +909,38 @@ mod tests {
         assert_eq!(secrets.encrypted_secrets.len(), 1);
     }
 
+    /// A second record at a held version never duplicates the version: one
+    /// record per version is kept (the higher-ranked one), and the delta is
+    /// not rejected over it (freenet/river#703).
     #[test]
-    fn test_apply_delta_rejects_duplicate_version() {
+    fn test_apply_delta_keeps_one_record_per_version() {
         let (state, params, owner_sk) = create_test_state_and_params();
 
         let mut secrets = RoomSecretsV1 {
             current_version: 1,
             ..Default::default()
         };
-        secrets.versions.push(create_version_record(1, &owner_sk));
+        let held = create_version_record(1, &owner_sk);
+        secrets.versions.push(held.clone());
 
+        let mut other = held.record.clone();
+        other.created_at += std::time::Duration::from_secs(1);
+        let other = AuthorizedSecretVersionRecord::new(other, &owner_sk);
         let delta = SecretsDelta {
             current_version: None,
-            new_versions: vec![create_version_record(1, &owner_sk)], // Duplicate!
+            new_versions: vec![other.clone()],
             new_encrypted_secrets: vec![],
         };
 
-        let result = secrets.apply_delta(&state, &params, &Some(delta));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Duplicate secret version"));
+        secrets
+            .apply_delta(&state, &params, &Some(delta))
+            .expect("a record at a held version must not fail the delta");
+        let want = if other.digest() > held.digest() {
+            other
+        } else {
+            held
+        };
+        assert_eq!(secrets.versions, vec![want]);
     }
 
     #[test]
@@ -936,15 +1009,95 @@ mod tests {
             .encrypted_secrets
             .push(create_encrypted_secret(owner_id, 1, &owner_sk));
 
+        // The identical blob again is a re-delivery: a no-op, not an error
+        // (freenet/river#703).
+        let before = secrets.clone();
         let delta = SecretsDelta {
             current_version: None,
             new_versions: vec![],
-            new_encrypted_secrets: vec![create_encrypted_secret(owner_id, 1, &owner_sk)], // Duplicate!
+            new_encrypted_secrets: vec![create_encrypted_secret(owner_id, 1, &owner_sk)],
         };
+        secrets
+            .apply_delta(&state, &params, &Some(delta))
+            .expect("re-delivering a held blob must not fail");
+        assert_eq!(secrets, before);
 
+        // A DIFFERENT blob for the same (version, member) is still rejected:
+        // there is no clean tie-break between two owner devices' secrets.
+        let mut other = create_encrypted_secret(owner_id, 1, &owner_sk).secret;
+        other.ciphertext = vec![9, 9, 9];
+        let delta = SecretsDelta {
+            current_version: None,
+            new_versions: vec![],
+            new_encrypted_secrets: vec![AuthorizedEncryptedSecretForMember::new(other, &owner_sk)],
+        };
         let result = secrets.apply_delta(&state, &params, &Some(delta));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Duplicate encrypted secret"));
+    }
+
+    /// A held version record re-delivered is a no-op; of two different
+    /// records at one version the greater signature digest wins, from either
+    /// side (freenet/river#703).
+    #[test]
+    fn test_apply_delta_redelivered_version_record_is_a_no_op() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let record = create_version_record(1, &owner_sk);
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            versions: vec![record.clone()],
+            ..Default::default()
+        };
+        let before = secrets.clone();
+        let delta = SecretsDelta {
+            current_version: Some(1),
+            new_versions: vec![record.clone()],
+            new_encrypted_secrets: vec![],
+        };
+        secrets
+            .apply_delta(&state, &params, &Some(delta))
+            .expect("re-delivering a held record must not fail");
+        assert_eq!(secrets, before);
+
+        let mut different = record.record.clone();
+        different.created_at += std::time::Duration::from_secs(1);
+        let different = AuthorizedSecretVersionRecord::new(different, &owner_sk);
+        let (hi, lo) = if different.digest() > record.digest() {
+            (different, record)
+        } else {
+            (record, different)
+        };
+        for (held, incoming) in [(lo.clone(), hi.clone()), (hi.clone(), lo.clone())] {
+            let mut secrets = RoomSecretsV1 {
+                current_version: 1,
+                versions: vec![held.clone()],
+                ..Default::default()
+            };
+            let summary = secrets.summarize(&state, &params);
+            let sender = RoomSecretsV1 {
+                current_version: 1,
+                versions: vec![incoming.clone()],
+                ..Default::default()
+            };
+            let delta = sender.delta(&state, &params, &summary);
+            assert_eq!(
+                delta.is_some(),
+                incoming == hi,
+                "only the winner is offered"
+            );
+            secrets
+                .apply_delta(
+                    &state,
+                    &params,
+                    &Some(SecretsDelta {
+                        current_version: None,
+                        new_versions: vec![incoming],
+                        new_encrypted_secrets: vec![],
+                    }),
+                )
+                .expect("an equal-version record must not fail the delta");
+            assert_eq!(secrets.versions, vec![hi.clone()]);
+        }
     }
 
     #[test]
@@ -958,17 +1111,19 @@ mod tests {
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets.versions.push(create_version_record(2, &owner_sk));
 
+        // A lower current version never moves it backward. It is a no-op
+        // rather than an error: a delta computed against a stale summary
+        // carries one (freenet/river#703).
         let delta = SecretsDelta {
-            current_version: Some(1), // Can't go backward!
+            current_version: Some(1),
             new_versions: vec![],
             new_encrypted_secrets: vec![],
         };
 
-        let result = secrets.apply_delta(&state, &params, &Some(delta));
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("must be greater than existing version"));
+        secrets
+            .apply_delta(&state, &params, &Some(delta))
+            .expect("an older current version is a no-op");
+        assert_eq!(secrets.current_version, 2);
     }
 
     #[test]

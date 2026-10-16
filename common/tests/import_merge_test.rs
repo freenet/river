@@ -5,7 +5,6 @@
 
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::util::FastHash;
-use freenet_scaffold::ComposableState;
 use rand::rngs::OsRng;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
