@@ -758,6 +758,54 @@ impl SnapshotDmSeen {
     }
 }
 
+/// The identity each room is held under, taken just before a merge, so the
+/// rooms whose identity the merge REPLACED (a newer generation adopted another
+/// `self_sk`) can be re-seeded afterwards (freenet/river#801, Codex review).
+///
+/// `DM_LAST_SEEN` is keyed only by `(room, peer)`, and every write to it is a
+/// max-merge, so cutoffs seeded or advanced under the replaced identity would
+/// otherwise apply to the adopted one and hide its unread DMs. Same remedy as
+/// the identity-import path: [`reseed_dm_last_seen_for_room`].
+pub(crate) struct IdentityWatch(HashMap<VerifyingKey, VerifyingKey>);
+
+impl IdentityWatch {
+    pub(crate) fn before(rooms: &crate::room_data::Rooms) -> Self {
+        Self(
+            rooms
+                .map
+                .iter()
+                .filter_map(|(room, data)| Some((*room, data.self_verifying_key()?)))
+                .collect(),
+        )
+    }
+
+    /// Rooms held before AND after under two different known identities.
+    pub(crate) fn replaced_in(&self, after: &crate::room_data::Rooms) -> Vec<VerifyingKey> {
+        self.0
+            .iter()
+            .filter(|(room, was)| {
+                after
+                    .map
+                    .get(room)
+                    .and_then(|r| r.self_verifying_key())
+                    .is_some_and(|now| now != **was)
+            })
+            .map(|(room, _)| *room)
+            .collect()
+    }
+
+    /// Re-seed every replaced room's cutoffs from its adopted identity.
+    /// Deferred, because the caller is inside `ROOMS.with_mut` and the
+    /// re-seed reads `ROOMS`; any snapshot advance for the room is deferred
+    /// earlier in the same pass, so the re-seed (which REPLACES the room's
+    /// cutoffs) lands last.
+    pub(crate) fn reseed_replaced(self, after: &crate::room_data::Rooms) {
+        for room in self.replaced_in(after) {
+            crate::util::defer(move || reseed_dm_last_seen_for_room(room));
+        }
+    }
+}
+
 /// Raise each `(room, peer)` cutoff in `seen` to the one in `updates` where
 /// that is later. Never lowers one.
 pub(crate) fn apply_dm_last_seen_advance(
@@ -1491,6 +1539,33 @@ mod tests {
         );
     }
 
+    /// Codex review: a merge that REPLACES a room's identity must be detected,
+    /// so the replaced identity's cutoffs (seeded or advanced) are re-seeded
+    /// rather than left to suppress the adopted identity's unread DMs. A room
+    /// new to the map, or one whose identity did not change, is not replaced.
+    #[test]
+    fn identity_watch_reports_only_replaced_identities() {
+        let owner = fixed_sk(71);
+        let other_owner = fixed_sk(72);
+        let a = fixed_sk(73);
+        let b = fixed_sk(74);
+        let owner_vk = owner.verifying_key();
+
+        let before = make_rooms(&owner, &a, &[]);
+        let watch = IdentityWatch::before(&before);
+        assert!(watch.replaced_in(&before).is_empty(), "unchanged");
+        assert_eq!(
+            watch.replaced_in(&make_rooms(&owner, &b, &[])),
+            vec![owner_vk]
+        );
+        assert!(
+            IdentityWatch::before(&empty_rooms())
+                .replaced_in(&make_rooms(&other_owner, &b, &[]))
+                .is_empty(),
+            "a room the merge newly added replaced nothing"
+        );
+    }
+
     /// Both frozen-snapshot merge sites must capture through
     /// `SnapshotDmSeen::for_merge` BEFORE the merge and advance from what
     /// landed AFTER it. Source pin, scoped to each site's function body: the
@@ -1524,6 +1599,16 @@ mod tests {
             .find("advance_dm_last_seen(snapshot_dm_seen.landed_in(current_rooms)")
             .expect("the hydrate must advance from what landed");
         assert!(capture < merge && merge < advance);
+        let watch = hydrate
+            .find("IdentityWatch::before(current_rooms)")
+            .expect("the hydrate must watch identities before the merge");
+        let reseed = hydrate
+            .find("identity_watch.reseed_replaced(current_rooms)")
+            .expect("the hydrate must re-seed replaced identities");
+        assert!(
+            watch < merge && advance < reseed,
+            "re-seed lands after the advance"
+        );
 
         let walk = squash(body(
             include_str!("app/freenet_api/delegate_migration.rs"),
@@ -1541,6 +1626,13 @@ mod tests {
             .find("advance_dm_last_seen(snapshot_dm_seen.landed_in(current)")
             .expect("the walk must advance from what landed");
         assert!(capture < merge && merge < advance);
+        let watch = walk
+            .find("IdentityWatch::before(current)")
+            .expect("the walk must watch identities before the merge");
+        let reseed = walk
+            .find("identity_watch.reseed_replaced(current)")
+            .expect("the walk must re-seed replaced identities");
+        assert!(watch < merge && advance < reseed);
     }
 
     fn sample_outbound_entry(

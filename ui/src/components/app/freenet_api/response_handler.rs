@@ -1800,6 +1800,8 @@ fn hydrate_loaded_rooms_with_authority(
     let loaded_keys = room_keys.clone();
     crate::util::defer(move || {
         ROOMS.with_mut(|current_rooms| {
+            let identity_watch =
+                crate::components::direct_messages::IdentityWatch::before(current_rooms);
             // Ranked by SOURCE, not arrival order (freenet/river#527): the
             // legacy fan-out hydrates from every delegate generation at once,
             // so an identity conflict is decided by which generation the copy
@@ -1830,6 +1832,7 @@ fn hydrate_loaded_rooms_with_authority(
                     snapshot_dm_seen.landed_in(current_rooms),
                 );
             }
+            identity_watch.reseed_replaced(current_rooms);
             // freenet/river#590: tell the SAVE path about any room the ranked
             // merge just brought back. It cannot infer it — `MergeRanks` is never
             // persisted and `RoomSlot::Tombstone` carries no rank, so

@@ -1261,6 +1261,8 @@ impl RiverImportSeam for LiveImportSeam {
                 return;
             }
             let result = crate::components::app::ROOMS.with_mut(|current| {
+                let identity_watch =
+                    crate::components::direct_messages::IdentityWatch::before(current);
                 let merged = chat_delegate::with_identity_source_ranks(|ranks| {
                     apply_recovered_rooms(current, rooms, source_rank, ranks)
                 });
@@ -1274,6 +1276,7 @@ impl RiverImportSeam for LiveImportSeam {
                         snapshot_dm_seen.landed_in(current),
                     );
                 }
+                identity_watch.reseed_replaced(current);
                 merged
             });
             // A ranked resurrection must be visible to the SAVE path, exactly
