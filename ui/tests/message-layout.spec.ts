@@ -39,19 +39,26 @@ test.describe("Edit box width (#205)", () => {
   });
 });
 
-// #207: hovering a reply strip must not change the width of its message.
+// #207: hovering a reply strip expands its preview in place. The strip must
+// stay inside the content column, the column must keep its width, and the
+// history must not scroll sideways. The self reply to the long URL is the
+// worst case: its unbreakable preview is wider than the column at 480px.
 test.describe("Reply strip layout (#207)", () => {
   test.use({ viewport: { width: 480, height: 900 } });
 
-  test("hovering the reply strip does not change the message width", async ({
+  test("a hovered reply strip expands inside the content column", async ({
     page,
   }, testInfo) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    const replyStrip = page.locator(".reply-strip").first();
+    const replyStrip = page
+      .locator(".reply-strip")
+      .filter({ hasText: "longlongurl" })
+      .first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
+    await replyStrip.scrollIntoViewIfNeeded();
 
     // The hover-expand CSS is gated behind
     // `@media (hover: hover) and (pointer: fine)`, which evaluates false
@@ -69,32 +76,33 @@ test.describe("Reply strip layout (#207)", () => {
       `(hover: hover) and (pointer: fine) is false in this browser (project: ${testInfo.project.name}); the hover-expand CSS is suppressed and there is nothing to exercise`
     );
 
-    const replyRow = replyStrip.locator(
-      "xpath=ancestor::*[@data-testid='message-row'][1]"
-    );
+    const measure = () =>
+      replyStrip.evaluate((el) => {
+        const strip = el.getBoundingClientRect();
+        const column = el.closest(".msg-content")!.getBoundingClientRect();
+        const scroller = document.getElementById("chat-scroll-container")!;
+        return {
+          strip: [strip.left, strip.right],
+          column: [column.left, column.right],
+          height: strip.height,
+          sideways: scroller.scrollWidth - scroller.clientWidth,
+        };
+      });
 
-    const widthBefore = await replyRow.evaluate(
-      (el) => el.getBoundingClientRect().width
-    );
-
-    // Move mouse to the origin first to ensure no prior hover state
-    // affects the measurement, then hover the reply strip.
     await page.mouse.move(0, 0);
+    const before = await measure();
     await replyStrip.hover();
-    // Poll until the computed `white-space` flips to `normal`, which
-    // proves the hover CSS actually engaged.
+    // The expansion engaged: the preview wraps onto more lines.
     await expect
-      .poll(async () =>
-        replyStrip.evaluate((el) => getComputedStyle(el).whiteSpace)
-      )
-      .toMatch(/normal/);
+      .poll(async () => (await measure()).height)
+      .toBeGreaterThan(before.height);
+    const after = await measure();
 
-    const widthAfter = await replyRow.evaluate(
-      (el) => el.getBoundingClientRect().width
-    );
-
-    // Width must not change when the reply strip expands on hover.
-    expect(Math.abs(widthAfter - widthBefore)).toBeLessThanOrEqual(0.5);
+    expect(after.column[0]).toBeCloseTo(before.column[0], 0);
+    expect(after.column[1]).toBeCloseTo(before.column[1], 0);
+    expect(after.strip[0]).toBeGreaterThanOrEqual(after.column[0] - 0.5);
+    expect(after.strip[1]).toBeLessThanOrEqual(after.column[1] + 0.5);
+    expect(after.sideways).toBeLessThanOrEqual(0);
   });
 });
 
