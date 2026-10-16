@@ -51,14 +51,20 @@ This file enumerates the Freenet contracts and delegates published from this rep
     take `delta_from_merged_summary`.
   - `apply_delta` returns `Ok` where it used to return `Err` for validly
     signed records the room does not admit (re-delivered records, a second
-    record at a held version, a configuration that fails the value checks, a
-    record for a member id already held, a public message in a private room,
-    a ban its known issuer's key does not verify): they are skipped, so a
-    merge with a peer holding one no longer fails.
+    record at a held version, a record for a member id already held, a
+    public message in a private room) and for a ban its known issuer's key
+    does not verify: they are skipped, so a merge with a peer holding one no
+    longer fails.
+  - A configuration that fails the value checks is ranked below every valid
+    one rather than refused: a held one is replaced by any valid
+    configuration or by an invalid one of higher rank, and is never dropped.
   - The room holds member nicknames only to a fixed 1000-byte ceiling
     (`NICKNAME_CEILING`); `max_nickname_size` is a client rule, checked with
-    `nickname_refusal` before signing. `Configuration::signing_refusal` is
-    the check to run before signing a configuration.
+    `nickname_refusal` before signing a nickname (on join as well as on
+    edit). Before signing a configuration, call
+    `Configuration::normalize_for_signing` and then
+    `Configuration::signing_refusal`; before creating a room,
+    `configuration::new_room_refusal`.
 - Every contract/delegate here can re-key on any release (see the Migration notes above) — **a build-time-constant reference to a key will silently go stale.** Resolve a pointer instead; see below.
 
 ## Stable identity: resolve a pointer, do not pin a key

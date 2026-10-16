@@ -18,10 +18,17 @@ forks rooms between peers. These rules hold the room contract to them.
 key it could be checked against verifies) or a work bound exceeded. A record
 that is validly signed but that the room does not admit (over a cap, at an
 unknown secret version, a public message in a private room, a second record
-for a member id this peer already holds, a configuration that fails the value
-checks) is SKIPPED on arrival and dropped where held, by the same rule in both
-places. An `Err` for such a record fails every merge with a peer holding it,
-in one direction only, and nothing but its author can repair it.
+for a member id this peer already holds) is SKIPPED on arrival and dropped
+where held, by the same rule in both places. So is a ban whose known
+issuer's key does not verify it: another peer may not know that issuer. An
+`Err` for such a record fails every merge with a peer holding it, in one
+direction only, and nothing but its author can repair it.
+
+A configuration that fails the value checks is the one record that is never
+dropped: an owner-signed one ranks below every valid configuration, so a
+held one is replaced by any valid configuration, or by an invalid one of
+higher rank, and an arriving one that does not outrank the held one is
+skipped. A configuration the owner did not sign is never offered.
 
 ## Use the room's own merge
 
