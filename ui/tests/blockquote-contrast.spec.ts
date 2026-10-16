@@ -3,13 +3,8 @@ import { contrast, luminance, selectRoom, waitForApp } from "./example-room";
 import { openMemberInfoForFirstNonSelf } from "./invite-picker";
 
 // Regression test: quoted text (`> …` Markdown) in a message must stay
-// legible, and must not invert against the surface it sits on.
-//
-// The reported bug was in the old solid-blue SENT bubble, where the quote
-// painted near-black beside white text (3.52:1). Messages now share one row
-// layout on the conversation background, so own and received rows render the
-// same quote surface: a received row is checked, in both colour schemes,
-// together with the tinted outgoing DM bubble.
+// legible and not invert against its surface (once 3.52:1 in the old sent
+// bubble). A received row and the tinted outgoing DM bubble, in both schemes.
 //
 // The Rust pins in `conversation/markdown.rs` assert the declaration TEXT. This spec
 // asserts what a reader actually sees: it puts a quote in a REAL rendered
@@ -127,11 +122,8 @@ async function sampleQuote(page: Page, surface: Surface): Promise<Sample> {
       if (!history) throw new Error("no conversation-history container");
 
       // A message body in a received row.
-      const prose = Array.from(
-        history.querySelectorAll('[data-testid="message-body"] .prose')
-      ).find(
-        (el) =>
-          el.closest("[data-message-self]")?.getAttribute("data-message-self") === "false"
+      const prose = history.querySelector(
+        '[data-message-self="false"] [data-testid="message-body"] .prose'
       );
       if (!prose) throw new Error("no received message with a .prose body");
 

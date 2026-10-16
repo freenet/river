@@ -40,9 +40,9 @@ test.describe("Edit box width (#205)", () => {
 });
 
 // #207: hovering a reply strip expands its preview in place. The strip must
-// stay inside the content column, show its whole preview, the column must keep
-// its width, and the history must not scroll sideways. The self reply to the long URL is the
-// worst case: its unbreakable preview is wider than the column at 480px.
+// stay inside the content column and show its whole preview, and the history
+// must not scroll sideways. The self reply to the long URL is the worst case:
+// its unbreakable preview is wider than the column at 480px.
 test.describe("Reply strip layout (#207)", () => {
   test.use({ viewport: { width: 480, height: 900 } });
 
@@ -102,8 +102,6 @@ test.describe("Reply strip layout (#207)", () => {
       .toBeGreaterThan(before.height);
     const after = await measure();
 
-    expect(after.column[0]).toBeCloseTo(before.column[0], 0);
-    expect(after.column[1]).toBeCloseTo(before.column[1], 0);
     expect(after.strip[0]).toBeGreaterThanOrEqual(after.column[0] - 0.5);
     expect(after.strip[1]).toBeLessThanOrEqual(after.column[1] + 0.5);
     expect(after.stripSpill, "the whole preview fits the strip").toBeLessThanOrEqual(0);

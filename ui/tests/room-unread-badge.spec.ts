@@ -246,9 +246,8 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
       const c = document.getElementById("chat-scroll-container")!;
       const rows = c.querySelectorAll("[data-item-key]");
       const newest = rows[rows.length - 1];
-      const messages = newest.querySelectorAll("[data-anchor-key]");
-      const message = messages.length ? messages[messages.length - 1] : newest;
-      const content = message.querySelector(".msg-content") ?? message;
+      const contents = newest.querySelectorAll(".msg-content");
+      const content = contents[contents.length - 1] ?? newest;
       return content.getBoundingClientRect().bottom - c.getBoundingClientRect().bottom;
     });
   }

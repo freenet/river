@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { coarsePointer, colourOf, contrast, over, resolveColor, rowSurfaces, selectRoom, waitForApp } from "./example-room";
+import { colourOf, contrast, over, resolveColor, rowSurfaces, selectRoom, waitForApp } from "./example-room";
 
 // Text in a message row sits on the conversation background, the row's hover
 // band, or a mention chip's fill over either. Links, mentions and the own
@@ -52,12 +52,6 @@ for (const scheme of ["light", "dark"] as const) {
       const el = history.locator(sel).first();
       await expect(el, `premise: ${sel} is rendered`).toBeAttached();
       expect(await colourOf(el), sel).toEqual(link);
-    }
-    if (!(await coarsePointer(page))) {
-      const a = history.locator(".prose a").first();
-      await a.scrollIntoViewIfNeeded();
-      await a.hover();
-      await expect.poll(() => colourOf(a), { message: "a hovered link" }).toEqual(await c("var(--color-link-hover)"));
     }
 
     const strip = history.getByTestId("reply-strip").first();

@@ -29,12 +29,8 @@ async function openDmThreadModal(page: Page) {
 
   // The member list is rendered after the room hydrates; wait for at
   // least one member row to appear before counting.
-  await page
-    .getByTestId("member-list")
-    .locator('button[title^="Member ID"]')
-    .first()
-    .waitFor({ state: "visible", timeout: 5_000 })
-    .catch(() => undefined);
+  const memberButtons = page.getByTestId("member-list").locator('button[title^="Member ID"]');
+  await memberButtons.first().waitFor({ state: "visible", timeout: 5_000 }).catch(() => undefined);
 
   // Member rows are buttons keyed by `title="Member ID: …"`
   // (members.rs:341). Example-data populates them with random names each
@@ -42,7 +38,6 @@ async function openDmThreadModal(page: Page) {
   // user — who is pinned to index 0 since freenet/river#584, though this
   // scan deliberately does not depend on that. Pick the first member
   // whose text doesn't include "(You)".
-  const memberButtons = page.getByTestId("member-list").locator('button[title^="Member ID"]');
   const count = await memberButtons.count();
   let clicked = false;
   for (let i = 0; i < count; i++) {
