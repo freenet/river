@@ -983,8 +983,9 @@ fn assert_floors(mode: Mode, stats: &Stats, required: &[&str], all_accepted: boo
     }
 }
 
-/// Honest divergence: every fork pair must fully converge. `FORK_SEEDS=N` runs
-/// more (0 of 3000 failed at N=1000).
+/// Honest divergence: every fork pair must fully converge, with the first
+/// exchange already commutative and no merge rejected. `FORK_SEEDS=N` runs
+/// more (0 of 4000 failed at N=1000, freenet/river#703).
 #[test]
 fn honest_forks_always_converge() {
     let seeds = default_seeds(seeds_from_env(3));
@@ -996,16 +997,18 @@ fn honest_forks_always_converge() {
         &["bans1", "config", "info", "members+info+msgs", "msgs"],
         true,
     );
+    // The full report first: it names every failing pair and its cause,
+    // which a bare rejection count does not.
+    assert!(
+        failures.is_empty(),
+        "{}",
+        failures.report("honest", seeds.len())
+    );
     assert_eq!(
         stats.merge_rejections,
         0,
         "an honest merge was rejected ({} by the flood guard): {stats:?}",
         stats.merge_rejections - stats.other_merge_rejections
-    );
-    assert!(
-        failures.is_empty(),
-        "{}",
-        failures.report("honest", seeds.len())
     );
 }
 
@@ -1095,6 +1098,21 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
 #[test]
 fn colliding_owner_configurations_converge() {
     let seeds = default_seeds(seeds_from_env(3));
+    // The mode is only a test of equal-version configurations if it produces
+    // them: count the pairs that end their forks holding two different
+    // configurations at one version.
+    let colliding = seeds
+        .iter()
+        .filter(|&&(seed, shape)| {
+            let (_, a, b) = fork_pair(seed, SHAPES[shape], Mode::Collide);
+            let (ca, cb) = (&a.configuration, &b.configuration);
+            ca.configuration.configuration_version == cb.configuration.configuration_version
+                && ca != cb
+        })
+        .count();
+    let _ = take_stats();
+    drain_not_idempotent();
+    assert!(colliding > 0, "no fork pair held colliding configurations");
     let failures = endings(Mode::Collide, &seeds);
     let stats = take_stats();
     assert_floors(
@@ -1141,6 +1159,7 @@ fn stale_summary_deltas_apply() {
     let mut rejected: std::collections::BTreeMap<String, usize> = Default::default();
     let mut examples: Vec<String> = Vec::new();
     let mut applied = 0usize;
+    let mut changed = 0usize;
     for mode in [
         Mode::Honest,
         Mode::Adversarial,
@@ -1164,6 +1183,22 @@ fn stale_summary_deltas_apply() {
                     Ok(()) => {
                         applied += 1;
                         check_idempotent(&r, &w.params, "stale apply");
+                        if ser(&r) != ser(receiver) {
+                            changed += 1;
+                        }
+                        // What the stale delta left must still converge with
+                        // the sender, the first exchange already commutative:
+                        // a delta that applied by silently dropping records
+                        // would pass the checks above and fail here.
+                        let (end, not_commutative) = ending(&w, &r, sender);
+                        if !matches!(end, Ending::Converged) || not_commutative.is_some() {
+                            *rejected
+                                .entry(format!(
+                                    "after a stale apply, no clean convergence ({})",
+                                    not_commutative.unwrap_or_default()
+                                ))
+                                .or_default() += 1;
+                        }
                     }
                     Err(e) => {
                         *rejected.entry(reason_class(&e)).or_default() += 1;
@@ -1186,6 +1221,10 @@ fn stale_summary_deltas_apply() {
     }
     let _ = take_stats();
     assert!(applied > 0, "no stale delta was produced");
+    assert!(
+        changed > 0,
+        "no stale delta changed its receiver ({applied} applied)"
+    );
     assert!(
         rejected.is_empty(),
         "stale-summary deltas rejected ({} applied), by cause: {:#?}\nexamples:\n{}",
