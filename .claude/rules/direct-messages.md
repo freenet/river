@@ -76,7 +76,13 @@ seeds `DM_LAST_SEEN` from the max inbound DM timestamp per
 `(room, peer)` exactly once on first hydration; a one-shot
 `DM_LAST_SEEN_SEEDED` flag prevents re-seeding — otherwise every
 arriving inbound DM would be instantly marked seen and never surface as
-unread.
+unread. A frozen delegate snapshot merged later (`MergeAuthority::OlderSnapshot`:
+a legacy generation, the crate walk's import, the `rooms_data` blob) also
+advances the cutoffs, max-merged, to cover its own inbound DMs
+(`SnapshotDmSeen`, freenet/river#801), because during a migration the first
+hydration is usually the OLDEST generation's stale copy. The current
+delegate's own copy never does, on a reload it may hold DMs received unread
+this session.
 
 **Read rule and scrolling.** The follow-at-end policy and its rationale live
 in [history-scrolling.md](history-scrolling.md).

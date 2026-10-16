@@ -3178,6 +3178,41 @@ mod tests {
         }
     }
 
+    /// freenet/river#801: the save path must keep the read marker furthest
+    /// along in the merged buffer, whichever side holds it. A tab that loaded
+    /// a stale legacy marker must not write it over the delegate's later one,
+    /// and the delegate's stale one must not survive a later local one.
+    #[test]
+    fn reconcile_room_present_keeps_the_furthest_read_marker() {
+        let owner = SigningKey::from_bytes(&[3u8; 32]);
+        let me = SigningKey::from_bytes(&[1u8; 32]);
+        let vk = owner.verifying_key();
+        let (mut early, ids) = crate::room_data::test_room_with_messages(&owner, &me, 2, 4);
+        early.last_read_message_id = Some(ids[0].clone());
+        let (mut late, _) = crate::room_data::test_room_with_messages(&owner, &me, 4, 4);
+        late.last_read_message_id = Some(ids[2].clone());
+
+        let stored_marker = |local: &RoomData, remote: &RoomData| {
+            let out = reconcile_room_present(Some(&present_slot_bytes(remote)), &vk, local, false)
+                .unwrap()
+                .expect("a present slot merges and stores");
+            match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+                RoomSlot::Present(r) => r.last_read_message_id,
+                RoomSlot::Tombstone => panic!("expected Present"),
+            }
+        };
+        assert_eq!(
+            stored_marker(&early, &late),
+            Some(ids[2].clone()),
+            "a local stale marker must not overwrite the delegate's later one"
+        );
+        assert_eq!(
+            stored_marker(&late, &early),
+            Some(ids[2].clone()),
+            "the local later marker must replace the delegate's stale one"
+        );
+    }
+
     /// An unparseable current slot is a hard error (surfaced, not silently
     /// treated as absent — which could clobber a slot the delegate holds).
     #[test]
@@ -8207,6 +8242,15 @@ pub(crate) fn reconcile_room_present(
                 for (version, secret) in remote.invitation_secrets {
                     m.invitation_secrets.entry(version).or_insert(secret);
                 }
+                // The read marker furthest along in the merged buffer wins, so
+                // a tab holding an older marker (a stale legacy copy won its
+                // merge, or another tab read further) never rolls the stored
+                // one back (freenet/river#801).
+                m.last_read_message_id = crate::room_data::furthest_read_marker(
+                    &m.room_state.recent_messages.messages,
+                    m.last_read_message_id.take(),
+                    remote.last_read_message_id,
+                );
                 m
             }
         }

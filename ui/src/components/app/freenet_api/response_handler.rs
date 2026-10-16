@@ -1790,6 +1790,12 @@ fn hydrate_loaded_rooms_with_authority(
         });
     });
 
+    // A frozen snapshot's DMs predate this session, so they count as seen
+    // once its rooms are merged (freenet/river#801; see `SnapshotDmSeen`).
+    // Captured here because the merge consumes `loaded_rooms`.
+    let snapshot_dm_seen = (authority == crate::room_data::MergeAuthority::OlderSnapshot)
+        .then(|| crate::components::direct_messages::SnapshotDmSeen::of(&loaded_rooms));
+
     // Merge the loaded rooms with the current rooms
     let loaded_keys = room_keys.clone();
     crate::util::defer(move || {
@@ -1818,6 +1824,11 @@ fn hydrate_loaded_rooms_with_authority(
                 error!("Failed to merge one or more rooms (others still merged): {e}");
             } else {
                 info!("Successfully merged rooms from delegate");
+            }
+            if let Some(snapshot_dm_seen) = snapshot_dm_seen {
+                crate::components::direct_messages::advance_dm_last_seen(
+                    snapshot_dm_seen.still_held_in(current_rooms),
+                );
             }
             // freenet/river#590: tell the SAVE path about any room the ranked
             // merge just brought back. It cannot infer it — `MergeRanks` is never
