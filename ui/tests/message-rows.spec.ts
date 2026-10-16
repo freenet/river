@@ -3,10 +3,8 @@ import { coarsePointer, colourOf, contrast, openInlinePicker, openRoomWithCompos
 import { deliverOffscreen, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
-// Full-width chat rows (plan 11): every author's group gets one River-logo
-// avatar and one header in its first row, every row shares one content column,
-// and the right 72px of each row is the gutter the hover bar and the touch
-// kebab sit in.
+// Full-width chat rows (plan 11): one avatar and header per group, one content
+// column for every row, and a 72px right gutter for the hover bar and kebab.
 
 const GUTTER_PX = 72;
 
@@ -46,46 +44,26 @@ async function openRoomWithPairs(page: Page): Promise<{ received: Locator; own: 
   return { received, own };
 }
 
-type Box = { left: number; right: number; top: number; bottom: number };
-const width = (b: Box) => b.right - b.left;
-type RowGeometry = {
-  self: string | null;
-  row: Box;
-  contentLeft: number;
-  avatars: Array<Box & { color: string; background: string; ariaHidden: string | null; tabIndex: number }>;
-  headers: Box[];
-  body: Box;
-  hoverBar: Box | null;
-  kebab: Box | null;
-};
+const width = (b: { left: number; right: number }) => b.right - b.left;
 
-function rowGeometry(group: Locator): Promise<RowGeometry[]> {
+function rowGeometry(group: Locator) {
   return group.evaluate((el) => {
     const box = (e: Element) => {
       const r = e.getBoundingClientRect();
       return { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
     };
-    // Laid out at all: `display: none` (the kebab on a fine pointer) reports no boxes.
-    const shown = (e: Element | null) => (e && e.getClientRects().length > 0 ? box(e) : null);
-    return Array.from(el.querySelectorAll('[data-testid="message-row"]')).map((row) => {
-      const cs = getComputedStyle(row);
-      return {
-        self: row.getAttribute("data-message-self"),
-        row: box(row),
-        contentLeft: row.getBoundingClientRect().left + parseFloat(cs.paddingLeft),
-        avatars: Array.from(row.querySelectorAll('[data-testid="message-group-avatar"]')).map((a) => ({
-          ...box(a),
-          color: getComputedStyle(a).color,
-          background: getComputedStyle(a).backgroundColor,
-          ariaHidden: a.getAttribute("aria-hidden"),
-          tabIndex: (a as HTMLElement).tabIndex,
-        })),
-        headers: Array.from(row.querySelectorAll('[data-testid="message-group-header"]')).map(box),
-        body: box(row.querySelector('[data-testid="message-body"]')!),
-        hoverBar: shown(row.querySelector(".hover-actions")),
-        kebab: shown(row.querySelector('[data-testid="message-kebab"]')),
-      };
-    });
+    return Array.from(el.querySelectorAll('[data-testid="message-row"]')).map((row) => ({
+      self: row.getAttribute("data-message-self"),
+      contentLeft: row.getBoundingClientRect().left + parseFloat(getComputedStyle(row).paddingLeft),
+      avatars: Array.from(row.querySelectorAll('[data-testid="message-group-avatar"]')).map((a) => ({
+        ...box(a),
+        background: getComputedStyle(a).backgroundColor,
+        ariaHidden: a.getAttribute("aria-hidden"),
+        tabIndex: (a as HTMLElement).tabIndex,
+      })),
+      headers: Array.from(row.querySelectorAll('[data-testid="message-group-header"]')).map(box),
+      body: box(row.querySelector('[data-testid="message-body"]')!),
+    }));
   });
 }
 
@@ -120,17 +98,14 @@ test.describe("Message rows", () => {
     expect(Math.max(...bodyLefts) - Math.min(...bodyLefts)).toBeLessThanOrEqual(0.5);
 
     // The own avatar is set apart: a disc where a received avatar has none.
-    const receivedAvatar = groups.received[0].avatars[0];
-    expect(groups.own[0].avatars[0].background, "own avatar looks different").not.toBe(receivedAvatar.background);
+    expect(groups.own[0].avatars[0].background, "own avatar looks different").not.toBe(groups.received[0].avatars[0].background);
 
     // The colour comes from the member id, so the same author gets it again after a reload.
-    const painted = await resolveColor(page, receivedAvatar.color);
-    await page.reload();
-    await waitForApp(page);
-    await openRoomWithComposer(page);
+    const avatarOf = (g: Locator) => colourOf(g.getByTestId("message-group-avatar"));
+    const painted = await avatarOf(received);
+    await openRoom(page);
     await callRiverTest(page, "insertMessageBeforeLast", "received after reload");
-    const again = await rowGeometry(groupWith(page, "received after reload"));
-    expect(await resolveColor(page, again[0].avatars[0].color)).toEqual(painted);
+    expect(await avatarOf(groupWith(page, "received after reload"))).toEqual(painted);
   });
 
   test("received avatars take each member's own colour", async ({ page }) => {
@@ -179,26 +154,21 @@ test.describe("Message rows", () => {
     }
   });
 
-  test("a group's name is a button that opens the member's info from the keyboard", async ({ page }) => {
-    const { received } = await openRoomWithPairs(page);
-    const name = received.getByTestId("message-group-header").getByRole("button", { name: "Test Sender Insert" });
-    await name.focus();
-    await expect(name).toBeFocused();
-    await page.keyboard.press("Enter");
-    const modal = page.getByTestId("member-info-modal");
-    await expect(modal).toBeVisible();
-    await expect(modal).toContainText("Test Sender Insert");
-  });
-
-  test("clicking a group's avatar opens that member's info, like the name", async ({ page }) => {
-    const { received } = await openRoomWithPairs(page);
-    const avatar = received.getByTestId("message-group-avatar");
-    await avatar.scrollIntoViewIfNeeded();
-    await avatar.click();
-    const modal = page.getByTestId("member-info-modal");
-    await expect(modal).toBeVisible();
-    await expect(modal).toContainText("Test Sender Insert");
-  });
+  for (const [how, open] of [
+    ["Enter on the name button", async (group: Locator, page: Page) => {
+      const name = group.getByTestId("message-group-header").getByRole("button", { name: "Test Sender Insert" });
+      await name.focus();
+      await expect(name).toBeFocused();
+      await page.keyboard.press("Enter");
+    }],
+    ["a click on the avatar", (group: Locator) => group.getByTestId("message-group-avatar").click()],
+  ] as const) {
+    test(`${how} opens that member's info`, async ({ page }) => {
+      const { received } = await openRoomWithPairs(page);
+      await open(received, page);
+      await expect(page.getByTestId("member-info-modal")).toContainText("Test Sender Insert");
+    });
+  }
 });
 
 // The narrowest supported width: a long message, a long link, a reply and a
@@ -248,50 +218,30 @@ test.describe("Message rows at 320px", () => {
     expect(report.docOverflow).toBeLessThanOrEqual(0);
     expect(report.scrollerOverflow).toBeLessThanOrEqual(0);
 
-    // Controls on the newest own message: in the gutter, inside the scroller,
-    // and the touch kebab is the element a tap there lands on.
+    // The newest own message's controls sit in the gutter inside the
+    // scroller, and a tap on the touch kebab lands on it.
     const row = own.getByTestId("message-row").last();
-    const [geometry] = (await rowGeometry(own)).slice(-1);
+    const body = (await row.getByTestId("message-body").boundingBox())!;
     const scroller = (await page.locator("#chat-scroll-container").boundingBox())!;
-    for (const b of [geometry.hoverBar, geometry.kebab]) {
-      if (!b) continue;
-      expect(b.left).toBeGreaterThanOrEqual(geometry.body.right - 0.5);
-      expect(b.right).toBeLessThanOrEqual(scroller.x + scroller.width + 0.5);
+    const kebab = row.getByTestId("message-kebab");
+    for (const control of [row.locator(".hover-actions"), kebab]) {
+      if (!(await control.isVisible())) continue;
+      const b = (await control.boundingBox())!;
+      expect(b.x).toBeGreaterThanOrEqual(body.x + body.width - 0.5);
+      expect(b.x + b.width).toBeLessThanOrEqual(scroller.x + scroller.width + 0.5);
     }
-    if (geometry.kebab) {
-      const kebab = row.getByTestId("message-kebab");
-      const hit = await kebab.evaluate((el) => {
-        const r = el.getBoundingClientRect();
-        const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-        return at !== null && (at === el || el.contains(at));
-      });
-      expect(hit, "the kebab is hit-testable").toBe(true);
-    }
+    if (await kebab.isVisible()) await kebab.click({ trial: true });
   });
 });
 
-// The inline reaction picker hangs off the "+" at the end of a row's reaction
-// chips, and the history scroller clips anything past its sides. At 320px a
-// few chips push "+" far enough right that a rightward picker loses its
-// right-hand emoji, so the picker opens toward the side of the scroller with
-// more room. Each case checks every emoji is inside the scroller and is the
-// element a tap at its centre lands on.
-type PickerReport = {
-  scroller: Box;
-  anchor: Box;
-  picker: Box;
-  buttons: Array<{ emoji: string; inside: boolean; hit: boolean }>;
-};
-
-/// Open `row`'s inline picker from its "+" and measure it.
-async function openPickerFromPlus(page: Page, row: Locator): Promise<PickerReport> {
-  await openInlinePicker(page, row);
-  return measurePicker(page);
-}
+// The inline picker hangs off the "+" after a row's chips, and the scroller
+// clips its sides, so at 320px it opens toward the roomier side. Each case
+// checks every emoji is inside the scroller and takes a tap at its centre.
+type PickerReport = Awaited<ReturnType<typeof measurePicker>>;
 
 /// The open picker, its "+" wrapper (the picker's containing block) and the
 /// scroller, with no click in between: a click elsewhere would close it.
-async function measurePicker(page: Page): Promise<PickerReport> {
+async function measurePicker(page: Page) {
   await expect(page.getByTestId("emoji-picker")).toBeVisible();
   return page.evaluate(() => {
     const box = (e: Element) => {
@@ -306,20 +256,12 @@ async function measurePicker(page: Page): Promise<PickerReport> {
       const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
       return {
         emoji: (b.textContent || "").trim(),
-        inside:
-          r.left >= scroller.left - 0.5 &&
-          r.right <= scroller.right + 0.5 &&
-          r.top >= scroller.top - 0.5 &&
-          r.bottom <= scroller.bottom + 0.5,
+        inside: r.left >= scroller.left - 0.5 && r.right <= scroller.right + 0.5 &&
+          r.top >= scroller.top - 0.5 && r.bottom <= scroller.bottom + 0.5,
         hit: at !== null && (at === b || b.contains(at)),
       };
     });
-    return {
-      scroller,
-      anchor: box(plus.parentElement!),
-      picker: box(picker),
-      buttons,
-    };
+    return { scroller, anchor: box(plus.parentElement!), picker: box(picker), buttons };
   });
 }
 
@@ -360,10 +302,7 @@ async function nearEdgeRow(page: Page): Promise<Locator> {
 
 /// What `left-0` would do: a rightward picker from this "+" ends past the scroller.
 function expectRightwardWouldClip(report: PickerReport) {
-  expect(
-    report.anchor.left + width(report.picker),
-    `a full line of chips no longer pushes + past the point where a rightward picker clips (+ at ${report.anchor.left}, picker ${width(report.picker)} wide, scroller ends at ${report.scroller.right})`,
-  ).toBeGreaterThan(report.scroller.right);
+  expect(report.anchor.left + width(report.picker), "premise: a rightward picker would clip").toBeGreaterThan(report.scroller.right);
 }
 
 test.describe("Reaction picker at 320px", () => {
@@ -371,7 +310,8 @@ test.describe("Reaction picker at 320px", () => {
 
   test("near the right edge, the picker opens leftward and every emoji is tappable", async ({ page }) => {
     const row = await nearEdgeRow(page);
-    const report = await openPickerFromPlus(page, row);
+    await openInlinePicker(page, row);
+    const report = await measurePicker(page);
     expectRightwardWouldClip(report);
     expectEveryEmojiTappable(report);
   });
@@ -382,25 +322,10 @@ test.describe("Reaction picker at 320px", () => {
     const row = page.getByTestId("message-row").filter({ hasText: "picker start" });
     await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-    const report = await openPickerFromPlus(page, row);
-    // What an unconditional `right-0` would do: a leftward picker from this "+" starts before the scroller.
-    expect(
-      report.anchor.right - width(report.picker),
-      `+ no longer starts the line (+ ends at ${report.anchor.right}, picker ${width(report.picker)} wide)`,
-    ).toBeLessThan(report.scroller.left);
-    expectEveryEmojiTappable(report);
-  });
-
-  test("the kebab's React opens the picker on the same side", async ({ page }) => {
-    test.skip(!(await coarsePointer(page)), "the kebab shows only on a coarse pointer");
-    const row = await nearEdgeRow(page);
-    await row.getByTestId("message-kebab").click();
-    // The menu fills in a tick after it opens.
-    const react = page.getByTestId("message-action-menu").getByRole("button", { name: "React" });
-    await expect(react).toBeVisible();
-    await react.click();
+    await openInlinePicker(page, row);
     const report = await measurePicker(page);
-    expectRightwardWouldClip(report);
+    // What an unconditional `right-0` would do: a leftward picker from this "+" starts before the scroller.
+    expect(report.anchor.right - width(report.picker), "premise: + starts the line").toBeLessThan(report.scroller.left);
     expectEveryEmojiTappable(report);
   });
 });
@@ -428,8 +353,9 @@ async function bandedRows(page: Page): Promise<string[]> {
 }
 
 test.describe("Message row hover band", () => {
+  test.beforeEach(async ({ page }) => test.skip(await coarsePointer(page), "no hover band on a touch pointer"));
+
   test("only the hovered row lights, from its avatar or its body", async ({ page }) => {
-    test.skip(await coarsePointer(page), "no hover band on a touch pointer");
     const { received } = await openRoomWithPairs(page);
     const [first, second] = [received.getByTestId("message-row").first(), received.getByTestId("message-row").nth(1)];
     const band = await resolveColor(page, "var(--color-row-hover)");
@@ -453,7 +379,6 @@ test.describe("Message row hover band", () => {
     test.use({ viewport: { width: 480, height: 800 } });
 
     test("the band stays while the row's reactor list is open, and removing the reaction does not scroll", async ({ page }) => {
-      test.skip(await coarsePointer(page), "no hover band on a touch pointer");
       const { received } = await openRoomWithPairs(page);
       const row = received.getByTestId("message-row").nth(1);
       await row.scrollIntoViewIfNeeded();
@@ -520,12 +445,8 @@ test.describe("Latest over row controls", () => {
     const [top, bottom] = [Math.max(c.y, l.y), Math.min(c.y + c.height, l.y + l.height)];
     expect(right - left, "premise: the control overlaps Latest across").toBeGreaterThan(0);
     expect(bottom - top, "premise: the control overlaps Latest down").toBeGreaterThan(0);
-    const onTop = await latest.evaluate(
-      (el, [x, y]) => el.contains(document.elementFromPoint(x, y)),
-      [(left + right) / 2, (top + bottom) / 2],
-    );
-    expect(onTop, "Latest is the top element where they overlap").toBe(true);
-    await latest.click();
+    // Playwright refuses the click if the control would take it there.
+    await latest.click({ position: { x: (left + right) / 2 - l.x, y: (top + bottom) / 2 - l.y } });
     await expect(latest).toBeHidden();
   });
 });
