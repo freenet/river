@@ -315,3 +315,132 @@ fn equal_version_upgrade_pointers_merge_the_same_way_and_forgeries_fail() {
     let mut m = base.clone();
     assert!(m.merge(&base, &r.params, &forged).is_err());
 }
+
+/// A pointer or secret version record that outranks the held one but is not
+/// owner-signed fails the merge, or at worst is ignored; it is never adopted.
+#[test]
+fn forged_pointers_never_replace_a_held_pointer() {
+    use river_core::room_state::upgrade::{AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1};
+    let r = room();
+    let base = state(&r, public_config(&r));
+    let pointer = |version: u8, byte: u8, sk: &SigningKey| {
+        let mut s = base.clone();
+        s.upgrade = OptionalUpgradeV1(Some(AuthorizedUpgradeV1::new(
+            UpgradeV1 {
+                owner_member_id: r.owner_id,
+                version,
+                new_chatroom_address: blake3::Hash::from([byte; 32]),
+            },
+            sk,
+        )));
+        s
+    };
+    let held = pointer(1, 1, &r.owner_sk);
+    let attacker = SigningKey::from_bytes(&[9; 32]);
+    let mut errs = 0;
+    for byte in 0..32u8 {
+        for version in [1u8, 2] {
+            let forged = pointer(version, byte, &attacker);
+            let mut m = held.clone();
+            match m.merge(&held, &r.params, &forged) {
+                Err(_) => errs += 1,
+                Ok(()) => assert_eq!(m.upgrade, held.upgrade, "forged pointer adopted"),
+            }
+        }
+    }
+    assert!(
+        errs > 0,
+        "some forged pointer must outrank the held one and fail"
+    );
+}
+
+#[test]
+fn forged_secret_records_never_replace_a_held_record() {
+    let r = room();
+    let base = private_room(&r);
+    let record = |created_at: SystemTime, sk: &SigningKey| {
+        AuthorizedSecretVersionRecord::new(
+            SecretVersionRecordV1 {
+                version: 1,
+                cipher_spec: RoomCipherSpec::Aes256Gcm,
+                created_at,
+            },
+            sk,
+        )
+    };
+    let attacker = SigningKey::from_bytes(&[9; 32]);
+    let mut errs = 0;
+    for t in 0..32u64 {
+        let mut forged = base.clone();
+        forged.secrets.versions = vec![record(at(100 + t), &attacker)];
+        let mut m = base.clone();
+        match m.merge(&base, &r.params, &forged) {
+            Err(_) => errs += 1,
+            Ok(()) => assert_eq!(
+                m.secrets.versions, base.secrets.versions,
+                "forged record adopted"
+            ),
+        }
+    }
+    assert!(
+        errs > 0,
+        "some forged record must outrank the held one and fail"
+    );
+}
+
+/// Records already held do not count toward a delta's work bound: 1001 held
+/// members (or messages) re-delivered with one new one still apply.
+#[test]
+fn redelivered_members_do_not_count_toward_the_work_bound() {
+    use river_core::room_state::member::MembersDelta;
+    let r = room();
+    let mut config = public_config(&r);
+    config.max_members = 1000;
+    let parent = state(&r, config);
+    let mk = |i: u8, j: u8| {
+        let sk = SigningKey::from_bytes(&[
+            i, j, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+            7, 7, 7,
+        ]);
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: r.owner_id,
+                invited_by: r.owner_id,
+                member_vk: sk.verifying_key(),
+            },
+            &r.owner_sk,
+        )
+    };
+    let held: Vec<AuthorizedMember> = (0..1001u32)
+        .map(|n| mk((n / 250) as u8, (n % 250) as u8))
+        .collect();
+    let mut members = MembersV1 {
+        members: held.clone(),
+    };
+    let mut delta = held.clone();
+    delta.push(mk(200, 1));
+    members
+        .apply_delta(&parent, &r.params, &Some(MembersDelta::new(delta)))
+        .expect("held members re-delivered with one new must apply");
+}
+
+#[test]
+fn redelivered_messages_do_not_count_toward_the_work_bound() {
+    use river_core::room_state::message::MessagesV1;
+    let r = room();
+    let mut config = public_config(&r);
+    config.max_recent_messages = 100;
+    let parent = state(&r, config);
+    let held: Vec<AuthorizedMessageV1> = (0..1001u64)
+        .map(|t| msg(&r, t, RoomMessageBody::public(format!("m{t}"))))
+        .collect();
+    let mut messages = MessagesV1 {
+        messages: held.clone(),
+        ..Default::default()
+    };
+    let mut delta = held.clone();
+    delta.push(msg(&r, 5000, RoomMessageBody::public("new".into())));
+    messages
+        .apply_delta(&parent, &r.params, &Some(delta))
+        .expect("held messages re-delivered with one new must apply");
+}
