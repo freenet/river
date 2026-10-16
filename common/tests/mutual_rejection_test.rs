@@ -336,11 +336,13 @@ fn a_banned_moderator_cannot_act_through_a_same_delta_re_add() {
     let _ = b_bans_t;
 }
 
-/// A forged signature is still rejected at apply time when the banner is known
+/// A forged signature is still refused at apply time when the banner is known
 /// here: dropping the orphaned-ban rule must not have dropped the signature
-/// check with it.
+/// check with it. The forged ban is skipped, not stored, and the rest of the
+/// delta applies (freenet/river#703: an error would fail every merge with a
+/// peer that holds it validly, not knowing the banner).
 #[test]
-fn a_forged_ban_by_a_current_member_is_still_rejected() {
+fn a_forged_ban_by_a_current_member_is_still_refused() {
     let room = Room::new();
     let (t, x) = (room.person(), room.person());
     let a = room.state(&[&t, &x], vec![], vec![room.msg(&t, 1), room.msg(&x, 2)]);
@@ -352,10 +354,14 @@ fn a_forged_ban_by_a_current_member_is_still_rejected() {
         ..Default::default()
     };
     let mut after = a.clone();
-    let err = after
+    after
         .apply_delta(&a, &room.params, &Some(delta))
-        .expect_err("a forged ban attributed to a current member must be rejected");
-    assert!(err.contains("signature"), "unexpected error: {err}");
+        .expect("a forged ban is skipped, not an error");
+    assert!(after.bans.0.is_empty(), "the forged ban is not stored");
+    assert!(
+        after.members.members.iter().any(|m| m.member.id() == t.id),
+        "the forged ban removes nobody"
+    );
 }
 
 /// The old draft of #672 made `MemberInfoV1::verify` accept a record for an

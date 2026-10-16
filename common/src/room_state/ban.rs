@@ -436,7 +436,8 @@ impl ComposableState for BansV1 {
     /// still rejects any stored state that is over the cap.
     ///
     /// Returns an error if the delta carries more new bans than the work bound
-    /// allows, or a ban whose known issuer's signature does not verify.
+    /// allows. A new ban whose known issuer's key does not verify it is
+    /// skipped.
     fn apply_delta(
         &mut self,
         parent_state: &Self::ParentState,
@@ -519,16 +520,31 @@ impl ComposableState for BansV1 {
             // delta re-adds is verified at step 0 against that issuer's key,
             // and takes no effect if the issuer is banned by a ban that does.
             //
-            // Signatures are still checked here for every issuer this peer
-            // knows (a forged ban attributed to a current member rejects the
-            // delta, as before).
-            //
-            let mut temp_bans = self.clone();
-            temp_bans.0.extend(new_bans.into_iter().cloned());
-            if let Err(e) = temp_bans.verify_ban_signatures(parent_state, parameters) {
-                return Err(format!("Invalid delta: {}", e));
-            }
-            self.0 = temp_bans.0;
+            // Signatures are still checked here for every NEW ban whose issuer
+            // this peer knows, and one that does not verify is skipped, not
+            // an error: a peer that does not know its issuer holds it validly
+            // (`verify` has no key to check it against there), and an error
+            // would fail every merge with that peer in one direction only.
+            // Held bans are not re-checked here: post_apply_cleanup step 4
+            // sweeps a held ban whose issuer's key does not verify it
+            // (freenet/river#703).
+            let known = parent_state
+                .ban_evidence
+                .lookup(&parent_state.members, parameters.owner_id());
+            let owner_id = parameters.owner_id();
+            self.0.extend(
+                new_bans
+                    .into_iter()
+                    .filter(|ban| {
+                        let key = if ban.banned_by == owner_id {
+                            Some(parameters.owner)
+                        } else {
+                            known.get(&ban.banned_by).map(|m| m.member.member_vk)
+                        };
+                        key.is_none_or(|vk| ban.verify_signature(&vk).is_ok())
+                    })
+                    .cloned(),
+            );
         }
 
         // A ban held twice (a state `verify` accepts but no apply produces)

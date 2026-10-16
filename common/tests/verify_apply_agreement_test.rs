@@ -830,3 +830,35 @@ fn the_state_version_ignores_lower_and_unreadable_deltas() {
     z.apply_delta(&s, &r.params, &Some(1)).unwrap();
     assert_eq!(z, StateVersion(1));
 }
+
+/// A ban attributed to a member, with a signature that member's key does not
+/// verify, held by a peer that does not know that member (`verify` cannot
+/// check it there): a peer that knows the member drops it on arrival instead
+/// of failing the merge, so both directions agree (freenet/river#703 review
+/// S5).
+#[test]
+fn a_ban_with_a_bad_signature_from_a_known_issuer_is_dropped_in_both_directions() {
+    use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+    let r = room();
+    let mut knows = state(&r, public_config(&r));
+    knows.recent_messages.messages = vec![msg(&r, 1, RoomMessageBody::public("hi".into()))];
+    let target = MemberId::from(&SigningKey::from_bytes(&[15; 32]).verifying_key());
+    let ban = UserBan {
+        owner_member_id: r.owner_id,
+        banned_at: at(5),
+        banned_user: target,
+    };
+    let other_sk = SigningKey::from_bytes(&[16; 32]);
+    let signed_by_other = AuthorizedUserBan::new(
+        ban.clone(),
+        MemberId::from(&other_sk.verifying_key()),
+        &other_sk,
+    );
+    let bad =
+        AuthorizedUserBan::with_signature(ban, r.member.member.id(), signed_by_other.signature);
+    let mut unaware = state(&r, public_config(&r));
+    unaware.members.members.clear();
+    unaware.bans = BansV1(vec![bad]);
+    let merged = assert_merges_agree(&r, &unaware, &knows);
+    assert!(merged.bans.0.is_empty());
+}
