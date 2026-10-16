@@ -228,6 +228,25 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Set the load state WITHOUT clearing ROOMS, for the rail's note under a
+    // partly restored list (freenet/river#802), which needs rooms showing.
+    set_hook(
+        "setRoomsLoadStateKeepingRooms",
+        Closure::<dyn FnMut(String)>::new(move |state: String| {
+            let parsed = match state.as_str() {
+                "loading" => RoomsLoadState::Loading,
+                "migrating" => RoomsLoadState::Migrating,
+                "failed" => RoomsLoadState::LoadFailed,
+                "loaded" => RoomsLoadState::Loaded,
+                other => wasm_bindgen::throw_str(&format!("unknown rooms load state {other:?}")),
+            };
+            crate::util::defer(move || {
+                *ROOMS_LOAD_STATE.write() = parsed;
+            });
+        })
+        .into_js_value(),
+    );
+
     // Switch rooms the way a notification click does: CURRENT_ROOM changes
     // while whatever modal is open stays open. The room list is behind the
     // modal's backdrop, so the UI itself cannot do this from a test.

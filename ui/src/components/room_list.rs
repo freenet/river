@@ -42,6 +42,9 @@ const TAIL_DROP_ZONE_KEY: &str = "room-reorder-tail-drop-zone";
 // the element across transitions.
 const ROOM_LIST_STATE_KEY: &str = "room-list-state";
 
+// Stable Dioxus key for the "Restoring more rooms…" note (freenet/river#802).
+const RESTORING_MORE_KEY: &str = "room-list-restoring-more";
+
 /// What the rooms rail shows in place of the room list (freenet/river#397).
 /// When the `ROOMS` map is empty during startup / migration, a bare `<ul>`
 /// rendered nothing, so a user with rooms still loading saw a blank list and
@@ -85,6 +88,42 @@ pub(crate) fn room_list_display_state(
             RoomsLoadState::LoadFailed => RoomListDisplay::LoadFailed,
         }
     }
+}
+
+/// Whether the rail shows a "Restoring more rooms…" note under a list that is
+/// already showing (freenet/river#802). Once one room has loaded the rail
+/// shows the list, so without it a partly restored list looked final while a
+/// migration was still bringing rooms back. `walk_restoring` is the journaled
+/// walk's answer ([`migration_journal::walk_may_restore_rooms`]); `Migrating`
+/// covers the sweep. With no rooms the full-size `Migrating` state shows
+/// instead, so this is false there.
+///
+/// [`migration_journal::walk_may_restore_rooms`]:
+///     crate::components::app::freenet_api::migration_journal::walk_may_restore_rooms
+pub(crate) fn restoring_more_rooms(
+    load_state: RoomsLoadState,
+    room_count: usize,
+    walk_restoring: bool,
+) -> bool {
+    room_count > 0 && (load_state == RoomsLoadState::Migrating || walk_restoring)
+}
+
+/// [`restoring_more_rooms`] read from the live state. Reads are fallible per
+/// the signal-safety rules; an unreadable signal shows no note (the note is
+/// advisory, and the next render corrects it).
+fn current_restoring_more_rooms() -> bool {
+    use crate::components::app::freenet_api::migration_journal;
+    // Subscribe to journal changes: the session itself is not a signal.
+    let _ = migration_journal::JOURNAL_GATE_VERSION.try_read();
+    let Ok(load_state) = ROOMS_LOAD_STATE.try_read().map(|g| *g) else {
+        return false;
+    };
+    let room_count = ROOMS.try_read().map(|rooms| rooms.map.len()).unwrap_or(0);
+    restoring_more_rooms(
+        load_state,
+        room_count,
+        migration_journal::current_walk_may_restore_rooms(),
+    )
 }
 
 /// Tooltip / accessible name for a room row's unread badge.
@@ -338,6 +377,7 @@ pub fn RoomList() -> Element {
     // into the rail and nowhere else, and below 768px the rail is
     // `display:none`, so mobile users saw none of them.
     let display = current_room_list_display();
+    let restoring_more = current_restoring_more_rooms();
 
     rsx! {
         aside {
@@ -729,6 +769,18 @@ pub fn RoomList() -> Element {
                     }
                 }).collect::<Vec<_>>().into_iter()}
 
+                // A migration is still bringing rooms back under a list that is
+                // already showing (freenet/river#802).
+                if restoring_more {
+                    li {
+                        key: "{RESTORING_MORE_KEY}",
+                        "data-testid": "room-list-restoring-more",
+                        class: "flex items-center gap-2 px-3 py-2 text-xs text-text-muted",
+                        div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
+                        span { "Restoring more rooms…" }
+                    }
+                }
+
                 // Tail drop zone: only present mid-drag. Every row drop inserts
                 // the dragged room BEFORE its target, so the final slot would be
                 // unreachable without a dedicated end target. Shown only while a
@@ -907,6 +959,24 @@ mod tests {
                 "{state:?} with rooms must render the list"
             );
         }
+    }
+
+    /// freenet/river#802: a list that is showing while a migration still
+    /// restores rooms carries a "Restoring more rooms…" note; a settled list,
+    /// or an empty one (which shows the full Migrating state), does not.
+    #[test]
+    fn restoring_more_rooms_only_under_a_list_while_restoring() {
+        assert!(restoring_more_rooms(RoomsLoadState::Migrating, 1, false));
+        assert!(restoring_more_rooms(RoomsLoadState::Loaded, 3, true));
+        assert!(restoring_more_rooms(RoomsLoadState::Loading, 3, true));
+        for state in [
+            RoomsLoadState::Loading,
+            RoomsLoadState::Loaded,
+            RoomsLoadState::LoadFailed,
+        ] {
+            assert!(!restoring_more_rooms(state, 3, false), "{state:?}");
+        }
+        assert!(!restoring_more_rooms(RoomsLoadState::Migrating, 0, true));
     }
 
     /// freenet/river#397 (#1 safety invariant): a genuinely-new user, once the

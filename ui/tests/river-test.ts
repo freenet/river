@@ -10,6 +10,8 @@ type RiverTestHooks = {
   removeMessages(containing: string): void;
   makeRoomPrivateWithoutSecret(): void;
   setRoomsLoadState(state: RoomsLoadState): void;
+  // Same, without clearing ROOMS: the rail's note under a partly restored list.
+  setRoomsLoadStateKeepingRooms(state: RoomsLoadState): void;
   switchRoom(name: string): void;
   // Peer 0 and peer 1 are two fixed test identities, each with its own thread. Others throw.
   appendDmsForPeer(peerIndex: 0 | 1, count: number): void;

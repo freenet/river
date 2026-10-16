@@ -196,6 +196,25 @@ pub(crate) fn a_pending_predecessor_may_hold_data(status: &JournalStatus) -> boo
     }
 }
 
+/// Whether a journaled walk running now may still bring rooms back: it is
+/// requested or running, and the journal says a pending predecessor may hold
+/// data (it has not been found "not installed") or an import was interrupted.
+/// Drives the rail's "Restoring more rooms…" note while a partly restored list
+/// is already showing (freenet/river#802). A walk over predecessors this node
+/// has never had (the usual case once a migration is done) shows nothing.
+pub(crate) fn walk_may_restore_rooms(s: &JournalSession) -> bool {
+    s.walk_in_flight
+        && s.status
+            .as_ref()
+            .is_some_and(|st| a_pending_predecessor_may_hold_data(st) || st.interrupted_import())
+}
+
+/// [`walk_may_restore_rooms`] as it stands now. Callers that render it read
+/// [`JOURNAL_GATE_VERSION`] first, so they re-render when it changes.
+pub(crate) fn current_walk_may_restore_rooms() -> bool {
+    walk_may_restore_rooms(&session())
+}
+
 /// The identity-import gate (freenet/river#414, #763), composed from:
 ///
 /// * a walk in flight, or a status not yet read → [`ImportGate::Pending`];
@@ -979,6 +998,33 @@ mod tests {
             status: Some(status),
             ..Default::default()
         }
+    }
+
+    /// freenet/river#802: the rail's "Restoring more rooms…" note follows a
+    /// walk that may still bring rooms, and nothing else.
+    #[test]
+    fn walk_may_restore_rooms_only_while_a_walk_may_bring_data() {
+        let mut s = known(fresh_status());
+        assert!(
+            !walk_may_restore_rooms(&s),
+            "no walk in flight: nothing is being restored"
+        );
+        s.walk_in_flight = true;
+        assert!(
+            walk_may_restore_rooms(&s),
+            "a walk over predecessors that may hold data"
+        );
+        let mut done = known(JournalStatus::Complete { rejected_items: 0 });
+        done.walk_in_flight = true;
+        assert!(
+            !walk_may_restore_rooms(&done),
+            "a complete journal brings nothing"
+        );
+        let unknown = JournalSession {
+            walk_in_flight: true,
+            ..Default::default()
+        };
+        assert!(!walk_may_restore_rooms(&unknown), "no status read yet");
     }
 
     #[test]
