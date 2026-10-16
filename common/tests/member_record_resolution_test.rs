@@ -180,8 +180,7 @@ fn a_held_record_is_kept_over_one_issued_by_another_inviter() {
     );
 }
 
-/// A key whose `MemberId` equals a held member's (the id is a 64-bit
-/// non-cryptographic hash): two adjacent bytes changed so the hash is kept.
+/// A key, other than `target`, whose `MemberId` equals `target`'s.
 fn colliding_vk(target: &VerifyingKey) -> VerifyingKey {
     let b = target.to_bytes();
     for i in 0..31usize {
