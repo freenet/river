@@ -1082,6 +1082,10 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
     // record block a resolvable one (freenet/river#703 review). Only
     // meaningful while `random_op_ext` draws as it does today.
     seeds.push((272, 2));
+    // A record kept as ban evidence only because an owner-removed descendant
+    // referenced it: kept by cleanup but unreferenced for `verify`, until
+    // cleanup walked references through the keepable records only.
+    seeds.push((121, 2));
     let failures = endings(Mode::Extended, &seeds);
     let stats = take_stats();
     assert_floors(

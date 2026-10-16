@@ -642,8 +642,14 @@ impl ChatRoomStateV1 {
             // step 4, and a ban naming it ranks as one whose target is held
             // nowhere. `BanEvidenceV1::verify` checks stored evidence against
             // `referenced_by_bans`, which this only narrows.
+            // Walked through the records that can be kept only, so a record
+            // referenced only through an owner-removed descendant is not kept
+            // either; `BanEvidenceV1::verify` walks the kept set the same way.
             let referenced =
                 crate::room_state::ban_evidence::referenced_by_bans(&self.bans, owner_id, |id| {
+                    if resolution.owner_removed.contains(&id) {
+                        return None;
+                    }
                     known_by_id.get(&id).map(|m| m.member.invited_by)
                 });
             let mut evidence: Vec<AuthorizedMember> = known_by_id
