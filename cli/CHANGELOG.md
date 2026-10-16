@@ -17,8 +17,8 @@ All notable changes to riverctl will be documented in this file.
 - Known limit: a ban's date is set by whoever signs it, so a member who floods
   the list with future-dated bans can still push out other members' bans, and
   owner bans beyond the newest half of the cap. Banning that member makes their
-  bans dead, but bans already pushed out are not restored. To protect every owner ban, set `max_user_bans` to at least twice
-  the number of owner bans.
+  bans dead, but bans already pushed out are not restored. To protect every
+  owner ban, set `max_user_bans` to at least twice the number of owner bans.
 
 ## [0.2.21] - 2026-10-15
 

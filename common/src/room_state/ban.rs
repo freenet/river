@@ -157,8 +157,8 @@ impl BansV1 {
     ///    `max_bans / 2` slots. Only a pool's bans beyond its guarantee can be
     ///    evicted, and among those the oldest by `(banned_at, id)` go first.
     ///    With an odd cap and both pools over their share, the spare slot
-    ///    goes to the newer of the two pools' oldest candidates; with one
-    ///    pool under its share, the other keeps it. Within a pool
+    ///    goes to the newest ban beyond either pool's share; with one pool
+    ///    under its share, the other keeps it. Within a pool
     ///    nothing ranks above anything else.
     ///
     /// Owner bans are often rare, so the guarantee is a floor, not an

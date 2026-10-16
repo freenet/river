@@ -2430,9 +2430,9 @@ fn surplus_dead_entries_go_oldest_first_and_spare_live_bans() {
 /// Both pools over their share with several evictions in one pass. Cap 4
 /// (share 2): owner bans at 10, 30, 40, 50 and deputy bans at 20, 60, 70.
 /// Seven live, three go: each pool's bans beyond its share, oldest first, so
-/// the newest two of each pool survive. (With an even cap the candidates
-/// always number exactly the overflow; the age choice between pools is pinned
-/// by `an_odd_caps_spare_slot_goes_to_the_newer_ban`.)
+/// the newest two of each pool survive. (With an even cap and both pools at
+/// or over their share, the candidates number exactly the overflow; the age
+/// choice between pools is pinned by `an_odd_caps_spare_slot_goes_to_the_newer_ban`.)
 #[test]
 fn several_evictions_take_each_pools_oldest_beyond_its_share() {
     let room = capped_room(20, 4);
@@ -2484,9 +2484,8 @@ fn an_inert_ban_goes_before_older_live_bans() {
     }
 }
 
-/// A ban on an id held nowhere is live only when its issuer is a present
-/// member: one whose issuer is not present is dead, and is evicted before
-/// older live bans.
+/// A ban on an id held nowhere by an issuer known nowhere is dead (its
+/// signature cannot be checked), and is evicted before older live bans.
 #[test]
 fn an_absent_target_ban_by_an_absent_issuer_is_dead() {
     let room = capped_room(20, 2);
