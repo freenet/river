@@ -98,7 +98,8 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             // gets told why instead.
             if contains_hidden_chars(&new_value) {
                 warn!("{EMOJI_REJECTION_MESSAGE}");
-                temp_nickname.set(initial_nickname_for_revert.clone());
+                let revert = initial_nickname_for_revert.clone();
+                crate::util::defer(move || temp_nickname.set(revert));
                 return;
             }
 
@@ -107,7 +108,8 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             // says why while typing).
             if let Some(reason) = length_refusal(&room_config, &new_value) {
                 warn!("{reason}");
-                temp_nickname.set(initial_nickname_for_revert.clone());
+                let revert = initial_nickname_for_revert.clone();
+                crate::util::defer(move || temp_nickname.set(revert));
                 return;
             }
 
