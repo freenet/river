@@ -76,16 +76,22 @@ seeds `DM_LAST_SEEN` from the max inbound DM timestamp per
 `(room, peer)` exactly once on first hydration; a one-shot
 `DM_LAST_SEEN_SEEDED` flag prevents re-seeding — otherwise every
 arriving inbound DM would be instantly marked seen and never surface as
-unread. A frozen delegate snapshot merged later (`MergeAuthority::OlderSnapshot`:
-a legacy generation, the crate walk's import, the `rooms_data` blob) also
-advances the cutoffs, max-merged, to cover its own inbound DMs
-(`SnapshotDmSeen`, freenet/river#801), because during a migration the first
-hydration is usually the OLDEST generation's stale copy. The current
-delegate's own copy never does, on a reload it may hold DMs received unread
-this session. Only DMs that actually landed in the merged room, under the
-snapshot's identity, count. A merge that REPLACES a room's identity re-seeds
-that room's cutoffs (`IdentityWatch`, `reseed_dm_last_seen_for_room`), since
-cutoffs are keyed by `(room, peer)` only and every other write max-merges.
+unread. Every delegate-load merge (the sweep's hydrate and the crate walk's
+import) then applies `dm_cutoff_plan` (freenet/river#801), because during a
+migration the first hydration is usually the OLDEST generation's stale copy:
+
+- A frozen snapshot (`MergeAuthority::OlderSnapshot`: a legacy generation, the
+  walk's import, the `rooms_data` blob) advances the cutoffs, max-merged, to
+  cover its inbound DMs that landed in the merged room under its identity.
+  The current delegate's own copy (`Authoritative`) never advances: on a
+  reload it may hold DMs received unread this session.
+- A merge that REPLACES a room's identity resets that room's cutoffs to the
+  adopted copy's landed DMs only, never DMs the room already held from the
+  network, since cutoffs are keyed by `(room, peer)` and every other write
+  max-merges.
+
+Cutoffs are per-peer timestamp maxima, so either rule also covers a DM from
+that peer stamped at or below the cutoff, as the seed does.
 
 **Read rule and scrolling.** The follow-at-end policy and its rationale live
 in [history-scrolling.md](history-scrolling.md).

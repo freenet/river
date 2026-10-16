@@ -1790,11 +1790,10 @@ fn hydrate_loaded_rooms_with_authority(
         });
     });
 
-    // A frozen snapshot's DMs predate this session, so they count as seen
-    // once its rooms are merged (freenet/river#801; see `SnapshotDmSeen`).
-    // Captured here because the merge consumes `loaded_rooms`.
-    let snapshot_dm_seen =
-        crate::components::direct_messages::SnapshotDmSeen::for_merge(authority, &loaded_rooms);
+    // The DMs this copy carries, for the read-cutoff plan once it is merged
+    // (freenet/river#801; see `dm_cutoff_plan`). Captured here because the
+    // merge consumes `loaded_rooms`.
+    let incoming_dms = crate::components::direct_messages::SnapshotDmSeen::of(&loaded_rooms);
 
     // Merge the loaded rooms with the current rooms
     let loaded_keys = room_keys.clone();
@@ -1827,12 +1826,14 @@ fn hydrate_loaded_rooms_with_authority(
             } else {
                 info!("Successfully merged rooms from delegate");
             }
-            if let Some(snapshot_dm_seen) = snapshot_dm_seen {
-                crate::components::direct_messages::advance_dm_last_seen(
-                    snapshot_dm_seen.landed_in(current_rooms),
-                );
-            }
-            identity_watch.reseed_replaced(current_rooms);
+            crate::components::direct_messages::commit_dm_cutoff_plan(
+                crate::components::direct_messages::dm_cutoff_plan(
+                    &incoming_dms,
+                    &identity_watch,
+                    authority,
+                    current_rooms,
+                ),
+            );
             // freenet/river#590: tell the SAVE path about any room the ranked
             // merge just brought back. It cannot infer it — `MergeRanks` is never
             // persisted and `RoomSlot::Tombstone` carries no rank, so
