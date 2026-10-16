@@ -50,7 +50,8 @@ pub fn UpdateBanner() -> Element {
             role: "status",
             "aria-live": "polite",
             "data-testid": "update-banner",
-            class: "fixed top-2 left-1/2 -translate-x-1/2 z-50 w-[calc(100%-1rem)] max-w-xl \
+            // Below the conversation header, so it does not hide the room title.
+            class: "fixed top-[4.5rem] left-1/2 -translate-x-1/2 z-50 w-[calc(100%-1rem)] max-w-xl \
                     px-4 py-3 rounded-lg shadow-lg bg-surface border border-border text-text text-sm \
                     flex flex-wrap items-center gap-3",
             span { class: "flex-1 min-w-[12rem]", "{message}" }

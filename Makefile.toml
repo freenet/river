@@ -386,6 +386,13 @@ if [ ! -f "published-contract/contract-id.txt" ]; then
 fi
 contract_id=$(cat published-contract/contract-id.txt)
 echo "Publishing using committed contract: $contract_id"
+# A UI built with RIVER_POINTER_RECORDS watches TEST pointer records, so its
+# open tabs would never reload after a re-key (freenet/river#580). dx build
+# hides the cargo warning, so refuse here.
+if [ -n "${RIVER_POINTER_RECORDS:-}" ]; then
+    echo "RIVER_POINTER_RECORDS is set: this shell builds test UIs. Unset it, rebuild, then publish." >&2
+    exit 1
+fi
 version_file="published-contract/contract-version.txt"
 version=$(tr -d '[:space:]' < "$version_file")
 
@@ -439,6 +446,11 @@ if [ ! -f "published-contract/contract-id.txt" ]; then
 fi
 contract_id=$(cat published-contract/contract-id.txt)
 echo "Publishing using committed contract in debug mode: $contract_id"
+# See [tasks.publish-river]: never publish a test-pointer build.
+if [ -n "${RIVER_POINTER_RECORDS:-}" ]; then
+    echo "RIVER_POINTER_RECORDS is set: this shell builds test UIs. Unset it, rebuild, then publish." >&2
+    exit 1
+fi
 # Same production contract and same production counter as
 # [tasks.publish-river], so the same forward-only rule and the same
 # advisory read-back apply. See [tasks.sign-webapp] for why.

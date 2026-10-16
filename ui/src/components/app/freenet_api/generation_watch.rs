@@ -501,6 +501,49 @@ pub(crate) fn start(i: Inputs, min_delay_ms: u64) -> Phase {
     }
 }
 
+/// Re-plan after the target moved, from the caps' decision for the NEW target.
+///
+/// Called on every move, not only the first. Both pointers usually move
+/// together, and their answers arrive milliseconds apart: the first names a
+/// partial target (`r2d1`) that has spent no tries, so it plans no delay, and
+/// the second names the real one (`r2d2`), which may be a retry owed a
+/// backoff. Keeping the first plan would retry every countdown and spend every
+/// try in under a minute. So a running plan takes the later of its own wait
+/// and the new delay, and never gets shorter.
+pub(crate) fn replan(phase: Phase, decision: &CapDecision, i: Inputs) -> Phase {
+    let CapDecision::Allow { min_delay_ms, .. } = decision else {
+        return Phase::ManualOnly;
+    };
+    let floor = i.now_ms + min_delay_ms;
+    match phase {
+        // ManualOnly too: a new target is a new decision, and this one allows.
+        Phase::Idle | Phase::ManualOnly => start(i, *min_delay_ms),
+        Phase::Countdown {
+            due_ms,
+            not_before_ms,
+        } => {
+            let not_before_ms = not_before_ms.max(floor);
+            Phase::Countdown {
+                due_ms: due_ms.max(not_before_ms),
+                not_before_ms,
+            }
+        }
+        Phase::Hidden {
+            due_ms,
+            not_before_ms,
+        } => {
+            let not_before_ms = not_before_ms.max(floor);
+            Phase::Hidden {
+                due_ms: due_ms.max(not_before_ms),
+                not_before_ms,
+            }
+        }
+        Phase::Snoozed { not_before_ms } => Phase::Snoozed {
+            not_before_ms: not_before_ms.max(floor),
+        },
+    }
+}
+
 /// Advance the plan one tick. Returns the next phase and whether to reload now.
 ///
 /// Never reloads while `composing`: the reload waits for the draft to go.
@@ -731,16 +774,16 @@ mod runtime {
     pub(super) fn on_newer_generation() {
         let Some(target) = target_key() else { return };
         let decision = cap_decision(existing_param().as_deref(), &target, now_ms());
+        match &decision {
+            CapDecision::Allow { min_delay_ms, .. } => info!(
+                "generation watch: reload planned for {target} (no sooner than {min_delay_ms} ms)"
+            ),
+            refused => warn!(
+                "generation watch: automatic reload for {target} refused ({refused:?}); banner only"
+            ),
+        }
         if let Ok(mut phase) = PLAN.lock() {
-            *phase = match (*phase, decision) {
-                (_, CapDecision::TriesExhausted | CapDecision::RateLimited) => Phase::ManualOnly,
-                (Phase::Idle, CapDecision::Allow { min_delay_ms, .. }) => {
-                    start(inputs(), min_delay_ms)
-                }
-                // A plan is already running (e.g. the delegate moved seconds
-                // after the room contract). It reloads for the latest target.
-                (running, CapDecision::Allow { .. }) => running,
-            };
+            *phase = replan(*phase, &decision, inputs());
         }
         if !DRIVER_RUNNING.swap(true, Ordering::SeqCst) {
             crate::util::safe_spawn_local(drive());
@@ -1342,6 +1385,86 @@ mod tests {
                 },
                 false
             )
+        );
+    }
+
+    /// Regression, found end to end: both pointers move, the reload lands on
+    /// the old build, and the reloaded page hears the room pointer ~7 ms
+    /// before the delegate's. The partial target `r2d1` has spent no tries
+    /// (they were recorded against `r2d2`), so it plans no delay; unless the
+    /// second answer re-plans, every retry fires after the 15 s countdown and
+    /// all four are gone in under a minute.
+    #[test]
+    fn the_second_pointer_answer_restores_the_retry_backoff() {
+        let (_, w, _) = test_watch();
+        let delegate = Watched {
+            artifact: Artifact::ChatDelegate,
+            ..w
+        };
+        let watched = [w, delegate];
+        let landed_with = "r2d2-1000-1-1"; // one try already spent on r2d2
+        let now = 5_000;
+
+        let mut observed = Observed::default();
+        assert!(observed.record(Artifact::RoomContract, Verdict::Newer(2)));
+        let partial = observed.target_key(&watched);
+        assert_eq!(partial, "r2d4", "delegate still at the build's version");
+        let first = cap_decision(Some(landed_with), &partial, now);
+        let phase = replan(Phase::Idle, &first, visible(now));
+        assert_eq!(
+            phase,
+            start(visible(now), 0),
+            "partial target: no delay yet"
+        );
+
+        assert!(observed.record(Artifact::ChatDelegate, Verdict::Newer(2)));
+        let full = observed.target_key(&watched);
+        assert_eq!(full, "r2d2");
+        let second = cap_decision(Some(landed_with), &full, now + 7);
+        assert!(matches!(
+            second,
+            CapDecision::Allow { min_delay_ms, .. } if min_delay_ms == RETRY_DELAYS_MS[0]
+        ));
+        let phase = replan(phase, &second, visible(now + 7));
+        let Phase::Countdown { due_ms, .. } = phase else {
+            panic!("expected a countdown, got {phase:?}");
+        };
+        assert!(
+            due_ms >= now + 7 + RETRY_DELAYS_MS[0],
+            "backoff lost: due {due_ms}"
+        );
+        assert_eq!(step(phase, visible(now + COUNTDOWN_MS)), (phase, false));
+    }
+
+    #[test]
+    fn replan_never_shortens_a_wait() {
+        let long = Phase::Hidden {
+            due_ms: 900_000,
+            not_before_ms: 600_000,
+        };
+        let no_delay = cap_decision(None, "r9d9", 1_000);
+        assert_eq!(replan(long, &no_delay, hidden(1_000)), long);
+        let snoozed = Phase::Snoozed {
+            not_before_ms: 600_000,
+        };
+        assert_eq!(replan(snoozed, &no_delay, visible(1_000)), snoozed);
+    }
+
+    #[test]
+    fn replan_refusal_is_manual_and_a_new_allowed_target_resumes() {
+        let running = start(visible(0), 0);
+        assert_eq!(
+            replan(running, &CapDecision::RateLimited, visible(0)),
+            Phase::ManualOnly
+        );
+        assert_eq!(
+            replan(running, &CapDecision::TriesExhausted, visible(0)),
+            Phase::ManualOnly
+        );
+        let allowed = cap_decision(None, "r3d3", 50);
+        assert_eq!(
+            replan(Phase::ManualOnly, &allowed, visible(50)),
+            start(visible(50), 0)
         );
     }
 
