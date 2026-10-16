@@ -313,6 +313,10 @@ impl RoomSynchronizer {
         // private-room secret lets us finally seal & publish our own
         // member_info. Sent as a standalone UPDATE AFTER the borrow releases.
         let mut pending_member_info_heal: Option<AuthorizedMemberInfo> = None;
+        // Set inside with_mut when a DM purge this device signed was missing
+        // from the room's winning envelope and was re-signed into local state
+        // (`RoomData::heal_own_purges`); the room is marked for sync after.
+        let mut purges_healed = false;
 
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
@@ -432,6 +436,8 @@ impl RoomSynchronizer {
                         // Keep cached self membership data up to date
                         room_data.capture_self_membership_data(&params);
 
+                        purges_healed = room_data.heal_own_purges();
+
                         // Issue freenet/river#267: compute newly-landed
                         // INBOUND DM senders by diffing the post-merge
                         // signature set against the pre-merge snapshot.
@@ -529,6 +535,9 @@ impl RoomSynchronizer {
         // "Unknown". Sent here, after the with_mut borrow released.
         if let Some(heal_info) = pending_member_info_heal {
             send_member_info_heal_update(owner_vk, heal_info);
+        }
+        if purges_healed {
+            crate::components::app::mark_needs_sync(owner_vk);
         }
 
         // Update document title after ROOMS.with_mut completes (update_document_title calls ROOMS.read())
@@ -1370,6 +1379,10 @@ impl RoomSynchronizer {
         // local in apply_delta_inner — a newly-arrived private-room secret may
         // let us finally seal & publish our own member_info.
         let mut pending_member_info_heal: Option<AuthorizedMemberInfo> = None;
+        // Set inside with_mut when a DM purge this device signed was missing
+        // from the room's winning envelope and was re-signed into local state
+        // (`RoomData::heal_own_purges`); the room is marked for sync after.
+        let mut purges_healed = false;
         let room_owner_copy = room_owner_vk;
 
         ROOMS.with_mut(|rooms| {
@@ -1472,6 +1485,8 @@ impl RoomSynchronizer {
                         // Keep cached self membership data up to date
                         let params = ChatRoomParametersV1 { owner: room_owner_vk };
                         room_data.capture_self_membership_data(&params);
+
+                        purges_healed = room_data.heal_own_purges();
 
                         // Issue freenet/river#267 (full-state path):
                         // diff post-merge DM signatures against the
@@ -1623,6 +1638,9 @@ impl RoomSynchronizer {
         // Symmetric with the apply_delta_inner path.
         if let Some(heal_info) = pending_member_info_heal {
             send_member_info_heal_update(room_owner_vk, heal_info);
+        }
+        if purges_healed {
+            crate::components::app::mark_needs_sync(room_owner_vk);
         }
 
         // Update document title after ROOMS.with_mut completes (update_document_title calls ROOMS.read())
@@ -2353,6 +2371,28 @@ mod tests {
             .find("mod tests {")
             .expect("this file must have a `mod tests {` to cut at");
         src[..cut].chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Both inbound-sync paths re-sign a DM purge this device signed that the
+    /// winning envelope omits, and mark the room for sync when they do
+    /// (behaviour pinned by `a_device_whose_purge_lost_re_signs_the_union`
+    /// in `room_data.rs`).
+    #[test]
+    fn both_ingestion_paths_heal_own_purges() {
+        let src = production_source_whitespace_stripped();
+        let delta_at = src.find("fnapply_delta_inner(").expect("apply_delta_inner");
+        let state_at = src
+            .find("fnupdate_room_state_inner(")
+            .expect("update_room_state_inner");
+        let (first, second) = if delta_at < state_at {
+            (&src[delta_at..state_at], &src[state_at..])
+        } else {
+            (&src[state_at..delta_at], &src[delta_at..])
+        };
+        for body in [first, second] {
+            assert!(body.contains("purges_healed=room_data.heal_own_purges();"));
+            assert!(body.contains("ifpurges_healed{crate::components::app::mark_needs_sync("));
+        }
     }
 
     /// Issue freenet/river#526 regression guard.

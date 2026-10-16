@@ -871,6 +871,10 @@ async fn execute_purge(
     };
 
     api.send_state_delta(&room_owner_key, &delta).await?;
+    // Recorded so a concurrent envelope from another device of this member
+    // cannot drop it for good (`ApiClient::heal_own_purges`).
+    api.storage()
+        .update_own_purges(&room_owner_key, |own| own.record(self_id, [resolved_token]))?;
 
     match format {
         OutputFormat::Human => println!(

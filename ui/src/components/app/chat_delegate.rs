@@ -3406,6 +3406,32 @@ mod tests {
         );
     }
 
+    /// The DM purges each tab recorded as its own are unioned by the save-side
+    /// merge, so one tab's save never drops a purge another tab recorded.
+    #[test]
+    fn reconcile_room_present_unions_own_purges() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let me = river_core::room_state::member::MemberId::from(
+            SigningKey::from_bytes(&[1u8; 32]).verifying_key(),
+        );
+        let mut local = crate::room_data::test_minimal_room_data(vk);
+        local.own_purges.record(me, [PurgeToken([1; 16])]);
+        let mut remote = crate::room_data::test_minimal_room_data(vk);
+        remote.own_purges.record(me, [PurgeToken([2; 16])]);
+        let out = reconcile_room_present(Some(&present_slot_bytes(&remote)), &vk, &local, false)
+            .unwrap()
+            .expect("matching-identity merge stores");
+        let merged = match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+            RoomSlot::Present(r) => r,
+            RoomSlot::Tombstone => panic!("expected Present"),
+        };
+        assert_eq!(
+            merged.own_purges.purged,
+            vec![(me, PurgeToken([1; 16])), (me, PurgeToken([2; 16]))]
+        );
+    }
+
     /// `legacy_scoped_correlation` namespaces a read by the target delegate, so a
     /// legacy read of `room:A` can't collide with a current/other-legacy read of
     /// `room:A` on the single-waiter PENDING_REQUESTS slot (codex/skeptical
@@ -8388,6 +8414,9 @@ pub(crate) fn reconcile_room_present(
                 for (version, secret) in remote.invitation_secrets {
                     m.invitation_secrets.entry(version).or_insert(secret);
                 }
+                // The DM purges each tab signed: unioned, so a purge another
+                // tab recorded can still be re-published.
+                m.own_purges.union(&remote.own_purges);
                 // The read marker furthest along in the merged buffer wins, so
                 // a tab holding an older marker (a stale legacy copy won its
                 // merge, or another tab read further) never rolls the stored

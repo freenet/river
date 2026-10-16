@@ -2095,6 +2095,7 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
         self_nickname: export.self_nickname,
         previous_contract_key: None,
         rekey_merge: Default::default(),
+        own_purges: Default::default(),
         // Restore the invitation-carried room secrets so a non-owner of a
         // private room keeps the secret across a device migration
         // (freenet/river#306). Folded into the `#[serde(skip)]` `secrets` map
@@ -2128,6 +2129,7 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
 /// self_nickname           REPLACE different-key / MERGE-keep-if-absent same-key
 /// previous_contract_key   KEEP (room-scoped #292 migration pointer)
 /// rekey_merge             KEEP (room-scoped #769 re-key merge marker)
+/// own_purges              KEEP (keyed by the recipient id each purge was signed as)
 /// invitation_secrets      REPLACE different-key / MERGE-union(existing wins) same-key
 /// ```
 #[allow(dead_code)]
@@ -2149,6 +2151,7 @@ fn _room_data_swap_classification(rd: crate::room_data::RoomData) {
         self_nickname: _,
         previous_contract_key: _,
         rekey_merge: _,
+        own_purges: _,
         invitation_secrets: _,
     } = rd;
 }

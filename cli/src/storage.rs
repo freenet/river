@@ -77,6 +77,13 @@ pub struct StoredRoomInfo {
     /// the room owner (who is never pruned, so never rejoins).
     #[serde(default)]
     pub self_nickname: Option<String>,
+    /// The DM purges this client signed in the room, per recipient id, and
+    /// the winning purge-envelope version it last re-signed against:
+    /// `ApiClient::heal_own_purges` re-publishes a recorded purge the room's
+    /// winning envelope omits (another device of the member won a concurrent
+    /// envelope). Recorded by `dm purge`.
+    #[serde(default)]
+    pub own_purges: river_core::own_purges::OwnPurges,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -812,6 +819,7 @@ impl Storage {
                 previous_contract_key: None,
                 invitation_secrets,
                 self_nickname: None,
+                own_purges: Default::default(),
             };
 
             storage.rooms.insert(owner_key_str, room_info);
@@ -840,6 +848,7 @@ impl Storage {
     /// previous_contract_key  KEEP    (room-scoped #292 migration pointer)
     /// invitation_secrets     MERGE-same-key (union, existing wins) / REPLACE-diff
     /// self_nickname          MERGE-same-key (keep-if-absent) / REPLACE-different
+    /// own_purges             KEEP    (keyed by the recipient id each purge was signed as)
     /// ```
     #[allow(dead_code)]
     fn _stored_room_info_overwrite_classification(r: StoredRoomInfo) {
@@ -852,6 +861,7 @@ impl Storage {
             previous_contract_key: _,
             invitation_secrets: _,
             self_nickname: _,
+            own_purges: _,
         } = r;
     }
 
@@ -998,6 +1008,7 @@ impl Storage {
                         previous_contract_key: None,
                         invitation_secrets,
                         self_nickname,
+                        own_purges: Default::default(),
                     },
                 );
             }
@@ -1071,6 +1082,24 @@ impl Storage {
         } else {
             Ok(None)
         }
+    }
+
+    /// Change a room's record of the DM purges this client signed, under the
+    /// storage lock (a no-op for a room not stored).
+    pub fn update_own_purges(
+        &self,
+        owner_vk: &VerifyingKey,
+        change: impl FnOnce(&mut river_core::own_purges::OwnPurges),
+    ) -> Result<()> {
+        self.with_lock(|| {
+            let mut storage = self.load_rooms_unlocked()?;
+            let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+            if let Some(info) = storage.rooms.get_mut(&owner_key_str) {
+                change(&mut info.own_purges);
+                self.save_rooms_unlocked(&storage)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn update_room_state(&self, owner_vk: &VerifyingKey, state: ChatRoomStateV1) -> Result<()> {
@@ -1358,6 +1387,7 @@ mod tests {
             previous_contract_key: None,
             invitation_secrets: HashMap::new(),
             self_nickname: None,
+            own_purges: Default::default(),
         }
     }
 
@@ -2434,6 +2464,7 @@ mod tests {
             previous_contract_key: None,
             invitation_secrets: HashMap::new(),
             self_nickname: Some("Alice".to_string()),
+            own_purges: Default::default(),
         };
         let mut value = serde_json::to_value(&info).unwrap();
         value

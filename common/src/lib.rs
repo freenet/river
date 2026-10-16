@@ -14,6 +14,11 @@ pub mod mention;
 /// do not enable it) keep byte-identical WASM and stable keys.
 #[cfg(feature = "migration")]
 pub mod migration;
+/// A client's record of its own DM purges and the purge envelope it re-signs
+/// when the room's winning envelope omits one. Gated on the `own-purges`
+/// feature (client crates only), so the WASM builds keep byte-identical WASM.
+#[cfg(any(feature = "own-purges", test))]
+pub mod own_purges;
 pub mod room_state;
 pub mod util;
 pub mod web_container;

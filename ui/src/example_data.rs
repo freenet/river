@@ -530,6 +530,7 @@ fn create_room(
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: std::collections::BTreeMap::new(),
         },
     }

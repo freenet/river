@@ -417,6 +417,15 @@ pub struct RoomData {
     /// queued again.
     #[serde(default)]
     pub rekey_merge: RekeyMerge,
+    /// The DM purges this device signed, per recipient id, and the winning
+    /// envelope version it last re-signed against: what
+    /// [`Self::heal_own_purges`] re-publishes when a concurrent envelope
+    /// from another device of the same member wins without them. Unioned
+    /// wherever two copies of the room merge. A tab on a build without the
+    /// field drops it on save (unknown fields are ignored), and the purges
+    /// recorded before that save are no longer re-published.
+    #[serde(default)]
+    pub own_purges: river_core::own_purges::OwnPurges,
     /// Room secrets recovered from the invitation artifact, by version.
     ///
     /// Populated once, when an invitation to a private room is accepted,
@@ -521,6 +530,46 @@ impl RoomData {
     /// future writer CAN produce such a blob and this build must survive it.
     /// The graceful behaviour is "this identity cannot act": skip the signing
     /// or decryption, log, and leave the rest of the room readable.
+    /// Re-sign a DM purge this device signed that the room's winning purge
+    /// envelope for this member omits (a concurrent envelope from another
+    /// device of the same member won), as `river_core::own_purges::OwnPurges::heal`
+    /// decides, and apply it to the local state. True when the room needs a
+    /// sync to publish it. Needs this room's signing key, as every
+    /// self-signed record does; the envelope carries no room secret.
+    pub fn heal_own_purges(&mut self) -> bool {
+        let Some(signing_key) = self.signing_key().cloned() else {
+            return false;
+        };
+        let owner = self.owner_vk;
+        let envelope = match self.own_purges.heal(&signing_key, &owner, &self.room_state) {
+            None => return false,
+            Some(Err(e)) => {
+                dioxus::logger::tracing::warn!("DM purge re-sign for {owner:?} not built: {e}");
+                return false;
+            }
+            Some(Ok(envelope)) => envelope,
+        };
+        let delta = river_core::room_state::ChatRoomStateV1Delta {
+            direct_messages: Some(
+                river_core::room_state::direct_messages::DirectMessagesDelta {
+                    new_messages: vec![],
+                    advanced_purges: vec![envelope],
+                },
+            ),
+            ..Default::default()
+        };
+        let parent = self.room_state.clone();
+        if let Err(e) =
+            self.room_state
+                .apply_delta(&parent, &ChatRoomParametersV1 { owner }, &Some(delta))
+        {
+            dioxus::logger::tracing::warn!("DM purge re-sign for {owner:?} not applied: {e}");
+            return false;
+        }
+        self.rebuild_private_actions_state();
+        true
+    }
+
     pub fn signing_key(&self) -> Option<&SigningKey> {
         self.self_sk.as_ref()
     }
@@ -2252,6 +2301,7 @@ pub(crate) fn test_minimal_room_data(owner_vk: VerifyingKey) -> RoomData {
         self_nickname: None,
         previous_contract_key: None,
         rekey_merge: Default::default(),
+        own_purges: Default::default(),
         invitation_secrets: BTreeMap::new(),
     }
 }
@@ -2459,6 +2509,7 @@ impl Rooms {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -2760,6 +2811,7 @@ impl Rooms {
                             e.invitation_secrets.clone(),
                             e.self_nickname.clone(),
                             e.last_read_message_id.clone(),
+                            e.own_purges.clone(),
                         )
                     })
                     .expect("AdoptIncoming implies the room is present");
@@ -2810,6 +2862,10 @@ impl Rooms {
                     existing_state.3,
                     room_data.last_read_message_id.take(),
                 );
+                // The DM purges this device signed are the device's record,
+                // not the identity's: unioned, so a purge either copy recorded
+                // can still be re-published (each is keyed by its recipient).
+                room_data.own_purges.union(&existing_state.4);
                 // The re-key merge marker stays the adopted copy's, as in the
                 // non-adopt branch below: it comes from the newer delegate
                 // generation, which knows the contract key the device last
@@ -2880,6 +2936,9 @@ impl Rooms {
                     // for good. `repopulate_secrets_from_state` cannot recover it:
                     // it reads the contract blob, which is what is missing.
                     // Local wins collisions, matching both sibling paths.
+                    // The DM purges this device signed: unioned, as in the
+                    // adopt branch.
+                    self_room_data.own_purges.union(&room_data.own_purges);
                     for (version, secret) in room_data.invitation_secrets {
                         self_room_data
                             .invitation_secrets
@@ -3079,6 +3138,155 @@ mod tests {
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::member::{AuthorizedMember, Member};
 
+    /// Two devices of one member, each holding the room, purge different
+    /// DMs at the same purge version. Each device's next ingestion of the
+    /// other's state keeps the winning envelope; the device whose purge lost
+    /// re-signs the union (`heal_own_purges`), and after one more exchange
+    /// both hold both tombstones and neither re-signs again.
+    #[test]
+    fn a_device_whose_purge_lost_re_signs_the_union() {
+        use river_core::room_state::direct_messages::{
+            advance_recipient_purges, DirectMessagesDelta, PurgeToken,
+        };
+        use river_core::room_state::ChatRoomStateV1Delta;
+        let owner_sk = SigningKey::from_bytes(&[31u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[32u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(owner_vk);
+        let bob_id = MemberId::from(bob_sk.verifying_key());
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let mut base = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        base.members.members = vec![AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: bob_sk.verifying_key(),
+            },
+            &owner_sk,
+        )];
+        let device = |token: PurgeToken| {
+            let mut rd = test_minimal_room_data(owner_vk);
+            rd.self_sk = Some(bob_sk.clone());
+            rd.room_state = base.clone();
+            // As the thread's "Delete their messages" does.
+            let env = advance_recipient_purges(&bob_sk, &owner_vk, None, [token]).unwrap();
+            let parent = rd.room_state.clone();
+            rd.room_state
+                .apply_delta(
+                    &parent,
+                    &params,
+                    &Some(ChatRoomStateV1Delta {
+                        direct_messages: Some(DirectMessagesDelta {
+                            new_messages: vec![],
+                            advanced_purges: vec![env],
+                        }),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            rd.own_purges.record(bob_id, [token]);
+            rd
+        };
+        let ingest = |rd: &mut RoomData, incoming: &ChatRoomStateV1| {
+            let delta = rd.room_state.delta_from_merged_summary(&params, incoming);
+            rd.room_state
+                .apply_delta(&ChatRoomStateV1::default(), &params, &delta)
+                .unwrap();
+            rd.heal_own_purges()
+        };
+        let tombstones = |rd: &RoomData| {
+            rd.room_state
+                .direct_messages
+                .purges
+                .iter()
+                .find(|p| p.recipient_id == bob_id)
+                .map(|p| p.state.purged.clone())
+                .unwrap_or_default()
+        };
+        let (t1, t2) = (PurgeToken([1; 16]), PurgeToken([2; 16]));
+        let (mut x, mut y) = (device(t1), device(t2));
+        let (x_state, y_state) = (x.room_state.clone(), y.room_state.clone());
+        let x_healed = ingest(&mut x, &y_state);
+        let y_healed = ingest(&mut y, &x_state);
+        assert!(x_healed != y_healed, "exactly the losing device re-signs");
+        let (x_state, y_state) = (x.room_state.clone(), y.room_state.clone());
+        assert!(!ingest(&mut x, &y_state));
+        assert!(!ingest(&mut y, &x_state));
+        assert_eq!(tombstones(&x), vec![t1, t2]);
+        assert_eq!(tombstones(&y), vec![t1, t2]);
+        assert_eq!(x.room_state.direct_messages, y.room_state.direct_messages);
+    }
+
+    /// No loop: a device whose re-signed envelope has not landed does not
+    /// re-sign again against the same winning version.
+    #[test]
+    fn a_purge_re_sign_is_not_repeated_for_the_same_winning_version() {
+        use river_core::room_state::direct_messages::{
+            advance_recipient_purges, DirectMessagesDelta, PurgeToken,
+        };
+        use river_core::room_state::ChatRoomStateV1Delta;
+        let owner_sk = SigningKey::from_bytes(&[33u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[34u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(owner_vk);
+        let bob_id = MemberId::from(bob_sk.verifying_key());
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        state.members.members = vec![AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: bob_sk.verifying_key(),
+            },
+            &owner_sk,
+        )];
+        let winner =
+            advance_recipient_purges(&bob_sk, &owner_vk, None, [PurgeToken([2; 16])]).unwrap();
+        let parent = state.clone();
+        state
+            .apply_delta(
+                &parent,
+                &params,
+                &Some(ChatRoomStateV1Delta {
+                    direct_messages: Some(DirectMessagesDelta {
+                        new_messages: vec![],
+                        advanced_purges: vec![winner],
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let mut rd = test_minimal_room_data(owner_vk);
+        rd.self_sk = Some(bob_sk.clone());
+        rd.own_purges.record(bob_id, [PurgeToken([1; 16])]);
+        rd.room_state = state.clone();
+        assert!(rd.heal_own_purges(), "the recorded purge is missing");
+        // The re-signed envelope never lands: the network state comes back.
+        rd.room_state = state;
+        assert!(
+            !rd.heal_own_purges(),
+            "not again at the same winning version"
+        );
+    }
+
     #[test]
     fn notification_mode_defaults_to_all() {
         assert_eq!(NotificationMode::default(), NotificationMode::All);
@@ -3184,6 +3392,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -3260,6 +3469,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -3332,6 +3542,7 @@ mod tests {
                 self_nickname: None,
                 previous_contract_key: None,
                 rekey_merge: Default::default(),
+                own_purges: Default::default(),
                 invitation_secrets: BTreeMap::new(),
             }
         };
@@ -3403,6 +3614,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         }
     }
@@ -4683,6 +4895,7 @@ mod tests {
             invitation_secrets: _, // unioned; adopted copy wins on collision
             self_nickname: _,      // local kept when the adopted copy has none
             last_read_message_id: _, // NOT carried over: furthest of local and adopted wins (#801)
+            own_purges: _,         // unioned
 
             // --- `#[serde(skip)]`: not persisted, so the local values are
             // runtime-only and are rebuilt after the merge —
@@ -5938,6 +6151,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         }
     }
@@ -6280,6 +6494,7 @@ mod tests {
                 self_nickname: None,
                 previous_contract_key: None,
                 rekey_merge: Default::default(),
+                own_purges: Default::default(),
                 invitation_secrets: BTreeMap::new(),
             }
         };
@@ -6934,6 +7149,7 @@ mod tests {
                 self_nickname: None,
                 previous_contract_key: None,
                 rekey_merge: Default::default(),
+                own_purges: Default::default(),
                 invitation_secrets: BTreeMap::new(),
             }
         };
@@ -7006,6 +7222,7 @@ mod tests {
                 self_nickname: None,
                 previous_contract_key: None,
                 rekey_merge: Default::default(),
+                own_purges: Default::default(),
                 invitation_secrets: BTreeMap::new(),
             }
         };
@@ -7239,6 +7456,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -7576,6 +7794,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -8616,6 +8835,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         }
     }
@@ -8836,6 +9056,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -9056,6 +9277,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -9172,6 +9394,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -9290,6 +9513,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 

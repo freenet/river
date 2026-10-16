@@ -24,6 +24,30 @@ live in `common/src/room_state/direct_messages.rs`.
   carries that rank, so peers holding different envelopes converge on one
   (freenet/river#703). The tombstone set is BLAKE3-derived `PurgeToken`s,
   which prevents signature-grinding attacks against tombstones.
+- **Own-purge re-sign (client-side, no contract change).** A recipient's
+  purge envelope is ONE record per recipient, so two devices of one member
+  that purge at the same version each sign a version-`v` envelope and one
+  wins by rank; the loser's tokens are no longer tombstoned. Each client
+  records the tokens it purged (`river_core::own_purges::OwnPurges`, behind
+  the client-only `own-purges` feature): the UI in `RoomData::own_purges`
+  (persisted with the room, unioned wherever two copies of the room merge),
+  riverctl in `StoredRoomInfo::own_purges` (`rooms.json`). When the room's
+  winning envelope for the member's own id omits a recorded token,
+  `OwnPurges::heal` re-signs the union of the winning list and the recorded
+  tokens at the next version with `advance_recipient_purges`, so the UI and
+  riverctl sign byte-identical envelopes. It fires only when a recorded
+  token is missing, only for the recipient id the token was recorded as,
+  only while that id is a member, and at most once per winning version
+  observed (`healed_at`, persisted), so devices never trade envelopes
+  without end. The envelope carries no room secret; it needs the room's own
+  signing key, like every self-signed record, and riverctl skips it under a
+  `--signing-key` override that is not the stored identity. Trigger points:
+  the UI's two ingestion paths (`apply_delta_inner`, `update_room_state_inner`,
+  then `mark_needs_sync`), and riverctl's `get_room` (every read).
+  Pinned by `own_purges::tests`, `a_device_whose_purge_lost_re_signs_the_union`,
+  `a_purge_re_sign_is_not_repeated_for_the_same_winning_version`,
+  `both_ingestion_paths_heal_own_purges` and
+  `a_purge_that_lost_is_re_signed_as_the_union`.
 - Bans are NOT enforced in `DirectMessagesV1::verify` — instead,
   `ChatRoomStateV1::post_apply_cleanup` sweeps DMs whose sender or
   recipient is now banned or no longer a member. Mirrors `MessagesV1`'s

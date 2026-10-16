@@ -16,11 +16,15 @@ All notable changes to riverctl will be documented in this file.
 - `room config` refuses a configuration the room would not take (for example
   a zero limit, or a nickname limit over 1000 bytes) instead of reporting
   success for an edit that does nothing.
-- `member set-nickname` refuses a nickname longer than
-  the room's nickname limit. The room no longer drops existing nicknames when
+- `member set-nickname`, `invite accept` and `room create` refuse a nickname
+  (or room name) longer than the room's limit. The room no longer drops existing nicknames when
   the owner lowers that limit.
 
 ### Fixed
+- A DM purge made with `dm purge` is no longer lost when another device of the
+  same member purged a different DM at the same time: riverctl records its own
+  purges and, on the next read of the room, re-publishes any the room's purge
+  list is missing.
 - `debug bans` judges each ban record by its own signature. A record that
   copies another ban's signature was reported with that ban's status
   (freenet/river#797 follow-up). Display only: the contract already drops
