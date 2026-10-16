@@ -725,6 +725,7 @@ fn NumericConfigField(
     let update_value = move |evt: Event<FormData>| {
         let new_val_str = evt.value().to_string();
         input_value.set(new_val_str.clone());
+        config_error.set(None);
 
         let Ok(new_val) = new_val_str.parse::<usize>() else {
             return;
@@ -781,6 +782,7 @@ fn MaxMembersField(
         }
         let new_val_str = evt.value().to_string();
         max_members_input.set(new_val_str.clone());
+        config_error.set(None);
 
         let Ok(new_max) = new_val_str.parse::<usize>() else {
             return;
