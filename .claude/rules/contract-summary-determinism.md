@@ -106,11 +106,18 @@ survives review while being wrong (see the encoding trap in History below). See
 - **freenet/river#703** (2026-10): several summaries gained a signature or
   record digest beside the version they carried, so two DIFFERENT records at
   one version are told apart and converge: the configuration summary is now
-  `(u32, SigDigest)`, the upgrade pointer `Option<(u8, SigDigest)>`, DM purge
+  `(bool, u32, SigDigest)` (whether it passes the value checks, then version
+  and digest), the upgrade pointer `Option<(u8, SigDigest)>`, DM purge
   versions `(u64, SigDigest)` per recipient, secret version ids a
-  `BTreeMap<SecretVersion, SigDigest>`, and `MembersV1::Summary` a
-  `BTreeMap<MemberId, EvidenceDigest>` (one record digest per member). The
-  same value-side rules apply to each; collections stayed `BTreeMap`.
+  `BTreeMap<SecretVersion, SigDigest>` and member blobs a
+  `BTreeMap<(SecretVersion, MemberId), SigDigest>`. `BansV1::Summary` is a
+  `BTreeSet` of 16-byte whole-record digests (`ban_digest`, golden vector in
+  `ban.rs`) instead of signature-only `BanId`s, so two ban records sharing a
+  signature are told apart (17.02 B/entry against 9.02). `MembersV1::Summary`
+  stayed `BTreeSet<MemberId>`: a peer keeps the member record it holds, so the
+  summary need not tell two records for one id apart (an interim
+  `(id, digest)` shape measured 26.01 B/entry against 9.01 and was dropped).
+  The same value-side rules apply to each; collections stayed `BTree*`.
 - **freenet/river#571** (2026-07): the same summary's VALUE then shrank,
   `(u32, Signature)` → `(u32, SigDigest)`, where `SigDigest` is a 128-bit BLAKE3
   digest of the signature serialized as a CBOR byte string. Measured 134.08 →

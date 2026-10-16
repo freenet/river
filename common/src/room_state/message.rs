@@ -91,9 +91,9 @@ pub enum RetentionHorizon {
     OldestRetained(MessageOrderKey),
     /// `max_recent_messages == 0`: the peer retains no messages at all.
     ///
-    /// `AuthorizedConfigurationV1::apply_delta` rejects a zero cap, but
-    /// `verify` does not, so an owner-signed zero can still arrive on the
-    /// full-state path. Represented explicitly rather than folded into
+    /// A configuration with a zero cap fails the value checks and ranks below
+    /// every valid one, but `verify` does not check it, so an owner-signed
+    /// zero can still be held after a full-state PUT. Represented explicitly rather than folded into
     /// `OldestRetained` so the sender suppresses the delta instead of looping
     /// against a peer that keeps nothing.
     Closed,

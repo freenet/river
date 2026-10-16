@@ -311,16 +311,14 @@ pub fn build_member_info_heal(
     // fits the room's current `max_nickname_size`, else the generic "Member"
     // placeholder.
     //
-    // Both candidates must satisfy the contract: `MemberInfoV1::apply_delta`
-    // rejects an entry whose `declared_len()` exceeds `max_nickname_size`,
-    // which would make the whole heal UPDATE fail — and `heal_member_info`
-    // persists the entry locally BEFORE sending, so an over-limit entry would
-    // leave the CLI holding a member_info the contract refuses. `declared_len()`
-    // is the plaintext byte length for both public and sealed values, so
-    // comparing `nick.len()` here matches the contract check exactly. If even
-    // the "Member" placeholder is over the limit (a room configured with
-    // `max_nickname_size < 6`), DEFER the heal entirely (`None`) rather than
-    // mint an entry the contract rejects (Codex review on PR #358).
+    // Both candidates must fit the room's `max_nickname_size`, a client rule
+    // riverctl and the UI check before signing (the room itself holds
+    // nicknames only to a fixed ceiling). `declared_len()` is the plaintext
+    // byte length for both public and sealed values, so comparing `nick.len()`
+    // here matches that check. If even the "Member" placeholder is over the
+    // limit (a room configured with `max_nickname_size < 6`), DEFER the heal
+    // entirely (`None`) rather than sign a nickname over the room's limit
+    // (Codex review on PR #358).
     let max_nickname_size = state.configuration.configuration.max_nickname_size;
     let nickname = self_nickname
         .filter(|nick| nick.len() <= max_nickname_size)

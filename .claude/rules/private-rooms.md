@@ -217,7 +217,8 @@ placeholder. The helper routes the nickname through
 private room) and falls back to public `"Member"` when no nickname is
 stored, a private room has no secret (so the plaintext is never leaked),
 OR the stored nickname exceeds the room's current `max_nickname_size`
-(which would otherwise make the contract reject the whole rejoin delta).
+(a client rule: riverctl and the UI do not sign a nickname over it; the
+room itself holds nicknames only to a fixed 1000-byte ceiling).
 
 This is a PARTIAL analog of the UI's `build_member_info_heal`, NOT the
 full #304 heal: it only restores the nickname on the rejoin/send path,

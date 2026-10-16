@@ -26,9 +26,9 @@ pub struct MembersV1 {
 
 impl ComposableState for MembersV1 {
     type ParentState = ChatRoomStateV1;
-    // BTreeMap (not HashMap) so the ciborium-serialized summary bytes are
+    // BTreeSet (not HashSet) so the ciborium-serialized summary bytes are
     // deterministic: freenet-core byte-compares `summarize_state` output for
-    // staleness, and a HashMap iterates in a per-process-random order, making
+    // staleness, and a HashSet iterates in a per-process-random order, making
     // two identical member sets summarize to different bytes → spurious
     // anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
     // and freenet/freenet-core#4857.

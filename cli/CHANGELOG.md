@@ -13,6 +13,12 @@ All notable changes to riverctl will be documented in this file.
   the merged room has room for.
 - A room update that repeats records the room already holds, or is computed
   against an out-of-date view of it, now applies instead of being rejected.
+- `room config` refuses a configuration the room would not take (for example
+  a zero limit, or a nickname limit over 1000 bytes) instead of reporting
+  success for an edit that does nothing.
+- `member set-nickname` refuses a nickname longer than
+  the room's nickname limit. The room no longer drops existing nicknames when
+  the owner lowers that limit.
 
 ### Fixed
 - `debug bans` judges each ban record by its own signature. A record that

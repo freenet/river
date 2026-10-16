@@ -449,9 +449,9 @@ impl AuthorizedEncryptedSecretForMember {
 /// For each current member (owner + each in `current_members_with_vks`),
 /// for each version `v` in `[0..=new_version]`:
 /// * If `(member, v)` is already in `existing_encrypted_secrets`, skip —
-///   the room state already has that pair and emitting it again would be
-///   rejected by `RoomSecretsV1::apply_delta`'s duplicate guard, wedging
-///   rotation permanently.
+///   the room state already has that pair, and a second blob for it would
+///   replace the held one whenever its signature digest is greater
+///   (`RoomSecretsV1::apply_delta` keeps one blob per pair).
 /// * Otherwise, emit a fresh `AuthorizedEncryptedSecretForMember` that
 ///   encrypts the per-version secret for the member's VK.
 ///
@@ -475,8 +475,8 @@ impl AuthorizedEncryptedSecretForMember {
 /// directly from `existing_encrypted_secrets` (rather than from a
 /// caller-local cache) is deliberate: the local cache can be missing
 /// (fresh delegate, restart, webapp reinstall), and using it as the
-/// dedup source would produce duplicate `(member, version)` pairs that
-/// the contract rejects.
+/// dedup source would produce second blobs for `(member, version)` pairs
+/// the room already holds, which could replace blobs members already have.
 ///
 /// Pure function, no I/O — extracted so the UI's synchronous
 /// `rotate_secret` fast-path and the chat-delegate's asynchronous

@@ -390,6 +390,12 @@ determinism test, and the WASM-migration coupling) lives in
 **`.claude/rules/contract-summary-determinism.md`**. Read it before touching any
 `type Summary` / `type Delta` under `common/src/room_state/`.
 
+The merge-law rules (a validly signed record never fails a merge; use the
+room's own `merge`, never `ComposableState::merge`; summaries carry a rank
+with a digest tie-break; held state is normalized on every apply;
+`FORK_SEEDS=1000` is the real check) live in
+**`.claude/rules/merge-laws.md`**.
+
 ## Dioxus WASM Signal Safety Rules
 
 The UI runs as single-threaded WASM and Firefox mobile fires Dioxus

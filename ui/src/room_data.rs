@@ -906,8 +906,8 @@ impl RoomData {
         // The assignment is unconditional and CAN move the pointer
         // backwards in the pathological case where local state holds a
         // newer decrypted version than the post-merge contract state.
-        // This relies on the `RoomSecretsV1` invariant
-        // (`common/src/room_state/secret.rs:166-174,192-213`) that
+        // This relies on the `RoomSecretsV1` invariant (its `apply_delta`)
+        // that
         // `current_version == max(versions)` and is monotonically
         // non-decreasing under merge — so the merge that immediately
         // precedes this call cannot move `current_version` backwards.
@@ -928,8 +928,9 @@ impl RoomData {
     /// rotation asynchronously via ContractNotification when the UI isn't
     /// active. Both produce byte-identical secrets via
     /// [`river_core::key_derivation::derive_room_secret`], so concurrent
-    /// rotations converge via the contract's CRDT (duplicate-version dedup
-    /// at `secret.rs:140-145`).
+    /// rotations converge in the contract (`RoomSecretsV1::apply_delta` keeps
+    /// one record per version and one blob per member and version, by
+    /// signature digest).
     ///
     /// This helper is retained for any future caller that wants to ask
     /// "is this room overdue for rotation?", but no UI sync trigger calls
@@ -1094,8 +1095,6 @@ impl RoomData {
         Err(SendMessageError::UserNotMember)
     }
 
-    /// Check if the user can participate in the room (send messages, edit profile).
-    /// Returns Ok if user is not banned AND (is owner OR has self_authorized_member OR is in members list).
     /// A private room whose current secret this device does not hold: a
     /// message it sends could not be encrypted, and the room does not admit
     /// a public body in a private room.
@@ -1103,6 +1102,8 @@ impl RoomData {
         self.is_private() && self.get_secret().is_none()
     }
 
+    /// Check if the user can participate in the room (send messages, edit profile).
+    /// Returns Ok if user is not banned AND (is owner OR has self_authorized_member OR is in members list).
     pub fn can_participate(&self) -> Result<(), SendMessageError> {
         // Participating means publishing a signed record, so the same rule as
         // `can_send_message` applies: the PRIVATE key is required, not just a
@@ -1657,11 +1658,10 @@ impl RoomData {
     /// produce **byte-identical** secrets because they both call
     /// [`river_core::key_derivation::derive_room_secret`] with the same
     /// `(signing_key_seed, owner_vk, new_version)` triple. Concurrent
-    /// rotation by both paths therefore converges via the contract's
-    /// duplicate-version dedup in `apply_delta` (`secret.rs:140-145`):
-    /// whichever record lands first wins, the other is rejected as a
-    /// duplicate, and both replicas end up with the same authoritative
-    /// state.
+    /// rotation by both paths therefore converges in
+    /// `RoomSecretsV1::apply_delta`: the blobs are byte-identical, and of the
+    /// two version records (the UI's and the delegate's `created_at` differ)
+    /// every replica keeps the one with the greater signature digest.
     pub fn rotate_secret(
         &mut self,
     ) -> Result<river_core::room_state::secret::SecretsDelta, String> {
