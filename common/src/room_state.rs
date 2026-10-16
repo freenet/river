@@ -865,6 +865,7 @@ fn trim_to_work_bounds(
     use crate::room_state::ban_evidence::{evidence_bound, evidence_depth_cap, evidence_digest};
     use crate::room_state::member::{members_work_bound, MembersDelta};
     use crate::room_state::message::messages_work_bound;
+    use std::collections::HashMap;
 
     if let Some(msgs) = delta.recent_messages.as_mut() {
         let bound = messages_work_bound(config.max_recent_messages);
@@ -895,21 +896,35 @@ fn trim_to_work_bounds(
     }
 
     // Invite depth in the sender's state (members and evidence), the owner
-    // at 0; a record whose chain does not reach the owner sorts last.
+    // at 0, computed for every id at once by one breadth-first walk (linear
+    // in the records); a record whose chain does not reach the owner sorts
+    // last.
     let depth_in_sender = || {
         let known = sender.ban_evidence.lookup(&sender.members, owner_id);
-        move |m: &AuthorizedMember| -> usize {
-            let mut depth = 1;
-            let mut inviter = m.member.invited_by;
-            let mut seen = HashSet::new();
-            while inviter != owner_id {
-                match known.get(&inviter) {
-                    Some(next) if seen.insert(inviter) => inviter = next.member.invited_by,
-                    _ => return usize::MAX,
+        let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+        for (id, m) in &known {
+            children.entry(m.member.invited_by).or_default().push(*id);
+        }
+        let mut id_depth: HashMap<MemberId, usize> = HashMap::from([(owner_id, 0)]);
+        let mut frontier = vec![owner_id];
+        let mut level = 0;
+        while !frontier.is_empty() {
+            level += 1;
+            let mut next = Vec::new();
+            for inviter in &frontier {
+                for child in children.get(inviter).into_iter().flatten() {
+                    if !id_depth.contains_key(child) {
+                        id_depth.insert(*child, level);
+                        next.push(*child);
+                    }
                 }
-                depth += 1;
             }
-            depth
+            frontier = next;
+        }
+        move |m: &AuthorizedMember| -> usize {
+            id_depth
+                .get(&m.member.invited_by)
+                .map_or(usize::MAX, |d| d + 1)
         }
     };
 
@@ -1061,10 +1076,11 @@ mod tests {
         let config = Configuration {
             owner_member_id: owner_id,
             max_members: 1,
-            max_user_bans: 1,
+            max_user_bans: 3,
             ..Default::default()
         };
-        // Evidence bound: 2 x max(1, MIN_BANS_DELTA_BOUND) x min(1, 4) = 200.
+        // Evidence bound: 2 x max(3, MIN_BANS_DELTA_BOUND) x min(1, 4) = 200. The
+        // two caps differ, so reading one for the other changes the bound.
         let invite = |inviter: MemberId, inviter_sk: &SigningKey, seed: u32| {
             let mut bytes = [0u8; 32];
             bytes[..4].copy_from_slice(&seed.to_le_bytes());
