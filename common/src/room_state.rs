@@ -879,7 +879,13 @@ mod tests {
         let owner_signing_key = SigningKey::generate(rng);
         let owner_verifying_key = owner_signing_key.verifying_key();
 
-        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_signing_key);
+        let config = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: owner_verifying_key.into(),
+                ..Configuration::default()
+            },
+            &owner_signing_key,
+        );
 
         (
             ChatRoomStateV1 {

@@ -164,6 +164,7 @@ impl World {
         ChatRoomStateV1 {
             configuration: AuthorizedConfigurationV1::new(
                 Configuration {
+                    owner_member_id: self.owner_id,
                     max_members: 50,
                     max_user_bans,
                     max_recent_messages,

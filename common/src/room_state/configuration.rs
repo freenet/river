@@ -73,8 +73,9 @@ impl ComposableState for AuthorizedConfigurationV1 {
     /// (freenet/river#703 defect 2, `delta_idempotence`).
     ///
     /// An outranking configuration with a bad signature is a forgery and is
-    /// rejected. One that is owner-signed but fails the checks below (a zero
-    /// cap, a changed `owner_member_id`, oversized or public display metadata
+    /// rejected. One that is owner-signed but fails [`Self::check_values`] (a
+    /// zero cap, an `owner_member_id` that is not the room owner's, oversized
+    /// or public display metadata
     /// in a private room) is SKIPPED, not rejected: an `Err` for a validly
     /// signed record would fail every whole-state merge with a peer holding
     /// it, freezing every other field between them too. `verify` only checks
@@ -94,7 +95,7 @@ impl ComposableState for AuthorizedConfigurationV1 {
             delta
                 .verify_signature(&parameters.owner)
                 .map_err(|e| format!("Invalid signature: {}", e))?;
-            if delta.check_values(&self.configuration).is_err() {
+            if delta.check_values(parameters).is_err() {
                 // Skipped, deliberately not an error: see the doc comment.
                 return Ok(());
             }
@@ -115,12 +116,19 @@ impl AuthorizedConfigurationV1 {
         )
     }
 
-    /// The checks a configuration must pass to replace `current`, other than
-    /// its signature and rank. `Err` names the first one it fails.
-    pub fn check_values(&self, current: &Configuration) -> Result<(), String> {
+    /// The checks a configuration must pass to be adopted, other than its
+    /// signature and rank. `Err` names the first one it fails.
+    ///
+    /// Every check reads only this configuration and the room's parameters,
+    /// never the configuration a peer currently holds: an answer that
+    /// depended on the held configuration would differ between peers holding
+    /// different ones, and one bad held configuration would make every later
+    /// valid one fail (freenet/river#703 review). Clients run the same checks
+    /// before signing.
+    pub fn check_values(&self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let c = &self.configuration;
-        if c.owner_member_id != current.owner_member_id {
-            return Err("Cannot change the owner_member_id".to_string());
+        if c.owner_member_id != parameters.owner_id() {
+            return Err("owner_member_id is not the room owner's".to_string());
         }
         if c.max_recent_messages == 0
             || c.max_user_bans == 0
@@ -508,7 +516,10 @@ mod tests {
     fn test_apply_delta_should_apply() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let configuration = Configuration::default();
+        let configuration = Configuration {
+            owner_member_id: owner_verifying_key.into(),
+            ..Configuration::default()
+        };
         let mut authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
@@ -601,8 +612,8 @@ mod tests {
             AuthorizedConfigurationV1::new(new_configuration, &owner_signing_key);
 
         assert_eq!(
-            new_authorized_configuration.check_values(&configuration),
-            Err("Cannot change the owner_member_id".to_string())
+            new_authorized_configuration.check_values(&parameters),
+            Err("owner_member_id is not the room owner's".to_string())
         );
         // Owner-signed, so skipped rather than rejected (freenet/river#703).
         let before = authorized_configuration.clone();
@@ -620,7 +631,10 @@ mod tests {
     fn test_apply_delta_invalid_values() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let configuration = Configuration::default();
+        let configuration = Configuration {
+            owner_member_id: owner_verifying_key.into(),
+            ..Configuration::default()
+        };
         let mut authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
@@ -639,7 +653,7 @@ mod tests {
             AuthorizedConfigurationV1::new(new_configuration, &owner_signing_key);
 
         assert_eq!(
-            new_authorized_configuration.check_values(&configuration),
+            new_authorized_configuration.check_values(&parameters),
             Err("Invalid configuration values".to_string())
         );
         // Owner-signed, so skipped rather than rejected (freenet/river#703).
@@ -669,6 +683,7 @@ mod tests {
             AuthorizedConfigurationV1::new(
                 Configuration {
                     configuration_version: 2,
+                    owner_member_id: parameters.owner_id(),
                     max_members,
                     ..Configuration::default()
                 },
@@ -706,6 +721,56 @@ mod tests {
             .apply_delta(&parent_state, &parameters, &Some(hi.clone()))
             .unwrap();
         assert_eq!(on_hi, hi, "re-delivery is a no-op");
+    }
+
+    /// A configuration's `owner_member_id` is checked against the room's
+    /// owner (the contract parameters), not against whatever configuration
+    /// the peer happens to hold: a held configuration naming the wrong owner
+    /// must not stop the correct one from being adopted, or the outcome
+    /// would depend on what each peer held (freenet/river#703 review).
+    #[test]
+    fn owner_member_id_is_checked_against_the_room_owner() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_signing_key.verifying_key(),
+        };
+        let mut held = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: MemberId(FastHash(1)),
+                ..Configuration::default()
+            },
+            &owner_signing_key,
+        );
+        let correct = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: parameters.owner_id(),
+                configuration_version: 2,
+                ..Configuration::default()
+            },
+            &owner_signing_key,
+        );
+        held.apply_delta(
+            &ChatRoomStateV1::default(),
+            &parameters,
+            &Some(correct.clone()),
+        )
+        .unwrap();
+        assert_eq!(held, correct, "the room owner's id is adopted");
+
+        let wrong = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: MemberId(FastHash(1)),
+                configuration_version: 3,
+                ..Configuration::default()
+            },
+            &owner_signing_key,
+        );
+        held.apply_delta(&ChatRoomStateV1::default(), &parameters, &Some(wrong))
+            .unwrap();
+        assert_eq!(
+            held, correct,
+            "a configuration naming another owner is skipped"
+        );
     }
 
     /// An outranking configuration whose signature does not verify is a

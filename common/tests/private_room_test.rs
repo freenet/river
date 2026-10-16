@@ -1019,7 +1019,7 @@ fn issue_318_member_info_apply_delta_has_no_contract_privacy_guard() {
     // unrelated validation starts failing first, this stops passing rather
     // than silently no longer testing the privacy guard.
     let reason = bad_config
-        .check_values(&state.configuration.configuration)
+        .check_values(&params)
         .expect_err("Configuration MUST refuse public display metadata in a private room");
     assert!(
         reason.contains("encrypted display metadata"),

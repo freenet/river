@@ -104,6 +104,7 @@ fn room(n_members: usize, max_direct_messages: Option<usize>) -> Room {
         .collect();
 
     let config = Configuration {
+        owner_member_id: owner_id,
         max_members: 1000,
         max_direct_messages,
         ..Default::default()
@@ -1202,7 +1203,7 @@ fn zero_max_direct_messages_is_rejected_by_configuration_apply_delta() {
     let bad = AuthorizedConfigurationV1::new(bad, &r.owner_sk);
 
     assert_eq!(
-        bad.check_values(&cfg.configuration),
+        bad.check_values(&r.params),
         Err("Invalid configuration values".to_string())
     );
     cfg.apply_delta(&r.state, &r.params, &Some(bad))
