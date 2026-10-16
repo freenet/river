@@ -11,7 +11,8 @@ All notable changes to riverctl will be documented in this file.
   removed first, then the oldest. Owner bans and all other bans are each
   guaranteed half the cap, and either can use slots the other leaves free.
   Before, a list full of owner bans removed every new deputy ban as soon as it
-  was made.
+  was made. Now, while owner bans fill more than half the cap, each new ban
+  lifts the oldest owner ban, and the person it named can rejoin.
 - Known limit: a ban's date is set by whoever signs it, so a member who floods
   the list with future-dated bans can still push out other members' bans, and
   owner bans beyond the newest half of the cap. Banning that member makes their

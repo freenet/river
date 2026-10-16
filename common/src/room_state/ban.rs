@@ -148,8 +148,10 @@ impl BansV1 {
     /// Evicts by RECENCY within two pools (freenet/river#796, Ian
     /// 2026-10-16). When the set is over the cap:
     ///
-    /// 1. Dead entries go first, oldest first: bans that take no effect and
-    ///    later duplicates of an `(issuer, target)` pair (below).
+    /// 1. Dead entries go first, oldest first: records whose own signature
+    ///    does not verify against their claimed issuer's key, bans that take
+    ///    no effect, and later duplicates of an `(issuer, target)` pair
+    ///    (below).
     /// 2. Then live bans are split into OWNER bans and all OTHER bans (deputy,
     ///    inviter and mutual bans alike). Each pool is guaranteed
     ///    `max_bans / 2` slots. Only a pool's bans beyond its guarantee can be
@@ -186,7 +188,8 @@ impl BansV1 {
     ///   no non-owner ban could evict an owner ban.
     ///
     /// An owner ban on the flooder makes all their bans dead, so the next cap
-    /// pass drops them first; bans already evicted stay evicted. A room that
+    /// pass drops them first; bans already evicted stay evicted, and the
+    /// members they named can rejoin. A room that
     /// wants every owner ban protected sets `max_user_bans` to at least twice
     /// its owner-ban count.
     ///
@@ -218,14 +221,35 @@ impl BansV1 {
         if bans.len() <= max_bans {
             return;
         }
+        // Canonical stored order, oldest first; every pass below walks it, and
+        // the per-record indices below refer to it. Records can share
+        // `(banned_at, id)` (an id hashes the signature alone), so the record
+        // digest breaks the tie and the eviction never depends on arrival
+        // order.
+        bans.sort_by_cached_key(|b| (b.ban.banned_at, b.id(), crate::util::record_digest(b)));
         let resolution =
             members.resolve_bans(evidence, &BansV1(bans.clone()), member_info, parameters);
-        // Only signature-verified bans compete for their pair, so a forged
-        // earlier copy cannot displace the real one.
+        let owner_id = parameters.owner_id();
+        let present = members.members_by_member_id();
+        let known = evidence.lookup(members, owner_id);
+        // Each record is judged by its own signature against its claimed
+        // issuer's key; one that does not verify is dead. `resolution` is
+        // keyed by `BanId`, so its lookups below are used only for records
+        // whose own signature verifies.
+        let own_signature_ok: Vec<bool> = bans
+            .iter()
+            .map(|b| {
+                Self::ban_signature_matches_current_key(b, &known, owner_id, &parameters.owner)
+            })
+            .collect();
+        // Only bans whose own signature verifies compete for their pair, so a
+        // forged earlier copy cannot displace the real one.
         let mut first_of_pair: HashMap<(MemberId, MemberId), (SystemTime, BanId)> = HashMap::new();
         for ban in bans
             .iter()
-            .filter(|b| resolution.verified.contains(&b.id()))
+            .zip(&own_signature_ok)
+            .filter(|(_, ok)| **ok)
+            .map(|(b, _)| b)
         {
             let key = (ban.banned_by, ban.ban.banned_user);
             let rank = (ban.ban.banned_at, ban.id());
@@ -238,12 +262,13 @@ impl BansV1 {
                 })
                 .or_insert(rank);
         }
-        let owner_id = parameters.owner_id();
-        let present = members.members_by_member_id();
-        let known = evidence.lookup(members, owner_id);
-        // A dead entry: a later duplicate of its (issuer, target) pair, or a
-        // ban that takes no effect.
-        let live = |ban: &AuthorizedUserBan| {
+        // A dead entry: a record whose own signature does not verify, a later
+        // duplicate of its (issuer, target) pair, or a ban that takes no
+        // effect.
+        let live = |i: usize, ban: &AuthorizedUserBan| {
+            if !own_signature_ok[i] {
+                return false;
+            }
             let first = first_of_pair
                 .get(&(ban.banned_by, ban.ban.banned_user))
                 .is_some_and(|(at, id)| *at == ban.ban.banned_at && *id == ban.id());
@@ -263,19 +288,12 @@ impl BansV1 {
                 && !resolution.removed.contains(&ban.banned_by)
         };
 
-        // Canonical stored order, oldest first; every pass below walks it.
-        bans.sort_by(|a, b| {
-            a.ban
-                .banned_at
-                .cmp(&b.ban.banned_at)
-                .then_with(|| a.id().cmp(&b.id()))
-        });
         let mut to_remove = bans.len() - max_bans;
         let mut evict = vec![false; bans.len()];
         let mut owner_live = Vec::new();
         let mut other_live = Vec::new();
         for (i, ban) in bans.iter().enumerate() {
-            if !live(ban) {
+            if !live(i, ban) {
                 if to_remove > 0 {
                     evict[i] = true;
                     to_remove -= 1;

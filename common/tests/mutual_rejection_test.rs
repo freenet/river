@@ -2390,6 +2390,73 @@ fn a_dead_entry_and_a_pool_eviction_in_one_pass() {
     assert_eq!(cap(&out), out, "a second pass changes nothing");
 }
 
+/// More dead entries than the overflow: only the oldest dead entries go, and
+/// no live ban is touched. Cap 5 with four live bans, then three later
+/// duplicates of the deputy's pairs (dead): two over, so the two oldest
+/// duplicates go and the newest stays.
+#[test]
+fn surplus_dead_entries_go_oldest_first_and_spare_live_bans() {
+    let room = capped_room(20, 5);
+    let (d, x, y) = (room.person(), room.person(), room.person());
+    let s = room.modded_state(&[&d, &x, &y], &[&d], vec![]);
+    let gone: Vec<Person> = (0..2).map(|_| room.person()).collect();
+    let o1 = room.owner_ban(&gone[0], 10);
+    let o2 = room.owner_ban(&gone[1], 11);
+    let dx = room.ban(&d, &x, 12);
+    let dy = room.ban(&d, &y, 13);
+    let s = apply_checked(
+        &s,
+        bans_delta(vec![o1.clone(), o2.clone(), dx.clone(), dy.clone()]),
+        &room.params,
+    );
+    // Three duplicates of live pairs: all dead. 7 bans against cap 5, so two
+    // go: the two OLDEST duplicates. The newest duplicate stays as a dead
+    // entry, since the set is then within the cap.
+    let dup1 = room.ban(&d, &x, 20);
+    let dup2 = room.ban(&d, &y, 21);
+    let dup3 = room.ban(&d, &x, 22);
+    let after = apply_checked(
+        &s,
+        bans_delta(vec![dup1.clone(), dup2.clone(), dup3.clone()]),
+        &room.params,
+    );
+    for live in [&o1, &o2, &dx, &dy] {
+        assert!(has_ban(&after, live), "no live ban is evicted");
+    }
+    assert!(!has_ban(&after, &dup1) && !has_ban(&after, &dup2));
+    assert!(has_ban(&after, &dup3), "only the overflow is evicted");
+}
+
+/// Both pools over their share with several evictions, interleaved by age
+/// across the pools. Cap 4 (share 2): owner bans at 10, 30, 40, 50 and deputy
+/// bans at 20, 60, 70. Seven live, three go. Candidates are the owner pool's
+/// two oldest (10, 30) and the other pool's oldest (20): exactly three, so
+/// all three go and the newest two of each pool survive.
+#[test]
+fn several_evictions_across_both_pools_go_by_age() {
+    let room = capped_room(20, 4);
+    let d = room.person();
+    let s = room.modded_state(&[&d], &[&d], vec![]);
+    let gone: Vec<Person> = (0..7).map(|_| room.person()).collect();
+    let o: Vec<AuthorizedUserBan> = [10, 30, 40, 50]
+        .iter()
+        .zip(&gone[..4])
+        .map(|(t, p)| room.owner_ban(p, *t))
+        .collect();
+    let db: Vec<AuthorizedUserBan> = [20, 60, 70]
+        .iter()
+        .zip(&gone[4..])
+        .map(|(t, p)| room.ban(&d, p, *t))
+        .collect();
+    let s = apply_checked(&s, bans_delta(o.clone()), &room.params);
+    let after = apply_checked(&s, bans_delta(db.clone()), &room.params);
+    assert_eq!(after.bans.0.len(), 4);
+    assert!(!has_ban(&after, &o[0]) && !has_ban(&after, &o[1]));
+    assert!(!has_ban(&after, &db[0]));
+    assert!(has_ban(&after, &o[2]) && has_ban(&after, &o[3]));
+    assert!(has_ban(&after, &db[1]) && has_ban(&after, &db[2]));
+}
+
 /// The widened residual of freenet/river#796, pinned so a future fix flips it
 /// deliberately: a plain member with no deputy grant and no invitees floods
 /// far-future bans against random ids whose record is held nowhere (each
