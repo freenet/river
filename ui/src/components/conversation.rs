@@ -4267,7 +4267,7 @@ fn MessageGroupComponent(
                                                 // (#402), and on a hover pointer lets it take clicks
                                                 // only while its row is hovered, so it never covers
                                                 // Latest or a neighbouring row.
-                                                class: "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 right-0 translate-x-full ml-2",
+                                                class: "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-20 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 right-0 translate-x-full ml-2",
                                                 // Reply button - available for all messages
                                                 button {
                                                     class: "text-xs text-text-muted hover:text-accent transition-colors",
@@ -4333,16 +4333,17 @@ fn MessageGroupComponent(
                                                 // would become the containing block for the `fixed`
                                                 // dismiss backdrop below, shrinking it to this element
                                                 // instead of the viewport (#402).
-                                                // Raise the OPEN wrapper above sibling kebabs: every
-                                                // `.touch-actions` is z-50, and later ones paint above an
-                                                // open popover, so without this a nearby message's kebab
-                                                // could sit over the menu rows and steal the tap. `z-[60]`
-                                                // lifts the whole open popover+backdrop above them (and its
-                                                // backdrop then covers those kebabs, so a tap on one just
-                                                // dismisses). (#402)
+                                                // A closed `.touch-actions` is z-20, under Latest (z-30),
+                                                // so a kebab at the bottom of the view never takes
+                                                // Latest's tap. Raise the OPEN wrapper above sibling
+                                                // kebabs: later ones paint above an open popover, so
+                                                // without this a nearby message's kebab could sit over the
+                                                // menu rows and steal the tap. `z-[60]` lifts the whole
+                                                // open popover+backdrop above them (and its backdrop then
+                                                // covers those kebabs, so a tap on one just dismisses). (#402)
                                                 class: format!(
                                                     "touch-actions absolute top-1 left-full ml-1 {}",
-                                                    if menu_open { "z-[60]" } else { "z-50" },
+                                                    if menu_open { "z-[60]" } else { "z-20" },
                                                 ),
                                                 // Kebab toggle button
                                                 button {

@@ -1,6 +1,6 @@
 import { test, expect, Locator, Page } from "@playwright/test";
 import { coarsePointer, contrast, openRoomWithComposer, reactTo, resolveColor, waitForApp } from "./example-room";
-import { readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
+import { readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
 // Full-width chat rows (plan 11): every author's group gets one River-logo
@@ -347,5 +347,47 @@ test.describe("Message row hover band", () => {
       await expect.poll(() => bandedRows(page), { message: "the band goes with the list" }).toEqual([]);
       expect((await scrollMetrics(page)).top, "removing the reaction does not scroll").toBe(before);
     });
+  });
+});
+
+// A row's resting controls (the hover bar on a hover pointer, the kebab on
+// touch) sit in the gutter, which can share Latest's corner. They paint under
+// Latest, so a row at the bottom of the view never takes Latest's click.
+test.describe("Latest over row controls", () => {
+  test("a row control aligned with Latest never takes its click", async ({ page }) => {
+    const touch = await coarsePointer(page);
+    await page.setViewportSize(touch ? { width: 390, height: 800 } : { width: 1024, height: 800 });
+    await openRoom(page);
+    const control = touch ? ".touch-actions" : ".hover-actions";
+    await readerLeavesTheEnd(page);
+    const latest = page.getByTestId("scroll-to-bottom");
+    await expect(latest).toBeVisible();
+    // Scroll the row nearest mid-view so its control's centre is on Latest's centre.
+    const { id, target } = await page.evaluate((sel) => {
+      const scroller = document.getElementById("chat-scroll-container")!;
+      const l = document.querySelector('[data-testid="scroll-to-bottom"]')!.getBoundingClientRect();
+      const mid = scroller.getBoundingClientRect().top + scroller.clientHeight / 2;
+      const rows = [...document.querySelectorAll<HTMLElement>('[data-testid="message-row"]')];
+      const dist = (r: HTMLElement) => Math.abs(r.getBoundingClientRect().top - mid);
+      const row = rows.reduce((a, b) => (dist(b) < dist(a) ? b : a));
+      const c = row.querySelector(sel)!.getBoundingClientRect();
+      return { id: row.id, target: scroller.scrollTop + c.top + c.height / 2 - (l.top + l.height / 2) };
+    }, control);
+    await readerScrollsWithoutGesture(page, target);
+    const row = page.locator(`[id="${id}"]`);
+    if (!touch) await row.locator(".msg-content").hover({ position: { x: 4, y: 4 } });
+    // Premise: the control really overlaps Latest, or the test proves nothing.
+    const [c, l] = [(await row.locator(control).boundingBox())!, (await latest.boundingBox())!];
+    const [left, right] = [Math.max(c.x, l.x), Math.min(c.x + c.width, l.x + l.width)];
+    const [top, bottom] = [Math.max(c.y, l.y), Math.min(c.y + c.height, l.y + l.height)];
+    expect(right - left, "premise: the control overlaps Latest across").toBeGreaterThan(0);
+    expect(bottom - top, "premise: the control overlaps Latest down").toBeGreaterThan(0);
+    const onTop = await latest.evaluate(
+      (el, [x, y]) => el.contains(document.elementFromPoint(x, y)),
+      [(left + right) / 2, (top + bottom) / 2],
+    );
+    expect(onTop, "Latest is the top element where they overlap").toBe(true);
+    await latest.click();
+    await expect(latest).toBeHidden();
   });
 });

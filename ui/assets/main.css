@@ -237,7 +237,9 @@
  * while its row is hovered: it sits in the row's own right gutter, so the
  * pointer reaches it without leaving the row, and an idle, invisible bar must
  * not cover the Latest button or a neighbouring row. Keyboard focus reaches
- * its buttons either way. */
+ * its buttons either way. It and the closed kebab are z-20, under Latest
+ * (z-30) and the dismiss backdrops (z-40), so a hovered bar never covers
+ * Latest either. */
 .hover-actions {
     pointer-events: none;
 }
