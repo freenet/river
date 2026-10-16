@@ -3541,9 +3541,17 @@ fn reaction_owners_popover_at(
     }
 }
 
+/// Where the inline emoji picker opens from its "+", set when it opens (#402).
+#[derive(Clone, Copy, Default, PartialEq)]
+struct PickerPlacement {
+    above: bool,
+    /// Leftward (`right-0`).
+    align_right: bool,
+}
+
 /// Whether the inline emoji picker opens leftward (`right-0`) from its "+":
-/// toward whichever side of the chat scroller has more room, like the reactor list.
-fn picker_opens_leftward(
+/// toward whichever side of the chat scroller has more room.
+fn picker_align_right(
     anchor_left: f64,
     anchor_right: f64,
     scroll_left: f64,
@@ -3594,7 +3602,7 @@ fn chat_scrollport_bounds() -> (f64, f64) {
 }
 
 /// The side for `msg-{msg_id}`'s inline picker, measured from its "+" wrapper; rightward when unmeasurable.
-fn inline_picker_opens_leftward(msg_id: &str) -> bool {
+fn inline_picker_align_right(msg_id: &str) -> bool {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return false;
     };
@@ -3614,7 +3622,7 @@ fn inline_picker_opens_leftward(msg_id: &str) -> bool {
         anchor.get_bounding_client_rect(),
         scroller.get_bounding_client_rect(),
     );
-    picker_opens_leftward(a.left(), a.right(), s.left(), s.right())
+    picker_align_right(a.left(), a.right(), s.left(), s.right())
 }
 
 /// ⚠ and 🛡 for one reactor. `reactor_id` is the member whose name is shown.
@@ -3694,7 +3702,7 @@ fn MessageGroupComponent(
     // Whether the kebab action menu should open above (true) or below (false)
     // the kebab. Set from the tap position so the menu for a message near the
     // bottom of the viewport flips upward instead of being clipped by the
-    // composer — mirrors `picker_show_above` for the emoji picker (#402).
+    // composer — mirrors `PickerPlacement::above` for the emoji picker (#402).
     let mut menu_show_above: Signal<bool> = use_signal(|| false);
 
     // Whether the kebab action menu should be left-anchored (open rightward) or
@@ -3711,10 +3719,18 @@ fn MessageGroupComponent(
     // the scroll container with Edit/Delete unreachable (#402).
     let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
 
-    // Track if emoji picker should appear above (true) or below (false) the button
-    let mut picker_show_above: Signal<bool> = use_signal(|| false);
-    // Whether it opens leftward (`right-0`); set at open time, like `picker_show_above`.
-    let mut picker_align_right: Signal<bool> = use_signal(|| false);
+    let mut picker_placement: Signal<PickerPlacement> = use_signal(PickerPlacement::default);
+    // Measures the "+" now, then places and opens the picker in one deferred
+    // step (.claude/rules/dioxus-signal-safety.md).
+    let open_inline_picker = move |msg_id: &str, above: bool| {
+        let align_right = inline_picker_align_right(msg_id);
+        let picker_id = format!("inline-{msg_id}");
+        crate::util::defer(move || {
+            picker_placement.set(PickerPlacement { above, align_right });
+            open_emoji_picker.set(Some(picker_id));
+            open_action_menu.set(None);
+        });
+    };
     let mut open_reaction_owners: Signal<Option<ReactionOwnersPopover>> = use_signal(|| None);
     {
         let live_owner_keys: HashSet<String> = group
@@ -4506,18 +4522,10 @@ fn MessageGroupComponent(
                                                         button {
                                                             class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
                                                             onclick: move |_| {
-                                                                let picker_id = format!("inline-{}", msg_id_menu_react);
                                                                 // Inherit the kebab's flip direction so the picker
                                                                 // for a bottom message also opens upward, not
                                                                 // clipped by the composer (#402).
-                                                                let above = *menu_show_above.peek();
-                                                                let align_right = inline_picker_opens_leftward(&msg_id_menu_react);
-                                                                crate::util::defer(move || {
-                                                                    picker_show_above.set(above);
-                                                                    picker_align_right.set(align_right);
-                                                                    open_emoji_picker.set(Some(picker_id));
-                                                                    open_action_menu.set(None);
-                                                                });
+                                                                open_inline_picker(&msg_id_menu_react, *menu_show_above.peek());
                                                             },
                                                             Icon { icon: FaFaceSmile, width: 14, height: 14 }
                                                             "React"
@@ -4878,7 +4886,6 @@ fn MessageGroupComponent(
                                                         let msg_id = msg_id_for_inline.clone();
                                                         move |e: MouseEvent| {
                                                             e.stop_propagation();
-                                                            let picker_id = picker_id.clone();
                                                             if open_emoji_picker.peek().as_ref() == Some(&picker_id) {
                                                                 crate::util::defer(move || open_emoji_picker.set(None));
                                                             } else {
@@ -4889,17 +4896,9 @@ fn MessageGroupComponent(
                                                                     .and_then(|w| w.inner_height().ok())
                                                                     .and_then(|h| h.as_f64())
                                                                     .unwrap_or(800.0);
-                                                                let above = click_y > viewport_height * 0.6;
-                                                                // From the "+" itself, not the click: a key press
-                                                                // reports no position.
-                                                                let align_right = inline_picker_opens_leftward(&msg_id);
-                                                                // Measured above; written in one deferred step
-                                                                // (.claude/rules/dioxus-signal-safety.md).
-                                                                crate::util::defer(move || {
-                                                                    picker_show_above.set(above);
-                                                                    picker_align_right.set(align_right);
-                                                                    open_emoji_picker.set(Some(picker_id));
-                                                                });
+                                                                // The side comes from the "+" itself, not the click:
+                                                                // a key press reports no position.
+                                                                open_inline_picker(&msg_id, click_y > viewport_height * 0.6);
                                                             }
                                                         }
                                                     },
@@ -4911,8 +4910,8 @@ fn MessageGroupComponent(
                                                         "data-testid": "emoji-picker",
                                                         class: format!(
                                                             "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid {} {}",
-                                                            if *picker_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                            if *picker_align_right.read() { "right-0" } else { "left-0" },
+                                                            if picker_placement.read().above { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                            if picker_placement.read().align_right { "right-0" } else { "left-0" },
                                                         ),
                                                         style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
                                                         onclick: move |e: MouseEvent| e.stop_propagation(),
@@ -4965,26 +4964,26 @@ mod tests {
     fn picker_opens_toward_the_roomier_side() {
         // A 320px scroller and a 20px "+".
         assert!(
-            !picker_opens_leftward(64.0, 84.0, 0.0, 320.0),
+            !picker_align_right(64.0, 84.0, 0.0, 320.0),
             "at the line's start it opens rightward"
         );
         assert!(
-            picker_opens_leftward(220.0, 240.0, 0.0, 320.0),
+            picker_align_right(220.0, 240.0, 0.0, 320.0),
             "near the right edge it opens leftward"
         );
         assert!(
-            !picker_opens_leftward(150.0, 170.0, 0.0, 320.0),
+            !picker_align_right(150.0, 170.0, 0.0, 320.0),
             "a tie keeps the rightward default"
         );
         // Desktop: the scroller starts past the room list.
         assert!(
-            !picker_opens_leftward(360.0, 380.0, 300.0, 1000.0),
+            !picker_align_right(360.0, 380.0, 300.0, 1000.0),
             "room is measured from the scroller's edges, not the window's"
         );
         // Measured from the window (0..1000) this "+" would have more room
         // to its left; inside the scroller it has more to its right.
         assert!(
-            !picker_opens_leftward(600.0, 620.0, 300.0, 1000.0),
+            !picker_align_right(600.0, 620.0, 300.0, 1000.0),
             "the scroller's left edge, not the window's, bounds the leftward room"
         );
     }
