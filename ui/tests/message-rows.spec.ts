@@ -177,7 +177,7 @@ test.describe("Message rows", () => {
     };
     await expect(groups.insert).toBeAttached();
     const names = await Promise.all(
-      Object.values(groups).map((g) => g.getByTestId("message-group-header").locator('span[title^="Member ID"]').getAttribute("title")),
+      Object.values(groups).map((g) => g.getByTestId("message-group-header").getByTestId("message-author-name").getAttribute("title")),
     );
     expect(new Set(names).size, `three distinct members: ${names}`).toBe(3);
 
@@ -212,6 +212,17 @@ test.describe("Message rows", () => {
       expect(contrast(worst, band), `${scheme}: hue ${hue} tone ${tone} on the band (${worst} on ${band})`).toBeGreaterThanOrEqual(3);
       expect(await paint(hue, (tone + 1) % 3), `${scheme}: tone changes the colour`).not.toEqual(worst);
     }
+  });
+
+  test("a group's name is a button that opens the member's info from the keyboard", async ({ page }) => {
+    const { received } = await openRoomWithPairs(page);
+    const name = received.getByTestId("message-group-header").getByRole("button", { name: "Test Sender Insert" });
+    await name.focus();
+    await expect(name).toBeFocused();
+    await page.keyboard.press("Enter");
+    const modal = page.getByTestId("member-info-modal");
+    await expect(modal).toBeVisible();
+    await expect(modal).toContainText("Test Sender Insert");
   });
 
   test("clicking a group's avatar opens that member's info, like the name", async ({ page }) => {

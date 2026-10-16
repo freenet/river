@@ -49,7 +49,7 @@ for (const scheme of ["light", "dark"] as const) {
     // The markup paints with those tokens.
     const link = await c("var(--color-link)");
     const history = page.locator("#chat-scroll-container");
-    for (const sel of [".prose a", ".river-mention", '[data-message-self="true"] span[title^="Member ID"]']) {
+    for (const sel of [".prose a", ".river-mention", '[data-message-self="true"] [data-testid="message-author-name"]']) {
       const el = history.locator(sel).first();
       await expect(el, `premise: ${sel} is rendered`).toBeAttached();
       expect(await colourOf(el), sel).toEqual(link);

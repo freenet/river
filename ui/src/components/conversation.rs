@@ -3860,9 +3860,9 @@ fn MessageGroupComponent(
                                 "data-message-self": "{is_self}",
                                 class: "msg-row group",
                                 if is_first {
-                                    // Decorative: the name beside it is the
-                                    // accessible, focusable control that does
-                                    // the same thing.
+                                    // Decorative and out of the tab order: the
+                                    // name button beside it opens the same
+                                    // member info from the keyboard.
                                     span {
                                         "data-testid": "message-group-avatar",
                                         "aria-hidden": "true",
@@ -3883,8 +3883,12 @@ fn MessageGroupComponent(
                                         div {
                                             "data-testid": "message-group-header",
                                             class: "flex flex-wrap items-baseline gap-x-2 mb-0.5",
-                                            span {
-                                                class: "text-sm font-medium min-w-0 [overflow-wrap:anywhere] cursor-pointer transition-colors {name_colour}",
+                                            // A native button: Enter and Space fire
+                                            // its click, so no key handler.
+                                            button {
+                                                r#type: "button",
+                                                "data-testid": "message-author-name",
+                                                class: "text-sm font-medium text-left min-w-0 [overflow-wrap:anywhere] cursor-pointer rounded-sm transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent {name_colour}",
                                                 title: "Member ID: {author_id}",
                                                 onclick: open_author_info,
                                                 "{group.author_name}"
