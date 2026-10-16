@@ -200,17 +200,10 @@ pub fn members_work_bound(max_members: usize) -> usize {
 impl MembersV1 {
     /// The member records to keep: every `held` one, plus the `added` ones
     /// this room admits. `added` holds no record for a held id: the caller
-    /// skips those, so a held record is never replaced, whatever the inviter
-    /// or key an arriving record for its id names: a member record is signed
-    /// by its inviter alone, so an arriving record carries no more authority
-    /// than the held one.
-    ///
-    /// Accepted residual, pending an invitee-consent design: two peers that
-    /// each hold a DIFFERENT record for one member keep their own when they
-    /// merge, so that merge is not commutative, and a record the other
-    /// peer's member then invites (signed by the key that peer holds) fails
-    /// the signature check here. Only a second record issued for an
-    /// existing member produces that state.
+    /// skips those: a held record is kept, and a record naming a different
+    /// inviter or a different key for a held id is skipped. Two peers that
+    /// each hold a different record for one member therefore each keep their
+    /// own when they merge.
     ///
     /// The added records are placed by a breadth-first walk from the owner
     /// through the held and added records: each new member keeps a record at

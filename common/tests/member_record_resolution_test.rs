@@ -5,13 +5,12 @@
 //! inviter the room already holds. The room keeps the record it holds:
 //!
 //! - a record for an id already held is skipped, never an error, whatever
-//!   its inviter and whatever key it names;
+//!   its inviter; a record naming a different key for a held id is skipped;
 //! - a state that itself holds two records for one id (`verify` allows it)
 //!   is normalized to one, the same way whatever order they are stored in.
 //!
-//! Accepted residual (pending an invitee-consent design): two peers that each
-//! hold a DIFFERENT record for one member keep their own when they merge, so
-//! that merge is not commutative.
+//! Two peers that each hold a different record for one member each keep
+//! their own when they merge (see `convergence_tests`).
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
@@ -178,72 +177,6 @@ fn a_held_record_is_kept_over_one_issued_by_another_inviter() {
         s.members.members.iter().any(|m| m.member.id() == f.n),
         "a ban from a member who is not an ancestor removes nobody"
     );
-}
-
-/// A key, other than `target`, whose `MemberId` equals `target`'s.
-fn colliding_vk(target: &VerifyingKey) -> VerifyingKey {
-    let b = target.to_bytes();
-    for i in 0..31usize {
-        for d in 1..8i32 {
-            let mut c = b;
-            let hi = c[i] as i32 + d;
-            let lo = c[i + 1] as i32 - 31 * d;
-            if !(0..=255).contains(&hi) || !(0..=255).contains(&lo) {
-                continue;
-            }
-            c[i] = hi as u8;
-            c[i + 1] = lo as u8;
-            if let Ok(vk) = VerifyingKey::from_bytes(&c) {
-                if MemberId::from(&vk) == MemberId::from(target) && vk != *target {
-                    return vk;
-                }
-            }
-        }
-    }
-    panic!("no colliding key found")
-}
-
-/// A record for a held id that names a different key is refused: the held
-/// member keeps their record and their messages, and members they invite
-/// afterwards are admitted.
-#[test]
-fn a_record_for_a_held_id_naming_another_key_is_refused() {
-    let f = fx();
-    let other = colliding_vk(&f.n_sk.verifying_key());
-    let second = rec(f.owner, f.x, other, &f.x_sk);
-    assert_eq!(second.member.id(), f.n, "premise: the ids collide");
-    let s = apply(&f, &f.base, members_delta(vec![second]));
-    let held = s
-        .members
-        .members
-        .iter()
-        .find(|m| m.member.id() == f.n)
-        .unwrap();
-    assert_eq!(held, &f.n_rec, "the held record is kept");
-    assert!(s
-        .recent_messages
-        .messages
-        .iter()
-        .any(|m| m.message.author == f.n));
-
-    // N invites C, and C posts: both admitted against N's held record.
-    let c_sk = sk(9);
-    let c = rec(f.owner, f.n, c_sk.verifying_key(), &f.n_sk);
-    let s = apply(
-        &f,
-        &s,
-        ChatRoomStateV1Delta {
-            members: Some(MembersDelta::new(vec![c.clone()])),
-            recent_messages: Some(vec![msg(f.owner, c.member.id(), &c_sk, 20)]),
-            ..Default::default()
-        },
-    );
-    assert!(s.members.members.contains(&c));
-    assert!(s
-        .recent_messages
-        .messages
-        .iter()
-        .any(|m| m.message.author == c.member.id()));
 }
 
 /// A state holding two records for one id (which `verify` accepts) is

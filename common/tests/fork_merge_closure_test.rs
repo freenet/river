@@ -74,7 +74,8 @@ struct Stats {
     /// (freenet/river#796).
     runs_over_ban_cap_with_both_pools: usize,
     /// Fork pairs that hold different records for one member id: the
-    /// accepted residual, counted apart (freenet/river#703).
+    /// pairs each side of which keeps its own record, counted apart
+    /// (freenet/river#703).
     runs_with_two_records_for_one_member: usize,
 }
 
@@ -960,9 +961,9 @@ impl Failures {
 }
 
 /// Whether the two states hold DIFFERENT records for one member id: the
-/// accepted residual of `MembersV1::resolve_records`. Each peer keeps the
-/// record it holds, so such a pair never converges on that member, and the
-/// tests count it apart instead of as a failure (freenet/river#703).
+/// Each peer keeps the record it holds (`MembersV1::resolve_records`), so
+/// such a pair does not converge on that member, and the tests count it
+/// apart instead of as a failure (freenet/river#703).
 fn hold_different_records_for_one_member(a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> bool {
     let held: std::collections::HashMap<MemberId, &AuthorizedMember> = a
         .members
@@ -982,11 +983,11 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
         drain_not_idempotent();
         let (w, a, b) = fork_pair(seed, SHAPES[shape], mode);
         let (end, not_commutative) = ending(&w, &a, &b);
-        let residual = hold_different_records_for_one_member(&a, &b);
+        let own_records = hold_different_records_for_one_member(&a, &b);
         STATS.with(|s| {
             let mut s = s.borrow_mut();
             s.runs += 1;
-            if residual {
+            if own_records {
                 s.runs_with_two_records_for_one_member += 1;
             }
             if !a.ban_evidence.is_empty() || !b.ban_evidence.is_empty() {
@@ -1013,10 +1014,10 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
             ));
             continue;
         }
-        // The residual pair keeps its own member record on each side (see
+        // Such a pair keeps its own member record on each side (see
         // `hold_different_records_for_one_member`). It must still never be
         // refused or leave cleanup unsettled; it is not required to converge.
-        if residual {
+        if own_records {
             if let Ending::Rejecting(e) = end {
                 out.rejecting.push(format!(
                     "seed {seed} shape {shape}: {}",
@@ -1174,7 +1175,7 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
         stats.runs_with_evidence > 0,
         "no run held ban evidence: {stats:?}"
     );
-    // Op 9 still produces the residual: forks holding different records for
+    // Op 9 still produces forks holding different records for
     // one member, which must merge without a refusal (checked in `endings`).
     assert!(
         stats.runs_with_two_records_for_one_member > 0,
@@ -1286,14 +1287,14 @@ fn stale_summary_deltas_apply() {
                         // a delta that applied by silently dropping records
                         // would pass the checks above and fail here.
                         let (end, not_commutative) = ending(&w, &r, sender);
-                        let residual = hold_different_records_for_one_member(&r, sender);
-                        if residual && matches!(end, Ending::Rejecting(_)) {
+                        let own_records = hold_different_records_for_one_member(&r, sender);
+                        if own_records && matches!(end, Ending::Rejecting(_)) {
                             *rejected
                                 .entry(
-                                    "after a stale apply, a residual pair was refused".to_string(),
+                                    "after a stale apply, a pair holding different member records was refused".to_string(),
                                 )
                                 .or_default() += 1;
-                        } else if !residual
+                        } else if !own_records
                             && (!matches!(end, Ending::Converged) || not_commutative.is_some())
                         {
                             *rejected

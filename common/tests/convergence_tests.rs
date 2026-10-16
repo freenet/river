@@ -3281,9 +3281,7 @@ fn a_deep_ban_evidence_chain_merges_into_a_fresh_peer() {
 /// freenet/river#703: two validly signed member records for one
 /// member id, issued by different inviters, held on different peers. Each
 /// peer keeps the record it holds (an arriving record never replaces a held
-/// one), so the merge is not commutative here: the accepted residual,
-/// pending an invitee-consent design, and only someone issuing a second
-/// record for an existing member produces it. Pinned so a change to it is
+/// one), so each direction keeps its own record. Pinned so a change to it is
 /// deliberate: each direction keeps its own record, neither merge fails, and
 /// both results verify. Covered for an owner-issued record against a
 /// member-issued one and for two members at the same depth.
