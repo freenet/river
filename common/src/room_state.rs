@@ -214,7 +214,13 @@ impl ChatRoomStateV1 {
                 .delta(other_state, parameters, summary)
                 .unwrap_or_default();
             delta.configuration = config_delta.clone();
-            trim_to_work_bounds(&mut delta, &merged_config, other_state, parameters);
+            trim_to_work_bounds(
+                &mut delta,
+                &merged_config,
+                Some(self),
+                other_state,
+                parameters,
+            );
             Some(delta)
         };
         let mut merged = self.clone();
@@ -273,6 +279,7 @@ impl ChatRoomStateV1 {
         trim_to_work_bounds(
             &mut delta,
             &with_config.configuration.configuration,
+            Some(self),
             other_state,
             parameters,
         );
@@ -867,9 +874,10 @@ fn configuration_delta_for_merge(
 /// (freenet/river#703). Each part keeps what the merged room's caps
 /// keep first:
 /// - messages: the newest (the `max_recent_messages` trim keeps the newest);
-/// - bans: what `BansV1::enforce_user_ban_cap` keeps at the bound, judged in
-///   the sender's state (dead bans first out, then each pool's oldest beyond
-///   its half), the rule the merged room's cap applies;
+/// - bans: in a whole-state merge (`receiver` given), the incoming bans the
+///   merged room's `max_user_bans` cap keeps, judged over both states (see
+///   `bans_surviving_the_merged_cap`); with only the sender known, what
+///   `BansV1::enforce_user_ban_cap` keeps at the bound in the sender's state;
 /// - members: the shortest invite chains, then the lowest id (the
 ///   `max_members` trim removes the longest chains, then the highest id);
 ///   a member's inviter is always shallower, so no kept member loses its
@@ -877,8 +885,8 @@ fn configuration_delta_for_merge(
 /// - ban evidence: the shallowest records (deeper ones are the first a
 ///   lowered `max_members` drops), then by digest.
 ///
-/// The bans trim applies the ban cap's own rule, so it keeps what the
-/// merged cap keeps. The members and evidence trims rank by invite depth
+/// In a whole-state merge the bans trim keeps exactly what the merged cap
+/// keeps of the incoming bans. The members and evidence trims rank by invite depth
 /// alone, not by what cleanup will then remove (banned members, the
 /// inactivity prune, unreferenced evidence), so one exchange can still
 /// differ from the other direction when the merged caps' choice depends on
@@ -887,6 +895,7 @@ fn configuration_delta_for_merge(
 fn trim_to_work_bounds(
     delta: &mut ChatRoomStateV1Delta,
     config: &crate::room_state::configuration::Configuration,
+    receiver: Option<&ChatRoomStateV1>,
     sender: &ChatRoomStateV1,
     parameters: &ChatRoomParametersV1,
 ) {
@@ -908,19 +917,32 @@ fn trim_to_work_bounds(
     let bans_bound = config.max_user_bans.max(MIN_BANS_DELTA_BOUND);
     if let Some(bans) = delta.bans.as_mut() {
         if bans.len() > bans_bound {
-            // The cap's own eviction, at the bound and judged in the sender's
-            // state: dead bans go first, then each pool keeps its newest
-            // `bans_bound / 2` and the spare slot goes to the newest beyond
-            // them, exactly as the merged room's `max_user_bans` cap
-            // (<= the bound) keeps them.
-            crate::room_state::ban::BansV1::enforce_user_ban_cap(
-                bans,
-                bans_bound,
-                &sender.members,
-                &sender.ban_evidence,
-                &sender.member_info,
-                parameters,
-            );
+            match receiver {
+                // A whole-state merge holds both states: keep exactly the
+                // incoming bans the merged room's `max_user_bans` cap keeps,
+                // judged over the bans and records of both (see
+                // `bans_surviving_the_merged_cap`).
+                Some(receiver) => {
+                    *bans = bans_surviving_the_merged_cap(
+                        receiver,
+                        sender,
+                        std::mem::take(bans),
+                        config.max_user_bans,
+                        parameters,
+                    );
+                }
+                // Only the sender's state is known (the contract's network
+                // delta): the cap's own eviction at the bound, judged in the
+                // sender's state. The rest follows in later rounds.
+                None => crate::room_state::ban::BansV1::enforce_user_ban_cap(
+                    bans,
+                    bans_bound,
+                    &sender.members,
+                    &sender.ban_evidence,
+                    &sender.member_info,
+                    parameters,
+                ),
+            }
         }
     }
 
@@ -976,6 +998,77 @@ fn trim_to_work_bounds(
             evidence.truncate(evidence_cap);
         }
     }
+}
+
+/// The incoming bans the merged room's `max_user_bans` cap keeps:
+/// `BansV1::enforce_user_ban_cap` over the receiver's bans and the incoming
+/// ones together, judged against both states' members, ban evidence and
+/// member_info (the receiver's record for an id first). A ban one side's
+/// records make take no effect (an owner ban on its issuer, a deputy grant,
+/// evidence naming its target) is judged as the merged room judges it, so
+/// the trim does not keep it in place of one the merged cap keeps. At most
+/// `max_user_bans` (<= the work bound) are returned.
+fn bans_surviving_the_merged_cap(
+    receiver: &ChatRoomStateV1,
+    sender: &ChatRoomStateV1,
+    incoming: Vec<crate::room_state::ban::AuthorizedUserBan>,
+    max_user_bans: usize,
+    parameters: &ChatRoomParametersV1,
+) -> Vec<crate::room_state::ban::AuthorizedUserBan> {
+    use crate::room_state::ban::{ban_digest, BansV1};
+    use crate::room_state::ban_evidence::BanEvidenceV1;
+    use crate::room_state::member::MembersV1;
+    use crate::room_state::member_info::MemberInfoV1;
+
+    let held_ids: HashSet<MemberId> = receiver
+        .members
+        .members
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
+    let mut members = receiver.members.members.clone();
+    members.extend(
+        sender
+            .members
+            .members
+            .iter()
+            .filter(|m| !held_ids.contains(&m.member.id()))
+            .cloned(),
+    );
+    let held_evidence: HashSet<MemberId> = receiver
+        .ban_evidence
+        .members
+        .iter()
+        .map(|m| m.member.id())
+        .chain(held_ids.iter().copied())
+        .collect();
+    let mut evidence = receiver.ban_evidence.members.clone();
+    evidence.extend(
+        sender
+            .ban_evidence
+            .members
+            .iter()
+            .filter(|m| !held_evidence.contains(&m.member.id()))
+            .cloned(),
+    );
+    let mut infos = receiver.member_info.member_info.clone();
+    infos.extend(sender.member_info.member_info.iter().cloned());
+
+    let incoming_digests: HashSet<_> = incoming.iter().map(ban_digest).collect();
+    let mut union = receiver.bans.0.clone();
+    union.extend(incoming);
+    BansV1::enforce_user_ban_cap(
+        &mut union,
+        max_user_bans,
+        &MembersV1 { members },
+        &BanEvidenceV1 { members: evidence },
+        &MemberInfoV1 { member_info: infos },
+        parameters,
+    );
+    union
+        .into_iter()
+        .filter(|b| incoming_digests.contains(&ban_digest(b)))
+        .collect()
 }
 
 /// Whether a merge that sent `summary` (horizons intact) and ended in `merged`
@@ -1159,7 +1252,7 @@ mod tests {
             bans: Some(bans),
             ..Default::default()
         };
-        trim_to_work_bounds(&mut delta, &config, &sender, &parameters);
+        trim_to_work_bounds(&mut delta, &config, None, &sender, &parameters);
 
         let evidence = delta.ban_evidence.unwrap();
         assert_eq!(evidence.len(), 200);

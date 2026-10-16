@@ -1,11 +1,13 @@
 //! Ban pools at the work bound, through the public whole-state merge: the
-//! merge trims what it offers the way the ban cap keeps bans, so one
-//! exchange gives the same ban set in both directions (freenet/river#703).
+//! merge keeps of the incoming bans exactly what the merged room's ban cap
+//! keeps, judged over both states, so one exchange gives the same ban set in
+//! both directions (freenet/river#703).
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersV1};
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
 use river_core::room_state::message::{
     AuthorizedMessageV1, MessageV1, MessagesV1, RoomMessageBody,
 };
@@ -149,4 +151,133 @@ fn a_bans_trim_agrees_with_the_cap_at_an_odd_bound() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Bans whose liveness depends on a deputy grant: the sender's bans trim
+/// judges them in the sender's state, where D (a deputy of A, not an
+/// ancestor of the targets) bans A's invitees. All 120 bans are live, so the
+/// trim leaves each pool its newest half; judging without the sender's
+/// `member_info` would call D's bans dead and evict them first.
+#[test]
+fn a_bans_trim_judges_deputy_bans_live_in_the_senders_state() {
+    let o = sk(1);
+    let owner = MemberId::from(&o.verifying_key());
+    let params = ChatRoomParametersV1 {
+        owner: o.verifying_key(),
+    };
+    let (a, d) = (sk(2), sk(3));
+    let rec = |inviter: &SigningKey, inviter_id: MemberId, who: &SigningKey| {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: owner,
+                invited_by: inviter_id,
+                member_vk: who.verifying_key(),
+            },
+            inviter,
+        )
+    };
+    let a_rec = rec(&o, owner, &a);
+    let d_rec = rec(&o, owner, &d);
+    let a_id = a_rec.member.id();
+    let d_id = d_rec.member.id();
+    let targets: Vec<SigningKey> = (0..60u64).map(|i| sk(100 + i)).collect();
+    let mut members = vec![a_rec, d_rec];
+    members.extend(targets.iter().map(|t| rec(&a, a_id, t)));
+    let msg = |s: &SigningKey, t: u64| {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner,
+                author: MemberId::from(&s.verifying_key()),
+                time: at(t),
+                content: RoomMessageBody::public(format!("m{t}")),
+            },
+            s,
+        )
+    };
+    let mut msgs = vec![msg(&a, 1), msg(&d, 2)];
+    msgs.extend(
+        targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| msg(t, 10 + i as u64)),
+    );
+    let mut grant = MemberInfo::new_public(a_id, 1, "a".into());
+    grant.deputies = vec![d_id];
+    let member_info = MemberInfoV1 {
+        member_info: vec![AuthorizedMemberInfo::new_with_member_key(grant, &a)],
+    };
+    let ban = |by: MemberId, by_sk: &SigningKey, target: MemberId, t: u64| {
+        AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner,
+                banned_at: at(t),
+                banned_user: target,
+            },
+            by,
+            by_sk,
+        )
+    };
+    let mut bans: Vec<AuthorizedUserBan> = (0..60u64)
+        .map(|i| {
+            ban(
+                owner,
+                &o,
+                MemberId::from(&sk(10_000 + i).verifying_key()),
+                1_000 + i,
+            )
+        })
+        .collect();
+    bans.extend(targets.iter().enumerate().map(|(i, t)| {
+        ban(
+            d_id,
+            &d,
+            MemberId::from(&t.verifying_key()),
+            2_000 + i as u64,
+        )
+    }));
+    let cfg = |version: u32, cap: usize| {
+        AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: owner,
+                configuration_version: version,
+                max_user_bans: cap,
+                max_members: 300,
+                ..Default::default()
+            },
+            &o,
+        )
+    };
+    let mut sender = ChatRoomStateV1 {
+        configuration: cfg(1, 120),
+        members: MembersV1 { members },
+        member_info,
+        bans: BansV1(bans),
+        recent_messages: MessagesV1 {
+            messages: msgs,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    sender.recent_messages.rebuild_actions_state();
+    sender.post_apply_cleanup(&params).unwrap();
+    sender
+        .verify(&sender, &params)
+        .expect("the sender verifies");
+    assert_eq!(sender.bans.0.len(), 120, "premise: nothing was capped");
+    let receiver = ChatRoomStateV1 {
+        configuration: cfg(2, 100),
+        ..Default::default()
+    };
+    let mut ab = receiver.clone();
+    ab.merge(&receiver, &params, &sender).expect("merge(R, S)");
+    let mut ba = sender.clone();
+    ba.merge(&sender, &params, &receiver).expect("merge(S, R)");
+    let by_d = |s: &ChatRoomStateV1| s.bans.0.iter().filter(|b| b.banned_by == d_id).count();
+    assert_eq!(
+        by_d(&ba),
+        50,
+        "premise: S<-R keeps each pool its newest half"
+    );
+    assert_eq!(by_d(&ab), by_d(&ba), "R<-S keeps the same split");
+    assert_eq!(ser(&ab), ser(&ba));
 }
