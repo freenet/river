@@ -434,7 +434,7 @@ impl ComposableState for BansV1 {
 
         // A ban held twice (a state `verify` accepts but no apply produces)
         // is kept once, so peers holding the copy and not converge
-        // (freenet/river#703 review).
+        // (freenet/river#703).
         let mut seen = std::collections::HashSet::new();
         self.0.retain(|ban| seen.insert(ban_digest(ban)));
 

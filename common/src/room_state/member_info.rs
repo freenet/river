@@ -135,7 +135,7 @@ pub const EXEMPT_NICKNAME_CEILING: usize = 1_000;
 /// One rule, applied to arrivals, to held records on every apply and to the
 /// summary, so whether a record is kept is a function of the record and the
 /// room's configuration alone, never of which peer held it
-/// (freenet/river#703 review).
+/// (freenet/river#703).
 pub fn nickname_admissible(
     info: &AuthorizedMemberInfo,
     max_nickname_size: usize,
@@ -424,7 +424,7 @@ impl ComposableState for MemberInfoV1 {
     /// drop is not advertised, so a peer holding one is offered the record it
     /// will keep instead. The whole-state merge summarizes against the
     /// configuration the merge ends with, which makes this symmetric
-    /// (freenet/river#703 review).
+    /// (freenet/river#703).
     fn summarize(
         &self,
         parent_state: &Self::ParentState,

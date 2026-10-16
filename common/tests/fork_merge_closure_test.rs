@@ -576,7 +576,7 @@ fn random_op_ext(
         // A second member record for an existing member, issued by a
         // different (present) inviter, with the inviter's chain and a message
         // by the member. Two validly signed records for one member must
-        // resolve the same way on every peer (freenet/river#703 review M4).
+        // resolve the same way on every peer (freenet/river#703).
         9 => {
             let Some(p) = pick(rng, &present) else {
                 return ChatRoomStateV1Delta::default();
@@ -839,7 +839,7 @@ fn differing_fields(a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> Vec<&'static st
 ///   holds {@2}; `A(BC)` holds {@1, @2}.
 ///
 /// Both are structural, not a River bug; the law is being revisited in
-/// freenet-core (freenet/river#703 review). Commutativity, which these tests
+/// freenet-core (freenet/river#703). Commutativity, which these tests
 /// do assert, holds.
 ///
 /// Gossip both ways until the two peers agree. A peer whose merge fails keeps
@@ -1085,7 +1085,7 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
     // Two ban-evidence records for one member from different inviters, one
     // whose inviter the merge removes: not one-shot commutative before
     // `BanEvidenceV1::apply_delta` stopped letting an unresolvable held
-    // record block a resolvable one (freenet/river#703 review). Only
+    // record block a resolvable one (freenet/river#703). Only
     // meaningful while `random_op_ext` draws as it does today.
     seeds.push((272, 2));
     // A record kept as ban evidence only because an owner-removed descendant

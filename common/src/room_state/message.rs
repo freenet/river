@@ -291,7 +291,7 @@ impl ComposableState for MessagesV1 {
 
         // A message held twice (a state `verify` accepts but no apply
         // produces) is kept once, so a peer holding the copy and one that
-        // does not end in the same state (freenet/river#703 review).
+        // does not end in the same state (freenet/river#703).
         let mut seen = std::collections::HashSet::new();
         self.messages
             .retain(|m| seen.insert(crate::util::record_digest(m)));
@@ -362,7 +362,7 @@ impl ComposableState for MessagesV1 {
 /// `apply_delta` skips arrivals that fail this and drops held messages that
 /// fail it, rather than rejecting the delta. `verify` does not check it, so a
 /// state can hold such a message, and an error on arrival would fail every
-/// merge with a peer holding one (freenet/river#703 review). Dropping it
+/// merge with a peer holding one (freenet/river#703). Dropping it
 /// where held makes both sides of a merge agree.
 ///
 /// History of the private-version rule (Bug #3, Ivvor's repro, and the

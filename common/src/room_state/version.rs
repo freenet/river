@@ -28,7 +28,7 @@ impl ComposableState for StateVersion {
     /// a total order's maximum, so merges of version 0 and 1 states commute
     /// and every existing state (merge(S, S) == S) is left as it is. Pinning
     /// every state to the current version instead would rewrite each
-    /// version-0 state on its first merge (freenet/river#703 review).
+    /// version-0 state on its first merge (freenet/river#703).
     /// Changing this type re-keys the contract.
     type Delta = u32;
     type Parameters = ChatRoomParametersV1;

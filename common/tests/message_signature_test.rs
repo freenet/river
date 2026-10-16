@@ -255,7 +255,7 @@ fn unsigned_messages_do_not_fail_a_private_room_delta() {
 
     // Validly signed but not admissible in a private room (an unknown
     // secret version, a public body): skipped like the unsigned ones, never
-    // failing the delta (freenet/river#703 review).
+    // failing the delta (freenet/river#703).
     for signed_but_invalid in [
         private(&room.b, &room.b, 13, 7),
         room.message(&room.b, &room.b, 14),

@@ -1196,7 +1196,7 @@ fn a_removed_members_invitee_is_removed_and_stays_removed() {
 /// A removed moderator editing their own `deputies` cannot escape a cycle
 /// whose other edge rests on ABSOLUTE authority (owner-appointed moderator).
 /// Their record is ban evidence, so the update applies and is kept (every
-/// evidence record keeps its `member_info`, freenet/river#703 review), but a
+/// evidence record keeps its `member_info`, freenet/river#703), but a
 /// `deputies` list grants authority only over its author's own subtree and
 /// never voids a ban on its author.
 #[test]

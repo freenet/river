@@ -1183,7 +1183,7 @@ fn message_at_older_or_newer_known_secret_version_is_accepted() {
     // record must still not be stored (defense in depth: an attacker could
     // not otherwise be ruled out from injecting ciphertext at a fabricated
     // version). It is skipped rather than failing the delta
-    // (freenet/river#703 review).
+    // (freenet/river#703).
     let msg_at_v99 = AuthorizedMessageV1::new(
         MessageV1 {
             room_owner: owner_id,

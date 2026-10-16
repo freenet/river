@@ -2925,7 +2925,7 @@ fn lowering_max_members_converges_with_a_stale_peer() {
 /// From above the work bound: the stale peer holds more members than one
 /// delta may add. A whole-state merge offers the shallowest members up to
 /// the bound (the merged room keeps fewer still), so no merge is refused
-/// and the peers converge (freenet/river#703 review).
+/// and the peers converge (freenet/river#703).
 #[test]
 fn lowering_max_members_from_above_the_work_bound_converges() {
     assert_eq!(lower_max_members_with_a_stale_peer(1_003, 2), 0);
@@ -3189,7 +3189,7 @@ fn lowering_max_user_bans_converges_with_a_stale_peer() {
 /// From above `MIN_BANS_DELTA_BOUND`: a whole-state merge offers the owner's
 /// and then the newest bans up to the bound (the merged room keeps fewer
 /// still), so no merge is refused and the peers converge
-/// (freenet/river#703 review).
+/// (freenet/river#703).
 #[test]
 fn lowering_max_user_bans_from_above_the_floor_converges() {
     let held = river_core::room_state::ban::MIN_BANS_DELTA_BOUND + 3;
@@ -3278,7 +3278,7 @@ fn a_deep_ban_evidence_chain_merges_into_a_fresh_peer() {
     a.verify(&a, &parameters).unwrap();
 }
 
-/// freenet/river#703 review M4: two validly signed member records for one
+/// freenet/river#703: two validly signed member records for one
 /// member id, issued by different inviters, held on different peers. Both
 /// merge directions must end in the same state, whichever record each peer
 /// held, and the result must verify. Also covered for a member invited by two
@@ -3447,7 +3447,7 @@ fn ser_room(s: &ChatRoomStateV1) -> Vec<u8> {
 }
 
 /// The same records must leave the same ban evidence whichever field they
-/// arrive in (freenet/river#703 review). X is owner-banned and is the
+/// arrive in (freenet/river#703). X is owner-banned and is the
 /// inviter of Q, whom P's stored ban names. Delivered as members, X and Q
 /// were removed by the owner ban before cleanup saw them, so nothing was
 /// kept; delivered as ban evidence, both were kept.

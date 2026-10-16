@@ -384,10 +384,9 @@ fn current_secret_from_state(
 /// the secret carried in the `Invitation` this member joined with
 /// (`invitation_secrets`). [`collect_secrets_for_room`] folds both sources.
 ///
-/// Returns an error (rather than silently falling back to a public body,
-/// which the contract rejects in a private room with "Cannot send public
-/// messages in private room") when no secret is available for the current
-/// version — see [`resolve_current_secret`]. Also errors if the resulting
+/// Returns an error (rather than falling back to a public body, which a
+/// private room does not admit, so the message would silently vanish) when
+/// no secret is available for the current version — see [`resolve_current_secret`]. Also errors if the resulting
 /// body exceeds the room's `max_message_size` — see [`guard_message_size`].
 pub fn build_message_body(
     state: &ChatRoomStateV1,
@@ -503,10 +502,10 @@ pub fn build_reply_body(
 /// Resolve the room's **current-version** secret for the member holding
 /// `self_sk`, for sealing an outgoing private-room body.
 ///
-/// Returns `(secret, current_version)` or an error (rather than silently
-/// falling back to a public body, which the contract rejects in a private room
-/// with "Cannot send public messages in private room") when no secret is
-/// available for the current version — the room owner must re-provision this
+/// Returns `(secret, current_version)` or an error (rather than falling back
+/// to a public body, which a private room does not admit, so the message
+/// would silently vanish) when no secret is available for the current
+/// version — the room owner must re-provision this
 /// member's secret, or the member must rejoin via a fresh invitation that
 /// carries the current version. Sealing only ever under `current_version`
 /// (never a stale version other members can't read) mirrors the
@@ -1379,8 +1378,8 @@ mod tests {
         let owner = fresh_signing_key();
         let state = state_with_privacy(&owner, PrivacyMode::Private);
         // A member with neither a contract blob nor an invitation secret for
-        // the current version must error — never silently send a public body
-        // that the contract would reject ("Cannot send public messages...").
+        // the current version must error — never send a public body, which
+        // the private room would not admit.
         let err = build_message_body(
             &state,
             &fresh_signing_key(),
@@ -1647,8 +1646,8 @@ mod tests {
         }
     }
 
-    /// Private room, no secret anywhere → error, never a silent public body
-    /// (which the contract rejects with "Cannot send public messages...").
+    /// Private room, no secret anywhere → error, never a public body (which
+    /// the private room would not admit).
     #[test]
     fn build_action_body_private_room_errors_without_secret() {
         let owner = fresh_signing_key();

@@ -2,7 +2,7 @@
 //! merge admits) must agree on every validly signed record: a record that
 //! `verify` accepts but `apply_delta` refuses makes every merge with a peer
 //! holding it fail, and nothing but its author could ever repair it
-//! (freenet/river#703 review). Such records are now handled the same way on
+//! (freenet/river#703). Such records are now handled the same way on
 //! both sides of a merge: skipped on arrival and dropped where held, so both
 //! merge directions end in the same state and the result verifies.
 //!
@@ -446,7 +446,7 @@ fn redelivered_messages_do_not_count_toward_the_work_bound() {
 }
 
 // ---------------------------------------------------------------------------
-// Normalization of held state (freenet/river#703 review B1): a state `verify`
+// Normalization of held state (freenet/river#703): a state `verify`
 // accepts but no apply would produce converges with its normal form.
 // ---------------------------------------------------------------------------
 
@@ -542,7 +542,7 @@ fn the_state_version_merges_to_the_higher() {
 }
 
 // ---------------------------------------------------------------------------
-// Secrets normalization (freenet/river#703 review B2)
+// Secrets normalization (freenet/river#703)
 // ---------------------------------------------------------------------------
 
 fn blob_for(
@@ -614,7 +614,7 @@ fn different_blobs_for_one_member_and_version_converge() {
 /// A held owner-signed configuration that fails the value checks (only a
 /// full-state PUT carries one; `verify` checks only the signature) does not
 /// compete: both merge directions end on the valid configuration
-/// (freenet/river#703 review B3).
+/// (freenet/river#703).
 #[test]
 fn an_invalid_held_configuration_yields_to_a_valid_one_in_both_directions() {
     let r = room();
@@ -633,7 +633,7 @@ fn an_invalid_held_configuration_yields_to_a_valid_one_in_both_directions() {
 }
 
 // ---------------------------------------------------------------------------
-// Nickname limit (freenet/river#703 review B4)
+// Nickname limit (freenet/river#703)
 // ---------------------------------------------------------------------------
 
 /// Lowering `max_nickname_size` must not revoke a moderator's deputy grants:

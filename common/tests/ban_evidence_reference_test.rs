@@ -1,5 +1,5 @@
 //! Ban evidence keeps only what a stored ban references through records
-//! cleanup can keep (freenet/river#703 review): deterministic repro of the
+//! cleanup can keep (freenet/river#703): deterministic repro of the
 //! case FORK_SEEDS=1000 found (extended seed (121, 2)).
 
 use ed25519_dalek::SigningKey;

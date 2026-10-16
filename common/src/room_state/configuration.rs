@@ -47,7 +47,7 @@ impl ComposableState for AuthorizedConfigurationV1 {
     /// full-state PUT can carry one: `verify` checks only the signature)
     /// does not compete. It summarizes as the lowest rank, so any valid
     /// configuration is offered to the peer holding it, and it is never
-    /// offered itself (freenet/river#703 review).
+    /// offered itself (freenet/river#703).
     fn summarize(
         &self,
         _parent_state: &Self::ParentState,
@@ -142,7 +142,7 @@ impl AuthorizedConfigurationV1 {
     /// never the configuration a peer currently holds: an answer that
     /// depended on the held configuration would differ between peers holding
     /// different ones, and one bad held configuration would make every later
-    /// valid one fail (freenet/river#703 review). Clients run the same checks
+    /// valid one fail (freenet/river#703). Clients run the same checks
     /// before signing.
     pub fn check_values(&self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         self.configuration.check_values(parameters)
@@ -761,7 +761,7 @@ mod tests {
     /// owner (the contract parameters), not against whatever configuration
     /// the peer happens to hold: a held configuration naming the wrong owner
     /// must not stop the correct one from being adopted, or the outcome
-    /// would depend on what each peer held (freenet/river#703 review).
+    /// would depend on what each peer held (freenet/river#703).
     #[test]
     fn owner_member_id_is_checked_against_the_room_owner() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);

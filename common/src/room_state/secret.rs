@@ -269,7 +269,7 @@ impl ComposableState for RoomSecretsV1 {
 
         // Normalize what is held, on every apply and not only one carrying a
         // secrets delta, so a state `verify` accepts but no apply produces
-        // converges with its normal form (freenet/river#703 review):
+        // converges with its normal form (freenet/river#703):
         // - one record per version, the greater signature digest;
         // - one blob per (version, member), the greater signature digest;
         // - blobs only for current members (and the owner), and only at a
@@ -337,7 +337,7 @@ pub struct SecretsSummary {
     pub version_ids: BTreeMap<SecretVersion, SigDigest>,
     /// Each held (version, member) with its blob's signature digest, so two
     /// different blobs for one member and version are told apart and
-    /// converge (freenet/river#703 review). Changing this type re-keys the
+    /// converge (freenet/river#703). Changing this type re-keys the
     /// contract.
     pub member_secrets: BTreeMap<(SecretVersion, MemberId), SigDigest>,
 }
@@ -1016,7 +1016,7 @@ mod tests {
     }
 
     /// A blob at a version with no record is not admitted, and does not
-    /// fail the delta (freenet/river#703 review).
+    /// fail the delta (freenet/river#703).
     #[test]
     fn test_apply_delta_skips_secret_for_nonexistent_version() {
         let (state, params, owner_sk) = create_test_state_and_params();
@@ -1066,7 +1066,7 @@ mod tests {
         // A DIFFERENT owner-signed blob for the same (version, member) is
         // resolved by signature digest, not rejected: the summary carries the
         // blob's digest, so peers holding different ones converge
-        // (freenet/river#703 review).
+        // (freenet/river#703).
         let mut other = create_encrypted_secret(owner_id, 1, &owner_sk).secret;
         other.ciphertext = vec![9, 9, 9];
         let other = AuthorizedEncryptedSecretForMember::new(other, &owner_sk);

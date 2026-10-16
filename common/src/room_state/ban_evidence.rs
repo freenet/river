@@ -465,7 +465,7 @@ impl ComposableState for BanEvidenceV1 {
                 // this merge) is replaced by any incoming record that does,
                 // as cleanup would drop it anyway. Otherwise a peer holding
                 // the stale record and a peer holding the resolvable one
-                // ended a merge differently (freenet/river#703 review).
+                // ended a merge differently (freenet/river#703).
                 let held: HashMap<MemberId, EvidenceDigest> = self
                     .members
                     .iter()

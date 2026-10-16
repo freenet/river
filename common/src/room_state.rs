@@ -207,7 +207,7 @@ impl ChatRoomStateV1 {
         // that arrived by a full-state PUT, which runs only `verify`)
         // unchanged when merged with a state holding nothing new, while the
         // other direction dropped them: merge(A, B) != merge(B, A)
-        // (freenet/river#703 review). On a state a merge or delta produced,
+        // (freenet/river#703). On a state a merge or delta produced,
         // the extra pass is a no-op.
         let delta_against = |summary: &ChatRoomStateV1Summary| {
             let mut delta = other_state
@@ -828,7 +828,7 @@ fn configuration_delta_for_merge(
 /// more than one delta may carry (`verify` judges it by its own, possibly
 /// higher, caps, and an older message window can be larger); the merged room
 /// keeps fewer still, so offering the rest only fails the merge one way
-/// (freenet/river#703 review). Each part keeps what the merged room's caps
+/// (freenet/river#703). Each part keeps what the merged room's caps
 /// keep first:
 /// - messages: the newest (the `max_recent_messages` trim keeps the newest);
 /// - bans: the owner's, then the newest (the `max_user_bans` cap never
@@ -1031,7 +1031,7 @@ mod tests {
 
     /// Over its bound, a whole-state merge's ban evidence keeps the
     /// shallowest records, and its bans keep the owner's and then the newest
-    /// (freenet/river#703 review).
+    /// (freenet/river#703).
     #[test]
     fn trim_to_work_bounds_keeps_what_the_merged_caps_keep() {
         let owner_sk = SigningKey::from_bytes(&[1; 32]);
@@ -1333,7 +1333,7 @@ mod tests {
         ));
     }
 
-    /// freenet/river#703 review M2: when the merge's open-horizon pass would
+    /// freenet/river#703: when the merge's open-horizon pass would
     /// carry more older messages than one messages delta may (the
     /// `max(max_recent_messages, 1000)` work bound), the merge must still
     /// succeed, and in both directions end in the same state. Here S holds

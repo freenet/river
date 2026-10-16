@@ -171,11 +171,11 @@ message {send,reply,edit,delete}` and reactions all work in a private room.
 
 All three helpers share `resolve_current_secret` (one secret-resolution
 decision for every message kind, so no kind leaks as an unsealed public body)
-and `guard_message_size`. **Deliberate divergence from the UI:** when no secret
-is available for the current version the UI logs a warning and falls back to a
-**public** body (`conversation.rs`, which the contract then drops); the CLI
-helpers instead **error** — never sending a public body into a private room,
-and never sealing under a stale (non-current) version. They also error on an
+and `guard_message_size`. When no secret is available for the current version
+the CLI helpers **error** — never sending a public body into a private room
+(which the room does not admit), and never sealing under a stale (non-current)
+version. The UI does not offer a composer in that state
+(`RoomData::missing_room_secret`) and its send path refuses as a backstop. They also error on an
 over-`max_message_size` body, which the contract would otherwise silently
 drop. For a private reply, the target author name and content preview are
 sealed alongside the reply text (they are fields of `ReplyContentV1`), so the

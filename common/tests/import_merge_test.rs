@@ -22,7 +22,7 @@ fn test_default_state_has_placeholder_owner() {
 }
 
 /// A configuration is checked against the room's owner, not against the
-/// configuration the peer holds (freenet/river#703 review). The placeholder
+/// configuration the peer holds (freenet/river#703). The placeholder
 /// configuration of an imported room names no owner, so merging the real
 /// network state into it adopts the network's configuration rather than
 /// failing (as it did before #703) or keeping the placeholder. The UI still

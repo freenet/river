@@ -37,7 +37,7 @@ impl ComposableState for MembersV1 {
     // peers holding different validly signed records for one member (issued
     // by different inviters) see the difference and exchange them; see
     // `MembersV1::resolve_records` for which one both keep
-    // (freenet/river#703 review). Changing this type re-keys the contract.
+    // (freenet/river#703). Changing this type re-keys the contract.
     type Summary = BTreeMap<MemberId, EvidenceDigest>;
     type Delta = MembersDelta;
     type Parameters = ChatRoomParametersV1;
@@ -1726,7 +1726,7 @@ pub(crate) mod tests {
             .is_err());
     }
 
-    /// freenet/river#703 review M1: deciding whether new members' invite
+    /// freenet/river#703: deciding whether new members' invite
     /// chains are known must cost work linear in the delta, not quadratic:
     /// each record's chain is resolved once, however many records chain
     /// through it. Here a long chain of records ends at an inviter nobody
