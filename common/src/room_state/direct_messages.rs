@@ -892,25 +892,23 @@ pub(crate) fn enforced_ban_set_of(
         ),
     );
     let evidence = pruned.as_ref().unwrap_or(&parent_state.ban_evidence);
-    // The bans `post_apply_cleanup` counts at the cap: without any its known
-    // issuer's key does not verify (step 0-sig).
-    let mut counted: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
-    BansV1::drop_bans_their_known_issuer_did_not_sign(
-        &mut counted,
-        &evidence.lookup(&parent_state.members, parameters.owner_id()),
-        parameters.owner_id(),
-        &parameters.owner,
-    );
-
-    if counted.len() <= max_bans {
+    if parent_state.bans.0.len() <= max_bans {
         return parent_state.members.banned_member_ids(
             evidence,
-            &BansV1(counted),
+            &parent_state.bans,
             &parent_state.member_info,
             parameters,
         );
     }
-    let mut capped: Vec<AuthorizedUserBan> = counted;
+    // The bans `post_apply_cleanup` counts at the cap: without any its known
+    // issuer's key does not verify (step 0-sig, which runs only over the cap).
+    let mut capped: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
+    BansV1::drop_bans_their_known_issuer_did_not_sign(
+        &mut capped,
+        &evidence.lookup(&parent_state.members, parameters.owner_id()),
+        parameters.owner_id(),
+        &parameters.owner,
+    );
     BansV1::enforce_user_ban_cap(
         &mut capped,
         max_bans,

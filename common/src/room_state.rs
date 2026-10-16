@@ -367,8 +367,11 @@ impl ChatRoomStateV1 {
         //     nothing: dropped before the cap counts it, as the same ban is
         //     skipped on arrival at a peer that knows its issuer
         //     (`BansV1::drop_bans_their_known_issuer_did_not_sign`; the DM
-        //     apply's enforced-ban set drops it the same way).
-        {
+        //     apply's enforced-ban set drops it the same way). Only the cap
+        //     can be swayed by one (resolution ignores a ban whose signature
+        //     does not verify, and step 4 sweeps it), so the signatures are
+        //     checked only when the bans are over the cap.
+        if self.bans.0.len() > self.configuration.configuration.max_user_bans {
             let known = self.ban_evidence.lookup(&self.members, owner_id);
             let mut bans = std::mem::take(&mut self.bans.0);
             BansV1::drop_bans_their_known_issuer_did_not_sign(
