@@ -20,9 +20,12 @@ that is validly signed but that the room does not admit (over a cap, at an
 unknown secret version, a public message in a private room, a second record
 for a member id this peer already holds) is SKIPPED on arrival and dropped
 where held, by the same rule in both places. So is a ban whose known
-issuer's key does not verify it: another peer may not know that issuer. An
-`Err` for such a record fails every merge with a peer holding it, in one
-direction only, and nothing but its author can repair it.
+issuer's key does not verify it: another peer may not know that issuer. A
+ban whose issuer is known nowhere is kept on arrival and swept by the same
+cleanup; neither kind counts toward `max_user_bans` (they are dropped before
+the cap counts, so they cannot evict a stored ban). An `Err` for such a
+record fails every merge with a peer holding it, in one direction only, and
+nothing but its author can repair it.
 
 A configuration that fails the value checks is the one record that is never
 dropped: an owner-signed one ranks below every valid configuration, so a

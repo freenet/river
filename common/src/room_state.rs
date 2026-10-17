@@ -989,8 +989,15 @@ fn configuration_delta_for_merge(
 /// bounds, so a state `verify` accepts is never refused here. The counts are
 /// compared before any signature is checked; caps above the per-delta floors
 /// count only when the room owner signed the configuration (one signature
-/// check), so the work a merge then does is bounded by what the owner signed.
-/// Messages have no such bound in `verify`, so none is applied to them here.
+/// check), so the bans, members and evidence a merge then checks are
+/// bounded by what the owner signed. Messages have no count bound in
+/// `verify`, so none is applied here: a whole-state merge checks as many
+/// messages as `verify` of the same state does.
+///
+/// Only the incoming side is held to this. A receiver that holds such a
+/// state merges into it (merge(S, base) succeeds where merge(base, S) is
+/// refused); only a client's local state can hold one, since the contract
+/// validates every state it stores and no apply or merge produces one.
 fn refuse_beyond_own_bounds(
     state: &ChatRoomStateV1,
     parameters: &ChatRoomParametersV1,

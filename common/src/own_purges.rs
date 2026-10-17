@@ -339,6 +339,23 @@ mod tests {
         );
     }
 
+    /// The room owner (never a member record) keeps its record, and the
+    /// healed version of a recipient that left is dropped too (and reported
+    /// as a change).
+    #[test]
+    fn a_prune_keeps_the_owner_and_drops_the_healed_version_of_one_who_left() {
+        let r = room();
+        let owner = MemberId::from(&r.owner_sk.verifying_key());
+        let gone = MemberId::from(&SigningKey::from_bytes(&[2; 32]).verifying_key());
+        let mut rec = OwnPurges::default();
+        rec.record(owner, [PurgeToken([1; 16])]);
+        assert!(!rec.prune(&r.params.owner, &r.state), "nothing to drop");
+        assert_eq!(rec.purged, vec![(owner, PurgeToken([1; 16]))]);
+        rec.healed_at = vec![(gone, 4)];
+        assert!(rec.prune(&r.params.owner, &r.state));
+        assert!(rec.healed_at.is_empty());
+    }
+
     /// Recorded tokens beyond what one envelope may hold are not re-signed
     /// all at once: the re-signed envelope stays within the tombstone cap.
     #[test]

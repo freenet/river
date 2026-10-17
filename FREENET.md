@@ -59,7 +59,14 @@ This file enumerates the Freenet contracts and delegates published from this rep
     record at a held version, a record for a member id already held, a
     public message in a private room) and for a ban its known issuer's key
     does not verify: they are skipped, so a merge with a peer holding one no
-    longer fails.
+    longer fails. A ban no known key verifies (its known issuer's key does
+    not, or its issuer is known nowhere) never counts toward
+    `max_user_bans`.
+  - A whole-state merge also refuses an incoming state whose configuration
+    does not outrank the receiver's when it holds more bans, members or ban
+    evidence than one delta may carry in the receiver's room; such a peer
+    takes the receiver's configuration from its own merge and the next
+    exchange goes through.
   - A configuration that fails the value checks is ranked below every valid
     one rather than refused: a held one is replaced by any valid
     configuration or by an invalid one of higher rank, and is never dropped.
