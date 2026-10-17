@@ -1845,10 +1845,10 @@ mod tests {
             m
         };
         let (lowered, stale) = (fix(lowered), fix(stale));
-        let mut probe = lowered.clone();
+        let refused = lowered.clone().merge_from(&params, &stale).unwrap_err();
         assert!(
-            probe.merge_from(&params, &stale).is_err(),
-            "premise: refused once"
+            refused.contains(crate::room_data::LOWER_RANKED_REFUSAL),
+            "premise: {refused}"
         );
         (lowered, stale)
     }
