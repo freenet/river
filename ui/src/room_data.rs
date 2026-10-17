@@ -4177,7 +4177,7 @@ mod tests {
         assert_eq!(
             merged_marker(vk, (stale.clone(), 3), (fresh.clone(), 20)),
             Some(ids[2].clone()),
-            "oldest generation first (the fan-out's usual order): its stale \
+            "oldest generation first (one possible order): its stale \
              marker must not stick"
         );
         assert_eq!(
@@ -10026,8 +10026,8 @@ mod tests {
         assert_eq!(owed_rekey_merge(&placeholder), None);
     }
 
-    /// The legacy fan-out after a delegate re-key answers oldest generation
-    /// first. The marker a room keeps must come from the NEWEST delegate
+    /// The legacy fan-out after a delegate re-key answers in any order. The
+    /// marker a room keeps must come from the NEWEST delegate
     /// generation's copy (it knows the key the device last saved under), not
     /// from whichever copy got there first (freenet/river#769).
     #[test]

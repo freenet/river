@@ -4721,9 +4721,10 @@ mod tests {
     /// (all sends failed / connection down) the once-per-session
     /// `LEGACY_MIGRATION_ATTEMPTED` guard is reset so a reconnect re-probes. A send
     /// that SUCCEEDS sets `any_dispatched` and does NOT mark (the genuine new-user
-    /// case). Review 10 (P2#1): the probe captures the attempt and gates BOTH the
-    /// mark and the guard reset on still-current, so a stale probe (superseded by
-    /// a reconnect's begin_load_attempt) can't pollute the new attempt.
+    /// case). Review 10 (P2#1): the probe captures the attempt and gates the mark
+    /// on still-current, and the guard reset on being the latest sweep
+    /// (freenet/river#809), so a stale probe (superseded by a reconnect's
+    /// begin_load_attempt) can't pollute the new attempt.
     #[test]
     fn legacy_probe_transport_failure_marks_and_resets_guard() {
         // `fire_legacy_migration_request` is the last fn in the file, defined
@@ -11747,12 +11748,10 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // for a probe that never left. Reset it so a reconnect re-probes. Keep it set
     // when at least one probe dispatched (a genuine new user whose node has no
     // legacy delegate simply gets no response — do NOT re-probe-spam that case).
-    // Gated on still-current (P2#1): a stale probe must not reopen the guard for
-    // the new attempt (whose own probe already ran / set it).
-    // The probe never went out, so this is not a re-probe and costs no
-    // re-arm, whether or not a reconnect began a new attempt meanwhile. The
-    // still-current check above is now the latest-sweep check: a newer sweep
-    // (that attempt's own probe) owns the guard (freenet/river#809).
+    // A stale probe must not reopen the guard for a new attempt whose own probe
+    // already ran (P2#1): the reset is gated on this being the latest sweep,
+    // since a new attempt's probe starts a newer one (freenet/river#809). It
+    // costs no re-arm: the probe never went out, so this is not a re-probe.
     if !any_dispatched {
         if SWEEP_EPOCH.load(Ordering::Relaxed) == epoch {
             LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
