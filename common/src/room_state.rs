@@ -227,6 +227,7 @@ impl ChatRoomStateV1 {
     ) -> Result<(), String> {
         refuse_beyond_own_bounds(other_state, parameters)?;
         let config_delta = configuration_delta_for_merge(self, parameters, other_state);
+        refuse_beyond_receiver_bounds(self, other_state, &config_delta)?;
         // The summary is read against the configuration the merge ends with
         // (a clone only when the configuration changes).
         let summary = self.summarize(
@@ -314,6 +315,7 @@ impl ChatRoomStateV1 {
     ) -> Result<Option<ChatRoomStateV1Delta>, String> {
         refuse_beyond_own_bounds(other_state, parameters)?;
         let config_delta = configuration_delta_for_merge(self, parameters, other_state);
+        refuse_beyond_receiver_bounds(self, other_state, &config_delta)?;
         let summary = self.summarize(
             &self.with_configuration(parameters, &config_delta),
             parameters,
@@ -1043,6 +1045,51 @@ fn refuse_beyond_own_bounds(
         }
     }
     Ok(())
+}
+
+/// Refuse `state` as the incoming side of a whole-state merge into
+/// `receiver` when the merge ends with the receiver's configuration
+/// (`config_delta` is `None`: the incoming configuration does not outrank it)
+/// and `state` holds more bans, members or ban evidence than one delta may
+/// carry in the receiver's room (each cap at least its per-delta floor).
+/// Counts only, before any signature is checked: without it, a replayed
+/// older configuration with a high cap would admit that many records, each
+/// checked here. An honest peer still on an older, higher cap is refused
+/// once; it takes the receiver's configuration from the other direction's
+/// merge and trims, and the next exchange goes through.
+fn refuse_beyond_receiver_bounds(
+    receiver: &ChatRoomStateV1,
+    state: &ChatRoomStateV1,
+    config_delta: &Option<AuthorizedConfigurationV1>,
+) -> Result<(), String> {
+    use crate::room_state::ban::MIN_BANS_DELTA_BOUND;
+    use crate::room_state::ban_evidence::{evidence_bound, evidence_depth_cap};
+    use crate::room_state::member::members_work_bound;
+    if config_delta.is_some() {
+        return Ok(());
+    }
+    let c = &receiver.configuration.configuration;
+    let bans = c.max_user_bans.max(MIN_BANS_DELTA_BOUND);
+    let members = members_work_bound(c.max_members);
+    let evidence = evidence_bound(bans, evidence_depth_cap(c.max_members));
+    let why = if state.bans.0.len() > bans {
+        format!("{} bans, more than {bans}", state.bans.0.len())
+    } else if state.members.members.len() > members {
+        format!(
+            "{} members, more than {members}",
+            state.members.members.len()
+        )
+    } else if state.ban_evidence.members.len() > evidence {
+        format!(
+            "{} ban evidence records, more than {evidence}",
+            state.ban_evidence.members.len()
+        )
+    } else {
+        return Ok(());
+    };
+    Err(format!(
+        "Refusing a state that holds {why} under a configuration that does not outrank this room's"
+    ))
 }
 
 /// Trim each part of a network `delta` (sent against a receiver's summary,

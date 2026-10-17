@@ -2923,12 +2923,13 @@ fn lowering_max_members_converges_with_a_stale_peer() {
 }
 
 /// From above the work bound: the stale peer holds more members than one
-/// delta may add. A whole-state merge offers the shallowest members up to
-/// the bound (the merged room keeps fewer still), so no merge is refused
-/// and the peers converge (freenet/river#703).
+/// delta may carry in the updated room, under a configuration that does not
+/// outrank the updated one, so the updated peer refuses its state once; the
+/// stale peer takes the new configuration and the peers converge
+/// (freenet/river#703).
 #[test]
 fn lowering_max_members_from_above_the_work_bound_converges() {
-    assert_eq!(lower_max_members_with_a_stale_peer(1_003, 2), 0);
+    assert_eq!(lower_max_members_with_a_stale_peer(1_003, 2), 1);
 }
 
 /// After the owner lowers `max_recent_messages`, a peer that has not yet seen
@@ -3188,12 +3189,14 @@ fn lowering_max_user_bans_converges_with_a_stale_peer() {
 
 /// From above `MIN_BANS_DELTA_BOUND`: a whole-state merge offers the owner's
 /// and then the newest bans up to the bound (the merged room keeps fewer
-/// still), so no merge is refused and the peers converge
-/// (freenet/river#703).
+/// still). Above the floor, the stale peer's state is refused once (it holds
+/// more than one delta may carry in the updated room, under a configuration
+/// that does not outrank the updated one); the stale peer takes the new
+/// configuration and the peers converge (freenet/river#703).
 #[test]
 fn lowering_max_user_bans_from_above_the_floor_converges() {
     let held = river_core::room_state::ban::MIN_BANS_DELTA_BOUND + 3;
-    assert_eq!(lower_max_user_bans_with_a_stale_peer(held, 2), 0);
+    assert_eq!(lower_max_user_bans_with_a_stale_peer(held, 2), 1);
 }
 
 /// A member bans the head and the tail of a 1003-deep invite chain under

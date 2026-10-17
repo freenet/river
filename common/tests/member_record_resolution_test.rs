@@ -387,11 +387,39 @@ fn both_ways(
     a: &ChatRoomStateV1,
     b: &ChatRoomStateV1,
 ) -> (ChatRoomStateV1, ChatRoomStateV1) {
-    let mut ab = a.clone();
-    ab.merge(a, params, b).expect("merge(A, B) must not fail");
-    let mut ba = b.clone();
-    ba.merge(b, params, a).expect("merge(B, A) must not fail");
-    (ab, ba)
+    exchange(params, a, b)
+}
+
+/// One exchange between `a` and `b`, as two peers hold it afterwards. A side
+/// holding more than one delta may carry in the other's room, under a
+/// configuration that does not outrank the other's, is refused first; it
+/// takes the other's configuration from the other direction's merge, and
+/// the refused side then merges that (freenet/river#703).
+fn exchange(
+    params: &ChatRoomParametersV1,
+    a: &ChatRoomStateV1,
+    b: &ChatRoomStateV1,
+) -> (ChatRoomStateV1, ChatRoomStateV1) {
+    let merged = |x: &ChatRoomStateV1, y: &ChatRoomStateV1| {
+        let mut out = x.clone();
+        out.merge_from(params, y).map(|()| out)
+    };
+    match (merged(a, b), merged(b, a)) {
+        (Ok(ab), Ok(ba)) => (ab, ba),
+        (Err(e), Ok(ba)) => {
+            assert!(e.contains("does not outrank"), "{e}");
+            (
+                merged(a, &ba).expect("the refused side merges the other's result"),
+                ba,
+            )
+        }
+        (Ok(ab), Err(e)) => {
+            assert!(e.contains("does not outrank"), "{e}");
+            let ba = merged(b, &ab).expect("the refused side merges the other's result");
+            (ab, ba)
+        }
+        (Err(e1), Err(e2)) => panic!("both directions refused: {e1} / {e2}"),
+    }
 }
 
 /// T7/T8/T8b/T8c: the sender holds more members than one delta may add AND

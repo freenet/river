@@ -46,7 +46,19 @@ follows the same rules.
 A whole-state merge refuses an incoming state holding more bans, members or
 ban evidence than its own owner-signed configuration allows (verify's own
 bounds, compared before any signature is checked), then applies EVERY
-incoming record and lets the merged room's caps decide. Do not trim what a
+incoming record and lets the merged room's caps decide.
+
+It also refuses, before any signature is checked, an incoming state whose
+configuration does not outrank the receiver's (the merge ends in the
+receiver's room) when it holds more bans, members or ban evidence than one
+delta may carry in the receiver's room (each cap at least its per-delta
+floor). A work-bound refusal: without it a replayed older owner-signed
+configuration with a high cap would admit that many records, each checked
+by the receiver. The honest case it also refuses is a peer still on an
+older, higher cap after the owner lowered it: that peer takes the new
+configuration from its own merge of the receiver's state and trims, and the
+next exchange goes through (one extra round; the merge verifier treats a
+refused merge as inconclusive). Do not trim what a
 whole-state merge applies: a trim chooses before the merged room's own
 removals run (a lowered `max_members`, a ban that removes an issuer), so the
 two directions of one exchange differ.

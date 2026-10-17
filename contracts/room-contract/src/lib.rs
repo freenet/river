@@ -425,82 +425,79 @@ mod tests {
     }
 
     /// A full-state update runs the room's own merge (`merge_from`), not the
-    /// trait default. The witness: after the owner lowers `max_user_bans`
-    /// from above the bans work bound, merging a peer that still holds the
-    /// old ban set applies every ban and keeps what the merged cap keeps,
-    /// where the trait default is refused by the per-delta bound
-    /// (freenet/river#703).
+    /// trait default. The witness: an incoming configuration raises
+    /// `max_recent_messages`; the room's merge keeps every message the raised
+    /// cap keeps, where the trait default reads the receiver's old retention
+    /// horizon and withholds the older ones (freenet/river#703).
     #[test]
     fn a_full_state_update_runs_the_rooms_own_merge() {
+        use river_core::room_state::message::{
+            AuthorizedMessageV1, MessageV1, MessagesV1, RoomMessageBody,
+        };
         let owner_sk = SigningKey::from_bytes(&[1; 32]);
         let owner_id = MemberId::from(&owner_sk.verifying_key());
         let parameters = ChatRoomParametersV1 {
             owner: owner_sk.verifying_key(),
         };
-        let config = |version: u32, max_user_bans: usize| {
+        let config = |version: u32, max_recent_messages: usize| {
             AuthorizedConfigurationV1::new(
                 Configuration {
                     owner_member_id: owner_id,
                     configuration_version: version,
-                    max_user_bans,
+                    max_recent_messages,
                     ..Default::default()
                 },
                 &owner_sk,
             )
         };
-        let held = river_core::room_state::ban::MIN_BANS_DELTA_BOUND + 3;
-        let bans = (0..held as u64)
-            .map(|i| {
-                let target = SigningKey::from_bytes(&{
-                    let mut b = [9u8; 32];
-                    b[..8].copy_from_slice(&i.to_le_bytes());
-                    b
-                });
-                AuthorizedUserBan::new(
-                    UserBan {
-                        owner_member_id: owner_id,
-                        banned_at: std::time::SystemTime::UNIX_EPOCH
-                            + std::time::Duration::from_secs(i),
-                        banned_user: MemberId::from(&target.verifying_key()),
-                    },
-                    owner_id,
-                    &owner_sk,
-                )
-            })
-            .collect();
-        let mut stale = ChatRoomStateV1 {
-            configuration: config(1, held),
-            bans: BansV1(bans),
+        let messages = |range: std::ops::Range<u64>| {
+            let mut m = MessagesV1 {
+                messages: range
+                    .map(|i| {
+                        AuthorizedMessageV1::new(
+                            MessageV1 {
+                                room_owner: owner_id,
+                                author: owner_id,
+                                time: std::time::SystemTime::UNIX_EPOCH
+                                    + std::time::Duration::from_secs(1_000 + i),
+                                content: RoomMessageBody::public(format!("m{i}")),
+                            },
+                            &owner_sk,
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            m.rebuild_actions_state();
+            m
+        };
+        let receiver = ChatRoomStateV1 {
+            configuration: config(1, 3),
+            recent_messages: messages(7..10),
             ..Default::default()
         };
-        stale.post_apply_cleanup(&parameters).unwrap();
-        assert_eq!(stale.bans.0.len(), held, "premise: every ban is kept");
-        let mut updated = stale.clone();
-        updated
-            .apply_delta(
-                &stale,
-                &parameters,
-                &Some(ChatRoomStateV1Delta {
-                    configuration: Some(config(2, 2)),
-                    ..Default::default()
-                }),
-            )
-            .unwrap();
+        let incoming = ChatRoomStateV1 {
+            configuration: config(2, 10),
+            recent_messages: messages(0..10),
+            ..Default::default()
+        };
 
-        let mut by_trait = updated.clone();
+        let mut by_trait = receiver.clone();
+        ComposableState::merge(&mut by_trait, &receiver, &parameters, &incoming).unwrap();
+        let mut expected = receiver.clone();
+        expected.merge_from(&parameters, &incoming).unwrap();
+        assert_eq!(expected.recent_messages.messages.len(), 10);
         assert!(
-            ComposableState::merge(&mut by_trait, &updated, &parameters, &stale).is_err(),
-            "premise: the trait default fails this merge"
+            by_trait.recent_messages.messages.len() < 10,
+            "premise: the trait default withholds the older messages"
         );
-        let mut expected = updated.clone();
-        expected.merge_from(&parameters, &stale).unwrap();
 
         let out = Contract::update_state(
             Parameters::from(cbor!(&parameters)),
-            State::from(cbor!(&updated)),
-            vec![UpdateData::State(State::from(cbor!(&stale)))],
+            State::from(cbor!(&receiver)),
+            vec![UpdateData::State(State::from(cbor!(&incoming)))],
         )
-        .expect("the room's merge trims to the work bound");
+        .expect("the room's merge applies it");
         assert_eq!(
             out.new_state.expect("a new state").as_ref(),
             cbor!(&expected).as_slice()

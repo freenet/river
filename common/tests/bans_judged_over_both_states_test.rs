@@ -103,12 +103,41 @@ impl Room {
         s
     }
     fn assert_one_exchange_agrees(&self, a: &ChatRoomStateV1, b: &ChatRoomStateV1) {
-        let mut ab = a.clone();
-        ab.merge_from(&self.p, b).expect("merge(A, B)");
-        let mut ba = b.clone();
-        ba.merge_from(&self.p, a).expect("merge(B, A)");
+        let (ab, ba) = exchange(&self.p, a, b);
         ab.verify(&ab, &self.p).unwrap();
         assert!(ser(&ab) == ser(&ba), "one exchange differs by direction");
+    }
+}
+
+/// One exchange between `a` and `b`, as two peers hold it afterwards. A side
+/// holding more than one delta may carry in the other's room, under a
+/// configuration that does not outrank the other's, is refused first; it
+/// takes the other's configuration from the other direction's merge, and
+/// the refused side then merges that (freenet/river#703).
+fn exchange(
+    params: &ChatRoomParametersV1,
+    a: &ChatRoomStateV1,
+    b: &ChatRoomStateV1,
+) -> (ChatRoomStateV1, ChatRoomStateV1) {
+    let merged = |x: &ChatRoomStateV1, y: &ChatRoomStateV1| {
+        let mut out = x.clone();
+        out.merge_from(params, y).map(|()| out)
+    };
+    match (merged(a, b), merged(b, a)) {
+        (Ok(ab), Ok(ba)) => (ab, ba),
+        (Err(e), Ok(ba)) => {
+            assert!(e.contains("does not outrank"), "{e}");
+            (
+                merged(a, &ba).expect("the refused side merges the other's result"),
+                ba,
+            )
+        }
+        (Ok(ab), Err(e)) => {
+            assert!(e.contains("does not outrank"), "{e}");
+            let ba = merged(b, &ab).expect("the refused side merges the other's result");
+            (ab, ba)
+        }
+        (Err(e1), Err(e2)) => panic!("both directions refused: {e1} / {e2}"),
     }
 }
 

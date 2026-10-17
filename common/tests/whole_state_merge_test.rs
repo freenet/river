@@ -112,6 +112,38 @@ impl Room {
     }
 }
 
+/// One exchange between `a` and `b`, as two peers hold it afterwards. A side
+/// holding more than one delta may carry in the other's room, under a
+/// configuration that does not outrank the other's, is refused first; it
+/// takes the other's configuration from the other direction's merge, and
+/// the refused side then merges that (freenet/river#703).
+fn exchange(
+    params: &ChatRoomParametersV1,
+    a: &ChatRoomStateV1,
+    b: &ChatRoomStateV1,
+) -> (ChatRoomStateV1, ChatRoomStateV1) {
+    let merged = |x: &ChatRoomStateV1, y: &ChatRoomStateV1| {
+        let mut out = x.clone();
+        out.merge_from(params, y).map(|()| out)
+    };
+    match (merged(a, b), merged(b, a)) {
+        (Ok(ab), Ok(ba)) => (ab, ba),
+        (Err(e), Ok(ba)) => {
+            assert!(e.contains("does not outrank"), "{e}");
+            (
+                merged(a, &ba).expect("the refused side merges the other's result"),
+                ba,
+            )
+        }
+        (Ok(ab), Err(e)) => {
+            assert!(e.contains("does not outrank"), "{e}");
+            let ba = merged(b, &ab).expect("the refused side merges the other's result");
+            (ab, ba)
+        }
+        (Err(e1), Err(e2)) => panic!("both directions refused: {e1} / {e2}"),
+    }
+}
+
 fn target(i: u64) -> MemberId {
     id(&sk(100_000 + i))
 }
@@ -210,8 +242,8 @@ fn bans_are_judged_after_the_merged_member_cap() {
     let r = Room::new();
     let (w, x) = (sk(3), sk(2));
     let mut bans: Vec<AuthorizedUserBan> =
-        (0..120).map(|i| r.ban(&x, target(i), 10_000 + i)).collect();
-    bans.extend((0..60).map(|i| r.ban(&w, target(1_000 + i), 100 + i)));
+        (0..60).map(|i| r.ban(&x, target(i), 10_000 + i)).collect();
+    bans.extend((0..30).map(|i| r.ban(&w, target(1_000 + i), 100 + i)));
     let sender = r.settled(ChatRoomStateV1 {
         configuration: r.cfg(1, |c| c.max_user_bans = 300),
         members: MembersV1 {
@@ -224,7 +256,7 @@ fn bans_are_judged_after_the_merged_member_cap() {
         recent_messages: r.messages(vec![r.msg(&w, 1), r.msg(&x, 2)]),
         ..Default::default()
     });
-    assert_eq!(sender.bans.0.len(), 180, "premise");
+    assert_eq!(sender.bans.0.len(), 90, "premise");
     let receiver = r.settled(ChatRoomStateV1 {
         configuration: r.cfg(2, |c| {
             c.max_user_bans = 10;
@@ -232,8 +264,7 @@ fn bans_are_judged_after_the_merged_member_cap() {
         }),
         ..Default::default()
     });
-    let rs = r.merged(&receiver, &sender).expect("merge(R, S)");
-    let sr = r.merged(&sender, &receiver).expect("merge(S, R)");
+    let (rs, sr) = exchange(&r.p, &receiver, &sender);
     assert!(
         ser(&rs) == ser(&sr),
         "one exchange gives the same state both ways"
@@ -269,7 +300,7 @@ fn a_ban_the_cap_evicts_still_decides_liveness_in_both_directions() {
         ..Default::default()
     });
     let mut sb = vec![r.ban(&y, id(&x), 50)];
-    sb.extend((0..150).map(|i| r.ban(&w, target(1_000 + i), 1_000 + i)));
+    sb.extend((0..90).map(|i| r.ban(&w, target(1_000 + i), 1_000 + i)));
     let sender = r.settled(ChatRoomStateV1 {
         configuration: r.cfg(1, |c| c.max_user_bans = 300),
         members: members(),
@@ -277,10 +308,77 @@ fn a_ban_the_cap_evicts_still_decides_liveness_in_both_directions() {
         bans: BansV1(sb),
         ..Default::default()
     });
-    let rs = r.merged(&receiver, &sender).expect("merge(R, S)");
-    let sr = r.merged(&sender, &receiver).expect("merge(S, R)");
+    let (rs, sr) = exchange(&r.p, &receiver, &sender);
     assert!(
         ser(&rs) == ser(&sr),
         "one exchange gives the same state both ways"
     );
+}
+
+/// An incoming state whose configuration ranks below the receiver's ends in
+/// the receiver's room, so it is held to the receiver's per-delta bounds
+/// before any signature is checked: a replayed older configuration with a
+/// high cap does not admit thousands of bans the receiver would then check.
+#[test]
+fn a_lower_ranked_state_over_the_receivers_bounds_is_refused() {
+    let r = Room::new();
+    let x = sk(2);
+    let receiver = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(2, |c| c.max_user_bans = 10),
+        members: MembersV1 {
+            members: vec![r.rec(&x.verifying_key(), &r.o)],
+        },
+        recent_messages: r.messages(vec![r.msg(&x, 1)]),
+        ..Default::default()
+    });
+    // Older owner-signed configuration with a high cap, and bans attributed
+    // to X that X's key does not verify.
+    let other = sk(3);
+    let bans: Vec<AuthorizedUserBan> = (0..20_000u64)
+        .map(|i| AuthorizedUserBan {
+            banned_by: id(&x),
+            ..r.ban(&other, target(i), i)
+        })
+        .collect();
+    let incoming = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_user_bans = 30_000),
+        bans: BansV1(bans),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    assert!(r.merged(&receiver, &incoming).is_err());
+    let mut ui = receiver.clone();
+    assert!(ui.merge_through_summary(&r.p, &incoming).is_err());
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "refused before checking signatures"
+    );
+}
+
+/// The honest case it covers: after the owner lowers the ban cap, a peer
+/// still on the old configuration and holding more bans than the new
+/// bounds allow is refused once, takes the new configuration from the
+/// receiver, and the next exchange converges.
+#[test]
+fn a_peer_on_an_older_higher_cap_converges_after_one_more_exchange() {
+    let r = Room::new();
+    let bans: Vec<AuthorizedUserBan> = (0..150).map(|i| r.ban(&r.o, target(i), i)).collect();
+    let stale = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_user_bans = 300),
+        bans: BansV1(bans),
+        ..Default::default()
+    });
+    assert_eq!(stale.bans.0.len(), 150, "premise");
+    let lowered = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(2, |c| c.max_user_bans = 10),
+        ..Default::default()
+    });
+    assert!(r.merged(&lowered, &stale).is_err(), "refused this round");
+    let stale_after = r
+        .merged(&stale, &lowered)
+        .expect("the stale peer takes the new configuration");
+    assert_eq!(stale_after.bans.0.len(), 10);
+    let a = r.merged(&lowered, &stale_after).expect("next exchange");
+    let b = r.merged(&stale_after, &lowered).expect("next exchange");
+    assert!(ser(&a) == ser(&b), "they converge");
 }
