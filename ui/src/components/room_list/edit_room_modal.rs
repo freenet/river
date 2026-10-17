@@ -839,9 +839,26 @@ fn MaxMembersField(
 ///
 /// Returns the reason when the change is refused before signing (see
 /// `Configuration::signing_refusal`), for the field to show the owner.
+/// `edited` (a copy of `held` with the owner's changes) as the room's next
+/// configuration, ready to sign, or the reason it must not be signed: the
+/// version advanced, then the normalization and check riverctl runs too
+/// (`Configuration::normalize_for_signing`, `Configuration::signing_refusal`).
+pub(super) fn prepare_config_for_signing(
+    held: &Configuration,
+    mut edited: Configuration,
+    params: &ChatRoomParametersV1,
+) -> Result<Configuration, String> {
+    edited.configuration_version = held.configuration_version + 1;
+    edited.normalize_for_signing(held, params);
+    match edited.signing_refusal(params) {
+        Some(reason) => Err(reason),
+        None => Ok(edited),
+    }
+}
+
 pub(super) fn sign_and_apply_configuration(
     owner_key: VerifyingKey,
-    mut new_config: Configuration,
+    new_config: Configuration,
     what: &'static str,
 ) -> Result<(), String> {
     let signing_data = ROOMS.with(|rooms| {
@@ -859,13 +876,17 @@ pub(super) fn sign_and_apply_configuration(
         warn!("Cannot update {what}: room or local signing key unavailable");
         return Ok(());
     };
-    new_config.configuration_version += 1;
-    let params = ChatRoomParametersV1 { owner: owner_key };
-    new_config.normalize_for_signing(&room_state.configuration.configuration, &params);
-    if let Some(reason) = new_config.signing_refusal(&params) {
-        error!("Not updating {what}: {reason}");
-        return Err(reason);
-    }
+    let new_config = match prepare_config_for_signing(
+        &room_state.configuration.configuration,
+        new_config,
+        &ChatRoomParametersV1 { owner: owner_key },
+    ) {
+        Ok(c) => c,
+        Err(reason) => {
+            error!("Not updating {what}: {reason}");
+            return Err(reason);
+        }
+    };
 
     spawn_local(async move {
         let mut config_bytes = Vec::new();
@@ -1139,5 +1160,39 @@ mod tests {
             squashed.contains(&format!("{}:\"{{{}}}\"", "title", "rotate_title")),
             "the disabled Rotate button must carry the explanatory title"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_signing_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    /// The owner's next configuration is the held one's version plus one,
+    /// normalized (a held nickname limit over the ceiling the edit leaves
+    /// alone is lowered to it), and refused with the reason when the edit
+    /// itself is invalid.
+    #[test]
+    fn a_config_edit_is_prepared_as_riverctl_prepares_it() {
+        let owner = SigningKey::from_bytes(&[71u8; 32]).verifying_key();
+        let params = ChatRoomParametersV1 { owner };
+        let ceiling = river_core::room_state::member_info::NICKNAME_CEILING;
+        let held = Configuration {
+            owner_member_id: owner.into(),
+            configuration_version: 4,
+            max_nickname_size: ceiling + 5,
+            ..Default::default()
+        };
+        let mut edited = held.clone();
+        edited.max_members = 7;
+        let ready = prepare_config_for_signing(&held, edited, &params).expect("signable");
+        assert_eq!(ready.configuration_version, 5);
+        assert_eq!(ready.max_members, 7);
+        assert_eq!(ready.max_nickname_size, ceiling);
+        let mut zero = held.clone();
+        zero.max_user_bans = 0;
+        assert!(prepare_config_for_signing(&held, zero, &params)
+            .unwrap_err()
+            .contains("max_user_bans"));
     }
 }

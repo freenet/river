@@ -253,3 +253,30 @@ fn a_network_delta_fits_the_floors() {
     r.exchange(&sender, &receiver)
         .expect("the receiver applies it");
 }
+
+/// Over the members bound, a record whose invite chain does not reach the
+/// owner in the sender's state is the first left out.
+#[test]
+fn a_network_delta_leaves_out_unreachable_members_first() {
+    let r = Room::new();
+    let stranger = sk(9);
+    let mut members: Vec<_> = (0..1_000u64)
+        .map(|i| r.rec(&sk(30_000 + i).verifying_key(), &r.o))
+        .collect();
+    let unreachable: Vec<_> = (0..5u64)
+        .map(|i| r.rec(&sk(40_000 + i).verifying_key(), &stranger))
+        .collect();
+    members.extend(unreachable.iter().cloned());
+    let sender = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_members = 10),
+        members: MembersV1 { members },
+        ..Default::default()
+    };
+    let empty = ChatRoomStateV1::default();
+    let delta = sender
+        .delta_within_work_bounds(&r.p, &empty.summarize(&empty, &r.p))
+        .expect("a delta");
+    let added = delta.members.expect("members").added().to_vec();
+    assert_eq!(added.len(), 1_000, "premise: the trim ran");
+    assert!(unreachable.iter().all(|m| !added.contains(m)));
+}

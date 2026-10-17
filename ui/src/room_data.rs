@@ -4935,6 +4935,89 @@ mod tests {
         );
     }
 
+    /// The DM purges a device signed are the device's record, not the
+    /// identity's: whichever copy's identity wins a room merge, the purges
+    /// either copy recorded survive it (the adopt branch and the same-identity
+    /// branch both union them).
+    #[test]
+    fn merging_rooms_unions_own_purges_in_both_branches() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let old_identity = SigningKey::generate(&mut rng);
+        let new_identity = SigningKey::generate(&mut rng);
+        let (me_old, me_new) = (
+            MemberId::from(old_identity.verifying_key()),
+            MemberId::from(new_identity.verifying_key()),
+        );
+
+        // Adopt branch: a newer identity replaces the older copy.
+        let mut old_room = make_rejoin_test_room(&owner, &old_identity, true);
+        old_room.own_purges.record(me_old, [PurgeToken([1; 16])]);
+        let mut new_room = make_rejoin_test_room(&owner, &new_identity, true);
+        new_room.own_purges.record(me_new, [PurgeToken([2; 16])]);
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+        local
+            .merge_from_source(
+                rooms_holding(vk, old_room),
+                3,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
+            .expect("old generation merge");
+        local
+            .merge_from_source(
+                rooms_holding(vk, new_room),
+                30,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
+            .expect("newer generation merge");
+        assert_eq!(
+            local.map.get(&vk).unwrap().own_purges.purged,
+            vec![(me_old, PurgeToken([1; 16])), (me_new, PurgeToken([2; 16]))]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "the adopt branch unions the purges of both copies"
+        );
+
+        // Same-identity branch: a third copy under the winning identity.
+        let mut third = make_rejoin_test_room(&owner, &new_identity, true);
+        third.own_purges.record(me_new, [PurgeToken([3; 16])]);
+        local
+            .merge_from_source(
+                rooms_holding(vk, third),
+                30,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
+            .expect("same-identity merge");
+        let tokens: std::collections::BTreeSet<_> = local
+            .map
+            .get(&vk)
+            .unwrap()
+            .own_purges
+            .purged
+            .iter()
+            .map(|(_, t)| *t)
+            .collect();
+        assert_eq!(
+            tokens,
+            [
+                PurgeToken([1; 16]),
+                PurgeToken([2; 16]),
+                PurgeToken([3; 16])
+            ]
+            .into_iter()
+            .collect(),
+            "the same-identity branch keeps what was recorded and adds the incoming copy's"
+        );
+    }
+
     /// Adopting a newer identity REPLACES the local `RoomData` wholesale, so
     /// every field not explicitly carried over is silently discarded. That is
     /// how the `invitation_secrets` loss got in — caught in review, not by a

@@ -356,3 +356,50 @@ fn a_ban_whose_issuer_is_known_nowhere_takes_no_cap_slot() {
     other.bans.0.push(arriving);
     r.assert_one_exchange_agrees(&held, &other);
 }
+
+/// Over the cap, the bans no known key verifies are dropped before the cap
+/// counts; an issuer known only through ban evidence is known, so its genuine
+/// ban is kept while a forged one by a present member is dropped.
+#[test]
+fn an_evidence_issuers_ban_is_known_when_forged_bans_are_dropped() {
+    use river_core::room_state::ban_evidence::BanEvidenceV1;
+    let r = Room::new();
+    let (m, e, other) = (sk(2), sk(3), sk(4));
+    let mut msgs = MessagesV1 {
+        messages: vec![r.msg(&m, 1)],
+        ..Default::default()
+    };
+    msgs.rebuild_actions_state();
+    let genuine = r.ban(&e, id(&sk(80)), 5);
+    let held = r.settle(ChatRoomStateV1 {
+        configuration: r.cfg(1, 2),
+        members: MembersV1 {
+            members: vec![r.rec(&m, &r.o)],
+        },
+        ban_evidence: BanEvidenceV1 {
+            members: vec![r.rec(&e, &r.o)],
+        },
+        recent_messages: msgs,
+        bans: BansV1(vec![genuine.clone(), r.ban(&r.o, id(&sk(81)), 6)]),
+        ..Default::default()
+    });
+    assert_eq!(held.bans.0.len(), 2, "premise");
+    assert_eq!(
+        held.ban_evidence.members.len(),
+        1,
+        "premise: the issuer is evidence"
+    );
+    // Claims to be the present member M's, signed by another key.
+    let forged = AuthorizedUserBan {
+        banned_by: id(&m),
+        ..r.ban(&other, id(&sk(82)), 7)
+    };
+    let mut applied = held.clone();
+    applied.bans.0.push(forged);
+    applied.post_apply_cleanup(&r.p).unwrap();
+    assert!(
+        applied.bans.0.contains(&genuine),
+        "the evidence issuer's ban is kept"
+    );
+    assert_eq!(applied.bans.0.len(), 2);
+}

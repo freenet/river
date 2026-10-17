@@ -380,3 +380,22 @@ fn length_refusal(
         .as_ref()
         .and_then(|c| river_core::room_state::member_info::nickname_refusal(nickname.len(), c))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A nickname over the room's `max_nickname_size` is refused before
+    /// signing, one at it is not, and with the room's configuration unknown
+    /// nothing is refused here.
+    #[test]
+    fn a_nickname_over_the_room_limit_is_refused() {
+        let config = river_core::room_state::configuration::Configuration {
+            max_nickname_size: 8,
+            ..Default::default()
+        };
+        assert!(length_refusal(&Some(config.clone()), &"n".repeat(8)).is_none());
+        assert!(length_refusal(&Some(config), &"n".repeat(9)).is_some());
+        assert!(length_refusal(&None, &"n".repeat(9)).is_none());
+    }
+}

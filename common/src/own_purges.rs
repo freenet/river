@@ -362,6 +362,103 @@ mod tests {
         assert_eq!(env.state.purged.len(), MAX_PURGED_TOMBSTONES_PER_RECIPIENT);
     }
 
+    /// The guard is once per winning version, not once ever: a later winning
+    /// envelope that omits a recorded token is re-signed again.
+    #[test]
+    fn a_later_winning_version_that_omits_a_token_is_re_signed_again() {
+        let r = room();
+        let bob = MemberId::from(&r.bob_sk.verifying_key());
+        let (t1, t2, t3) = (
+            PurgeToken([1; 16]),
+            PurgeToken([2; 16]),
+            PurgeToken([3; 16]),
+        );
+        let mut rec = OwnPurges::default();
+        rec.record(bob, [t1]);
+        let v1 = advance_recipient_purges(&r.bob_sk, &r.params.owner, None, [t2]).unwrap();
+        let s1 = with_envelope(&r, &r.state, v1.clone());
+        assert!(rec.heal(&r.bob_sk, &r.params.owner, &s1).is_some());
+        assert!(rec.heal(&r.bob_sk, &r.params.owner, &s1).is_none());
+        let v2 = advance_recipient_purges(&r.bob_sk, &r.params.owner, Some(&v1), [t3]).unwrap();
+        let v3 = advance_recipient_purges(&r.bob_sk, &r.params.owner, Some(&v2), []).unwrap();
+        let s3 = with_envelope(&r, &s1, v3);
+        assert!(rec.heal(&r.bob_sk, &r.params.owner, &s3).is_some());
+    }
+
+    /// The room owner, a member without a record in `members`, re-signs its
+    /// own purge too.
+    #[test]
+    fn the_room_owner_re_signs_its_own_purge() {
+        let r = room();
+        let owner = MemberId::from(&r.owner_sk.verifying_key());
+        let mut rec = OwnPurges::default();
+        rec.record(owner, [PurgeToken([1; 16])]);
+        let winner =
+            advance_recipient_purges(&r.owner_sk, &r.params.owner, None, [PurgeToken([2; 16])])
+                .unwrap();
+        let s = with_envelope(&r, &r.state, winner);
+        assert!(rec.heal(&r.owner_sk, &r.params.owner, &s).is_some());
+    }
+
+    /// Two copies of the record merge to the union of the purges and the
+    /// later healed version per recipient, in either order; the record stays
+    /// sorted and free of duplicates.
+    #[test]
+    fn a_union_keeps_every_purge_and_the_later_healed_version() {
+        let bob = MemberId::from(&SigningKey::from_bytes(&[12u8; 32]).verifying_key());
+        for (x, y) in [(5, 3), (3, 5)] {
+            let mut a = OwnPurges {
+                healed_at: vec![(bob, x)],
+                ..Default::default()
+            };
+            let b = OwnPurges {
+                healed_at: vec![(bob, y)],
+                ..Default::default()
+            };
+            a.union(&b);
+            assert_eq!(a.healed_at, vec![(bob, 5)]);
+        }
+        let mut a = OwnPurges::default();
+        a.record(bob, [PurgeToken([9; 16]), PurgeToken([1; 16])]);
+        a.record(bob, [PurgeToken([9; 16])]);
+        assert_eq!(
+            a.purged,
+            vec![(bob, PurgeToken([1; 16])), (bob, PurgeToken([9; 16]))]
+        );
+        let mut b = OwnPurges::default();
+        b.record(bob, [PurgeToken([5; 16]), PurgeToken([9; 16])]);
+        a.union(&b);
+        assert_eq!(
+            a.purged,
+            vec![
+                (bob, PurgeToken([1; 16])),
+                (bob, PurgeToken([5; 16])),
+                (bob, PurgeToken([9; 16]))
+            ]
+        );
+    }
+
+    /// A winning envelope already at the tombstone cap leaves no room: nothing
+    /// is re-signed.
+    #[test]
+    fn a_full_envelope_is_not_re_signed() {
+        use crate::room_state::direct_messages::MAX_PURGED_TOMBSTONES_PER_RECIPIENT;
+        let r = room();
+        let bob = MemberId::from(&r.bob_sk.verifying_key());
+        let full: Vec<PurgeToken> = (0..MAX_PURGED_TOMBSTONES_PER_RECIPIENT as u32)
+            .map(|i| {
+                let mut t = [0u8; 16];
+                t[..4].copy_from_slice(&i.to_le_bytes());
+                PurgeToken(t)
+            })
+            .collect();
+        let winner = advance_recipient_purges(&r.bob_sk, &r.params.owner, None, full).unwrap();
+        let s = with_envelope(&r, &r.state, winner);
+        let mut rec = OwnPurges::default();
+        rec.record(bob, [PurgeToken([0xEE; 16])]);
+        assert!(rec.heal(&r.bob_sk, &r.params.owner, &s).is_none());
+    }
+
     /// Only the recipient a token was recorded as re-signs it, and only
     /// while a member of the room.
     #[test]

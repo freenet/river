@@ -9396,6 +9396,55 @@ mod create_room_tests {
         assert_eq!(out, network);
     }
 
+    /// The nickname and room checks run before anything is signed, in each
+    /// command that signs: `invite accept` before the invitee's member info
+    /// is sealed, `member set-nickname` before the nickname is sealed, `room
+    /// create` before its first state is built, and `room config` through
+    /// `prepare_config_edit` before signing.
+    #[test]
+    fn the_refusals_run_before_signing_in_each_command() {
+        // The first occurrence of each signature is the definition; the
+        // test modules come after the `impl ApiClient` block.
+        let code = include_str!("api.rs");
+        let body = |sig: &str| {
+            let start = code.find(sig).unwrap_or_else(|| panic!("{sig}"));
+            let rest = &code[start..];
+            rest[..rest.find("\n    }\n").expect("method end")]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        };
+        let before = |b: &str, check: &str, then: &str| {
+            let c = b.find(check).unwrap_or_else(|| panic!("{check} missing"));
+            let t = b.find(then).unwrap_or_else(|| panic!("{then} missing"));
+            assert!(c < t, "{check} must come before {then}");
+        };
+        let accept = body("pub async fn accept_invitation_struct(");
+        before(
+            &accept,
+            "nickname_edit_refusal(&room_state,nickname)",
+            "seal_invitee_nickname(",
+        );
+        let set = body("pub async fn set_nickname(");
+        before(
+            &set,
+            "nickname_edit_refusal(&room_state,&new_nickname)?;",
+            "AuthorizedMemberInfo",
+        );
+        let create = body("pub async fn create_room(");
+        before(
+            &create,
+            "configuration::new_room_refusal(",
+            "build_new_room_state(",
+        );
+        let config = body("pub async fn update_config(");
+        before(
+            &config,
+            "prepare_config_edit(",
+            "AuthorizedConfigurationV1::new(",
+        );
+    }
+
     /// `rooms.json` stores the purge record as JSON and reads it back; an
     /// older file without it reads as empty.
     #[test]

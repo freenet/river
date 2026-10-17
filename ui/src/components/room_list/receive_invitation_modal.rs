@@ -97,6 +97,19 @@ pub(crate) static JOIN_NICKNAME_REFUSALS: GlobalSignal<
     std::collections::HashMap<VerifyingKey, NicknameRefusal>,
 > = Global::new(std::collections::HashMap::new);
 
+/// Whether the invitation dialog's Accept is disabled for `nickname`: empty,
+/// holding emoji, over the ceiling every room holds nicknames to, or the
+/// nickname the room refused.
+pub(crate) fn invitation_accept_disabled(
+    nickname: &str,
+    refusal: Option<&NicknameRefusal>,
+) -> bool {
+    nickname.trim().is_empty()
+        || contains_hidden_chars(nickname)
+        || nickname.len() > river_core::room_state::member_info::NICKNAME_CEILING
+        || nickname_was_refused(refusal, nickname)
+}
+
 /// Whether `nickname` is the one the room refused (Accept stays disabled
 /// for it; any other nickname may be tried).
 pub(crate) fn nickname_was_refused(refusal: Option<&NicknameRefusal>, nickname: &str) -> bool {
@@ -1039,9 +1052,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
         .try_read()
         .ok()
         .and_then(|r| r.get(&inv.room).cloned());
-    let refused = nickname_was_refused(refusal.as_ref(), &nickname.read());
-    let accept_disabled =
-        nickname.read().trim().is_empty() || nickname_has_emoji || nickname_too_long || refused;
+    let accept_disabled = invitation_accept_disabled(&nickname.read(), refusal.as_ref());
 
     rsx! {
         p { class: "text-text mb-2", "You have been invited to join a new room." }
@@ -1335,6 +1346,24 @@ pub(crate) fn adopt_and_purge_legacy_persisted_invitation_once() {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    /// Accept is disabled for an empty nickname, one with emoji, one over
+    /// the nickname ceiling and the refused one, and enabled otherwise.
+    #[test]
+    fn invitation_accept_is_disabled_for_a_nickname_the_room_cannot_take() {
+        let ceiling = river_core::room_state::member_info::NICKNAME_CEILING;
+        let refusal = NicknameRefusal {
+            reason: "too long".into(),
+            nickname: "refused".into(),
+        };
+        assert!(!invitation_accept_disabled("Alex", None));
+        assert!(!invitation_accept_disabled(&"n".repeat(ceiling), None));
+        assert!(invitation_accept_disabled(" ", None));
+        assert!(invitation_accept_disabled("Alex \u{1F6E1}", None));
+        assert!(invitation_accept_disabled(&"n".repeat(ceiling + 1), None));
+        assert!(invitation_accept_disabled("refused", Some(&refusal)));
+        assert!(!invitation_accept_disabled("other", Some(&refusal)));
+    }
 
     /// The invitation GET path hands a nickname refusal to
     /// `refuse_join_for_nickname` from a deferred closure, before any member
