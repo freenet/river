@@ -1472,6 +1472,11 @@ pub(crate) struct RiverSuccessorIo<'a, C: RiverDelegateChannel, S: RiverImportSe
     /// key is written, so only a read that would otherwise have gone to the
     /// node a moment later is answered from here (freenet/river#809).
     prefetched_markers: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    /// The journal as [`begin_with`] read it to decide on the prefetch, used
+    /// by the first [`JournaledSuccessorIo::load_journal`] instead of reading
+    /// it again, so the crate's `begin` sees the same journal the markers
+    /// were read against.
+    prefetched_journal: Option<Option<Vec<u8>>>,
 }
 
 impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S> {
@@ -1487,6 +1492,7 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
             walk_orders: Vec::new(),
             rooms_merged: false,
             prefetched_markers: HashMap::new(),
+            prefetched_journal: None,
         }
     }
 
@@ -1966,12 +1972,17 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> JournaledSuccessorIo
     /// mismatched reply): `None` would make a later store start the journal
     /// afresh over a stored one.
     async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
-        let loaded = get_current(
-            self.channel,
-            &self.successor,
-            MIGRATION_JOURNAL_KEY.to_vec(),
-        )
-        .await?;
+        let loaded = match self.prefetched_journal.take() {
+            Some(loaded) => loaded,
+            None => {
+                get_current(
+                    self.channel,
+                    &self.successor,
+                    MIGRATION_JOURNAL_KEY.to_vec(),
+                )
+                .await?
+            }
+        };
         self.journal = loaded.clone();
         Ok(loaded)
     }
@@ -2034,16 +2045,17 @@ pub(crate) async fn begin_with<C: RiverDelegateChannel>(
     // every marker, and that `begin` holds the sweep's first merge, so only it
     // is worth the prefetch. With a journal stored, `begin` runs off the
     // visible path and reads few markers; the prefetch there only competes
-    // with the room load (about 0.2 s later in the rehearsal). A journal read
-    // that is silent or errs skips the prefetch; `begin` meets the same
-    // failure itself.
-    let fresh = matches!(
-        get_current(channel, &successor, MIGRATION_JOURNAL_KEY.to_vec()).await,
-        Ok(None)
-    );
+    // with the room load (about 0.2 s later in the rehearsal). The journal read
+    // here is handed to `begin`'s own first journal load, so it costs no extra
+    // round trip. A read that is silent or errs skips the prefetch and is not
+    // handed on; `begin` reads again and meets the failure itself.
+    let journal = get_current(channel, &successor, MIGRATION_JOURNAL_KEY.to_vec()).await;
     let mut writer = RiverSuccessorIo::new(channel, NoImports, successor);
-    if fresh {
-        writer.prefetch_markers(lineage).await;
+    if let Ok(journal) = journal {
+        if journal.is_none() {
+            writer.prefetch_markers(lineage).await;
+        }
+        writer.prefetched_journal = Some(journal);
     }
     begin_migration_journal(&mut writer, lineage, &river_secret_policy()).await
 }

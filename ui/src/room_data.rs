@@ -3970,10 +3970,11 @@ mod tests {
     // freenet/river#527 — identity conflicts resolve by DELEGATE GENERATION,
     // not by which probe answered first.
     //
-    // `fire_legacy_migration_request` probes every legacy generation at once
-    // and each hydrates independently, so for a long-time user whose rooms
-    // exist under many generations these merges arrive in a racy order —
-    // dispatched oldest-first, so the oldest copy usually lands first.
+    // `fire_legacy_migration_request` probes every legacy generation and each
+    // hydrates independently, so for a long-time user whose rooms exist under
+    // many generations these merges arrive in a racy order. (Dispatched
+    // oldest-first until freenet/river#809, newest-first in waves since; the
+    // ranking must hold for either order.)
     // =====================================================================
 
     fn empty_rooms_for_merge() -> Rooms {
@@ -4694,9 +4695,10 @@ mod tests {
     /// freenet/river#590, PROBE-B — the interleaving that probe order makes the
     /// LIKELY one, and that a "is it in the map right now" guard cannot see.
     ///
-    /// `fire_legacy_migration_request` dispatches `LEGACY_DELEGATES.iter()` in
-    /// file order, oldest generation first, so the OLDEST generation usually
-    /// answers while the map is still empty. Its stale tombstone lands
+    /// `fire_legacy_migration_request` dispatched `LEGACY_DELEGATES.iter()` in
+    /// file order, oldest generation first, until freenet/river#809 (newest
+    /// first since), so the OLDEST generation usually answered while the map
+    /// was still empty. The interleaving stays possible on any order. Its stale tombstone lands
     /// unopposed; the newest generation's `Present` then arrives and is skipped
     /// by the tombstone check; and the re-save writes `room:R = Tombstone` to the
     /// current delegate, taking `self_sk` with it.

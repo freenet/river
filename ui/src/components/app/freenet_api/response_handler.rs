@@ -157,7 +157,11 @@ impl ResponseHandler {
                 let responding_delegate = key.clone();
                 if is_legacy_delegate {
                     info!("Received response from LEGACY delegate - checking for migration data");
-                    crate::components::app::chat_delegate::note_sweep_answer(key.bytes());
+                    if values.is_empty() {
+                        // Core 0.2.136 and earlier answer a delegate it does
+                        // not have with an empty reply: still an answer.
+                        crate::components::app::chat_delegate::note_sweep_answer(key.bytes());
+                    }
                 }
 
                 // Log a short key fingerprint, not the full `DelegateKey` Debug: that
@@ -204,6 +208,15 @@ impl ResponseHandler {
                             );
 
                             if let Ok(response) = deserialization_result {
+                                if is_legacy_delegate
+                                    && crate::components::app::chat_delegate::is_sweep_reply(
+                                        &response,
+                                    )
+                                {
+                                    crate::components::app::chat_delegate::note_sweep_answer(
+                                        responding_delegate.bytes(),
+                                    );
+                                }
                                 // Summary, NOT the full Debug. This single call site was
                                 // 98.5% of all console bytes River emits during startup:
                                 // 39 lines averaging ~383 KB (14.93 MB of 15.15 MB total).
@@ -795,6 +808,22 @@ impl ResponseHandler {
 /// single wave. Waves run sequentially, so each wave also gets a fresh response
 /// timeout — a slow first-time delegate WASM compile can't time out later rooms.
 const ROOM_LOAD_CONCURRENCY: usize = 16;
+
+/// One legacy generation's per-room slot fan-out at a time (freenet/river#809).
+static LEGACY_SLOT_FETCH: std::sync::LazyLock<futures::lock::Mutex<()>> =
+    std::sync::LazyLock::new(|| futures::lock::Mutex::new(()));
+
+// What one client can have in the node's shared delegate admission queue
+// (capped at 100 for every client and delegate together, freenet-core
+// `fair_queue.rs`) on the first load after a re-key: a sweep wave, one slot
+// fan-out, and a marker-prefetch wave. Kept to half the cap, leaving room for
+// other clients on a shared node (freenet/river#809).
+const _: () = assert!(
+    3 * crate::components::app::chat_delegate::SWEEP_WAVE_GENERATIONS
+        + ROOM_LOAD_CONCURRENCY
+        + super::delegate_migration::MARKER_PREFETCH_WAVE
+        <= 50
+);
 // `slice::chunks(0)` panics; pin the wave size as a valid chunk at compile time.
 const _: () = assert!(ROOM_LOAD_CONCURRENCY > 0);
 
@@ -1434,7 +1463,17 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     // (`ROOM_LOAD_CONCURRENCY`): one round trip per room held the first load
     // after a re-key for N round trips (freenet/river#809). Each waiter is
     // scoped to this legacy delegate and its room key, so it is distinct from
-    // every other in flight.
+    // every other in flight, once duplicates are dropped (as the current
+    // delegate's load does). One generation fans out at a time: a long-time
+    // user's rooms sit in many generations, and several fan-outs at once would
+    // overflow the node's shared delegate queue (see `LEGACY_SLOT_FETCH`).
+    let room_vks = {
+        let mut seen = std::collections::HashSet::with_capacity(room_vks.len());
+        let mut room_vks = room_vks;
+        room_vks.retain(|vk| seen.insert(vk.to_bytes()));
+        room_vks
+    };
+    let slot_fetch = LEGACY_SLOT_FETCH.lock().await;
     let mut responses: Vec<(
         ed25519_dalek::VerifyingKey,
         Result<ChatDelegateResponseMsg, String>,
@@ -1463,6 +1502,7 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
             .await,
         );
     }
+    drop(slot_fetch);
     for (vk, response) in responses {
         match response {
             Ok(ChatDelegateResponseMsg::GetResponse {
