@@ -359,9 +359,9 @@ fn a_ban_whose_issuer_is_known_nowhere_takes_no_cap_slot() {
 
 /// Over the cap, the bans no known key verifies are dropped before the cap
 /// counts; an issuer known only through ban evidence is known, so its genuine
-/// ban is kept while a forged one by a present member is dropped.
+/// ban is kept while one a present member's key does not verify is dropped.
 #[test]
-fn an_evidence_issuers_ban_is_known_when_forged_bans_are_dropped() {
+fn an_evidence_issuers_ban_is_known_when_unverified_bans_are_dropped() {
     use river_core::room_state::ban_evidence::BanEvidenceV1;
     let r = Room::new();
     let (m, e, other) = (sk(2), sk(3), sk(4));
@@ -390,12 +390,12 @@ fn an_evidence_issuers_ban_is_known_when_forged_bans_are_dropped() {
         "premise: the issuer is evidence"
     );
     // Claims to be the present member M's, signed by another key.
-    let forged = AuthorizedUserBan {
+    let unverified = AuthorizedUserBan {
         banned_by: id(&m),
         ..r.ban(&other, id(&sk(82)), 7)
     };
     let mut applied = held.clone();
-    applied.bans.0.push(forged);
+    applied.bans.0.push(unverified);
     applied.post_apply_cleanup(&r.p).unwrap();
     assert!(
         applied.bans.0.contains(&genuine),

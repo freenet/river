@@ -22,7 +22,7 @@ fn at(t: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t)
 }
 
-fn forged_as(
+fn claimed_as(
     claimed: MemberId,
     real: &SigningKey,
     target: MemberId,
@@ -56,7 +56,7 @@ fn a_new_ban_a_known_issuers_key_does_not_verify_is_skipped_not_refused() {
     let params = ChatRoomParametersV1 {
         owner: o.verifying_key(),
     };
-    let (a, evil) = (sk(2), sk(3));
+    let (a, other_key) = (sk(2), sk(3));
     let a_rec = AuthorizedMember::new(
         Member {
             owner_member_id: owner,
@@ -73,8 +73,8 @@ fn a_new_ban_a_known_issuers_key_does_not_verify_is_skipped_not_refused() {
         },
         ..Default::default()
     };
-    let as_owner = forged_as(owner, &evil, target, 5, owner);
-    let as_member = forged_as(a_id, &evil, target, 6, owner);
+    let as_owner = claimed_as(owner, &other_key, target, 5, owner);
+    let as_member = claimed_as(a_id, &other_key, target, 6, owner);
     let genuine = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner,
@@ -84,24 +84,24 @@ fn a_new_ban_a_known_issuers_key_does_not_verify_is_skipped_not_refused() {
         a_id,
         &a,
     );
-    for forged in [
+    for delta in [
         vec![as_owner.clone()],
         vec![as_member.clone()],
         vec![as_owner, as_member, genuine.clone()],
     ] {
         let mut bans = BansV1(vec![]);
-        bans.apply_delta(&parent, &params, &Some(forged.clone()))
-            .expect("a forged ban from a known issuer is skipped, not refused");
+        bans.apply_delta(&parent, &params, &Some(delta.clone()))
+            .expect("a ban its known issuer's key does not verify is skipped, not refused");
         let kept: Vec<_> = bans.0.iter().collect();
-        if forged.contains(&genuine) {
+        if delta.contains(&genuine) {
             assert_eq!(kept, vec![&genuine], "only the genuine ban is kept");
         } else {
-            assert!(kept.is_empty(), "the forged ban is not stored");
+            assert!(kept.is_empty(), "the ban is not stored");
         }
     }
 }
 
-/// A forged ban claiming an issuer known here only through ban evidence (a
+/// A ban claiming an issuer known here only through ban evidence (a
 /// removed member whose record a stored ban still needs) is skipped too.
 #[test]
 fn a_new_ban_an_evidence_issuers_key_does_not_verify_is_skipped() {
@@ -111,7 +111,7 @@ fn a_new_ban_an_evidence_issuers_key_does_not_verify_is_skipped() {
     let params = ChatRoomParametersV1 {
         owner: o.verifying_key(),
     };
-    let (e, evil) = (sk(4), sk(5));
+    let (e, other_key) = (sk(4), sk(5));
     let e_rec = AuthorizedMember::new(
         Member {
             owner_member_id: owner,
@@ -128,7 +128,7 @@ fn a_new_ban_an_evidence_issuers_key_does_not_verify_is_skipped() {
         ..Default::default()
     };
     let target = MemberId::from(&sk(51).verifying_key());
-    let forged = forged_as(e_id, &evil, target, 5, owner);
+    let unverified = claimed_as(e_id, &other_key, target, 5, owner);
     let genuine = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner,
@@ -139,7 +139,7 @@ fn a_new_ban_an_evidence_issuers_key_does_not_verify_is_skipped() {
         &e,
     );
     let mut bans = BansV1(vec![]);
-    bans.apply_delta(&parent, &params, &Some(vec![forged, genuine.clone()]))
+    bans.apply_delta(&parent, &params, &Some(vec![unverified, genuine.clone()]))
         .expect("skipped, not refused");
     assert_eq!(bans.0, vec![genuine]);
 }
