@@ -1682,7 +1682,7 @@ test.describe("The end holds after an explicit request", () => {
       await expect(page.getByText("batched arrival 79")).toHaveCount(1, { timeout: 5_000 });
       await addLoadingImageAboveTheEnd(page, image);
       await reopenTeamChat(page);
-      // The opening alone renders a few rows over the window (63 here); the
+      // The opening alone renders a few rows over the window; the
       // backfill lands later and adds most of another window's worth.
       await expect
         .poll(() => page.locator("[data-item-key]").count(), { message: "premise: the opening backfilled" })

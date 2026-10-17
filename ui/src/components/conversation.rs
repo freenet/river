@@ -3515,11 +3515,7 @@ fn reaction_owners_popover_at(
     x: f64,
     y: f64,
 ) -> ReactionOwnersPopover {
-    let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
-    let space_below = scroll_bottom - y;
-    let space_above = y - scroll_top;
-    let above = space_below < REACTION_OWNERS_POPOVER_HEIGHT_PX && space_above > space_below;
-    let max_h = ((if above { space_above } else { space_below }) - 16.0).max(1.0);
+    let (above, max_h) = vertical_placement(y, REACTION_OWNERS_POPOVER_HEIGHT_PX);
     let win_w = web_sys::window()
         .and_then(|w| w.inner_width().ok())
         .and_then(|v| v.as_f64())
@@ -3576,6 +3572,18 @@ fn focus_without_scrolling(element: &web_sys::Element) -> bool {
     element.focus_with_options(&options).is_ok()
 }
 
+/// Whether a popover of `height` opened at viewport `y` goes above (only when
+/// it doesn't fit below and there is more room above, within the chat
+/// scrollport), and its max height: the space on that side less the 8px gap
+/// each way, so an `overflow-y-auto` popover scrolls instead of clipping (#402).
+fn vertical_placement(y: f64, height: f64) -> (bool, f64) {
+    let (top, bottom) = chat_scrollport_bounds();
+    let (below, above_space) = (bottom - y, y - top);
+    let above = below < height && above_space > below;
+    let max_h = ((if above { above_space } else { below }) - 16.0).max(1.0);
+    (above, max_h)
+}
+
 fn chat_scrollport_bounds() -> (f64, f64) {
     web_sys::window()
         .and_then(|w| w.document())
@@ -3587,21 +3595,22 @@ fn chat_scrollport_bounds() -> (f64, f64) {
         .unwrap_or((60.0, 600.0))
 }
 
-/// Whether `msg-{msg_id}`'s inline picker opens leftward (`right-0`): toward
-/// whichever side of the chat scroller has more room from its "+" wrapper;
-/// rightward when unmeasurable.
+/// Whether `msg-{msg_id}`'s inline picker opens leftward (`right-0`): when
+/// its "+" wrapper sits right of the chat scroller's centre, so the picker
+/// opens toward the roomier side; rightward when unmeasurable.
 fn inline_picker_align_right(msg_id: &str) -> bool {
     let measure = || {
         let document = web_sys::window()?.document()?;
         let plus = document
             .get_element_by_id(&format!("msg-{msg_id}"))?
             .query_selector("[data-testid=\"add-reaction-button\"]")
-            .ok()??;
-        let a = plus.parent_element()?.get_bounding_client_rect();
-        let s = document
+            .ok()??
+            .parent_element()?
+            .get_bounding_client_rect();
+        let scroller = document
             .get_element_by_id("chat-scroll-container")?
             .get_bounding_client_rect();
-        Some(a.right() - s.left() > s.right() - a.left())
+        Some(plus.left() + plus.right() > scroller.left() + scroller.right())
     };
     measure().unwrap_or(false)
 }
@@ -3928,7 +3937,6 @@ fn MessageGroupComponent(
                                             }
                                         }
                                     }
-                                    // Message body (or edit form if editing)
                                     {
                                         let is_editing = editing_message.read().as_ref() == Some(&msg.id);
                                         let msg_id_for_save = msg.message_id.clone();
@@ -4236,8 +4244,11 @@ fn MessageGroupComponent(
                                         let reply_author_name = group.author_name.clone();
                                         rsx! {
                                             div {
-                                                // Right gutter; pointer rules in main.css `.hover-actions`.
-                                                class: "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-20 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 right-0 translate-x-full",
+                                                // Right gutter. Opacity-0 still takes clicks, so it takes none
+                                                // until its row is hovered: a touch tap can't fire an invisible
+                                                // action (#402) and an idle bar never covers Latest. It and the
+                                                // closed kebab are z-20, under Latest (z-30) and backdrops (z-40).
+                                                class: "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-20 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto right-0 translate-x-full",
                                                 // Reply button - available for all messages
                                                 button {
                                                     class: "text-xs text-text-muted hover:text-accent transition-colors",
@@ -4303,7 +4314,7 @@ fn MessageGroupComponent(
                                                 // would become the containing block for the `fixed`
                                                 // dismiss backdrop below, shrinking it to this element
                                                 // instead of the viewport (#402).
-                                                // Closed, it is z-20 (see `.hover-actions`). Raise the OPEN
+                                                // Closed, it is z-20 like the hover bar. Raise the OPEN
                                                 // wrapper above sibling kebabs: later ones paint above an open popover, so
                                                 // without this a nearby message's kebab could sit over the
                                                 // menu rows and steal the tap. `z-[60]` lifts the whole
@@ -4327,35 +4338,11 @@ fn MessageGroupComponent(
                                                         if is_open {
                                                             crate::util::defer(move || open_action_menu.set(None));
                                                         } else {
-                                                            let coords = e.client_coordinates();
-                                                            // Choose the flip direction from the space available in
-                                                            // BOTH directions within the chat scrollport (which lives
-                                                            // inside an overflow-y-auto container whose bounds sit
-                                                            // above the composer and below the header). Open downward
-                                                            // when the menu fits below; only flip up when it doesn't
-                                                            // fit below AND there's more room above. A received menu
-                                                            // (2 rows) is shorter than an own menu (4 rows), so it
-                                                            // stays down in cases where an own menu would flip.
-                                                            // (#402)
-                                                            let (sp_top, sp_bottom) = chat_scrollport_bounds();
+                                                            // An own menu (4 rows) is taller than a received one
+                                                            // (2 rows), so it flips up sooner.
                                                             let menu_height = if is_self { 200.0 } else { 110.0 };
-                                                            let space_below = sp_bottom - coords.y;
-                                                            let space_above = coords.y - sp_top;
-                                                            let above =
-                                                                space_below < menu_height && space_above > space_below;
-                                                            // Cap the menu to the actual space on the chosen side
-                                                            // (minus a small gap) so it scrolls internally rather
-                                                            // than being clipped by the scroll container when it
-                                                            // fits neither side. Floor so it never collapses.
-                                                            // Exactly the space on the chosen side (minus the
-                                                            // mt-1/mb-1 gap): never larger, so the overflow-y-auto
-                                                            // menu can't exceed the scrollport and clip its own
-                                                            // rows. `above` already selects the roomier side, so
-                                                            // this is realistically ample; the 1px floor only
-                                                            // guards a degenerate near-zero measurement.
-                                                            let max_h = ((if above { space_above } else { space_below })
-                                                                - 16.0)
-                                                                .max(1.0);
+                                                            let (above, max_h) =
+                                                                vertical_placement(e.client_coordinates().y, menu_height);
                                                             let id = msg_id_kebab_toggle.clone();
                                                             // Defer signal writes out of the event handler per
                                                             // .claude/rules/dioxus-signal-safety.md (Firefox-mobile
@@ -4451,362 +4438,362 @@ fn MessageGroupComponent(
                                             }
                                         }
                                     }
-                                // Reactions display with inline add button
-                                {
-                                    let msg_id_for_inline = msg.id.clone();
-                                    let msg_id_react = msg.message_id.clone();
-                                    let is_inline_picker_open = open_emoji_picker.read().as_ref() == Some(&format!("inline-{}", msg_id_for_inline));
+                                    // Reactions display with inline add button
+                                    {
+                                        let msg_id_for_inline = msg.id.clone();
+                                        let msg_id_react = msg.message_id.clone();
+                                        let is_inline_picker_open = open_emoji_picker.read().as_ref() == Some(&format!("inline-{}", msg_id_for_inline));
 
-                                    // Find user's current reaction on this message (if any)
-                                    // No known identity ⇒ no reaction is ours,
-                                    // so nothing is highlighted and the picker
-                                    // offers a fresh reaction rather than a
-                                    // toggle of someone else's.
-                                    let user_reaction: Option<String> = msg.reactions.iter().find_map(|(emoji, reactors)| {
-                                        if self_member_id.is_some_and(|me| reactors.contains(&me)) {
-                                            Some(emoji.clone())
-                                        } else {
-                                            None
-                                        }
-                                    });
-                                    let user_reaction_for_picker = user_reaction.clone();
+                                        // Find user's current reaction on this message (if any)
+                                        // No known identity ⇒ no reaction is ours,
+                                        // so nothing is highlighted and the picker
+                                        // offers a fresh reaction rather than a
+                                        // toggle of someone else's.
+                                        let user_reaction: Option<String> = msg.reactions.iter().find_map(|(emoji, reactors)| {
+                                            if self_member_id.is_some_and(|me| reactors.contains(&me)) {
+                                                Some(emoji.clone())
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                        let user_reaction_for_picker = user_reaction.clone();
 
-                                    rsx! {
-                                        div {
-                                            "data-testid": "message-reaction-row",
-                                            class: "flex flex-wrap items-center gap-1 mt-0.5",
-                                            // Existing reactions (clickable to toggle if user has reacted)
-                                            {
-                                                let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
-                                                sorted_reactions.sort_by_key(|(emoji, _)| emoji.as_str());
-                                                sorted_reactions.into_iter().map(|(emoji, reactors)| {
-                                                    let count = reactors.len();
-                                                    let is_user_reaction = self_member_id.is_some_and(|me| reactors.contains(&me));
-                                                    let emoji_for_click = emoji.clone();
-                                                    let msg_id_for_click = msg_id_react.clone();
+                                        rsx! {
+                                            div {
+                                                "data-testid": "message-reaction-row",
+                                                class: "flex flex-wrap items-center gap-1 mt-0.5",
+                                                // Existing reactions (clickable to toggle if user has reacted)
+                                                {
+                                                    let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
+                                                    sorted_reactions.sort_by_key(|(emoji, _)| emoji.as_str());
+                                                    sorted_reactions.into_iter().map(|(emoji, reactors)| {
+                                                        let count = reactors.len();
+                                                        let is_user_reaction = self_member_id.is_some_and(|me| reactors.contains(&me));
+                                                        let emoji_for_click = emoji.clone();
+                                                        let msg_id_for_click = msg_id_react.clone();
 
-                                                    // "You" is not a nickname, so it is not checked
-                                                    // for impersonation. Everyone else gets the
-                                                    // same ⚠ / 🛡 as the author line.
-                                                    let shown_reactors: Vec<_> = reactors.iter().map(|reactor_id| {
-                                                        let is_you = Some(*reactor_id) == self_member_id;
-                                                        let name = if is_you {
-                                                            "You".to_string()
+                                                        // "You" is not a nickname, so it is not checked
+                                                        // for impersonation. Everyone else gets the
+                                                        // same ⚠ / 🛡 as the author line.
+                                                        let shown_reactors: Vec<_> = reactors.iter().map(|reactor_id| {
+                                                            let is_you = Some(*reactor_id) == self_member_id;
+                                                            let name = if is_you {
+                                                                "You".to_string()
+                                                            } else {
+                                                                member_names.get(reactor_id)
+                                                                    .cloned()
+                                                                    .unwrap_or_else(|| "Unknown".to_string())
+                                                            };
+                                                            let (warning, badge) = if is_you {
+                                                                (None, deputy_badges.get(reactor_id).cloned())
+                                                            } else {
+                                                                reaction_owner_marks(
+                                                                    *reactor_id,
+                                                                    &name,
+                                                                    &impersonation,
+                                                                    owner_id,
+                                                                    &deputy_badges,
+                                                                )
+                                                            };
+                                                            (name, warning, badge)
+                                                        }).collect();
+                                                        let names_str = shown_reactors
+                                                            .iter()
+                                                            .map(|(name, _, _)| name.as_str())
+                                                            .collect::<Vec<_>>()
+                                                            .join(", ");
+                                                        let tooltip = if is_user_reaction {
+                                                            format!("{names_str} (click to remove)")
                                                         } else {
-                                                            member_names.get(reactor_id)
-                                                                .cloned()
-                                                                .unwrap_or_else(|| "Unknown".to_string())
+                                                            names_str
                                                         };
-                                                        let (warning, badge) = if is_you {
-                                                            (None, deputy_badges.get(reactor_id).cloned())
-                                                        } else {
-                                                            reaction_owner_marks(
-                                                                *reactor_id,
-                                                                &name,
-                                                                &impersonation,
-                                                                owner_id,
-                                                                &deputy_badges,
+                                                        let owners_key = format!("{msg_id_for_inline}:{emoji}");
+                                                        let (
+                                                            owners_open,
+                                                            owners_above,
+                                                            owners_align_right,
+                                                            owners_max_h,
+                                                            owners_max_w,
+                                                        ) = {
+                                                            let open = open_reaction_owners.read();
+                                                            let mine = open.as_ref().filter(|popup| popup.key == owners_key);
+                                                            (
+                                                                mine.is_some(),
+                                                                mine.is_some_and(|popup| popup.above),
+                                                                mine.is_some_and(|popup| popup.align_right),
+                                                                mine.map(|popup| popup.max_h).unwrap_or(REACTION_OWNERS_POPOVER_HEIGHT_PX),
+                                                                mine.map(|popup| popup.max_w).unwrap_or(240.0),
                                                             )
                                                         };
-                                                        (name, warning, badge)
-                                                    }).collect();
-                                                    let names_str = shown_reactors
-                                                        .iter()
-                                                        .map(|(name, _, _)| name.as_str())
-                                                        .collect::<Vec<_>>()
-                                                        .join(", ");
-                                                    let tooltip = if is_user_reaction {
-                                                        format!("{names_str} (click to remove)")
-                                                    } else {
-                                                        names_str
-                                                    };
-                                                    let owners_key = format!("{msg_id_for_inline}:{emoji}");
-                                                    let (
-                                                        owners_open,
-                                                        owners_above,
-                                                        owners_align_right,
-                                                        owners_max_h,
-                                                        owners_max_w,
-                                                    ) = {
-                                                        let open = open_reaction_owners.read();
-                                                        let mine = open.as_ref().filter(|popup| popup.key == owners_key);
-                                                        (
-                                                            mine.is_some(),
-                                                            mine.is_some_and(|popup| popup.above),
-                                                            mine.is_some_and(|popup| popup.align_right),
-                                                            mine.map(|popup| popup.max_h).unwrap_or(REACTION_OWNERS_POPOVER_HEIGHT_PX),
-                                                            mine.map(|popup| popup.max_w).unwrap_or(240.0),
-                                                        )
-                                                    };
-                                                    let msg_id_for_remove = msg_id_for_click.clone();
-                                                    let emoji_for_remove = emoji_for_click.clone();
-                                                    let owners_key_for_click = owners_key.clone();
-                                                    let owners_key_for_key = owners_key.clone();
-                                                    let owners_key_for_press = owners_key.clone();
-                                                    let chip_pressed_with_click = chip_pressed_with.clone();
-                                                    let chip_pressed_with_down = chip_pressed_with.clone();
-                                                    let chip_pressed_with_cancel = chip_pressed_with.clone();
-                                                    let msg_id_for_owners = msg_id_for_inline.clone();
-                                                    let msg_id_for_owners_key = msg_id_for_inline.clone();
-                                                    let chip_id = reaction_chip_id(&owners_key);
-                                                    let chip_id_for_key = chip_id.clone();
-                                                    let owners_dialog_id = reaction_owners_dialog_id(&owners_key);
+                                                        let msg_id_for_remove = msg_id_for_click.clone();
+                                                        let emoji_for_remove = emoji_for_click.clone();
+                                                        let owners_key_for_click = owners_key.clone();
+                                                        let owners_key_for_key = owners_key.clone();
+                                                        let owners_key_for_press = owners_key.clone();
+                                                        let chip_pressed_with_click = chip_pressed_with.clone();
+                                                        let chip_pressed_with_down = chip_pressed_with.clone();
+                                                        let chip_pressed_with_cancel = chip_pressed_with.clone();
+                                                        let msg_id_for_owners = msg_id_for_inline.clone();
+                                                        let msg_id_for_owners_key = msg_id_for_inline.clone();
+                                                        let chip_id = reaction_chip_id(&owners_key);
+                                                        let chip_id_for_key = chip_id.clone();
+                                                        let owners_dialog_id = reaction_owners_dialog_id(&owners_key);
 
-                                                    rsx! {
-                                                        div {
-                                                            key: "{emoji}",
-                                                            class: format!(
-                                                                "relative inline-flex items-center {}",
-                                                                if owners_open { "z-[60]" } else { "" }
-                                                            ),
-                                                            if owners_open {
-                                                                div {
-                                                                    class: "fixed inset-0 z-40",
-                                                                    onclick: move |_| {
-                                                                        crate::util::defer(move || open_reaction_owners.set(None));
-                                                                    },
+                                                        rsx! {
+                                                            div {
+                                                                key: "{emoji}",
+                                                                class: format!(
+                                                                    "relative inline-flex items-center {}",
+                                                                    if owners_open { "z-[60]" } else { "" }
+                                                                ),
+                                                                if owners_open {
+                                                                    div {
+                                                                        class: "fixed inset-0 z-40",
+                                                                        onclick: move |_| {
+                                                                            crate::util::defer(move || open_reaction_owners.set(None));
+                                                                        },
+                                                                    }
+                                                                    div {
+                                                                        id: "{owners_dialog_id}",
+                                                                        "data-testid": "reaction-owners",
+                                                                        role: "dialog",
+                                                                        tabindex: "-1",
+                                                                        "aria-label": "Who reacted",
+                                                                        class: format!(
+                                                                            "absolute z-50 w-max min-w-[8rem] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
+                                                                            if owners_above { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                                            if owners_align_right { "right-0" } else { "left-0" }
+                                                                        ),
+                                                                        style: format!("max-height: {owners_max_h}px; max-width: {owners_max_w}px"),
+                                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                                        onkeydown: move |e: KeyboardEvent| {
+                                                                            if e.key() == Key::Escape {
+                                                                                e.prevent_default();
+                                                                                crate::util::defer(move || open_reaction_owners.set(None));
+                                                                            }
+                                                                        },
+                                                                        if is_user_reaction {
+                                                                            button {
+                                                                                "data-testid": "reaction-remove",
+                                                                                class: "px-3 py-2 text-sm text-left text-red-500 hover:bg-error-bg",
+                                                                                onclick: move |_| {
+                                                                                    let id = msg_id_for_remove.clone();
+                                                                                    let emoji = emoji_for_remove.clone();
+                                                                                    crate::util::defer(move || {
+                                                                                        on_react.call((id, emoji));
+                                                                                        open_reaction_owners.set(None);
+                                                                                    });
+                                                                                },
+                                                                                "Remove"
+                                                                            }
+                                                                        }
+                                                                        {shown_reactors.iter().enumerate().map(|(index, (name, warning, badge))| {
+                                                                            rsx! {
+                                                                                div {
+                                                                                    key: "{index}",
+                                                                                    class: "flex items-baseline gap-1 px-3 py-1.5 text-sm text-text text-left",
+                                                                                    span {
+                                                                                        "data-testid": "reaction-owner",
+                                                                                        class: "[overflow-wrap:anywhere]",
+                                                                                        "{name}"
+                                                                                    }
+                                                                                    {warning.as_ref().map(|warning| name_mark("reaction-owner-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
+                                                                                    {badge.as_ref().map(|badge| name_mark("reaction-owner-deputy-badge", "cursor-default", badge.tooltip(), "🛡"))}
+                                                                                }
+                                                                            }
+                                                                        })}
+                                                                    }
                                                                 }
-                                                                div {
-                                                                    id: "{owners_dialog_id}",
-                                                                    "data-testid": "reaction-owners",
-                                                                    role: "dialog",
-                                                                    tabindex: "-1",
-                                                                    "aria-label": "Who reacted",
+                                                                span {
+                                                                    id: "{chip_id}",
+                                                                    "data-testid": "reaction-chip",
+                                                                    role: "button",
+                                                                    tabindex: "0",
+                                                                    "aria-expanded": if owners_open { "true" } else { "false" },
+                                                                    "aria-haspopup": "dialog",
                                                                     class: format!(
-                                                                        "absolute z-50 w-max min-w-[8rem] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
-                                                                        if owners_above { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                                        if owners_align_right { "right-0" } else { "left-0" }
+                                                                        "inline-flex items-center gap-0.5 text-base transition-transform {}",
+                                                                        if is_user_reaction {
+                                                                            "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
+                                                                        } else {
+                                                                            "cursor-default hover:scale-110"
+                                                                        }
                                                                     ),
-                                                                    style: format!("max-height: {owners_max_h}px; max-width: {owners_max_w}px"),
-                                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                                    title: "{tooltip}",
+                                                                    onpointerdown: move |e: PointerEvent| {
+                                                                        record_press(
+                                                                            &chip_pressed_with_down,
+                                                                            &owners_key_for_press,
+                                                                            e.data().pointer_type(),
+                                                                        );
+                                                                    },
+                                                                    onpointercancel: move |_| {
+                                                                        chip_pressed_with_cancel.borrow_mut().take();
+                                                                    },
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        let click_y = e.client_coordinates().y;
+                                                                        let click_x = e.client_coordinates().x;
+                                                                        // Only this chip's own recent press counts.
+                                                                        let pressed_with = take_fresh_press(
+                                                                            &chip_pressed_with_click,
+                                                                            &owners_key_for_click,
+                                                                        );
+                                                                        if gesture_opens_owner_list(pressed_with.as_deref()) {
+                                                                            let popover = reaction_owners_popover_at(
+                                                                                owners_key_for_click.clone(),
+                                                                                msg_id_for_owners.clone(),
+                                                                                click_x,
+                                                                                click_y,
+                                                                            );
+                                                                            crate::util::defer(move || {
+                                                                                let already_open = open_reaction_owners
+                                                                                    .peek()
+                                                                                    .as_ref()
+                                                                                    .is_some_and(|popup| popup.key == popover.key);
+                                                                                if already_open {
+                                                                                    open_reaction_owners.set(None);
+                                                                                } else {
+                                                                                    open_emoji_picker.set(None);
+                                                                                    open_action_menu.set(None);
+                                                                                    open_reaction_owners.set(Some(popover));
+                                                                                }
+                                                                            });
+                                                                        } else if is_user_reaction {
+                                                                            let id = msg_id_for_click.clone();
+                                                                            let emoji = emoji_for_click.clone();
+                                                                            crate::util::defer(move || {
+                                                                                on_react.call((id, emoji));
+                                                                            });
+                                                                        }
+                                                                    },
                                                                     onkeydown: move |e: KeyboardEvent| {
-                                                                        if e.key() == Key::Escape {
+                                                                        let key = e.key();
+                                                                        if key == Key::Escape {
                                                                             e.prevent_default();
                                                                             crate::util::defer(move || open_reaction_owners.set(None));
+                                                                            return;
                                                                         }
-                                                                    },
-                                                                    if is_user_reaction {
-                                                                        button {
-                                                                            "data-testid": "reaction-remove",
-                                                                            class: "px-3 py-2 text-sm text-left text-red-500 hover:bg-error-bg",
-                                                                            onclick: move |_| {
-                                                                                let id = msg_id_for_remove.clone();
-                                                                                let emoji = emoji_for_remove.clone();
-                                                                                crate::util::defer(move || {
-                                                                                    on_react.call((id, emoji));
-                                                                                    open_reaction_owners.set(None);
-                                                                                });
-                                                                            },
-                                                                            "Remove"
+                                                                        // A `role="button"` answers Enter and Space.
+                                                                        // Both open the list, never remove: removing
+                                                                        // stays one step away, behind the list's
+                                                                        // Remove, and a key press has no hover title
+                                                                        // to say who reacted.
+                                                                        let space = matches!(&key, Key::Character(c) if c == " ");
+                                                                        if key != Key::Enter && !space {
+                                                                            return;
                                                                         }
-                                                                    }
-                                                                    {shown_reactors.iter().enumerate().map(|(index, (name, warning, badge))| {
-                                                                        rsx! {
-                                                                            div {
-                                                                                key: "{index}",
-                                                                                class: "flex items-baseline gap-1 px-3 py-1.5 text-sm text-text text-left",
-                                                                                span {
-                                                                                    "data-testid": "reaction-owner",
-                                                                                    class: "[overflow-wrap:anywhere]",
-                                                                                    "{name}"
-                                                                                }
-                                                                                {warning.as_ref().map(|warning| name_mark("reaction-owner-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
-                                                                                {badge.as_ref().map(|badge| name_mark("reaction-owner-deputy-badge", "cursor-default", badge.tooltip(), "🛡"))}
-                                                                            }
-                                                                        }
-                                                                    })}
-                                                                }
-                                                            }
-                                                            span {
-                                                                id: "{chip_id}",
-                                                                "data-testid": "reaction-chip",
-                                                                role: "button",
-                                                                tabindex: "0",
-                                                                "aria-expanded": if owners_open { "true" } else { "false" },
-                                                                "aria-haspopup": "dialog",
-                                                                class: format!(
-                                                                    "inline-flex items-center gap-0.5 text-base transition-transform {}",
-                                                                    if is_user_reaction {
-                                                                        "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
-                                                                    } else {
-                                                                        "cursor-default hover:scale-110"
-                                                                    }
-                                                                ),
-                                                                title: "{tooltip}",
-                                                                onpointerdown: move |e: PointerEvent| {
-                                                                    record_press(
-                                                                        &chip_pressed_with_down,
-                                                                        &owners_key_for_press,
-                                                                        e.data().pointer_type(),
-                                                                    );
-                                                                },
-                                                                onpointercancel: move |_| {
-                                                                    chip_pressed_with_cancel.borrow_mut().take();
-                                                                },
-                                                                onclick: move |e: MouseEvent| {
-                                                                    let click_y = e.client_coordinates().y;
-                                                                    let click_x = e.client_coordinates().x;
-                                                                    // Only this chip's own recent press counts.
-                                                                    let pressed_with = take_fresh_press(
-                                                                        &chip_pressed_with_click,
-                                                                        &owners_key_for_click,
-                                                                    );
-                                                                    if gesture_opens_owner_list(pressed_with.as_deref()) {
+                                                                        // Space would scroll the history.
+                                                                        e.prevent_default();
+                                                                        let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
                                                                         let popover = reaction_owners_popover_at(
-                                                                            owners_key_for_click.clone(),
-                                                                            msg_id_for_owners.clone(),
-                                                                            click_x,
-                                                                            click_y,
+                                                                            owners_key_for_key.clone(),
+                                                                            msg_id_for_owners_key.clone(),
+                                                                            x,
+                                                                            y,
                                                                         );
                                                                         crate::util::defer(move || {
-                                                                            let already_open = open_reaction_owners
-                                                                                .peek()
-                                                                                .as_ref()
-                                                                                .is_some_and(|popup| popup.key == popover.key);
-                                                                            if already_open {
-                                                                                open_reaction_owners.set(None);
-                                                                            } else {
-                                                                                open_emoji_picker.set(None);
-                                                                                open_action_menu.set(None);
-                                                                                open_reaction_owners.set(Some(popover));
-                                                                            }
+                                                                            open_emoji_picker.set(None);
+                                                                            open_action_menu.set(None);
+                                                                            open_reaction_owners.set(Some(popover));
                                                                         });
-                                                                    } else if is_user_reaction {
-                                                                        let id = msg_id_for_click.clone();
-                                                                        let emoji = emoji_for_click.clone();
-                                                                        crate::util::defer(move || {
-                                                                            on_react.call((id, emoji));
-                                                                        });
-                                                                    }
-                                                                },
-                                                                onkeydown: move |e: KeyboardEvent| {
-                                                                    let key = e.key();
-                                                                    if key == Key::Escape {
-                                                                        e.prevent_default();
-                                                                        crate::util::defer(move || open_reaction_owners.set(None));
-                                                                        return;
-                                                                    }
-                                                                    // A `role="button"` answers Enter and Space.
-                                                                    // Both open the list, never remove: removing
-                                                                    // stays one step away, behind the list's
-                                                                    // Remove, and a key press has no hover title
-                                                                    // to say who reacted.
-                                                                    let space = matches!(&key, Key::Character(c) if c == " ");
-                                                                    if key != Key::Enter && !space {
-                                                                        return;
-                                                                    }
-                                                                    // Space would scroll the history.
-                                                                    e.prevent_default();
-                                                                    let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
-                                                                    let popover = reaction_owners_popover_at(
-                                                                        owners_key_for_key.clone(),
-                                                                        msg_id_for_owners_key.clone(),
-                                                                        x,
-                                                                        y,
-                                                                    );
-                                                                    crate::util::defer(move || {
-                                                                        open_emoji_picker.set(None);
-                                                                        open_action_menu.set(None);
-                                                                        open_reaction_owners.set(Some(popover));
-                                                                    });
-                                                                },
-                                                                "{emoji}"
-                                                                if count > 1 {
-                                                                    span { class: "text-xs text-text-muted", "{count}" }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                })
-                                            }
-                                            // Inline add reaction button (same line height as reactions)
-                                            div {
-                                                // Raise the whole picker (grid + z-40 backdrop) above the
-                                                // closed z-20 kebabs and hover bars while it's open, so a
-                                                // nearby one can't paint over the emoji grid and steal a tap
-                                                // (mirrors the action menu's z-[60] behaviour). (#402)
-                                                class: format!(
-                                                    "relative group/react inline-flex items-center {}",
-                                                    if is_inline_picker_open { "z-[60]" } else { "" }
-                                                ),
-                                                // Invisible backdrop when picker is open
-                                                if is_inline_picker_open {
-                                                    div {
-                                                        class: "fixed inset-0 z-40",
-                                                        onclick: move |_| open_emoji_picker.set(None),
-                                                    }
-                                                }
-                                                button {
-                                                    "data-testid": "add-reaction-button",
-                                                    class: format!(
-                                                        "add-reaction-btn inline-flex items-center justify-center text-xl leading-none hover:scale-110 {}",
-                                                        if has_reactions || is_inline_picker_open { "has-reactions" } else { "" }
-                                                    ),
-                                                    title: "Add reaction",
-                                                    onclick: {
-                                                        let picker_id = format!("inline-{}", msg_id_for_inline);
-                                                        let msg_id = msg_id_for_inline.clone();
-                                                        move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            if open_emoji_picker.peek().as_ref() == Some(&picker_id) {
-                                                                crate::util::defer(move || open_emoji_picker.set(None));
-                                                            } else {
-                                                                // Determine if picker should appear above or below based on click position
-                                                                // If click is in bottom 40% of viewport, show picker above
-                                                                let click_y = e.client_coordinates().y;
-                                                                let viewport_height = web_sys::window()
-                                                                    .and_then(|w| w.inner_height().ok())
-                                                                    .and_then(|h| h.as_f64())
-                                                                    .unwrap_or(800.0);
-                                                                // The side comes from the "+" itself, not the click:
-                                                                // a key press reports no position.
-                                                                open_inline_picker(&msg_id, click_y > viewport_height * 0.6);
-                                                            }
-                                                        }
-                                                    },
-                                                    "+"
-                                                }
-                                                // Emoji picker for inline button (flips vertically from the tap, and opens toward the side of the scroller with more room)
-                                                if is_inline_picker_open {
-                                                    div {
-                                                        "data-testid": "emoji-picker",
-                                                        class: format!(
-                                                            "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid {} {}",
-                                                            if picker_placement.read().above { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                            if picker_placement.read().align_right { "right-0" } else { "left-0" },
-                                                        ),
-                                                        style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
-                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                        {FREQUENT_EMOJIS.iter().map(|emoji| {
-                                                            let emoji_str = emoji.to_string();
-                                                            let msg_id = msg_id_react.clone();
-                                                            let is_current = user_reaction_for_picker.as_ref() == Some(&emoji_str);
-                                                            rsx! {
-                                                                button {
-                                                                    key: "{emoji}",
-                                                                    class: format!(
-                                                                        "p-1 rounded hover:bg-surface transition-colors text-xl leading-none {}",
-                                                                        if is_current { "bg-accent/20 ring-2 ring-accent" } else { "" }
-                                                                    ),
-                                                                    title: if is_current {
-                                                                        format!("Remove {} reaction", emoji)
-                                                                    } else {
-                                                                        format!("React with {}", emoji)
-                                                                    },
-                                                                    onclick: move |_| {
-                                                                        on_react.call((msg_id.clone(), emoji_str.clone()));
-                                                                        open_emoji_picker.set(None);
                                                                     },
                                                                     "{emoji}"
+                                                                    if count > 1 {
+                                                                        span { class: "text-xs text-text-muted", "{count}" }
+                                                                    }
                                                                 }
                                                             }
-                                                        })}
+                                                        }
+                                                    })
+                                                }
+                                                // Inline add reaction button (same line height as reactions)
+                                                div {
+                                                    // Raise the whole picker (grid + z-40 backdrop) above the
+                                                    // closed z-20 kebabs and hover bars while it's open, so a
+                                                    // nearby one can't paint over the emoji grid and steal a tap
+                                                    // (mirrors the action menu's z-[60] behaviour). (#402)
+                                                    class: format!(
+                                                        "relative group/react inline-flex items-center {}",
+                                                        if is_inline_picker_open { "z-[60]" } else { "" }
+                                                    ),
+                                                    // Invisible backdrop when picker is open
+                                                    if is_inline_picker_open {
+                                                        div {
+                                                            class: "fixed inset-0 z-40",
+                                                            onclick: move |_| open_emoji_picker.set(None),
+                                                        }
+                                                    }
+                                                    button {
+                                                        "data-testid": "add-reaction-button",
+                                                        class: format!(
+                                                            "add-reaction-btn inline-flex items-center justify-center text-xl leading-none hover:scale-110 {}",
+                                                            if has_reactions || is_inline_picker_open { "has-reactions" } else { "" }
+                                                        ),
+                                                        title: "Add reaction",
+                                                        onclick: {
+                                                            let picker_id = format!("inline-{}", msg_id_for_inline);
+                                                            let msg_id = msg_id_for_inline.clone();
+                                                            move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                if open_emoji_picker.peek().as_ref() == Some(&picker_id) {
+                                                                    crate::util::defer(move || open_emoji_picker.set(None));
+                                                                } else {
+                                                                    // Determine if picker should appear above or below based on click position
+                                                                    // If click is in bottom 40% of viewport, show picker above
+                                                                    let click_y = e.client_coordinates().y;
+                                                                    let viewport_height = web_sys::window()
+                                                                        .and_then(|w| w.inner_height().ok())
+                                                                        .and_then(|h| h.as_f64())
+                                                                        .unwrap_or(800.0);
+                                                                    // The side comes from the "+" itself, not the click:
+                                                                    // a key press reports no position.
+                                                                    open_inline_picker(&msg_id, click_y > viewport_height * 0.6);
+                                                                }
+                                                            }
+                                                        },
+                                                        "+"
+                                                    }
+                                                    // Inline emoji picker; placed by `open_inline_picker`.
+                                                    if is_inline_picker_open {
+                                                        div {
+                                                            "data-testid": "emoji-picker",
+                                                            class: format!(
+                                                                "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid {} {}",
+                                                                if picker_placement.read().above { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                                if picker_placement.read().align_right { "right-0" } else { "left-0" },
+                                                            ),
+                                                            style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
+                                                            onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                            {FREQUENT_EMOJIS.iter().map(|emoji| {
+                                                                let emoji_str = emoji.to_string();
+                                                                let msg_id = msg_id_react.clone();
+                                                                let is_current = user_reaction_for_picker.as_ref() == Some(&emoji_str);
+                                                                rsx! {
+                                                                    button {
+                                                                        key: "{emoji}",
+                                                                        class: format!(
+                                                                            "p-1 rounded hover:bg-surface transition-colors text-xl leading-none {}",
+                                                                            if is_current { "bg-accent/20 ring-2 ring-accent" } else { "" }
+                                                                        ),
+                                                                        title: if is_current {
+                                                                            format!("Remove {} reaction", emoji)
+                                                                        } else {
+                                                                            format!("React with {}", emoji)
+                                                                        },
+                                                                        onclick: move |_| {
+                                                                            on_react.call((msg_id.clone(), emoji_str.clone()));
+                                                                            open_emoji_picker.set(None);
+                                                                        },
+                                                                        "{emoji}"
+                                                                    }
+                                                                }
+                                                            })}
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                }
                                 }
                             }
                         }

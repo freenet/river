@@ -37,7 +37,7 @@
   --color-text-muted: #6b6b6b;
   --color-text-quote: #5c5c5c;
   --color-text-inverse: #ffffff;
-  /* Text links and mentions: 4.5:1 on the row, its hover band and a mention chip; lighter on hover in dark. */
+  /* Text links and mentions: 4.5:1 on the row, its hover band and a mention chip. */
   --color-link: #024cb0;
   --color-link-hover: #013b8a;
   --color-success-bg: #f0fdf4;
