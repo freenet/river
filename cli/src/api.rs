@@ -9347,6 +9347,11 @@ mod create_room_tests {
         })
         .await;
         assert_eq!(out, network, "nothing published, the state is unchanged");
+        let (_, stored, _) = storage.get_room(&owner_vk).unwrap().unwrap();
+        assert!(
+            stored.direct_messages.purges.is_empty(),
+            "nothing unpublished is stored"
+        );
         heal_own_purges_in(&storage, &owner_vk, network, |_| {
             sent.set(sent.get() + 1);
             async { Ok(()) }
@@ -9489,7 +9494,7 @@ mod create_room_tests {
             .collect();
         assert!(dm.contains(&format!(
             "{}{}",
-            ".record_own_purges(&room_owner_key,&signing_key,", "[resolved_token])"
+            "record_sent_purge(api.storage(),&room_owner_key,", "&signing_key,resolved_token)"
         )));
     }
 

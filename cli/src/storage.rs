@@ -2167,10 +2167,12 @@ mod tests {
         let (storage, _temp_dir) = create_test_storage();
         let owner_sk = create_test_signing_key();
         let owner_vk = owner_sk.verifying_key();
+        // The room's stored identity: a member key, not the owner's.
+        let member_sk = create_test_signing_key();
         storage
             .add_room(
                 &owner_vk,
-                &owner_sk,
+                &member_sk,
                 create_test_state(&owner_sk),
                 &expected_contract_key(&owner_vk),
             )
@@ -2179,17 +2181,24 @@ mod tests {
         assert!(!storage
             .record_own_purges(&owner_vk, &other, [PurgeToken([1; 16])])
             .unwrap());
+        assert!(!storage
+            .record_own_purges(&owner_vk, &owner_sk, [PurgeToken([3; 16])])
+            .unwrap());
         assert!(storage
-            .record_own_purges(&owner_vk, &owner_sk, [PurgeToken([2; 16])])
+            .record_own_purges(&owner_vk, &member_sk, [PurgeToken([2; 16])])
             .unwrap());
         let key_str = bs58::encode(owner_vk.as_bytes()).into_string();
         assert_eq!(
             storage.load_rooms().unwrap().rooms[&key_str]
                 .own_purges
                 .purged,
-            vec![(MemberId::from(&owner_vk), PurgeToken([2; 16]))]
+            vec![(
+                MemberId::from(&member_sk.verifying_key()),
+                PurgeToken([2; 16])
+            )]
         );
     }
+
     /// Source-grep pins guarding the rejoin-nickname wiring against silent
     /// refactor regressions (testing-reviewer findings on PR #321). These live
     /// in storage.rs — NOT api.rs/identity.rs — so the pinned strings are not
