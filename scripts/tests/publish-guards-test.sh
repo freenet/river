@@ -338,5 +338,86 @@ else
         "exited $status" "$out"
 fi
 
+# ---------------------------------------------------------------------------
+# 3. A test-pointer UI is refused before the counter moves (freenet/river#580).
+#
+# A UI built with RIVER_POINTER_RECORDS watches pointers nobody publishes, so
+# its open tabs would never reload after a re-key. The guard reads the built
+# archive, and must run in sign-webapp BEFORE the forward-only counter bump.
+# ---------------------------------------------------------------------------
+
+author_check="$repo_root/scripts/check-webapp-pointer-author.sh"
+guard_dir="$(mktemp -d)"
+make_archive() { # $1 name, $2 bytes the UI wasm contains
+    local dir="$guard_dir/$1"
+    mkdir -p "$dir/wasm" "$dir/contracts"
+    printf '\0asm junk %s junk' "$2" >"$dir/wasm/river-ui_bg.wasm"
+    # The real key in a CONTRACT wasm must not count: only the UI's does.
+    printf 'river:v1:vk:REAL' >"$dir/contracts/room_contract.wasm"
+    tar -cJf "$guard_dir/$1.tar.xz" -C "$dir" wasm contracts
+}
+printf 'author_verifying_key = "river:v1:vk:REAL"\n' >"$guard_dir/records.toml"
+make_archive real "river:v1:vk:REAL"
+make_archive test "river:v1:vk:TESTKEY"
+
+if "$author_check" "$guard_dir/real.tar.xz" "$guard_dir/records.toml" >/dev/null 2>&1; then
+    ok "a UI carrying the real pointer author key is accepted"
+else
+    fail "a UI carrying the real pointer author key is accepted"
+fi
+"$author_check" "$guard_dir/test.tar.xz" "$guard_dir/records.toml" >/dev/null 2>&1
+status=$?
+if [[ "$status" -eq 1 ]]; then
+    ok "a UI built against test pointer records is refused"
+else
+    fail "a UI built against test pointer records is refused" "exited $status (expected 1)"
+fi
+"$author_check" "$guard_dir/missing.tar.xz" "$guard_dir/records.toml" >/dev/null 2>&1
+status=$?
+# 2 = could not check, distinct from 1 = refused, so a broken check is never
+# mistaken for a verdict on the archive.
+if [[ "$status" -eq 2 ]]; then
+    ok "an archive that cannot be read is reported as uncheckable (exit 2)"
+else
+    fail "an archive that cannot be read is reported as uncheckable (exit 2)" "exited $status"
+fi
+printf 'pointer_code_hash = "x"\n' >"$guard_dir/no-author.toml"
+"$author_check" "$guard_dir/real.tar.xz" "$guard_dir/no-author.toml" >/dev/null 2>&1
+status=$?
+if [[ "$status" -eq 2 ]]; then
+    ok "a records file without an author key is reported as uncheckable"
+else
+    fail "a records file without an author key is reported as uncheckable" "exited $status"
+fi
+mkdir -p "$guard_dir/contracts-only/contracts"
+printf 'river:v1:vk:REAL' >"$guard_dir/contracts-only/contracts/room_contract.wasm"
+tar -cJf "$guard_dir/contracts-only.tar.xz" -C "$guard_dir/contracts-only" contracts
+"$author_check" "$guard_dir/contracts-only.tar.xz" "$guard_dir/records.toml" >/dev/null 2>&1
+status=$?
+if [[ "$status" -eq 2 ]]; then
+    ok "an archive with no UI WASM is reported as uncheckable, not accepted"
+else
+    fail "an archive with no UI WASM is reported as uncheckable, not accepted" "exited $status"
+fi
+rm -rf "$guard_dir"
+
+# The call must sit in sign-webapp, uncommented, before the counter is bumped.
+sign_block="$(awk '/^\[tasks\.sign-webapp\]/{on=1; next} /^\[tasks\./{on=0} on' "$makefile")"
+guard_line="$(grep -n 'check-webapp-pointer-author.sh' <<<"$sign_block" | grep -v ':[[:space:]]*#' | head -1 | cut -d: -f1)"
+bump_line="$(grep -n 'echo "\$version" > "\$version_file"' <<<"$sign_block" | head -1 | cut -d: -f1)"
+if [[ -n "$guard_line" && -n "$bump_line" && "$guard_line" -lt "$bump_line" ]]; then
+    ok "sign-webapp checks the pointer author key before bumping the counter"
+else
+    fail "sign-webapp checks the pointer author key before bumping the counter" \
+        "guard at line '${guard_line:-none}', bump at line '${bump_line:-none}' of the task"
+fi
+# And the refusal must stop the task: without `|| exit 1` it is only advice.
+if grep -v '^[[:space:]]*#' <<<"$sign_block" |
+    grep -q 'check-webapp-pointer-author\.sh.*|| exit 1'; then
+    ok "a refused archive stops sign-webapp"
+else
+    fail "a refused archive stops sign-webapp" "the guard call does not end in '|| exit 1'"
+fi
+
 printf '\n%d checks, %d failures\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]

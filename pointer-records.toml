@@ -6,6 +6,12 @@
 # freenet-core#5194 and the contract's README:
 # https://github.com/freenet/freenet-migrate/tree/main/contracts/pointer-contract
 #
+# River's own UI reads these too: an open tab watches both records and reloads
+# when one names a newer generation than the build it is running
+# (freenet/river#580). So an unpublished record strands our own users' open
+# tabs as well as third parties. The UI build also reads `version` and
+# `code_hash` from this file (ui/build.rs) to know which generation it is.
+#
 # This solves ADDRESSING ONLY. It says nothing about whether state or secrets
 # under the old key survived — see the note under [[record]] for the delegate.
 #

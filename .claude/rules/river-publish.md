@@ -51,16 +51,17 @@ cargo make sync-wasm
 
 The WASM you just rebuilt has a new code hash, so River's **pointer records**
 now name a key that no longer exists. Those records are what third parties
-resolve instead of pinning a key — see `pointer-records.toml` and FREENET.md.
+resolve instead of pinning a key — see `pointer-records.toml` and FREENET.md —
+and what our users' already-open tabs watch to know they must reload (step 7).
 
 ```bash
 cargo make sign-pointer-records   # re-signs against the WASM you just built
 ```
 
 Step 2's migration entry carries **our own users'** data forward. This carries
-**everyone else** forward. Same trigger, different set of people who lose if it
-is skipped — and their failure is quieter, because a stale pointer answers
-confidently with a dead key rather than erroring.
+their **open tabs** and **everyone else** forward. Skip it and both fail
+quietly: a stale pointer answers integrators confidently with a dead key, and
+open tabs never learn they are on the old one.
 
 CI's `check-pointer-freshness` fails the PR if you skip this, so it is not
 possible to publish a stale pointer through the normal flow. That is the
@@ -85,6 +86,12 @@ cargo make build
 cargo make compress-webapp
 cargo make publish-river  # bumps published-contract/contract-version.txt
 ```
+
+`sign-webapp` (run by `publish-river`) first checks that the built UI carries
+River's pointer author key (`scripts/check-webapp-pointer-author.sh`), before
+the counter moves. If it refuses, the UI was built with `RIVER_POINTER_RECORDS`
+set (an end-to-end test build, whose tabs would never reload after a re-key):
+unset it, rebuild, and publish again.
 
 ### Step 6: Commit the version bump through a PR, and verify
 
@@ -114,6 +121,26 @@ network already has: a silent no-op, or a fork if the archive differs.
 
 Signing (3b) happens in the PR; publishing is the network half and runs from
 `main` after the merge, like every other publish here.
+
+**This step is what reloads every River tab that is already open.** The UI
+watches both pointer records, and a tab running the old build reloads only
+when a record newer than its own lands (freenet/river#580,
+`ui/src/components/app/freenet_api/generation_watch.rs`). Skip this step and
+those tabs stay on the old room contract and old delegate with no signal: the
+room looks quiet, and their delegate writes are stranded.
+
+Order matters. The pre-flight below refuses unless the UI carrying the new WASM
+is live **as seen from the node you publish through**; it cannot see other
+nodes, so the wait is advice, not enforcement. Nothing enforces that this step
+runs at all (CI checks signing, not publishing), so do not skip it. Do the UI
+publish (step 5) first, then **wait ~2 minutes** before this step.
+
+Why two minutes: the ~1.2 MB web container reaches most peers within a minute
+or two, while the 100-byte pointer arrives in under a second (measured figures
+are with `RETRY_DELAYS_MS` in `generation_watch.rs`). Waiting longer buys
+little. A tab whose node does not yet hold the new UI reloads into the old one
+and spends a retry; the UI retries with backoff for about an hour, then falls
+back to a banner.
 
 ```bash
 POINTER_NODE_PORT=<a network node of yours, NOT 7509> \

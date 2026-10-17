@@ -19,6 +19,105 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     generate_build_info();
     generate_legacy_delegates();
+    generate_pointer_records();
+}
+
+/// Generate `POINTER_AUTHOR_VK` and `POINTER_RECORDS` from
+/// `../pointer-records.toml` (freenet/river#580).
+///
+/// The UI watches River's own pointer records to notice, while a tab is open,
+/// that the room contract or chat delegate has re-keyed. To tell "the network
+/// is ahead of me" from "the network is behind me" it has to know which pointer
+/// version it was built as, and this file is where that lives: CI's
+/// `check-pointer-freshness` guarantees each record names the BLAKE3 of the
+/// WASM committed at its `wasm_path`, which is the same file the UI embeds.
+///
+/// Only the version and code hash are emitted. Whether the embedded WASM
+/// actually matches is checked at runtime (`generation_watch`), so a local
+/// build whose WASM was rebuilt without re-signing simply disables the watch
+/// instead of failing to compile.
+///
+/// `RIVER_POINTER_RECORDS` points the build at another records file. It is for
+/// end-to-end tests that publish a pointer signed by a throwaway key to a local
+/// node; never set it for a publish. A build made with it watches pointers
+/// nobody else publishes, so it would never reload (fails safe, not open).
+fn generate_pointer_records() {
+    println!("cargo:rerun-if-env-changed=RIVER_POINTER_RECORDS");
+    let path = match std::env::var("RIVER_POINTER_RECORDS") {
+        Ok(path) if !path.is_empty() => {
+            println!(
+                "cargo:warning=RIVER_POINTER_RECORDS={path}: this build watches TEST pointer \
+                 records. Do not publish it."
+            );
+            path
+        }
+        _ => "../pointer-records.toml".to_string(),
+    };
+    println!("cargo:rerun-if-changed={path}");
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set for build scripts");
+    let dest = Path::new(&out_dir).join("pointer_records.rs");
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // docs.rs builds the packaged crate without the workspace root. An
+        // empty table there disables the watch, which is harmless.
+        Err(_) if docs_rs_build() => {
+            std::fs::write(
+                &dest,
+                "pub(crate) const POINTER_AUTHOR_VK: &str = \"\";\n\
+                 pub(crate) const POINTER_RECORDS: &[BuildPointerRecord] = &[];\n",
+            )
+            .expect("write pointer_records.rs");
+            return;
+        }
+        Err(e) => panic!("read {path}: {e}"),
+    };
+    let doc: toml::Table = text.parse().unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    let author = doc
+        .get("author_verifying_key")
+        .and_then(|v| v.as_str())
+        .expect("pointer-records.toml: author_verifying_key");
+
+    let mut rows = String::new();
+    for record in doc
+        .get("record")
+        .and_then(|v| v.as_array())
+        .expect("pointer-records.toml: [[record]] entries")
+    {
+        let app_id = record
+            .get("app_id")
+            .and_then(|v| v.as_str())
+            .expect("pointer record: app_id");
+        let version = record
+            .get("version")
+            .and_then(|v| v.as_integer())
+            .and_then(|v| u32::try_from(v).ok())
+            .expect("pointer record: version must be a u32");
+        let hex = record
+            .get("code_hash")
+            .and_then(|v| v.as_str())
+            .expect("pointer record: code_hash");
+        assert!(
+            hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+            "pointer record {app_id}: code_hash must be 64 hex digits"
+        );
+        let bytes: Vec<String> = (0..32)
+            .map(|i| format!("0x{}", &hex[i * 2..i * 2 + 2]))
+            .collect();
+        rows.push_str(&format!(
+            "    BuildPointerRecord {{ app_id: {app_id:?}, version: {version}, code_hash: [{}] }},\n",
+            bytes.join(", ")
+        ));
+    }
+
+    std::fs::write(
+        &dest,
+        format!(
+            "pub(crate) const POINTER_AUTHOR_VK: &str = {author:?};\n\
+             pub(crate) const POINTER_RECORDS: &[BuildPointerRecord] = &[\n{rows}];\n"
+        ),
+    )
+    .expect("write pointer_records.rs");
 }
 
 fn generate_build_info() {

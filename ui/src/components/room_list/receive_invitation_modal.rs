@@ -534,6 +534,15 @@ fn parse_processed_hash(hash: &str) -> Vec<String> {
         .collect()
 }
 
+/// The fragment a self-reload should carry: the processed list as this page
+/// knows it, which can be newer than the iframe's own `location.hash` (see
+/// `PROCESSED_CACHE`). Empty when nothing has been processed. Used by
+/// `generation_watch` (freenet/river#580).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) fn processed_hash_for_reload() -> String {
+    build_processed_hash(&read_processed_list())
+}
+
 /// Build the hash string for a list of fingerprints. Empty list collapses to
 /// the empty string so callers can clear the hash entirely if desired.
 fn build_processed_hash(list: &[String]) -> String {

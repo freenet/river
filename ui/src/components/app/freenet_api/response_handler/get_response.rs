@@ -40,6 +40,11 @@ pub async fn handle_get_response(
 ) -> Result<(), SynchronizerError> {
     info!("Received get response for key {key}");
 
+    // River's own pointer records (freenet/river#580): not a room.
+    if crate::components::app::freenet_api::generation_watch::deliver_state(key.id(), &state) {
+        return Ok(());
+    }
+
     // Backward-probe routing (freenet/river#292): a GET response whose
     // contract id matches an outstanding legacy-key probe is for a
     // *previous* room-contract generation. It cannot be resolved to an
@@ -1405,6 +1410,12 @@ pub(crate) fn request_seed_put(owner_vk: ed25519_dalek::VerifyingKey) {
 /// behaviour, which is to ignore a `NotFound` and let its own timeout handle
 /// it.
 pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
+    // A pointer record not found is no signal (freenet/river#580); the next
+    // check asks again.
+    if crate::components::app::freenet_api::generation_watch::is_watched(&instance_id) {
+        info!("generation watch: pointer {instance_id} not found");
+        return;
+    }
     if deliver_probe_absent(instance_id).await {
         return;
     }
