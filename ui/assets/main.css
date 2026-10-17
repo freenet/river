@@ -55,30 +55,56 @@
     }
 }
 
+/* Message rows: the content, then a 72px right gutter for the hover bar and
+ * kebab. Rows bleed 8px so the hover band has room; the history's -my-2
+ * cancels the group-edge padding so the bottom sentinel sits at the newest
+ * message's bottom. No opacity, transform, filter, isolation or z-index on a
+ * row: it would trap its menus beneath later rows. */
+.msg-row {
+    margin-inline: -0.5rem;
+    padding: 0.125rem 72px 0.125rem 0.5rem;
+    border-radius: 0.5rem;
+    transition: background-color 0.15s;
+}
+
+.msg-row:first-child {
+    padding-top: 0.5rem;
+}
+
+.msg-row:last-child {
+    padding-bottom: 0.5rem;
+}
+
+/* Fine pointers only: a touchscreen laptop would otherwise keep a sticky
+ * band. The band also stays while a reaction chip's reactor list is open
+ * (the chip reports itself expanded). */
+@media (hover: hover) and (not (any-pointer: coarse)) {
+    .msg-row:hover,
+    .msg-row:has([aria-expanded="true"]) {
+        background-color: var(--color-row-hover);
+    }
+}
+
 /* @mention chips. Rendered as raw <span class="river-mention"> inside message
  * bodies (see conversation::message_to_html_with_mentions). Clickable via the
- * document-level mention click interceptor.
+ * document-level mention click interceptor: link-coloured text on a
+ * soft-accent fill, matching how `.prose a` links render.
+ * `river-mention-self` (a mention of the local user) is a stronger fill so
+ * you spot at a glance that you were tagged.
  *
- * The base rule below targets RECEIVED messages (a `bg-surface` bubble in both
- * light and dark mode): an accent-coloured pill on a soft-accent fill, matching
- * how `.prose a` links render. `river-mention-self` (a mention of the local
- * user) is a stronger fill so you spot at a glance that you were tagged.
- *
- * SENT messages render in a `bg-accent` (solid brand-blue) bubble — there the
- * base rule's accent text/fill would be blue-on-blue and effectively invisible
- * (freenet/river: dark-mode @mention vs sent-bubble background). The
- * `.bg-accent .river-mention*` overrides below invert the chip to a
- * translucent-white pill with white text, exactly as `.bg-accent .prose a`
- * does for links inside sent bubbles. */
+ * A chip stays whole while it fits the line (inline-block is atomic), and
+ * wraps inside itself only when it is wider than the column, as a long
+ * nickname is at 320px. */
 .river-mention {
-    display: inline;
+    display: inline-block;
+    max-width: 100%;
     padding: 0 0.2rem;
     border-radius: 0.3rem;
     font-weight: 500;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
     cursor: pointer;
-    color: var(--color-accent, #0265e7);
-    background-color: var(--color-accent-soft, rgba(2, 101, 231, 0.12));
+    color: var(--color-link);
+    background-color: var(--color-accent-soft);
 }
 
 .river-mention:hover {
@@ -94,20 +120,6 @@
     outline-offset: 1px;
 }
 
-/* Mention chips inside the local user's own (blue) sent-message bubbles. */
-.bg-accent .river-mention {
-    color: #fff;
-    background-color: rgba(255, 255, 255, 0.22);
-}
-
-.bg-accent .river-mention-self {
-    background-color: rgba(255, 255, 255, 0.34);
-}
-
-.bg-accent .river-mention:focus-visible {
-    outline-color: #fff;
-}
-
 /* Reply highlight animation (when clicking "scroll to original") */
 .reply-highlight {
     animation: replyHighlight 2s ease-out;
@@ -118,15 +130,17 @@
     100% { background-color: transparent; }
 }
 
-/* Reply strip text truncation. The strip lives inside the message bubble
- * and always shows a single ellipsized line; on devices with a real pointer
+/* Reply strip text truncation. The strip sits above the message body and
+ * always shows a single ellipsized line; on devices with a real pointer
  * (mouse) it expands to full text on hover. Touch devices skip the hover
  * expansion because (a) they have no reliable hover state and (b) tapping
- * the strip already scrolls to the quoted original message. */
+ * the strip already scrolls to the quoted original message. The expanded
+ * preview breaks anywhere, so a long URL wraps instead of being clipped. */
 .reply-strip {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    overflow-wrap: anywhere;
 }
 
 @media (hover: hover) and (pointer: fine) {
@@ -166,16 +180,6 @@
 @media (hover: none) {
     .touch-actions {
         display: flex;
-    }
-
-    /* The hover action bar (reply/edit/delete) is opacity-0 until hovered, but
-     * an opacity-0 element still captures taps. On a touch device (no hover) it
-     * can never become visible, so make it non-interactive there; otherwise a
-     * tap on the gutter where it sits would fire an invisible reply/edit/delete.
-     * Left interactive on desktop (@media hover:hover) so slow mouse travel
-     * across the gap to the bar still works. (#402) */
-    .hover-actions {
-        pointer-events: none;
     }
 }
 

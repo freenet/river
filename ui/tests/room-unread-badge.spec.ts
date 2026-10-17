@@ -17,7 +17,6 @@ import {
   expectSettledAtBottom,
   fillHistory,
   hideChatBehindMembers,
-  newestRowFromViewBottom,
   nextFrames,
   openRoomAtBottom,
   readerReturnsToEnd,
@@ -239,17 +238,27 @@ test.describe("Unseen arrivals versus the viewport (A07)", () => {
     await expect(teamChatBadge(page), "hiding the tab marked an unseen arrival read").toBeVisible();
   });
 
-  /// Scroll so the newest row's bottom sits `below` px under the visible
-  /// history's bottom edge (negative: above it). Returns where it landed.
-  async function parkNewestBottom(page: Page, below: number): Promise<number> {
-    const target = await page.evaluate((b) => {
+  /// How far the newest message's own bottom sits under the visible history's
+  /// bottom edge (negative: above it). The message, not its row: a group's
+  /// last row carries 8px of hover-band padding below the message.
+  function newestMessageBelowView(page: Page): Promise<number> {
+    return page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       const rows = c.querySelectorAll("[data-item-key]");
-      const newestBottom = rows[rows.length - 1].getBoundingClientRect().bottom;
-      return c.scrollTop + newestBottom - c.getBoundingClientRect().bottom - b;
-    }, below);
-    await readerScrollsWithoutGesture(page, target);
-    return -(await newestRowFromViewBottom(page)).gap;
+      const newest = rows[rows.length - 1];
+      const contents = newest.querySelectorAll(".msg-content");
+      const content = contents[contents.length - 1] ?? newest;
+      return content.getBoundingClientRect().bottom - c.getBoundingClientRect().bottom;
+    });
+  }
+
+  /// Scroll so the newest message's bottom sits `below` px under the visible
+  /// history's bottom edge (negative: above it). Returns where it landed.
+  async function parkNewestBottom(page: Page, below: number): Promise<number> {
+    const now = await newestMessageBelowView(page);
+    const { top } = await scrollMetrics(page);
+    await readerScrollsWithoutGesture(page, top + now - below);
+    return newestMessageBelowView(page);
   }
 
   /// The history's own padding must not count as part of the newest message:

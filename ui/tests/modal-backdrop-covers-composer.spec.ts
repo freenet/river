@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { openRoomWithComposer, waitForApp } from "./example-room";
+import { openRoomWithComposer } from "./example-room";
 
 // elementFromPoint only sees the modal's transparent z-50 wrapper; elementsFromPoint gives paint order.
 async function paintOrderAtComposer(page: Page) {
@@ -16,8 +16,6 @@ async function paintOrderAtComposer(page: Page) {
 test.use({ viewport: { width: 1280, height: 800 } });
 
 test("the Invite Member backdrop paints over the composer", async ({ page }) => {
-  await page.goto("/");
-  await waitForApp(page);
   await openRoomWithComposer(page);
   await page.getByTestId("invite-member-button").click();
   await expect(page.getByTestId("invite-member-backdrop")).toBeVisible();

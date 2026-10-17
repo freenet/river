@@ -7471,21 +7471,7 @@ mod tests {
             conversation.contains("impersonation_checker_for_viewer("),
             "the conversation no longer builds an impersonation checker"
         );
-        // The rendered element, anchored on its test id.
-        assert!(
-            conversation.contains("\"data-testid\": \"message-author-impersonation-warning\""),
-            "the message author line no longer renders the warning element"
-        );
-        assert!(
-            between(
-                conversation,
-                "\"data-testid\": \"message-author-impersonation-warning\"",
-                "// Deputy shield.",
-                "author-line warning element",
-            )
-            .contains("WARNING_GLYPH"),
-            "the author-line warning element no longer renders the warning glyph"
-        );
+        // The rendered element and its glyph: impersonation-warning.spec.ts.
 
         // --- Member-info modal -------------------------------------------
         //
@@ -7539,7 +7525,7 @@ mod tests {
              the viewer id would flag the real owner"
         );
         assert!(
-            conversation.contains("\"data-testid\": \"reaction-owner-impersonation-warning\""),
+            conversation.contains("name_mark(\"reaction-owner-impersonation-warning\""),
             "the reactor list no longer renders the warning element"
         );
     }
