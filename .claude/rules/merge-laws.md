@@ -77,6 +77,12 @@ would drop, so every state an apply or merge produces is a fixpoint of
 `merge(S, S)`. `verify` itself stays as it is: tightening it would make the
 migration PUT reject states rooms hold today.
 
+One limit, which predates #703: the contract does not apply an empty delta,
+so a state stored by a full-state PUT that holds records the rules drop (for
+example a member an owner ban removes) stays as stored until a non-empty
+delta or a whole-state merge reaches it. Delta gossip between two peers that
+hold nothing new for each other does not normalize it.
+
 ## The real check is FORK_SEEDS=1000
 
 `common/tests/fork_merge_closure_test.rs` grows pairs of forks (honest,
