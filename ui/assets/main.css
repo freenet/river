@@ -76,8 +76,8 @@
 }
 
 /* Fine pointers only: a touchscreen laptop would otherwise keep a sticky
- * band. The band also stays while a control the row opened (a reaction
- * chip's reactor list, the kebab menu) reports itself expanded. */
+ * band. The band also stays while a reaction chip's reactor list is open
+ * (the chip reports itself expanded). */
 @media (hover: hover) and (not (any-pointer: coarse)) {
     .msg-row:hover,
     .msg-row:has([aria-expanded="true"]) {

@@ -3695,13 +3695,6 @@ fn MessageGroupComponent(
     // composer — mirrors `PickerPlacement::above` for the emoji picker (#402).
     let mut menu_show_above: Signal<bool> = use_signal(|| false);
 
-    // Whether the kebab action menu should be left-anchored (open rightward) or
-    // right-anchored (open leftward). Chosen from the tap's horizontal position
-    // so the menu always opens toward the viewport centre regardless of
-    // where the row sits, and never clips its content off a narrow
-    // screen edge (#402).
-    let mut menu_align_left: Signal<bool> = use_signal(|| false);
-
     // Max height (px) for the kebab action menu, measured at tap time as the
     // actual space available on the chosen side within the chat scrollport. The
     // menu is `overflow-y-auto`, so on a very short/landscape viewport where it
@@ -4334,17 +4327,7 @@ fn MessageGroupComponent(
                                                         if is_open {
                                                             crate::util::defer(move || open_action_menu.set(None));
                                                         } else {
-                                                            // Position the menu from the tap coordinates: flip it
-                                                            // above the kebab when the tap is in the bottom ~40% of
-                                                            // the viewport (so the composer doesn't clip it), and
-                                                            // open it toward the viewport centre (left-anchored when
-                                                            // the kebab is on the left half, right-anchored on the
-                                                            // right half) so its content never runs off a screen edge.
                                                             let coords = e.client_coordinates();
-                                                            let win_w = web_sys::window()
-                                                                .and_then(|w| w.inner_width().ok())
-                                                                .and_then(|v| v.as_f64())
-                                                                .unwrap_or(400.0);
                                                             // Choose the flip direction from the space available in
                                                             // BOTH directions within the chat scrollport (which lives
                                                             // inside an overflow-y-auto container whose bounds sit
@@ -4354,22 +4337,12 @@ fn MessageGroupComponent(
                                                             // (2 rows) is shorter than an own menu (4 rows), so it
                                                             // stays down in cases where an own menu would flip.
                                                             // (#402)
-                                                            let (sp_top, sp_bottom) = web_sys::window()
-                                                                .and_then(|w| w.document())
-                                                                .and_then(|d| {
-                                                                    d.get_element_by_id("chat-scroll-container")
-                                                                })
-                                                                .map(|el| {
-                                                                    let r = el.get_bounding_client_rect();
-                                                                    (r.top(), r.bottom())
-                                                                })
-                                                                .unwrap_or((60.0, 600.0));
+                                                            let (sp_top, sp_bottom) = chat_scrollport_bounds();
                                                             let menu_height = if is_self { 200.0 } else { 110.0 };
                                                             let space_below = sp_bottom - coords.y;
                                                             let space_above = coords.y - sp_top;
                                                             let above =
                                                                 space_below < menu_height && space_above > space_below;
-                                                            let align_left = coords.x < win_w * 0.5;
                                                             // Cap the menu to the actual space on the chosen side
                                                             // (minus a small gap) so it scrolls internally rather
                                                             // than being clipped by the scroll container when it
@@ -4389,7 +4362,6 @@ fn MessageGroupComponent(
                                                             // re-entrant borrow crashes).
                                                             crate::util::defer(move || {
                                                                 menu_show_above.set(above);
-                                                                menu_align_left.set(align_left);
                                                                 menu_max_h.set(max_h);
                                                                 // Dismiss any open reaction picker so the two
                                                                 // popovers can't stack (#402).
@@ -4409,13 +4381,11 @@ fn MessageGroupComponent(
                                                         onclick: move |_| crate::util::defer(move || open_action_menu.set(None)),
                                                     }
                                                     div {
-                                                        // Opens toward the viewport centre from the
-                                                        // gutter kebab; `max-w` clamps it to the viewport
-                                                        // as a backstop against a narrow-screen overflow.
+                                                        // Opens leftward from the right-gutter kebab;
+                                                        // `max-w` clamps it to the viewport at 320px.
                                                         class: format!(
-                                                            "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
+                                                            "absolute z-50 right-0 min-w-[8rem] max-w-[calc(100vw-1rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {}",
                                                             if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                            if *menu_align_left.read() { "left-0" } else { "right-0" }
                                                         ),
                                                         style: format!("max-height: {}px", *menu_max_h.read()),
                                                         "data-testid": "message-action-menu",
@@ -4752,8 +4722,8 @@ fn MessageGroupComponent(
                                             // Inline add reaction button (same line height as reactions)
                                             div {
                                                 // Raise the whole picker (grid + z-40 backdrop) above the
-                                                // z-50 message kebabs while it's open, so a nearby closed
-                                                // kebab can't paint over the emoji grid and steal a tap
+                                                // closed z-20 kebabs and hover bars while it's open, so a
+                                                // nearby one can't paint over the emoji grid and steal a tap
                                                 // (mirrors the action menu's z-[60] behaviour). (#402)
                                                 class: format!(
                                                     "relative group/react inline-flex items-center {}",

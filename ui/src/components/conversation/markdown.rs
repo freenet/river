@@ -1847,18 +1847,16 @@ mod tests {
     /// app-wide `--color-text-muted`.
     ///
     /// The muted token is tuned for glanceable metadata (timestamps, field
-    /// labels) and falls under 4.5:1 on two of the backgrounds a quote
-    /// actually appears over, both in LIGHT mode: `--color-surface` (4.47:1)
-    /// and the `bg-accent/20` outgoing DM bubble (3.96:1, the worst quote
-    /// surface in the app). The dark-mode equivalents were already fine.
+    /// labels) and falls under 4.5:1 on the `bg-accent/20` outgoing DM
+    /// bubble in LIGHT mode (3.96:1, the worst quote surface in the app).
     ///
     /// The token must be declared in BOTH colour schemes, and the two ways to
     /// break that fail DIFFERENTLY — which is why this counts declarations
     /// instead of asserting either symptom:
     ///
     /// - Drop the DARK value and `:root`'s light value still resolves, so
-    ///   every dark-mode quote silently paints the light colour (2.49:1 on a
-    ///   dark received bubble — worse than the bug this PR fixes).
+    ///   every dark-mode quote silently paints the light colour on a dark
+    ///   background, far below AA.
     /// - Drop the LIGHT value and the token is undefined everywhere `:root`
     ///   would have supplied it, so `var()` is invalid at computed-value time,
     ///   `color` inherits the body text colour, and the muted look vanishes

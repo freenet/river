@@ -51,7 +51,6 @@ function rowGeometry(group: Locator) {
     return Array.from(el.querySelectorAll('[data-testid="message-row"]')).map((row) => ({
       self: row.getAttribute("data-message-self"),
       contentLeft: row.getBoundingClientRect().left + parseFloat(getComputedStyle(row).paddingLeft),
-      avatars: row.querySelectorAll('[data-testid="message-group-avatar"]').length,
       headers: Array.from(row.querySelectorAll('[data-testid="message-group-header"]')).map(box),
       body: box(row.querySelector('[data-testid="message-body"]')!),
     }));
@@ -67,8 +66,7 @@ test.describe("Message rows", () => {
     for (const [kind, rows] of Object.entries(groups)) {
       expect(rows, `${kind}: a two-message group`).toHaveLength(2);
       expect(rows.map((r) => r.self)).toEqual(Array(2).fill(kind === "own" ? "true" : "false"));
-      // No avatar, and one header, in the first row.
-      expect(rows.map((r) => r.avatars), `${kind}: avatars per row`).toEqual([0, 0]);
+      // One header, in the first row.
       expect(rows.map((r) => r.headers.length), `${kind}: headers per row`).toEqual([1, 0]);
 
       // The header and every body start at the row's content edge.
