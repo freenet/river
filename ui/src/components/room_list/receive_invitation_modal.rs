@@ -1442,6 +1442,53 @@ mod tests {
         });
     }
 
+    /// Accepting again clears an earlier refusal for the room.
+    #[test]
+    fn accepting_again_clears_the_refusal() {
+        reset_storage();
+        let dom = VirtualDom::new(|| rsx! {});
+        dom.in_scope(ScopeId::ROOT, || {
+            let room_sk = SigningKey::from_bytes(&[46u8; 32]);
+            let room = room_sk.verifying_key();
+            let invitee_sk = SigningKey::from_bytes(&[47u8; 32]);
+            let invitee = AuthorizedMember::new(
+                river_core::room_state::member::Member {
+                    owner_member_id: MemberId::from(room),
+                    invited_by: MemberId::from(room),
+                    member_vk: invitee_sk.verifying_key(),
+                },
+                &room_sk,
+            );
+            JOIN_NICKNAME_REFUSALS.with_mut(|r| {
+                r.insert(
+                    room,
+                    NicknameRefusal {
+                        reason: "too long".into(),
+                        nickname: "a very long name".into(),
+                    },
+                )
+            });
+            accept_invitation(
+                Invitation {
+                    room,
+                    invitee_signing_key: invitee_sk,
+                    invitee,
+                    room_secrets: vec![],
+                },
+                "short".into(),
+            );
+            assert!(JOIN_NICKNAME_REFUSALS.read().get(&room).is_none());
+            assert_eq!(
+                PENDING_INVITES
+                    .read()
+                    .map
+                    .get(&room)
+                    .map(|j| j.preferred_nickname.clone()),
+                Some("short".to_string())
+            );
+        });
+    }
+
     /// The invitation GET path hands a nickname refusal to
     /// `refuse_join_for_nickname` from a deferred closure, before any member
     /// info is signed.
