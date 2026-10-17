@@ -1,252 +1,51 @@
-import { test, expect, Page } from "@playwright/test";
-import { contrast, luminance, selectRoom, waitForApp } from "./example-room";
+import { test, expect, Locator } from "@playwright/test";
+import { colourOf, contrast, over, resolveColor, waitForApp } from "./example-room";
 import { openMemberInfoForFirstNonSelf } from "./invite-picker";
 
-// Regression test: quoted text (`> …` Markdown) in a message must stay
-// legible and not invert against its surface (once 3.52:1 in the old sent
-// bubble). A received row and the tinted outgoing DM bubble, in both schemes.
-//
-// The Rust pins in `conversation/markdown.rs` assert the declaration TEXT. This spec
-// asserts what a reader actually sees: it puts a quote in a REAL rendered
-// message, so the class list, the cascade and the compiled stylesheet are all
-// the app's own, then composites the colours the browser computed.
+// Quoted text (`> …` Markdown) on the tinted outgoing DM bubble, the app's
+// worst quote surface (the app-wide muted token was 3.96:1 there in light
+// mode). It must clear AA and stay dimmer than the bubble's other text.
+// message-contrast.spec.ts covers quotes in room messages.
 
-type Rgb = [number, number, number];
-
-// WCAG 2.1 AA: 4.5:1 for body text.
 const AA_TEXT = 4.5;
 
-// ── Sampling the live DOM ───────────────────────────────────────────────────
-
-interface Sample {
-  background: Rgb;
-  normal: Rgb;
-  quote: Rgb;
-}
-
-/** Which real surface to measure. */
-type Surface = "received" | "dm";
-
-/**
- * Put a blockquote in a real message on `surface`, read back what the browser
- * computed for it, and clean up after.
- *
- * The room-message surface is probed by injecting into an existing row's
- * body; the DM surface has no example-data messages at all, so its bubble is
- * created by actually sending a DM (see `openDmThread`).
- */
-async function sampleQuote(page: Page, surface: Surface): Promise<Sample> {
-  const raw = await page.evaluate((which: Surface) => {
-    // A colour the app never uses, so "fillStyle did not change" is
-    // unambiguous. `fillStyle` normalises to lowercase hex.
-    const SENTINEL = "#ff00ff";
-
-    // Resolve any CSS colour string — rgb(), oklab(), color-mix(), color() —
-    // to sRGB by painting one pixel and reading it back.
-    const canvas = document.createElement("canvas");
-    canvas.width = canvas.height = 1;
-    const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
-    const resolve = (css: string): { rgb: number[]; a: number } => {
-      ctx.clearRect(0, 0, 1, 1);
-      // Assigning an unparseable value to `fillStyle` is a no-op — it keeps
-      // the PREVIOUS value, in chromium, firefox and webkit alike. Without a
-      // sentinel, a colour syntax some engine doesn't support would silently
-      // measure whatever was sampled before it, which reads as a real number.
-      ctx.fillStyle = SENTINEL;
-      ctx.fillStyle = css;
-      if (ctx.fillStyle === SENTINEL && css.toLowerCase() !== SENTINEL) {
-        throw new Error(`browser could not parse the colour: ${css}`);
-      }
-      ctx.fillRect(0, 0, 1, 1);
-      const d = ctx.getImageData(0, 0, 1, 1).data;
-      // `getImageData` returns STRAIGHT (non-premultiplied) alpha — verified
-      // in all three engines: `rgba(255,0,0,0.2)` reads back as [255,0,0,51],
-      // not [51,0,0,51]. Do NOT divide by alpha here. An earlier revision did,
-      // which inflated and clamped every translucent colour: the
-      // `bg-accent/20` DM bubble resolved to a nonsense rgb(204,255,255)
-      // instead of rgb(204,224,250), and the fabricated contrast number that
-      // produced was quoted as evidence before anyone measured the real modal.
-      return { rgb: [d[0], d[1], d[2]], a: d[3] / 255 };
-    };
-
-    const over = (fg: { rgb: number[]; a: number }, bg: number[]): number[] =>
-      fg.rgb.map((c, i) => c * fg.a + bg[i] * (1 - fg.a));
-
-    /**
-     * The opaque colour actually behind `el`: walk ancestors collecting
-     * backgrounds until an opaque one is found, then composite back down.
-     * A bubble's own background can be translucent — the outgoing DM bubble
-     * is `bg-accent/20` — so reading only the nearest one would measure
-     * against a colour no pixel ever has.
-     */
-    const effectiveBackground = (el: Element): number[] => {
-      const layers: { rgb: number[]; a: number }[] = [];
-      let node: Element | null = el;
-      while (node) {
-        const c = resolve(getComputedStyle(node).backgroundColor);
-        if (c.a > 0) {
-          layers.push(c);
-          if (c.a === 1) break;
-        }
-        node = node.parentElement;
-      }
-      // Nothing opaque anywhere up the chain: the canvas is white.
-      let base = [255, 255, 255];
-      for (let i = layers.length - 1; i >= 0; i--) base = over(layers[i], base);
-      return base;
-    };
-
-    let bubble: Element;
-    let quoteEl: Element;
-    let normalEl: Element;
-    let cleanup = () => {};
-
-    if (which === "dm") {
-      // The outgoing DM bubble IS the `.prose` container (dm_thread_modal.rs),
-      // and it already holds a real `<blockquote>` — `openDmThread` sent one.
-      const container = document.querySelector("#dm-scroll-container");
-      if (!container) throw new Error("DM thread modal is not open");
-      const bq = container.querySelector("blockquote");
-      if (!bq) throw new Error("no blockquote in the DM thread");
-      bubble = bq.closest("[class*='bg-accent']") ?? bq.parentElement!;
-      quoteEl = bq;
-      const p = Array.from(bubble.querySelectorAll("p")).find(
-        (el) => !el.closest("blockquote")
-      );
-      if (!p) throw new Error("DM bubble has no non-quoted paragraph");
-      normalEl = p;
-    } else {
-      const history = document.querySelector(
-        '[data-testid="conversation-history"]'
-      );
-      if (!history) throw new Error("no conversation-history container");
-
-      // A message body in a received row.
-      const prose = history.querySelector(
-        '[data-message-self="false"] [data-testid="message-body"] .prose'
-      );
-      if (!prose) throw new Error("no received message with a .prose body");
-
-      // Inject a quote and an ordinary paragraph as siblings inside the real
-      // body container, so both are measured under the identical cascade.
-      const probe = document.createElement("div");
-      probe.innerHTML =
-        "<p data-probe-normal>normal</p>" +
-        "<blockquote data-probe-quote><p>quoted</p></blockquote>";
-      prose.appendChild(probe);
-      cleanup = () => probe.remove();
-
-      bubble = prose;
-      normalEl = probe.querySelector("[data-probe-normal]")!;
-      quoteEl = probe.querySelector("[data-probe-quote]")!;
-    }
-
-    try {
-      const background = effectiveBackground(bubble);
-      return {
-        background,
-        normal: over(resolve(getComputedStyle(normalEl).color), background),
-        quote: over(resolve(getComputedStyle(quoteEl).color), background),
-      };
-    } finally {
-      cleanup();
-    }
-  }, surface);
-
-  return raw as Sample;
-}
-
-// ── Fixtures ────────────────────────────────────────────────────────────────
-
-async function openRoomWithMessages(page: Page) {
-  await page.goto("/");
-  await waitForApp(page);
-
-  // "Your Private Room" is the example-data room the local user owns, and it
-  // carries received messages.
-  await selectRoom(page, "Your Private Room");
-  await expect(
-    page.locator('[data-testid="conversation-history"] .prose')
-  ).not.toHaveCount(0, { timeout: 15_000 });
-}
-
-/**
- * Open a DM thread and send one quoted message into it.
- *
- * Example data ships zero DMs, so the outgoing bubble has to be created. The
- * member-info → "Send direct message" route mirrors `dm-thread-modal.spec.ts`.
- */
-async function openDmThread(page: Page) {
-  await page.goto("/");
-  await waitForApp(page);
-  await openMemberInfoForFirstNonSelf(page);
-  await page.getByTestId("member-info-dm-button").click();
-  await page.waitForSelector("#dm-scroll-container", { timeout: 15_000 });
-
-  const composer = page.getByPlaceholder("Type a direct message...");
-  await composer.fill("They wrote:\n\n> this is quoted text\n\nMy reply.");
-  await page.keyboard.press("Enter");
-  await page
-    .locator("#dm-scroll-container blockquote")
-    .first()
-    .waitFor({ timeout: 15_000 });
-}
-
-// ── Assertions shared by every surface ──────────────────────────────────────
-
-function expectNotInverted(s: Sample) {
-  // The reported symptom, stated directly: the quote used to sit on the
-  // OPPOSITE side of the background's luminance from every other word in the
-  // same message. This fails on that regression even if some future palette
-  // happened to keep the raw ratio above AA.
-  const bg = luminance(s.background);
-  expect(
-    Math.sign(luminance(s.quote) - bg),
-    `quoted text must not invert against its own bubble: normal text ` +
-      `rgb(${s.normal.map(Math.round)}) vs quote ` +
-      `rgb(${s.quote.map(Math.round)}) over rgb(${s.background.map(Math.round)})`
-  ).toBe(Math.sign(luminance(s.normal) - bg));
+/// The opaque colour behind `el`: every ancestor's background, composited
+/// from the page down, since the bubble itself is translucent (`bg-accent/20`).
+async function effectiveBackground(el: Locator): Promise<number[]> {
+  const layers = await el.evaluate((e) => {
+    const out: string[] = [];
+    for (let n: Element | null = e; n; n = n.parentElement) out.push(getComputedStyle(n).backgroundColor);
+    return out.reverse();
+  });
+  let base = [255, 255, 255, 1];
+  for (const css of layers) base = over(await resolveColor(el.page(), css), base);
+  return base;
 }
 
 for (const colorScheme of ["dark", "light"] as const) {
   test.describe(`Blockquote contrast (${colorScheme} mode)`, () => {
-    // A desktop viewport on every project: the mobile projects hide the
-    // conversation pane behind view switching, which this test has no reason
-    // to exercise — the stylesheet under test is viewport-independent.
+    // Desktop on every project: mobile hides the conversation behind view switching.
     test.use({ colorScheme, viewport: { width: 1280, height: 900 } });
 
-    // A quote is deliberately dimmer than its normal text — it just has to
-    // stay above AA while doing it, which the app-wide `--color-text-muted`
-    // did not in light mode (3.96:1 on the outgoing DM bubble). Both bounds
-    // are asserted: without the upper one, deleting `--color-text-quote`'s
-    // light value makes `var()` invalid, the quote inherits full body colour,
-    // and every floor-only assertion still passes.
-    for (const surface of ["received", "dm"] as const) {
-      const label = { received: "a received message", dm: "an outgoing DM bubble" }[surface];
-      test(`quoted text in ${label} is readable and still muted`, async ({
-        page,
-      }) => {
-        if (surface === "dm") {
-          await openDmThread(page);
-        } else {
-          await openRoomWithMessages(page);
-        }
-        const s = await sampleQuote(page, surface);
+    test("quoted text in an outgoing DM bubble is readable and still muted", async ({ page }) => {
+      // Example data ships no DMs, so send one with a quote.
+      await page.goto("/");
+      await waitForApp(page);
+      await openMemberInfoForFirstNonSelf(page);
+      await page.getByTestId("member-info-dm-button").click();
+      await page.getByPlaceholder("Type a direct message...").fill("They wrote:\n\n> this is quoted text\n\nMy reply.");
+      await page.keyboard.press("Enter");
+      const quoteEl = page.locator("#dm-scroll-container blockquote").first();
+      await expect(quoteEl).toBeAttached({ timeout: 15_000 });
+      const bubble = quoteEl.locator("xpath=ancestor::*[contains(@class, 'bg-accent')][1]");
+      const normalEl = bubble.locator("p:not(blockquote p)").first();
 
-        const quote = contrast(s.quote, s.background);
-        const normal = contrast(s.normal, s.background);
-
-        expectNotInverted(s);
-        expect(
-          quote,
-          "quoted text must clear the WCAG AA floor"
-        ).toBeGreaterThanOrEqual(AA_TEXT);
-        expect(
-          quote,
-          "a quote must stay visibly secondary to its normal text, not " +
-            "collapse into the body colour"
-        ).toBeLessThan(normal * 0.8);
-      });
-    }
+      const background = await effectiveBackground(bubble);
+      const quote = contrast(over(await colourOf(quoteEl), background), background);
+      const normal = contrast(over(await colourOf(normalEl), background), background);
+      expect(quote, "quoted text clears AA").toBeGreaterThanOrEqual(AA_TEXT);
+      // Without this bound, a missing light `--color-text-quote` would inherit body text and pass.
+      expect(quote, "a quote stays dimmer than its bubble's text").toBeLessThan(normal * 0.8);
+    });
   });
 }

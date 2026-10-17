@@ -178,7 +178,8 @@ html, body {
  * READABLE while reading as secondary, and the muted token (tuned for
  * timestamps and labels) falls under the 4.5:1 WCAG AA floor on the light
  * `bg-accent/20` outgoing DM bubble, the worst quote surface in the app.
- * blockquote-contrast.spec.ts measures every quote surface in both themes.
+ * message-contrast.spec.ts and blockquote-contrast.spec.ts measure the row
+ * and DM-bubble surfaces in both themes.
  * It is deliberately a SEPARATE token: nudging `--color-text-muted` itself
  * would repaint every timestamp, placeholder and label in the app.
  *

@@ -147,7 +147,7 @@ export function resolveColor(page: Page, css: string): Promise<number[]> {
 }
 
 /// WCAG 2.x relative luminance of an 8-bit sRGB colour (alpha ignored).
-export function luminance(c: number[]): number {
+function luminance(c: number[]): number {
   const [r, g, b] = c.slice(0, 3).map((v) => {
     const s = v / 255;
     return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
@@ -165,12 +165,6 @@ export function contrast(a: number[], b: number[]): number {
 export function over(fg: number[], bg: number[]): number[] {
   const a = fg[3] ?? 1;
   return [0, 1, 2].map((i) => fg[i] * a + bg[i] * (1 - a)).concat(1);
-}
-
-/// The conversation background and the row hover band composited over it.
-export async function rowSurfaces(page: Page): Promise<{ bg: number[]; band: number[] }> {
-  const bg = await resolveColor(page, "var(--color-bg)");
-  return { bg, band: over(await resolveColor(page, "var(--color-row-hover)"), bg) };
 }
 
 /// The element's computed text colour, as `resolveColor` returns it.

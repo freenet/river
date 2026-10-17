@@ -7471,21 +7471,7 @@ mod tests {
             conversation.contains("impersonation_checker_for_viewer("),
             "the conversation no longer builds an impersonation checker"
         );
-        // The rendered element, anchored on its test id.
-        assert!(
-            conversation.contains("name_mark(\"message-author-impersonation-warning\""),
-            "the message author line no longer renders the warning element"
-        );
-        assert!(
-            between(
-                conversation,
-                "name_mark(\"message-author-impersonation-warning\"",
-                "// Deputy shield.",
-                "author-line warning element",
-            )
-            .contains("WARNING_GLYPH"),
-            "the author-line warning element no longer renders the warning glyph"
-        );
+        // The rendered element and its glyph: impersonation-warning.spec.ts.
 
         // --- Member-info modal -------------------------------------------
         //

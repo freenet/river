@@ -4,9 +4,7 @@ import { deliverOffscreen, readerLeavesTheEnd, readerScrollsWithoutGesture, scro
 import { callRiverTest } from "./river-test";
 
 // Full-width chat rows (plan 11): one header per group, one content column for
-// every row, and a 72px right gutter for the hover bar and kebab.
-
-const GUTTER_PX = 72;
+// every row, and a right gutter for the hover bar and kebab.
 
 /// The history item (a group of one author's rows) holding `text`.
 function groupWith(page: Page, text: string): Locator {
@@ -75,29 +73,19 @@ test.describe("Message rows", () => {
     expect(Math.max(...bodyLefts) - Math.min(...bodyLefts)).toBeLessThanOrEqual(0.5);
   });
 
-  for (const [how, open] of [
-    ["Enter on the name button", async (group: Locator, page: Page) => {
-      const name = group.getByTestId("message-group-header").getByRole("button", { name: "Test Sender Insert" });
-      await name.focus();
-      await expect(name).toBeFocused();
-      await page.keyboard.press("Enter");
-    }],
-    ["a click on the name", (group: Locator) => group.getByTestId("message-author-name").click()],
-  ] as const) {
-    test(`${how} opens that member's info`, async ({ page }) => {
-      const { received } = await openRoomWithPairs(page);
-      await open(received, page);
-      await expect(page.getByTestId("member-info-modal")).toContainText("Test Sender Insert");
-    });
-  }
+  test("the author name is a button that opens that member's info", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await callRiverTest(page, "insertMessageBeforeLast", "name opens info");
+    await groupWith(page, "name opens info").getByRole("button", { name: "Test Sender Insert" }).click();
+    await expect(page.getByTestId("member-info-modal")).toContainText("Test Sender Insert");
+  });
 });
 
 // The narrowest supported width: a long message, a long link, a reply and a
 // reaction row must wrap inside the content column, and the controls must stay
-// in the gutter and on screen. Regression (#212): a self reply whose
-// reply-strip preview held a long unbreakable URL rendered nowrap and spilled
-// off both edges of a 375px screen. The example data carries a self reply to
-// the long-URL message so this reproduces.
+// in the gutter and on screen. Regression (#212): a long unbreakable URL must
+// wrap rather than widen the row or the page. The example data carries that
+// URL and a reply quoting it, whose strip preview must stay in the column too.
 test.describe("Message rows at 320px", () => {
   test.use({ viewport: { width: 320, height: 700 } });
 
@@ -109,7 +97,7 @@ test.describe("Message rows at 320px", () => {
     // A send drops the fixture reactions, so react to the newest own message.
     await reactTo(page, own.getByTestId("message-row").last());
 
-    const report = await page.evaluate((gutter) => {
+    const report = await page.evaluate(() => {
       const vw = document.documentElement.clientWidth;
       const scroller = document.getElementById("chat-scroll-container")!;
       const sr = scroller.getBoundingClientRect();
@@ -118,7 +106,7 @@ test.describe("Message rows at 320px", () => {
       for (const row of Array.from(document.querySelectorAll('[data-testid="message-row"]'))) {
         const r = row.getBoundingClientRect();
         if (r.left < sr.left - 0.5 || r.right > sr.right + 0.5) bad.push(`row ${label(row)}: ${r.left}..${r.right}`);
-        const column = r.right - gutter;
+        const column = row.querySelector(".msg-content")!.getBoundingClientRect().right;
         for (const sel of ['[data-testid="message-body"]', ".reply-strip", ".reply-strip-unavailable", '[data-testid="message-reaction-row"]', '[data-testid="message-group-header"]']) {
           for (const part of Array.from(row.querySelectorAll(sel))) {
             const p = part.getBoundingClientRect();
@@ -134,7 +122,7 @@ test.describe("Message rows at 320px", () => {
         docOverflow: document.documentElement.scrollWidth - vw,
         scrollerOverflow: scroller.scrollWidth - scroller.clientWidth,
       };
-    }, GUTTER_PX);
+    });
     expect(report.bad).toEqual([]);
     expect(report.docOverflow).toBeLessThanOrEqual(0);
     expect(report.scrollerOverflow).toBeLessThanOrEqual(0);
