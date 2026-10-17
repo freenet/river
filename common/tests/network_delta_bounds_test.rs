@@ -280,3 +280,402 @@ fn a_network_delta_leaves_out_unreachable_members_first() {
     assert_eq!(added.len(), 1_000, "premise: the trim ran");
     assert!(unreachable.iter().all(|m| !added.contains(m)));
 }
+
+use river_core::room_state::ban_evidence::{evidence_bound, evidence_depth_cap, BanEvidenceV1};
+
+fn owner_msgs(r: &Room, n: u64) -> MessagesV1 {
+    let mut m = MessagesV1 {
+        messages: (0..n).map(|i| r.msg(&r.o, i)).collect(),
+        ..Default::default()
+    };
+    m.rebuild_actions_state();
+    m
+}
+
+/// After a whole-state merge the work bounds must be back on for network deltas.
+#[test]
+fn the_work_bounds_are_back_on_after_a_whole_state_merge() {
+    let r = Room::new();
+    let big_delta = || {
+        Some(ChatRoomStateV1Delta {
+            bans: Some(
+                (0..250u64)
+                    .map(|i| r.ban(&r.o, id(&sk(50_000 + i)), i))
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+    };
+    let base = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_user_bans = 10),
+        ..Default::default()
+    };
+    let mut control = base.clone();
+    assert!(
+        control.apply_delta(&base, &r.p, &big_delta()).is_err(),
+        "control: bounded"
+    );
+    let mut s = base.clone();
+    s.merge_from(&r.p, &base).unwrap();
+    let mut t = base.clone();
+    assert!(
+        t.apply_delta(&base, &r.p, &big_delta()).is_err(),
+        "bounded after merge_from"
+    );
+    let mut u = base.clone();
+    u.merge_through_summary(&r.p, &base).unwrap();
+    assert!(
+        u.apply_delta(&base, &r.p, &big_delta()).is_err(),
+        "bounded after merge_through_summary"
+    );
+}
+
+fn authors_state(r: &Room, n: u64, cap: usize) -> ChatRoomStateV1 {
+    let authors: Vec<SigningKey> = (0..n).map(|i| sk(70_000 + i)).collect();
+    let members: Vec<_> = authors
+        .iter()
+        .map(|a| r.rec(&a.verifying_key(), &r.o))
+        .collect();
+    let mut messages = MessagesV1 {
+        messages: authors
+            .iter()
+            .enumerate()
+            .map(|(i, a)| r.msg(a, i as u64))
+            .collect(),
+        ..Default::default()
+    };
+    messages.rebuild_actions_state();
+    ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| {
+            c.max_user_bans = 300;
+            c.max_members = cap;
+            c.max_recent_messages = cap;
+        }),
+        members: MembersV1 { members },
+        recent_messages: messages,
+        ..Default::default()
+    }
+}
+
+/// The trimmed delta's content: every message author is accounted
+/// for, members and messages are within the floors.
+#[test]
+fn a_trimmed_delta_carries_no_message_whose_author_it_left_out() {
+    let r = Room::new();
+    let sender = authors_state(&r, 1_200, 5_000);
+    let receiver = ChatRoomStateV1 {
+        configuration: r.cfg(2, |c| {
+            c.max_user_bans = 2;
+            c.max_members = 2;
+        }),
+        ..Default::default()
+    };
+    let summary = receiver.summarize(&receiver, &r.p);
+    let delta = sender.delta_within_work_bounds(&r.p, &summary).unwrap();
+    let carried: std::collections::HashSet<MemberId> = delta
+        .members
+        .as_ref()
+        .map(|m| m.added().iter().map(|a| a.member.id()).collect())
+        .unwrap_or_default();
+    let msgs = delta.recent_messages.clone().unwrap_or_default();
+    assert!(
+        carried.len() <= 1_000,
+        "members within the floor: {}",
+        carried.len()
+    );
+    assert!(
+        msgs.len() <= 1_000,
+        "messages within the floor: {}",
+        msgs.len()
+    );
+    assert!(!msgs.is_empty());
+    for m in &msgs {
+        let a = m.message.author;
+        assert!(
+            a == r.owner || summary.members.contains(&a) || carried.contains(&a),
+            "author left out"
+        );
+    }
+}
+
+/// Messages by the owner and by a member the receiver lists are kept.
+#[test]
+fn messages_by_the_owner_and_by_listed_members_are_kept() {
+    let r = Room::new();
+    let mut sender = authors_state(&r, 3, 200);
+    sender.recent_messages = owner_msgs(&r, 3);
+    let receiver = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_members = 200),
+        ..Default::default()
+    };
+    let summary = receiver.summarize(&receiver, &r.p);
+    let delta = sender.delta_within_work_bounds(&r.p, &summary).unwrap();
+    assert_eq!(
+        delta.recent_messages.map(|m| m.len()),
+        Some(3),
+        "owner's messages kept"
+    );
+    // an author the receiver's summary lists, absent from the delta's members
+    let sender2 = authors_state(&r, 3, 200);
+    let mut receiver2 = sender2.clone();
+    receiver2.recent_messages = MessagesV1::default();
+    receiver2.configuration = r.cfg(1, |c| c.max_members = 200);
+    let summary2 = receiver2.summarize(&receiver2, &r.p);
+    let delta2 = sender2.delta_within_work_bounds(&r.p, &summary2).unwrap();
+    assert!(
+        delta2.members.is_none() || delta2.members.as_ref().unwrap().added().is_empty(),
+        "premise: receiver holds the members"
+    );
+    assert_eq!(
+        delta2.recent_messages.map(|m| m.len()),
+        Some(3),
+        "summary-listed authors kept"
+    );
+}
+
+/// The newest messages are kept.
+#[test]
+fn the_messages_trim_keeps_the_newest() {
+    let r = Room::new();
+    let sender = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_recent_messages = 1_200),
+        recent_messages: owner_msgs(&r, 1_200),
+        ..Default::default()
+    };
+    let receiver = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_recent_messages = 1_200),
+        ..Default::default()
+    };
+    let summary = receiver.summarize(&receiver, &r.p);
+    let delta = sender.delta_within_work_bounds(&r.p, &summary).unwrap();
+    let msgs = delta.recent_messages.unwrap();
+    assert_eq!(
+        msgs.len(),
+        1_200,
+        "sender's own bound (1200) when receiver takes the sender's configuration"
+    );
+    // now the floors: a newer receiver configuration
+    let receiver2 = ChatRoomStateV1 {
+        configuration: r.cfg(2, |c| c.max_recent_messages = 5),
+        ..Default::default()
+    };
+    let summary2 = receiver2.summarize(&receiver2, &r.p);
+    let delta2 = sender.delta_within_work_bounds(&r.p, &summary2).unwrap();
+    let m2 = delta2.recent_messages.unwrap();
+    assert_eq!(m2.len(), 1_000, "the floors bound");
+    let newest = sender
+        .recent_messages
+        .messages
+        .iter()
+        .map(|m| m.message.time)
+        .max()
+        .unwrap();
+    assert!(
+        m2.iter().any(|m| m.message.time == newest),
+        "the newest kept"
+    );
+    let oldest = sender
+        .recent_messages
+        .messages
+        .iter()
+        .map(|m| m.message.time)
+        .min()
+        .unwrap();
+    assert!(
+        m2.iter().all(|m| m.message.time != oldest),
+        "the oldest dropped"
+    );
+}
+
+fn evidence_sender(r: &Room, n: u64, max_members: usize) -> ChatRoomStateV1 {
+    let evidence: Vec<_> = (0..n)
+        .map(|i| r.rec(&sk(10_000 + i).verifying_key(), &r.o))
+        .collect();
+    ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_members = max_members),
+        ban_evidence: BanEvidenceV1 { members: evidence },
+        ..Default::default()
+    }
+}
+
+/// The floors take the LEAST depth cap (max_members 1).
+#[test]
+fn the_floor_evidence_bound_uses_the_least_depth_cap() {
+    let r = Room::new();
+    let sender = evidence_sender(&r, 700, 200);
+    let receiver = ChatRoomStateV1 {
+        configuration: r.cfg(2, |c| c.max_members = 1),
+        ..Default::default()
+    };
+    let summary = receiver.summarize(&receiver, &r.p);
+    let delta = sender.delta_within_work_bounds(&r.p, &summary).unwrap();
+    assert_eq!(
+        delta.ban_evidence.unwrap().len(),
+        evidence_bound(100, evidence_depth_cap(1))
+    );
+}
+
+/// Under the sender's own configuration evidence is bounded at the sender's depth cap.
+#[test]
+fn evidence_under_the_senders_configuration_uses_its_depth_cap() {
+    let r = Room::new();
+    let sender = evidence_sender(&r, 1_200, 200);
+    let receiver = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_members = 200),
+        ..Default::default()
+    };
+    let summary = receiver.summarize(&receiver, &r.p);
+    let delta = sender.delta_within_work_bounds(&r.p, &summary).unwrap();
+    let want = evidence_bound(100, evidence_depth_cap(200));
+    assert!(1_200 > want, "premise");
+    assert_eq!(delta.ban_evidence.unwrap().len(), want);
+}
+
+/// A state at its own legitimate evidence bound is not refused.
+#[test]
+fn a_state_at_its_own_evidence_bound_is_not_refused() {
+    let r = Room::new();
+    let n = evidence_bound(100, evidence_depth_cap(300)); // 800
+    let s = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| {
+            c.max_user_bans = 100;
+            c.max_members = 300;
+        }),
+        ban_evidence: BanEvidenceV1 {
+            members: (0..n as u64)
+                .map(|i| r.rec(&sk(10_000 + i).verifying_key(), &r.o))
+                .collect(),
+        },
+        ..Default::default()
+    };
+    let mut recv = ChatRoomStateV1::default();
+    recv.merge_from(&r.p, &s).expect("not refused");
+}
+
+/// An unsigned configuration earns no members/evidence above the floors.
+#[test]
+fn an_unsigned_configuration_earns_no_member_or_evidence_bound() {
+    let r = Room::new();
+    let unsigned = |m: usize, b: usize| {
+        AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: r.owner,
+                max_members: m,
+                max_user_bans: b,
+                ..Default::default()
+            },
+            &sk(9),
+        )
+    };
+    let members = ChatRoomStateV1 {
+        configuration: unsigned(5_000, 10),
+        members: MembersV1 {
+            members: (0..1_001u64)
+                .map(|i| r.rec(&sk(20_000 + i).verifying_key(), &r.o))
+                .collect(),
+        },
+        ..Default::default()
+    };
+    assert!(
+        ChatRoomStateV1::default()
+            .merge_from(&r.p, &members)
+            .is_err(),
+        "members"
+    );
+    let ev = ChatRoomStateV1 {
+        configuration: unsigned(5_000, 1_000),
+        ban_evidence: BanEvidenceV1 {
+            members: (0..201u64)
+                .map(|i| r.rec(&sk(20_000 + i).verifying_key(), &r.o))
+                .collect(),
+        },
+        ..Default::default()
+    };
+    assert!(
+        ChatRoomStateV1::default().merge_from(&r.p, &ev).is_err(),
+        "evidence"
+    );
+}
+
+/// The DM apply's enforced-ban set must not count a ban no known key
+/// verifies at the cap: a ban of a present member stays enforced.
+#[test]
+fn a_ban_whose_issuer_is_known_nowhere_does_not_unseat_a_stored_one() {
+    let r = Room::new();
+    let (m, x, unknown) = (sk(2), sk(3), sk(4));
+    let mut msgs = MessagesV1 {
+        messages: vec![r.msg(&m, 1), r.msg(&x, 2)],
+        ..Default::default()
+    };
+    msgs.rebuild_actions_state();
+    let held = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_user_bans = 2),
+        members: MembersV1 {
+            members: vec![
+                r.rec(&m.verifying_key(), &r.o),
+                r.rec(&x.verifying_key(), &r.o),
+            ],
+        },
+        recent_messages: msgs,
+        // the owner bans present member X (oldest) and an id held nowhere
+        bans: BansV1(vec![r.ban(&r.o, id(&x), 5), r.ban(&r.o, id(&sk(90)), 6)]),
+        ..Default::default()
+    });
+    assert_eq!(held.bans.0.len(), 2);
+    let mut applied = held.clone();
+    applied
+        .apply_delta(
+            &held,
+            &r.p,
+            &Some(ChatRoomStateV1Delta {
+                bans: Some(vec![r.ban(&unknown, id(&sk(91)), 20)]),
+                ..Default::default()
+            }),
+        )
+        .expect("applies");
+    assert_eq!(applied.bans, held.bans);
+}
+
+/// The work bounds are back on after a whole-state merge that fails, too.
+#[test]
+fn the_work_bounds_are_back_on_after_a_failed_whole_state_merge() {
+    let r = Room::new();
+    let base = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_user_bans = 10),
+        ..Default::default()
+    };
+    // A member record attributed to the owner's invitation that the owner
+    // did not sign: the merge fails inside the apply.
+    let mut bad = base.clone();
+    bad.members.members.push(AuthorizedMember {
+        member: Member {
+            owner_member_id: r.owner,
+            invited_by: r.owner,
+            member_vk: sk(77).verifying_key(),
+        },
+        signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+    });
+    let mut s = base.clone();
+    assert!(
+        s.merge_from(&r.p, &bad).is_err(),
+        "premise: the merge fails"
+    );
+    let mut u = base.clone();
+    assert!(u.merge_through_summary(&r.p, &bad).is_err(), "premise");
+    let big: Vec<_> = (0..250u64)
+        .map(|i| r.ban(&r.o, id(&sk(50_000 + i)), i))
+        .collect();
+    let mut t = base.clone();
+    assert!(
+        t.apply_delta(
+            &base,
+            &r.p,
+            &Some(ChatRoomStateV1Delta {
+                bans: Some(big),
+                ..Default::default()
+            })
+        )
+        .is_err(),
+        "bounded after a failed merge"
+    );
+}
