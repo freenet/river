@@ -48,7 +48,12 @@ This file enumerates the Freenet contracts and delegates published from this rep
   - `ChatRoomStateV1::merge` is an inherent method that shadows
     `ComposableState::merge`; call it (or `merge_from`), never the trait
     method, on a room. A receiver that merges through its own summary should
-    take `delta_from_merged_summary`.
+    call `merge_through_summary`. A whole-state merge refuses an incoming
+    state holding more bans, members or ban evidence than its own
+    owner-signed configuration allows, and otherwise applies every record.
+  - A delta for a peer you know only by its summary should come from
+    `delta_within_work_bounds` (or `delta` followed by
+    `trim_network_delta`), so a peer on a lowered cap applies it.
   - `apply_delta` returns `Ok` where it used to return `Err` for validly
     signed records the room does not admit (re-delivered records, a second
     record at a held version, a record for a member id already held, a

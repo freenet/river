@@ -35,11 +35,28 @@ skipped. A configuration the owner did not sign is never offered.
 `ChatRoomStateV1::merge` (and `merge_from`) is an inherent method that
 SHADOWS `ComposableState::merge`. Never call `ComposableState::merge` on a
 room: the trait default reads retention horizons against the receiver's
-pre-merge configuration, does not trim to the work bounds, and is not
-commutative for rooms. The contract's `update_state` is pinned to
+pre-merge configuration, holds a whole state to the per-delta work bounds,
+and is not commutative for rooms. The contract's `update_state` is pinned to
 `merge_from` by a native test in `contracts/room-contract`. A receiver that
-merges through its own summary (the UI) uses
-`delta_from_merged_summary`, which trims the same way.
+merges through its own summary (the UI) uses `merge_through_summary`, which
+follows the same rules.
+
+## Whole states are held to their own caps; deltas to the work bounds
+
+A whole-state merge refuses an incoming state holding more bans, members or
+ban evidence than its own owner-signed configuration allows (verify's own
+bounds, compared before any signature is checked), then applies EVERY
+incoming record and lets the merged room's caps decide. Do not trim what a
+whole-state merge applies: a trim chooses before the merged room's own
+removals run (a lowered `max_members`, a ban that removes an issuer), so the
+two directions of one exchange differ.
+
+A network delta is sent against a summary, without the receiver's state, so
+it is trimmed (`trim_network_delta`) to the work bounds of the receiver's
+room: the sender's caps when the receiver will end with the sender's
+configuration, otherwise the least bounds any room has. The rest follows in
+later rounds. Anything that adds records to a network delta (the contract's
+`ensure_members_for_message_authors`) runs before the trim.
 
 ## Summaries carry a rank, with a digest tie-break
 
