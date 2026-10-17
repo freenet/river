@@ -293,9 +293,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     };
 
     let on_blur = {
-        // `mut` because the emoji-rejection branch reverts `temp_nickname`,
-        // which makes the closure `FnMut`.
-        let mut save_changes = save_changes.clone();
+        let save_changes = save_changes.clone();
         move |_| {
             let new_value = temp_nickname();
             save_changes(new_value);
@@ -303,7 +301,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     };
 
     let on_keydown = {
-        let mut save_changes = save_changes.clone();
+        let save_changes = save_changes.clone();
         move |evt: dioxus_core::Event<KeyboardData>| {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
