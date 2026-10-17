@@ -4762,6 +4762,17 @@ mod tests {
         );
     }
 
+    /// freenet/river#809: the sweep asks the NEWEST legacy generation first, so
+    /// its answer is not queued on the node behind every older generation.
+    #[test]
+    fn legacy_sweep_asks_the_newest_generation_first() {
+        let src = include_str!("chat_delegate.rs");
+        let body = &src[src
+            .rfind("pub(crate) async fn fire_legacy_migration_request() -> bool {")
+            .expect("fire_legacy_migration_request must exist")..];
+        assert!(body.contains("in LEGACY_DELEGATES.iter().enumerate().rev() {"));
+    }
+
     // ===== resolve_hidden_thread_hydration tests (#261 Codex P3) =====
     use freenet_scaffold::util::FastHash;
 
@@ -11315,7 +11326,13 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
     let mut any_dispatched = false;
 
-    for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate() {
+    // Newest generation first (freenet/river#809). The node runs delegate
+    // requests one at a time, in arrival order, so oldest-first put the
+    // generation most likely to hold the user's rooms behind every older one,
+    // each paying a module load on a cold node (0.4 s each in the rehearsal).
+    // Arrival order decides nothing else: every merge is ranked by source
+    // generation, never by arrival (freenet/river#527).
+    for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate().rev() {
         let legacy_code_hash = CodeHash::new(*code_hash_bytes);
         let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
 

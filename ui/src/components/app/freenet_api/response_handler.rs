@@ -19,16 +19,16 @@ use crate::components::app::chat_delegate::{
     complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
     complete_pending_signing_key_request, current_delegate_source_rank, current_load_attempt,
     decide_legacy_migration_action, decide_per_room_load_action, enqueue_delegate_request,
-    fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
-    is_legacy_delegate_key, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_fetch_failure_if_current, mark_outbound_dms_hydrated, mark_room_set_complete,
-    note_current_list_response, note_delegate_response_for_register_ack, parse_room_storage_key,
-    per_room_terminal, prune_outbound_dms_for_purges, request_outbound_dms_once,
-    response_correlation_base, room_storage_key, save_outbound_dms_to_delegate,
-    save_rooms_to_delegate, seed_saved_slots_from_load, send_delegate_request,
-    send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
-    LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
-    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
+    enqueue_delegate_request_to, fire_legacy_migration_request, hydrate_hidden_dm_threads,
+    hydrate_outbound_dms_cache, is_legacy_delegate_key, legacy_scoped_correlation,
+    load_state_after_probe_legacy, mark_fetch_failure_if_current, mark_outbound_dms_hydrated,
+    mark_room_set_complete, note_current_list_response, note_delegate_response_for_register_ack,
+    parse_room_storage_key, per_room_terminal, prune_outbound_dms_for_purges,
+    request_outbound_dms_once, response_correlation_base, room_storage_key,
+    save_outbound_dms_to_delegate, save_rooms_to_delegate, seed_saved_slots_from_load,
+    send_delegate_request, send_delegate_request_to, set_load_state_if_current,
+    source_rank_for_delegate_key, LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest,
+    RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::notifications::mark_initial_sync_complete;
 use crate::components::app::sync_info::SYNC_INFO;
@@ -1429,15 +1429,41 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     // keeps the predecessor pending for good) and NOT rooms inside a
     // `rooms_data` blob (one item to the walk).
     let mut items_read: u32 = 0;
-    for vk in room_vks {
-        match send_delegate_request_to(
-            legacy_key.clone(),
-            ChatDelegateRequestMsg::GetRequest {
-                key: ChatDelegateKey::new(room_storage_key(&vk)),
-            },
-        )
-        .await
-        {
+    // Fetched in concurrent waves, as the current delegate's per-room load is
+    // (`ROOM_LOAD_CONCURRENCY`): one round trip per room held the first load
+    // after a re-key for N round trips (freenet/river#809). Each waiter is
+    // scoped to this legacy delegate and its room key, so it is distinct from
+    // every other in flight.
+    let mut responses: Vec<(
+        ed25519_dalek::VerifyingKey,
+        Result<ChatDelegateResponseMsg, String>,
+    )> = Vec::with_capacity(room_vks.len());
+    for wave in room_vks.chunks(ROOM_LOAD_CONCURRENCY) {
+        let mut pending = Vec::with_capacity(wave.len());
+        for vk in wave {
+            match enqueue_delegate_request_to(
+                legacy_key.clone(),
+                ChatDelegateRequestMsg::GetRequest {
+                    key: ChatDelegateKey::new(room_storage_key(vk)),
+                },
+            )
+            .await
+            {
+                Ok(p) => pending.push((*vk, p)),
+                Err(e) => responses.push((*vk, Err(e))),
+            }
+        }
+        responses.extend(
+            futures::future::join_all(
+                pending
+                    .into_iter()
+                    .map(|(vk, p)| async move { (vk, await_delegate_response(p).await) }),
+            )
+            .await,
+        );
+    }
+    for (vk, response) in responses {
+        match response {
             Ok(ChatDelegateResponseMsg::GetResponse {
                 value: Some(bytes), ..
             }) => {
@@ -3445,7 +3471,7 @@ mod tests {
             .find("worker.set_load_state(RoomsLoadState::Migrating)")
             .expect("migrate_legacy_per_room must announce Migrating for a non-empty index");
         let loop_pos = body
-            .find("for vk in room_vks")
+            .find("room_vks.chunks(ROOM_LOAD_CONCURRENCY)")
             .expect("migrate_legacy_per_room must have a per-slot fetch loop");
         assert!(
             migrating_pos < loop_pos,
@@ -3776,6 +3802,48 @@ mod tests {
         assert!(
             region.contains("chunks(ROOM_LOAD_CONCURRENCY)"),
             "per-room load must fan out in bounded waves of ROOM_LOAD_CONCURRENCY, not all N at once"
+        );
+    }
+
+    /// freenet/river#809: a legacy generation's room slots are fetched in
+    /// concurrent waves too, not one round trip per room. The first load after
+    /// a re-key reads every room through this path, so a serial loop cost N
+    /// round trips before any room showed. Same borrow-safety shape as
+    /// `per_room_load_fans_out_concurrently`.
+    #[test]
+    fn legacy_per_room_migration_fans_out_concurrently() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let start = production
+            .find("Migrating {} per-room slot(s) from legacy delegate")
+            .expect("legacy per-room fetch marker must exist");
+        let end = production[start..]
+            .find("let meta = if has_meta")
+            .map(|i| start + i)
+            .expect("the legacy per-room loop must be followed by the meta load");
+        let region = &production[start..end];
+
+        let enqueue_pos = region
+            .find("enqueue_delegate_request_to(")
+            .expect("legacy slot GETs must be enqueued, scoped to the legacy delegate");
+        let join_pos = region
+            .find("join_all(")
+            .expect("legacy slot responses must be awaited concurrently via join_all");
+        assert!(region.contains("await_delegate_response("));
+        assert!(
+            enqueue_pos < join_pos && !region[join_pos..].contains("enqueue_delegate_request"),
+            "enqueues (the WEB_API borrow) must stay outside the join_all fan-out"
+        );
+        assert!(
+            !region.contains("send_delegate_request_to("),
+            "legacy slots must not be fetched with the serial send+await"
+        );
+        assert!(
+            region.contains("chunks(ROOM_LOAD_CONCURRENCY)"),
+            "the legacy fan-out must be bounded by ROOM_LOAD_CONCURRENCY"
         );
     }
 

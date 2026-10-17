@@ -1467,6 +1467,11 @@ pub(crate) struct RiverSuccessorIo<'a, C: RiverDelegateChannel, S: RiverImportSe
     /// merged none cannot have resurrected anything, and re-merging would only
     /// dirty the rooms and cost a redundant save.
     rooms_merged: bool,
+    /// Marker values read ahead by [`Self::prefetch_markers`], by storage key.
+    /// Each is used by at most one [`Self::get_marker`] and is dropped when the
+    /// key is written, so only a read that would otherwise have gone to the
+    /// node a moment later is answered from here (freenet/river#809).
+    prefetched_markers: HashMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
 impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S> {
@@ -1481,6 +1486,60 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
             pending_provenance: Vec::new(),
             walk_orders: Vec::new(),
             rooms_merged: false,
+            prefetched_markers: HashMap::new(),
+        }
+    }
+
+    /// Read the done and in-progress markers of every predecessor in
+    /// `lineage` concurrently, in waves of [`MARKER_PREFETCH_WAVE`], so that
+    /// `begin` does not read them one round trip at a time (freenet/river#809:
+    /// two reads per generation, 66 round trips for 33 generations, which held
+    /// the first load after a re-key for about 8 s at 120 ms RTT).
+    ///
+    /// Only definitive answers are kept: a marker that is silent or errs here
+    /// is read again, one at a time, when `begin` asks for it, and fails there
+    /// exactly as it would have without the prefetch. Silence is still never
+    /// read as absence.
+    pub(crate) async fn prefetch_markers(&mut self, lineage: &[DelegateLineageEntry]) {
+        let keys: Vec<Vec<u8>> = lineage
+            .iter()
+            .flat_map(|entry| {
+                let predecessor =
+                    DelegateKey::new(entry.delegate_key, CodeHash::new(entry.code_hash));
+                [
+                    pred_done_marker_key(&predecessor),
+                    pred_wip_marker_key(&predecessor),
+                ]
+            })
+            .collect();
+        for wave in keys.chunks(MARKER_PREFETCH_WAVE) {
+            // `request_all`, NOT a `join_all` of `request`: see `prewarm`.
+            let outcomes = self
+                .channel
+                .request_all(
+                    wave.iter()
+                        .map(|key| {
+                            (
+                                self.successor.clone(),
+                                ChatDelegateRequestMsg::GetRequest {
+                                    key: ChatDelegateKey::new(key.clone()),
+                                },
+                            )
+                        })
+                        .collect(),
+                )
+                .await;
+            for (key, outcome) in wave.iter().zip(outcomes) {
+                if let Ok(Some(ChatDelegateResponseMsg::GetResponse {
+                    key: reply_key,
+                    value,
+                })) = outcome
+                {
+                    if reply_key.as_bytes() == key.as_slice() {
+                        self.prefetched_markers.insert(key.clone(), value);
+                    }
+                }
+            }
         }
     }
 
@@ -1521,6 +1580,9 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
     /// guessing `None` would re-import a possibly-done predecessor, and
     /// guessing `Done` would silently skip one.
     async fn get_marker(&mut self, storage_key: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
+        if let Some(value) = self.prefetched_markers.remove(&storage_key) {
+            return Ok(value);
+        }
         let request = ChatDelegateRequestMsg::GetRequest {
             key: ChatDelegateKey::new(storage_key.clone()),
         };
@@ -1557,6 +1619,7 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
     /// is durable when this returns (the crate's record_marker and
     /// store_journal contracts — never batched with items).
     async fn put_marker(&mut self, storage_key: Vec<u8>, value: &[u8]) -> Result<(), String> {
+        self.prefetched_markers.remove(&storage_key);
         put_current(self.channel, &self.successor, storage_key, value).await
     }
 
@@ -1571,6 +1634,7 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
         saw_data: bool,
     ) -> Result<(), String> {
         let key = ChatDelegateKey::new(pred_wip_marker_key(predecessor));
+        self.prefetched_markers.remove(key.as_bytes());
         let (mut current, mut generation) = match self
             .channel
             .request(
@@ -1635,6 +1699,15 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
         Err("wip-marker store kept conflicting".to_string())
     }
 }
+
+/// How many marker reads [`RiverSuccessorIo::prefetch_markers`] keeps in
+/// flight at once. Every delegate request on a node shares ONE admission queue
+/// per priority tier, capped at 100 (`MAX_QUEUED_PER_CONTRACT`, freenet-core
+/// `fair_queue.rs`), and the sweep's legacy burst lands in it at the same time;
+/// a wave of 16 keeps well under the cap, as the room load's waves do
+/// (`ROOM_LOAD_CONCURRENCY`).
+pub(crate) const MARKER_PREFETCH_WAVE: usize = 16;
+const _: () = assert!(MARKER_PREFETCH_WAVE > 0);
 
 /// Compare-and-swap attempts for one in-progress marker write. Each conflict
 /// means another session wrote it in between; a handful is plenty.
@@ -1956,6 +2029,7 @@ pub(crate) async fn begin_with<C: RiverDelegateChannel>(
     lineage: &[DelegateLineageEntry],
 ) -> Result<JournalStatus, JournalError> {
     let mut writer = RiverSuccessorIo::new(channel, NoImports, successor);
+    writer.prefetch_markers(lineage).await;
     begin_migration_journal(&mut writer, lineage, &river_secret_policy()).await
 }
 
@@ -2595,6 +2669,10 @@ pub(crate) mod tests_support {
         pub(crate) max_in_flight: Cell<usize>,
         /// `(target delegate key bytes, "list" | "get:<key>" | "store:<key>")`
         pub(crate) log: RefCell<Vec<(Vec<u8>, String)>>,
+        /// Sequential round trips: each `request` outside a batch, and each
+        /// `request_all` batch, counts one (freenet/river#809).
+        pub(crate) round_trips: Cell<usize>,
+        batching: Cell<bool>,
     }
 
     impl MockChannel {
@@ -2802,6 +2880,9 @@ pub(crate) mod tests_support {
             target: &DelegateKey,
             request: ChatDelegateRequestMsg,
         ) -> Result<Option<ChatDelegateResponseMsg>, String> {
+            if !self.batching.get() {
+                self.round_trips.set(self.round_trips.get() + 1);
+            }
             self.in_flight.set(self.in_flight.get() + 1);
             self.max_in_flight
                 .set(self.max_in_flight.get().max(self.in_flight.get()));
@@ -2824,12 +2905,16 @@ pub(crate) mod tests_support {
             &self,
             requests: Vec<(DelegateKey, ChatDelegateRequestMsg)>,
         ) -> Vec<Result<Option<ChatDelegateResponseMsg>, String>> {
-            futures::future::join_all(
+            self.round_trips.set(self.round_trips.get() + 1);
+            self.batching.set(true);
+            let out = futures::future::join_all(
                 requests
                     .iter()
                     .map(|(target, request)| self.request(target, request.clone())),
             )
-            .await
+            .await;
+            self.batching.set(false);
+            out
         }
     }
 
@@ -4932,6 +5017,89 @@ mod tests {
         assert_eq!(
             sweep_write_for(&Err(JournalError::Successor("x".into()))),
             SweepWrite::Skip
+        );
+    }
+
+    /// A lineage of `n` generations, every predecessor installed and empty.
+    fn lineage_n(n: u8) -> (Vec<DelegateLineageEntry>, MockChannel) {
+        let table: Vec<([u8; 32], [u8; 32])> =
+            (0..n).map(|g| ([20 + g; 32], [120 + g; 32])).collect();
+        let mut channel =
+            MockChannel::default().with_delegate(&successor_key(), DelegateSim::default());
+        for (k, ch) in &table {
+            channel = channel.with_delegate(
+                &DelegateKey::new(*k, CodeHash::new(*ch)),
+                DelegateSim::default(),
+            );
+        }
+        (river_delegate_lineage(&table), channel)
+    }
+
+    /// freenet/river#809: `begin` read every predecessor's markers one round
+    /// trip at a time (done, then in-progress), so on the first load after a
+    /// re-key the sweep's merge waited 2 x 33 round trips for it: about 8 s of
+    /// the 16 s the rehearsal measured before any room showed. The marker reads
+    /// now go out in bounded concurrent waves, so `begin` costs a handful of
+    /// round trips whatever the lineage length.
+    #[test]
+    fn begin_reads_markers_in_waves_not_one_round_trip_each() {
+        let rounds = |n: u8| {
+            let (lineage, channel) = lineage_n(n);
+            block_on(begin_with(&channel, successor_key(), &lineage)).unwrap();
+            channel.round_trips.get()
+        };
+        let small = rounds(3);
+        let large = rounds(33);
+        let extra_waves = (2 * 33usize).div_ceil(MARKER_PREFETCH_WAVE)
+            - (2 * 3usize).div_ceil(MARKER_PREFETCH_WAVE);
+        assert!(
+            large <= small + extra_waves,
+            "begin over 33 generations took {large} round trips against {small} over 3: \
+             its marker reads must not grow one round trip per generation"
+        );
+    }
+
+    /// The prefetch never turns silence into absence (constraint 1): a marker
+    /// the prefetch could not read is read again live, and a marker that stays
+    /// silent still refuses `begin`, exactly as without the prefetch.
+    #[test]
+    fn begin_still_refuses_on_a_marker_that_stays_silent() {
+        let (lineage, channel) = lineage_n(3);
+        let silent = pred_done_marker_key(&DelegateKey::new(
+            lineage[1].delegate_key,
+            CodeHash::new(lineage[1].code_hash),
+        ));
+        channel
+            .delegates
+            .borrow_mut()
+            .get_mut(successor_key().bytes())
+            .unwrap()
+            .silent_get_keys
+            .push(silent.clone());
+        assert!(block_on(begin_with(&channel, successor_key(), &lineage)).is_err());
+        let reads = channel
+            .log
+            .borrow()
+            .iter()
+            .filter(|(_, what)| *what == format!("get:{}", String::from_utf8_lossy(&silent)))
+            .count();
+        assert_eq!(reads, 2, "read once by the prefetch, then again live");
+    }
+
+    /// A prefetched marker is used at most once and is dropped by a write, so
+    /// the in-progress marker's read-back (the crate's marker contract) sees
+    /// what was just recorded, never the value read before it.
+    #[test]
+    fn a_prefetched_marker_does_not_outlive_a_write() {
+        let channel = channel_with_gen0(DelegateSim::default());
+        let lineage = lineage3();
+        let mut io = RiverSuccessorIo::new(&channel, NoImports, successor_key());
+        block_on(io.prefetch_markers(&lineage));
+        let pred = pred_key(0);
+        block_on(io.record_marker(&pred, MigrationMarker::InProgress { saw_data: true })).unwrap();
+        assert_eq!(
+            block_on(io.read_marker(&pred)).unwrap(),
+            Some(MigrationMarker::InProgress { saw_data: true })
         );
     }
 
