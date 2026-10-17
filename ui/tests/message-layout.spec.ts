@@ -521,8 +521,6 @@ test.describe("Composer grows with the draft, up to half the viewport", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("grows as you type, and an 80-line draft never scrolls the app shell", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
     await openRoomWithComposer(page);
     const ta = page.getByTestId("message-input");
     const metrics = () =>
@@ -685,8 +683,6 @@ test.describe("Unavailable reply quote", () => {
 // conversation's scroll policy. Run at each project's own device viewport.
 test.describe("Editing the last message keeps its controls reachable (A08)", () => {
   test("Save and Cancel are inside the visible history and hit-testable", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
     await openRoomWithComposer(page);
     const input = page.getByTestId("message-input");
     await input.fill("edit me, I am the last message");

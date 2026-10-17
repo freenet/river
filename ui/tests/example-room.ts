@@ -100,8 +100,11 @@ export function memberRows(page: Page): Locator {
   return page.getByTestId("member-list").locator('[data-testid^="member-item-"] button');
 }
 
-// Self owns "Your Private Room"; in "Public Discussion Room" self is an observer with no composer.
+// Opens the app at "/" and the room self owns, "Your Private Room" (in
+// "Public Discussion Room" self is an observer with no composer).
 export async function openRoomWithComposer(page: Page) {
+  await page.goto("/");
+  await waitForApp(page);
   await selectRoom(page, "Your Private Room");
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
 }
@@ -114,7 +117,7 @@ export async function openOwnMessageEdit(page: Page, message?: Locator): Promise
   const ownRow = message ?? page.locator('[id^="msg-"][data-message-self="true"]').first();
   await expect(ownRow).toBeVisible();
   if (!message) await ownRow.scrollIntoViewIfNeeded();
-  if (await page.evaluate(() => window.matchMedia("(hover: none)").matches)) {
+  if (await touchOnly(page)) {
     await ownRow.getByTestId("message-kebab").click();
     await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();
   } else {
@@ -173,6 +176,11 @@ export async function rowSurfaces(page: Page): Promise<{ bg: number[]; band: num
 /// The element's computed text colour, as `resolveColor` returns it.
 export async function colourOf(locator: Locator): Promise<number[]> {
   return resolveColor(locator.page(), await locator.evaluate((el) => getComputedStyle(el).color));
+}
+
+/// Whether there is no hover pointer, so rows show the kebab, not the hover bar.
+export function touchOnly(page: Page): Promise<boolean> {
+  return page.evaluate(() => window.matchMedia("(hover: none)").matches);
 }
 
 /// Whether a finger can be the pointer: the same query as main.css.

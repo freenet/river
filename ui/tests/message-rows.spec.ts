@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { coarsePointer, openInlinePicker, openRoomWithComposer, reactTo, resolveColor, waitForApp } from "./example-room";
+import { coarsePointer, openInlinePicker, openRoomWithComposer, reactTo, resolveColor, touchOnly } from "./example-room";
 import { deliverOffscreen, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
@@ -13,17 +13,11 @@ function groupWith(page: Page, text: string): Locator {
   return page.locator("[data-item-key]").filter({ hasText: text });
 }
 
-async function openRoom(page: Page) {
-  await page.goto("/");
-  await waitForApp(page);
-  await openRoomWithComposer(page);
-}
-
 /// A received pair (one fixed test identity, inserted before the newest
 /// message) and an own pair (two sends from the composer). Example data picks
 /// its authors at random, so neither pair is left to chance.
 async function openRoomWithPairs(page: Page): Promise<{ received: Locator; own: Locator }> {
-  await openRoom(page);
+  await openRoomWithComposer(page);
   for (const text of ["received pair one", "received pair two"]) {
     await callRiverTest(page, "insertMessageBeforeLast", text);
   }
@@ -207,7 +201,7 @@ function expectEveryEmojiTappable(report: PickerReport) {
 /// emoji chips are 3px wider.
 async function nearEdgeRow(page: Page): Promise<Locator> {
   const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"];
-  await openRoom(page);
+  await openRoomWithComposer(page);
   await deliverOffscreen(page, "picker edge");
   const row = page.getByTestId("message-row").filter({ hasText: "picker edge" });
   const chips = row.getByTestId("reaction-chip");
@@ -244,7 +238,7 @@ test.describe("Reaction picker at 320px", () => {
   });
 
   test("at the start of the line, the picker opens rightward", async ({ page }) => {
-    await openRoom(page);
+    await openRoomWithComposer(page);
     await deliverOffscreen(page, "picker start");
     const row = page.getByTestId("message-row").filter({ hasText: "picker start" });
     await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
@@ -345,9 +339,9 @@ test.describe("Message row hover band", () => {
 // Latest, so a row at the bottom of the view never takes Latest's click.
 test.describe("Latest over row controls", () => {
   test("a row control aligned with Latest never takes its click", async ({ page }) => {
-    const touch = await coarsePointer(page);
+    const touch = await touchOnly(page);
     await page.setViewportSize(touch ? { width: 390, height: 800 } : { width: 1024, height: 800 });
-    await openRoom(page);
+    await openRoomWithComposer(page);
     const control = touch ? ".touch-actions" : ".hover-actions";
     await readerLeavesTheEnd(page);
     const latest = page.getByTestId("scroll-to-bottom");

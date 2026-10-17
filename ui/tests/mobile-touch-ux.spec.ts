@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp, selectRoom } from "./example-room";
+import { touchOnly, waitForApp, selectRoom } from "./example-room";
 import { AT_BOTTOM_EPSILON_PX } from "./history-geometry";
 
 // Coverage for freenet/river#402 — mobile / touch UX improvements:
@@ -9,11 +9,6 @@ import { AT_BOTTOM_EPSILON_PX } from "./history-geometry";
 //   3. A scroll-to-latest button shown whenever the newest message's bottom
 //      is off screen, plus a jump to the newest message on room switch.
 
-// Whether this browser context has no hover pointer (i.e. a touch device).
-// The kebab is shown only in that case; the hover action bar only otherwise.
-async function isTouchOnly(page: Page): Promise<boolean> {
-  return page.evaluate(() => window.matchMedia("(hover: none)").matches);
-}
 
 // The app scrolls to the bottom asynchronously on room entry. Wait for that to
 // settle before a test scrolls up, otherwise the pending async scroll races the
@@ -81,7 +76,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     // pure-CSS decision keyed on `@media (hover: none)`.
     await expect(kebab).toHaveCount(1);
 
-    if (await isTouchOnly(page)) {
+    if (await touchOnly(page)) {
       await expect(kebab).toBeVisible();
     } else {
       // On a device with a hover pointer the kebab stays display:none — the
@@ -99,7 +94,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
 
     // This flow only applies where the kebab is actually usable (touch).
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
@@ -133,7 +128,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
@@ -156,7 +151,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
@@ -193,7 +188,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
@@ -248,7 +243,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
@@ -280,7 +275,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
