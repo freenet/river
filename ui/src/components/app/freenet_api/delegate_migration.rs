@@ -1496,6 +1496,8 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
     /// two reads per generation, 66 round trips for 33 generations, which held
     /// the first load after a re-key for about 8 s at 120 ms RTT).
     ///
+    /// Called only before the first `begin` on a successor ([`begin_with`]).
+    ///
     /// Only definitive answers are kept: a marker that is silent or errs here
     /// is read again, one at a time, when `begin` asks for it, and fails there
     /// exactly as it would have without the prefetch. Silence is still never
@@ -2028,8 +2030,21 @@ pub(crate) async fn begin_with<C: RiverDelegateChannel>(
     successor: DelegateKey,
     lineage: &[DelegateLineageEntry],
 ) -> Result<JournalStatus, JournalError> {
+    // Only a journal not yet stored (the first load after a re-key) reads
+    // every marker, and that `begin` holds the sweep's first merge, so only it
+    // is worth the prefetch. With a journal stored, `begin` runs off the
+    // visible path and reads few markers; the prefetch there only competes
+    // with the room load (about 0.2 s later in the rehearsal). A journal read
+    // that is silent or errs skips the prefetch; `begin` meets the same
+    // failure itself.
+    let fresh = matches!(
+        get_current(channel, &successor, MIGRATION_JOURNAL_KEY.to_vec()).await,
+        Ok(None)
+    );
     let mut writer = RiverSuccessorIo::new(channel, NoImports, successor);
-    writer.prefetch_markers(lineage).await;
+    if fresh {
+        writer.prefetch_markers(lineage).await;
+    }
     begin_migration_journal(&mut writer, lineage, &river_secret_policy()).await
 }
 
@@ -5056,6 +5071,33 @@ mod tests {
             large <= small + extra_waves,
             "begin over 33 generations took {large} round trips against {small} over 3: \
              its marker reads must not grow one round trip per generation"
+        );
+    }
+
+    /// With a journal stored, `begin` is off the visible path and reads few
+    /// markers, so it does not prefetch them all.
+    #[test]
+    fn begin_prefetches_only_before_the_journal_exists() {
+        let (lineage, channel) = lineage_n(5);
+        block_on(begin_with(&channel, successor_key(), &lineage)).unwrap();
+        let marker_reads = |c: &MockChannel| {
+            c.log
+                .borrow()
+                .iter()
+                .filter(|(_, what)| what.starts_with("get:__migrate_pred_"))
+                .count()
+        };
+        assert_eq!(
+            marker_reads(&channel),
+            10,
+            "first begin: every marker, prefetched"
+        );
+        channel.reset_counters();
+        block_on(begin_with(&channel, successor_key(), &lineage)).unwrap();
+        assert_eq!(
+            marker_reads(&channel),
+            0,
+            "nothing resolved yet, so nothing to re-read"
         );
     }
 

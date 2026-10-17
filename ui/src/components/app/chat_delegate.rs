@@ -4765,12 +4765,58 @@ mod tests {
     /// freenet/river#809: the sweep asks the NEWEST legacy generation first, so
     /// its answer is not queued on the node behind every older generation.
     #[test]
-    fn legacy_sweep_asks_the_newest_generation_first() {
+    fn legacy_sweep_asks_newest_first_in_bounded_waves() {
         let src = include_str!("chat_delegate.rs");
         let body = &src[src
             .rfind("pub(crate) async fn fire_legacy_migration_request() -> bool {")
             .expect("fire_legacy_migration_request must exist")..];
-        assert!(body.contains("in LEGACY_DELEGATES.iter().enumerate().rev() {"));
+        assert!(body.contains("(0..LEGACY_DELEGATES.len()).rev().collect()"));
+        assert!(body.contains("newest_first.chunks(SWEEP_WAVE_GENERATIONS)"));
+        assert!(
+            body.matches("expect_sweep_answer(key_bytes);").count() == 2,
+            "every sent request (the two GETs and the ListRequest) must be expected"
+        );
+        assert!(body.contains("seal_sweep_wave()"));
+        // Three requests a generation: a wave stays far below the node's
+        // shared 100-request delegate queue.
+        assert!(3 * SWEEP_WAVE_GENERATIONS <= 16);
+    }
+
+    /// A sweep wave completes once every request it sent is answered, by a
+    /// reply or by an error naming its delegate; an error naming no delegate
+    /// (the node's queue refusal) answers nothing, so the wave falls back to
+    /// its wait bound.
+    #[test]
+    fn a_sweep_wave_completes_when_every_request_is_answered() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let mut wave = SweepWave::default();
+        for _ in 0..3 {
+            wave.expect(&a);
+        }
+        wave.expect(&b);
+        let mut done = wave.seal().expect("requests are outstanding");
+        wave.answered(&a);
+        wave.errored(&format!(
+            "missing delegate {}",
+            bs58::encode(a).into_string()
+        ));
+        wave.errored("no response received from handler");
+        wave.answered(&[9u8; 32]);
+        assert!(
+            matches!(done.try_recv(), Ok(None)),
+            "a and b still outstanding"
+        );
+        wave.errored(&format!(
+            "delegate {} is rate limited after repeated failures; retry in 80 ms",
+            bs58::encode(a).into_string()
+        ));
+        assert!(matches!(done.try_recv(), Ok(None)), "b still outstanding");
+        wave.answered(&b);
+        assert!(matches!(done.try_recv(), Ok(Some(()))));
+
+        let mut empty = SweepWave::default();
+        assert!(empty.seal().is_none(), "nothing sent: nothing to wait for");
     }
 
     // ===== resolve_hidden_thread_hydration tests (#261 Codex P3) =====
@@ -11255,6 +11301,132 @@ pub(crate) fn retry_rooms_load() {
 /// legacy delegate request, creating a tight error spam loop.
 static LEGACY_MIGRATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
+/// Legacy generations the startup sweep asks at once (freenet/river#809).
+///
+/// Every delegate request on a node, from every client and for every
+/// delegate, waits in ONE admission queue per priority tier, capped at 100
+/// (`MAX_QUEUED_PER_CONTRACT`, freenet-core `fair_queue.rs`), and one past the
+/// cap is refused with an error that names no delegate, so its waiter sits
+/// out its whole timeout. The sweep sends three requests per generation, so
+/// all 33 at once is 99: in the rehearsal that alone, plus the load's other
+/// requests, got the newest generation's room reads refused and held the room
+/// list for 26 s. Four generations is 12 requests a wave.
+const SWEEP_WAVE_GENERATIONS: usize = 4;
+const _: () = assert!(SWEEP_WAVE_GENERATIONS > 0);
+
+/// The longest a sweep wave waits for its answers before the next one goes
+/// out. A warm node answers a wave in one round trip; a cold one loads each
+/// delegate module first (about 0.4 s each in the rehearsal).
+const SWEEP_WAVE_WAIT_MS: u64 = 2_000;
+
+/// The requests of the sweep wave in flight that have no answer yet: per
+/// legacy delegate, how many were sent and not answered, with the key's
+/// base58 form (what the node's error texts name). The wave is complete once
+/// sealed with nothing outstanding.
+#[derive(Default)]
+pub(crate) struct SweepWave {
+    outstanding: HashMap<[u8; 32], (u32, String)>,
+    sealed: bool,
+    done: Option<oneshot::Sender<()>>,
+}
+
+impl SweepWave {
+    pub(crate) fn expect(&mut self, key: &[u8; 32]) {
+        self.outstanding
+            .entry(*key)
+            .or_insert_with(|| (0, bs58::encode(key).into_string()))
+            .0 += 1;
+    }
+
+    /// One request to `key` was answered: a reply, or an error naming it. A
+    /// key outside the wave (a late answer to an earlier wave, or another
+    /// path's request to the same generation) is ignored; one counted early
+    /// only lets the next wave go out sooner.
+    pub(crate) fn answered(&mut self, key: &[u8]) {
+        if let Ok(key) = <[u8; 32]>::try_from(key) {
+            if let Some((n, _)) = self.outstanding.get_mut(&key) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.outstanding.remove(&key);
+                }
+            }
+        }
+        self.finish_if_complete();
+    }
+
+    /// An error from the node: it answers the request to the wave key its
+    /// text names (typed `Missing`, the rate limiter's refusal, core's "not
+    /// found in store"). An error naming no key answers nothing.
+    pub(crate) fn errored(&mut self, text: &str) {
+        let named = self
+            .outstanding
+            .iter()
+            .find(|(_, (_, b58))| text.contains(b58.as_str()))
+            .map(|(k, _)| *k);
+        if let Some(key) = named {
+            self.answered(&key);
+        }
+    }
+
+    /// Every request is sent: from now on the wave completes when nothing is
+    /// outstanding. `None` when it already is.
+    pub(crate) fn seal(&mut self) -> Option<oneshot::Receiver<()>> {
+        self.sealed = true;
+        if self.outstanding.is_empty() {
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        self.done = Some(tx);
+        Some(rx)
+    }
+
+    fn finish_if_complete(&mut self) {
+        if self.sealed && self.outstanding.is_empty() {
+            if let Some(done) = self.done.take() {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+static SWEEP_WAVE: LazyLock<Mutex<Option<SweepWave>>> = LazyLock::new(|| Mutex::new(None));
+
+fn arm_sweep_wave() {
+    *SWEEP_WAVE.lock().unwrap() = Some(SweepWave::default());
+}
+
+fn expect_sweep_answer(key: &[u8; 32]) {
+    if let Some(wave) = SWEEP_WAVE.lock().unwrap().as_mut() {
+        wave.expect(key);
+    }
+}
+
+fn seal_sweep_wave() -> Option<oneshot::Receiver<()>> {
+    SWEEP_WAVE
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(SweepWave::seal)
+}
+
+fn disarm_sweep_wave() {
+    *SWEEP_WAVE.lock().unwrap() = None;
+}
+
+/// A legacy delegate replied (called for every legacy `DelegateResponse`).
+pub(crate) fn note_sweep_answer(key: &[u8]) {
+    if let Some(wave) = SWEEP_WAVE.lock().unwrap().as_mut() {
+        wave.answered(key);
+    }
+}
+
+/// The node answered some request with an error (called for every one).
+pub(crate) fn note_sweep_error(text: &str) {
+    if let Some(wave) = SWEEP_WAVE.lock().unwrap().as_mut() {
+        wave.errored(text);
+    }
+}
+
 /// Per-session guard so interrupted-migration recovery re-fires the legacy
 /// probe at most ONCE per session. Without it, every WebSocket reconnect that
 /// re-runs the per-room load would reset [`LEGACY_MIGRATION_ATTEMPTED`] and
@@ -11326,126 +11498,147 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
     let mut any_dispatched = false;
 
-    // Newest generation first (freenet/river#809). The node runs delegate
-    // requests one at a time, in arrival order, so oldest-first put the
-    // generation most likely to hold the user's rooms behind every older one,
-    // each paying a module load on a cold node (0.4 s each in the rehearsal).
-    // Arrival order decides nothing else: every merge is ranked by source
-    // generation, never by arrival (freenet/river#527).
-    for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate().rev() {
-        let legacy_code_hash = CodeHash::new(*code_hash_bytes);
-        let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
+    // Newest generation first, in waves (freenet/river#809). The node runs
+    // delegate requests one at a time, in arrival order, so oldest-first put
+    // the generation most likely to hold the user's rooms behind every older
+    // one. And all of them at once (three requests each, 99 for 33
+    // generations) nearly fills the ONE admission queue every delegate request
+    // on the node shares (see `SWEEP_WAVE_GENERATIONS`); a request the node
+    // turns away there comes back with no key, so its waiter sits out its
+    // whole timeout. Arrival order decides nothing else: every merge is ranked
+    // by source generation, never by arrival (freenet/river#527).
+    let newest_first: Vec<usize> = (0..LEGACY_DELEGATES.len()).rev().collect();
+    for wave in newest_first.chunks(SWEEP_WAVE_GENERATIONS) {
+        arm_sweep_wave();
+        for &i in wave {
+            let (key_bytes, code_hash_bytes) = &LEGACY_DELEGATES[i];
+            let legacy_code_hash = CodeHash::new(*code_hash_bytes);
+            let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
 
-        // Send a GetRequest for each storage key we want to migrate.
-        // rooms_data is the original and gates the migration; outbound_dms
-        // (#256) is mirrored so a delegate rebuild doesn't orphan the
-        // sender's own DM plaintext.
-        let storage_keys: [&[u8]; 2] = [ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY];
-        for storage_key in storage_keys {
-            let request = ChatDelegateRequestMsg::GetRequest {
-                key: ChatDelegateKey::new(storage_key.to_vec()),
-            };
+            // Send a GetRequest for each storage key we want to migrate.
+            // rooms_data is the original and gates the migration; outbound_dms
+            // (#256) is mirrored so a delegate rebuild doesn't orphan the
+            // sender's own DM plaintext.
+            let storage_keys: [&[u8]; 2] = [ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY];
+            for storage_key in storage_keys {
+                let request = ChatDelegateRequestMsg::GetRequest {
+                    key: ChatDelegateKey::new(storage_key.to_vec()),
+                };
 
-            let mut payload = Vec::new();
-            if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
-                error!(
-                    "Failed to serialize legacy migration request #{} for key {:?}: {}",
-                    i,
-                    String::from_utf8_lossy(storage_key),
-                    e
-                );
-                continue;
-            }
-
-            let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
-
-            let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
-                key: legacy_delegate_key.clone(),
-                params: Parameters::from(Vec::<u8>::new()),
-                inbound: vec![
-                    freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg),
-                ],
-            });
-
-            let api_result = {
-                let mut web_api = WEB_API.write();
-                if let Some(api) = web_api.as_mut() {
-                    api.send(delegate_request).await
-                } else {
-                    Err(freenet_stdlib::client_api::Error::ConnectionClosed)
-                }
-            };
-
-            match api_result {
-                Ok(_) => {
-                    any_dispatched = true;
-                    info!(
-                        "Legacy migration request #{} sent for key {:?}",
-                        i,
-                        String::from_utf8_lossy(storage_key)
-                    );
-                }
-                Err(e) => {
-                    // A send that RETURNS Err is a transport failure (connection
-                    // closed), NOT "delegate not present". Mark it (P1) — but only
-                    // for the current attempt (P2#1), so a stale probe can't
-                    // pollute a reconnect's fresh load.
-                    info!(
-                        "Legacy migration request #{} for key {:?} failed to send \
-                         (transport): {}",
+                let mut payload = Vec::new();
+                if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
+                    error!(
+                        "Failed to serialize legacy migration request #{} for key {:?}: {}",
                         i,
                         String::from_utf8_lossy(storage_key),
                         e
                     );
+                    continue;
+                }
+
+                let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
+
+                let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+                    key: legacy_delegate_key.clone(),
+                    params: Parameters::from(Vec::<u8>::new()),
+                    inbound: vec![
+                        freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg),
+                    ],
+                });
+
+                let api_result = {
+                    let mut web_api = WEB_API.write();
+                    if let Some(api) = web_api.as_mut() {
+                        api.send(delegate_request).await
+                    } else {
+                        Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+                    }
+                };
+
+                match api_result {
+                    Ok(_) => {
+                        any_dispatched = true;
+                        expect_sweep_answer(key_bytes);
+                        info!(
+                            "Legacy migration request #{} sent for key {:?}",
+                            i,
+                            String::from_utf8_lossy(storage_key)
+                        );
+                    }
+                    Err(e) => {
+                        // A send that RETURNS Err is a transport failure (connection
+                        // closed), NOT "delegate not present". Mark it (P1) — but only
+                        // for the current attempt (P2#1), so a stale probe can't
+                        // pollute a reconnect's fresh load.
+                        info!(
+                            "Legacy migration request #{} for key {:?} failed to send \
+                         (transport): {}",
+                            i,
+                            String::from_utf8_lossy(storage_key),
+                            e
+                        );
+                        mark_fetch_failure_if_current(attempt);
+                    }
+                }
+            }
+
+            // Per-room keys (room:<vk>, rooms_meta) are DYNAMIC, so the fixed
+            // GetRequests above can't discover them. Probe the legacy delegate's key
+            // index with a ListRequest; the ListResponse (is_legacy) is routed in
+            // response_handler.rs to a per-room migration that reconstructs those
+            // slots from THIS legacy delegate and re-saves them to the current one
+            // (freenet/river#345 / #65). Without this, the NEXT delegate-WASM bump
+            // after per-room storage ships would strand every room under the old key.
+            // Fire-and-forget (not awaited): a ListResponse only arrives if the
+            // legacy delegate is present, so an absent delegate costs nothing rather
+            // than a 10s per-delegate timeout for fresh users.
+            let list_request = ChatDelegateRequestMsg::ListRequest;
+            let mut list_payload = Vec::new();
+            if let Err(e) = ciborium::ser::into_writer(&list_request, &mut list_payload) {
+                error!("Failed to serialize legacy ListRequest #{i}: {e}");
+                continue;
+            }
+            let list_app_msg = freenet_stdlib::prelude::ApplicationMessage::new(list_payload);
+            let list_delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+                key: legacy_delegate_key.clone(),
+                params: Parameters::from(Vec::<u8>::new()),
+                inbound: vec![
+                    freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(list_app_msg),
+                ],
+            });
+            let list_result = {
+                let mut web_api = WEB_API.write();
+                if let Some(api) = web_api.as_mut() {
+                    api.send(list_delegate_request).await
+                } else {
+                    Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+                }
+            };
+            match list_result {
+                Ok(_) => {
+                    any_dispatched = true;
+                    expect_sweep_answer(key_bytes);
+                    info!("Legacy ListRequest #{i} sent for per-room key discovery");
+                }
+                Err(e) => {
+                    // Transport failure on the ListRequest send → mark it (P1),
+                    // current-attempt only (P2#1) via the uniform helper (review 11).
+                    info!("Legacy ListRequest #{i} failed to send (transport): {e}");
                     mark_fetch_failure_if_current(attempt);
                 }
             }
         }
-
-        // Per-room keys (room:<vk>, rooms_meta) are DYNAMIC, so the fixed
-        // GetRequests above can't discover them. Probe the legacy delegate's key
-        // index with a ListRequest; the ListResponse (is_legacy) is routed in
-        // response_handler.rs to a per-room migration that reconstructs those
-        // slots from THIS legacy delegate and re-saves them to the current one
-        // (freenet/river#345 / #65). Without this, the NEXT delegate-WASM bump
-        // after per-room storage ships would strand every room under the old key.
-        // Fire-and-forget (not awaited): a ListResponse only arrives if the
-        // legacy delegate is present, so an absent delegate costs nothing rather
-        // than a 10s per-delegate timeout for fresh users.
-        let list_request = ChatDelegateRequestMsg::ListRequest;
-        let mut list_payload = Vec::new();
-        if let Err(e) = ciborium::ser::into_writer(&list_request, &mut list_payload) {
-            error!("Failed to serialize legacy ListRequest #{i}: {e}");
-            continue;
+        // The next wave goes out once every request in this one is answered,
+        // or after `SWEEP_WAVE_WAIT_MS` if some stay silent. Silence concludes
+        // nothing here: the sweep never treated a missing answer as absence,
+        // and the journaled walk asks again.
+        if let Some(answered) = seal_sweep_wave() {
+            let timeout = Box::pin(crate::util::sleep(std::time::Duration::from_millis(
+                SWEEP_WAVE_WAIT_MS,
+            )));
+            let _ = select(answered, timeout).await;
         }
-        let list_app_msg = freenet_stdlib::prelude::ApplicationMessage::new(list_payload);
-        let list_delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
-            key: legacy_delegate_key.clone(),
-            params: Parameters::from(Vec::<u8>::new()),
-            inbound: vec![
-                freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(list_app_msg),
-            ],
-        });
-        let list_result = {
-            let mut web_api = WEB_API.write();
-            if let Some(api) = web_api.as_mut() {
-                api.send(list_delegate_request).await
-            } else {
-                Err(freenet_stdlib::client_api::Error::ConnectionClosed)
-            }
-        };
-        match list_result {
-            Ok(_) => {
-                any_dispatched = true;
-                info!("Legacy ListRequest #{i} sent for per-room key discovery");
-            }
-            Err(e) => {
-                // Transport failure on the ListRequest send → mark it (P1),
-                // current-attempt only (P2#1) via the uniform helper (review 11).
-                info!("Legacy ListRequest #{i} failed to send (transport): {e}");
-                mark_fetch_failure_if_current(attempt);
-            }
-        }
+        disarm_sweep_wave();
     }
 
     // freenet/river#397 Codex review 9 (P1): if NO probe was actually dispatched

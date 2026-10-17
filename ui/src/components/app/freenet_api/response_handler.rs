@@ -157,6 +157,7 @@ impl ResponseHandler {
                 let responding_delegate = key.clone();
                 if is_legacy_delegate {
                     info!("Received response from LEGACY delegate - checking for migration data");
+                    crate::components::app::chat_delegate::note_sweep_answer(key.bytes());
                 }
 
                 // Log a short key fingerprint, not the full `DelegateKey` Debug: that
