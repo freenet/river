@@ -485,8 +485,10 @@ impl RoomSynchronizer {
                             }
                         }
 
-                        // Persist to delegate so state survives refresh
-                        wasm_bindgen_futures::spawn_local(async {
+                        // Persist to delegate so state survives refresh.
+                        // `safe_spawn_local`: spawned from inside a signal
+                        // write (dioxus-signal-safety), and a no-op natively.
+                        crate::util::safe_spawn_local(async {
                             if let Err(e) = save_rooms_to_delegate().await {
                                 error!("Failed to save rooms to delegate after delta: {}", e);
                             }
@@ -1578,8 +1580,10 @@ impl RoomSynchronizer {
                             }
                         }
 
-                        // Persist to delegate so state survives refresh
-                        wasm_bindgen_futures::spawn_local(async {
+                        // Persist to delegate so state survives refresh.
+                        // `safe_spawn_local`: spawned from inside a signal
+                        // write (dioxus-signal-safety), and a no-op natively.
+                        crate::util::safe_spawn_local(async {
                             if let Err(e) = save_rooms_to_delegate().await {
                                 error!("Failed to save rooms to delegate after state update: {}", e);
                             }
@@ -2370,6 +2374,119 @@ mod tests {
         src[..cut].chars().filter(|c| !c.is_whitespace()).collect()
     }
 
+    /// A room in `ROOMS`, held as bob, with bob's recorded purge of token 1,
+    /// and the network state in which bob's other device's envelope (token 7)
+    /// won.
+    fn purge_heal_room() -> (VerifyingKey, ChatRoomStateV1) {
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        use river_core::room_state::direct_messages::{
+            advance_recipient_purges, DirectMessagesDelta, PurgeToken,
+        };
+        use river_core::room_state::member::{AuthorizedMember, Member};
+        let owner_sk = SigningKey::from_bytes(&[61u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[62u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let base = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            members: river_core::room_state::member::MembersV1 {
+                members: vec![AuthorizedMember::new(
+                    Member {
+                        owner_member_id: owner_id,
+                        invited_by: owner_id,
+                        member_vk: bob_sk.verifying_key(),
+                    },
+                    &owner_sk,
+                )],
+            },
+            ..Default::default()
+        };
+        let other_device =
+            advance_recipient_purges(&bob_sk, &owner_vk, None, [PurgeToken([7; 16])]).unwrap();
+        let mut network = base.clone();
+        network
+            .apply_delta(
+                &base,
+                &params,
+                &Some(ChatRoomStateV1Delta {
+                    direct_messages: Some(DirectMessagesDelta {
+                        new_messages: vec![],
+                        advanced_purges: vec![other_device],
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let mut rd = crate::room_data::test_minimal_room_data(owner_vk);
+        rd.self_sk = Some(bob_sk.clone());
+        rd.room_state = base;
+        rd.own_purges.record(
+            MemberId::from(bob_sk.verifying_key()),
+            [PurgeToken([1; 16])],
+        );
+        ROOMS.with_mut(|rooms| rooms.map.insert(owner_vk, rd));
+        (owner_vk, network)
+    }
+
+    fn held_tombstones(
+        owner_vk: &VerifyingKey,
+    ) -> Vec<river_core::room_state::direct_messages::PurgeToken> {
+        ROOMS.read().map[owner_vk]
+            .room_state
+            .direct_messages
+            .purges
+            .iter()
+            .flat_map(|p| p.state.purged.clone())
+            .collect()
+    }
+
+    /// An incoming full state whose winning purge envelope omits a purge
+    /// this device recorded leaves the room holding the re-signed union.
+    #[test]
+    fn a_full_state_ingestion_re_signs_a_lost_purge() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let dom = dioxus::prelude::VirtualDom::new(|| rsx! {});
+        dom.in_scope(dioxus::prelude::ScopeId::ROOT, || {
+            let (owner_vk, network) = purge_heal_room();
+            RoomSynchronizer::update_room_state_inner(owner_vk, network);
+            assert_eq!(
+                held_tombstones(&owner_vk),
+                vec![PurgeToken([1; 16]), PurgeToken([7; 16])]
+            );
+        });
+    }
+
+    /// The same for an incoming delta.
+    #[test]
+    fn a_delta_ingestion_re_signs_a_lost_purge() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let dom = dioxus::prelude::VirtualDom::new(|| rsx! {});
+        dom.in_scope(dioxus::prelude::ScopeId::ROOT, || {
+            let (owner_vk, network) = purge_heal_room();
+            let delta = ChatRoomStateV1Delta {
+                direct_messages: Some(
+                    river_core::room_state::direct_messages::DirectMessagesDelta {
+                        new_messages: vec![],
+                        advanced_purges: network.direct_messages.purges.clone(),
+                    },
+                ),
+                ..Default::default()
+            };
+            RoomSynchronizer::apply_delta_inner(owner_vk, delta);
+            assert_eq!(
+                held_tombstones(&owner_vk),
+                vec![PurgeToken([1; 16]), PurgeToken([7; 16])]
+            );
+        });
+    }
+
     /// Both inbound-sync paths re-sign a DM purge this device signed that the
     /// winning envelope omits, and mark the room for sync when they do
     /// (behaviour pinned by `a_device_whose_purge_lost_re_signs_the_union`
@@ -2390,6 +2507,28 @@ mod tests {
             assert!(body.contains("purges_healed=room_data.heal_own_purges();"));
             assert!(body.contains("ifpurges_healed{crate::components::app::mark_needs_sync("));
         }
+    }
+
+    /// Every GET path that brings network state into a held room re-signs a
+    /// lost DM purge after the state lands: the re-accept refresh, the join,
+    /// the imported-room replacement, the refresh merge and the recovered
+    /// state of a backward probe, and the two whose sync is not otherwise
+    /// marked mark it. None of the calls sits behind a constant condition.
+    #[test]
+    fn every_get_ingestion_path_heals_own_purges() {
+        let raw = include_str!("response_handler/get_response.rs");
+        let cut = raw.find("mod tests {").expect("a tests module to cut at");
+        let src: String = raw[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(src.matches("room_data.heal_own_purges()").count(), 5);
+        assert_eq!(
+            src.matches("ifpurges_healed{crate::components::app::mark_needs_sync(owner_vk);}")
+                .count(),
+            2
+        );
+        assert!(
+            !src.contains("iffalse"),
+            "no call behind a constant condition"
+        );
     }
 
     /// Issue freenet/river#526 regression guard.

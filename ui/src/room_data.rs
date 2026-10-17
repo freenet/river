@@ -530,6 +530,40 @@ impl RoomData {
     /// future writer CAN produce such a blob and this build must survive it.
     /// The graceful behaviour is "this identity cannot act": skip the signing
     /// or decryption, log, and leave the rest of the room readable.
+    /// Apply this member's purge `envelope` (signed on this device, purging
+    /// `tokens`) to the room, and record the tokens as this device's own, so
+    /// a concurrent envelope from another device of the member cannot drop
+    /// them for good ([`Self::heal_own_purges`]).
+    pub fn apply_own_purge(
+        &mut self,
+        envelope: river_core::room_state::direct_messages::AuthorizedRecipientPurges,
+        tokens: Vec<river_core::room_state::direct_messages::PurgeToken>,
+    ) -> Result<(), String> {
+        let recipient = envelope.recipient_id;
+        let delta = river_core::room_state::ChatRoomStateV1Delta {
+            direct_messages: Some(
+                river_core::room_state::direct_messages::DirectMessagesDelta {
+                    new_messages: vec![],
+                    advanced_purges: vec![envelope],
+                },
+            ),
+            ..Default::default()
+        };
+        let parent = self.room_state.clone();
+        self.room_state.apply_delta(
+            &parent,
+            &ChatRoomParametersV1 {
+                owner: self.owner_vk,
+            },
+            &Some(delta),
+        )?;
+        // #310: preserve private edits/reactions across the optimistic
+        // apply_delta. No-op on public rooms.
+        self.rebuild_private_actions_state();
+        self.own_purges.record(recipient, tokens);
+        Ok(())
+    }
+
     /// Re-sign a DM purge this device signed that the room's winning purge
     /// envelope for this member omits (a concurrent envelope from another
     /// device of the same member won), as `river_core::own_purges::OwnPurges::heal`
@@ -3223,6 +3257,48 @@ mod tests {
         assert_eq!(tombstones(&x), vec![t1, t2]);
         assert_eq!(tombstones(&y), vec![t1, t2]);
         assert_eq!(x.room_state.direct_messages, y.room_state.direct_messages);
+    }
+
+    /// Deleting a peer's DMs applies the envelope and records its tokens as
+    /// this device's own, under the member's id.
+    #[test]
+    fn a_purge_is_applied_and_recorded_as_own() {
+        use river_core::room_state::direct_messages::{advance_recipient_purges, PurgeToken};
+        let owner_sk = SigningKey::from_bytes(&[35u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[36u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(owner_vk);
+        let mut rd = test_minimal_room_data(owner_vk);
+        rd.self_sk = Some(bob_sk.clone());
+        rd.room_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        rd.room_state.members.members = vec![AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: bob_sk.verifying_key(),
+            },
+            &owner_sk,
+        )];
+        let token = PurgeToken([3; 16]);
+        let env = advance_recipient_purges(&bob_sk, &owner_vk, None, [token]).unwrap();
+        rd.apply_own_purge(env, vec![token]).unwrap();
+        assert_eq!(
+            rd.room_state.direct_messages.purges[0].state.purged,
+            vec![token]
+        );
+        assert_eq!(
+            rd.own_purges.purged,
+            vec![(MemberId::from(bob_sk.verifying_key()), token)]
+        );
     }
 
     /// No loop: a device whose re-signed envelope has not landed does not

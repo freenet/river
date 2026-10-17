@@ -206,30 +206,37 @@ pub async fn handle_get_response(
                 // ROOMS mutation in this handler) to avoid a borrow conflict
                 // with the synchronous signal reads above.
                 crate::util::defer(move || {
-                    ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
-                            let params = ChatRoomParametersV1 { owner: owner_vk };
-                            let current_state = room_data.room_state.clone();
-                            match room_data.room_state.merge(
-                                &current_state,
-                                &params,
-                                &retrieved_state,
-                            ) {
-                                Ok(_) => {
-                                    room_data.capture_self_membership_data(&params);
-                                    let _ = room_data.repopulate_secrets_from_state();
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Re-accept refresh: failed to merge state for room \
-                                         {:?}: {}",
-                                        MemberId::from(owner_vk),
-                                        e
-                                    );
-                                }
+                    let purges_healed = ROOMS.with_mut(|rooms| {
+                        let Some(room_data) = rooms.map.get_mut(&owner_vk) else {
+                            return false;
+                        };
+                        let params = ChatRoomParametersV1 { owner: owner_vk };
+                        let current_state = room_data.room_state.clone();
+                        match room_data
+                            .room_state
+                            .merge(&current_state, &params, &retrieved_state)
+                        {
+                            Ok(_) => {
+                                room_data.capture_self_membership_data(&params);
+                                let _ = room_data.repopulate_secrets_from_state();
+                                // A DM purge this device signed that the
+                                // network's winning envelope omits.
+                                room_data.heal_own_purges()
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Re-accept refresh: failed to merge state for room \
+                                     {:?}: {}",
+                                    MemberId::from(owner_vk),
+                                    e
+                                );
+                                false
                             }
                         }
                     });
+                    if purges_healed {
+                        crate::components::app::mark_needs_sync(owner_vk);
+                    }
                 });
 
                 // Move the room out of `Subscribing` in SYNC_INFO.
@@ -599,6 +606,9 @@ pub async fn handle_get_response(
                             decrypted, member_id
                         );
                     }
+                    // A DM purge this device signed that the network's winning
+                    // envelope omits (published by the sync marked below).
+                    let _ = room_data.heal_own_purges();
 
                     // The invitee's `authorized_member_info` was built once
                     // above, before `build_state_for_put`, and moved into this
@@ -1009,8 +1019,11 @@ pub async fn handle_get_response(
             }
 
             crate::util::defer(move || {
-                ROOMS.with_mut(|rooms| {
-                    if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                let purges_healed = ROOMS.with_mut(|rooms| {
+                    let Some(room_data) = rooms.map.get_mut(&owner_vk) else {
+                        return false;
+                    };
+                    {
                         let params = ChatRoomParametersV1 { owner: owner_vk };
 
                         // Note: we intentionally do NOT record receive times here.
@@ -1051,6 +1064,9 @@ pub async fn handle_get_response(
                             // key guard inside the helper makes lingering
                             // entries from a prior state harmless.
                             let _ = room_data.repopulate_secrets_from_state();
+                            // A DM purge this device signed that the network's
+                            // winning envelope omits.
+                            room_data.heal_own_purges()
                         } else {
                             let current_state = room_data.room_state.clone();
                             match room_data
@@ -1070,6 +1086,9 @@ pub async fn handle_get_response(
                                     // this, the in-memory `secrets` map stays
                                     // stale until the next subscription update.
                                     let _ = room_data.repopulate_secrets_from_state();
+                                    // A DM purge this device signed that the
+                                    // network's winning envelope omits.
+                                    room_data.heal_own_purges()
                                 }
                                 Err(e) => {
                                     error!(
@@ -1077,11 +1096,15 @@ pub async fn handle_get_response(
                                         MemberId::from(owner_vk),
                                         e
                                     );
+                                    false
                                 }
                             }
                         }
                     }
                 });
+                if purges_healed {
+                    crate::components::app::mark_needs_sync(owner_vk);
+                }
             });
 
             // Send the member-info self-heal as a standalone UPDATE — but
@@ -1551,6 +1574,9 @@ pub(crate) fn merge_recovered_into_room(
     }
     room_data.capture_self_membership_data(&params);
     let _ = room_data.repopulate_secrets_from_state();
+    // A DM purge this device signed that the recovered state's winning
+    // envelope omits (published with the room's next sync).
+    let _ = room_data.heal_own_purges();
     true
 }
 

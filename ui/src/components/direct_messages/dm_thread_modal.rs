@@ -848,34 +848,14 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                 };
 
-            let delta = ChatRoomStateV1Delta {
-                direct_messages: Some(DirectMessagesDelta {
-                    new_messages: vec![],
-                    advanced_purges: vec![envelope.clone()],
-                }),
-                ..Default::default()
-            };
-            let params = ChatRoomParametersV1 { owner: room };
-
             crate::util::defer(move || {
                 let applied = ROOMS.with_mut(|rooms| {
                     let Some(rd) = rooms.map.get_mut(&room) else {
                         return false;
                     };
-                    let parent = rd.room_state.clone();
-                    if let Err(e) = rd.room_state.apply_delta(&parent, &params, &Some(delta)) {
-                        error!("DM purge apply_delta failed: {:?}", e);
-                        false
-                    } else {
-                        // #310: preserve private edits/reactions across the
-                        // optimistic apply_delta. No-op on public rooms.
-                        rd.rebuild_private_actions_state();
-                        // Recorded so a concurrent envelope from another
-                        // device of this member cannot drop them for good
-                        // (`RoomData::heal_own_purges`).
-                        rd.own_purges.record(self_id, purged_tokens);
-                        true
-                    }
+                    rd.apply_own_purge(envelope, purged_tokens)
+                        .map_err(|e| error!("DM purge apply_delta failed: {:?}", e))
+                        .is_ok()
                 });
                 if applied {
                     mark_needs_sync(room);
@@ -2367,7 +2347,7 @@ mod tests {
         let src: String = raw[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         assert!(src.contains(&format!(
             "{}{}",
-            "rd.own_purges.record(self_id,", "purged_tokens);"
+            "rd.apply_own_purge(envelope,", "purged_tokens)"
         )));
         assert!(src.contains(&format!("{}{}", "letpurged_tokens=", "tokens.clone();")));
     }
