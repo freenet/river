@@ -1796,7 +1796,6 @@ mod tests {
     /// that does not outrank); the local merges converge instead of keeping
     /// one side.
     fn lowered_and_stale(sk: &SigningKey) -> (ChatRoomStateV1, ChatRoomStateV1) {
-        use freenet_scaffold::ComposableState;
         use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
         let owner_id = MemberId::from(&sk.verifying_key());
         let cfg = |version: u32, cap: usize| {
