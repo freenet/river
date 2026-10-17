@@ -41,9 +41,13 @@ Two converging paths:
 - Both paths derive the new secret deterministically via
   `river_core::key_derivation::derive_room_secret(seed, owner_vk, new_version)`,
   so they produce **byte-identical** secrets for the same target version.
-  Concurrent rotation by both paths therefore converges via the contract's
-  duplicate-version dedup in `RoomSecretsV1::apply_delta`
-  (`secret.rs:140-145`).
+  Concurrent rotation by both paths therefore converges in
+  `RoomSecretsV1::apply_delta`: the encrypted blobs are byte-identical (a
+  held blob is a no-op), and the two version RECORDS are not (the UI stamps
+  `created_at` with the wall clock, the delegate with `UNIX_EPOCH`), so the
+  record with the greater signature digest wins at that version. Until
+  freenet/river#703 the second record was rejected as "Duplicate secret
+  version", failing the whole delta.
 
 ## Shared rotation back-fill helper (issue #110)
 
@@ -167,11 +171,11 @@ message {send,reply,edit,delete}` and reactions all work in a private room.
 
 All three helpers share `resolve_current_secret` (one secret-resolution
 decision for every message kind, so no kind leaks as an unsealed public body)
-and `guard_message_size`. **Deliberate divergence from the UI:** when no secret
-is available for the current version the UI logs a warning and falls back to a
-**public** body (`conversation.rs`, which the contract then rejects); the CLI
-helpers instead **error** — never sending a public body into a private room,
-and never sealing under a stale (non-current) version. They also error on an
+and `guard_message_size`. When no secret is available for the current version
+the CLI helpers **error** — never sending a public body into a private room
+(which the room does not admit), and never sealing under a stale (non-current)
+version. The UI does not offer a composer in that state
+(`RoomData::missing_room_secret`) and its send path refuses as a backstop. They also error on an
 over-`max_message_size` body, which the contract would otherwise silently
 drop. For a private reply, the target author name and content preview are
 sealed alongside the reply text (they are fields of `ReplyContentV1`), so the
@@ -213,7 +217,8 @@ placeholder. The helper routes the nickname through
 private room) and falls back to public `"Member"` when no nickname is
 stored, a private room has no secret (so the plaintext is never leaked),
 OR the stored nickname exceeds the room's current `max_nickname_size`
-(which would otherwise make the contract reject the whole rejoin delta).
+(a client rule: riverctl and the UI do not sign a nickname over it; the
+room itself holds nicknames only to a fixed 1000-byte ceiling).
 
 This is a PARTIAL analog of the UI's `build_member_info_heal`, NOT the
 full #304 heal: it only restores the nickname on the rejoin/send path,

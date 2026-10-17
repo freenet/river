@@ -1,4 +1,5 @@
 use crate::room_state::member::MemberId;
+use crate::room_state::member_info::{outranks, sig_digest, SigDigest};
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, truncated_base64, verify_struct};
 use crate::ChatRoomStateV1;
@@ -17,9 +18,17 @@ pub struct AuthorizedUpgradeV1 {
     pub signature: Signature,
 }
 
+/// An upgrade pointer's place in the order peers resolve it by: higher
+/// `version` wins, and at an equal version the greater signature digest wins
+/// (freenet/river#703), as for the configuration and `member_info`.
+pub type UpgradeRank = (u8, SigDigest);
+
 impl ComposableState for OptionalUpgradeV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = Option<u8>;
+    /// The held pointer's [`UpgradeRank`], so two pointers at the same
+    /// version are told apart and converge on one. Changing this type re-keys
+    /// the contract.
+    type Summary = Option<UpgradeRank>;
     type Delta = AuthorizedUpgradeV1;
     type Parameters = ChatRoomParametersV1;
 
@@ -42,7 +51,7 @@ impl ComposableState for OptionalUpgradeV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        self.0.as_ref().map(|u| u.upgrade.version)
+        self.0.as_ref().map(AuthorizedUpgradeV1::rank)
     }
 
     fn delta(
@@ -53,10 +62,9 @@ impl ComposableState for OptionalUpgradeV1 {
     ) -> Option<Self::Delta> {
         match &self.0 {
             Some(upgrade) => {
-                // If the upgrade has a higher version than the old room_state summary or of the old summary is None
-                // then return the upgrade as a delta
-                if old_state_summary.is_none_or(|old_version| upgrade.upgrade.version > old_version)
-                {
+                // Offer the pointer if the receiver holds none, or one it
+                // outranks.
+                if old_state_summary.is_none_or(|old_rank| outranks(upgrade.rank(), old_rank)) {
                     Some(upgrade.clone())
                 } else {
                     None
@@ -73,6 +81,17 @@ impl ComposableState for OptionalUpgradeV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(delta) = delta {
+            // A pointer that does not outrank the held one is a no-op: a
+            // re-delivery, or an older pointer from a delta computed against
+            // a stale summary. Before freenet/river#703 it was adopted
+            // unconditionally, so such a delta rolled the pointer back.
+            if self
+                .0
+                .as_ref()
+                .is_some_and(|held| !outranks(delta.rank(), held.rank()))
+            {
+                return Ok(());
+            }
             // Verify the delta before applying it
             delta
                 .validate(&parameters.owner)
@@ -85,6 +104,11 @@ impl ComposableState for OptionalUpgradeV1 {
 }
 
 impl AuthorizedUpgradeV1 {
+    /// This pointer's [`UpgradeRank`].
+    pub fn rank(&self) -> UpgradeRank {
+        (self.upgrade.version, sig_digest(&self.signature))
+    }
+
     pub fn new(upgrade: UpgradeV1, signing_key: &SigningKey) -> Self {
         Self {
             upgrade: upgrade.clone(),
@@ -206,7 +230,7 @@ mod tests {
         let upgrade = create_test_upgrade(owner_id);
         let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade, &signing_key);
 
-        let optional_upgrade = OptionalUpgradeV1(Some(authorized_upgrade));
+        let optional_upgrade = OptionalUpgradeV1(Some(authorized_upgrade.clone()));
 
         let parent_state = ChatRoomStateV1::default();
         let parameters = ChatRoomParametersV1 {
@@ -214,7 +238,10 @@ mod tests {
         };
 
         let summary = optional_upgrade.summarize(&parent_state, &parameters);
-        assert_eq!(summary, Some(1));
+        assert_eq!(
+            summary,
+            Some((1, sig_digest(&authorized_upgrade.signature)))
+        );
 
         let none_upgrade = OptionalUpgradeV1(None);
         let none_summary = none_upgrade.summarize(&parent_state, &parameters);
@@ -266,5 +293,62 @@ mod tests {
             .apply_delta(&parent_state, &parameters, &Some(delta.clone()))
             .is_ok());
         assert_eq!(optional_upgrade, OptionalUpgradeV1(Some(delta)));
+    }
+
+    /// freenet/river#703: an older pointer (a stale delta) must not roll the
+    /// held one back, a re-delivery is a no-op, and two pointers at the same
+    /// version converge on the higher-ranked one from either side.
+    #[test]
+    fn upgrade_pointer_resolves_by_rank() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let parent_state = ChatRoomStateV1::default();
+        let pointer = |version: u8, byte: u8| {
+            AuthorizedUpgradeV1::new(
+                UpgradeV1 {
+                    owner_member_id: owner_id,
+                    version,
+                    new_chatroom_address: Hash::from([byte; 32]),
+                },
+                &owner_sk,
+            )
+        };
+
+        let mut held = OptionalUpgradeV1(Some(pointer(2, 2)));
+        held.apply_delta(&parent_state, &parameters, &Some(pointer(1, 1)))
+            .unwrap();
+        assert_eq!(held, OptionalUpgradeV1(Some(pointer(2, 2))), "no rollback");
+        held.apply_delta(&parent_state, &parameters, &Some(pointer(2, 2)))
+            .unwrap();
+        assert_eq!(held, OptionalUpgradeV1(Some(pointer(2, 2))));
+
+        let (x, y) = (pointer(3, 7), pointer(3, 9));
+        let (hi, lo) = if outranks(x.rank(), y.rank()) {
+            (x, y)
+        } else {
+            (y, x)
+        };
+        let mut on_lo = OptionalUpgradeV1(Some(lo.clone()));
+        let d = OptionalUpgradeV1(Some(hi.clone())).delta(
+            &parent_state,
+            &parameters,
+            &on_lo.summarize(&parent_state, &parameters),
+        );
+        on_lo.apply_delta(&parent_state, &parameters, &d).unwrap();
+        let mut on_hi = OptionalUpgradeV1(Some(hi.clone()));
+        let d = OptionalUpgradeV1(Some(lo.clone())).delta(
+            &parent_state,
+            &parameters,
+            &on_hi.summarize(&parent_state, &parameters),
+        );
+        assert_eq!(d, None);
+        on_hi
+            .apply_delta(&parent_state, &parameters, &Some(lo))
+            .unwrap();
+        assert_eq!(on_lo, on_hi);
+        assert_eq!(on_hi, OptionalUpgradeV1(Some(hi)));
     }
 }

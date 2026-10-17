@@ -668,9 +668,9 @@ fn absorbing_two_peers_is_associative() {
     );
 }
 
-/// A zero cap is reachable: `AuthorizedConfigurationV1::apply_delta` rejects
-/// it, but `verify` does not, so an owner-signed zero still arrives on the
-/// full-state path. The peer must retain nothing AND be offered nothing —
+/// A zero cap is reachable: a configuration holding one ranks below every
+/// valid one, but `verify` accepts it, so an owner-signed zero can be held
+/// after a full-state PUT. The peer must retain nothing AND be offered nothing —
 /// suppressing the delta rather than looping against a peer that keeps nothing.
 #[test]
 fn a_zero_cap_peer_retains_nothing_and_is_offered_nothing() {

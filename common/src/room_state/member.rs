@@ -1,5 +1,5 @@
 use crate::room_state::ban::{BanId, BansV1};
-use crate::room_state::ban_evidence::BanEvidenceV1;
+use crate::room_state::ban_evidence::{evidence_digest, BanEvidenceV1, EvidenceDigest};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, truncated_base32, verify_struct};
@@ -32,6 +32,10 @@ impl ComposableState for MembersV1 {
     // two identical member sets summarize to different bytes → spurious
     // anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
     // and freenet/freenet-core#4857.
+    //
+    // Ids only: a peer keeps the record it holds for a member (see
+    // `MembersV1::resolve_records`), so a different record for a held id is
+    // never offered or taken, and the summary need not tell two apart.
     type Summary = BTreeSet<MemberId>;
     type Delta = MembersDelta;
     type Parameters = ChatRoomParametersV1;
@@ -111,6 +115,10 @@ impl ComposableState for MembersV1 {
     ) -> Result<(), String> {
         let max_members = parent_state.configuration.configuration.max_members;
 
+        // One record per id among those held, on every apply (see
+        // `normalize_held_records`).
+        self.normalize_held_records(parameters);
+
         if let Some(delta) = delta {
             // A bound on the compute work one delta can cause, not a room
             // rule: each added member costs a signature check, and a delta
@@ -121,51 +129,46 @@ impl ComposableState for MembersV1 {
             // `max_members` reduction can produce a delta over the bound; it
             // is rejected only until that peer receives the new
             // configuration and trims its own set.
-            let work_bound = max_members.max(MIN_MEMBERS_DELTA_BOUND);
-            if delta.added.len() > work_bound {
+            //
+            // Only NEW records count: a record for an id this peer already
+            // holds is skipped before anything else (see `resolve_records`),
+            // so a delta computed against a stale summary of this peer, which
+            // re-delivers held members, costs nothing and is not refused over
+            // them (freenet/river#703 defect 2). A raw length past held +
+            // bound is refused first.
+            //
+            // The owner is never in the members list (`verify` rejects a
+            // record with the owner's id). Such a record in a delta is ignored
+            // here rather than failing the delta, so the rest of the delta
+            // applies the same way whatever else it carries.
+            let work_bound = members_work_bound(max_members);
+            if !crate::room_state::work_bounds::lifted()
+                && delta.added.len() > self.members.len().saturating_add(work_bound)
+            {
                 return Err(format!(
                     "Members delta of {} exceeds {}",
                     delta.added.len(),
                     work_bound
                 ));
             }
-
-            // The owner is never in the members list (`verify` rejects a
-            // record with the owner's id). Such a record in a delta is ignored
-            // here rather than failing the delta, so the rest of the delta
-            // applies the same way whatever else it carries.
             let owner_id = parameters.owner_id();
+            let held: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
+            let mut in_delta = HashSet::new();
             let added: Vec<&AuthorizedMember> = delta
                 .added
                 .iter()
                 .filter(|m| m.member.id() != owner_id)
+                .filter(|m| !held.contains(&m.member.id()) && in_delta.insert(evidence_digest(m)))
                 .collect();
-
-            // Build a combined lookup map that includes both existing members
-            // AND members being added in this delta. This is necessary because
-            // during merge, a member and their inviter may both be in the delta
-            // (e.g., member B invited by member A, both being added from the
-            // other state). Without this, verify would fail with "Inviter not found".
-            let mut combined_members_by_id = self.members_by_member_id();
-            for member in &added {
-                combined_members_by_id
-                    .entry(member.member.id())
-                    .or_insert(member);
+            if !crate::room_state::work_bounds::lifted() && added.len() > work_bound {
+                return Err(format!(
+                    "Members delta of {} new members exceeds {}",
+                    added.len(),
+                    work_bound
+                ));
             }
-
-            // Verify that all new members have valid invites
-            Self::verify_invite_chains(&added, parameters, &combined_members_by_id)?;
-
-            // Add ALL new members (deduplicated), let remove_excess_members handle trimming.
-            // This ensures CRDT convergence: regardless of delta order, the same set of
-            // members will be kept based on the deterministic removal criteria.
-            let mut held: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
-            for member in added {
-                // Skip if this member already exists
-                if !held.insert(member.member.id()) {
-                    continue;
-                }
-                self.members.push(member.clone());
+            if !added.is_empty() {
+                self.members = Self::resolve_records(&self.members, &added, parameters)?;
             }
         }
 
@@ -191,21 +194,217 @@ impl ComposableState for MembersV1 {
 /// See `MembersV1::apply_delta`.
 const MIN_MEMBERS_DELTA_BOUND: usize = 1_000;
 
+/// How many new members one delta may add in a room with `max_members`.
+pub fn members_work_bound(max_members: usize) -> usize {
+    max_members.max(MIN_MEMBERS_DELTA_BOUND)
+}
+
 impl MembersV1 {
-    /// Verify the invite chain of every member in `added` against a lookup
-    /// map that includes both existing members AND the delta's members, so
-    /// inviters in the same delta can be found. Each record's signature is
-    /// checked at most once per call.
-    fn verify_invite_chains<'a>(
-        added: &[&'a AuthorizedMember],
+    /// The member records to keep: every `held` one, plus the `added` ones
+    /// this room admits. `added` holds no record for a held id: the caller
+    /// skips those: a held record is kept, and a record naming a different
+    /// inviter or a different key for a held id is skipped. Two peers that
+    /// each hold a different record for one member therefore each keep their
+    /// own when they merge.
+    ///
+    /// The added records are placed by a breadth-first walk from the owner
+    /// through the held and added records: each new member keeps a record at
+    /// its least invite depth, and of several at that depth the one with the
+    /// lower record digest, so the result does not depend on the order the
+    /// records arrived in. A record that is never reached (its inviter is
+    /// unknown here, or it only loops back on itself) is skipped rather than
+    /// failing the delta: a delta computed against a stale summary can omit
+    /// an inviter this peer has since pruned, and the next delta re-sends the
+    /// record with its inviter (freenet/river#703 defect 2). Each record is
+    /// visited once, so the work is linear in the records. Every reached
+    /// added record has its signature checked against its inviter's key, and
+    /// a bad one fails the delta. Held records are kept as they are, reached
+    /// or not.
+    fn resolve_records(
+        held: &[AuthorizedMember],
+        added: &[&AuthorizedMember],
         parameters: &ChatRoomParametersV1,
-        members_by_id: &HashMap<MemberId, &'a AuthorizedMember>,
-    ) -> Result<(), String> {
-        let mut verified = HashSet::new();
-        for member in added {
-            Self::verify_invite_chain(member, parameters, members_by_id, &mut verified)?;
+    ) -> Result<Vec<AuthorizedMember>, String> {
+        let owner_id = parameters.owner_id();
+        let mut held_by_inviter: HashMap<MemberId, Vec<&AuthorizedMember>> = HashMap::new();
+        for m in held {
+            held_by_inviter
+                .entry(m.member.invited_by)
+                .or_default()
+                .push(m);
         }
-        Ok(())
+        // Of new records for one id that name different keys, only those
+        // naming the key of the LAST one in the delta compete: a delta lists
+        // a sender's records in the order it stores them, and that last
+        // record is the one the sender's `verify` reads and its
+        // normalization keeps (see `normalize_held_records`), so this peer
+        // keeps the record the sender keeps.
+        let mut sender_key: HashMap<MemberId, VerifyingKey> = HashMap::new();
+        for m in added {
+            sender_key.insert(m.member.id(), m.member.member_vk);
+        }
+        let mut added_by_inviter: HashMap<MemberId, Vec<&AuthorizedMember>> = HashMap::new();
+        for m in added
+            .iter()
+            .filter(|m| sender_key.get(&m.member.id()) == Some(&m.member.member_vk))
+        {
+            added_by_inviter
+                .entry(m.member.invited_by)
+                .or_default()
+                .push(m);
+        }
+        let held_ids: HashSet<MemberId> = held.iter().map(|m| m.member.id()).collect();
+        // Every key some held or added record names for each id.
+        let mut by_id_keys: HashMap<MemberId, Vec<VerifyingKey>> = HashMap::new();
+        for m in held.iter().chain(added.iter().copied()) {
+            let keys = by_id_keys.entry(m.member.id()).or_default();
+            if !keys.contains(&m.member.member_vk) {
+                keys.push(m.member.member_vk);
+            }
+        }
+        let mut reached: HashSet<MemberId> = HashSet::from([owner_id]);
+        let mut kept: BTreeMap<MemberId, &AuthorizedMember> = BTreeMap::new();
+        let mut frontier: Vec<(MemberId, VerifyingKey)> = vec![(owner_id, parameters.owner)];
+        while !frontier.is_empty() {
+            let mut next: Vec<(MemberId, VerifyingKey)> = Vec::new();
+            let mut level: BTreeMap<MemberId, (EvidenceDigest, &AuthorizedMember)> =
+                BTreeMap::new();
+            for (inviter_id, inviter_vk) in &frontier {
+                for record in held_by_inviter.get(inviter_id).into_iter().flatten() {
+                    #[cfg(test)]
+                    tests::count_chain_step();
+                    let id = record.member.id();
+                    if reached.insert(id) {
+                        next.push((id, record.member.member_vk));
+                    }
+                }
+                for record in added_by_inviter.get(inviter_id).into_iter().flatten() {
+                    #[cfg(test)]
+                    tests::count_chain_step();
+                    let id = record.member.id();
+                    if id == owner_id || held_ids.contains(&id) {
+                        continue;
+                    }
+                    // Checked even when the member already has a record kept
+                    // at a lesser depth, so whether a delta fails does not
+                    // depend on which records it competes with.
+                    #[cfg(test)]
+                    tests::count_invite_signature_check();
+                    if let Err(e) = record.verify_signature(inviter_vk) {
+                        // Signed by the key another record for its inviter's
+                        // id names: skipped, as a record whose inviter record
+                        // this peer does not keep. Otherwise the delta
+                        // fails.
+                        let other_key_signed = by_id_keys
+                            .get(inviter_id)
+                            .into_iter()
+                            .flatten()
+                            .any(|vk| vk != inviter_vk && record.verify_signature(vk).is_ok());
+                        if other_key_signed {
+                            continue;
+                        }
+                        return Err(format!("Invalid signature for member {:?}: {}", id, e));
+                    }
+                    if reached.contains(&id) {
+                        continue;
+                    }
+                    let digest = evidence_digest(record);
+                    level
+                        .entry(id)
+                        .and_modify(|best| {
+                            if digest < best.0 {
+                                *best = (digest, record);
+                            }
+                        })
+                        .or_insert((digest, record));
+                }
+            }
+            for (id, (_, r)) in level {
+                reached.insert(id);
+                next.push((id, r.member.member_vk));
+                kept.insert(id, r);
+            }
+            frontier = next;
+        }
+        let mut out = held.to_vec();
+        out.extend(kept.into_values().cloned());
+        Ok(out)
+    }
+
+    /// Reduce the held records to one per member id. `verify` accepts a state
+    /// holding two records for one id (a full-state PUT can carry one), and
+    /// without this the record such a state used, and its summary, would
+    /// depend on the order the records happen to be stored in.
+    ///
+    /// Only records naming the key `verify` checks the state's other records
+    /// against compete (the key of the last record stored for the id, as
+    /// [`Self::members_by_member_id`] reads it), so normalization keeps the
+    /// record `verify` checks the member's invitees against and a valid state
+    /// stays valid. Among those, the record kept is the one at the least invite
+    /// depth through the held records (a record whose chain does not reach
+    /// the owner counts as deepest), then the lower record digest. Depth
+    /// first, because the shallowest record depends on the fewest others to
+    /// stay valid; the digest breaks a tie. Records for one id that name one
+    /// key are kept the same way whatever order they are stored in. Applied
+    /// only among duplicates one state already holds: an arriving record
+    /// never replaces a held one (see `resolve_records`). A no-op, after one
+    /// pass over the ids, when no id is held twice.
+    fn normalize_held_records(&mut self, parameters: &ChatRoomParametersV1) {
+        let mut seen = HashSet::new();
+        if self.members.iter().all(|m| seen.insert(m.member.id())) {
+            return;
+        }
+        let owner_id = parameters.owner_id();
+        let mut by_inviter: HashMap<MemberId, Vec<usize>> = HashMap::new();
+        for (i, m) in self.members.iter().enumerate() {
+            by_inviter.entry(m.member.invited_by).or_default().push(i);
+        }
+        // Each record's depth: one more than the least depth of its inviter's
+        // id, by a breadth-first walk over ids from the owner.
+        let mut depth = vec![usize::MAX; self.members.len()];
+        let mut reached: HashSet<MemberId> = HashSet::from([owner_id]);
+        let mut frontier = vec![owner_id];
+        let mut level = 1;
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for inviter in &frontier {
+                for &i in by_inviter.get(inviter).into_iter().flatten() {
+                    depth[i] = depth[i].min(level);
+                    let id = self.members[i].member.id();
+                    if reached.insert(id) {
+                        next.push(id);
+                    }
+                }
+            }
+            frontier = next;
+            level += 1;
+        }
+        let verify_key: HashMap<MemberId, VerifyingKey> = self
+            .members
+            .iter()
+            .map(|m| (m.member.id(), m.member.member_vk))
+            .collect();
+        let mut best: BTreeMap<MemberId, (usize, EvidenceDigest, usize)> = BTreeMap::new();
+        for (i, m) in self.members.iter().enumerate() {
+            if verify_key.get(&m.member.id()) != Some(&m.member.member_vk) {
+                continue;
+            }
+            let rank = (depth[i], evidence_digest(m), i);
+            best.entry(m.member.id())
+                .and_modify(|b| {
+                    if (rank.0, rank.1) < (b.0, b.1) {
+                        *b = rank;
+                    }
+                })
+                .or_insert(rank);
+        }
+        let keep: HashSet<usize> = best.values().map(|b| b.2).collect();
+        let mut i = 0;
+        self.members.retain(|_| {
+            let k = keep.contains(&i);
+            i += 1;
+            k
+        });
     }
 
     /// Verify `member`'s invite chain up to the owner, with the same checks
@@ -1128,6 +1327,15 @@ pub(crate) mod tests {
 
     thread_local! {
         static INVITE_SIGNATURE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static CHAIN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_chain_step() {
+        CHAIN_STEPS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn chain_steps() -> usize {
+        CHAIN_STEPS.with(|c| c.get())
     }
 
     pub(super) fn count_invite_signature_check() {
@@ -1248,14 +1456,16 @@ pub(crate) mod tests {
             let sk = SigningKey::generate(rng);
             // Invited by the owner or by an earlier member, biased deep.
             let pick = rng.gen_range(0..=records.len());
-            let (inviter_id, inviter_sk) = if pick == records.len() && rng.gen_bool(0.2) {
-                (owner_id, owner_sk.clone())
-            } else if records.is_empty() {
-                (owner_id, owner_sk.clone())
-            } else {
-                let i = rng.gen_range(0..records.len());
-                (records[i].member.id(), keys[i].clone())
-            };
+            // `gen_bool` is drawn only when `pick == records.len()`, as before
+            // these two identical branches were merged, so the RNG stream is
+            // unchanged.
+            let (inviter_id, inviter_sk) =
+                if (pick == records.len() && rng.gen_bool(0.2)) || records.is_empty() {
+                    (owner_id, owner_sk.clone())
+                } else {
+                    let i = rng.gen_range(0..records.len());
+                    (records[i].member.id(), keys[i].clone())
+                };
             let member = Member {
                 owner_member_id: owner_id,
                 invited_by: inviter_id,
@@ -1473,7 +1683,9 @@ pub(crate) mod tests {
     }
 
     /// A record whose own signature does not verify rejects the delta,
-    /// whatever else in the delta shares its id, in either order.
+    /// whatever else in the delta shares its id, in either order, unless its
+    /// id is already held: a record for a held id is skipped unchecked, since
+    /// the held record is kept whatever arrives (freenet/river#703).
     #[test]
     fn a_record_sharing_an_id_with_a_verified_one_is_still_checked() {
         let r = same_id_records();
@@ -1490,17 +1702,56 @@ pub(crate) mod tests {
         assert!(apply(vec![r.b.clone()], vec![r.other.clone(), r.genuine.clone()]).is_err());
         // The genuine record held, with a member it invited in the delta.
         let held = vec![r.genuine.clone(), r.b.clone()];
-        assert!(apply(held.clone(), vec![r.y.clone(), r.other.clone()]).is_err());
-        assert!(apply(held.clone(), vec![r.other.clone(), r.y.clone()]).is_err());
-        assert!(apply(held, vec![r.y.clone()]).is_ok());
+        for added in [
+            vec![r.y.clone(), r.other.clone()],
+            vec![r.other.clone(), r.y.clone()],
+            vec![r.y.clone()],
+        ] {
+            let mut members = MembersV1 {
+                members: held.clone(),
+            };
+            members
+                .apply_delta(
+                    &r.parent_state,
+                    &r.parameters,
+                    &Some(MembersDelta::new(added)),
+                )
+                .expect("a record for a held id is skipped");
+            assert!(members.members.contains(&r.genuine));
+            assert!(!members.members.contains(&r.other));
+        }
     }
 
-    /// A second record for a held member's key, validly signed by a member
-    /// further down the held record's own subtree, makes the chain return to
-    /// its own id. The delta is rejected in either order, also when an earlier
-    /// walk in the same delta already verified the held record.
+    /// `members.apply_delta(added)` on a separate thread, failing the test if
+    /// it does not finish within 30 seconds: a looping invite chain must fail
+    /// a test with a message, not hang the suite.
+    fn apply_within_seconds(
+        mut members: MembersV1,
+        parent_state: &ChatRoomStateV1,
+        parameters: &ChatRoomParametersV1,
+        added: Vec<AuthorizedMember>,
+    ) -> MembersV1 {
+        let (parent_state, parameters) = (parent_state.clone(), parameters.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = members
+                .apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(added)))
+                .map(|()| members);
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("apply_delta did not finish: a looping invite chain was followed forever")
+            .unwrap()
+    }
+
+    /// A second record for a member's key, validly signed by a member
+    /// further down that member's own subtree, would make the chain return to
+    /// its own id. It is never stored: the member keeps the record nearest
+    /// the owner, and a record reachable only through itself is never
+    /// reached. Until freenet/river#703 a delta carrying it without the
+    /// member held was rejected outright.
     #[test]
-    fn a_record_whose_chain_returns_to_its_own_id_is_rejected() {
+    fn a_record_whose_chain_returns_to_its_own_id_is_never_stored() {
         let owner_sk = SigningKey::generate(&mut OsRng);
         let owner_id: MemberId = owner_sk.verifying_key().into();
         let (x, x_sk) = create_test_member(owner_id, owner_id);
@@ -1535,15 +1786,149 @@ pub(crate) mod tests {
         for added in [
             vec![y.clone(), s.clone()],
             vec![s.clone(), y.clone()],
-            vec![s],
+            vec![s.clone()],
         ] {
-            let mut members = MembersV1 {
-                members: held.clone(),
-            };
-            let result =
-                members.apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(added)));
-            assert!(result.is_err(), "{result:?}");
+            let members = apply_within_seconds(
+                MembersV1 {
+                    members: held.clone(),
+                },
+                &parent_state,
+                &parameters,
+                added,
+            );
+            assert!(!members.members.contains(&s), "never stored while held");
         }
+        // Not held: x's genuine record and the looping one arrive together,
+        // in either order, or the looping one with no way to the owner.
+        let x_rec = held[0].clone();
+        let e_rec = held[1].clone();
+        for (added, kept) in [
+            (vec![x_rec.clone(), e_rec.clone(), s.clone()], 2),
+            (vec![s.clone(), e_rec.clone(), x_rec.clone()], 2),
+            (vec![e_rec.clone(), s.clone()], 0),
+        ] {
+            let members =
+                apply_within_seconds(MembersV1::default(), &parent_state, &parameters, added);
+            assert!(!members.members.contains(&s));
+            assert_eq!(members.members.len(), kept);
+        }
+    }
+
+    /// freenet/river#703 defect 2: a stale delta can omit an inviter its
+    /// sender believed this peer held. The member, and everyone invited
+    /// through them, is skipped rather than rejecting the delta; the rest
+    /// applies, and a later delta carrying the inviter adds them all.
+    #[test]
+    fn a_member_whose_inviter_is_unknown_is_skipped_with_its_subtree() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let parent_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_members: 10,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        let (a, a_sk) = create_test_member(owner_id, owner_id);
+        let (b, b_sk) = create_test_member(owner_id, a.id());
+        let (c, _) = create_test_member(owner_id, b.id());
+        let (d, _) = create_test_member(owner_id, owner_id);
+        let a = AuthorizedMember::new(a, &owner_sk);
+        let b = AuthorizedMember::new(b, &a_sk);
+        let c = AuthorizedMember::new(c, &b_sk);
+        let d = AuthorizedMember::new(d, &owner_sk);
+        let d_signature = d.signature;
+
+        let mut members = MembersV1::default();
+        members
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(MembersDelta::new(vec![c.clone(), b.clone(), d.clone()])),
+            )
+            .expect("an unknown inviter must not reject the delta");
+        assert_eq!(members.members, vec![d.clone()]);
+
+        members
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(MembersDelta::new(vec![a.clone(), b.clone(), c.clone()])),
+            )
+            .unwrap();
+        let mut want = vec![a, b, c, d];
+        want.sort_by_key(|m| m.member.id());
+        assert_eq!(members.members, want);
+
+        // A bad signature is still a rejection, inviter known or not.
+        let (e, _) = create_test_member(owner_id, owner_id);
+        let forged = AuthorizedMember {
+            member: e,
+            signature: d_signature,
+        };
+        assert!(members
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(MembersDelta::new(vec![forged])),
+            )
+            .is_err());
+    }
+
+    /// freenet/river#703: deciding whether new members' invite
+    /// chains are known must cost work linear in the delta, not quadratic:
+    /// each record's chain is resolved once, however many records chain
+    /// through it. Here a long chain of records ends at an inviter nobody
+    /// holds, so all of it is skipped; the walk must stay within a small
+    /// multiple of its length. A delta longer than held + bound is refused
+    /// before any per-record work.
+    #[test]
+    fn unknown_chains_are_resolved_in_linear_work() {
+        let (parent_state, parameters, _, _) = invite_chain(1, 5_000);
+        let owner_id = parameters.owner_id();
+        let unknown = MemberId::from(&SigningKey::generate(&mut OsRng).verifying_key());
+        let any_signature = ed25519_dalek::Signature::from_bytes(&[0; 64]);
+        let n = 2_000;
+        let mut records = Vec::with_capacity(n);
+        let mut inviter = unknown;
+        for _ in 0..n {
+            let (m, _) = create_test_member(owner_id, inviter);
+            inviter = m.id();
+            records.push(AuthorizedMember {
+                member: m,
+                signature: any_signature,
+            });
+        }
+        records.reverse();
+        let mut members = MembersV1::default();
+        let before = chain_steps();
+        members
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(MembersDelta::new(records.clone())),
+            )
+            .expect("members with an unknown inviter are skipped");
+        assert!(members.members.is_empty());
+        let steps = chain_steps() - before;
+        assert!(steps <= 3 * n, "{steps} chain steps for {n} records");
+
+        // Past held + bound, refused before any chain is walked.
+        let mut big = records.clone();
+        big.extend(records.iter().cloned());
+        big.extend(records.iter().cloned());
+        let before = chain_steps();
+        assert!(MembersV1::default()
+            .apply_delta(&parent_state, &parameters, &Some(MembersDelta::new(big)))
+            .is_err());
+        assert_eq!(chain_steps() - before, 0);
     }
 
     /// The bound is `max(max_members, MIN_MEMBERS_DELTA_BOUND)`. It is checked

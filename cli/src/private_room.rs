@@ -311,16 +311,14 @@ pub fn build_member_info_heal(
     // fits the room's current `max_nickname_size`, else the generic "Member"
     // placeholder.
     //
-    // Both candidates must satisfy the contract: `MemberInfoV1::apply_delta`
-    // rejects an entry whose `declared_len()` exceeds `max_nickname_size`,
-    // which would make the whole heal UPDATE fail — and `heal_member_info`
-    // persists the entry locally BEFORE sending, so an over-limit entry would
-    // leave the CLI holding a member_info the contract refuses. `declared_len()`
-    // is the plaintext byte length for both public and sealed values, so
-    // comparing `nick.len()` here matches the contract check exactly. If even
-    // the "Member" placeholder is over the limit (a room configured with
-    // `max_nickname_size < 6`), DEFER the heal entirely (`None`) rather than
-    // mint an entry the contract rejects (Codex review on PR #358).
+    // Both candidates must fit the room's `max_nickname_size`, a client rule
+    // riverctl and the UI check before signing (the room itself holds
+    // nicknames only to a fixed ceiling). `declared_len()` is the plaintext
+    // byte length for both public and sealed values, so comparing `nick.len()`
+    // here matches that check. If even the "Member" placeholder is over the
+    // limit (a room configured with `max_nickname_size < 6`), DEFER the heal
+    // entirely (`None`) rather than sign a nickname over the room's limit
+    // (Codex review on PR #358).
     let max_nickname_size = state.configuration.configuration.max_nickname_size;
     let nickname = self_nickname
         .filter(|nick| nick.len() <= max_nickname_size)
@@ -384,10 +382,9 @@ fn current_secret_from_state(
 /// the secret carried in the `Invitation` this member joined with
 /// (`invitation_secrets`). [`collect_secrets_for_room`] folds both sources.
 ///
-/// Returns an error (rather than silently falling back to a public body,
-/// which the contract rejects in a private room with "Cannot send public
-/// messages in private room") when no secret is available for the current
-/// version — see [`resolve_current_secret`]. Also errors if the resulting
+/// Returns an error (rather than falling back to a public body, which a
+/// private room does not admit, so the message would silently vanish) when
+/// no secret is available for the current version — see [`resolve_current_secret`]. Also errors if the resulting
 /// body exceeds the room's `max_message_size` — see [`guard_message_size`].
 pub fn build_message_body(
     state: &ChatRoomStateV1,
@@ -503,10 +500,10 @@ pub fn build_reply_body(
 /// Resolve the room's **current-version** secret for the member holding
 /// `self_sk`, for sealing an outgoing private-room body.
 ///
-/// Returns `(secret, current_version)` or an error (rather than silently
-/// falling back to a public body, which the contract rejects in a private room
-/// with "Cannot send public messages in private room") when no secret is
-/// available for the current version — the room owner must re-provision this
+/// Returns `(secret, current_version)` or an error (rather than falling back
+/// to a public body, which a private room does not admit, so the message
+/// would silently vanish) when no secret is available for the current
+/// version — the room owner must re-provision this
 /// member's secret, or the member must rejoin via a fresh invitation that
 /// carries the current version. Sealing only ever under `current_version`
 /// (never a stale version other members can't read) mirrors the
@@ -1101,9 +1098,8 @@ mod tests {
     }
 
     /// A stored nickname longer than the room's current `max_nickname_size`
-    /// must be dropped to "Member" — publishing an over-long entry would make
-    /// the contract reject the whole heal UPDATE (same clamp as
-    /// `rejoin_preferred_nickname`).
+    /// is replaced by "Member": riverctl does not sign a nickname over the
+    /// room's limit (same clamp as `rejoin_preferred_nickname`).
     #[test]
     fn heal_clamps_over_long_nickname_to_member_placeholder() {
         let owner = fresh_signing_key();
@@ -1379,8 +1375,8 @@ mod tests {
         let owner = fresh_signing_key();
         let state = state_with_privacy(&owner, PrivacyMode::Private);
         // A member with neither a contract blob nor an invitation secret for
-        // the current version must error — never silently send a public body
-        // that the contract would reject ("Cannot send public messages...").
+        // the current version must error — never send a public body, which
+        // the private room would not admit.
         let err = build_message_body(
             &state,
             &fresh_signing_key(),
@@ -1647,8 +1643,8 @@ mod tests {
         }
     }
 
-    /// Private room, no secret anywhere → error, never a silent public body
-    /// (which the contract rejects with "Cannot send public messages...").
+    /// Private room, no secret anywhere → error, never a public body (which
+    /// the private room would not admit).
     #[test]
     fn build_action_body_private_room_errors_without_secret() {
         let owner = fresh_signing_key();

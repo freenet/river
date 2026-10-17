@@ -60,8 +60,13 @@ pub(crate) fn get_visibility_state() -> bool {
         .unwrap_or(true)
 }
 
+/// Non-WASM fallback: there is no document (native tests run the callers).
+#[cfg(not(target_arch = "wasm32"))]
+fn set_document_title(_title: &str) {}
+
 /// Set the document title, notifying the parent shell via postMessage.
 /// Skips the postMessage if the title hasn't changed since the last call.
+#[cfg(target_arch = "wasm32")]
 fn set_document_title(title: &str) {
     if let Some(window) = web_sys::window() {
         if let Some(document) = window.document() {
@@ -1235,6 +1240,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: std::collections::BTreeMap::new(),
         }
     }

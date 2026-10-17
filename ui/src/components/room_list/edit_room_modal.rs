@@ -568,6 +568,7 @@ fn stored_description(config: &Configuration) -> String {
 fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
     let seed_config = config.clone();
     let mut description = use_signal(move || stored_description(&seed_config));
+    let mut config_error = use_signal(|| None::<String>);
 
     let update_description = move |evt: Event<FormData>| {
         if !is_owner {
@@ -623,7 +624,8 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
             description: sealed_desc,
         };
 
-        sign_and_apply_configuration(owner_key, new_config, "Room description");
+        let refusal = sign_and_apply_configuration(owner_key, new_config, "Room description").err();
+        crate::util::defer(move || config_error.set(refusal));
     };
 
     rsx! {
@@ -670,6 +672,7 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
                 },
                 onchange: update_description,
             }
+            ConfigError { error: config_error() }
         }
     }
 }
@@ -717,10 +720,12 @@ fn NumericConfigField(
     field: ConfigField,
 ) -> Element {
     let mut input_value = use_signal(|| value.to_string());
+    let mut config_error = use_signal(|| None::<String>);
 
     let update_value = move |evt: Event<FormData>| {
         let new_val_str = evt.value().to_string();
         input_value.set(new_val_str.clone());
+        crate::util::defer(move || config_error.set(None));
 
         let Ok(new_val) = new_val_str.parse::<usize>() else {
             return;
@@ -736,7 +741,8 @@ fn NumericConfigField(
         let mut new_config = config.clone();
         field.set(&mut new_config, new_val);
 
-        sign_and_apply_configuration(owner_key, new_config, label);
+        let refusal = sign_and_apply_configuration(owner_key, new_config, label).err();
+        crate::util::defer(move || config_error.set(refusal));
     };
 
     rsx! {
@@ -755,6 +761,7 @@ fn NumericConfigField(
                 oninput: move |evt: Event<FormData>| input_value.set(evt.value().to_string()),
                 onchange: update_value,
             }
+            ConfigError { error: config_error() }
         }
     }
 }
@@ -768,6 +775,7 @@ fn MaxMembersField(
     config: Configuration,
 ) -> Element {
     let mut max_members_input = use_signal(|| max_members.to_string());
+    let mut config_error = use_signal(|| None::<String>);
 
     let update_max_members = move |evt: Event<FormData>| {
         if !is_owner {
@@ -775,6 +783,7 @@ fn MaxMembersField(
         }
         let new_val_str = evt.value().to_string();
         max_members_input.set(new_val_str.clone());
+        crate::util::defer(move || config_error.set(None));
 
         let Ok(new_max) = new_val_str.parse::<usize>() else {
             return;
@@ -790,7 +799,8 @@ fn MaxMembersField(
         let mut new_config = config.clone();
         new_config.max_members = new_max;
 
-        sign_and_apply_configuration(owner_key, new_config, "Max members");
+        let refusal = sign_and_apply_configuration(owner_key, new_config, "Max members").err();
+        crate::util::defer(move || config_error.set(refusal));
     };
 
     rsx! {
@@ -817,6 +827,7 @@ fn MaxMembersField(
                     oninput: move |evt: Event<FormData>| max_members_input.set(evt.value().to_string()),
                     onchange: update_max_members,
                 }
+                ConfigError { error: config_error() }
             }
         }
     }
@@ -825,11 +836,31 @@ fn MaxMembersField(
 /// Bump `new_config`'s version, sign it with the room key, apply it locally and
 /// queue the sync. The room's state is snapshotted here, synchronously, as the
 /// parent for the delta.
+///
+/// Returns the reason when the change is refused before signing (see
+/// `Configuration::signing_refusal`), for the field to show the owner.
+/// `edited` (a copy of `held` with the owner's changes) as the room's next
+/// configuration, ready to sign, or the reason it must not be signed: the
+/// version advanced, then the normalization and check riverctl runs too
+/// (`Configuration::normalize_for_signing`, `Configuration::signing_refusal`).
+pub(super) fn prepare_config_for_signing(
+    held: &Configuration,
+    mut edited: Configuration,
+    params: &ChatRoomParametersV1,
+) -> Result<Configuration, String> {
+    edited.configuration_version = held.configuration_version + 1;
+    edited.normalize_for_signing(held, params);
+    match edited.signing_refusal(params) {
+        Some(reason) => Err(reason),
+        None => Ok(edited),
+    }
+}
+
 pub(super) fn sign_and_apply_configuration(
     owner_key: VerifyingKey,
-    mut new_config: Configuration,
+    new_config: Configuration,
     what: &'static str,
-) {
+) -> Result<(), String> {
     let signing_data = ROOMS.with(|rooms| {
         rooms.map.get(&owner_key).and_then(|room_data| {
             room_data
@@ -843,9 +874,19 @@ pub(super) fn sign_and_apply_configuration(
         // `user_can_edit`, so a key-less owner never gets an enabled field;
         // the modal explains the refusal up front instead (R4).
         warn!("Cannot update {what}: room or local signing key unavailable");
-        return;
+        return Ok(());
     };
-    new_config.configuration_version += 1;
+    let new_config = match prepare_config_for_signing(
+        &room_state.configuration.configuration,
+        new_config,
+        &ChatRoomParametersV1 { owner: owner_key },
+    ) {
+        Ok(c) => c,
+        Err(reason) => {
+            error!("Not updating {what}: {reason}");
+            return Err(reason);
+        }
+    };
 
     spawn_local(async move {
         let mut config_bytes = Vec::new();
@@ -889,6 +930,18 @@ pub(super) fn sign_and_apply_configuration(
             }
         });
     });
+    Ok(())
+}
+
+/// The refusal from [`sign_and_apply_configuration`], under the field that
+/// caused it.
+#[component]
+pub(super) fn ConfigError(error: Option<String>) -> Element {
+    rsx! {
+        if let Some(e) = error {
+            p { "data-testid": "config-error", class: "text-xs text-red-400 mt-1", "{e}" }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1107,5 +1160,39 @@ mod tests {
             squashed.contains(&format!("{}:\"{{{}}}\"", "title", "rotate_title")),
             "the disabled Rotate button must carry the explanatory title"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_signing_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    /// The owner's next configuration is the held one's version plus one,
+    /// normalized (a held nickname limit over the ceiling the edit leaves
+    /// alone is lowered to it), and refused with the reason when the edit
+    /// itself is invalid.
+    #[test]
+    fn a_config_edit_is_prepared_as_riverctl_prepares_it() {
+        let owner = SigningKey::from_bytes(&[71u8; 32]).verifying_key();
+        let params = ChatRoomParametersV1 { owner };
+        let ceiling = river_core::room_state::member_info::NICKNAME_CEILING;
+        let held = Configuration {
+            owner_member_id: owner.into(),
+            configuration_version: 4,
+            max_nickname_size: ceiling + 5,
+            ..Default::default()
+        };
+        let mut edited = held.clone();
+        edited.max_members = 7;
+        let ready = prepare_config_for_signing(&held, edited, &params).expect("signable");
+        assert_eq!(ready.configuration_version, 5);
+        assert_eq!(ready.max_members, 7);
+        assert_eq!(ready.max_nickname_size, ceiling);
+        let mut zero = held.clone();
+        zero.max_user_bans = 0;
+        assert!(prepare_config_for_signing(&held, zero, &params)
+            .unwrap_err()
+            .contains("max_user_bans"));
     }
 }

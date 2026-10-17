@@ -835,6 +835,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 .iter()
                 .find(|p| p.recipient_id == self_id)
                 .cloned();
+            let purged_tokens = tokens.clone();
             let envelope =
                 match advance_recipient_purges(&self_sk, &room, previous.as_ref(), tokens) {
                     Ok(e) => e,
@@ -847,30 +848,14 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                 };
 
-            let delta = ChatRoomStateV1Delta {
-                direct_messages: Some(DirectMessagesDelta {
-                    new_messages: vec![],
-                    advanced_purges: vec![envelope.clone()],
-                }),
-                ..Default::default()
-            };
-            let params = ChatRoomParametersV1 { owner: room };
-
             crate::util::defer(move || {
                 let applied = ROOMS.with_mut(|rooms| {
                     let Some(rd) = rooms.map.get_mut(&room) else {
                         return false;
                     };
-                    let parent = rd.room_state.clone();
-                    if let Err(e) = rd.room_state.apply_delta(&parent, &params, &Some(delta)) {
-                        error!("DM purge apply_delta failed: {:?}", e);
-                        false
-                    } else {
-                        // #310: preserve private edits/reactions across the
-                        // optimistic apply_delta. No-op on public rooms.
-                        rd.rebuild_private_actions_state();
-                        true
-                    }
+                    rd.apply_own_purge(envelope, purged_tokens)
+                        .map_err(|e| error!("DM purge apply_delta failed: {:?}", e))
+                        .is_ok()
                 });
                 if applied {
                     mark_needs_sync(room);
@@ -2348,6 +2333,23 @@ mod tests {
             None,
             "a contended read after the room went revived its thread"
         );
+    }
+
+    /// "Delete their messages" records the purged tokens as this device's
+    /// own, so `RoomData::heal_own_purges` can re-sign them if a concurrent
+    /// envelope from another device of the member wins without them.
+    #[test]
+    fn a_purge_records_its_tokens_as_own() {
+        let raw = include_str!("dm_thread_modal.rs");
+        let cut = raw
+            .find("mod tests {")
+            .expect("this file must have a `mod tests {`");
+        let src: String = raw[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(src.contains(&format!(
+            "{}{}",
+            "rd.apply_own_purge(envelope,", "purged_tokens)"
+        )));
+        assert!(src.contains(&format!("{}{}", "letpurged_tokens=", "tokens.clone();")));
     }
 
     #[test]

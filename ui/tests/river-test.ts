@@ -9,6 +9,7 @@ type RiverTestHooks = {
   appendMessages(count: number): void;
   removeMessages(containing: string): void;
   makeRoomPrivateWithoutSecret(): void;
+  forgeNextSendSignature(): void;
   setRoomsLoadState(state: RoomsLoadState): void;
   // Same, without clearing ROOMS: the rail's note under a partly restored list.
   // "migrating" also holds a load worker open until the next call.

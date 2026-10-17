@@ -1241,24 +1241,19 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     page.on("console", (msg) => {
       if (msg.text().includes("Failed to apply message delta")) applyFailures.push(msg.text());
     });
-    // Self owns this room, which the hook below needs.
     await openRoomAtBottom(page, "Your Private Room");
     await fillHistory(page);
     await readerScrollsWithoutGesture(page, 0);
     await expectParkedAwayFromEnd(page, "premise: reading older messages");
     const row = await expectReadingRow(page);
 
-    // A private room whose secret this device lacks: the send falls back to a
-    // public body, which the local apply rejects after the draft is handed off.
-    await callRiverTest(page, "makeRoomPrivateWithoutSecret");
-    await expect(
-      page.getByTestId("room-list").getByRole("button", { name: "Your Private Room" }).getByLabel("Private room"),
-      "premise: the room should now be private",
-    ).toBeVisible();
+    // A message the room does not admit (its signature is corrupted), so the
+    // send fails at the local apply after the draft is handed off.
+    await callRiverTest(page, "forgeNextSendSignature");
     await sendWithEnter(page, "own send that fails to apply");
     await expect
       .poll(() => applyFailures.length, {
-        message: "premise: the send should reach the local apply and be rejected there",
+        message: "premise: the send should reach the local apply and not be admitted there",
       })
       .toBeGreaterThan(0);
 

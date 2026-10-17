@@ -371,8 +371,9 @@ pub(crate) fn handle_contract_notification(
 
     // Determine the new version. We always derive from the notification's
     // current_version + 1 so concurrent rotations across replicas at least
-    // converge on the highest observed version+1; the contract rejects
-    // replays of an existing version with `Duplicate secret version`.
+    // converge on the highest observed version+1; at a version both paths
+    // signed, the contract keeps the record with the greater signature digest
+    // (freenet/river#703).
     //
     // Hard-error and bail on overflow: silently wrapping `u32::MAX -> 0` would
     // collide with the existing version-0 record and reuse a key the
@@ -417,9 +418,10 @@ pub(crate) fn handle_contract_notification(
     // the room state's `encrypted_secrets`, NOT by the delegate-local
     // member-set cache. The cache can be missing (fresh delegate, restart,
     // user reinstalls webapp), and if we used it as the only source of
-    // truth we'd emit duplicate `(member, version)` blobs that the room
-    // contract rejects via `RoomSecretsV1::apply_delta`'s duplicate check,
-    // wedging rotation permanently.
+    // truth we'd emit second blobs for `(member, version)` pairs the room
+    // already holds. The room keeps one blob per pair, the greater signature
+    // digest (`RoomSecretsV1::apply_delta`, freenet/river#703), so a
+    // re-emitted blob could replace the one every member already holds.
     //
     // Prior-version secrets for back-fill are RECOVERED by decrypting the
     // owner's existing `encrypted_secret`-at-v from the room state — we
@@ -589,9 +591,9 @@ fn ok_response(
 /// For each current member (owner + each in `current_members_with_vks`),
 /// for each version `v` in `[0..=new_version]`:
 /// * If `(member, v)` is already in `existing_encrypted_secrets`, skip —
-///   the room state already has that pair and emitting it again would be
-///   rejected by `RoomSecretsV1::apply_delta`'s duplicate guard, wedging
-///   rotation permanently.
+///   the room state already has that pair, and a second blob for it would
+///   replace the held one whenever its signature digest is greater
+///   (`RoomSecretsV1::apply_delta` keeps one blob per pair).
 /// * Otherwise, emit a fresh `AuthorizedEncryptedSecretForMember` that
 ///   encrypts the per-version secret for the member's VK.
 ///
@@ -618,8 +620,9 @@ fn ok_response(
 /// directly from `existing_encrypted_secrets` (rather than from a
 /// delegate-local cache) is deliberate: the local cache can be missing
 /// (fresh delegate, restart, webapp reinstall), and using it as the
-/// dedup source would produce duplicate `(member, version)` pairs that
-/// the contract rejects (Codex review of PR #245).
+/// dedup source would produce second blobs for `(member, version)` pairs
+/// the room already holds, which could replace blobs members already have
+/// (Codex review of PR #245).
 ///
 /// Pure function, no I/O — delegates to the shared
 /// [`river_core::room_state::secret::build_rotation_encrypted_secrets`]

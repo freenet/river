@@ -3230,6 +3230,42 @@ mod tests {
         assert_eq!(stored_marker(&late, &unmarked), Some(ids[2].clone()));
     }
 
+    /// A save whose stored copy of the room is on an older configuration (ban
+    /// cap 300, 150 bans, a message the local copy lacks) while the local
+    /// copy is on the owner's newer one (cap 10): the room's merge refuses
+    /// the stored copy once, and the save converges and stores rather than
+    /// failing (which would leave the local edits unsaved).
+    #[test]
+    fn reconcile_room_present_converges_past_a_lower_ranked_refusal() {
+        let owner = SigningKey::from_bytes(&[94u8; 32]);
+        let vk = owner.verifying_key();
+        let params = river_core::room_state::ChatRoomParametersV1 { owner: vk };
+        let mut local = crate::room_data::test_minimal_room_data(vk);
+        local.room_state = crate::room_data::test_generation_copy(&owner, 2, 10, &["m1"], 0);
+        let mut stored = local.clone();
+        stored.room_state =
+            crate::room_data::test_generation_copy(&owner, 1, 300, &["m1", "m2"], 150);
+        let refused = local
+            .room_state
+            .clone()
+            .merge_from(&params, &stored.room_state)
+            .unwrap_err();
+        assert!(
+            refused.contains(crate::room_data::LOWER_RANKED_REFUSAL),
+            "premise: {refused}"
+        );
+        let out = reconcile_room_present(Some(&present_slot_bytes(&stored)), &vk, &local, false)
+            .expect("the save converges")
+            .expect("a present slot merges and stores");
+        match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+            RoomSlot::Present(r) => {
+                assert_eq!(r.room_state.recent_messages.messages.len(), 2);
+                assert_eq!(r.room_state.bans.0.len(), 10);
+            }
+            RoomSlot::Tombstone => panic!("expected Present"),
+        }
+    }
+
     /// An unparseable current slot is a hard error (surfaced, not silently
     /// treated as absent — which could clobber a slot the delegate holds).
     #[test]
@@ -3403,6 +3439,32 @@ mod tests {
             merged.invitation_secrets.get(&2),
             Some(&[22u8; 32]),
             "remote-only version must be absorbed, not dropped"
+        );
+    }
+
+    /// The DM purges each tab recorded as its own are unioned by the save-side
+    /// merge, so one tab's save never drops a purge another tab recorded.
+    #[test]
+    fn reconcile_room_present_unions_own_purges() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let me = river_core::room_state::member::MemberId::from(
+            SigningKey::from_bytes(&[1u8; 32]).verifying_key(),
+        );
+        let mut local = crate::room_data::test_minimal_room_data(vk);
+        local.own_purges.record(me, [PurgeToken([1; 16])]);
+        let mut remote = crate::room_data::test_minimal_room_data(vk);
+        remote.own_purges.record(me, [PurgeToken([2; 16])]);
+        let out = reconcile_room_present(Some(&present_slot_bytes(&remote)), &vk, &local, false)
+            .unwrap()
+            .expect("matching-identity merge stores");
+        let merged = match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+            RoomSlot::Present(r) => r,
+            RoomSlot::Tombstone => panic!("expected Present"),
+        };
+        assert_eq!(
+            merged.own_purges.purged,
+            vec![(me, PurgeToken([1; 16])), (me, PurgeToken([2; 16]))]
         );
     }
 
@@ -6411,12 +6473,17 @@ mod tests {
     /// room-state code that change touches, and the river-core 0.2.0 -> 0.2.1
     /// bump moves it regardless. V35 (`49a3122b…`, from PR #702) is the
     /// outgoing generation.
+    ///
+    /// Updated for V36 (the freenet/river#703 merge-law fixes): the delegate
+    /// links the room-state code they change, and the river-core 0.2.1 ->
+    /// 0.3.0 bump would move it regardless. V36 (`eca06ace…`, from PR #797)
+    /// is the outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "eca06ace26857393b0c0ef283b560e06839b2c97b29d40d64b3909e9f9ead0aa",
+            "0fc3625e5ec0eee35d614938327e8d0dee9ce9ceacafaa3204a54673ba2a580d",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
@@ -8367,13 +8434,15 @@ pub(crate) fn reconcile_room_present(
                 local.clone()
             } else {
                 let mut m = local.clone();
-                m.room_state
-                    .merge(
-                        &local.room_state,
-                        &river_core::room_state::ChatRoomParametersV1 { owner: *owner_vk },
-                        &remote.room_state,
-                    )
-                    .map_err(|e| format!("room_state merge failed: {e}"))?;
+                // Converges when the room's merge refuses the stored copy
+                // once (its configuration does not outrank the local one's),
+                // as the other local merges do, so the save still stores.
+                crate::room_data::merge_converging(
+                    &mut m.room_state,
+                    &river_core::room_state::ChatRoomParametersV1 { owner: *owner_vk },
+                    &remote.room_state,
+                )
+                .map_err(|e| format!("room_state merge failed: {e}"))?;
                 // Union the invitation-carried secrets: a concurrent tab may hold
                 // a version this tab lacks, and these are persisted-only recovery
                 // state for a private-room invitee before the owner's contract
@@ -8383,6 +8452,9 @@ pub(crate) fn reconcile_room_present(
                 for (version, secret) in remote.invitation_secrets {
                     m.invitation_secrets.entry(version).or_insert(secret);
                 }
+                // The DM purges each tab signed: unioned, so a purge another
+                // tab recorded can still be re-published.
+                m.own_purges.union(&remote.own_purges);
                 // The read marker furthest along in the merged buffer wins, so
                 // a tab holding an older marker (a stale legacy copy won its
                 // merge, or another tab read further) never rolls the stored

@@ -1,4 +1,4 @@
-use crate::room_state::ban_evidence::BanEvidenceV1;
+use crate::room_state::ban_evidence::{BanEvidenceV1, EvidenceDigest};
 use crate::room_state::member::{AuthorizedMember, BanResolution, MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
@@ -131,6 +131,26 @@ impl BansV1 {
             return false;
         };
         ban.verify_signature(&vk).is_ok()
+    }
+
+    /// Drop every ban that no key known here verifies: one whose issuer is
+    /// the owner or a record in `members_by_id` and whose key does not verify
+    /// it, and one whose issuer is known nowhere (cleanup step 4 sweeps that
+    /// one in the same pass). Both `post_apply_cleanup` (before the cap
+    /// counts) and the DM apply's enforced-ban set run this when the bans are
+    /// over the cap, so such a ban never takes a cap slot from a stored one
+    /// (freenet/river#703). Returns whether anything was dropped.
+    pub fn drop_bans_no_known_key_verifies(
+        bans: &mut Vec<AuthorizedUserBan>,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        owner_id: MemberId,
+        owner_vk: &VerifyingKey,
+    ) -> bool {
+        let before = bans.len();
+        bans.retain(|b| {
+            Self::ban_signature_matches_current_key(b, members_by_id, owner_id, owner_vk)
+        });
+        bans.len() != before
     }
 
     /// THE single definition of the `max_user_bans` eviction (#411 round 7).
@@ -348,7 +368,13 @@ impl ComposableState for BansV1 {
     // two identical ban sets summarize to different bytes → spurious
     // anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
     // and freenet/freenet-core#4857.
-    type Summary = BTreeSet<BanId>;
+    //
+    // Keyed by each ban's whole-record digest, not its `BanId` (which hashes
+    // the signature alone): two records that share a signature but differ
+    // elsewhere are different bans, and a summary that cannot tell them apart
+    // leaves peers holding different ones unreconciled (freenet/river#703
+    // review). Changing this type re-keys the contract.
+    type Summary = BTreeSet<EvidenceDigest>;
     type Delta = Vec<AuthorizedUserBan>;
     type Parameters = ChatRoomParametersV1;
 
@@ -383,7 +409,7 @@ impl ComposableState for BansV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        self.0.iter().map(|ban| ban.id()).collect()
+        self.0.iter().map(ban_digest).collect()
     }
 
     /// Computes the difference between current ban state and old state
@@ -400,7 +426,7 @@ impl ComposableState for BansV1 {
         let delta = self
             .0
             .iter()
-            .filter(|ban| !old_state_summary.contains(&ban.id()))
+            .filter(|ban| !old_state_summary.contains(&ban_digest(ban)))
             .cloned()
             .collect::<Vec<_>>();
         if delta.is_empty() {
@@ -413,7 +439,7 @@ impl ComposableState for BansV1 {
     /// Applies changes from a delta to the current ban state.
     ///
     /// This method:
-    /// - Checks for duplicate bans
+    /// - Skips bans already held (a re-delivery is a no-op)
     /// - Verifies the signatures of the bans whose banner is known here,
     ///   EXCLUDING the `max_user_bans` ceiling. Whether a ban takes effect is
     ///   decided later, from converged state (freenet/river#423).
@@ -429,7 +455,9 @@ impl ComposableState for BansV1 {
     /// post_apply_cleanup at the end of the same whole-state apply; `verify`
     /// still rejects any stored state that is over the cap.
     ///
-    /// Returns an error if any ban in the delta is invalid or already exists.
+    /// Returns an error if the delta carries more new bans than the work bound
+    /// allows. A new ban whose known issuer's key does not verify it is
+    /// skipped.
     fn apply_delta(
         &mut self,
         parent_state: &Self::ParentState,
@@ -437,38 +465,60 @@ impl ComposableState for BansV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(delta) = delta {
-            // Bound the number of NEW bans a single delta may carry (#411 round
-            // 3 item C). Since post_apply_cleanup caps stored state at
-            // `max_user_bans`, ANY legitimate peer's ban list — and therefore
-            // any legitimate delta (a summary-diff against another peer) — holds
-            // at most `max_user_bans` bans. A larger delta can only be a forged
-            // flood; rejecting it bounds the O(N) signature-verification work
-            // below (round 2 removed the pre-verify cap that used to do this).
-            // Deterministic across peers, so it does not affect convergence: a
-            // legitimate delta is never over the bound, and a flood is rejected
-            // identically everywhere.
-            //
-            // Transient skew during a `max_user_bans` REDUCTION: config applies
-            // before bans in field order, so a peer that has already applied the
-            // lower (monotonic) cap may briefly reject a ban-only delta from a
-            // peer still lagging on the old higher cap. Self-heals once the
-            // config converges (the lagging peer re-derives a within-bound delta).
+            // A ban this peer already holds (the same record, which is what
+            // the summary and `delta` compare) is skipped. A delta computed
+            // against a stale summary of this peer re-delivers such bans, and
+            // freenet-core sends exactly those; rejecting the whole delta over
+            // them cost a full-state resync each time and broke the
+            // `delta_idempotence` merge law (freenet/river#703 defect 2). A
+            // ban repeated identically inside one delta is stored once;
+            // records that share an id but differ are all kept, so the checks
+            // here and at step 0 judge each of them.
             let max_bans = parent_state.configuration.configuration.max_user_bans;
-            if delta.len() > max_bans {
+            let bound = max_bans.max(MIN_BANS_DELTA_BOUND);
+            // A delta longer than everything held plus the bound cannot be
+            // within the bound however many it re-delivers: refused before
+            // any record is hashed.
+            if !crate::room_state::work_bounds::lifted()
+                && delta.len() > self.0.len().saturating_add(bound)
+            {
                 return Err(format!(
-                    "Ban delta of {} exceeds max_user_bans ({}); refusing to process a flood",
+                    "Ban delta of {} exceeds {}; refusing to process a flood",
                     delta.len(),
-                    max_bans
+                    bound
                 ));
             }
+            let held: std::collections::HashSet<EvidenceDigest> =
+                self.0.iter().map(ban_digest).collect();
+            let mut in_delta = std::collections::HashSet::new();
+            let new_bans: Vec<&AuthorizedUserBan> = delta
+                .iter()
+                .filter(|ban| {
+                    let d = ban_digest(ban);
+                    !held.contains(&d) && in_delta.insert(d)
+                })
+                .collect();
 
-            // Check for duplicate bans
-            let existing_ban_ids: std::collections::HashSet<_> =
-                self.0.iter().map(|ban| ban.id()).collect();
-            for new_ban in delta {
-                if existing_ban_ids.contains(&new_ban.id()) {
-                    return Err(format!("Duplicate ban detected: {:?}", new_ban.id()));
-                }
+            // Bound the number of NEW bans a single delta may carry (#411 round
+            // 3 item C). Since post_apply_cleanup caps stored state at
+            // `max_user_bans`, a legitimate peer's ban list holds at most its
+            // own `max_user_bans` bans, so a far larger delta can only be a
+            // forged flood; rejecting it bounds the O(N) signature-verification
+            // work below (round 2 removed the pre-verify cap that used to do
+            // this). Deterministic across peers.
+            //
+            // The bound is `max(max_user_bans, MIN_BANS_DELTA_BOUND)`, not
+            // `max_user_bans`: config applies before bans in field order, so a
+            // peer that has already applied a LOWERED cap would otherwise
+            // reject a ban delta from a peer still on the old, higher cap
+            // (freenet/river#703 defect 2). The floor heals any reduction from
+            // a cap at or below it in one exchange; cleanup trims the excess.
+            if !crate::room_state::work_bounds::lifted() && new_bans.len() > bound {
+                return Err(format!(
+                    "Ban delta of {} new bans exceeds {}; refusing to process a flood",
+                    new_bans.len(),
+                    bound
+                ));
             }
 
             // Create a temporary BansV1 with the new bans, WITHOUT the max-cap
@@ -492,26 +542,38 @@ impl ComposableState for BansV1 {
             // delta re-adds is verified at step 0 against that issuer's key,
             // and takes no effect if the issuer is banned by a ban that does.
             //
-            // Signatures are still checked here for every issuer this peer
-            // knows (a forged ban attributed to a current member rejects the
-            // delta, as before).
-            //
-            // A ban repeated identically inside one delta is stored once.
-            // Records that share an id but differ are all kept, so the checks
-            // here and at step 0 judge each of them.
-            let mut in_delta = std::collections::HashSet::new();
-            let mut temp_bans = self.clone();
-            temp_bans.0.extend(
-                delta
-                    .iter()
-                    .filter(|ban| in_delta.insert(crate::util::record_digest(*ban)))
+            // Signatures are still checked here for every NEW ban whose issuer
+            // this peer knows, and one that does not verify is skipped, not
+            // an error: a peer that does not know its issuer holds it validly
+            // (`verify` has no key to check it against there), and an error
+            // would fail every merge with that peer in one direction only.
+            // Held bans are not re-checked here: post_apply_cleanup step 4
+            // sweeps a held ban whose issuer's key does not verify it
+            // (freenet/river#703).
+            let known = parent_state
+                .ban_evidence
+                .lookup(&parent_state.members, parameters.owner_id());
+            let owner_id = parameters.owner_id();
+            self.0.extend(
+                new_bans
+                    .into_iter()
+                    .filter(|ban| {
+                        let key = if ban.banned_by == owner_id {
+                            Some(parameters.owner)
+                        } else {
+                            known.get(&ban.banned_by).map(|m| m.member.member_vk)
+                        };
+                        key.is_none_or(|vk| ban.verify_signature(&vk).is_ok())
+                    })
                     .cloned(),
             );
-            if let Err(e) = temp_bans.verify_ban_signatures(parent_state, parameters) {
-                return Err(format!("Invalid delta: {}", e));
-            }
-            self.0 = temp_bans.0;
         }
+
+        // A ban held twice (a state `verify` accepts but no apply produces)
+        // is kept once, so peers holding the copy and not converge
+        // (freenet/river#703).
+        let mut seen = std::collections::HashSet::new();
+        self.0.retain(|ban| seen.insert(ban_digest(ban)));
 
         // Sort for deterministic ordering (CRDT convergence requirement)
         self.0.sort_by(|a, b| {
@@ -523,6 +585,35 @@ impl ComposableState for BansV1 {
 
         Ok(())
     }
+}
+
+/// One ban delta may carry `max(max_user_bans, MIN_BANS_DELTA_BOUND)` NEW
+/// bans (see `BansV1::apply_delta`); ban evidence takes the same floor. A
+/// work bound, not a room rule: each new ban costs a signature check here and
+/// up to `2 x MAX_EVIDENCE_DEPTH` evidence chain checks. Kept well below the
+/// members and messages bounds (1000) because of that evidence fan-out: at 100
+/// the evidence floor is 800 records.
+///
+/// The cost this admits, for a room on the default `max_user_bans` (10, so
+/// 10 bans / 80 evidence records before the floor): a 100-ban delta,
+/// including the cap eviction and cleanup it triggers, measured 15-18 ms
+/// natively (opt-level 3, 200 members, 2026-10-16); with the node's WASM
+/// runtime at 0.64-1.0 s per 2000 signature checks (see
+/// `ban_evidence::MAX_EVIDENCE_DEPTH`) that is about 0.03-0.05 s for the
+/// 100 ban checks, and at most 0.26-0.4 s for 800 evidence chain checks:
+/// under 0.5 s together, inside the 5 s compute limit. In exchange, a peer
+/// that has applied a `max_user_bans` reduction from any cap up to 100 no
+/// longer refuses a lagging peer's ban delta (freenet/river#703).
+pub const MIN_BANS_DELTA_BOUND: usize = 100;
+
+/// The digest of a whole ban record: what the bans summary, `delta` and the
+/// held-ban checks compare (16 bytes of BLAKE3 over its CBOR, serialized as a
+/// byte string like [`EvidenceDigest`]).
+pub fn ban_digest(ban: &AuthorizedUserBan) -> EvidenceDigest {
+    let full = crate::util::record_digest(ban);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    EvidenceDigest(out)
 }
 
 /// A user ban with authorization proof
@@ -605,6 +696,54 @@ pub struct UserBan {
 /// Created from a hash of the ban's signature to ensure uniqueness
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug, Ord, PartialOrd)]
 pub struct BanId(pub FastHash);
+
+#[cfg(test)]
+mod ban_digest_golden {
+    use super::*;
+
+    /// A fixed ban record: fixed fields and fixed signature bytes (a
+    /// `Signature` is not validated on construction), so the digest input is
+    /// exactly this record's CBOR.
+    fn fixture() -> AuthorizedUserBan {
+        let mut raw = [0u8; 64];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        AuthorizedUserBan::with_signature(
+            UserBan {
+                owner_member_id: MemberId(freenet_scaffold::util::FastHash(1)),
+                banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+                banned_user: MemberId(freenet_scaffold::util::FastHash(2)),
+            },
+            MemberId(freenet_scaffold::util::FastHash(3)),
+            Signature::from_bytes(&raw),
+        )
+    }
+
+    /// `ban_digest` is wire format: the bans summary and `delta` compare it.
+    /// One fixed record, one expected digest, one expected encoding. If this
+    /// changes deliberately it re-keys the room contract.
+    #[test]
+    fn ban_digest_golden_vector() {
+        const EXPECTED: [u8; 16] = [
+            0x98, 0x22, 0xae, 0x47, 0x04, 0x56, 0xd4, 0xc9, 0xb2, 0xd1, 0x39, 0x6e, 0xce, 0xf6,
+            0x64, 0xcc,
+        ];
+        let digest = ban_digest(&fixture());
+        assert_eq!(
+            digest.0, EXPECTED,
+            "ban_digest changed: a wire-format change"
+        );
+        let mut reversed = EXPECTED;
+        reversed.reverse();
+        assert_ne!(digest.0, reversed, "the vector must distinguish byte order");
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(&digest, &mut cbor).unwrap();
+        assert_eq!(cbor.len(), 17, "a CBOR byte string of 16 bytes");
+        assert_eq!(cbor[0], 0x50);
+        assert_eq!(&cbor[1..], &EXPECTED);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -869,8 +1008,8 @@ mod tests {
         let summary = bans.summarize(&state, &params);
 
         assert_eq!(summary.len(), 2);
-        assert!(summary.contains(&ban1.id()));
-        assert!(summary.contains(&ban2.id()));
+        assert!(summary.contains(&ban_digest(&ban1)));
+        assert!(summary.contains(&ban_digest(&ban2)));
     }
 
     #[test]
@@ -909,12 +1048,15 @@ mod tests {
         assert_eq!(delta, Some(vec![ban1.clone(), ban2.clone()]));
 
         // Test 2: Partial old summary
-        let partial_summary: BTreeSet<BanId> = vec![ban1.id()].into_iter().collect();
+        let partial_summary: BTreeSet<EvidenceDigest> =
+            vec![ban_digest(&ban1)].into_iter().collect();
         let delta = bans.delta(&state, &params, &partial_summary);
         assert_eq!(delta, Some(vec![ban2.clone()]));
 
         // Test 3: Full old summary
-        let full_summary: BTreeSet<BanId> = vec![ban1.id(), ban2.id()].into_iter().collect();
+        let full_summary: BTreeSet<EvidenceDigest> = vec![ban_digest(&ban1), ban_digest(&ban2)]
+            .into_iter()
+            .collect();
         let delta = bans.delta(&state, &params, &full_summary);
         assert_eq!(delta, None);
     }
@@ -1014,19 +1156,14 @@ mod tests {
             "apply_delta must NOT drop the oldest ban — evicting is post_apply_cleanup's job"
         );
 
-        // Test 3: Apply invalid delta (duplicate ban) - use one of the bans still in the list
+        // Test 3: re-delivering a held ban is a no-op, not an error: a delta
+        // computed against a stale summary carries it (freenet/river#703).
         let existing_ban = many_bans.last().unwrap().clone();
-        let invalid_delta = Some(vec![existing_ban]);
-        assert!(
-            bans.apply_delta(&state, &params, &invalid_delta).is_err(),
-            "Applying duplicate ban should fail: {:?}",
-            bans.apply_delta(&state, &params, &invalid_delta).ok()
-        );
-        assert_eq!(
-            bans.0.len(),
-            6,
-            "State should not change after applying duplicate ban"
-        );
+        let redelivery = Some(vec![existing_ban]);
+        let before = bans.clone();
+        bans.apply_delta(&state, &params, &redelivery)
+            .expect("re-delivering a held ban must not fail");
+        assert_eq!(bans, before, "a re-delivered ban changes nothing");
 
         // Test 4: More valid bans keep accumulating (still no cap at this level).
         let mut additional_bans = Vec::new();
@@ -1096,5 +1233,55 @@ mod tests {
             &owner_key,
         );
         assert_ne!(authorized_ban.id(), another_ban.id());
+    }
+
+    /// The flood bound counts NEW bans only, against
+    /// `max(max_user_bans, MIN_BANS_DELTA_BOUND)` (freenet/river#703).
+    #[test]
+    fn ban_flood_bound_counts_new_bans_against_the_floor() {
+        let owner_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let owner_id = MemberId::from(&owner_key.verifying_key());
+        let params = ChatRoomParametersV1 {
+            owner: owner_key.verifying_key(),
+        };
+        let state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                crate::room_state::configuration::Configuration {
+                    owner_member_id: owner_id,
+                    max_user_bans: 2,
+                    ..Default::default()
+                },
+                &owner_key,
+            ),
+            ..Default::default()
+        };
+        let ban = |i: u64| {
+            AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(i),
+                    banned_user: MemberId(FastHash(i as i64)),
+                },
+                owner_id,
+                &owner_key,
+            )
+        };
+        let at_floor: Vec<_> = (0..MIN_BANS_DELTA_BOUND as u64).map(ban).collect();
+        let mut bans = BansV1::default();
+        bans.apply_delta(&state, &params, &Some(at_floor.clone()))
+            .expect("a delta at the floor is accepted under a lower cap");
+
+        let mut redelivery = at_floor.clone();
+        redelivery.push(ban(MIN_BANS_DELTA_BOUND as u64));
+        bans.apply_delta(&state, &params, &Some(redelivery))
+            .expect("held bans do not count toward the bound");
+
+        let over: Vec<_> = (1_000..1_000 + MIN_BANS_DELTA_BOUND as u64 + 1)
+            .map(ban)
+            .collect();
+        let err = BansV1::default()
+            .apply_delta(&state, &params, &Some(over))
+            .unwrap_err();
+        assert!(err.contains("refusing to process a flood"), "{err}");
     }
 }

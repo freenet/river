@@ -50,10 +50,13 @@ impl MemberInfoV1 {
         // The rank is computed once per candidate rather than once per
         // comparison, because `member_info_rank` hashes (see [`SigDigest`]).
         let mut best: Option<(&AuthorizedMemberInfo, (u32, SigDigest))> = None;
+        // A record over the nickname ceiling is not one the room keeps; it is
+        // ignored here as the summary and `apply_delta` ignore it.
         for info in self
             .member_info
             .iter()
             .filter(|info| info.member_info.member_id == member_id)
+            .filter(|info| within_nickname_ceiling(info))
         {
             let rank = member_info_rank(info.member_info.version, &info.signature);
             let better = match &best {
@@ -120,6 +123,36 @@ impl MemberInfoV1 {
     }
 }
 
+/// The most bytes a nickname may declare in any member_info record the room
+/// keeps. One fixed bound, the same for every record, held or arriving, and
+/// independent of the room's configuration: a record over it is skipped on
+/// arrival, dropped where held on every apply, left out of the summary, and
+/// ignored by [`MemberInfoV1::canonical`] (and so by `deputies_of`), so every
+/// reader sees the same records (freenet/river#703).
+///
+/// The room's `max_nickname_size` is a client rule: the UI and riverctl check
+/// a nickname against it before signing (see [`nickname_refusal`]). The
+/// contract does not enforce it, so changing it drops no record and cannot
+/// bring back a superseded one.
+pub const NICKNAME_CEILING: usize = 1_000;
+
+/// Whether `info`'s nickname is within [`NICKNAME_CEILING`].
+pub fn within_nickname_ceiling(info: &AuthorizedMemberInfo) -> bool {
+    info.member_info.preferred_nickname.declared_len() <= NICKNAME_CEILING
+}
+
+/// Why a client must not sign a nickname declaring `declared_len` bytes in a
+/// room with `config`, if it must not: over the room's `max_nickname_size`
+/// (a client rule) or over [`NICKNAME_CEILING`] (which the room enforces).
+pub fn nickname_refusal(
+    declared_len: usize,
+    config: &crate::room_state::configuration::Configuration,
+) -> Option<String> {
+    let limit = config.max_nickname_size.min(NICKNAME_CEILING);
+    (declared_len > limit)
+        .then(|| format!("Nickname is {declared_len} bytes; this room allows at most {limit}."))
+}
+
 /// Deterministic ordering used to pick the canonical `MemberInfo` when two
 /// signed records for the SAME member collide (#411 round 4 item B).
 ///
@@ -156,8 +189,8 @@ fn member_info_rank(version: u32, signature: &Signature) -> (u32, SigDigest) {
 
 /// Whether `candidate` beats `incumbent` under [`member_info_rank`]'s order.
 ///
-/// THE SINGLE IMPLEMENTATION OF THE TIE RULE. Five sites choose between two
-/// ranked records — [`MemberInfoV1::canonical`],
+/// THE SINGLE IMPLEMENTATION OF THE TIE RULE. Five `member_info` sites choose
+/// between two ranked records — [`MemberInfoV1::canonical`],
 /// [`MemberInfoV1::dedup_to_canonical`], `summarize`, `delta`, and `apply_delta`
 /// — and every one of them must break a tie the SAME way, keeping the incumbent.
 /// They previously each spelled `>` inline, which is one edit away from silent
@@ -168,9 +201,15 @@ fn member_info_rank(version: u32, signature: &Signature) -> (u32, SigDigest) {
 /// branch behaviorally needs a genuine [`SigDigest`] collision.
 ///
 /// Routing all five through here means the rule has one definition and one test
-/// (`outranks_keeps_the_incumbent_on_a_tie`) rather than five prose assertions.
+/// (`outranks_keeps_the_incumbent_on_a_tie`) rather than five prose assertions;
+/// the other ranked records listed below route through it too.
 /// Strict `>` is the rule: **ties keep the incumbent.**
-fn outranks(candidate: (u32, SigDigest), incumbent: (u32, SigDigest)) -> bool {
+///
+/// The other owner- or self-signed singletons that resolve an equal-version
+/// collision by `(version, signature digest)` use it too, with their own
+/// version type: the room configuration, the upgrade pointer and DM purge
+/// envelopes (freenet/river#703).
+pub(crate) fn outranks<R: Ord>(candidate: R, incumbent: R) -> bool {
     candidate > incumbent
 }
 
@@ -284,7 +323,7 @@ impl<'de> Deserialize<'de> for SigDigest {
 
 /// The [`SigDigest`] of `signature`. See that type for the threat model, why the
 /// width is 128 bits, and the wire-format commitments this function makes.
-fn sig_digest(signature: &Signature) -> SigDigest {
+pub(crate) fn sig_digest(signature: &Signature) -> SigDigest {
     let digest = blake3::hash(signature.to_bytes().as_ref());
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest.as_bytes()[..16]);
@@ -369,6 +408,9 @@ impl ComposableState for MemberInfoV1 {
         Ok(())
     }
 
+    /// A record over [`NICKNAME_CEILING`] is not advertised, so a peer
+    /// holding one is offered the record it will keep instead
+    /// (freenet/river#703).
     fn summarize(
         &self,
         _parent_state: &Self::ParentState,
@@ -386,7 +428,11 @@ impl ComposableState for MemberInfoV1 {
         // would advertise a different summary and anti-entropy would never
         // reconcile. Migration-safe: `verify` still accepts duplicates.
         let mut summary: Self::Summary = BTreeMap::new();
-        for info in &self.member_info {
+        for info in self
+            .member_info
+            .iter()
+            .filter(|info| within_nickname_ceiling(info))
+        {
             // The summary value IS the rank, so the fold compares tuples
             // directly rather than re-deriving a rank from a stored signature.
             let candidate = member_info_rank(info.member_info.version, &info.signature);
@@ -444,7 +490,11 @@ impl ComposableState for MemberInfoV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        let max_nickname_size = parent_state.configuration.configuration.max_nickname_size;
+        // A held record over the nickname ceiling is dropped first, so it
+        // neither outranks an arrival within it nor stays: whether a record is
+        // kept is the same whichever side of a merge held it (the arrival
+        // check below applies the same rule).
+        self.member_info.retain(within_nickname_ceiling);
 
         if let Some(delta) = delta {
             // Members plus ban evidence, built once for the whole delta.
@@ -454,13 +504,12 @@ impl ComposableState for MemberInfoV1 {
             for member_info in delta {
                 let member_id = &member_info.member_info.member_id;
 
-                // Validate nickname declared length
-                if member_info.member_info.preferred_nickname.declared_len() > max_nickname_size {
-                    return Err(format!(
-                        "Nickname declared length {} exceeds max_nickname_size {}",
-                        member_info.member_info.preferred_nickname.declared_len(),
-                        max_nickname_size
-                    ));
+                // A record over the nickname ceiling is skipped, not an
+                // error, and one already held is dropped above: `verify` does
+                // not check the length, and an error here would fail every
+                // merge with a peer holding it.
+                if !within_nickname_ceiling(member_info) {
+                    continue;
                 }
 
                 // Enforce the deputy-list cap at the DELTA boundary too — `verify`
@@ -657,6 +706,27 @@ impl MemberInfo {
 }
 
 #[cfg(test)]
+mod nickname_refusal_tests {
+    use super::*;
+    use crate::room_state::configuration::Configuration;
+
+    /// A nickname up to the room's limit may be signed; one byte over is
+    /// refused; a limit over the ceiling is read as the ceiling.
+    #[test]
+    fn nickname_refusal_reads_the_room_limit_and_the_ceiling() {
+        let mut c = Configuration {
+            max_nickname_size: 10,
+            ..Configuration::default()
+        };
+        assert_eq!(nickname_refusal(10, &c), None);
+        assert!(nickname_refusal(11, &c).is_some());
+        c.max_nickname_size = NICKNAME_CEILING + 50;
+        assert_eq!(nickname_refusal(NICKNAME_CEILING, &c), None);
+        assert!(nickname_refusal(NICKNAME_CEILING + 1, &c).is_some());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::room_state::member::{AuthorizedMember, Member};
@@ -771,8 +841,10 @@ mod tests {
     /// Left disagreeing, a state holding duplicates would answer `deputies_of`
     /// one way on a freshly-GET'd full state and the other way after the next
     /// `apply_delta` ran dedup.
-    /// [`outranks`] is the single definition of the tie rule that all five rank
-    /// consumers share, so this is the one place it is pinned.
+    /// [`outranks`] is the single definition of the tie rule that every rank
+    /// consumer shares (the five `member_info` sites, and the configuration,
+    /// upgrade pointer and DM purge ranks), so this is the one place it is
+    /// pinned.
     ///
     /// Relaxing `>` to `>=` at any individual call site used to leave the entire
     /// suite green: reaching the tie branch behaviorally needs a genuine
@@ -788,7 +860,7 @@ mod tests {
         // The load-bearing case: equal rank must NOT outrank. `>=` fails here.
         assert!(
             !outranks((1, lo), (1, lo)),
-            "a tie must keep the INCUMBENT — all five consumers depend on this"
+            "a tie must keep the INCUMBENT — every rank consumer depends on this"
         );
 
         // Version dominates the digest in both directions.

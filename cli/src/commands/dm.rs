@@ -871,6 +871,16 @@ async fn execute_purge(
     };
 
     api.send_state_delta(&room_owner_key, &delta).await?;
+    // Recorded so a concurrent envelope from another device of this member
+    // cannot drop it for good (`ApiClient::heal_own_purges`), under the
+    // room's stored identity only. The purge is already sent, so a failure
+    // to record it is reported but does not fail the command.
+    if let Some(warning) = record_sent_purge(|| {
+        api.storage()
+            .record_own_purges(&room_owner_key, &signing_key, [resolved_token])
+    }) {
+        eprintln!("{warning}");
+    }
 
     match format {
         OutputFormat::Human => println!(
@@ -889,6 +899,15 @@ async fn execute_purge(
         ),
     }
     Ok(())
+}
+
+/// Record a purge that was already sent as this client's own (`record`
+/// stores it under the room's stored identity). A failure to record it is
+/// returned as a warning, never an error: the purge itself went out.
+fn record_sent_purge(record: impl FnOnce() -> Result<bool>) -> Option<String> {
+    record()
+        .err()
+        .map(|e| format!("Warning: the purge was sent, but recording it locally failed: {e}"))
 }
 
 /// `dm accept` — join a room from an invitation that arrived as a DM.
@@ -1446,6 +1465,19 @@ fn format_unix_local(unix_secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A purge that was sent and cannot be recorded locally gives a
+    /// warning, not an error; one that is recorded gives nothing.
+    #[test]
+    fn a_sent_purge_that_cannot_be_recorded_is_a_warning() {
+        assert_eq!(record_sent_purge(|| Ok(true)), None);
+        assert_eq!(record_sent_purge(|| Ok(false)), None);
+        let warning = record_sent_purge(|| Err(anyhow!("rooms.json is read-only")));
+        assert!(
+            warning.is_some_and(|w| w.starts_with("Warning: the purge was sent")
+                && w.contains("rooms.json is read-only"))
+        );
+    }
+
     use super::*;
 
     /// `dm list`'s counterparty nickname is attacker-controlled (any room

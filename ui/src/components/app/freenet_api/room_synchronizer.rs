@@ -26,10 +26,9 @@ use freenet_stdlib::{
         Parameters, UpdateData, WrappedContract, WrappedState,
     },
 };
-use river_core::room_state::direct_messages::{DirectMessagesSummary, DmRetentionHorizon};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
-use river_core::room_state::message::{AuthorizedMessageV1, MessagesSummary, RetentionHorizon};
+use river_core::room_state::message::AuthorizedMessageV1;
 use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{
     ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary,
@@ -44,9 +43,16 @@ use std::sync::Arc;
 /// `merge` passes ONE `parent_state` to all three legs, and the three legs want
 /// different things.
 ///
-/// * `summarize` must see the SUMMARIZING peer's own state.
+/// * `summarize` must see the SUMMARIZING peer's own state, with the
+///   configuration the merge will end with
+///   (`ChatRoomStateV1::merge_through_summary`, which summarizes as
+///   `summarize_with_merged_configuration` does and applies every incoming
+///   record, as the room's own whole-state merge does).
 ///   `MessagesV1::summarize` reads `max_recent_messages` from it to size its
-///   retention horizon; hand it anything else and the horizon is wrong.
+///   retention horizon (and the DM summary its global cap); hand it anything
+///   else and the horizon is wrong. With the PRE-merge configuration, an
+///   incoming configuration that raises a cap withheld messages the merged
+///   room keeps (freenet/river#703).
 /// * `delta` deliberately reads nothing from it (the default `merge` would hand
 ///   the SENDER's `delta` the RECEIVER's state, so anything read there would be
 ///   the wrong peer's), but passing `incoming` keeps the argument honest.
@@ -54,6 +60,11 @@ use std::sync::Arc;
 ///   `#[composable]` macro clones `self` per field — so the cheap default
 ///   sentinel stays, saving a full-state clone per network event
 ///   (freenet/river#246).
+///
+/// Unlike `ChatRoomStateV1::merge`, this keeps the retention horizons: it runs
+/// on every network event, and a horizon that occasionally costs an extra
+/// round is cheaper here than re-verifying older messages on each one. The
+/// local copy is not what the merge laws judge; the contract's merge is.
 ///
 /// Returning the delta lets tests assert on what was actually pulled over,
 /// which is the only way to catch a regression that produces the right final
@@ -63,11 +74,10 @@ fn merge_incoming_state(
     params: &ChatRoomParametersV1,
     incoming: &ChatRoomStateV1,
 ) -> Result<Option<ChatRoomStateV1Delta>, String> {
-    let summary = local.summarize(local, params);
-    let delta = incoming.delta(incoming, params, &summary);
-    let parent_sentinel = ChatRoomStateV1::default();
-    local.apply_delta(&parent_sentinel, params, &delta)?;
-    Ok(delta)
+    // The summary is read with the incoming configuration merged in, and
+    // every incoming record is applied, as the room's own whole-state merge
+    // does (freenet/river#703).
+    local.merge_through_summary(params, incoming)
 }
 
 pub(crate) fn compute_update_data(
@@ -138,89 +148,17 @@ fn outbound_summary(
     baseline: &ChatRoomStateV1,
     params: &ChatRoomParametersV1,
 ) -> ChatRoomStateV1Summary {
-    // EXHAUSTIVE DESTRUCTURE, deliberately — do not replace this with
-    // `let mut summary = ...; summary.x = ...`.
-    //
-    // This function is a hand-maintained mirror of "which summary fields are
-    // horizon-shaped", and nothing else in the codebase links it to the horizon
-    // definitions. Binding every field by name makes adding a field to
-    // `ChatRoomStateV1Summary` a COMPILE ERROR *at exactly the site that has to
-    // make the keep-or-clear decision*, instead of a silent default-to-keep.
-    //
-    // That is not hypothetical. `MembersV1` (`remove_excess_members`) and
-    // `BansV1` (`max_user_bans`) have the same non-monotonic defect and are
-    // deferred to a follow-up — see "Not fixed here".
-    //
-    // Scope of the guard, stated precisely because overstating it is what let
-    // freenet/river#519 through: the top-level destructure catches a new field
-    // on `ChatRoomStateV1Summary` ITSELF, and the two leaf destructures below
-    // catch one added to `MessagesSummary` or `DirectMessagesSummary`. The other
-    // eight leaf summaries — `members`, `bans`, `ban_evidence`, `member_info`,
-    // `secrets`, `configuration`, `upgrade`, `version` — are bound whole and are NOT
-    // guarded. So when the `MembersV1` follow-up adds `MembersSummary.horizon`,
-    // nothing here will fail to compile; whoever writes it must remember to
-    // neutralise it and destructure that leaf too.
-    let ChatRoomStateV1Summary {
-        configuration,
-        bans,
-        members,
-        ban_evidence,
-        member_info,
-        secrets,
-        recent_messages,
-        direct_messages,
-        upgrade,
-        version,
-    } = baseline.summarize(baseline, params);
-
-    // The LEAF summaries are destructured too, for the same reason and against
-    // a failure that already happened: freenet/river#519 added a THIRD
-    // horizon-shaped field, `DirectMessagesSummary::global_horizon`. Because it
-    // was nested one level below `ChatRoomStateV1Summary`, the top-level
-    // destructure above bound it inside `direct_messages` and this file
-    // compiled clean — silently reintroducing the exact bug the guard exists to
-    // prevent, on the new field. Binding leaf fields by name makes the next
-    // nested horizon a compile error here as well.
-    //
-    // "Horizon-shaped" means the field makes the SENDER withhold something it
-    // holds and the receiver lacks; every other field is a pure have-statement
-    // (an id set, a version, a digest map), which is safe — indeed required —
-    // to feed from the sender's own baseline, because that is what makes the
-    // delta "what changed since I last synced".
-    let MessagesSummary {
-        message_ids,
-        horizon: _drop_message_horizon,
-    } = recent_messages;
-    let recent_messages = MessagesSummary {
-        message_ids,
-        horizon: RetentionHorizon::Open,
-    };
-
-    let DirectMessagesSummary {
-        message_signatures,
-        purge_versions,
-        pair_horizons: _drop_pair_horizons,
-        global_horizon: _drop_global_horizon,
-    } = direct_messages;
-    let direct_messages = DirectMessagesSummary {
-        message_signatures,
-        purge_versions,
-        pair_horizons: Vec::new(),
-        global_horizon: DmRetentionHorizon::Open,
-    };
-
-    ChatRoomStateV1Summary {
-        configuration,
-        bans,
-        members,
-        ban_evidence,
-        member_info,
-        secrets,
-        recent_messages,
-        direct_messages,
-        upgrade,
-        version,
-    }
+    // The keep-or-clear decision for each summary field, and the exhaustive
+    // destructure that makes a new horizon-shaped field a compile error,
+    // live in `ChatRoomStateV1Summary::without_retention_horizons` (shared
+    // with the contract's whole-state merge, freenet/river#703). Note what it
+    // does NOT guard: only `MessagesSummary` and `DirectMessagesSummary` are
+    // destructured leaf by leaf, so when the `MembersV1` follow-up adds
+    // `MembersSummary.horizon` (see "Not fixed here"), nothing will fail to
+    // compile; whoever writes it must neutralise it there (freenet/river#519).
+    baseline
+        .summarize(baseline, params)
+        .without_retention_horizons()
 }
 
 /// Send a member-info self-heal as a standalone, member_info-only UPDATE.
@@ -372,6 +310,10 @@ impl RoomSynchronizer {
         // private-room secret lets us finally seal & publish our own
         // member_info. Sent as a standalone UPDATE AFTER the borrow releases.
         let mut pending_member_info_heal: Option<AuthorizedMemberInfo> = None;
+        // Set inside with_mut when a DM purge this device signed was missing
+        // from the room's winning envelope and was re-signed into local state
+        // (`RoomData::heal_own_purges`); the room is marked for sync after.
+        let mut purges_healed = false;
 
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
@@ -491,6 +433,8 @@ impl RoomSynchronizer {
                         // Keep cached self membership data up to date
                         room_data.capture_self_membership_data(&params);
 
+                        purges_healed = room_data.heal_own_purges();
+
                         // Issue freenet/river#267: compute newly-landed
                         // INBOUND DM senders by diffing the post-merge
                         // signature set against the pre-merge snapshot.
@@ -541,8 +485,10 @@ impl RoomSynchronizer {
                             }
                         }
 
-                        // Persist to delegate so state survives refresh
-                        wasm_bindgen_futures::spawn_local(async {
+                        // Persist to delegate so state survives refresh.
+                        // `safe_spawn_local`: spawned from inside a signal
+                        // write (dioxus-signal-safety), and a no-op natively.
+                        crate::util::safe_spawn_local(async {
                             if let Err(e) = save_rooms_to_delegate().await {
                                 error!("Failed to save rooms to delegate after delta: {}", e);
                             }
@@ -588,6 +534,9 @@ impl RoomSynchronizer {
         // "Unknown". Sent here, after the with_mut borrow released.
         if let Some(heal_info) = pending_member_info_heal {
             send_member_info_heal_update(owner_vk, heal_info);
+        }
+        if purges_healed {
+            crate::components::app::mark_needs_sync(owner_vk);
         }
 
         // Update document title after ROOMS.with_mut completes (update_document_title calls ROOMS.read())
@@ -1429,6 +1378,10 @@ impl RoomSynchronizer {
         // local in apply_delta_inner — a newly-arrived private-room secret may
         // let us finally seal & publish our own member_info.
         let mut pending_member_info_heal: Option<AuthorizedMemberInfo> = None;
+        // Set inside with_mut when a DM purge this device signed was missing
+        // from the room's winning envelope and was re-signed into local state
+        // (`RoomData::heal_own_purges`); the room is marked for sync after.
+        let mut purges_healed = false;
         let room_owner_copy = room_owner_vk;
 
         ROOMS.with_mut(|rooms| {
@@ -1532,6 +1485,8 @@ impl RoomSynchronizer {
                         let params = ChatRoomParametersV1 { owner: room_owner_vk };
                         room_data.capture_self_membership_data(&params);
 
+                        purges_healed = room_data.heal_own_purges();
+
                         // Issue freenet/river#267 (full-state path):
                         // diff post-merge DM signatures against the
                         // pre-merge snapshot to find genuinely new
@@ -1625,8 +1580,10 @@ impl RoomSynchronizer {
                             }
                         }
 
-                        // Persist to delegate so state survives refresh
-                        wasm_bindgen_futures::spawn_local(async {
+                        // Persist to delegate so state survives refresh.
+                        // `safe_spawn_local`: spawned from inside a signal
+                        // write (dioxus-signal-safety), and a no-op natively.
+                        crate::util::safe_spawn_local(async {
                             if let Err(e) = save_rooms_to_delegate().await {
                                 error!("Failed to save rooms to delegate after state update: {}", e);
                             }
@@ -1682,6 +1639,9 @@ impl RoomSynchronizer {
         // Symmetric with the apply_delta_inner path.
         if let Some(heal_info) = pending_member_info_heal {
             send_member_info_heal_update(room_owner_vk, heal_info);
+        }
+        if purges_healed {
+            crate::components::app::mark_needs_sync(room_owner_vk);
         }
 
         // Update document title after ROOMS.with_mut completes (update_document_title calls ROOMS.read())
@@ -1850,6 +1810,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use freenet_scaffold::util::FastHash;
+    use river_core::room_state::direct_messages::DmRetentionHorizon;
     use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
     use std::time::SystemTime;
 
@@ -1934,6 +1895,84 @@ mod tests {
         };
         let authorized = AuthorizedMessageV1::new(msg, author_sk);
         state.recent_messages.messages.push(authorized);
+    }
+
+    /// An incoming state under an older configuration with a higher
+    /// `max_user_bans`, into a local state already on the lowered cap: within
+    /// one delta's bound it merges and the lowered cap keeps what it keeps;
+    /// over it, it is refused, as the whole-state merge refuses it
+    /// (freenet/river#703).
+    #[test]
+    fn merge_incoming_state_holds_a_lower_ranked_state_to_the_local_bounds() {
+        use river_core::room_state::ban::{
+            AuthorizedUserBan, BansV1, UserBan, MIN_BANS_DELTA_BOUND,
+        };
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        let (_, params, owner_sk) = create_test_room();
+        let owner_id = params.owner_id();
+        let config = |version: u32, max_user_bans: usize| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    configuration_version: version,
+                    max_user_bans,
+                    ..Default::default()
+                },
+                &owner_sk,
+            )
+        };
+        let held = MIN_BANS_DELTA_BOUND;
+        let bans = (0..held as u64)
+            .map(|i| {
+                let target = SigningKey::from_bytes(&{
+                    let mut b = [9u8; 32];
+                    b[..8].copy_from_slice(&i.to_le_bytes());
+                    b
+                });
+                AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner_id,
+                        banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i),
+                        banned_user: MemberId::from(&target.verifying_key()),
+                    },
+                    owner_id,
+                    &owner_sk,
+                )
+            })
+            .collect();
+        let mut incoming = ChatRoomStateV1 {
+            configuration: config(1, held),
+            bans: BansV1(bans),
+            ..Default::default()
+        };
+        incoming.post_apply_cleanup(&params).unwrap();
+        let mut local = ChatRoomStateV1 {
+            configuration: config(2, 2),
+            ..Default::default()
+        };
+        let base = local.clone();
+        merge_incoming_state(&mut local, &params, &incoming)
+            .expect("an incoming state within the bound merges");
+        assert_eq!(local.bans.0.len(), 2);
+        local.verify(&local, &params).unwrap();
+
+        let mut over = incoming.clone();
+        over.configuration = config(1, held + 3);
+        over.bans.0.extend((0..3u64).map(|i| {
+            AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10_000 + i),
+                    banned_user: MemberId::from(
+                        &SigningKey::from_bytes(&[200 + i as u8; 32]).verifying_key(),
+                    ),
+                },
+                owner_id,
+                &owner_sk,
+            )
+        }));
+        let mut refused = base.clone();
+        assert!(merge_incoming_state(&mut refused, &params, &over).is_err());
     }
 
     #[test]
@@ -2354,6 +2393,169 @@ mod tests {
         src[..cut].chars().filter(|c| !c.is_whitespace()).collect()
     }
 
+    /// A room in `ROOMS`, held as bob, with bob's recorded purge of token 1,
+    /// and the network state in which bob's other device's envelope (token 7)
+    /// won.
+    fn purge_heal_room() -> (VerifyingKey, ChatRoomStateV1) {
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        use river_core::room_state::direct_messages::{
+            advance_recipient_purges, DirectMessagesDelta, PurgeToken,
+        };
+        use river_core::room_state::member::{AuthorizedMember, Member};
+        let owner_sk = SigningKey::from_bytes(&[61u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[62u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let base = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            members: river_core::room_state::member::MembersV1 {
+                members: vec![AuthorizedMember::new(
+                    Member {
+                        owner_member_id: owner_id,
+                        invited_by: owner_id,
+                        member_vk: bob_sk.verifying_key(),
+                    },
+                    &owner_sk,
+                )],
+            },
+            ..Default::default()
+        };
+        let other_device =
+            advance_recipient_purges(&bob_sk, &owner_vk, None, [PurgeToken([7; 16])]).unwrap();
+        let mut network = base.clone();
+        network
+            .apply_delta(
+                &base,
+                &params,
+                &Some(ChatRoomStateV1Delta {
+                    direct_messages: Some(DirectMessagesDelta {
+                        new_messages: vec![],
+                        advanced_purges: vec![other_device],
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let mut rd = crate::room_data::test_minimal_room_data(owner_vk);
+        rd.self_sk = Some(bob_sk.clone());
+        rd.room_state = base;
+        rd.own_purges.record(
+            MemberId::from(bob_sk.verifying_key()),
+            [PurgeToken([1; 16])],
+        );
+        ROOMS.with_mut(|rooms| rooms.map.insert(owner_vk, rd));
+        (owner_vk, network)
+    }
+
+    fn held_tombstones(
+        owner_vk: &VerifyingKey,
+    ) -> Vec<river_core::room_state::direct_messages::PurgeToken> {
+        ROOMS.read().map[owner_vk]
+            .room_state
+            .direct_messages
+            .purges
+            .iter()
+            .flat_map(|p| p.state.purged.clone())
+            .collect()
+    }
+
+    /// An incoming full state whose winning purge envelope omits a purge
+    /// this device recorded leaves the room holding the re-signed union.
+    #[test]
+    fn a_full_state_ingestion_re_signs_a_lost_purge() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let dom = dioxus::prelude::VirtualDom::new(|| rsx! {});
+        dom.in_scope(dioxus::prelude::ScopeId::ROOT, || {
+            let (owner_vk, network) = purge_heal_room();
+            RoomSynchronizer::update_room_state_inner(owner_vk, network);
+            assert_eq!(
+                held_tombstones(&owner_vk),
+                vec![PurgeToken([1; 16]), PurgeToken([7; 16])]
+            );
+        });
+    }
+
+    /// The same for an incoming delta.
+    #[test]
+    fn a_delta_ingestion_re_signs_a_lost_purge() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let dom = dioxus::prelude::VirtualDom::new(|| rsx! {});
+        dom.in_scope(dioxus::prelude::ScopeId::ROOT, || {
+            let (owner_vk, network) = purge_heal_room();
+            let delta = ChatRoomStateV1Delta {
+                direct_messages: Some(
+                    river_core::room_state::direct_messages::DirectMessagesDelta {
+                        new_messages: vec![],
+                        advanced_purges: network.direct_messages.purges.clone(),
+                    },
+                ),
+                ..Default::default()
+            };
+            RoomSynchronizer::apply_delta_inner(owner_vk, delta);
+            assert_eq!(
+                held_tombstones(&owner_vk),
+                vec![PurgeToken([1; 16]), PurgeToken([7; 16])]
+            );
+        });
+    }
+
+    /// Both inbound-sync paths re-sign a DM purge this device signed that the
+    /// winning envelope omits, and mark the room for sync when they do
+    /// (behaviour pinned by `a_device_whose_purge_lost_re_signs_the_union`
+    /// in `room_data.rs`).
+    #[test]
+    fn both_ingestion_paths_heal_own_purges() {
+        let src = production_source_whitespace_stripped();
+        let delta_at = src.find("fnapply_delta_inner(").expect("apply_delta_inner");
+        let state_at = src
+            .find("fnupdate_room_state_inner(")
+            .expect("update_room_state_inner");
+        let (first, second) = if delta_at < state_at {
+            (&src[delta_at..state_at], &src[state_at..])
+        } else {
+            (&src[state_at..delta_at], &src[delta_at..])
+        };
+        for body in [first, second] {
+            assert!(body.contains("purges_healed=room_data.heal_own_purges();"));
+            assert!(body.contains("ifpurges_healed{crate::components::app::mark_needs_sync("));
+        }
+    }
+
+    /// Every GET path that brings network state into a held room re-signs a
+    /// lost DM purge after the state lands: the re-accept refresh, the join,
+    /// the imported-room replacement, the refresh merge and the recovered
+    /// state of a backward probe, and the two whose sync is not otherwise
+    /// marked mark it. None of the calls sits behind a constant condition.
+    #[test]
+    fn every_get_ingestion_path_heals_own_purges() {
+        let raw = include_str!("response_handler/get_response.rs");
+        let cut = raw.find("mod tests {").expect("a tests module to cut at");
+        // Comment lines are dropped, so a commented-out call does not count.
+        let src: String = raw[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(src.matches("room_data.heal_own_purges()").count(), 5);
+        assert_eq!(
+            src.matches("ifpurges_healed{crate::components::app::mark_needs_sync(owner_vk);}")
+                .count(),
+            2
+        );
+        assert!(
+            !src.contains("iffalse"),
+            "no call behind a constant condition"
+        );
+    }
+
     /// Issue freenet/river#526 regression guard.
     ///
     /// The two inbound-sync call sites must use the CUTOFF-GATED unhide.
@@ -2582,6 +2784,61 @@ mod tests {
         assert_eq!(
             room_state.recent_messages.messages, before,
             "and, consistently, the retained window must be untouched"
+        );
+    }
+
+    /// freenet/river#703: the incoming state's configuration outranks the
+    /// room's and raises `max_recent_messages` from 5 to 10. The room is at
+    /// its old cap with newer messages; the incoming state holds older ones.
+    /// The merged room has room for them, so `merge_incoming_state` must pull
+    /// them over: its horizon is read against the MERGED configuration
+    /// (`summarize_with_merged_configuration`). Read against the room's own
+    /// cap, the horizon withholds them and the delta carries no messages.
+    #[test]
+    fn merge_incoming_state_reads_a_raised_cap_from_the_incoming_configuration() {
+        use river_core::room_state::configuration::AuthorizedConfigurationV1;
+
+        let (mut room_state, params, owner_sk) = create_test_room();
+        let mut cfg = room_state.configuration.configuration.clone();
+        cfg.owner_member_id = params.owner_id();
+        cfg.max_recent_messages = 5;
+        room_state.configuration = AuthorizedConfigurationV1::new(cfg.clone(), &owner_sk);
+        let at = |state: &mut ChatRoomStateV1, secs: u64| {
+            let msg = MessageV1 {
+                room_owner: params.owner_id(),
+                author: params.owner_id(),
+                content: RoomMessageBody::public(format!("m{secs}")),
+                time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            };
+            state
+                .recent_messages
+                .messages
+                .push(AuthorizedMessageV1::new(msg, &owner_sk));
+        };
+        let mut incoming = room_state.clone();
+        cfg.configuration_version += 1;
+        cfg.max_recent_messages = 10;
+        incoming.configuration = AuthorizedConfigurationV1::new(cfg, &owner_sk);
+        for i in 0..3u64 {
+            at(&mut incoming, 1_000 + i);
+        }
+        for i in 0..5u64 {
+            at(&mut room_state, 2_000 + i);
+        }
+
+        let applied =
+            merge_incoming_state(&mut room_state, &params, &incoming).expect("merge must succeed");
+        assert!(
+            applied
+                .as_ref()
+                .and_then(|d| d.recent_messages.as_ref())
+                .is_some_and(|m| m.len() == 3),
+            "the merge withheld older messages the raised cap keeps"
+        );
+        assert_eq!(room_state.recent_messages.messages.len(), 8);
+        assert_eq!(
+            room_state.configuration.configuration.max_recent_messages,
+            10
         );
     }
 
@@ -2832,6 +3089,7 @@ mod tests {
         // BASELINE: cap 3, exactly 3 messages, so it publishes a real horizon.
         let mut baseline = room_state.clone();
         let mut cfg = baseline.configuration.configuration.clone();
+        cfg.owner_member_id = MemberId::from(&owner_sk.verifying_key());
         cfg.max_recent_messages = 3;
         baseline.configuration = AuthorizedConfigurationV1::new(cfg.clone(), &owner_sk);
         for i in 0..3u64 {

@@ -76,6 +76,12 @@ migration = []
 # stay byte-identical. The contract treats message content as opaque bytes and
 # never parses mentions, so this is a pure client concern.
 mentions = []
+# A client's record of the DM purges it signed, and the envelope it re-signs
+# when a concurrent envelope from another device of the same member wins
+# without them. Enabled ONLY by the client crates (river-ui, riverctl), like
+# `migration` and `mentions`, so the room-contract and chat-delegate WASM
+# (and their keys) stay byte-identical.
+own-purges = []
 
 [build-dependencies]
 # Parses legacy_room_contracts.toml, validates every hash, and generates the

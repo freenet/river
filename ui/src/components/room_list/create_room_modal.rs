@@ -21,6 +21,12 @@ pub fn CreateRoomModal() -> Element {
             info!("🔴 {EMOJI_REJECTION_MESSAGE} — room creation blocked");
             return;
         }
+        // The room's first configuration and the creator's nickname must
+        // pass the checks the room applies (shown under the fields below).
+        if let Some(reason) = new_room_limit_refusal(&name, &nickname.read()) {
+            info!("🔴 {reason} — room creation blocked");
+            return;
+        }
         info!("🔵 Room name: {}", name);
 
         // Generate key outside the borrow
@@ -131,6 +137,8 @@ pub fn CreateRoomModal() -> Element {
     // `crate::util::display_name`). Emoji would be stripped at render time
     // anyway; telling the user up front beats silently losing characters.
     let nickname_has_emoji = contains_hidden_chars(&nickname());
+    let limit_refusal = new_room_limit_refusal(&room_name(), &nickname());
+    let limit_blocked = limit_refusal.is_some();
 
     rsx! {
         // Dimmer and centring wrapper are one element, so a click outside the card hits this handler.
@@ -213,6 +221,14 @@ pub fn CreateRoomModal() -> Element {
                                 "{EMOJI_REJECTION_MESSAGE}"
                             }
                         }
+                        if let Some(reason) = limit_refusal {
+                            p {
+                                "data-testid": "create-room-limit-error",
+                                class: "mt-1 text-xs text-red-400",
+                                role: "alert",
+                                "{reason}"
+                            }
+                        }
                     }
 
                     label { class: "flex items-center gap-3 cursor-pointer",
@@ -250,12 +266,41 @@ pub fn CreateRoomModal() -> Element {
                         class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                         // Disabled rather than silently no-op, matching the
                         // accept-invitation modal's nickname gate.
-                        disabled: nickname_has_emoji,
+                        disabled: nickname_has_emoji || limit_blocked,
                         onclick: create_room,
                         "Create Room"
                     }
                 }
             }
         }
+    }
+}
+
+/// Why a room named `name`, created by someone nicknamed `nickname`, would
+/// not be taken as entered (a name or nickname over the new room's default
+/// limits), if it would not. The owner id does not affect the answer, so a
+/// fixed key stands in for the one generated at creation.
+fn new_room_limit_refusal(name: &str, nickname: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    let params = river_core::room_state::ChatRoomParametersV1 {
+        owner: SigningKey::from_bytes(&[1u8; 32]).verifying_key(),
+    };
+    river_core::room_state::configuration::new_room_refusal(&params, name, nickname)
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    /// A name or nickname over the new room's default limits is refused
+    /// with a reason; an empty name is left to the existing empty check.
+    #[test]
+    fn a_new_room_over_the_default_limits_is_refused() {
+        assert_eq!(new_room_limit_refusal("Room", "Alex"), None);
+        assert_eq!(new_room_limit_refusal("", "Alex"), None);
+        assert!(new_room_limit_refusal(&"n".repeat(101), "Alex").is_some());
+        assert!(new_room_limit_refusal("Room", &"k".repeat(51)).is_some());
     }
 }

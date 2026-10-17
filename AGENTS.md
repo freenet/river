@@ -30,8 +30,13 @@ cargo make test-web-container
 cargo make test-common
 cargo make test-chat-delegate
 cargo make test-web-container-integration
-cargo test -p river-ui --bins      # river-ui crate native unit tests (CI-gated)
+cargo make test-ui                 # river-ui crate native unit tests (CI-gated)
 ```
+
+`cargo test -p river-ui --bins` alone needs `ui/assets/styles.css`, a
+gitignored build product: on a clean tree it fails to compile with "Asset at
+/assets/styles.css doesn't exist" until `cargo make build-tailwind` (or any
+UI build) has generated it. `cargo make test-ui` runs that first.
 
 ### Local UI Testing with dx serve
 
@@ -407,6 +412,12 @@ Full rule (why, the `BTreeMap`/`BTreeSet`/sorted-`Vec` fix, the required
 determinism test, and the WASM-migration coupling) lives in
 **`.claude/rules/contract-summary-determinism.md`**. Read it before touching any
 `type Summary` / `type Delta` under `common/src/room_state/`.
+
+The merge-law rules (a validly signed record never fails a merge; use the
+room's own `merge`, never `ComposableState::merge`; summaries carry a rank
+with a digest tie-break; held state is normalized on every apply;
+`FORK_SEEDS=1000` is the real check) live in
+**`.claude/rules/merge-laws.md`**.
 
 ## Dioxus WASM Signal Safety Rules
 

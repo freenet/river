@@ -355,9 +355,11 @@ mod tests {
         // some value that IS a valid UTF-8 leading byte (e.g. 0x20,
         // 0x7B), at which point a user typing a DM that begins with
         // that character would silently mis-decode.
-        assert!(
-            DM_BODY_MAGIC >= 0x80 && DM_BODY_MAGIC <= 0xBF,
-            "DM_BODY_MAGIC must be a UTF-8 continuation byte (0x80..=0xBF) so it cannot start a valid UTF-8 string"
-        );
+        const {
+            assert!(
+                DM_BODY_MAGIC >= 0x80 && DM_BODY_MAGIC <= 0xBF,
+                "DM_BODY_MAGIC must be a UTF-8 continuation byte (0x80..=0xBF) so it cannot start a valid UTF-8 string"
+            )
+        };
     }
 }

@@ -36,6 +36,47 @@ This file enumerates the Freenet contracts and delegates published from this rep
 
 - Depend on `river-core` for the wire types; you almost never need to compile or execute the contract/delegate WASM yourself to read or construct River-compatible data.
 - Chat-delegate message byte fields (stored values, signing payloads) are CBOR **byte strings** from the delegate generation after `V33` (freenet/river#757); earlier generations used CBOR arrays of integers. River encodes with ciborium, which decodes either form into a `Vec<u8>`; a decoder built on another CBOR library must accept both.
+- **`river-core` 0.3.0** (freenet/river#703) changes room-state types an
+  integrator may depend on:
+  - Summary shapes: the configuration summary is `(bool, u32, SigDigest)`
+    (passes the value checks, version, signature digest); the bans summary is
+    a set of whole-record digests (`ban_digest`) rather than `BanId`s; secret
+    blobs are summarized as `(version, member) -> SigDigest`. The members
+    summary is a set of member ids, as before.
+  - `ChatRoomStateV1Delta.version` is `Option<u32>`: the state format version
+    merges to the higher of the two.
+  - `ChatRoomStateV1::merge` is an inherent method that shadows
+    `ComposableState::merge`; call it (or `merge_from`), never the trait
+    method, on a room. A receiver that merges through its own summary should
+    call `merge_through_summary`. A whole-state merge refuses an incoming
+    state holding more bans, members or ban evidence than its own
+    owner-signed configuration allows, and otherwise applies every record.
+  - A delta for a peer you know only by its summary should come from
+    `delta_within_work_bounds` (or `delta` followed by
+    `trim_network_delta`), so a peer on a lowered cap applies it.
+  - `apply_delta` returns `Ok` where it used to return `Err` for validly
+    signed records the room does not admit (re-delivered records, a second
+    record at a held version, a record for a member id already held, a
+    public message in a private room) and for a ban its known issuer's key
+    does not verify: they are skipped, so a merge with a peer holding one no
+    longer fails. A ban no known key verifies (its known issuer's key does
+    not, or its issuer is known nowhere) never counts toward
+    `max_user_bans`.
+  - A whole-state merge also refuses an incoming state whose configuration
+    does not outrank the receiver's when it holds more bans, members or ban
+    evidence than one delta may carry in the receiver's room; such a peer
+    takes the receiver's configuration from its own merge and the next
+    exchange goes through.
+  - A configuration that fails the value checks is ranked below every valid
+    one rather than refused: a held one is replaced by any valid
+    configuration or by an invalid one of higher rank, and is never dropped.
+  - The room holds member nicknames only to a fixed 1000-byte ceiling
+    (`NICKNAME_CEILING`); `max_nickname_size` is a client rule, checked with
+    `nickname_refusal` before signing a nickname (on join as well as on
+    edit). Before signing a configuration, call
+    `Configuration::normalize_for_signing` and then
+    `Configuration::signing_refusal`; before creating a room,
+    `configuration::new_room_refusal`.
 - Every contract/delegate here can re-key on any release (see the Migration notes above) — **a build-time-constant reference to a key will silently go stale.** Resolve a pointer instead; see below.
 
 ## Stable identity: resolve a pointer, do not pin a key

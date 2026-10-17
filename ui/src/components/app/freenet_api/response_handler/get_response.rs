@@ -21,7 +21,6 @@ use crate::util::{
 };
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
-use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
@@ -212,30 +211,37 @@ pub async fn handle_get_response(
                 // ROOMS mutation in this handler) to avoid a borrow conflict
                 // with the synchronous signal reads above.
                 crate::util::defer(move || {
-                    ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
-                            let params = ChatRoomParametersV1 { owner: owner_vk };
-                            let current_state = room_data.room_state.clone();
-                            match room_data.room_state.merge(
-                                &current_state,
-                                &params,
-                                &retrieved_state,
-                            ) {
-                                Ok(_) => {
-                                    room_data.capture_self_membership_data(&params);
-                                    let _ = room_data.repopulate_secrets_from_state();
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Re-accept refresh: failed to merge state for room \
-                                         {:?}: {}",
-                                        MemberId::from(owner_vk),
-                                        e
-                                    );
-                                }
+                    let purges_healed = ROOMS.with_mut(|rooms| {
+                        let Some(room_data) = rooms.map.get_mut(&owner_vk) else {
+                            return false;
+                        };
+                        let params = ChatRoomParametersV1 { owner: owner_vk };
+                        match crate::room_data::merge_converging(
+                            &mut room_data.room_state,
+                            &params,
+                            &retrieved_state,
+                        ) {
+                            Ok(_) => {
+                                room_data.capture_self_membership_data(&params);
+                                let _ = room_data.repopulate_secrets_from_state();
+                                // A DM purge this device signed that the
+                                // network's winning envelope omits.
+                                room_data.heal_own_purges()
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Re-accept refresh: failed to merge state for room \
+                                     {:?}: {}",
+                                    MemberId::from(owner_vk),
+                                    e
+                                );
+                                false
                             }
                         }
                     });
+                    if purges_healed {
+                        crate::components::app::mark_needs_sync(owner_vk);
+                    }
                 });
 
                 // Move the room out of `Subscribing` in SYNC_INFO.
@@ -362,6 +368,29 @@ pub async fn handle_get_response(
             // secret has arrived. (The heal runs only on GET, not on the
             // UPDATE that typically delivers the secret — tracked as issue
             // #295.)
+            // The room's `max_nickname_size` is a client rule, checked here
+            // before the invitee's member_info is signed: over it, the join
+            // stops and the invitation dialog returns to the nickname prompt
+            // with the reason (freenet/river#703).
+            if let Some(reason) = river_core::room_state::member_info::nickname_refusal(
+                preferred_nickname.len(),
+                &retrieved_state.configuration.configuration,
+            ) {
+                warn!(
+                    "Invitation not completed for room {:?}: {reason}",
+                    MemberId::from(owner_vk)
+                );
+                // Back to the nickname prompt with the reason (not Retry,
+                // which would resubmit the same nickname).
+                let nickname = preferred_nickname.clone();
+                crate::util::defer(move || {
+                    crate::components::room_list::receive_invitation_modal::refuse_join_for_nickname(
+                        owner_vk, nickname, reason,
+                    );
+                });
+                return Ok(());
+            }
+
             let authorized_member_info: Option<AuthorizedMemberInfo> = {
                 // Seal the invitee's nickname against the room secret —
                 // taken from the contract state if the owner has already
@@ -485,6 +514,7 @@ pub async fn handle_get_response(
                             self_nickname: None,
                             previous_contract_key: None,
                             rekey_merge: Default::default(),
+                            own_purges: Default::default(),
                             invitation_secrets: std::collections::BTreeMap::new(),
                         }
                     });
@@ -500,18 +530,28 @@ pub async fn handle_get_response(
                         // Create parameters for merge
                         let params = ChatRoomParametersV1 { owner: owner_vk };
 
-                        // Clone current state to avoid borrow issues during merge
-                        let current_state = room_data.room_state.clone();
-
                         // Merge the retrieved state into the existing state
                         // FIRST, so the membership decision below sees the
                         // CANONICAL members (the merge folds in any remote
                         // removal/ban). Judging it from the pre-merge local
                         // snapshot would be stale.
-                        room_data
-                            .room_state
-                            .merge(&current_state, &params, &retrieved_state)
-                            .expect("Failed to merge room states");
+                        //
+                        // A refused merge (the retrieved state under a
+                        // configuration that does not outrank the held one,
+                        // over its bounds) converges through the other
+                        // direction; a merge that fails either way keeps the
+                        // held state rather than stopping the join.
+                        if let Err(e) = crate::room_data::merge_converging(
+                            &mut room_data.room_state,
+                            &params,
+                            &retrieved_state,
+                        ) {
+                            error!(
+                                "Invitation GET: failed to merge state for room {:?}: {}",
+                                MemberId::from(owner_vk),
+                                e
+                            );
+                        }
 
                         // Adopt the invitation's signing key as our per-room
                         // identity ONLY when the key we currently hold is not
@@ -581,6 +621,9 @@ pub async fn handle_get_response(
                             decrypted, member_id
                         );
                     }
+                    // A DM purge this device signed that the network's winning
+                    // envelope omits (published by the sync marked below).
+                    let _ = room_data.heal_own_purges();
 
                     // The invitee's `authorized_member_info` was built once
                     // above, before `build_state_for_put`, and moved into this
@@ -991,8 +1034,11 @@ pub async fn handle_get_response(
             }
 
             crate::util::defer(move || {
-                ROOMS.with_mut(|rooms| {
-                    if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                let purges_healed = ROOMS.with_mut(|rooms| {
+                    let Some(room_data) = rooms.map.get_mut(&owner_vk) else {
+                        return false;
+                    };
+                    {
                         let params = ChatRoomParametersV1 { owner: owner_vk };
 
                         // Note: we intentionally do NOT record receive times here.
@@ -1002,12 +1048,12 @@ pub async fn handle_get_response(
                         // capture the true arrival moment.
 
                         if room_data.is_awaiting_initial_sync() {
-                            // Imported rooms have a placeholder default state with
-                            // owner_member_id: FastHash(0). Merging fails because
-                            // the retrieved state has the real owner's member ID
-                            // and apply_delta rejects owner_member_id changes.
-                            // Replace the state wholesale — the default has no
-                            // useful data to preserve.
+                            // Imported rooms have a placeholder default state
+                            // whose configuration is not signed by the owner.
+                            // A merge would now adopt the network's
+                            // configuration (freenet/river#703), but the
+                            // placeholder holds nothing worth keeping, so the
+                            // state is replaced wholesale.
                             info!(
                                 "Replacing placeholder state for imported room {:?} with network state",
                                 MemberId::from(owner_vk)
@@ -1033,12 +1079,15 @@ pub async fn handle_get_response(
                             // key guard inside the helper makes lingering
                             // entries from a prior state harmless.
                             let _ = room_data.repopulate_secrets_from_state();
+                            // A DM purge this device signed that the network's
+                            // winning envelope omits.
+                            room_data.heal_own_purges()
                         } else {
-                            let current_state = room_data.room_state.clone();
-                            match room_data
-                                .room_state
-                                .merge(&current_state, &params, &retrieved_state)
-                            {
+                            match crate::room_data::merge_converging(
+                                &mut room_data.room_state,
+                                &params,
+                                &retrieved_state,
+                            ) {
                                 Ok(_) => {
                                     info!(
                                         "Successfully merged refreshed state for room {:?}",
@@ -1052,6 +1101,9 @@ pub async fn handle_get_response(
                                     // this, the in-memory `secrets` map stays
                                     // stale until the next subscription update.
                                     let _ = room_data.repopulate_secrets_from_state();
+                                    // A DM purge this device signed that the
+                                    // network's winning envelope omits.
+                                    room_data.heal_own_purges()
                                 }
                                 Err(e) => {
                                     error!(
@@ -1059,11 +1111,15 @@ pub async fn handle_get_response(
                                         MemberId::from(owner_vk),
                                         e
                                     );
+                                    false
                                 }
                             }
                         }
                     }
                 });
+                if purges_healed {
+                    crate::components::app::mark_needs_sync(owner_vk);
+                }
             });
 
             // Send the member-info self-heal as a standalone UPDATE — but
@@ -1527,7 +1583,7 @@ pub(crate) fn merge_recovered_into_room(
         // room behind.
         let current_state = room_data.room_state.clone();
         let mut merged = current_state.clone();
-        if let Err(e) = merged.merge(&current_state, &params, &recovered) {
+        if let Err(e) = crate::room_data::merge_converging(&mut merged, &params, &recovered) {
             error!(
                 "Backward probe: failed to merge recovered state for room {:?}: {}",
                 MemberId::from(owner_vk),
@@ -1539,6 +1595,9 @@ pub(crate) fn merge_recovered_into_room(
     }
     room_data.capture_self_membership_data(&params);
     let _ = room_data.repopulate_secrets_from_state();
+    // A DM purge this device signed that the recovered state's winning
+    // envelope omits (published with the room's next sync).
+    let _ = room_data.heal_own_purges();
     true
 }
 
@@ -1572,7 +1631,7 @@ pub(crate) fn merge_room_states(
     params: &ChatRoomParametersV1,
 ) -> ChatRoomStateV1 {
     let mut merged = primary.clone();
-    match merged.merge(&primary, params, local) {
+    match crate::room_data::merge_converging(&mut merged, params, local) {
         Ok(()) => merged,
         Err(e) => {
             warn!(
@@ -1841,6 +1900,7 @@ pub(crate) fn build_state_for_put(
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use freenet_scaffold::ComposableState;
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::member::{AuthorizedMember, Member};
     use river_core::room_state::privacy::SealedBytes;

@@ -38,11 +38,23 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsValue;
 
 thread_local! {
+    static FORGE_NEXT_SEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The load worker `setRoomsLoadStateKeepingRooms("migrating")` holds open
     /// (until the next call, or `releaseHeldLoadWorker`).
     static HELD_LOAD_WORKER: std::cell::RefCell<
         Option<crate::components::app::chat_delegate::LoadWorkerGuard>,
     > = const { std::cell::RefCell::new(None) };
+}
+
+/// `signature` with one bit flipped if `forgeNextSendSignature` was called
+/// since the last send, else unchanged. Called by the composer's send path.
+pub fn forge_if_requested(signature: ed25519_dalek::Signature) -> ed25519_dalek::Signature {
+    if !FORGE_NEXT_SEND.with(|f| f.replace(false)) {
+        return signature;
+    }
+    let mut bytes = signature.to_bytes();
+    bytes[0] ^= 1;
+    ed25519_dalek::Signature::from_bytes(&bytes)
 }
 
 pub fn install_test_hooks() {
@@ -173,11 +185,9 @@ pub fn install_test_hooks() {
     );
 
     // Put the current room in the state of a private room whose secret this
-    // device does not hold. A send then falls back to a public body, which
-    // the send's own local `apply_delta` rejects ("Cannot send public messages
-    // in private room"), so the send fails AFTER the composer has handed it
-    // off: the failed-send case of the A06 specs. The rendered history does
-    // not change, since every example message body is public.
+    // device does not hold. The conversation then offers no composer and
+    // says why. The rendered history does not change, since every example
+    // message body is public.
     //
     // Only for a room self owns: the configuration is re-signed with the
     // owner's key, because a configuration that fails its signature check
@@ -208,6 +218,14 @@ pub fn install_test_hooks() {
             });
         })
         .into_js_value(),
+    );
+
+    // Corrupt the signature of the next own message the composer sends, so
+    // the room does not admit it and the send fails AFTER the composer has
+    // handed it off: the failed-send case of the A06 specs.
+    set_hook(
+        "forgeNextSendSignature",
+        Closure::<dyn FnMut()>::new(move || FORGE_NEXT_SEND.with(|f| f.set(true))).into_js_value(),
     );
 
     // Drive the no-room screen's load states (freenet/river#509), which the

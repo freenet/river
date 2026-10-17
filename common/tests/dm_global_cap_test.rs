@@ -104,6 +104,7 @@ fn room(n_members: usize, max_direct_messages: Option<usize>) -> Room {
         .collect();
 
     let config = Configuration {
+        owner_member_id: owner_id,
         max_members: 1000,
         max_direct_messages,
         ..Default::default()
@@ -658,9 +659,9 @@ fn a_peer_below_the_global_cap_still_receives_older_dms() {
 }
 
 /// A zero cap must suppress the delta outright rather than loop against a peer
-/// that keeps nothing. `AuthorizedConfigurationV1::apply_delta` rejects a zero,
-/// but `verify` does not, so an owner-signed zero can still arrive by the
-/// full-state path.
+/// that keeps nothing. A configuration with a zero cap ranks below every
+/// valid one, but `verify` accepts it, so an owner-signed zero can be held
+/// after a full-state PUT.
 #[test]
 fn zero_global_cap_suppresses_the_delta_instead_of_looping() {
     let r = room(6, Some(40));
@@ -1054,8 +1055,10 @@ fn duplicate_entries_do_not_defeat_the_global_cap() {
     messages.extend(std::iter::repeat_n(duplicated.clone(), 30));
     messages.extend(spread(&r, 200..210, 3));
 
-    let mut d = DirectMessagesV1::default();
-    d.messages = messages;
+    let mut d = DirectMessagesV1 {
+        messages,
+        ..Default::default()
+    };
     d.apply_delta(&r.state, &r.params, &None)
         .expect("empty delta must apply");
 
@@ -1184,20 +1187,155 @@ fn verify_accepts_state_over_the_global_cap_so_the_migration_put_survives() {
     );
 }
 
-/// A zero cap is rejected at configuration-update time, alongside the other
-/// zero-valued limits.
+/// A zero cap is refused at configuration-update time, alongside the other
+/// zero-valued limits. Refused means not adopted: an owner-signed
+/// configuration is skipped rather than failing the whole delta
+/// (freenet/river#703).
 #[test]
 fn zero_max_direct_messages_is_rejected_by_configuration_apply_delta() {
     let r = room(4, Some(40));
     let mut cfg = r.state.configuration.clone();
+    let before = cfg.clone();
 
     let mut bad = cfg.configuration.clone();
     bad.configuration_version += 1;
     bad.max_direct_messages = Some(0);
     let bad = AuthorizedConfigurationV1::new(bad, &r.owner_sk);
 
-    let err = cfg
-        .apply_delta(&r.state, &r.params, &Some(bad))
-        .expect_err("a zero DM cap must be rejected");
-    assert_eq!(err, "Invalid configuration values");
+    assert_eq!(
+        bad.check_values(&r.params),
+        Err("Invalid configuration values: max_direct_messages is 0".to_string())
+    );
+    cfg.apply_delta(&r.state, &r.params, &Some(bad))
+        .expect("an owner-signed configuration is skipped, not rejected");
+    assert_eq!(cfg, before, "a zero DM cap must not be adopted");
+}
+
+// ---------------------------------------------------------------------------
+// Whole-state merges (freenet/river#703 defect 3, the DM half)
+// ---------------------------------------------------------------------------
+
+fn ser_state(s: &ChatRoomStateV1) -> Vec<u8> {
+    let mut v = Vec::new();
+    ciborium::ser::into_writer(s, &mut v).unwrap();
+    v
+}
+
+/// A normalized state of `r` under `config` holding `dms` (and `extra`).
+fn normalized(
+    r: &Room,
+    config: Configuration,
+    dms: Vec<AuthorizedDirectMessage>,
+    extra: impl FnOnce(&mut ChatRoomStateV1),
+) -> ChatRoomStateV1 {
+    let mut s = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(config, &r.owner_sk),
+        ..r.state.clone()
+    };
+    s.direct_messages.messages = dms;
+    extra(&mut s);
+    s.post_apply_cleanup(&r.params).unwrap();
+    s.verify(&s, &r.params).unwrap();
+    s
+}
+
+/// Both merge directions end in the same state, which verifies.
+fn merged_both_ways(r: &Room, a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> ChatRoomStateV1 {
+    let mut ab = a.clone();
+    ab.merge(a, &r.params, b).unwrap();
+    let mut ba = b.clone();
+    ba.merge(b, &r.params, a).unwrap();
+    assert!(
+        ser_state(&ab) == ser_state(&ba),
+        "merge(A, B) must equal merge(B, A)"
+    );
+    ab.verify(&ab, &r.params).unwrap();
+    ab
+}
+
+/// X is at the global cap, and 5 of its DMs are from a member Y's owner ban
+/// removes; Y holds 5 older DMs. The ban frees 5 slots, so the merged room
+/// keeps Y's older DMs whichever side merges: X's global horizon must not
+/// withhold them.
+#[test]
+fn a_removal_frees_global_dm_slots_in_both_merge_directions() {
+    let r = room(4, Some(20));
+    let config = r.state.configuration.configuration.clone();
+    let mut x_dms: Vec<_> = (100..115).map(|o| dm(&r, 0, 1, o)).collect();
+    x_dms.extend((200..205).map(|o| dm(&r, 3, 1, o)));
+    let x = normalized(&r, config.clone(), x_dms, |_| {});
+    assert_eq!(
+        x.direct_messages.messages.len(),
+        20,
+        "premise: X at the cap"
+    );
+    let owner_id = r.params.owner_id();
+    let y = normalized(&r, config, (0..5).map(|o| dm(&r, 0, 1, o)).collect(), |s| {
+        s.bans = river_core::room_state::ban::BansV1(vec![
+            river_core::room_state::ban::AuthorizedUserBan::new(
+                river_core::room_state::ban::UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(BASE_TS),
+                    banned_user: r.id(3),
+                },
+                owner_id,
+                &r.owner_sk,
+            ),
+        ])
+    });
+    let merged = merged_both_ways(&r, &x, &y);
+    assert_eq!(merged.direct_messages.messages.len(), 20);
+}
+
+/// Y's configuration outranks X's and raises the global DM cap from 10 to
+/// 20; X is at its cap of 10 with newer DMs, Y holds 10 older ones. The
+/// merged room keeps all 20 in both directions.
+#[test]
+fn a_raised_global_dm_cap_is_read_at_its_merged_value() {
+    let r = room(4, Some(10));
+    let mut low = r.state.configuration.configuration.clone();
+    low.max_direct_messages = Some(10);
+    let mut high = low.clone();
+    high.configuration_version += 1;
+    high.max_direct_messages = Some(20);
+    let x = normalized(
+        &r,
+        low,
+        (100..110).map(|o| dm(&r, 0, 1, o)).collect(),
+        |_| {},
+    );
+    let y = normalized(&r, high, (0..10).map(|o| dm(&r, 0, 1, o)).collect(), |_| {});
+    let merged = merged_both_ways(&r, &x, &y);
+    assert_eq!(merged.direct_messages.messages.len(), 20);
+}
+
+/// The per-pair horizon: X holds a full pair; Y holds the recipient's purge
+/// of 5 of them and 5 older DMs in the pair. The purge frees 5 of the pair's
+/// slots, so the merged room keeps Y's older DMs in both directions.
+#[test]
+fn a_purge_frees_pair_dm_slots_in_both_merge_directions() {
+    use river_core::room_state::direct_messages::{sign_recipient_purges, RecipientPurges};
+    let r = room(4, None);
+    let config = r.state.configuration.configuration.clone();
+    let x_dms: Vec<_> = (100..100 + MAX_DM_MESSAGES_PER_PAIR as u64)
+        .map(|o| dm(&r, 0, 1, o))
+        .collect();
+    let purged: Vec<_> = x_dms[50..55].iter().map(|m| m.purge_token()).collect();
+    let x = normalized(&r, config.clone(), x_dms, |_| {});
+    let envelope = sign_recipient_purges(
+        &r.member_sks[1],
+        r.id(1),
+        &r.params.owner,
+        RecipientPurges { version: 1, purged },
+    )
+    .unwrap();
+    let y = normalized(&r, config, (0..5).map(|o| dm(&r, 0, 1, o)).collect(), |s| {
+        s.direct_messages.purges = vec![envelope]
+    });
+    let merged = merged_both_ways(&r, &x, &y);
+    assert_eq!(
+        merged.direct_messages.messages.len(),
+        MAX_DM_MESSAGES_PER_PAIR
+    );
 }
