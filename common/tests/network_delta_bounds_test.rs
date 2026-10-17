@@ -734,3 +734,46 @@ fn every_trimmed_network_delta_advances_the_receiver() {
         "the whole window arrives"
     );
 }
+
+/// A receiver that pruned a member (no record, no messages of theirs) is
+/// sent that member's record with their new message, so the message
+/// verifies on arrival (freenet/river#145).
+#[test]
+fn a_new_message_arrives_with_its_authors_record() {
+    let r = Room::new();
+    let m = sk(5);
+    let mut held = MessagesV1 {
+        messages: vec![r.msg(&r.o, 1)],
+        ..Default::default()
+    };
+    held.rebuild_actions_state();
+    let receiver = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(1, |_| {}),
+        recent_messages: held,
+        ..Default::default()
+    });
+    let mut msgs = MessagesV1 {
+        messages: vec![r.msg(&r.o, 1), r.msg(&m, 2)],
+        ..Default::default()
+    };
+    msgs.rebuild_actions_state();
+    let sender = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(1, |_| {}),
+        members: MembersV1 {
+            members: vec![r.rec(&m.verifying_key(), &r.o)],
+        },
+        recent_messages: msgs,
+        ..Default::default()
+    });
+    let after = r.exchange(&sender, &receiver).expect("applies");
+    assert!(after
+        .recent_messages
+        .messages
+        .iter()
+        .any(|x| x.message.author == id(&m)));
+    assert!(after
+        .members
+        .members
+        .iter()
+        .any(|x| x.member.id() == id(&m)));
+}

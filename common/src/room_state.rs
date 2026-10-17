@@ -1113,8 +1113,7 @@ fn refuse_beyond_receiver_bounds(
 /// A message whose author is neither the owner, a member the receiver's
 /// summary lists, nor a member the trimmed delta carries is dropped, so the
 /// delta never carries a message its receiver cannot verify. Run it after
-/// anything that adds records to the delta (the contract's
-/// `ensure_members_for_message_authors`).
+/// anything that adds records to the delta.
 fn trim_to_work_bounds(
     delta: &mut ChatRoomStateV1Delta,
     config: &crate::room_state::configuration::Configuration,

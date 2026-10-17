@@ -67,8 +67,10 @@ A network delta is sent against a summary, without the receiver's state, so
 it is trimmed (`trim_network_delta`) to the work bounds of the receiver's
 room: the sender's caps when the receiver will end with the sender's
 configuration, otherwise the least bounds any room has. The rest follows in
-later rounds. Anything that adds records to a network delta (the contract's
-`ensure_members_for_message_authors`) runs before the trim.
+later rounds. The trim keeps first the authors of the messages it keeps
+(with their invite chains), so every trimmed delta delivers messages the
+receiver can verify; anything that adds records to a network delta runs
+before the trim.
 
 ## Summaries carry a rank, with a digest tie-break
 
