@@ -2279,18 +2279,6 @@ fn rejoin_preferred_nickname(
         .unwrap_or_else(|| SealedBytes::public("Member".to_string().into_bytes()))
 }
 
-/// Build the initial `ChatRoomStateV1` for a brand-new room: the owner-signed
-/// configuration and the owner's `member_info`, plus — for a **private** room —
-/// the v0 room secret, its version record, and the owner-addressed ECIES secret
-/// blob written into contract state so the owner can decrypt later. Returns the
-/// state and `Some(secret)` for a private room (`None` for public).
-///
-/// Pure (no network / no `self`) so the private-room creation crypto is
-/// unit-testable. Mirrors the UI's `create_new_room_with_name`
-/// (`ui/src/room_data.rs`) field-for-field: `generate_room_secret` (a RANDOM
-/// v0, never derived) → `encrypt_secret_for_member` for the owner →
-/// `AuthorizedSecretVersionRecord` + `AuthorizedEncryptedSecretForMember`, then
-/// name + nickname sealed with `encrypt_with_symmetric_key` under that secret.
 /// `state` with a DM purge this client signed, and the room's winning purge
 /// envelope omits, re-signed in (see `river_core::own_purges`), and the
 /// envelope to publish; `None` when nothing is re-signed. `own` records the
@@ -2442,6 +2430,18 @@ fn prepare_config_edit(
     Ok(new_config)
 }
 
+/// Build the initial `ChatRoomStateV1` for a brand-new room: the owner-signed
+/// configuration and the owner's `member_info`, plus — for a **private** room —
+/// the v0 room secret, its version record, and the owner-addressed ECIES secret
+/// blob written into contract state so the owner can decrypt later. Returns the
+/// state and `Some(secret)` for a private room (`None` for public).
+///
+/// Pure (no network / no `self`) so the private-room creation crypto is
+/// unit-testable. Mirrors the UI's `create_new_room_with_name`
+/// (`ui/src/room_data.rs`) field-for-field: `generate_room_secret` (a RANDOM
+/// v0, never derived) → `encrypt_secret_for_member` for the owner →
+/// `AuthorizedSecretVersionRecord` + `AuthorizedEncryptedSecretForMember`, then
+/// name + nickname sealed with `encrypt_with_symmetric_key` under that secret.
 fn build_new_room_state(
     signing_key: &SigningKey,
     name: &str,
@@ -3282,6 +3282,19 @@ impl ApiClient {
         Ok(room_state)
     }
 
+    /// Re-publish a DM purge this client signed that `state`'s winning purge
+    /// envelope omits ([`heal_own_purges_in`], publishing with `send_delta`).
+    async fn heal_own_purges(
+        &self,
+        room_owner_key: &VerifyingKey,
+        state: ChatRoomStateV1,
+    ) -> ChatRoomStateV1 {
+        heal_own_purges_in(&self.storage, room_owner_key, state, |delta| {
+            self.send_delta(room_owner_key, delta)
+        })
+        .await
+    }
+
     /// Detect and remediate the "Unknown member" condition for the current
     /// member (issue freenet/river#304): self present in `state.members` but
     /// absent from `state.member_info`. When detected, publish a standalone
@@ -3310,22 +3323,6 @@ impl ApiClient {
     /// so the caller can still use it (the heal is best-effort). A network-send
     /// failure is NOT an error here: the local state was already repaired and
     /// stored, so it is logged and the healed state is returned as `Ok`.
-    /// Re-publish a DM purge this client signed that `state`'s winning purge
-    /// envelope for this member omits (`fold_own_purge_heal`). Skipped under
-    /// a signing-key override that is not the room's stored identity, whose
-    /// purges these are not. Returns the state to operate on: the re-signed
-    /// one when the local fold succeeded, else `state` unchanged.
-    async fn heal_own_purges(
-        &self,
-        room_owner_key: &VerifyingKey,
-        state: ChatRoomStateV1,
-    ) -> ChatRoomStateV1 {
-        heal_own_purges_in(&self.storage, room_owner_key, state, |delta| {
-            self.send_delta(room_owner_key, delta)
-        })
-        .await
-    }
-
     async fn heal_member_info(
         &self,
         room_owner_key: &VerifyingKey,

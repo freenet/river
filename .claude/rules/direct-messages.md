@@ -30,24 +30,36 @@ live in `common/src/room_state/direct_messages.rs`.
   wins by rank; the loser's tokens are no longer tombstoned. Each client
   records the tokens it purged (`river_core::own_purges::OwnPurges`, behind
   the client-only `own-purges` feature): the UI in `RoomData::own_purges`
-  (persisted with the room, unioned wherever two copies of the room merge),
-  riverctl in `StoredRoomInfo::own_purges` (`rooms.json`). When the room's
-  winning envelope for the member's own id omits a recorded token,
-  `OwnPurges::heal` re-signs the union of the winning list and the recorded
-  tokens at the next version with `advance_recipient_purges`, so the UI and
-  riverctl sign byte-identical envelopes. It fires only when a recorded
-  token is missing, only for the recipient id the token was recorded as,
-  only while that id is a member, and at most once per winning version
-  observed (`healed_at`, persisted), so devices never trade envelopes
-  without end. The envelope carries no room secret; it needs the room's own
+  (recorded by `RoomData::apply_own_purge`, persisted with the room, unioned
+  wherever two copies of the room merge), riverctl in
+  `StoredRoomInfo::own_purges` (`rooms.json`, recorded by `dm purge` under
+  the room's stored identity only). When the room's winning envelope for the
+  member's own id omits a recorded token, `OwnPurges::heal` re-signs the
+  union of the winning list and the recorded tokens at the next version with
+  `advance_recipient_purges`, so the UI and riverctl sign byte-identical
+  envelopes. It fires only when a recorded token is missing, only for the
+  recipient id the token was recorded as, only while that id is a member, at
+  most once per winning version observed (`healed_at`), and never past the
+  tombstone cap. `OwnPurges::prune` first drops the record of any recipient
+  that is no longer a member (of a state whose configuration the owner
+  signed). The envelope carries no room secret; it needs the room's own
   signing key, like every self-signed record, and riverctl skips it under a
-  `--signing-key` override that is not the stored identity. Trigger points:
-  the UI's two ingestion paths (`apply_delta_inner`, `update_room_state_inner`,
-  then `mark_needs_sync`), and riverctl's `get_room` (every read).
-  Pinned by `own_purges::tests`, `a_device_whose_purge_lost_re_signs_the_union`,
-  `a_purge_re_sign_is_not_repeated_for_the_same_winning_version`,
-  `both_ingestion_paths_heal_own_purges` and
-  `a_purge_that_lost_is_re_signed_as_the_union`.
+  `--signing-key` override that is not the stored identity. riverctl stores
+  the re-signed state and `healed_at` only once the publish succeeds, so an
+  envelope that did not go out is signed again on the next read.
+  Trigger points: in the UI every path that brings network state into a held
+  room — the subscription paths (`apply_delta_inner`,
+  `update_room_state_inner`) and the GET paths (re-accept refresh, join,
+  imported-room replacement, refresh merge, a backward probe's recovered
+  state) — each marking the room for sync; in riverctl, `get_room` (every
+  read). A build without the field drops it when it saves the room
+  (unknown fields are ignored). Pinned by `own_purges::tests`,
+  `a_full_state_ingestion_re_signs_a_lost_purge`,
+  `a_delta_ingestion_re_signs_a_lost_purge`,
+  `every_get_ingestion_path_heals_own_purges`,
+  `a_device_whose_purge_lost_re_signs_the_union`,
+  `a_purge_that_lost_is_re_signed_as_the_union` and the riverctl
+  `heal_own_purges_in` tests.
 - Bans are NOT enforced in `DirectMessagesV1::verify` — instead,
   `ChatRoomStateV1::post_apply_cleanup` sweeps DMs whose sender or
   recipient is now banned or no longer a member. Mirrors `MessagesV1`'s

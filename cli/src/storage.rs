@@ -81,7 +81,9 @@ pub struct StoredRoomInfo {
     /// the winning purge-envelope version it last re-signed against:
     /// `ApiClient::heal_own_purges` re-publishes a recorded purge the room's
     /// winning envelope omits (another device of the member won a concurrent
-    /// envelope). Recorded by `dm purge`.
+    /// envelope). Recorded by `dm purge`. A riverctl from before this field
+    /// that rewrites `rooms.json` drops it (unknown fields are ignored); the
+    /// purges recorded until then are then no longer re-published.
     #[serde(default)]
     pub own_purges: river_core::own_purges::OwnPurges,
 }

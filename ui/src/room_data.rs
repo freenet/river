@@ -520,16 +520,6 @@ pub(crate) fn current_secret_from_state(
 }
 
 impl RoomData {
-    /// The local user's private signing key for this room, if this build still
-    /// holds it locally.
-    ///
-    /// `None` means the blob was written by a River that keeps the key
-    /// elsewhere. No shipped writer does that yet, so in practice this is
-    /// always `Some` today — but every caller must still handle `None` without
-    /// panicking, because the whole point of the tolerant reader is that a
-    /// future writer CAN produce such a blob and this build must survive it.
-    /// The graceful behaviour is "this identity cannot act": skip the signing
-    /// or decryption, log, and leave the rest of the room readable.
     /// Apply this member's purge `envelope` (signed on this device, purging
     /// `tokens`) to the room, and record the tokens as this device's own, so
     /// a concurrent envelope from another device of the member cannot drop
@@ -606,6 +596,16 @@ impl RoomData {
         true
     }
 
+    /// The local user's private signing key for this room, if this build still
+    /// holds it locally.
+    ///
+    /// `None` means the blob was written by a River that keeps the key
+    /// elsewhere. No shipped writer does that yet, so in practice this is
+    /// always `Some` today — but every caller must still handle `None` without
+    /// panicking, because the whole point of the tolerant reader is that a
+    /// future writer CAN produce such a blob and this build must survive it.
+    /// The graceful behaviour is "this identity cannot act": skip the signing
+    /// or decryption, log, and leave the rest of the room readable.
     pub fn signing_key(&self) -> Option<&SigningKey> {
         self.self_sk.as_ref()
     }
