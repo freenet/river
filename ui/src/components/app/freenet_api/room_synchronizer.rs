@@ -45,9 +45,9 @@ use std::sync::Arc;
 ///
 /// * `summarize` must see the SUMMARIZING peer's own state, with the
 ///   configuration the merge will end with
-///   (`ChatRoomStateV1::delta_from_merged_summary`, which summarizes as
-///   `summarize_with_merged_configuration` does and trims the delta to the
-///   merged room's work bounds).
+///   (`ChatRoomStateV1::merge_through_summary`, which summarizes as
+///   `summarize_with_merged_configuration` does and applies every incoming
+///   record, as the room's own whole-state merge does).
 ///   `MessagesV1::summarize` reads `max_recent_messages` from it to size its
 ///   retention horizon (and the DM summary its global cap); hand it anything
 ///   else and the horizon is wrong. With the PRE-merge configuration, an
@@ -74,13 +74,10 @@ fn merge_incoming_state(
     params: &ChatRoomParametersV1,
     incoming: &ChatRoomStateV1,
 ) -> Result<Option<ChatRoomStateV1Delta>, String> {
-    // The summary is read with the incoming configuration merged in, and the
-    // delta is trimmed to the merged room's work bounds, as the room's own
-    // whole-state merge trims it (freenet/river#703).
-    let delta = local.delta_from_merged_summary(params, incoming);
-    let parent_sentinel = ChatRoomStateV1::default();
-    local.apply_delta(&parent_sentinel, params, &delta)?;
-    Ok(delta)
+    // The summary is read with the incoming configuration merged in, and
+    // every incoming record is applied, as the room's own whole-state merge
+    // does (freenet/river#703).
+    local.merge_through_summary(params, incoming)
 }
 
 pub(crate) fn compute_update_data(

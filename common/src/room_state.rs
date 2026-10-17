@@ -13,6 +13,39 @@ pub mod secret;
 pub mod upgrade;
 pub mod version;
 
+/// Whether the per-delta work bounds (the most new messages, bans, members
+/// and ban-evidence records one delta may add) are lifted for the apply in
+/// progress. A whole-state merge lifts them: it holds the incoming state to
+/// its own owner-signed configuration's caps before anything is checked
+/// (`refuse_beyond_own_bounds`), applies every incoming record, and lets the
+/// merged room's caps decide what is kept. A network delta, whose sender
+/// alone decides its size, is held to the bounds.
+pub(crate) mod work_bounds {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIFTED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// True while [`lifted_while`] runs.
+    pub(crate) fn lifted() -> bool {
+        LIFTED.with(|l| l.get())
+    }
+
+    /// Run `f` with the work bounds lifted, restoring the previous setting
+    /// afterwards (also if `f` panics).
+    pub(crate) fn lifted_while<R>(f: impl FnOnce() -> R) -> R {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LIFTED.with(|l| l.set(self.0));
+            }
+        }
+        let _restore = Restore(LIFTED.with(|l| l.replace(true)));
+        f()
+    }
+}
+
 use crate::room_state::ban::BansV1;
 use crate::room_state::ban_evidence::BanEvidenceV1;
 use crate::room_state::configuration::AuthorizedConfigurationV1;
@@ -143,11 +176,18 @@ impl ChatRoomStateV1 {
     /// would have been pruned on arrival and the open merge gives the same
     /// state. See [`merge_may_have_withheld_a_survivor`].
     ///
-    /// Both passes trim what they offer to the work bounds (see
-    /// `trim_to_work_bounds`), so a sender holding more than one delta may
-    /// carry cannot fail the merge. Trimming can leave one exchange's two
-    /// directions differing in records the merged caps would drop anyway; the
-    /// next exchange carries the difference and they converge.
+    /// # Work and the per-delta bounds
+    ///
+    /// `other_state` is first held to its own owner-signed configuration's
+    /// caps, the bounds `verify` holds a state to (`refuse_beyond_own_bounds`,
+    /// counts compared before any signature is checked): a state holding more
+    /// bans, members or ban evidence than that is refused, and a state
+    /// `verify` accepts never is. Within them, every record the receiver
+    /// lacks is applied, the per-delta work bounds a network delta is held to
+    /// lifted (`work_bounds`), and the merged room's caps in
+    /// `post_apply_cleanup` decide what is kept. Trimming what one side
+    /// offered to the per-delta bounds instead made the two directions
+    /// differ: the trim chose before the merged room's own removals had run.
     ///
     /// The open pass's error is discarded and the first pass's result stands.
     /// The open pass applies the first pass's delta plus older messages, so
@@ -185,16 +225,14 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
     ) -> Result<(), String> {
+        refuse_beyond_own_bounds(other_state, parameters)?;
         let config_delta = configuration_delta_for_merge(self, parameters, other_state);
-        // The summary is read against the configuration the merge ends with,
-        // derived once (a clone only when the configuration changes).
-        let (summary, merged_config) = {
-            let with_config = self.with_configuration(parameters, &config_delta);
-            (
-                self.summarize(&with_config, parameters),
-                with_config.configuration.configuration.clone(),
-            )
-        };
+        // The summary is read against the configuration the merge ends with
+        // (a clone only when the configuration changes).
+        let summary = self.summarize(
+            &self.with_configuration(parameters, &config_delta),
+            parameters,
+        );
         // Field `delta`s never read their parent; pass the sender's own state,
         // as `get_state_delta` does on the network path. The macro's
         // `apply_delta` ignores its parent (it re-reads `self` per field), so
@@ -214,26 +252,26 @@ impl ChatRoomStateV1 {
                 .delta(other_state, parameters, summary)
                 .unwrap_or_default();
             delta.configuration = config_delta.clone();
-            trim_to_work_bounds(
-                &mut delta,
-                &merged_config,
-                Some(self),
-                other_state,
-                parameters,
-            );
             Some(delta)
         };
+        // Every incoming record is applied (the per-delta work bounds are
+        // lifted: the incoming state was held to its own caps above), and the
+        // merged room's caps in `post_apply_cleanup` decide what is kept, so
+        // both directions keep the same records.
         let mut merged = self.clone();
-        merged.apply_delta(self, parameters, &delta_against(&summary))?;
+        work_bounds::lifted_while(|| {
+            merged.apply_delta(self, parameters, &delta_against(&summary))
+        })?;
         if merge_may_have_withheld_a_survivor(&summary, &merged) {
             let open = summary.without_retention_horizons();
             let mut open_merged = self.clone();
             // If the open pass fails, keep the first pass's result rather
             // than failing a merge the first pass completed (defensive; see
             // the doc comment above).
-            if open_merged
-                .apply_delta(self, parameters, &delta_against(&open))
-                .is_ok()
+            if work_bounds::lifted_while(|| {
+                open_merged.apply_delta(self, parameters, &delta_against(&open))
+            })
+            .is_ok()
             {
                 merged = open_merged;
             }
@@ -244,7 +282,7 @@ impl ChatRoomStateV1 {
 
     /// This state's summary, computed against itself with `other_state`'s
     /// configuration merged in: what a receiver that is about to merge
-    /// `other_state` and still wants the delta trimmed to its retention
+    /// `other_state` and still wants the delta limited by its retention
     /// horizons should publish (the UI's incoming-state path). Without the
     /// merged configuration, a cap the merge raises is read at its old value
     /// and the horizon withholds messages the merged room keeps.
@@ -260,75 +298,90 @@ impl ChatRoomStateV1 {
         )
     }
 
-    /// What `other_state` offers this state against
-    /// [`Self::summarize_with_merged_configuration`], trimmed to the work
-    /// bounds of the room the merge ends with, as [`Self::merge_from`] trims
-    /// it: the delta a receiver that merges `other_state` through its own
-    /// summary (the UI's incoming-state path) applies. Without the trim, an
-    /// incoming state holding more than one delta may carry fails to merge
-    /// (freenet/river#703).
-    pub fn delta_from_merged_summary(
-        &self,
+    /// Merge `other_state` through this state's own summary, read with the
+    /// configuration the merge ends with (as
+    /// [`Self::summarize_with_merged_configuration`]), keeping this state's
+    /// retention horizons: the receiver's side of an incoming whole state
+    /// (the UI's incoming-state path). Held to the same rules as
+    /// [`Self::merge_from`]: `other_state` is refused when it holds more
+    /// records than its own owner-signed configuration allows, every
+    /// incoming record is applied, and the merged room's caps decide what is
+    /// kept. Returns the delta applied (`None` when the two already agree).
+    pub fn merge_through_summary(
+        &mut self,
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
-    ) -> Option<ChatRoomStateV1Delta> {
+    ) -> Result<Option<ChatRoomStateV1Delta>, String> {
+        refuse_beyond_own_bounds(other_state, parameters)?;
         let config_delta = configuration_delta_for_merge(self, parameters, other_state);
-        let with_config = self.with_configuration(parameters, &config_delta);
-        let summary = self.summarize(&with_config, parameters);
+        let summary = self.summarize(
+            &self.with_configuration(parameters, &config_delta),
+            parameters,
+        );
         // The configuration the merge ends with is offered as `merge_from`
         // offers it: the summary alone does not replace a placeholder that
         // outranks the owner's configuration.
-        let mut delta = match other_state.delta(other_state, parameters, &summary) {
-            Some(delta) => delta,
-            None if config_delta.is_some() => ChatRoomStateV1Delta::default(),
-            None => return None,
-        };
-        delta.configuration = config_delta;
-        trim_to_work_bounds(
-            &mut delta,
-            &with_config.configuration.configuration,
-            Some(self),
-            other_state,
-            parameters,
-        );
-        Some(delta)
+        let delta = match other_state.delta(other_state, parameters, &summary) {
+            Some(delta) => Some(delta),
+            None if config_delta.is_some() => Some(ChatRoomStateV1Delta::default()),
+            None => None,
+        }
+        .map(|mut delta| {
+            delta.configuration = config_delta;
+            delta
+        });
+        // `apply_delta` ignores its outer parent (the macro reads `self`
+        // per field), so a cheap default stands in for it.
+        work_bounds::lifted_while(|| {
+            self.apply_delta(&ChatRoomStateV1::default(), parameters, &delta)
+        })?;
+        Ok(delta)
     }
 
     /// This state's delta against a receiver's `summary`, trimmed to the
     /// work bounds one delta may carry in the receiver's room: what a sender
     /// that holds only the receiver's summary (the contract's network delta)
-    /// sends. The receiver's caps are this state's when the receiver's
-    /// configuration does not outrank this one (the receiver then ends with
-    /// this one), and the floors every room's bounds are at least otherwise
-    /// (the receiver's configuration is not known here). Without the trim, a
-    /// receiver on a lowered cap refuses the whole delta; trimmed, the rest
-    /// follows in later rounds (freenet/river#703).
+    /// sends. See [`Self::trim_network_delta`].
     pub fn delta_within_work_bounds(
         &self,
         parameters: &ChatRoomParametersV1,
         summary: &ChatRoomStateV1Summary,
     ) -> Option<ChatRoomStateV1Delta> {
         let mut delta = self.delta(self, parameters, summary)?;
+        self.trim_network_delta(parameters, summary, &mut delta);
+        Some(delta)
+    }
+
+    /// Trim `delta`, this state's delta against a receiver's `summary`, to
+    /// the work bounds one delta may carry in the receiver's room, so the
+    /// receiver applies it rather than refusing it; the rest follows in
+    /// later rounds (freenet/river#703). The receiver's caps are this
+    /// state's when the receiver's configuration does not outrank this one
+    /// (the receiver then ends with this one), and otherwise the floors
+    /// every room's bounds are at least (the receiver's configuration is not
+    /// known here): each cap at its least. Run it after anything that adds
+    /// records to the delta.
+    pub fn trim_network_delta(
+        &self,
+        parameters: &ChatRoomParametersV1,
+        summary: &ChatRoomStateV1Summary,
+        delta: &mut ChatRoomStateV1Delta,
+    ) {
         let own = &self.configuration;
-        // This state's configuration is the one the receiver's room ends
-        // with unless the receiver's outranks it.
         let config = if !crate::room_state::member_info::outranks(
             summary.configuration,
             own.rank(parameters),
         ) {
             own.configuration.clone()
         } else {
-            // The bounds' floors: `max(cap, floor)` with each cap at its
-            // least, and the evidence depth cap at its largest.
             crate::room_state::configuration::Configuration {
                 max_recent_messages: 1,
                 max_user_bans: 1,
-                max_members: crate::room_state::ban_evidence::MAX_EVIDENCE_DEPTH,
+                max_members: 1,
                 ..own.configuration.clone()
             }
         };
-        trim_to_work_bounds(&mut delta, &config, None, self, parameters);
-        Some(delta)
+        trim_to_work_bounds(delta, &config, self, summary, parameters);
     }
 
     /// This state with `config_delta` applied to its configuration, borrowed
@@ -931,41 +984,103 @@ fn configuration_delta_for_merge(
         })
 }
 
-/// Trim each part of a whole-state merge's `delta` that one delta of the
-/// merged room may not carry to its work bound. The sender's state may hold
-/// more than one delta may carry (`verify` judges it by its own, possibly
-/// higher, caps, and an older message window can be larger); the merged room
-/// keeps fewer still, so offering the rest only fails the merge one way
-/// (freenet/river#703). Each part keeps what the merged room's caps
-/// keep first:
+/// Refuse `state` as the incoming side of a whole-state merge when it holds
+/// more records than its own configuration allows: more bans than
+/// `max_user_bans`, more members than `max_members`, or more ban evidence
+/// than those two caps bound (`evidence_bound`). These are `verify`'s own
+/// bounds, so a state `verify` accepts is never refused here. The counts are
+/// compared before any signature is checked; caps above the per-delta floors
+/// count only when the room owner signed the configuration (one signature
+/// check), so the work a merge then does is bounded by what the owner signed.
+/// Messages have no such bound in `verify`, so none is applied to them here.
+fn refuse_beyond_own_bounds(
+    state: &ChatRoomStateV1,
+    parameters: &ChatRoomParametersV1,
+) -> Result<(), String> {
+    use crate::room_state::ban::MIN_BANS_DELTA_BOUND;
+    use crate::room_state::ban_evidence::{evidence_bound, evidence_depth_cap};
+    use crate::room_state::member::members_work_bound;
+    let over = |max_user_bans: usize, max_members: usize, evidence: usize| {
+        if state.bans.0.len() > max_user_bans {
+            Some(format!(
+                "{} bans, more than {max_user_bans}",
+                state.bans.0.len()
+            ))
+        } else if state.members.members.len() > max_members {
+            Some(format!(
+                "{} members, more than {max_members}",
+                state.members.members.len()
+            ))
+        } else if state.ban_evidence.members.len() > evidence {
+            Some(format!(
+                "{} ban evidence records, more than {evidence}",
+                state.ban_evidence.members.len()
+            ))
+        } else {
+            None
+        }
+    };
+    let config = &state.configuration.configuration;
+    if let Some(why) = over(
+        config.max_user_bans,
+        config.max_members,
+        evidence_bound(config.max_user_bans, evidence_depth_cap(config.max_members)),
+    ) {
+        return Err(format!(
+            "Refusing a state that holds {why} (its own configuration's limit)"
+        ));
+    }
+    let floors = over(
+        MIN_BANS_DELTA_BOUND,
+        members_work_bound(1),
+        evidence_bound(MIN_BANS_DELTA_BOUND, evidence_depth_cap(1)),
+    );
+    if let Some(why) = floors {
+        if state
+            .configuration
+            .verify_signature(&parameters.owner)
+            .is_err()
+        {
+            return Err(format!(
+                "Refusing a state that holds {why} under a configuration the room owner did not sign"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Trim each part of a network `delta` (sent against a receiver's summary,
+/// the receiver's state unknown) to the work bound one delta may carry in a
+/// room with `config`'s caps, so the receiver applies it rather than
+/// refusing it; the rest follows in later rounds (freenet/river#703). Each
+/// part keeps first what the caps keep first:
 /// - messages: the newest (the `max_recent_messages` trim keeps the newest);
-/// - bans: in a whole-state merge (`receiver` given), the incoming bans the
-///   merged room's `max_user_bans` cap keeps, judged over both states (see
-///   `bans_surviving_the_merged_cap`); with only the sender known, what
-///   `BansV1::enforce_user_ban_cap` keeps at the bound in the sender's state;
+/// - bans: what `BansV1::enforce_user_ban_cap` keeps at the bound, judged in
+///   the sender's state;
 /// - members: the shortest invite chains, then the lowest id (the
 ///   `max_members` trim removes the longest chains, then the highest id);
 ///   a member's inviter is always shallower, so no kept member loses its
 ///   inviter to the trim;
-/// - ban evidence: the shallowest records (deeper ones are the first a
-///   lowered `max_members` drops), then by digest.
+/// - ban evidence: only records a ban the receiver will hold references
+///   (the sender's bans less those trimmed here), then the shallowest, then
+///   by digest.
 ///
-/// In a whole-state merge the bans trim keeps exactly what the merged cap
-/// keeps of the incoming bans. The members and evidence trims rank by invite depth
-/// alone, not by what cleanup will then remove (banned members, the
-/// inactivity prune, unreferenced evidence), so one exchange can still
-/// differ from the other direction when the merged caps' choice depends on
-/// records trimmed here; the records each peer kept travel in the next
-/// exchange, and the peers converge.
+/// A message whose author is neither the owner, a member the receiver's
+/// summary lists, nor a member the trimmed delta carries is dropped, so the
+/// delta never carries a message its receiver cannot verify. Run it after
+/// anything that adds records to the delta (the contract's
+/// `ensure_members_for_message_authors`).
 fn trim_to_work_bounds(
     delta: &mut ChatRoomStateV1Delta,
     config: &crate::room_state::configuration::Configuration,
-    receiver: Option<&ChatRoomStateV1>,
     sender: &ChatRoomStateV1,
+    summary: &ChatRoomStateV1Summary,
     parameters: &ChatRoomParametersV1,
 ) {
-    use crate::room_state::ban::MIN_BANS_DELTA_BOUND;
-    use crate::room_state::ban_evidence::{evidence_bound, evidence_depth_cap, evidence_digest};
+    use crate::room_state::ban::{ban_digest, MIN_BANS_DELTA_BOUND};
+    use crate::room_state::ban_evidence::{
+        evidence_bound, evidence_depth_cap, evidence_digest, referenced_by_bans,
+    };
     use crate::room_state::member::{members_work_bound, MembersDelta};
     use crate::room_state::message::messages_work_bound;
     use std::collections::HashMap;
@@ -980,34 +1095,20 @@ fn trim_to_work_bounds(
 
     let owner_id = parameters.owner_id();
     let bans_bound = config.max_user_bans.max(MIN_BANS_DELTA_BOUND);
+    let mut trimmed_bans = HashSet::new();
     if let Some(bans) = delta.bans.as_mut() {
         if bans.len() > bans_bound {
-            match receiver {
-                // A whole-state merge holds both states: keep exactly the
-                // incoming bans the merged room's `max_user_bans` cap keeps,
-                // judged over the bans and records of both (see
-                // `bans_surviving_the_merged_cap`).
-                Some(receiver) => {
-                    *bans = bans_surviving_the_merged_cap(
-                        receiver,
-                        sender,
-                        std::mem::take(bans),
-                        config.max_user_bans,
-                        parameters,
-                    );
-                }
-                // Only the sender's state is known (the contract's network
-                // delta): the cap's own eviction at the bound, judged in the
-                // sender's state. The rest follows in later rounds.
-                None => crate::room_state::ban::BansV1::enforce_user_ban_cap(
-                    bans,
-                    bans_bound,
-                    &sender.members,
-                    &sender.ban_evidence,
-                    &sender.member_info,
-                    parameters,
-                ),
-            }
+            let before: Vec<_> = bans.iter().map(ban_digest).collect();
+            crate::room_state::ban::BansV1::enforce_user_ban_cap(
+                bans,
+                bans_bound,
+                &sender.members,
+                &sender.ban_evidence,
+                &sender.member_info,
+                parameters,
+            );
+            let kept: HashSet<_> = bans.iter().map(ban_digest).collect();
+            trimmed_bans = before.into_iter().filter(|d| !kept.contains(d)).collect();
         }
     }
 
@@ -1015,8 +1116,8 @@ fn trim_to_work_bounds(
     // at 0, computed for every id at once by one breadth-first walk (linear
     // in the records); a record whose chain does not reach the owner sorts
     // last.
+    let known = sender.ban_evidence.lookup(&sender.members, owner_id);
     let depth_in_sender = || {
-        let known = sender.ban_evidence.lookup(&sender.members, owner_id);
         let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
         for (id, m) in &known {
             children.entry(m.member.invited_by).or_default().push(*id);
@@ -1074,85 +1175,41 @@ fn trim_to_work_bounds(
         }
     }
 
-    let evidence_cap = evidence_bound(bans_bound, evidence_depth_cap(config.max_members));
     if let Some(evidence) = delta.ban_evidence.as_mut() {
+        if !trimmed_bans.is_empty() {
+            let still_held = crate::room_state::ban::BansV1(
+                sender
+                    .bans
+                    .0
+                    .iter()
+                    .filter(|b| !trimmed_bans.contains(&ban_digest(b)))
+                    .cloned()
+                    .collect(),
+            );
+            let referenced = referenced_by_bans(&still_held, owner_id, |id| {
+                known.get(&id).map(|m| m.member.invited_by)
+            });
+            evidence.retain(|m| referenced.contains(&m.member.id()));
+        }
+        let evidence_cap = evidence_bound(bans_bound, evidence_depth_cap(config.max_members));
         if evidence.len() > evidence_cap {
             let depth = depth_in_sender();
             evidence.sort_by_cached_key(|m| (depth(m), evidence_digest(m)));
             evidence.truncate(evidence_cap);
         }
     }
-}
 
-/// The incoming bans the merged room's `max_user_bans` cap keeps:
-/// `BansV1::enforce_user_ban_cap` over the receiver's bans and the incoming
-/// ones together, judged against both states' members, ban evidence and
-/// member_info (the receiver's record for an id first). A ban one side's
-/// records make take no effect (an owner ban on its issuer, a deputy grant,
-/// evidence naming its target) is judged as the merged room judges it, so
-/// the trim does not keep it in place of one the merged cap keeps. At most
-/// `max_user_bans` (<= the work bound) are returned.
-fn bans_surviving_the_merged_cap(
-    receiver: &ChatRoomStateV1,
-    sender: &ChatRoomStateV1,
-    incoming: Vec<crate::room_state::ban::AuthorizedUserBan>,
-    max_user_bans: usize,
-    parameters: &ChatRoomParametersV1,
-) -> Vec<crate::room_state::ban::AuthorizedUserBan> {
-    use crate::room_state::ban::{ban_digest, BansV1};
-    use crate::room_state::ban_evidence::BanEvidenceV1;
-    use crate::room_state::member::MembersV1;
-    use crate::room_state::member_info::MemberInfoV1;
-
-    let held_ids: HashSet<MemberId> = receiver
-        .members
-        .members
-        .iter()
-        .map(|m| m.member.id())
-        .collect();
-    let mut members = receiver.members.members.clone();
-    members.extend(
-        sender
+    if let Some(msgs) = delta.recent_messages.as_mut() {
+        let carried: HashSet<MemberId> = delta
             .members
-            .members
-            .iter()
-            .filter(|m| !held_ids.contains(&m.member.id()))
-            .cloned(),
-    );
-    let held_evidence: HashSet<MemberId> = receiver
-        .ban_evidence
-        .members
-        .iter()
-        .map(|m| m.member.id())
-        .chain(held_ids.iter().copied())
-        .collect();
-    let mut evidence = receiver.ban_evidence.members.clone();
-    evidence.extend(
-        sender
-            .ban_evidence
-            .members
-            .iter()
-            .filter(|m| !held_evidence.contains(&m.member.id()))
-            .cloned(),
-    );
-    let mut infos = receiver.member_info.member_info.clone();
-    infos.extend(sender.member_info.member_info.iter().cloned());
-
-    let incoming_digests: HashSet<_> = incoming.iter().map(ban_digest).collect();
-    let mut union = receiver.bans.0.clone();
-    union.extend(incoming);
-    BansV1::enforce_user_ban_cap(
-        &mut union,
-        max_user_bans,
-        &MembersV1 { members },
-        &BanEvidenceV1 { members: evidence },
-        &MemberInfoV1 { member_info: infos },
-        parameters,
-    );
-    union
-        .into_iter()
-        .filter(|b| incoming_digests.contains(&ban_digest(b)))
-        .collect()
+            .as_ref()
+            .map(|m| m.added().iter().map(|a| a.member.id()).collect())
+            .unwrap_or_default();
+        msgs.retain(|m| {
+            let author = m.message.author;
+            author == owner_id || summary.members.contains(&author) || carried.contains(&author)
+        });
+    }
 }
 
 /// Whether a merge that sent `summary` (horizons intact) and ended in `merged`
@@ -1267,13 +1324,12 @@ mod tests {
     use std::fmt::Debug;
     use std::time::SystemTime;
 
-    /// Over its bound, a whole-state merge's ban evidence keeps the
-    /// shallowest records, and its bans keep what the ban cap keeps at the
-    /// bound (here the owner's live ban and the newest of the rest); the
-    /// pools are covered through the public merge in `bans_trim_test`
-    /// (freenet/river#703).
+    /// Over its bound, a network delta's ban evidence keeps the shallowest
+    /// records, its bans keep what the ban cap keeps at the bound (here the
+    /// owner's live ban and the newest of the rest), and evidence only a
+    /// trimmed ban references is not sent (freenet/river#703).
     #[test]
-    fn trim_to_work_bounds_keeps_what_the_merged_caps_keep() {
+    fn a_network_delta_trim_keeps_what_the_caps_keep() {
         let owner_sk = SigningKey::from_bytes(&[1; 32]);
         let owner_id = MemberId::from(&owner_sk.verifying_key());
         let parameters = ChatRoomParametersV1 {
@@ -1331,16 +1387,46 @@ mod tests {
         let owner_ban = ban(&owner_sk, 0);
         bans.push(owner_ban.clone());
 
+        let summary =
+            ChatRoomStateV1::default().summarize(&ChatRoomStateV1::default(), &parameters);
+
+        // Evidence over the bound, no ban trimmed: the shallowest are kept.
         let mut delta = ChatRoomStateV1Delta {
             ban_evidence: Some(sender.ban_evidence.members.clone()),
-            bans: Some(bans),
+            bans: Some(vec![owner_ban.clone()]),
             ..Default::default()
         };
-        trim_to_work_bounds(&mut delta, &config, None, &sender, &parameters);
-
+        trim_to_work_bounds(&mut delta, &config, &sender, &summary, &parameters);
         let evidence = delta.ban_evidence.unwrap();
         assert_eq!(evidence.len(), 200);
         assert!(shallow.iter().all(|m| evidence.contains(m)));
+
+        // Bans over the bound: the cap's choice at the bound (the owner's
+        // ban, then the newest others) is kept, and evidence only a trimmed
+        // ban references is not sent.
+        let target_ban = |by: &SigningKey, secs: u64, target: &AuthorizedMember| {
+            AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                    banned_user: target.member.id(),
+                },
+                MemberId::from(&by.verifying_key()),
+                by,
+            )
+        };
+        bans.truncate(MIN_BANS_DELTA_BOUND + 10 - 2);
+        bans.push(target_ban(&member_sk, 1, &shallow[0]));
+        bans.push(target_ban(&member_sk, 10_000, &shallow[1]));
+        bans.push(owner_ban.clone());
+        let mut sender = sender.clone();
+        sender.bans = BansV1(bans.clone());
+        let mut delta = ChatRoomStateV1Delta {
+            ban_evidence: Some(vec![shallow[0].clone(), shallow[1].clone()]),
+            bans: Some(bans),
+            ..Default::default()
+        };
+        trim_to_work_bounds(&mut delta, &config, &sender, &summary, &parameters);
         let bans = delta.bans.unwrap();
         assert_eq!(bans.len(), MIN_BANS_DELTA_BOUND);
         assert!(bans.contains(&owner_ban));
@@ -1352,8 +1438,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             oldest_kept,
-            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(111)
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(110)
         );
+        assert_eq!(delta.ban_evidence.unwrap(), vec![shallow[1].clone()]);
     }
 
     #[test]

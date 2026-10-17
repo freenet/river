@@ -410,7 +410,9 @@ impl ComposableState for BanEvidenceV1 {
             );
             // Refused before any record is hashed when it cannot be within
             // the bound however many records it re-delivers.
-            if delta.len() > self.members.len().saturating_add(bound) {
+            if !crate::room_state::work_bounds::lifted()
+                && delta.len() > self.members.len().saturating_add(bound)
+            {
                 return Err(format!(
                     "Ban evidence delta of {} exceeds {bound}",
                     delta.len()
@@ -425,7 +427,7 @@ impl ComposableState for BanEvidenceV1 {
                 .iter()
                 .filter(|m| !held_records.contains(&(m.member.id(), evidence_digest(m))))
                 .count();
-            if new_records > bound {
+            if !crate::room_state::work_bounds::lifted() && new_records > bound {
                 return Err(format!(
                     "Ban evidence delta of {new_records} new records exceeds {bound}"
                 ));

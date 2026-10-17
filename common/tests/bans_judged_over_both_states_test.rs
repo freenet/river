@@ -1,8 +1,7 @@
-//! The whole-state merge trims an incoming ban list to the work bound by the
-//! ban cap's own rule, judged over the bans and records BOTH states hold, so
-//! a ban one side's records make dead is not kept in place of one the merged
-//! room keeps (freenet/river#703). One exchange then gives the same state in
-//! both directions.
+//! A whole-state merge applies every incoming ban and the merged room's ban
+//! cap judges them over the bans and records BOTH states hold, so a ban one
+//! side's records make dead is not kept in place of one the merged room keeps
+//! (freenet/river#703). One exchange gives the same state in both directions.
 
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
@@ -115,7 +114,7 @@ impl Room {
 
 /// The receiver holds the owner's ban on issuer X; the sender does not, and
 /// holds X's newest bans beside W's older ones. In the merged room X's bans
-/// take no effect, so the trim must not keep them in place of W's.
+/// take no effect, so they are not kept in place of W's.
 #[test]
 fn a_ban_the_receiver_makes_dead_does_not_displace_a_live_one() {
     let r = Room::new();
@@ -148,7 +147,7 @@ fn a_ban_the_receiver_makes_dead_does_not_displace_a_live_one() {
 /// The receiver holds the deputy grant that makes the sender's newest bans
 /// (by M6 on M0's invitees) take effect; in the sender they take none.
 #[test]
-fn a_ban_the_receiver_makes_live_is_not_trimmed_as_dead() {
+fn a_ban_the_receiver_makes_live_is_kept_as_live() {
     let r = Room::new();
     let (m0, m6) = (sk(2), sk(3));
     let invitees: Vec<SigningKey> = (0..10).map(|i| sk(700 + i)).collect();
@@ -203,9 +202,9 @@ fn a_ban_the_receiver_makes_live_is_not_trimmed_as_dead() {
 
 /// Only the receiver holds the records (as ban evidence) of the targets of
 /// the sender's newest bans, which are then judged by their issuer's
-/// authority, and take no effect in the merged room.
+/// authority, and take no effect in the merged room in either direction.
 #[test]
-fn a_ban_judged_by_evidence_only_the_receiver_holds_is_trimmed_as_the_merged_room_judges_it() {
+fn a_ban_judged_by_evidence_only_the_receiver_holds_is_judged_as_the_merged_room_judges_it() {
     let r = Room::new();
     let (z, m, w) = (sk(2), sk(3), sk(4));
     let targets: Vec<SigningKey> = (0..60).map(|i| sk(500 + i)).collect();

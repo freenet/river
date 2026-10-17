@@ -3197,9 +3197,8 @@ mod tests {
             rd
         };
         let ingest = |rd: &mut RoomData, incoming: &ChatRoomStateV1| {
-            let delta = rd.room_state.delta_from_merged_summary(&params, incoming);
             rd.room_state
-                .apply_delta(&ChatRoomStateV1::default(), &params, &delta)
+                .merge_through_summary(&params, incoming)
                 .unwrap();
             rd.heal_own_purges()
         };

@@ -1,7 +1,7 @@
-//! Ban pools at the work bound, through the public whole-state merge: the
-//! merge keeps of the incoming bans exactly what the merged room's ban cap
-//! keeps, judged over both states, so one exchange gives the same ban set in
-//! both directions (freenet/river#703).
+//! Ban pools larger than one delta may carry, through the public whole-state
+//! merge: every incoming ban is applied and the merged room's ban cap keeps
+//! what it keeps, so one exchange gives the same ban set in both directions
+//! (freenet/river#703).
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
@@ -30,10 +30,9 @@ fn ser(s: &ChatRoomStateV1) -> Vec<u8> {
 }
 
 /// owner bans and a present member's bans on ids held nowhere (live, in the
-/// other pool), each pool larger than half the work bound; the receiver's newer
-/// configuration lowers `max_user_bans` to exactly the bound. The sender's trim
-/// must leave each pool its newest `bound / 2`, or the two merge directions end
-/// in different ban sets in ONE exchange.
+/// other pool), each pool larger than half the per-delta bound; the receiver's
+/// newer configuration lowers `max_user_bans` to exactly the bound. Both merge
+/// directions must leave each pool its newest `bound / 2` in ONE exchange.
 fn run(owner_n: usize, other_n: usize, receiver_cap: usize, owner_newer: bool) {
     let o = sk(1);
     let owner = MemberId::from(&o.verifying_key());
@@ -131,7 +130,7 @@ fn run(owner_n: usize, other_n: usize, receiver_cap: usize, owner_newer: bool) {
 }
 
 #[test]
-fn a_bans_trim_leaves_each_pool_its_newest_half_at_an_even_bound() {
+fn each_pool_keeps_its_newest_half_at_an_even_cap() {
     for newer in [false, true] {
         run(60, 140, 100, newer);
         run(100, 100, 100, newer);
@@ -139,9 +138,9 @@ fn a_bans_trim_leaves_each_pool_its_newest_half_at_an_even_bound() {
     }
 }
 
-/// An odd bound above the floor: the spare slot must go where the cap puts it.
+/// An odd cap above the floor: the spare slot goes where the cap puts it.
 #[test]
-fn a_bans_trim_agrees_with_the_cap_at_an_odd_bound() {
+fn each_pool_keeps_its_share_at_an_odd_cap() {
     let mut failures = vec![];
     for newer in [false, true] {
         for (o, x) in [(60usize, 160usize), (130, 90), (51, 51), (200, 60)] {
@@ -153,13 +152,12 @@ fn a_bans_trim_agrees_with_the_cap_at_an_odd_bound() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Bans whose liveness depends on a deputy grant: the sender's bans trim
-/// judges them in the sender's state, where D (a deputy of A, not an
+/// Bans whose liveness depends on a deputy grant: D (a deputy of A, not an
 /// ancestor of the targets) bans A's invitees. All 120 bans are live, so the
-/// trim leaves each pool its newest half; judging without the sender's
-/// `member_info` would call D's bans dead and evict them first.
+/// merged cap leaves each pool its newest half in both directions; judging
+/// without the grant would call D's bans dead and evict them first.
 #[test]
-fn a_bans_trim_judges_deputy_bans_live_in_the_senders_state() {
+fn deputy_bans_are_judged_live_in_both_directions() {
     let o = sk(1);
     let owner = MemberId::from(&o.verifying_key());
     let params = ChatRoomParametersV1 {

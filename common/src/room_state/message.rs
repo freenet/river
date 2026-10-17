@@ -257,7 +257,9 @@ impl ComposableState for MessagesV1 {
             // (freenet/river#703). A raw length past held + bound is refused
             // before any per-record work.
             let work_bound = messages_work_bound(max_recent_messages);
-            if delta.len() > self.messages.len().saturating_add(work_bound) {
+            if !crate::room_state::work_bounds::lifted()
+                && delta.len() > self.messages.len().saturating_add(work_bound)
+            {
                 return Err(format!(
                     "Messages delta of {} exceeds {}",
                     delta.len(),
@@ -267,7 +269,7 @@ impl ComposableState for MessagesV1 {
             let held_ids: std::collections::HashSet<MessageId> =
                 self.messages.iter().map(|m| m.id()).collect();
             let new_count = delta.iter().filter(|m| !held_ids.contains(&m.id())).count();
-            if new_count > work_bound {
+            if !crate::room_state::work_bounds::lifted() && new_count > work_bound {
                 return Err(format!(
                     "Messages delta of {} new messages exceeds {}",
                     new_count, work_bound

@@ -482,7 +482,9 @@ impl ComposableState for BansV1 {
             // A delta longer than everything held plus the bound cannot be
             // within the bound however many it re-delivers: refused before
             // any record is hashed.
-            if delta.len() > self.0.len().saturating_add(bound) {
+            if !crate::room_state::work_bounds::lifted()
+                && delta.len() > self.0.len().saturating_add(bound)
+            {
                 return Err(format!(
                     "Ban delta of {} exceeds {}; refusing to process a flood",
                     delta.len(),
@@ -514,7 +516,7 @@ impl ComposableState for BansV1 {
             // reject a ban delta from a peer still on the old, higher cap
             // (freenet/river#703 defect 2). The floor heals any reduction from
             // a cap at or below it in one exchange; cleanup trims the excess.
-            if new_bans.len() > bound {
+            if !crate::room_state::work_bounds::lifted() && new_bans.len() > bound {
                 return Err(format!(
                     "Ban delta of {} new bans exceeds {}; refusing to process a flood",
                     new_bans.len(),

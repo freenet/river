@@ -315,7 +315,7 @@ fn the_bans_raw_length_bound() {
     assert!(apply(2 + MIN_BANS_DELTA_BOUND).is_err());
 }
 
-/// The delta the UI applies for an incoming state (`delta_from_merged_summary`)
+/// The delta the UI applies for an incoming state (`merge_through_summary`)
 /// is read against the configuration the merge ends with: an incoming
 /// configuration that raises the message cap gets every message the raised
 /// cap keeps, not only those newer than the receiver's old horizon.
@@ -361,7 +361,8 @@ fn the_merged_summary_delta_reads_a_raised_cap() {
     };
     incoming.recent_messages.rebuild_actions_state();
     let delta = receiver
-        .delta_from_merged_summary(&params, &incoming)
+        .merge_through_summary(&params, &incoming)
+        .expect("merges")
         .expect("a delta");
     assert_eq!(delta.recent_messages.map(|m| m.len()), Some(7));
 }
@@ -388,11 +389,11 @@ fn owner_messages(o: &SigningKey, range: std::ops::Range<u64>) -> MessagesV1 {
     m
 }
 
-/// An incoming state holding more messages than one delta may carry still
-/// merges through `delta_from_merged_summary` in one apply: the delta is
-/// trimmed to the newest the bound allows, and the room keeps its newest.
+/// An incoming state holding more messages than one network delta may carry
+/// merges through `merge_through_summary` in one apply: every incoming
+/// message is applied, and the room keeps its newest.
 #[test]
-fn the_merged_summary_delta_is_trimmed_to_the_work_bound() {
+fn the_incoming_path_is_not_held_to_the_delta_bound() {
     use river_core::room_state::message::messages_work_bound;
     let o = sk(1);
     let params = ChatRoomParametersV1 {
@@ -409,17 +410,15 @@ fn the_merged_summary_delta_is_trimmed_to_the_work_bound() {
         recent_messages: owner_messages(&o, 0..n),
         ..Default::default()
     };
-    let delta = local
-        .delta_from_merged_summary(&params, &incoming)
+    let mut merged = local.clone();
+    let delta = merged
+        .merge_through_summary(&params, &incoming)
+        .expect("merges")
         .expect("a delta");
     assert_eq!(
         delta.recent_messages.as_ref().map(|m| m.len()),
-        Some(messages_work_bound(10))
+        Some(n as usize)
     );
-    let mut merged = local.clone();
-    merged
-        .apply_delta(&ChatRoomStateV1::default(), &params, &Some(delta))
-        .expect("the trimmed delta applies");
     let times: Vec<_> = merged
         .recent_messages
         .messages
@@ -429,11 +428,10 @@ fn the_merged_summary_delta_is_trimmed_to_the_work_bound() {
     assert_eq!(times, (n - 10..n).map(at).collect::<Vec<_>>());
 }
 
-/// The trim reads the configuration the merge ends with: an incoming
-/// configuration raising the message cap past the floor gets every message
-/// the raised cap keeps in one apply.
+/// An incoming configuration raising the message cap past the per-delta
+/// floor gets every message the raised cap keeps in one apply.
 #[test]
-fn the_merged_summary_delta_is_trimmed_by_the_merged_cap() {
+fn the_incoming_path_keeps_what_a_raised_cap_keeps() {
     use river_core::room_state::message::messages_work_bound;
     let o = sk(1);
     let params = ChatRoomParametersV1 {
@@ -454,11 +452,10 @@ fn the_merged_summary_delta_is_trimmed_by_the_merged_cap() {
         recent_messages: owner_messages(&o, 0..n),
         ..Default::default()
     };
-    let delta = local.delta_from_merged_summary(&params, &incoming);
     let mut merged = local.clone();
     merged
-        .apply_delta(&ChatRoomStateV1::default(), &params, &delta)
-        .expect("apply");
+        .merge_through_summary(&params, &incoming)
+        .expect("merges");
     assert_eq!(merged.recent_messages.messages.len(), n as usize);
 }
 

@@ -921,7 +921,7 @@ fn an_unsigned_configuration_is_never_offered() {
 /// A client's local placeholder configuration (not the owner's) is replaced
 /// by the owner's configuration whatever their ranks, by the whole-state
 /// merge and by the delta a client applies for an incoming state
-/// (`delta_from_merged_summary`) alike; two placeholders never replace each
+/// (`merge_through_summary`) alike; two placeholders never replace each
 /// other, and merging them does not fail.
 #[test]
 fn a_placeholder_configuration_is_replaced_only_by_the_owners() {
@@ -945,10 +945,9 @@ fn a_placeholder_configuration_is_replaced_only_by_the_owners() {
     merged.merge(&local, &r.params, &owners).expect("merge");
     assert_eq!(merged.configuration, owners.configuration);
     let mut applied = local.clone();
-    let delta = local.delta_from_merged_summary(&r.params, &owners);
     applied
-        .apply_delta(&ChatRoomStateV1::default(), &r.params, &delta)
-        .expect("apply");
+        .merge_through_summary(&r.params, &owners)
+        .expect("merges");
     assert_eq!(applied.configuration, owners.configuration);
 
     let other = ChatRoomStateV1 {

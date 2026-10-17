@@ -142,7 +142,9 @@ impl ComposableState for MembersV1 {
             // here rather than failing the delta, so the rest of the delta
             // applies the same way whatever else it carries.
             let work_bound = members_work_bound(max_members);
-            if delta.added.len() > self.members.len().saturating_add(work_bound) {
+            if !crate::room_state::work_bounds::lifted()
+                && delta.added.len() > self.members.len().saturating_add(work_bound)
+            {
                 return Err(format!(
                     "Members delta of {} exceeds {}",
                     delta.added.len(),
@@ -158,7 +160,7 @@ impl ComposableState for MembersV1 {
                 .filter(|m| m.member.id() != owner_id)
                 .filter(|m| !held.contains(&m.member.id()) && in_delta.insert(evidence_digest(m)))
                 .collect();
-            if added.len() > work_bound {
+            if !crate::room_state::work_bounds::lifted() && added.len() > work_bound {
                 return Err(format!(
                     "Members delta of {} new members exceeds {}",
                     added.len(),

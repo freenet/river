@@ -217,11 +217,16 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         let summary = from_reader::<ChatRoomStateV1Summary, &[u8]>(summary.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        // Trimmed to the receiver's work bounds, so a receiver on a lowered
-        // cap applies it rather than refusing it (freenet/river#703).
-        let delta = chat_state.delta_within_work_bounds(&parameters, &summary);
-        let delta = delta
-            .map(|d| ensure_members_for_message_authors(d, &chat_state, &parameters, &summary));
+        // Message authors' member records are added first, then the whole
+        // delta is trimmed to the receiver's work bounds, so a receiver on a
+        // lowered cap applies it rather than refusing it (freenet/river#703).
+        let delta = chat_state
+            .delta(&chat_state, &parameters, &summary)
+            .map(|d| ensure_members_for_message_authors(d, &chat_state, &parameters, &summary))
+            .map(|mut d| {
+                chat_state.trim_network_delta(&parameters, &summary, &mut d);
+                d
+            });
         match delta {
             Some(d) => {
                 let mut delta_bytes = vec![];
@@ -321,11 +326,110 @@ mod tests {
         assert!(out.new_state.is_some());
     }
 
+    /// Message authors' member records are added to a network delta before
+    /// it is trimmed, so the trimmed delta never carries more members than
+    /// the receiver's bound, nor a message whose author it left out: a
+    /// receiver on a newer configuration the sender does not know applies it
+    /// (freenet/river#703).
+    #[test]
+    fn a_network_delta_with_message_authors_fits_the_bound() {
+        use river_core::room_state::member::{AuthorizedMember, Member, MembersV1};
+        use river_core::room_state::message::{
+            AuthorizedMessageV1, MessageV1, MessagesV1, RoomMessageBody,
+        };
+        let owner_sk = SigningKey::from_bytes(&[1; 32]);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let config = |version: u32, cap: usize| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    configuration_version: version,
+                    max_members: cap,
+                    max_recent_messages: cap,
+                    ..Default::default()
+                },
+                &owner_sk,
+            )
+        };
+        let authors: Vec<SigningKey> = (0..1_200u64)
+            .map(|i| {
+                let mut b = [5u8; 32];
+                b[..8].copy_from_slice(&i.to_le_bytes());
+                SigningKey::from_bytes(&b)
+            })
+            .collect();
+        let mut messages = MessagesV1 {
+            messages: authors
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    AuthorizedMessageV1::new(
+                        MessageV1 {
+                            room_owner: owner_id,
+                            author: MemberId::from(&a.verifying_key()),
+                            time: std::time::SystemTime::UNIX_EPOCH
+                                + std::time::Duration::from_secs(i as u64),
+                            content: RoomMessageBody::public(format!("m{i}")),
+                        },
+                        a,
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        messages.rebuild_actions_state();
+        let sender = ChatRoomStateV1 {
+            configuration: config(1, 5_000),
+            members: MembersV1 {
+                members: authors
+                    .iter()
+                    .map(|a| {
+                        AuthorizedMember::new(
+                            Member {
+                                owner_member_id: owner_id,
+                                invited_by: owner_id,
+                                member_vk: a.verifying_key(),
+                            },
+                            &owner_sk,
+                        )
+                    })
+                    .collect(),
+            },
+            recent_messages: messages,
+            ..Default::default()
+        };
+        let receiver = ChatRoomStateV1 {
+            configuration: config(2, 2),
+            ..Default::default()
+        };
+        let summary = Contract::summarize_state(
+            Parameters::from(cbor!(&parameters)),
+            State::from(cbor!(&receiver)),
+        )
+        .unwrap();
+        let delta = Contract::get_state_delta(
+            Parameters::from(cbor!(&parameters)),
+            State::from(cbor!(&sender)),
+            summary,
+        )
+        .unwrap();
+        Contract::update_state(
+            Parameters::from(cbor!(&parameters)),
+            State::from(cbor!(&receiver)),
+            vec![UpdateData::Delta(delta)],
+        )
+        .expect("the receiver applies the network delta");
+    }
+
     /// A full-state update runs the room's own merge (`merge_from`), not the
     /// trait default. The witness: after the owner lowers `max_user_bans`
     /// from above the bans work bound, merging a peer that still holds the
-    /// old ban set trims what it offers to the bound, where the trait default
-    /// offers everything and fails (freenet/river#703).
+    /// old ban set applies every ban and keeps what the merged cap keeps,
+    /// where the trait default is refused by the per-delta bound
+    /// (freenet/river#703).
     #[test]
     fn a_full_state_update_runs_the_rooms_own_merge() {
         let owner_sk = SigningKey::from_bytes(&[1; 32]);
