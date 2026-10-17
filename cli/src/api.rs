@@ -203,15 +203,17 @@ fn next_upgrade_hop(
 /// `next_state` INTO a clone of `base`, mirroring the UI (which merges a
 /// followed pointer's state into the authoritative current-key `RoomData`
 /// rather than replacing it), so a followed subset can never drop content
-/// already present on the base. On a merge failure the base is returned
-/// unchanged rather than losing it.
+/// already present on the base. The merge is [`merge_converging`], as for
+/// the other local merges, so a followed generation the room's merge refuses
+/// once (its configuration does not outrank the base's) is still folded in.
+/// On a merge failure the base is returned unchanged rather than losing it.
 fn fold_forward_upgrade_state(
     base: &ChatRoomStateV1,
     next_state: &ChatRoomStateV1,
     params: &ChatRoomParametersV1,
 ) -> ChatRoomStateV1 {
     let mut merged = base.clone();
-    match merged.merge(base, params, next_state) {
+    match merge_converging(&mut merged, params, next_state) {
         Ok(()) => {
             merged.recent_messages.rebuild_actions_state();
             merged
@@ -9302,66 +9304,81 @@ mod create_room_tests {
         assert!(fold_own_purge_heal(&mut own, &bob, &owner_vk, &network).is_none());
     }
 
+    /// A copy of the room `owner` owns, on configuration `version` with ban
+    /// cap `cap`, holding `n_msgs` owner messages and `n_bans` owner-issued
+    /// bans, normalized by a merge with itself.
+    fn generation_copy(
+        owner: &SigningKey,
+        version: u32,
+        cap: usize,
+        n_msgs: u64,
+        n_bans: u64,
+    ) -> ChatRoomStateV1 {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        use river_core::room_state::member::MemberId;
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let owner_id = MemberId::from(&owner.verifying_key());
+        let params = ChatRoomParametersV1 {
+            owner: owner.verifying_key(),
+        };
+        let (mut s, _) = build_new_room_state(owner, "Room", "Owner", false);
+        let mut c = s.configuration.configuration.clone();
+        c.configuration_version = version;
+        c.max_user_bans = cap;
+        s.configuration = AuthorizedConfigurationV1::new(c, owner);
+        s.recent_messages.messages = (0..n_msgs)
+            .map(|i| {
+                AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: owner_id,
+                        author: owner_id,
+                        time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i),
+                        content: RoomMessageBody::public(format!("m{i}")),
+                    },
+                    owner,
+                )
+            })
+            .collect();
+        s.recent_messages.rebuild_actions_state();
+        s.bans = BansV1(
+            (0..n_bans)
+                .map(|i| {
+                    AuthorizedUserBan::new(
+                        UserBan {
+                            owner_member_id: owner_id,
+                            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(i),
+                            banned_user: MemberId::from(
+                                &SigningKey::from_bytes(&{
+                                    let mut b = [6u8; 32];
+                                    b[..8].copy_from_slice(&i.to_le_bytes());
+                                    b
+                                })
+                                .verifying_key(),
+                            ),
+                        },
+                        owner_id,
+                        owner,
+                    )
+                })
+                .collect(),
+        );
+        let mut m = s.clone();
+        m.merge_from(&params, &s).unwrap();
+        m
+    }
+
     /// A copy on the owner's newer configuration (ban cap 10) merging a copy
     /// on an older one holding 150 bans and a message it lacks: the room's
     /// merge refuses the older copy once, and the local merge converges
     /// instead of keeping one side.
     #[test]
     fn a_local_merge_converges_past_a_lower_ranked_refusal() {
-        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
-        use river_core::room_state::member::MemberId;
-        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
         let owner = SigningKey::from_bytes(&[43u8; 32]);
-        let owner_id = MemberId::from(&owner.verifying_key());
         let params = ChatRoomParametersV1 {
             owner: owner.verifying_key(),
         };
         let state = |version: u32, cap: usize, n_msgs: u64, n_bans: u64| {
-            let (mut s, _) = build_new_room_state(&owner, "Room", "Owner", false);
-            let mut c = s.configuration.configuration.clone();
-            c.configuration_version = version;
-            c.max_user_bans = cap;
-            s.configuration = AuthorizedConfigurationV1::new(c, &owner);
-            s.recent_messages.messages = (0..n_msgs)
-                .map(|i| {
-                    AuthorizedMessageV1::new(
-                        MessageV1 {
-                            room_owner: owner_id,
-                            author: owner_id,
-                            time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i),
-                            content: RoomMessageBody::public(format!("m{i}")),
-                        },
-                        &owner,
-                    )
-                })
-                .collect();
-            s.recent_messages.rebuild_actions_state();
-            s.bans = BansV1(
-                (0..n_bans)
-                    .map(|i| {
-                        AuthorizedUserBan::new(
-                            UserBan {
-                                owner_member_id: owner_id,
-                                banned_at: std::time::UNIX_EPOCH
-                                    + std::time::Duration::from_secs(i),
-                                banned_user: MemberId::from(
-                                    &SigningKey::from_bytes(&{
-                                        let mut b = [6u8; 32];
-                                        b[..8].copy_from_slice(&i.to_le_bytes());
-                                        b
-                                    })
-                                    .verifying_key(),
-                                ),
-                            },
-                            owner_id,
-                            &owner,
-                        )
-                    })
-                    .collect(),
-            );
-            let mut m = s.clone();
-            m.merge_from(&params, &s).unwrap();
-            m
+            generation_copy(&owner, version, cap, n_msgs, n_bans)
         };
         let lowered = state(2, 10, 1, 0);
         let stale = state(1, 300, 2, 150);
@@ -9372,6 +9389,69 @@ mod create_room_tests {
         merge_converging(&mut merged, &params, &stale).expect("converges");
         assert_eq!(merged.recent_messages.messages.len(), 2);
         assert_eq!(merged.bans.0.len(), 10);
+    }
+
+    /// Folding a followed generation the room's merge refuses once (its
+    /// configuration does not outrank the base's and it holds 150 bans
+    /// where the base's cap is 10) converges as the other local merges do:
+    /// the followed generation's message is kept and the base's cap holds.
+    #[test]
+    fn fold_forward_upgrade_state_converges_past_a_lower_ranked_refusal() {
+        let owner = SigningKey::from_bytes(&[44u8; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: owner.verifying_key(),
+        };
+        let base = generation_copy(&owner, 2, 10, 1, 0);
+        let followed = generation_copy(&owner, 1, 300, 2, 150);
+        let refused = base.clone().merge_from(&params, &followed).unwrap_err();
+        assert!(refused.contains(LOWER_RANKED_REFUSAL), "premise: {refused}");
+        let folded = fold_forward_upgrade_state(&base, &followed, &params);
+        assert_eq!(folded.recent_messages.messages.len(), 2);
+        assert_eq!(folded.bans.0.len(), 10);
+    }
+
+    /// When the converging merge fails past the lower-ranked refusal (the
+    /// refused copy also holds a member record the owner did not sign, with
+    /// a message by that member: the copy takes the target's side, and
+    /// merging that in fails on the record), the target is left exactly as
+    /// it was and the error is the refusal.
+    #[test]
+    fn a_failed_converging_merge_leaves_the_target_untouched() {
+        use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let owner = SigningKey::from_bytes(&[45u8; 32]);
+        let owner_vk = owner.verifying_key();
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let lowered = generation_copy(&owner, 2, 10, 1, 0);
+        let mut stale = generation_copy(&owner, 1, 300, 2, 150);
+        let member = SigningKey::from_bytes(&[46u8; 32]);
+        stale.members.members.push(AuthorizedMember {
+            member: Member {
+                owner_member_id: MemberId::from(&owner_vk),
+                invited_by: MemberId::from(&owner_vk),
+                member_vk: member.verifying_key(),
+            },
+            signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+        });
+        stale
+            .recent_messages
+            .messages
+            .push(AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: MemberId::from(&owner_vk),
+                    author: MemberId::from(&member.verifying_key()),
+                    time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000),
+                    content: RoomMessageBody::public("by the member".to_string()),
+                },
+                &member,
+            ));
+        stale.recent_messages.rebuild_actions_state();
+        let refused = lowered.clone().merge_from(&params, &stale).unwrap_err();
+        assert!(refused.contains(LOWER_RANKED_REFUSAL), "premise: {refused}");
+        let mut target = lowered.clone();
+        let err = merge_converging(&mut target, &params, &stale).unwrap_err();
+        assert!(err.contains(LOWER_RANKED_REFUSAL), "{err}");
+        assert_eq!(target, lowered);
     }
 
     /// A storage holding the room `room_with_bob` builds, as bob, with bob
