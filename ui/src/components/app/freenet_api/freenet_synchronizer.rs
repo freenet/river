@@ -860,6 +860,9 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
+                                crate::components::app::chat_delegate::note_sweep_error(
+                                    &e.to_string(),
+                                );
 
                                 let current = current_delegate_key();
                                 if let Some(key) = e.register_failed_key() {
