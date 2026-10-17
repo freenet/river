@@ -1789,6 +1789,45 @@ mod tests {
         );
     }
 
+    /// A recovered state whose winning purge envelope for this member omits a
+    /// purge this device recorded leaves the room holding the re-signed
+    /// union.
+    #[test]
+    fn a_recovered_state_re_signs_a_lost_purge() {
+        use freenet_scaffold::ComposableState;
+        use river_core::room_state::direct_messages::{
+            advance_recipient_purges, DirectMessagesDelta, PurgeToken,
+        };
+        let sk = SigningKey::from_bytes(&[84u8; 32]);
+        let owner_vk = sk.verifying_key();
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let base = room_with_messages(&sk, &["m1"]);
+        let other_device =
+            advance_recipient_purges(&sk, &owner_vk, None, [PurgeToken([7; 16])]).unwrap();
+        let mut recovered = base.clone();
+        recovered
+            .apply_delta(
+                &base,
+                &params,
+                &Some(river_core::room_state::ChatRoomStateV1Delta {
+                    direct_messages: Some(DirectMessagesDelta {
+                        new_messages: vec![],
+                        advanced_purges: vec![other_device],
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let mut room = room_data(&sk, base);
+        room.own_purges
+            .record(MemberId::from(&owner_vk), [PurgeToken([1; 16])]);
+        assert!(merge_recovered_into_room(&mut room, recovered, owner_vk));
+        assert_eq!(
+            room.room_state.direct_messages.purges[0].state.purged,
+            vec![PurgeToken([1; 16]), PurgeToken([7; 16])]
+        );
+    }
+
     /// A recovered state that does not merge leaves the room exactly as it
     /// was AND keeps the marker, so the next load tries again.
     #[test]

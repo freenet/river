@@ -1897,13 +1897,13 @@ mod tests {
         state.recent_messages.messages.push(authorized);
     }
 
-    /// An incoming state that holds more bans than one delta may carry (its
-    /// owner's configuration was older, with a higher `max_user_bans`) merges
-    /// into a local state already on the lowered cap: the incoming path trims
-    /// what it takes to the work bound, as the whole-state merge does
+    /// An incoming state under an older configuration with a higher
+    /// `max_user_bans`, into a local state already on the lowered cap: within
+    /// one delta's bound it merges and the lowered cap keeps what it keeps;
+    /// over it, it is refused, as the whole-state merge refuses it
     /// (freenet/river#703).
     #[test]
-    fn merge_incoming_state_trims_to_the_work_bound() {
+    fn merge_incoming_state_holds_a_lower_ranked_state_to_the_local_bounds() {
         use river_core::room_state::ban::{
             AuthorizedUserBan, BansV1, UserBan, MIN_BANS_DELTA_BOUND,
         };
@@ -1921,7 +1921,7 @@ mod tests {
                 &owner_sk,
             )
         };
-        let held = MIN_BANS_DELTA_BOUND + 3;
+        let held = MIN_BANS_DELTA_BOUND;
         let bans = (0..held as u64)
             .map(|i| {
                 let target = SigningKey::from_bytes(&{
@@ -1950,10 +1950,29 @@ mod tests {
             configuration: config(2, 2),
             ..Default::default()
         };
+        let base = local.clone();
         merge_incoming_state(&mut local, &params, &incoming)
-            .expect("an incoming state over the work bound merges");
+            .expect("an incoming state within the bound merges");
         assert_eq!(local.bans.0.len(), 2);
         local.verify(&local, &params).unwrap();
+
+        let mut over = incoming.clone();
+        over.configuration = config(1, held + 3);
+        over.bans.0.extend((0..3u64).map(|i| {
+            AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10_000 + i),
+                    banned_user: MemberId::from(
+                        &SigningKey::from_bytes(&[200 + i as u8; 32]).verifying_key(),
+                    ),
+                },
+                owner_id,
+                &owner_sk,
+            )
+        }));
+        let mut refused = base.clone();
+        assert!(merge_incoming_state(&mut refused, &params, &over).is_err());
     }
 
     #[test]
@@ -2518,7 +2537,13 @@ mod tests {
     fn every_get_ingestion_path_heals_own_purges() {
         let raw = include_str!("response_handler/get_response.rs");
         let cut = raw.find("mod tests {").expect("a tests module to cut at");
-        let src: String = raw[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        // Comment lines are dropped, so a commented-out call does not count.
+        let src: String = raw[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
         assert_eq!(src.matches("room_data.heal_own_purges()").count(), 5);
         assert_eq!(
             src.matches("ifpurges_healed{crate::components::app::mark_needs_sync(owner_vk);}")

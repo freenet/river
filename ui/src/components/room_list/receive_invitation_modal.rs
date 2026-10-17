@@ -119,27 +119,38 @@ pub(crate) fn nickname_was_refused(refusal: Option<&NicknameRefusal>, nickname: 
 /// The state change for a join the room refused for its nickname: the join
 /// is no longer pending, so the dialog returns to the nickname prompt (not
 /// to Retry, which would resubmit the same nickname), and the reason is kept
-/// for the prompt.
+/// for the prompt. Returns the join that was pending.
 pub(crate) fn record_nickname_refusal(
     pending: &mut crate::invites::PendingInvites,
     refusals: &mut std::collections::HashMap<VerifyingKey, NicknameRefusal>,
     room: VerifyingKey,
     nickname: String,
     reason: String,
-) {
-    pending.map.remove(&room);
+) -> Option<PendingRoomJoin> {
     refusals.insert(room, NicknameRefusal { reason, nickname });
+    pending.map.remove(&room)
 }
 
-/// Apply [`record_nickname_refusal`] to the app's signals, and drop the saved
-/// nickname, so a reload re-prompts rather than resuming the join with the
-/// refused one. Call from a deferred context (it writes signals).
+/// Apply [`record_nickname_refusal`] to the app's signals, and present the
+/// invitation again, so the nickname prompt shows with the reason even when
+/// the dialog was closed (or the join was resumed after a reload).
+/// Presenting it stores the invitation and drops the saved nickname, so a
+/// reload re-prompts rather than resuming the join with the refused one.
+/// Call from a deferred context (it writes signals).
 pub(crate) fn refuse_join_for_nickname(room: VerifyingKey, nickname: String, reason: String) {
-    PENDING_INVITES.with_mut(|pending| {
+    let join = PENDING_INVITES.with_mut(|pending| {
         JOIN_NICKNAME_REFUSALS
             .with_mut(|refusals| record_nickname_refusal(pending, refusals, room, nickname, reason))
     });
     clear_invitation_nickname_from_storage();
+    if let Some(join) = join {
+        present_invitation(Invitation {
+            room,
+            invitee_signing_key: join.invitee_signing_key,
+            invitee: join.authorized_member,
+            room_secrets: join.room_secrets,
+        });
+    }
 }
 
 /// Surface the `ReceiveInvitationModal` for `inv` from anywhere in the app
@@ -1247,9 +1258,12 @@ pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
         MemberId::from(room_owner)
     );
 
-    // A nickname refused earlier for this room is no longer the one asked.
-    JOIN_NICKNAME_REFUSALS.with_mut(|refusals| {
-        refusals.remove(&room_owner);
+    // A nickname refused earlier for this room is no longer the one asked
+    // (deferred: a signal write from an event handler).
+    crate::util::defer(move || {
+        JOIN_NICKNAME_REFUSALS.with_mut(|refusals| {
+            refusals.remove(&room_owner);
+        });
     });
 
     // Add to pending invites
@@ -1363,6 +1377,69 @@ mod tests {
         assert!(invitation_accept_disabled(&"n".repeat(ceiling + 1), None));
         assert!(invitation_accept_disabled("refused", Some(&refusal)));
         assert!(!invitation_accept_disabled("other", Some(&refusal)));
+    }
+
+    /// A join refused for its nickname: the join is no longer pending, the
+    /// reason is kept for the prompt, the saved nickname is dropped (a reload
+    /// re-prompts instead of resuming with it), and the invitation is
+    /// presented again, so the prompt shows even when the dialog was closed.
+    #[test]
+    fn a_refused_join_presents_the_invitation_again_at_the_prompt() {
+        reset_storage();
+        let dom = VirtualDom::new(|| rsx! {});
+        dom.in_scope(ScopeId::ROOT, || {
+            let room_sk = SigningKey::from_bytes(&[44u8; 32]);
+            let room = room_sk.verifying_key();
+            let invitee_sk = SigningKey::from_bytes(&[45u8; 32]);
+            let invitee = AuthorizedMember::new(
+                river_core::room_state::member::Member {
+                    owner_member_id: MemberId::from(room),
+                    invited_by: MemberId::from(room),
+                    member_vk: invitee_sk.verifying_key(),
+                },
+                &room_sk,
+            );
+            let inv = Invitation {
+                room,
+                invitee_signing_key: invitee_sk.clone(),
+                invitee: invitee.clone(),
+                room_secrets: vec![],
+            };
+            save_invitation_to_storage(&inv);
+            save_invitation_nickname_to_storage(&inv.to_encoded_string(), "a very long name");
+            PENDING_INVITES.with_mut(|p| {
+                p.map.insert(
+                    room,
+                    PendingRoomJoin {
+                        authorized_member: invitee,
+                        invitee_signing_key: invitee_sk,
+                        preferred_nickname: "a very long name".into(),
+                        status: PendingRoomStatus::Subscribing,
+                        subscribing_since: None,
+                        retry_count: 0,
+                        room_secrets: vec![],
+                    },
+                )
+            });
+            refuse_join_for_nickname(room, "a very long name".into(), "too long".into());
+            assert!(!PENDING_INVITES.read().map.contains_key(&room));
+            assert_eq!(
+                JOIN_NICKNAME_REFUSALS
+                    .read()
+                    .get(&room)
+                    .map(|r| r.reason.clone()),
+                Some("too long".to_string())
+            );
+            assert_eq!(
+                load_invitation_nickname_from_storage(&inv.to_encoded_string()),
+                None
+            );
+            assert_eq!(
+                PRESENT_INVITATION_REQUEST.read().as_ref().map(|i| i.room),
+                Some(room),
+                "the invitation is presented again"
+            );
+        });
     }
 
     /// The invitation GET path hands a nickname refusal to

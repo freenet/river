@@ -3303,6 +3303,34 @@ mod tests {
         );
     }
 
+    /// A re-sign first drops the record of a recipient that is no longer a
+    /// member: nothing is re-signed for it.
+    #[test]
+    fn a_purge_record_of_a_member_who_left_is_dropped_before_re_signing() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let owner_sk = SigningKey::from_bytes(&[37u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[38u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let mut rd = test_minimal_room_data(owner_vk);
+        rd.self_sk = Some(bob_sk.clone());
+        rd.room_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: MemberId::from(owner_vk),
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        rd.own_purges.record(
+            MemberId::from(bob_sk.verifying_key()),
+            [PurgeToken([1; 16])],
+        );
+        assert!(!rd.heal_own_purges());
+        assert!(rd.own_purges.purged.is_empty());
+    }
+
     /// No loop: a device whose re-signed envelope has not landed does not
     /// re-sign again against the same winning version.
     #[test]
