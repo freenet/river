@@ -394,9 +394,10 @@ impl ProbeStateOps for RiverCliMigrationProbeOps {
         // The active-migration merge (unlike the read path's pass-through):
         // CRDT-merge the recovered network state with the local cache so
         // neither a fresher network state nor unsynced local edits are lost.
-        // Preserved exactly from the pre-driver `get_migration_state`:
-        //   let mut merged = net_state.clone();
-        //   merged.merge(&net_state, &params, local_state)  // Err => net_state
+        // The merge is `merge_converging`, as for the other local merges, so
+        // a local copy the room's merge refuses once (its configuration does
+        // not outrank the recovered state's) is still merged in. On any other
+        // failure the recovered network state is used alone, as before.
         let params = ChatRoomParametersV1 {
             owner: self.inner.owner_vk,
         };
@@ -9408,6 +9409,34 @@ mod create_room_tests {
         let folded = fold_forward_upgrade_state(&base, &followed, &params);
         assert_eq!(folded.recent_messages.messages.len(), 2);
         assert_eq!(folded.bans.0.len(), 10);
+    }
+
+    /// Any other merge error is returned as it is, without the converging
+    /// steps: here the incoming copy holds 150 bans under its own cap of 100,
+    /// and the converging steps would succeed (the copy takes the target's
+    /// side and trims), yet the merge fails with the copy's own-limit error
+    /// and the target is unchanged.
+    #[test]
+    fn a_merge_error_other_than_the_refusal_is_returned_at_once() {
+        let owner = SigningKey::from_bytes(&[47u8; 32]);
+        let vk = owner.verifying_key();
+        let params = ChatRoomParametersV1 { owner: vk };
+        let lowered = generation_copy(&owner, 2, 10, 1, 0);
+        let mut over = generation_copy(&owner, 1, 300, 2, 150);
+        let mut c = over.configuration.configuration.clone();
+        c.max_user_bans = 100;
+        over.configuration = AuthorizedConfigurationV1::new(c, &owner);
+        let mut other_side = over.clone();
+        other_side.merge_from(&params, &lowered).unwrap();
+        let mut converged = lowered.clone();
+        converged
+            .merge_from(&params, &other_side)
+            .expect("premise: the converging steps succeed here");
+        let mut target = lowered.clone();
+        let err = merge_converging(&mut target, &params, &over).unwrap_err();
+        assert!(err.contains("its own configuration's limit"), "{err}");
+        assert!(!err.contains(LOWER_RANKED_REFUSAL), "{err}");
+        assert_eq!(target, lowered);
     }
 
     /// When the converging merge fails past the lower-ranked refusal (the
