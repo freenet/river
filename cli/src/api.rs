@@ -2364,6 +2364,14 @@ where
         return state;
     }
     let mut own = info.own_purges.clone();
+    // A recipient that left the room has its record dropped first.
+    if own.prune(room_owner_key, &state) {
+        if let Err(e) = storage.update_own_purges(room_owner_key, |held| {
+            held.prune(room_owner_key, &state);
+        }) {
+            warn!("DM purge record: not pruned: {e}");
+        }
+    }
     let Some(result) = fold_own_purge_heal(&mut own, &signing_key, room_owner_key, &state) else {
         return state;
     };
@@ -9348,6 +9356,26 @@ mod create_room_tests {
         })
         .await;
         assert_eq!(sent.get(), 2);
+    }
+
+    /// A read of a room the recorded recipient has left drops its record
+    /// and publishes nothing.
+    #[tokio::test]
+    async fn a_purge_record_of_a_recipient_who_left_is_dropped() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let (storage, _dir, owner, mut network) = purge_heal_fixture(PurgeToken([1; 16]));
+        let owner_vk = owner.verifying_key();
+        network.members.members.clear();
+        network.direct_messages.purges.clear();
+        heal_own_purges_in(&storage, &owner_vk, network, |_| async {
+            panic!("must not publish")
+        })
+        .await;
+        let key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        assert!(storage.load_rooms().unwrap().rooms[&key_str]
+            .own_purges
+            .purged
+            .is_empty());
     }
 
     /// Under a signing-key override that is not the room's stored identity,

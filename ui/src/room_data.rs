@@ -575,6 +575,8 @@ impl RoomData {
             return false;
         };
         let owner = self.owner_vk;
+        // A recipient that left the room has its record dropped first.
+        self.own_purges.prune(&owner, &self.room_state);
         let envelope = match self.own_purges.heal(&signing_key, &owner, &self.room_state) {
             None => return false,
             Some(Err(e)) => {

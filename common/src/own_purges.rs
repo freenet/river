@@ -61,6 +61,30 @@ impl OwnPurges {
         }
     }
 
+    /// Drop the record of every recipient that is not a member of the room
+    /// in `state` (it left or was pruned, and its DMs went with it), so a
+    /// later rejoin does not re-sign every token it ever purged. Only a
+    /// state whose configuration the room owner signed is read; a
+    /// placeholder prunes nothing. Returns whether anything was dropped (the
+    /// caller then persists this record).
+    pub fn prune(&mut self, room_owner_vk: &VerifyingKey, state: &ChatRoomStateV1) -> bool {
+        if state.configuration.verify_signature(room_owner_vk).is_err() {
+            return false;
+        }
+        let owner = MemberId::from(room_owner_vk);
+        let members: std::collections::HashSet<MemberId> = state
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect();
+        let kept = |r: &MemberId| *r == owner || members.contains(r);
+        let before = (self.purged.len(), self.healed_at.len());
+        self.purged.retain(|(r, _)| kept(r));
+        self.healed_at.retain(|(r, _)| kept(r));
+        before != (self.purged.len(), self.healed_at.len())
+    }
+
     fn healed_at(&self, recipient: MemberId) -> Option<u64> {
         self.healed_at
             .iter()
@@ -84,8 +108,9 @@ impl OwnPurges {
     /// next version. `None` when nothing is missing, when the recipient is
     /// not a member of the room, or when this client already re-signed
     /// against the winning envelope's version (recorded here, so the caller
-    /// persists this record afterwards). `Some(Err)` when the envelope
-    /// cannot be built (the tombstone cap); the version is recorded then too.
+    /// persists this record afterwards). The re-signed envelope holds at most
+    /// the tombstone cap; recorded tokens past it are left out. `Some(Err)`
+    /// when the envelope cannot be built; the version is recorded then too.
     pub fn heal(
         &mut self,
         recipient_sk: &SigningKey,
@@ -104,11 +129,16 @@ impl OwnPurges {
             .iter()
             .find(|p| p.recipient_id == me);
         let held_tokens: &[PurgeToken] = held.map_or(&[], |p| &p.state.purged);
+        // At most what the envelope still has room for: recorded tokens past
+        // the tombstone cap are not all re-signed at once.
+        let room = crate::room_state::direct_messages::MAX_PURGED_TOMBSTONES_PER_RECIPIENT
+            .saturating_sub(held_tokens.len());
         let missing: Vec<PurgeToken> = self
             .purged
             .iter()
             .filter(|(r, t)| *r == me && !held_tokens.contains(t))
             .map(|(_, t)| *t)
+            .take(room)
             .collect();
         if missing.is_empty() {
             return None;
@@ -285,6 +315,51 @@ mod tests {
         tab.record(bob, [t1]);
         tab.union(&rec);
         assert!(tab.heal(&r.bob_sk, &r.params.owner, &lost).is_none());
+    }
+
+    /// A recipient that is no longer a member of the room (it left or was
+    /// pruned, and its DMs went with it) has its record dropped, so a later
+    /// rejoin does not re-sign every token it ever purged; a room whose
+    /// configuration the owner did not sign (a placeholder) prunes nothing.
+    #[test]
+    fn the_record_of_a_recipient_who_left_is_dropped() {
+        let r = room();
+        let stranger = SigningKey::from_bytes(&[14u8; 32]);
+        let sid = MemberId::from(&stranger.verifying_key());
+        let bob = MemberId::from(&r.bob_sk.verifying_key());
+        let mut rec = OwnPurges::default();
+        rec.record(sid, [PurgeToken([5; 16])]);
+        rec.record(bob, [PurgeToken([6; 16])]);
+        assert!(!rec.prune(&r.params.owner, &ChatRoomStateV1::default()));
+        assert!(rec.prune(&r.params.owner, &r.state));
+        assert_eq!(rec.purged, vec![(bob, PurgeToken([6; 16]))]);
+        assert!(
+            !rec.prune(&r.params.owner, &r.state),
+            "nothing more to drop"
+        );
+    }
+
+    /// Recorded tokens beyond what one envelope may hold are not re-signed
+    /// all at once: the re-signed envelope stays within the tombstone cap.
+    #[test]
+    fn a_heal_stays_within_the_tombstone_cap() {
+        use crate::room_state::direct_messages::MAX_PURGED_TOMBSTONES_PER_RECIPIENT;
+        let r = room();
+        let bob = MemberId::from(&r.bob_sk.verifying_key());
+        let mut rec = OwnPurges::default();
+        rec.record(
+            bob,
+            (0..MAX_PURGED_TOMBSTONES_PER_RECIPIENT as u32 + 50).map(|i| {
+                let mut t = [0u8; 16];
+                t[..4].copy_from_slice(&i.to_le_bytes());
+                PurgeToken(t)
+            }),
+        );
+        let env = rec
+            .heal(&r.bob_sk, &r.params.owner, &r.state)
+            .expect("missing tokens")
+            .expect("within the cap");
+        assert_eq!(env.state.purged.len(), MAX_PURGED_TOMBSTONES_PER_RECIPIENT);
     }
 
     /// Only the recipient a token was recorded as re-signs it, and only
