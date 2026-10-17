@@ -4774,19 +4774,69 @@ mod tests {
             .expect("fire_legacy_migration_request must exist")..];
         assert!(body.contains("sweep_wave_plan(LEGACY_DELEGATES.len())"));
         assert!(
-            body.matches("expect_sweep_answer(wave, key_bytes);")
+            body[body.find("async fn send_sweep_generation(").unwrap()..]
+                .matches("expect_sweep_answer(wave, key_bytes);")
                 .count()
                 == 2,
             "every sent request (the two GETs and the ListRequest) must be expected"
         );
         assert!(body.contains("await_sweep_wave(wave).await"));
         // The caller writes the load state right after this returns, so no
-        // wave may be awaited before it does (#810 review): otherwise that
+        // wave may be awaited before it does: otherwise that
         // write lands after the first wave's merge and undoes its `Loaded`.
         let spawn = body
             .find("crate::util::safe_spawn_local(async move {")
             .expect("later waves run from a background task");
         assert!(!body[..spawn].contains("await_sweep_wave("));
+        // The worker is taken before returning, outside the task, so the idle
+        // timer cannot arm before the task first runs.
+        assert!(body[..spawn].contains("let worker = LoadWorkerGuard::new();"));
+        assert!(body[spawn..].contains("sweep_continuation("));
+    }
+
+    /// A pacing sweep stops for a newer sweep (leaving the guard alone) or a
+    /// new load attempt (clearing it), and a new attempt may start over a
+    /// sweep still pacing for an earlier one, but not over its own.
+    #[test]
+    fn a_pacing_sweep_yields_to_newer_sweeps_and_attempts() {
+        assert_eq!(sweep_continuation(true, true), SweepNext::Continue);
+        assert_eq!(sweep_continuation(false, true), SweepNext::Superseded);
+        assert_eq!(sweep_continuation(false, false), SweepNext::Superseded);
+        assert_eq!(sweep_continuation(true, false), SweepNext::Rearm);
+
+        assert!(sweep_may_start(false, 0, 5), "first sweep of the session");
+        assert!(!sweep_may_start(true, 0, 5), "once per session");
+        assert!(
+            !sweep_may_start(true, 6, 5),
+            "this attempt's own sweep is pacing"
+        );
+        assert!(
+            sweep_may_start(true, 5, 5),
+            "an earlier attempt's sweep is pacing"
+        );
+    }
+
+    /// Waves of overlapping sweeps are kept apart: an answer counts toward
+    /// every wave expecting its key, and disarming one leaves the other.
+    #[test]
+    fn sweep_waves_are_kept_per_sweep() {
+        let key = [42u8; 32];
+        let a = arm_sweep_wave();
+        let b = arm_sweep_wave();
+        expect_sweep_answer(a, &key);
+        expect_sweep_answer(b, &key);
+        let mut done_a = seal_sweep_wave(a).unwrap();
+        let mut done_b = seal_sweep_wave(b).unwrap();
+        disarm_sweep_wave(a);
+        note_sweep_answer(&key);
+        assert!(
+            done_a.try_recv().is_err(),
+            "a disarmed wave's waiter is dropped"
+        );
+        assert!(matches!(done_b.try_recv(), Ok(Some(()))));
+        disarm_sweep_wave(b);
+        expect_sweep_answer(b, &key);
+        assert!(seal_sweep_wave(b).is_none(), "a disarmed token is a no-op");
     }
 
     /// The plan: newest first, every generation exactly once, no wave larger
@@ -10976,7 +11026,8 @@ pub(crate) static LOAD_ACTIVITY_GEN: AtomicU32 = AtomicU32::new(0);
 /// shell is already interactive at ~240 ms). It was 4_000 ms; recalibrated
 /// toward the actual legacy-probe response burst (~72 fire-and-forget probes over
 /// 24 delegate generations, measured ~130 ms spread, all in by ~490 ms on a fast
-/// link).
+/// link). Since freenet/river#809 the sweep sends in waves and holds a load
+/// worker while the later ones pace, so this timer arms only after the last.
 ///
 /// The FLOOR is set by the one cohort that can flash: a returning user whose
 /// CURRENT delegate is empty but a LEGACY delegate still has data (the first load
@@ -11576,11 +11627,20 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
 /// (nothing more is coming) — see [`load_state_after_probe_legacy`].
 pub(crate) async fn fire_legacy_migration_request() -> bool {
     // Only attempt migration once per session to avoid error spam on reconnect.
-    // If the legacy delegates aren't installed, retrying won't help.
-    if LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
+    // If the legacy delegates aren't installed, retrying won't help. The one
+    // exception: a sweep still pacing its waves for an EARLIER load attempt
+    // (freenet/river#809). It stops at its next wave, so this attempt starts a
+    // full sweep of its own rather than skip the generations it had not asked.
+    let already = LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed);
+    if !sweep_may_start(
+        already,
+        SWEEP_RUNNING_FOR.load(Ordering::Relaxed),
+        LOAD_ATTEMPT_GEN.load(Ordering::Relaxed),
+    ) {
         info!("Legacy migration already attempted this session, skipping");
         return false;
     }
+    let epoch = SWEEP_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
 
     info!(
         "Attempting to migrate data from {} legacy delegate(s)",
@@ -11643,13 +11703,37 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     }
 
     let rest: Vec<Vec<usize>> = waves.collect();
+    if rest.is_empty() {
+        disarm_sweep_wave(wave);
+        return true;
+    }
+    // Taken here, before returning, so the load's idle timer cannot arm
+    // between this return and the task's first poll.
     let worker = LoadWorkerGuard::new();
+    SWEEP_RUNNING_FOR.store(attempt.wrapping_add(1), Ordering::Relaxed);
     crate::util::safe_spawn_local(async move {
         let _worker = worker;
         let mut wave = wave;
         for generations in rest {
             await_sweep_wave(wave).await;
             disarm_sweep_wave(wave);
+            match sweep_continuation(
+                SWEEP_EPOCH.load(Ordering::Relaxed) == epoch,
+                load_attempt_is_current(attempt),
+            ) {
+                SweepNext::Continue => {}
+                SweepNext::Superseded => return,
+                SweepNext::Rearm => {
+                    // A reconnect or Retry began a new load attempt. Its
+                    // requests go out on a new connection, and this sweep's
+                    // last wave may have gone down with the old one; the new
+                    // attempt sweeps from the start instead (the journaled
+                    // walk asks the generations too).
+                    LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+                    SWEEP_RUNNING_FOR.store(0, Ordering::Relaxed);
+                    return;
+                }
+            }
             wave = arm_sweep_wave();
             let mut failed = false;
             for &i in &generations {
@@ -11657,13 +11741,19 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
             }
             if failed {
                 // The connection dropped mid-sweep: let the next load attempt
-                // sweep again rather than skip the generations not yet asked
-                // (the journaled walk asks them too).
-                LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
-                break;
+                // sweep again rather than skip the generations not yet asked.
+                disarm_sweep_wave(wave);
+                if SWEEP_EPOCH.load(Ordering::Relaxed) == epoch {
+                    LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+                    SWEEP_RUNNING_FOR.store(0, Ordering::Relaxed);
+                }
+                return;
             }
         }
         disarm_sweep_wave(wave);
+        if SWEEP_EPOCH.load(Ordering::Relaxed) == epoch {
+            SWEEP_RUNNING_FOR.store(0, Ordering::Relaxed);
+        }
     });
 
     // The `freenet-migrate` walk is no longer armed from here: it runs on EVERY
@@ -11672,6 +11762,44 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // (freenet/river#763). Every merge this sweep's responses make is gated by
     // the journal (`migration_journal::gate_sweep_import`).
     true
+}
+
+/// Bumped by every sweep that starts; a pacing sweep whose epoch is no longer
+/// the latest stops at its next wave (freenet/river#809).
+static SWEEP_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// `attempt + 1` of the load attempt whose sweep is still pacing its later
+/// waves; 0 when none is.
+static SWEEP_RUNNING_FOR: AtomicU32 = AtomicU32::new(0);
+
+/// Whether a sweep may start now. `already`: the once-per-session guard was
+/// set; `running_for`: [`SWEEP_RUNNING_FOR`]. A sweep still pacing for an
+/// earlier attempt does not count as this session's sweep: it stops at its
+/// next wave, and this attempt sweeps from the start. Pure.
+pub(crate) fn sweep_may_start(already: bool, running_for: u32, attempt: u32) -> bool {
+    !already || (running_for != 0 && running_for != attempt.wrapping_add(1))
+}
+
+/// What a pacing sweep does before its next wave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepNext {
+    /// Send it.
+    Continue,
+    /// A newer sweep started, and it asks every generation: stop, and leave
+    /// the once-per-session guard to it.
+    Superseded,
+    /// The load attempt changed and no newer sweep has started: stop, and
+    /// clear the guard so the new attempt sweeps.
+    Rearm,
+}
+
+/// Decide [`SweepNext`] from whether this sweep is still the latest and its
+/// load attempt still current. Pure.
+pub(crate) fn sweep_continuation(latest: bool, attempt_current: bool) -> SweepNext {
+    match (latest, attempt_current) {
+        (false, _) => SweepNext::Superseded,
+        (true, false) => SweepNext::Rearm,
+        (true, true) => SweepNext::Continue,
+    }
 }
 
 /// The sweep's waves: generation indexes, newest first, at most

@@ -2747,8 +2747,9 @@ impl Rooms {
         // against the combined set, which lost that ordering entirely: an ancient
         // "you left this room" deleted a room you had since rejoined, and the
         // migration's re-save wrote the tombstone to the current delegate, taking
-        // `self_sk` with it. Probes dispatch oldest-first, so the oldest
-        // generation usually answers while the map is still empty — which is why
+        // `self_sk` with it. Probes dispatched oldest-first (until
+        // freenet/river#809), so the oldest generation usually answered while the
+        // map was still empty, and any generation still can — which is why
         // guarding only "is it in the map right now" is not enough.
         //
         // An `Authoritative` source (the current delegate, or a deliberate
@@ -2824,10 +2825,11 @@ impl Rooms {
         for (vk, mut room_data) in other.map {
             // Honour tombstones — never re-add a room the user has left — UNLESS
             // this observation comes from a strictly NEWER source than the one
-            // that tombstoned it (freenet/river#590). Probes are dispatched
-            // oldest-first, so without this a stale "you left" from the oldest
-            // generation suppresses the newest generation's `Present` and the
-            // re-save then tombstones the room on the current delegate.
+            // that tombstoned it (freenet/river#590). Generations answer in any
+            // order, so without this a stale "you left" from an older
+            // generation that answers first suppresses a newer generation's
+            // `Present` and the re-save then tombstones the room on the
+            // current delegate.
             if self.removed_rooms.contains(&vk) {
                 if !ranks.presence_survives_tombstone(&vk.to_bytes(), incoming_rank) {
                     continue;
@@ -4130,7 +4132,7 @@ mod tests {
     // =====================================================================
     // freenet/river#801: a room's read marker across a legacy migration.
     //
-    // The fan-out delivers one copy per delegate generation, oldest first,
+    // The fan-out delivers one copy per delegate generation, in any order,
     // and an old generation's frozen snapshot carries a weeks-old marker. The
     // merged room must keep the marker furthest along in the MERGED buffer,
     // whichever copy arrived first and whichever generation it came from.

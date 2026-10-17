@@ -1437,7 +1437,7 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
 
     // freenet/river#397 Codex review 2/4 (P1): the legacy index is NON-EMPTY, so
     // rooms provably exist under the old delegate key. Announce `Migrating`
-    // BEFORE the sequential fetch loop below — otherwise the state stays
+    // BEFORE the fetch loop below — otherwise the state stays
     // `Loading` through the whole fetch window and the 60s backstop could flip it
     // to a terminal despite that positive evidence. `Migrating` is not rescued
     // early by the backstop. On an all-empty/all-failed result this writes NOTHING
@@ -3886,6 +3886,34 @@ mod tests {
             region.contains("chunks(ROOM_LOAD_CONCURRENCY)"),
             "the legacy fan-out must be bounded by ROOM_LOAD_CONCURRENCY"
         );
+        // One generation's fan-out at a time, held until its responses are in
+        // (the queue budget assumes it), over deduplicated room keys.
+        let lock = region
+            .find("LEGACY_SLOT_FETCH.lock().await")
+            .expect("legacy fan-outs must take LEGACY_SLOT_FETCH");
+        assert!(lock < enqueue_pos);
+        assert!(region.contains("seen.insert(vk.to_bytes())"));
+        let join_end = region.rfind("join_all(").unwrap();
+        let drop_pos = region
+            .find("drop(slot_fetch);")
+            .expect("the lock is released");
+        assert!(
+            drop_pos > join_end,
+            "released only after every wave is awaited"
+        );
+    }
+
+    /// The sweep's pacing hears about replies and errors: without these hooks
+    /// every wave would sit out its full wait (freenet/river#809).
+    #[test]
+    fn sweep_pacing_hooks_are_wired() {
+        let handler = include_str!("response_handler.rs");
+        let production = handler.split("mod tests {").next().unwrap();
+        assert!(production.contains("chat_delegate::note_sweep_answer(key.bytes())"));
+        assert!(production.contains("chat_delegate::is_sweep_reply("));
+        let sync = include_str!("freenet_synchronizer.rs");
+        let sync_prod = sync.split("mod tests {").next().unwrap();
+        assert!(sync_prod.contains("chat_delegate::note_sweep_error("));
     }
 
     /// freenet/river#397 Codex review 4 (concurrency P2): the legacy re-save

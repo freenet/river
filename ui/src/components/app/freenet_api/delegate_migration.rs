@@ -1503,6 +1503,10 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
     /// the first load after a re-key for about 8 s at 120 ms RTT).
     ///
     /// Called only before the first `begin` on a successor ([`begin_with`]).
+    /// Another session can write a marker between this read and its use;
+    /// markers only move forward, so a value read early can only under-report
+    /// (an import re-run, or an in-progress flag the journal merge restores),
+    /// never seal anything.
     ///
     /// Only definitive answers are kept: a marker that is silent or errs here
     /// is read again, one at a time, when `begin` asks for it, and fails there
@@ -5084,6 +5088,24 @@ mod tests {
             "begin over 33 generations took {large} round trips against {small} over 3: \
              its marker reads must not grow one round trip per generation"
         );
+    }
+
+    /// `begin_with`'s journal read is handed to `begin`'s first journal load,
+    /// once: a fresh `begin` reads the journal twice in all (that read, and
+    /// the store's read-merge-write, which must read fresh to merge another
+    /// tab's journal stored in between).
+    #[test]
+    fn begin_reads_the_journal_once_for_its_start_and_fresh_for_its_store() {
+        let (lineage, channel) = lineage_n(3);
+        block_on(begin_with(&channel, successor_key(), &lineage)).unwrap();
+        let journal_get = format!("get:{}", String::from_utf8_lossy(MIGRATION_JOURNAL_KEY));
+        let reads = channel
+            .log
+            .borrow()
+            .iter()
+            .filter(|(_, what)| *what == journal_get)
+            .count();
+        assert_eq!(reads, 2);
     }
 
     /// With a journal stored, `begin` is off the visible path and reads few
