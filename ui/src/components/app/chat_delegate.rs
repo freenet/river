@@ -4780,6 +4780,13 @@ mod tests {
             "every sent request (the two GETs and the ListRequest) must be expected"
         );
         assert!(body.contains("await_sweep_wave(wave).await"));
+        // The caller writes the load state right after this returns, so no
+        // wave may be awaited before it does (#810 review): otherwise that
+        // write lands after the first wave's merge and undoes its `Loaded`.
+        let spawn = body
+            .find("crate::util::safe_spawn_local(async move {")
+            .expect("later waves run from a background task");
+        assert!(!body[..spawn].contains("await_sweep_wave("));
     }
 
     /// The plan: newest first, every generation exactly once, no wave larger
