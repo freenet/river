@@ -875,9 +875,10 @@ async fn execute_purge(
     // cannot drop it for good (`ApiClient::heal_own_purges`), under the
     // room's stored identity only. The purge is already sent, so a failure
     // to record it is reported but does not fail the command.
-    if let Some(warning) =
-        record_sent_purge(api.storage(), &room_owner_key, &signing_key, resolved_token)
-    {
+    if let Some(warning) = record_sent_purge(|| {
+        api.storage()
+            .record_own_purges(&room_owner_key, &signing_key, [resolved_token])
+    }) {
         eprintln!("{warning}");
     }
 
@@ -900,17 +901,11 @@ async fn execute_purge(
     Ok(())
 }
 
-/// Record a purge that was already sent as this client's own, under the
-/// room's stored identity. A failure to record it is returned as a warning,
-/// never an error: the purge itself went out.
-fn record_sent_purge(
-    storage: &crate::storage::Storage,
-    room_owner_key: &VerifyingKey,
-    signing_key: &SigningKey,
-    token: PurgeToken,
-) -> Option<String> {
-    storage
-        .record_own_purges(room_owner_key, signing_key, [token])
+/// Record a purge that was already sent as this client's own (`record`
+/// stores it under the room's stored identity). A failure to record it is
+/// returned as a warning, never an error: the purge itself went out.
+fn record_sent_purge(record: impl FnOnce() -> Result<bool>) -> Option<String> {
+    record()
         .err()
         .map(|e| format!("Warning: the purge was sent, but recording it locally failed: {e}"))
 }
@@ -1470,37 +1465,17 @@ fn format_unix_local(unix_secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// A purge that was sent and cannot be recorded locally (the store is
-    /// not writable) gives a warning, not an error.
+    /// A purge that was sent and cannot be recorded locally gives a
+    /// warning, not an error; one that is recorded gives nothing.
     #[test]
     fn a_sent_purge_that_cannot_be_recorded_is_a_warning() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::TempDir::new().unwrap();
-        let storage = crate::storage::Storage::new(Some(dir.path().to_str().unwrap())).unwrap();
-        let owner = SigningKey::from_bytes(&[51u8; 32]);
-        let owner_vk = owner.verifying_key();
-        storage
-            .add_room(
-                &owner_vk,
-                &owner,
-                river_core::room_state::ChatRoomStateV1::default(),
-                // bundled-wasm-ok: a test fixture's stored key; no pointer is resolved.
-                &crate::api::compute_contract_key(&owner_vk),
-            )
-            .unwrap();
-        assert_eq!(
-            record_sent_purge(&storage, &owner_vk, &owner, PurgeToken([1; 16])),
-            None
+        assert_eq!(record_sent_purge(|| Ok(true)), None);
+        assert_eq!(record_sent_purge(|| Ok(false)), None);
+        let warning = record_sent_purge(|| Err(anyhow!("rooms.json is read-only")));
+        assert!(
+            warning.is_some_and(|w| w.starts_with("Warning: the purge was sent")
+                && w.contains("rooms.json is read-only"))
         );
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-        std::fs::set_permissions(
-            dir.path().join("rooms.json"),
-            std::fs::Permissions::from_mode(0o444),
-        )
-        .unwrap();
-        let warning = record_sent_purge(&storage, &owner_vk, &owner, PurgeToken([2; 16]));
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(warning.is_some_and(|w| w.starts_with("Warning: the purge was sent")));
     }
 
     use super::*;
