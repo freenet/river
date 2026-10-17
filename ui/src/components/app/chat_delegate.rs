@@ -4793,11 +4793,13 @@ mod tests {
         assert!(body[..spawn].contains("let worker = LoadWorkerGuard::new();"));
         let task = &body[spawn..];
         assert!(task.contains("sweep_continuation("));
-        // Every stop goes through `stop_sweep` (latest-only, capped re-arm);
-        // nothing in the task writes the guard or the marker directly.
+        // Every stop in the task goes through `stop_sweep` (latest-only,
+        // capped re-arm); nothing in it writes the guard or the marker
+        // directly. The task's end re-arms on an attempt change too.
         assert!(task.contains("SweepNext::Superseded => return,"));
         assert!(task.contains("stop_sweep(epoch, true);"));
-        assert!(task.contains("stop_sweep(epoch, false);"));
+        assert!(task.contains("stop_sweep(epoch, !load_attempt_is_current(attempt));"));
+        assert!(body.contains("SweepStart::OverEarlier => take_sweep_rearm(),"));
         let task_end = task.find("\n    });").expect("task end");
         assert!(!task[..task_end].contains("LEGACY_MIGRATION_ATTEMPTED.store("));
         assert!(!task[..task_end].contains("SWEEP_RUNNING_FOR.store("));
@@ -4813,30 +4815,37 @@ mod tests {
         assert_eq!(sweep_continuation(false, false), SweepNext::Superseded);
         assert_eq!(sweep_continuation(true, false), SweepNext::Rearm);
 
-        assert!(sweep_may_start(false, 0, 5), "first sweep of the session");
-        assert!(!sweep_may_start(true, 0, 5), "once per session");
-        assert!(
-            !sweep_may_start(true, 6, 5),
-            "this attempt's own sweep is pacing"
+        assert_eq!(sweep_start(false, 0, 5), SweepStart::Fresh, "first sweep");
+        assert_eq!(
+            sweep_start(true, 0, 5),
+            SweepStart::Refuse,
+            "once per session"
         );
-        assert!(
-            !sweep_may_start(false, 6, 5),
+        assert_eq!(
+            sweep_start(true, 6, 5),
+            SweepStart::Refuse,
+            "own sweep pacing"
+        );
+        assert_eq!(
+            sweep_start(false, 6, 5),
+            SweepStart::Refuse,
             "not even when a recovery or Retry cleared the guard"
         );
-        assert!(
-            sweep_may_start(true, 5, 5),
-            "an earlier attempt's sweep is pacing"
+        assert_eq!(
+            sweep_start(true, 5, 5),
+            SweepStart::OverEarlier,
+            "an earlier attempt's sweep is pacing: a re-sweep, from the budget"
         );
 
-        // Stopping: only the latest sweep touches the shared state, and
-        // re-arming the guard is capped per session.
-        assert_eq!(sweep_stop_effects(false, true, 0), (false, false));
-        assert_eq!(sweep_stop_effects(true, false, 0), (true, false));
-        assert_eq!(sweep_stop_effects(true, true, 0), (true, true));
+        // Stopping: only the latest sweep touches the shared state, and only
+        // a re-arm of a guard still set tries to clear it.
+        assert_eq!(sweep_stop_effects(false, true, true), (false, false));
+        assert_eq!(sweep_stop_effects(true, false, true), (true, false));
+        assert_eq!(sweep_stop_effects(true, true, true), (true, true));
         assert_eq!(
-            sweep_stop_effects(true, true, MAX_SWEEP_REARMS),
+            sweep_stop_effects(true, true, false),
             (true, false),
-            "a run of reconnects cannot re-probe forever"
+            "a Retry already cleared it: no re-arm spent"
         );
     }
 
@@ -11378,9 +11387,12 @@ pub(crate) fn room_set_complete_core(latch: u32, attempt: u32, current_attempt: 
 /// fresh gen-guarded hard-max backstop. Does NOT touch `LEGACY_MIGRATION_ATTEMPTED`
 /// — a plain reconnect must not force a legacy re-probe (re-probe spam). The
 /// guard only limits repeat probes; #253 is enforced by the callers, which
-/// fire only over an empty current delegate. Besides `retry_rooms_load`, a
-/// sweep that a reconnect interrupts mid-pacing re-enables it, at most
-/// `MAX_SWEEP_REARMS` times a session (freenet/river#809).
+/// fire only over an empty current delegate, except the interrupted-migration
+/// recovery (#352), which fires only after a per-room load read every slot,
+/// and saves room by room through a CAS read-merge-write. Besides
+/// `retry_rooms_load` and that recovery, a sweep that a reconnect interrupts
+/// mid-pacing re-enables it, at most `MAX_SWEEP_REARMS` times a session
+/// (freenet/river#809).
 pub(crate) fn begin_load_attempt() {
     LOAD_ATTEMPT_GEN.fetch_add(1, Ordering::Relaxed);
     PENDING_LOADS.store(0, Ordering::Relaxed);
@@ -11660,11 +11672,18 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // (freenet/river#809). It stops at its next wave, so this attempt starts a
     // full sweep of its own rather than skip the generations it had not asked.
     let already = LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed);
-    if !sweep_may_start(
+    let start = match sweep_start(
         already,
         SWEEP_RUNNING_FOR.load(Ordering::Relaxed),
         LOAD_ATTEMPT_GEN.load(Ordering::Relaxed),
     ) {
+        // Over an earlier attempt's pacing sweep: a re-sweep, from the same
+        // per-session budget as a stopped sweep's re-arm.
+        SweepStart::OverEarlier => take_sweep_rearm(),
+        SweepStart::Fresh => true,
+        SweepStart::Refuse => false,
+    };
+    if !start {
         info!("Legacy migration already attempted this session, skipping");
         return false;
     }
@@ -11729,10 +11748,14 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // legacy delegate simply gets no response — do NOT re-probe-spam that case).
     // Gated on still-current (P2#1): a stale probe must not reopen the guard for
     // the new attempt (whose own probe already ran / set it).
+    // The probe never went out, so this is not a re-probe and costs no
+    // re-arm; only the latest sweep clears the guard (freenet/river#809).
     if !any_dispatched && load_attempt_is_current(attempt) {
-        LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+        if SWEEP_EPOCH.load(Ordering::Relaxed) == epoch {
+            LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+            SWEEP_RUNNING_FOR.store(0, Ordering::Relaxed);
+        }
         disarm_sweep_wave(wave);
-        stop_sweep(epoch, false);
         return true;
     }
 
@@ -11742,7 +11765,7 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
         // that attempt sweeps instead (no task: its worker would hold the NEW
         // attempt's load open).
         disarm_sweep_wave(wave);
-        stop_sweep(epoch, !rest.is_empty());
+        stop_sweep(epoch, !load_attempt_is_current(attempt));
         return true;
     }
     // Taken here, before returning, so the load's idle timer cannot arm
@@ -11778,7 +11801,9 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
                     load_attempt_is_current(attempt),
                 ) != SweepNext::Continue
                 {
-                    // Superseded mid-wave: send no more of it.
+                    // Superseded, or the attempt changed, mid-wave: send no
+                    // more of it (the stop after the loop or at the next
+                    // wave decides the rest).
                     break;
                 }
                 failed |= send_sweep_generation(i, attempt, wave).await.failed;
@@ -11792,7 +11817,9 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
             }
         }
         disarm_sweep_wave(wave);
-        stop_sweep(epoch, false);
+        // An attempt change during the LAST wave has no next wave to notice
+        // it, so the end re-arms too in that case.
+        stop_sweep(epoch, !load_attempt_is_current(attempt));
     });
 
     // The `freenet-migrate` walk is no longer armed from here: it runs on EVERY
@@ -11814,41 +11841,75 @@ static SWEEP_RUNNING_FOR: AtomicU32 = AtomicU32::new(0);
 /// set; `running_for`: [`SWEEP_RUNNING_FOR`]. A sweep still pacing for an
 /// earlier attempt does not count as this session's sweep: it stops at its
 /// next wave, and this attempt sweeps from the start. Pure.
-pub(crate) fn sweep_may_start(already: bool, running_for: u32, attempt: u32) -> bool {
+pub(crate) fn sweep_start(already: bool, running_for: u32, attempt: u32) -> SweepStart {
     if running_for == attempt.wrapping_add(1) {
         // This attempt's own sweep is pacing: it asks every generation, even
         // if a recovery or Retry cleared the guard meanwhile.
-        return false;
+        SweepStart::Refuse
+    } else if !already {
+        SweepStart::Fresh
+    } else if running_for != 0 {
+        SweepStart::OverEarlier
+    } else {
+        SweepStart::Refuse
     }
-    !already || running_for != 0
 }
 
-/// How many times per session a stopped sweep may clear the once-per-session
-/// guard so a later load attempt sweeps again. Bounds the re-probes a run of
-/// reconnects during the sweep's pacing could otherwise cause.
+/// Whether a sweep may start, from [`sweep_start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepStart {
+    /// The guard was clear: the session's sweep, or one a Retry or recovery
+    /// allowed.
+    Fresh,
+    /// An earlier attempt's sweep is still pacing: it stops at its next
+    /// wave, and this one starts over, if a re-arm is left.
+    OverEarlier,
+    /// Already swept this session, or this attempt's own sweep is pacing.
+    Refuse,
+}
+
+/// Take one of this session's [`MAX_SWEEP_REARMS`]; false when none is left.
+fn take_sweep_rearm() -> bool {
+    SWEEP_REARMS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            (used < MAX_SWEEP_REARMS).then_some(used + 1)
+        })
+        .is_ok()
+}
+
+/// How many re-sweeps a session allows: a stopped sweep clearing the
+/// once-per-session guard, or a new attempt starting over an earlier
+/// attempt's pacing sweep, each take one. Bounds the re-probes a run of
+/// reconnects during the sweep's pacing (or a socket the sweep keeps
+/// dropping) could otherwise cause. A Retry and the interrupted-migration
+/// recovery clear the guard themselves and take none.
 const MAX_SWEEP_REARMS: u32 = 2;
 static SWEEP_REARMS: AtomicU32 = AtomicU32::new(0);
 
 /// What stopping a sweep does to the shared state: `(clear the running
-/// marker, clear the once-per-session guard)`. Only the latest sweep touches
-/// either; a re-arm clears the guard while re-arms are left. Pure.
-pub(crate) fn sweep_stop_effects(latest: bool, rearm: bool, rearms_used: u32) -> (bool, bool) {
+/// marker, try to clear the once-per-session guard)`. Only the latest sweep
+/// touches either, and only a re-arm of a guard that is still set tries
+/// (a Retry may have cleared it already; that must not spend a re-arm). Pure.
+pub(crate) fn sweep_stop_effects(latest: bool, rearm: bool, guard_set: bool) -> (bool, bool) {
     if !latest {
         return (false, false);
     }
-    (true, rearm && rearms_used < MAX_SWEEP_REARMS)
+    (true, rearm && guard_set)
 }
 
-/// Stop sweep `epoch`: apply [`sweep_stop_effects`].
+/// Stop sweep `epoch`: apply [`sweep_stop_effects`], the guard clear only
+/// while a re-arm is left.
 fn stop_sweep(epoch: u64, rearm: bool) {
     let latest = SWEEP_EPOCH.load(Ordering::Relaxed) == epoch;
-    let (clear_running, clear_guard) =
-        sweep_stop_effects(latest, rearm, SWEEP_REARMS.load(Ordering::Relaxed));
+    let (clear_running, try_clear_guard) = sweep_stop_effects(
+        latest,
+        rearm,
+        LEGACY_MIGRATION_ATTEMPTED.load(Ordering::Relaxed),
+    );
     if clear_running {
         SWEEP_RUNNING_FOR.store(0, Ordering::Relaxed);
     }
-    if clear_guard {
-        SWEEP_REARMS.fetch_add(1, Ordering::Relaxed);
+    if try_clear_guard && take_sweep_rearm() {
         LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     }
 }
