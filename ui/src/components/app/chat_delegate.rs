@@ -3230,6 +3230,42 @@ mod tests {
         assert_eq!(stored_marker(&late, &unmarked), Some(ids[2].clone()));
     }
 
+    /// A save whose stored copy of the room is on an older configuration (ban
+    /// cap 300, 150 bans, a message the local copy lacks) while the local
+    /// copy is on the owner's newer one (cap 10): the room's merge refuses
+    /// the stored copy once, and the save converges and stores rather than
+    /// failing (which would leave the local edits unsaved).
+    #[test]
+    fn reconcile_room_present_converges_past_a_lower_ranked_refusal() {
+        let owner = SigningKey::from_bytes(&[94u8; 32]);
+        let vk = owner.verifying_key();
+        let params = river_core::room_state::ChatRoomParametersV1 { owner: vk };
+        let mut local = crate::room_data::test_minimal_room_data(vk);
+        local.room_state = crate::room_data::test_generation_copy(&owner, 2, 10, &["m1"], 0);
+        let mut stored = local.clone();
+        stored.room_state =
+            crate::room_data::test_generation_copy(&owner, 1, 300, &["m1", "m2"], 150);
+        let refused = local
+            .room_state
+            .clone()
+            .merge_from(&params, &stored.room_state)
+            .unwrap_err();
+        assert!(
+            refused.contains(crate::room_data::LOWER_RANKED_REFUSAL),
+            "premise: {refused}"
+        );
+        let out = reconcile_room_present(Some(&present_slot_bytes(&stored)), &vk, &local, false)
+            .expect("the save converges")
+            .expect("a present slot merges and stores");
+        match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+            RoomSlot::Present(r) => {
+                assert_eq!(r.room_state.recent_messages.messages.len(), 2);
+                assert_eq!(r.room_state.bans.0.len(), 10);
+            }
+            RoomSlot::Tombstone => panic!("expected Present"),
+        }
+    }
+
     /// An unparseable current slot is a hard error (surfaced, not silently
     /// treated as absent — which could clobber a slot the delegate holds).
     #[test]
@@ -8398,13 +8434,15 @@ pub(crate) fn reconcile_room_present(
                 local.clone()
             } else {
                 let mut m = local.clone();
-                m.room_state
-                    .merge(
-                        &local.room_state,
-                        &river_core::room_state::ChatRoomParametersV1 { owner: *owner_vk },
-                        &remote.room_state,
-                    )
-                    .map_err(|e| format!("room_state merge failed: {e}"))?;
+                // Converges when the room's merge refuses the stored copy
+                // once (its configuration does not outrank the local one's),
+                // as the other local merges do, so the save still stores.
+                crate::room_data::merge_converging(
+                    &mut m.room_state,
+                    &river_core::room_state::ChatRoomParametersV1 { owner: *owner_vk },
+                    &remote.room_state,
+                )
+                .map_err(|e| format!("room_state merge failed: {e}"))?;
                 // Union the invitation-carried secrets: a concurrent tab may hold
                 // a version this tab lacks, and these are persisted-only recovery
                 // state for a private-room invitee before the owner's contract

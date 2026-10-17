@@ -2385,6 +2385,78 @@ pub(crate) fn test_minimal_room_data(owner_vk: VerifyingKey) -> RoomData {
     }
 }
 
+/// A copy of the room `owner_sk` owns, on configuration `version` with
+/// ban cap `cap`, holding `texts` as the owner's messages and `bans`
+/// owner-issued bans, normalized by a merge with itself.
+#[cfg(test)]
+pub(crate) fn test_generation_copy(
+    owner_sk: &SigningKey,
+    version: u32,
+    cap: usize,
+    texts: &[&str],
+    bans: u64,
+) -> ChatRoomStateV1 {
+    use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+    use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    let owner_id = river_core::room_state::member::MemberId::from(owner_sk.verifying_key());
+    let params = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+    let mut s = ChatRoomStateV1 {
+        configuration: river_core::room_state::configuration::AuthorizedConfigurationV1::new(
+            river_core::room_state::configuration::Configuration {
+                owner_member_id: owner_id,
+                configuration_version: version,
+                max_user_bans: cap,
+                ..Default::default()
+            },
+            owner_sk,
+        ),
+        bans: BansV1(
+            (0..bans)
+                .map(|i| {
+                    AuthorizedUserBan::new(
+                        UserBan {
+                            owner_member_id: owner_id,
+                            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(i),
+                            banned_user: river_core::room_state::member::MemberId::from(
+                                SigningKey::from_bytes(&{
+                                    let mut b = [4u8; 32];
+                                    b[..8].copy_from_slice(&i.to_le_bytes());
+                                    b
+                                })
+                                .verifying_key(),
+                            ),
+                        },
+                        owner_id,
+                        owner_sk,
+                    )
+                })
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    s.recent_messages.messages = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: owner_id,
+                    time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i as u64),
+                    content: RoomMessageBody::public(t.to_string()),
+                },
+                owner_sk,
+            )
+        })
+        .collect();
+    s.recent_messages.rebuild_actions_state();
+    let mut m = s.clone();
+    m.merge_from(&params, &s).unwrap();
+    m
+}
+
 /// A public room joined by `self_sk`, whose `recent_messages` holds the first
 /// `count` of a fixed sequence of owner-authored messages, one second apart.
 /// Returns the room and the ids of ALL `total` messages in that sequence, so
@@ -3921,79 +3993,6 @@ mod tests {
         rooms
     }
 
-    /// A copy of the room `owner_sk` owns, on configuration `version` with
-    /// ban cap `cap`, holding `texts` as the owner's messages and `bans`
-    /// owner-issued bans, normalized by a merge with itself.
-    fn generation_copy(
-        owner_sk: &SigningKey,
-        version: u32,
-        cap: usize,
-        texts: &[&str],
-        bans: u64,
-    ) -> ChatRoomStateV1 {
-        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
-        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
-        let owner_id = MemberId::from(owner_sk.verifying_key());
-        let params = ChatRoomParametersV1 {
-            owner: owner_sk.verifying_key(),
-        };
-        let mut s = ChatRoomStateV1 {
-            configuration: AuthorizedConfigurationV1::new(
-                Configuration {
-                    owner_member_id: owner_id,
-                    configuration_version: version,
-                    max_user_bans: cap,
-                    ..Default::default()
-                },
-                owner_sk,
-            ),
-            bans: BansV1(
-                (0..bans)
-                    .map(|i| {
-                        AuthorizedUserBan::new(
-                            UserBan {
-                                owner_member_id: owner_id,
-                                banned_at: std::time::UNIX_EPOCH
-                                    + std::time::Duration::from_secs(i),
-                                banned_user: MemberId::from(
-                                    SigningKey::from_bytes(&{
-                                        let mut b = [4u8; 32];
-                                        b[..8].copy_from_slice(&i.to_le_bytes());
-                                        b
-                                    })
-                                    .verifying_key(),
-                                ),
-                            },
-                            owner_id,
-                            owner_sk,
-                        )
-                    })
-                    .collect(),
-            ),
-            ..Default::default()
-        };
-        s.recent_messages.messages = texts
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                AuthorizedMessageV1::new(
-                    MessageV1 {
-                        room_owner: owner_id,
-                        author: owner_id,
-                        time: std::time::UNIX_EPOCH
-                            + std::time::Duration::from_secs(1_000 + i as u64),
-                        content: RoomMessageBody::public(t.to_string()),
-                    },
-                    owner_sk,
-                )
-            })
-            .collect();
-        s.recent_messages.rebuild_actions_state();
-        let mut m = s.clone();
-        m.merge_from(&params, &s).unwrap();
-        m
-    }
-
     /// Two copies of a room loaded from the delegate, one on the owner's
     /// newer configuration (ban cap 10), the other on an older one holding
     /// 150 bans and a message the first lacks: the merge converges rather
@@ -4004,7 +4003,7 @@ mod tests {
         let vk = owner_sk.verifying_key();
         let params = ChatRoomParametersV1 { owner: vk };
         let state = |version: u32, cap: usize, texts: &[&str], bans: u64| {
-            generation_copy(&owner_sk, version, cap, texts, bans)
+            test_generation_copy(&owner_sk, version, cap, texts, bans)
         };
         let refused = state(2, 10, &["m1"], 0)
             .merge_from(&params, &state(1, 300, &["m1", "m2"], 150))
@@ -4030,6 +4029,34 @@ mod tests {
         assert_eq!(room.room_state.bans.0.len(), 10);
     }
 
+    /// Any other merge error is returned as it is, without the converging
+    /// steps: here the incoming copy holds 150 bans under its own cap of 100,
+    /// and the converging steps would succeed (the copy takes the target's
+    /// side and trims), yet the merge fails with the copy's own-limit error
+    /// and the target is unchanged.
+    #[test]
+    fn a_merge_error_other_than_the_refusal_is_returned_at_once() {
+        let owner_sk = SigningKey::from_bytes(&[95u8; 32]);
+        let vk = owner_sk.verifying_key();
+        let params = ChatRoomParametersV1 { owner: vk };
+        let lowered = test_generation_copy(&owner_sk, 2, 10, &["m1"], 0);
+        let mut over = test_generation_copy(&owner_sk, 1, 300, &["m1", "m2"], 150);
+        let mut c = over.configuration.configuration.clone();
+        c.max_user_bans = 100;
+        over.configuration = AuthorizedConfigurationV1::new(c, &owner_sk);
+        let mut other_side = over.clone();
+        other_side.merge_from(&params, &lowered).unwrap();
+        let mut converged = lowered.clone();
+        converged
+            .merge_from(&params, &other_side)
+            .expect("premise: the converging steps succeed here");
+        let mut target = lowered.clone();
+        let err = merge_converging(&mut target, &params, &over).unwrap_err();
+        assert!(err.contains("its own configuration's limit"), "{err}");
+        assert!(!err.contains(LOWER_RANKED_REFUSAL), "{err}");
+        assert_eq!(target, lowered);
+    }
+
     /// When the converging merge fails past the lower-ranked refusal (the
     /// refused copy also holds a member record the owner did not sign, with
     /// a message by that member: the copy takes the target's side, and
@@ -4041,8 +4068,8 @@ mod tests {
         let owner_sk = SigningKey::from_bytes(&[92u8; 32]);
         let vk = owner_sk.verifying_key();
         let params = ChatRoomParametersV1 { owner: vk };
-        let lowered = generation_copy(&owner_sk, 2, 10, &["m1"], 0);
-        let mut stale = generation_copy(&owner_sk, 1, 300, &["m1", "m2"], 150);
+        let lowered = test_generation_copy(&owner_sk, 2, 10, &["m1"], 0);
+        let mut stale = test_generation_copy(&owner_sk, 1, 300, &["m1", "m2"], 150);
         let member_sk = SigningKey::from_bytes(&[93u8; 32]);
         stale
             .members
