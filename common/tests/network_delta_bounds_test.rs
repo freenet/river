@@ -679,3 +679,58 @@ fn the_work_bounds_are_back_on_after_a_failed_whole_state_merge() {
         "bounded after a failed merge"
     );
 }
+
+/// More members missing than one delta may carry, each authoring one
+/// message, with the newest messages by the members of highest id: every
+/// trimmed delta still advances the receiver (it keeps messages and their
+/// authors), and repeated exchanges deliver the whole window.
+#[test]
+fn every_trimmed_network_delta_advances_the_receiver() {
+    let r = Room::new();
+    let mut authors: Vec<SigningKey> = (0..2_000u64).map(|i| sk(90_000 + i)).collect();
+    authors.sort_by_key(id);
+    let members: Vec<_> = authors
+        .iter()
+        .map(|a| r.rec(&a.verifying_key(), &r.o))
+        .collect();
+    let mut messages = MessagesV1 {
+        messages: authors
+            .iter()
+            .enumerate()
+            .map(|(i, a)| r.msg(a, i as u64))
+            .collect(),
+        ..Default::default()
+    };
+    messages.rebuild_actions_state();
+    let sender = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| {
+            c.max_members = 5_000;
+            c.max_recent_messages = 5_000;
+        }),
+        members: MembersV1 { members },
+        recent_messages: messages,
+        ..Default::default()
+    };
+    // The receiver's newer configuration (same caps) is unknown to the
+    // sender, so the delta is held to the floors.
+    let mut receiver = ChatRoomStateV1 {
+        configuration: r.cfg(2, |c| {
+            c.max_members = 5_000;
+            c.max_recent_messages = 5_000;
+        }),
+        ..Default::default()
+    };
+    let first = r.exchange(&sender, &receiver).expect("applies");
+    assert!(
+        !first.recent_messages.messages.is_empty(),
+        "the first trimmed delta delivers messages"
+    );
+    for _ in 0..4 {
+        receiver = r.exchange(&sender, &receiver).expect("applies");
+    }
+    assert_eq!(
+        receiver.recent_messages.messages.len(),
+        2_000,
+        "the whole window arrives"
+    );
+}

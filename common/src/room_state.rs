@@ -1100,10 +1100,12 @@ fn refuse_beyond_receiver_bounds(
 /// - messages: the newest (the `max_recent_messages` trim keeps the newest);
 /// - bans: what `BansV1::enforce_user_ban_cap` keeps at the bound, judged in
 ///   the sender's state;
-/// - members: the shortest invite chains, then the lowest id (the
-///   `max_members` trim removes the longest chains, then the highest id);
-///   a member's inviter is always shallower, so no kept member loses its
-///   inviter to the trim;
+/// - members: first the authors of the messages kept and their invite
+///   chains, so the delta always delivers messages with their authors;
+///   then the shortest invite chains, then the lowest id (the `max_members`
+///   trim removes the longest chains, then the highest id); a member's
+///   inviter is always shallower, so no kept member loses its inviter to the
+///   trim;
 /// - ban evidence: only records a ban the receiver will hold references
 ///   (the sender's bans less those trimmed here), then the shallowest, then
 ///   by digest.
@@ -1192,20 +1194,46 @@ fn trim_to_work_bounds(
     if let Some(members) = delta.members.as_mut() {
         if members.added().len() > members_bound {
             let depth = depth_in_sender();
-            // Rank by (depth, id), but keep the kept records in the order
-            // the delta lists them: placing new records reads that order
-            // (the last record for an id names the sender's key).
-            let mut ranked: Vec<(usize, MemberId, usize)> = members
+            // The authors of the messages the delta keeps, and their invite
+            // chains, go first, so a trimmed delta always delivers messages
+            // with their authors (otherwise the two trims can choose disjoint
+            // sets, every message is then left out, and the receiver prunes
+            // the members it took: the same delta forever).
+            let mut needed: HashSet<MemberId> = HashSet::new();
+            for author in delta
+                .recent_messages
+                .iter()
+                .flatten()
+                .map(|m| m.message.author)
+            {
+                let mut current = author;
+                while current != owner_id
+                    && !summary.members.contains(&current)
+                    && needed.insert(current)
+                {
+                    match known.get(&current) {
+                        Some(m) => current = m.member.invited_by,
+                        None => break,
+                    }
+                }
+            }
+            // Rank by (not needed, depth, id), but keep the kept records in
+            // the order the delta lists them: placing new records reads that
+            // order (the last record for an id names the sender's key).
+            let mut ranked: Vec<(bool, usize, MemberId, usize)> = members
                 .added()
                 .iter()
                 .enumerate()
-                .map(|(i, m)| (depth(m), m.member.id(), i))
+                .map(|(i, m)| {
+                    let id = m.member.id();
+                    (!needed.contains(&id), depth(m), id, i)
+                })
                 .collect();
             ranked.sort();
             let keep: HashSet<usize> = ranked
                 .into_iter()
                 .take(members_bound)
-                .map(|(_, _, i)| i)
+                .map(|(_, _, _, i)| i)
                 .collect();
             let added: Vec<AuthorizedMember> = members
                 .added()
