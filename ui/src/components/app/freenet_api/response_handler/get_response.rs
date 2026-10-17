@@ -211,11 +211,11 @@ pub async fn handle_get_response(
                             return false;
                         };
                         let params = ChatRoomParametersV1 { owner: owner_vk };
-                        let current_state = room_data.room_state.clone();
-                        match room_data
-                            .room_state
-                            .merge(&current_state, &params, &retrieved_state)
-                        {
+                        match crate::room_data::merge_converging(
+                            &mut room_data.room_state,
+                            &params,
+                            &retrieved_state,
+                        ) {
                             Ok(_) => {
                                 room_data.capture_self_membership_data(&params);
                                 let _ = room_data.repopulate_secrets_from_state();
@@ -525,18 +525,28 @@ pub async fn handle_get_response(
                         // Create parameters for merge
                         let params = ChatRoomParametersV1 { owner: owner_vk };
 
-                        // Clone current state to avoid borrow issues during merge
-                        let current_state = room_data.room_state.clone();
-
                         // Merge the retrieved state into the existing state
                         // FIRST, so the membership decision below sees the
                         // CANONICAL members (the merge folds in any remote
                         // removal/ban). Judging it from the pre-merge local
                         // snapshot would be stale.
-                        room_data
-                            .room_state
-                            .merge(&current_state, &params, &retrieved_state)
-                            .expect("Failed to merge room states");
+                        //
+                        // A refused merge (the retrieved state under a
+                        // configuration that does not outrank the held one,
+                        // over its bounds) converges through the other
+                        // direction; a merge that fails either way keeps the
+                        // held state rather than stopping the join.
+                        if let Err(e) = crate::room_data::merge_converging(
+                            &mut room_data.room_state,
+                            &params,
+                            &retrieved_state,
+                        ) {
+                            error!(
+                                "Invitation GET: failed to merge state for room {:?}: {}",
+                                MemberId::from(owner_vk),
+                                e
+                            );
+                        }
 
                         // Adopt the invitation's signing key as our per-room
                         // identity ONLY when the key we currently hold is not
@@ -1068,11 +1078,11 @@ pub async fn handle_get_response(
                             // winning envelope omits.
                             room_data.heal_own_purges()
                         } else {
-                            let current_state = room_data.room_state.clone();
-                            match room_data
-                                .room_state
-                                .merge(&current_state, &params, &retrieved_state)
-                            {
+                            match crate::room_data::merge_converging(
+                                &mut room_data.room_state,
+                                &params,
+                                &retrieved_state,
+                            ) {
                                 Ok(_) => {
                                     info!(
                                         "Successfully merged refreshed state for room {:?}",
@@ -1562,7 +1572,7 @@ pub(crate) fn merge_recovered_into_room(
         // room behind.
         let current_state = room_data.room_state.clone();
         let mut merged = current_state.clone();
-        if let Err(e) = merged.merge(&current_state, &params, &recovered) {
+        if let Err(e) = crate::room_data::merge_converging(&mut merged, &params, &recovered) {
             error!(
                 "Backward probe: failed to merge recovered state for room {:?}: {}",
                 MemberId::from(owner_vk),
@@ -1610,7 +1620,7 @@ pub(crate) fn merge_room_states(
     params: &ChatRoomParametersV1,
 ) -> ChatRoomStateV1 {
     let mut merged = primary.clone();
-    match merged.merge(&primary, params, local) {
+    match crate::room_data::merge_converging(&mut merged, params, local) {
         Ok(()) => merged,
         Err(e) => {
             warn!(

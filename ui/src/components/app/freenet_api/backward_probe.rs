@@ -243,7 +243,7 @@ impl ProbeStateOps for RiverProbeOps {
             owner: self.owner_vk,
         };
         let mut merged = newer.clone();
-        match merged.merge(&newer, &params, &older) {
+        match crate::room_data::merge_converging(&mut merged, &params, &older) {
             Ok(()) => merged,
             Err(e) => {
                 warn!("Re-key merge: folding an older generation failed ({e}); keeping the newer");
@@ -1787,6 +1787,107 @@ mod tests {
             texts(&room.room_state),
             strs(&["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m20"])
         );
+    }
+
+    /// Two copies of a room: `lowered` on the owner's newer configuration
+    /// (ban cap 10), `stale` on an older one (cap 300) holding 150 bans and a
+    /// message `lowered` lacks. Merging `stale` into `lowered` is refused
+    /// once (it holds more than one delta may carry under a configuration
+    /// that does not outrank); the local merges converge instead of keeping
+    /// one side.
+    fn lowered_and_stale(sk: &SigningKey) -> (ChatRoomStateV1, ChatRoomStateV1) {
+        use freenet_scaffold::ComposableState;
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        let owner_id = MemberId::from(&sk.verifying_key());
+        let cfg = |version: u32, cap: usize| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    configuration_version: version,
+                    max_user_bans: cap,
+                    ..Configuration::default()
+                },
+                sk,
+            )
+        };
+        let mut lowered = room_with_messages(sk, &["m1"]);
+        lowered.configuration = cfg(2, 10);
+        let mut stale = room_with_messages(sk, &["m1", "m2"]);
+        stale.configuration = cfg(1, 300);
+        stale.bans = BansV1(
+            (0..150u64)
+                .map(|i| {
+                    AuthorizedUserBan::new(
+                        UserBan {
+                            owner_member_id: owner_id,
+                            banned_at: std::time::SystemTime::UNIX_EPOCH
+                                + std::time::Duration::from_secs(i),
+                            banned_user: MemberId::from(
+                                &SigningKey::from_bytes(&{
+                                    let mut b = [3u8; 32];
+                                    b[..8].copy_from_slice(&i.to_le_bytes());
+                                    b
+                                })
+                                .verifying_key(),
+                            ),
+                        },
+                        owner_id,
+                        sk,
+                    )
+                })
+                .collect(),
+        );
+        let params = ChatRoomParametersV1 {
+            owner: sk.verifying_key(),
+        };
+        let fix = |s: ChatRoomStateV1| {
+            let mut m = s.clone();
+            m.merge_from(&params, &s).unwrap();
+            m
+        };
+        let (lowered, stale) = (fix(lowered), fix(stale));
+        let mut probe = lowered.clone();
+        assert!(
+            probe.merge_from(&params, &stale).is_err(),
+            "premise: refused once"
+        );
+        (lowered, stale)
+    }
+
+    /// The local merges of two copies converge when the room's merge refuses
+    /// one: the stale copy's message survives, and the lowered cap holds.
+    #[test]
+    fn local_merges_converge_past_a_lower_ranked_refusal() {
+        let sk = SigningKey::from_bytes(&[85u8; 32]);
+        let (lowered, stale) = lowered_and_stale(&sk);
+        let check = |s: &ChatRoomStateV1, what: &str| {
+            assert_eq!(texts(s), strs(&["m1", "m2"]), "{what}");
+            assert_eq!(s.bans.0.len(), 10, "{what}");
+        };
+        let params = ChatRoomParametersV1 {
+            owner: sk.verifying_key(),
+        };
+        check(
+            &crate::components::app::freenet_api::response_handler::get_response::merge_room_states(
+                lowered.clone(),
+                &stale,
+                &params,
+            ),
+            "merge_room_states",
+        );
+        let ops = RiverProbeOps::new(sk.verifying_key());
+        check(
+            &ops.merge_generations(lowered.clone(), stale.clone()),
+            "merge_generations",
+        );
+        assert!(!ops.fold_failed.load(Ordering::Relaxed));
+        let mut room = room_data(&sk, lowered);
+        assert!(merge_recovered_into_room(
+            &mut room,
+            stale,
+            sk.verifying_key()
+        ));
+        check(&room.room_state, "merge_recovered_into_room");
     }
 
     /// A recovered state whose winning purge envelope for this member omits a

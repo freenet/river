@@ -399,7 +399,7 @@ impl ProbeStateOps for RiverCliMigrationProbeOps {
             owner: self.inner.owner_vk,
         };
         let mut merged = recovered.clone();
-        match merged.merge(&recovered, &params, local) {
+        match merge_converging(&mut merged, &params, local) {
             Ok(()) => merged,
             Err(e) => {
                 info!("Merge with local state failed ({e}); using network state alone");
@@ -2277,6 +2277,47 @@ fn rejoin_preferred_nickname(
             )
         })
         .unwrap_or_else(|| SealedBytes::public("Member".to_string().into_bytes()))
+}
+
+/// How the room's whole-state merge words its refusal of an incoming state
+/// whose configuration does not outrank the receiver's and that holds more
+/// than one delta may carry in the receiver's room (river-core's
+/// `refuse_beyond_receiver_bounds`). Pinned by the convergence tests.
+const LOWER_RANKED_REFUSAL: &str = "under a configuration that does not outrank this room's";
+
+/// Merge `other` into `target` with the room's whole-state merge, and
+/// converge when that merge refuses `other` (its configuration does not
+/// outrank `target`'s and it holds more than one delta may carry in
+/// `target`'s room): `other` first takes `target`'s side, then that is
+/// merged in. The UI's `room_data::merge_converging` does the same. `target`
+/// is unchanged when the merge fails either way; the error is the first
+/// merge's.
+fn merge_converging(
+    target: &mut ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+    other: &ChatRoomStateV1,
+) -> std::result::Result<(), String> {
+    let mut merged = target.clone();
+    let first = match merged.merge_from(params, other) {
+        Ok(()) => {
+            *target = merged;
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    // Only the lower-ranked refusal converges this way; any other failure
+    // (a record no key verifies, ...) is the merge's answer.
+    if !first.contains(LOWER_RANKED_REFUSAL) {
+        return Err(first);
+    }
+    let mut other_side = other.clone();
+    other_side
+        .merge_from(params, target)
+        .map_err(|_| first.clone())?;
+    let mut merged = target.clone();
+    merged.merge_from(params, &other_side).map_err(|_| first)?;
+    *target = merged;
+    Ok(())
 }
 
 /// `state` with a DM purge this client signed, and the room's winning purge
@@ -9261,6 +9302,78 @@ mod create_room_tests {
         assert!(fold_own_purge_heal(&mut own, &bob, &owner_vk, &network).is_none());
     }
 
+    /// A copy on the owner's newer configuration (ban cap 10) merging a copy
+    /// on an older one holding 150 bans and a message it lacks: the room's
+    /// merge refuses the older copy once, and the local merge converges
+    /// instead of keeping one side.
+    #[test]
+    fn a_local_merge_converges_past_a_lower_ranked_refusal() {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        use river_core::room_state::member::MemberId;
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let owner = SigningKey::from_bytes(&[43u8; 32]);
+        let owner_id = MemberId::from(&owner.verifying_key());
+        let params = ChatRoomParametersV1 {
+            owner: owner.verifying_key(),
+        };
+        let state = |version: u32, cap: usize, n_msgs: u64, n_bans: u64| {
+            let (mut s, _) = build_new_room_state(&owner, "Room", "Owner", false);
+            let mut c = s.configuration.configuration.clone();
+            c.configuration_version = version;
+            c.max_user_bans = cap;
+            s.configuration = AuthorizedConfigurationV1::new(c, &owner);
+            s.recent_messages.messages = (0..n_msgs)
+                .map(|i| {
+                    AuthorizedMessageV1::new(
+                        MessageV1 {
+                            room_owner: owner_id,
+                            author: owner_id,
+                            time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i),
+                            content: RoomMessageBody::public(format!("m{i}")),
+                        },
+                        &owner,
+                    )
+                })
+                .collect();
+            s.recent_messages.rebuild_actions_state();
+            s.bans = BansV1(
+                (0..n_bans)
+                    .map(|i| {
+                        AuthorizedUserBan::new(
+                            UserBan {
+                                owner_member_id: owner_id,
+                                banned_at: std::time::UNIX_EPOCH
+                                    + std::time::Duration::from_secs(i),
+                                banned_user: MemberId::from(
+                                    &SigningKey::from_bytes(&{
+                                        let mut b = [6u8; 32];
+                                        b[..8].copy_from_slice(&i.to_le_bytes());
+                                        b
+                                    })
+                                    .verifying_key(),
+                                ),
+                            },
+                            owner_id,
+                            &owner,
+                        )
+                    })
+                    .collect(),
+            );
+            let mut m = s.clone();
+            m.merge_from(&params, &s).unwrap();
+            m
+        };
+        let lowered = state(2, 10, 1, 0);
+        let stale = state(1, 300, 2, 150);
+        let mut probe = lowered.clone();
+        let refused = probe.merge_from(&params, &stale).unwrap_err();
+        assert!(refused.contains(LOWER_RANKED_REFUSAL), "premise: {refused}");
+        let mut merged = lowered.clone();
+        merge_converging(&mut merged, &params, &stale).expect("converges");
+        assert_eq!(merged.recent_messages.messages.len(), 2);
+        assert_eq!(merged.bans.0.len(), 10);
+    }
+
     /// A storage holding the room `room_with_bob` builds, as bob, with bob
     /// having recorded a purge of `token` that the network's winning
     /// envelope (signed by bob's other install) omits; and that network state.
@@ -9494,7 +9607,8 @@ mod create_room_tests {
             .collect();
         assert!(dm.contains(&format!(
             "{}{}",
-            "record_sent_purge(api.storage(),&room_owner_key,", "&signing_key,resolved_token)"
+            "record_sent_purge(||{api.storage().record_own_purges(&room_owner_key,",
+            "&signing_key,[resolved_token])})"
         )));
     }
 

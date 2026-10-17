@@ -519,6 +519,48 @@ pub(crate) fn current_secret_from_state(
     Some((secret, version))
 }
 
+/// How the room's whole-state merge words its refusal of an incoming state
+/// whose configuration does not outrank the receiver's and that holds more
+/// than one delta may carry in the receiver's room (river-core's
+/// `refuse_beyond_receiver_bounds`). Pinned by the convergence tests.
+const LOWER_RANKED_REFUSAL: &str = "under a configuration that does not outrank this room's";
+
+/// Merge `other` into `target` with the room's whole-state merge, and
+/// converge when that merge refuses `other` (its configuration does not
+/// outrank `target`'s and it holds more than one delta may carry in
+/// `target`'s room): `other` first takes `target`'s side (a copy of `other`
+/// merges `target`, adopting the outranking configuration and trimming),
+/// then that is merged in, which is where the two peers of such an exchange
+/// end. `target` is unchanged when the merge fails either way; the error is
+/// the first merge's.
+pub(crate) fn merge_converging(
+    target: &mut ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+    other: &ChatRoomStateV1,
+) -> Result<(), String> {
+    let mut merged = target.clone();
+    let first = match merged.merge_from(params, other) {
+        Ok(()) => {
+            *target = merged;
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    // Only the lower-ranked refusal converges this way; any other failure
+    // (a record no key verifies, ...) is the merge's answer.
+    if !first.contains(LOWER_RANKED_REFUSAL) {
+        return Err(first);
+    }
+    let mut other_side = other.clone();
+    other_side
+        .merge_from(params, target)
+        .map_err(|_| first.clone())?;
+    let mut merged = target.clone();
+    merged.merge_from(params, &other_side).map_err(|_| first)?;
+    *target = merged;
+    Ok(())
+}
+
 impl RoomData {
     /// Apply this member's purge `envelope` (signed on this device, purging
     /// `tokens`) to the room, and record the tokens as this device's own, so
@@ -2859,8 +2901,8 @@ impl Rooms {
                 // the next legacy generation's copy would be adopted unranked.
                 // Same shape as `do_save_rooms_to_delegate`, which accumulates
                 // per-key errors and keeps going for the same reason.
-                if let Err(e) = room_data.room_state.merge(
-                    &room_data.room_state.clone(),
+                if let Err(e) = merge_converging(
+                    &mut room_data.room_state,
                     &ChatRoomParametersV1 { owner: vk },
                     &existing_state.0,
                 ) {
@@ -2945,8 +2987,8 @@ impl Rooms {
                     // case was resolved above) — merge in the new state.
                     let self_room_data = self.map.get_mut(&vk).unwrap();
                     // freenet/river#591: per-room isolation, as above.
-                    if let Err(e) = self_room_data.room_state.merge(
-                        &self_room_data.room_state.clone(),
+                    if let Err(e) = merge_converging(
+                        &mut self_room_data.room_state,
                         &ChatRoomParametersV1 { owner: vk },
                         &room_data.room_state,
                     ) {
@@ -3876,6 +3918,95 @@ mod tests {
         let mut rooms = empty_rooms_for_merge();
         rooms.map.insert(vk, room);
         rooms
+    }
+
+    /// Two copies of a room loaded from the delegate, one on the owner's
+    /// newer configuration (ban cap 10), the other on an older one holding
+    /// 150 bans and a message the first lacks: the merge converges rather
+    /// than keeping one copy (the room's merge refuses the older copy once).
+    #[test]
+    fn copies_from_two_generations_converge_past_a_lower_ranked_refusal() {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let owner_sk = SigningKey::from_bytes(&[91u8; 32]);
+        let vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(vk);
+        let params = ChatRoomParametersV1 { owner: vk };
+        let state = |version: u32, cap: usize, texts: &[&str], bans: u64| {
+            let mut s = ChatRoomStateV1 {
+                configuration: AuthorizedConfigurationV1::new(
+                    Configuration {
+                        owner_member_id: owner_id,
+                        configuration_version: version,
+                        max_user_bans: cap,
+                        ..Default::default()
+                    },
+                    &owner_sk,
+                ),
+                bans: BansV1(
+                    (0..bans)
+                        .map(|i| {
+                            AuthorizedUserBan::new(
+                                UserBan {
+                                    owner_member_id: owner_id,
+                                    banned_at: std::time::UNIX_EPOCH
+                                        + std::time::Duration::from_secs(i),
+                                    banned_user: MemberId::from(
+                                        SigningKey::from_bytes(&{
+                                            let mut b = [4u8; 32];
+                                            b[..8].copy_from_slice(&i.to_le_bytes());
+                                            b
+                                        })
+                                        .verifying_key(),
+                                    ),
+                                },
+                                owner_id,
+                                &owner_sk,
+                            )
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            };
+            s.recent_messages.messages = texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    AuthorizedMessageV1::new(
+                        MessageV1 {
+                            room_owner: owner_id,
+                            author: owner_id,
+                            time: std::time::UNIX_EPOCH
+                                + std::time::Duration::from_secs(1_000 + i as u64),
+                            content: RoomMessageBody::public(t.to_string()),
+                        },
+                        &owner_sk,
+                    )
+                })
+                .collect();
+            s.recent_messages.rebuild_actions_state();
+            let mut m = s.clone();
+            m.merge_from(&params, &s).unwrap();
+            m
+        };
+        let mut lowered = test_minimal_room_data(vk);
+        lowered.self_sk = Some(owner_sk.clone());
+        lowered.room_state = state(2, 10, &["m1"], 0);
+        let mut stale = lowered.clone();
+        stale.room_state = state(1, 300, &["m1", "m2"], 150);
+        let mut local = rooms_holding(vk, lowered);
+        let mut ranks = MergeRanks::default();
+        local
+            .merge_from_source(
+                rooms_holding(vk, stale),
+                3,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
+            .expect("merges");
+        let room = &local.map[&vk];
+        assert_eq!(room.room_state.recent_messages.messages.len(), 2);
+        assert_eq!(room.room_state.bans.0.len(), 10);
     }
 
     /// A private room is missing its secret until this device holds the
