@@ -26,7 +26,8 @@ If `git status` shows modified `.wasm` files in `ui/public/contracts/` or `cli/c
 2. Run `cargo make sync-wasm` to intentionally rebuild WASMs
 3. Run `cargo make sign-pointer-records` — a rebuilt WASM invalidates River's
    published pointer records, which third parties resolve instead of pinning a
-   key (see `pointer-records.toml`). CI's `check-pointer-freshness` fails the PR
+   key and open UI tabs watch to know they must reload (see
+   `pointer-records.toml`, #580). CI's `check-pointer-freshness` fails the PR
    if you skip it.
 4. Run `cargo test -p river-core --test migration_test` to validate
 

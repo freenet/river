@@ -258,12 +258,15 @@ publishing any change that touches those paths. The publish-side
 counterpart is **`.claude/rules/river-publish.md`**.
 
 **The same change also invalidates River's pointer records.** A migration
-entry carries OUR users' data forward; a pointer record tells THIRD PARTIES
-where the artifact moved to, so they resolve instead of pinning a key that
-re-keys weekly. Run `cargo make sign-pointer-records` alongside
+entry carries OUR users' data forward; a pointer record says where the
+artifact moved to. Two audiences read it: THIRD PARTIES, who resolve it
+instead of pinning a key that re-keys weekly, and OUR users' already-open tabs,
+which reload into the new build only when a newer record lands
+(freenet/river#580). Run `cargo make sign-pointer-records` alongside
 `add-migration`, and `cargo make publish-pointer-records` from main after the
-merge. CI's `check-pointer-freshness` fails the PR if a pointed-at WASM changed
-and no new record was signed. See `pointer-records.toml` and `FREENET.md`.
+merge and after the UI publish (`.claude/rules/river-publish.md`, step 7).
+CI's `check-pointer-freshness` fails the PR if a pointed-at WASM changed and no
+new record was signed. See `pointer-records.toml` and `FREENET.md`.
 
 A pointer solves **addressing only** — it says nothing about whether state or
 secrets under the old key survived, which is what the migration registries are
@@ -349,6 +352,21 @@ Both the UI and riverctl detect this automatically via `regenerate_contract_key(
    this device synced the room under that key. Owed merges that do not block a seed (retries,
    the predecessor merge) run alongside the subscribe and never delay the room.
 4. If room owner: also sends an `OptionalUpgradeV1` pointer on the old key for stragglers
+
+**A tab that is already open does none of this**: it runs the build it loaded,
+with the old WASM compiled in. It notices a re-key through River's pointer
+records and reloads into the new build, which then runs the flow above
+(freenet/river#580, `ui/src/components/app/freenet_api/generation_watch.rs`).
+It reloads rather than following the new key in place for the same reason
+riverctl restarts (`cli/src/pointer.rs`, `Recheck`): the new generation can
+change the state format and validation, and the delegate cannot be followed
+without the new build's migration. The reload is capped (tries per target with
+backoff, an hourly ceiling, one reload per page, never while the reader is
+busy) and goes through the shell's `navigate` so the old page's sockets close;
+read the module docs before changing any of it. This is why
+`cargo make publish-pointer-records` is not optional after a re-key
+(`.claude/rules/river-publish.md`, step 7). Tabs on builds older than this
+mechanism (30000403 and earlier) have none of it and need one manual reload.
 
 **This only works if:**
 - The state format is backwards-compatible (see below)

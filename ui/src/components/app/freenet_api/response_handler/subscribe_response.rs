@@ -10,6 +10,11 @@ use river_core::room_state::member::MemberId;
 pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) -> bool {
     info!("Received subscribe response for key {key}, subscribed: {subscribed}");
 
+    // River's own pointer records (freenet/river#580): not a room, never re-PUT.
+    if crate::components::app::freenet_api::generation_watch::is_watched(key.id()) {
+        return false;
+    }
+
     // Get the owner VK for this contract first, then release the read lock
     let owner_vk_opt = {
         let sync_info = SYNC_INFO.read();

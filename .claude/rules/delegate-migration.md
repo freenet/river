@@ -77,9 +77,10 @@ cargo make add-room-contract-migration
 cargo make sync-wasm
 
 # 2b. Re-sign the pointer records against the WASM you just built.
-#     Step 1 carries OUR users forward; this carries THIRD PARTIES forward
-#     (see "The other half of a re-key" below). Same trigger, and CI's
-#     check-pointer-freshness fails the PR if you skip it.
+#     Step 1 carries OUR users' data forward; this carries THIRD PARTIES and
+#     our users' already-open tabs forward (see "The other half of a re-key"
+#     below). Same trigger, and CI's check-pointer-freshness fails the PR if
+#     you skip it.
 cargo make sign-pointer-records
 
 # 3. Run migration tests
@@ -109,13 +110,15 @@ every read comes back looking like "this user has nothing stored".
 
 That half is `pointer-records.toml`: a record at a FIXED address naming the
 artifact's current code hash, signed by River's author key, which integrators
-resolve instead of pinning. Same trigger as a migration entry, different
-beneficiary.
+resolve instead of pinning. Our own users' already-open tabs watch it too, and
+reload into the new build only when a newer record lands (freenet/river#580),
+so it is not optional for us either.
 
 ```bash
 cargo make sign-pointer-records      # after sync-wasm, BEFORE committing
 cargo make check-pointer-freshness   # what CI runs
-# then, from main after the PR merges:
+# then, from main after the PR merges AND the UI publish is live
+# (~2 minutes after it; see river-publish.md Step 7):
 cargo make publish-pointer-records
 ```
 
@@ -147,7 +150,7 @@ rest of this file is about.
 | `ui/src/components/app/chat_delegate.rs` | Uses generated `LEGACY_DELEGATES` for runtime migration |
 | `scripts/check-migration.sh` / `scripts/add-migration.sh` | Delegate migration validation / entry |
 | `scripts/check-room-contract-migration.sh` / `scripts/add-room-contract-migration.sh` | Room-contract registry validation / entry |
-| `pointer-records.toml` | Signed pointer records — third-party stable identity (addressing only) |
+| `pointer-records.toml` | Signed pointer records — stable identity (addressing only) for third parties, and the re-key signal open UI tabs watch (#580) |
 | `scripts/check-pointer-freshness.sh` / `scripts/sign-pointer-records.sh` / `scripts/publish-pointer-records.sh` | Pointer gate / re-sign / network publish |
 | `scripts/sync-wasm.sh` | Builds all WASMs and copies to committed locations |
 | `common/tests/migration_test.rs` / `common/tests/room_contract_migration_test.rs` | Validate TOML entries are well-formed |
