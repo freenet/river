@@ -872,9 +872,15 @@ async fn execute_purge(
 
     api.send_state_delta(&room_owner_key, &delta).await?;
     // Recorded so a concurrent envelope from another device of this member
-    // cannot drop it for good (`ApiClient::heal_own_purges`).
-    api.storage()
-        .update_own_purges(&room_owner_key, |own| own.record(self_id, [resolved_token]))?;
+    // cannot drop it for good (`ApiClient::heal_own_purges`), under the
+    // room's stored identity only. The purge is already sent, so a failure
+    // to record it is reported but does not fail the command.
+    if let Err(e) = api
+        .storage()
+        .record_own_purges(&room_owner_key, &signing_key, [resolved_token])
+    {
+        eprintln!("Warning: the purge was sent, but recording it locally failed: {e}");
+    }
 
     match format {
         OutputFormat::Human => println!(

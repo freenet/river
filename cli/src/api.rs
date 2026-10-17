@@ -2334,6 +2334,73 @@ fn fold_own_purge_heal(
     )
 }
 
+/// Re-publish a DM purge this client signed that `state`'s winning purge
+/// envelope for this member omits (`fold_own_purge_heal`), with `publish`
+/// sending the delta. Skipped under a signing-key override that is not the
+/// room's stored identity, whose purges these are not. The re-signed state
+/// is stored, and the record of the version re-signed against kept, only
+/// once `publish` succeeds, so an envelope that did not go out is signed and
+/// published again on the next read. Returns the state to operate on: the
+/// re-signed one when the envelope was published, else `state` unchanged.
+async fn heal_own_purges_in<F, Fut>(
+    storage: &crate::storage::Storage,
+    room_owner_key: &VerifyingKey,
+    state: ChatRoomStateV1,
+    publish: F,
+) -> ChatRoomStateV1
+where
+    F: FnOnce(ChatRoomStateV1Delta) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let Ok(rooms) = storage.load_rooms() else {
+        return state;
+    };
+    let key_str = bs58::encode(room_owner_key.as_bytes()).into_string();
+    let Some(info) = rooms.rooms.get(&key_str) else {
+        return state;
+    };
+    let signing_key = storage.resolve_signing_key(&info.signing_key_bytes);
+    if signing_key.to_bytes() != info.signing_key_bytes {
+        return state;
+    }
+    let mut own = info.own_purges.clone();
+    let Some(result) = fold_own_purge_heal(&mut own, &signing_key, room_owner_key, &state) else {
+        return state;
+    };
+    let (healed, envelope) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("{e}");
+            return state;
+        }
+    };
+    info!(
+        "Re-signing DM purges for room {key_str} at version {}: the room's winning \
+         envelope omits a purge this client signed",
+        envelope.state.version
+    );
+    let delta = ChatRoomStateV1Delta {
+        direct_messages: Some(
+            river_core::room_state::direct_messages::DirectMessagesDelta {
+                new_messages: vec![],
+                advanced_purges: vec![envelope],
+            },
+        ),
+        ..Default::default()
+    };
+    if let Err(e) = publish(delta).await {
+        warn!("DM purge re-sign: not published, signed again on the next read: {e}");
+        return state;
+    }
+    if let Err(e) = storage.update_own_purges(room_owner_key, |held| held.union(&own)) {
+        warn!("DM purge re-sign: record not saved: {e}");
+    }
+    if let Err(e) = storage.update_room_state(room_owner_key, healed.clone()) {
+        warn!("DM purge re-sign: local state not saved: {e}");
+    }
+    healed
+}
+
 /// The check riverctl runs before signing a nickname for `state`'s room
 /// (setting it, or joining with it): the room's `max_nickname_size` is a
 /// client rule, and the room holds nicknames to a fixed ceiling regardless.
@@ -3245,59 +3312,10 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         state: ChatRoomStateV1,
     ) -> ChatRoomStateV1 {
-        let Ok(storage) = self.storage.load_rooms() else {
-            return state;
-        };
-        let key_str = bs58::encode(room_owner_key.as_bytes()).into_string();
-        let Some(info) = storage.rooms.get(&key_str) else {
-            return state;
-        };
-        let signing_key = self.storage.resolve_signing_key(&info.signing_key_bytes);
-        if signing_key.to_bytes() != info.signing_key_bytes {
-            return state;
-        }
-        let mut own = info.own_purges.clone();
-        let Some(result) = fold_own_purge_heal(&mut own, &signing_key, room_owner_key, &state)
-        else {
-            return state;
-        };
-        if let Err(e) = self
-            .storage
-            .update_own_purges(room_owner_key, |held| held.union(&own))
-        {
-            warn!("DM purge re-sign: record not saved: {e}");
-        }
-        let (healed, envelope) = match result {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("{e}");
-                return state;
-            }
-        };
-        info!(
-            "Re-signing DM purges for room {key_str} at version {}: the room's winning \
-             envelope omits a purge this client signed",
-            envelope.state.version
-        );
-        if let Err(e) = self
-            .storage
-            .update_room_state(room_owner_key, healed.clone())
-        {
-            warn!("DM purge re-sign: local state not saved: {e}");
-        }
-        let delta = ChatRoomStateV1Delta {
-            direct_messages: Some(
-                river_core::room_state::direct_messages::DirectMessagesDelta {
-                    new_messages: vec![],
-                    advanced_purges: vec![envelope],
-                },
-            ),
-            ..Default::default()
-        };
-        if let Err(e) = self.send_delta(room_owner_key, delta).await {
-            warn!("DM purge re-sign: not published: {e}");
-        }
-        healed
+        heal_own_purges_in(&self.storage, room_owner_key, state, |delta| {
+            self.send_delta(room_owner_key, delta)
+        })
+        .await
     }
 
     async fn heal_member_info(
@@ -9238,6 +9256,118 @@ mod create_room_tests {
         assert!(fold_own_purge_heal(&mut own, &bob, &owner_vk, &network).is_none());
     }
 
+    /// A storage holding the room `room_with_bob` builds, as bob, with bob
+    /// having recorded a purge of `token` that the network's winning
+    /// envelope (signed by bob's other install) omits; and that network state.
+    fn purge_heal_fixture(
+        token: river_core::room_state::direct_messages::PurgeToken,
+    ) -> (
+        crate::storage::Storage,
+        tempfile::TempDir,
+        SigningKey,
+        ChatRoomStateV1,
+    ) {
+        use river_core::room_state::direct_messages::{advance_recipient_purges, PurgeToken};
+        use river_core::room_state::member::MemberId;
+        let (owner, bob, base) = room_with_bob();
+        let owner_vk = owner.verifying_key();
+        let other_install =
+            advance_recipient_purges(&bob, &owner_vk, None, [PurgeToken([7; 16])]).unwrap();
+        let network = with_purge(&base, &owner, other_install);
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::storage::Storage::new(Some(dir.path().to_str().unwrap())).unwrap();
+        storage
+            .add_room(
+                &owner_vk,
+                &bob,
+                base.clone(),
+                // bundled-wasm-ok: a test fixture's stored key; no pointer is resolved.
+                &compute_contract_key(&owner_vk),
+            )
+            .unwrap();
+        storage
+            .update_own_purges(&owner_vk, |own| {
+                own.record(MemberId::from(&bob.verifying_key()), [token])
+            })
+            .unwrap();
+        (storage, dir, owner, network)
+    }
+
+    /// A re-signed envelope that is published stores the re-signed state and
+    /// records the version it was signed against, so the next read does not
+    /// sign again; the record kept is the union with what is stored.
+    #[tokio::test]
+    async fn a_published_purge_re_sign_is_recorded() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let token = PurgeToken([1; 16]);
+        let (storage, _dir, owner, network) = purge_heal_fixture(token);
+        let owner_vk = owner.verifying_key();
+        let sent = std::cell::Cell::new(0);
+        let healed = heal_own_purges_in(&storage, &owner_vk, network.clone(), |d| {
+            sent.set(sent.get() + 1);
+            assert_eq!(
+                d.direct_messages.unwrap().advanced_purges[0]
+                    .state
+                    .purged
+                    .len(),
+                2
+            );
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(sent.get(), 1);
+        let held = |s: &ChatRoomStateV1| s.direct_messages.purges[0].state.purged.clone();
+        assert_eq!(held(&healed), vec![token, PurgeToken([7; 16])]);
+        let (_, stored, _) = storage.get_room(&owner_vk).unwrap().unwrap();
+        assert_eq!(held(&stored), held(&healed));
+        heal_own_purges_in(&storage, &owner_vk, network, |_| {
+            sent.set(sent.get() + 1);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(sent.get(), 1, "not signed again against the same version");
+    }
+
+    /// A re-sign whose publish fails is not recorded: the next read signs and
+    /// publishes again.
+    #[tokio::test]
+    async fn a_purge_re_sign_that_was_not_published_is_retried() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let (storage, _dir, owner, network) = purge_heal_fixture(PurgeToken([1; 16]));
+        let owner_vk = owner.verifying_key();
+        let sent = std::cell::Cell::new(0);
+        let out = heal_own_purges_in(&storage, &owner_vk, network.clone(), |_| {
+            sent.set(sent.get() + 1);
+            async { Err(anyhow!("node unreachable")) }
+        })
+        .await;
+        assert_eq!(out, network, "nothing published, the state is unchanged");
+        heal_own_purges_in(&storage, &owner_vk, network, |_| {
+            sent.set(sent.get() + 1);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(sent.get(), 2);
+    }
+
+    /// Under a signing-key override that is not the room's stored identity,
+    /// nothing is re-signed: the recorded purges are not that identity's.
+    #[tokio::test]
+    async fn a_purge_re_sign_is_skipped_under_another_identity() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let (_, dir, owner, network) = purge_heal_fixture(PurgeToken([1; 16]));
+        let other = crate::storage::Storage::new_with_override(
+            Some(dir.path().to_str().unwrap()),
+            Some(SigningKey::from_bytes(&[99u8; 32])),
+        )
+        .unwrap();
+        let out = heal_own_purges_in(&other, &owner.verifying_key(), network.clone(), |_| async {
+            panic!("must not publish")
+        })
+        .await;
+        assert_eq!(out, network);
+    }
+
     /// `rooms.json` stores the purge record as JSON and reads it back; an
     /// older file without it reads as empty.
     #[test]
@@ -9285,7 +9415,7 @@ mod create_room_tests {
             .collect();
         assert!(dm.contains(&format!(
             "{}{}",
-            ".update_own_purges(&room_owner_key,|own|", "own.record(self_id,[resolved_token]))?;"
+            ".record_own_purges(&room_owner_key,&signing_key,", "[resolved_token])"
         )));
     }
 
