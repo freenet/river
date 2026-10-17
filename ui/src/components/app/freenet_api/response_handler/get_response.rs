@@ -358,23 +358,23 @@ pub async fn handle_get_response(
             // #295.)
             // The room's `max_nickname_size` is a client rule, checked here
             // before the invitee's member_info is signed: over it, the join
-            // stops with the reason, and the user accepts the invitation
-            // again with a shorter name (freenet/river#703).
+            // stops and the invitation dialog returns to the nickname prompt
+            // with the reason (freenet/river#703).
             if let Some(reason) = river_core::room_state::member_info::nickname_refusal(
                 preferred_nickname.len(),
                 &retrieved_state.configuration.configuration,
             ) {
-                let msg = format!("{reason} Accept the invitation again with a shorter name.");
                 warn!(
-                    "Invitation not completed for room {:?}: {msg}",
+                    "Invitation not completed for room {:?}: {reason}",
                     MemberId::from(owner_vk)
                 );
+                // Back to the nickname prompt with the reason (not Retry,
+                // which would resubmit the same nickname).
+                let nickname = preferred_nickname.clone();
                 crate::util::defer(move || {
-                    PENDING_INVITES.with_mut(|pending| {
-                        if let Some(join) = pending.map.get_mut(&owner_vk) {
-                            join.status = PendingRoomStatus::Error(msg.clone());
-                        }
-                    });
+                    crate::components::room_list::receive_invitation_modal::refuse_join_for_nickname(
+                        owner_vk, nickname, reason,
+                    );
                 });
                 return Ok(());
             }

@@ -84,6 +84,51 @@ const MAX_PROCESSED_INVITATIONS: usize = 32;
 /// — the bridge effect in `App` is the only writer to the local signal.
 pub static PRESENT_INVITATION_REQUEST: GlobalSignal<Option<Invitation>> = Global::new(|| None);
 
+/// A join the room refused for its nickname (over the room's
+/// `max_nickname_size`), by room: the invitation dialog shows the reason at
+/// the nickname prompt and keeps Accept disabled for the refused nickname.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct NicknameRefusal {
+    pub(crate) reason: String,
+    pub(crate) nickname: String,
+}
+
+pub(crate) static JOIN_NICKNAME_REFUSALS: GlobalSignal<
+    std::collections::HashMap<VerifyingKey, NicknameRefusal>,
+> = Global::new(std::collections::HashMap::new);
+
+/// Whether `nickname` is the one the room refused (Accept stays disabled
+/// for it; any other nickname may be tried).
+pub(crate) fn nickname_was_refused(refusal: Option<&NicknameRefusal>, nickname: &str) -> bool {
+    refusal.is_some_and(|r| r.nickname == nickname)
+}
+
+/// The state change for a join the room refused for its nickname: the join
+/// is no longer pending, so the dialog returns to the nickname prompt (not
+/// to Retry, which would resubmit the same nickname), and the reason is kept
+/// for the prompt.
+pub(crate) fn record_nickname_refusal(
+    pending: &mut crate::invites::PendingInvites,
+    refusals: &mut std::collections::HashMap<VerifyingKey, NicknameRefusal>,
+    room: VerifyingKey,
+    nickname: String,
+    reason: String,
+) {
+    pending.map.remove(&room);
+    refusals.insert(room, NicknameRefusal { reason, nickname });
+}
+
+/// Apply [`record_nickname_refusal`] to the app's signals, and drop the saved
+/// nickname, so a reload re-prompts rather than resuming the join with the
+/// refused one. Call from a deferred context (it writes signals).
+pub(crate) fn refuse_join_for_nickname(room: VerifyingKey, nickname: String, reason: String) {
+    PENDING_INVITES.with_mut(|pending| {
+        JOIN_NICKNAME_REFUSALS
+            .with_mut(|refusals| record_nickname_refusal(pending, refusals, room, nickname, reason))
+    });
+    clear_invitation_nickname_from_storage();
+}
+
 /// Surface the `ReceiveInvitationModal` for `inv` from anywhere in the app
 /// (currently called by the DM-thread "Accept" button — see
 /// [`river_core::room_state::dm_body::DirectMessageBody::Invite`]).
@@ -289,7 +334,7 @@ pub(crate) fn purge_persisted_invitation() {
 /// previously accepted invitation can never auto-accept a different,
 /// not-yet-accepted invitation that overwrote `INVITATION_STORAGE_KEY` (Codex
 /// review, PR #333).
-fn clear_invitation_nickname_from_storage() {
+pub(crate) fn clear_invitation_nickname_from_storage() {
     storage_remove(INVITATION_NICKNAME_STORAGE_KEY);
     storage_remove(INVITATION_NICKNAME_FP_STORAGE_KEY);
 }
@@ -986,12 +1031,17 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
     // anyway; telling the user up front beats silently losing characters.
     let nickname_has_emoji = contains_hidden_chars(&nickname());
     // The room's own nickname limit is known only once its state arrives
-    // (checked then, before signing); the ceiling every room holds nicknames
-    // to is checked here.
+    // (checked then, before signing; a refusal returns here with the reason);
+    // the ceiling every room holds nicknames to is checked here.
     let ceiling = river_core::room_state::member_info::NICKNAME_CEILING;
     let nickname_too_long = nickname.read().len() > ceiling;
+    let refusal = JOIN_NICKNAME_REFUSALS
+        .try_read()
+        .ok()
+        .and_then(|r| r.get(&inv.room).cloned());
+    let refused = nickname_was_refused(refusal.as_ref(), &nickname.read());
     let accept_disabled =
-        nickname.read().trim().is_empty() || nickname_has_emoji || nickname_too_long;
+        nickname.read().trim().is_empty() || nickname_has_emoji || nickname_too_long || refused;
 
     rsx! {
         p { class: "text-text mb-2", "You have been invited to join a new room." }
@@ -1042,6 +1092,14 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
                     class: "mt-1 text-xs text-red-400",
                     role: "alert",
                     "A display name can be at most {ceiling} bytes."
+                }
+            }
+            if let Some(refusal) = refusal.as_ref() {
+                p {
+                    "data-testid": "receive-invitation-nickname-refused",
+                    class: "mt-1 text-xs text-red-400",
+                    role: "alert",
+                    "{refusal.reason} Choose a shorter name and accept again."
                 }
             }
         }
@@ -1178,6 +1236,11 @@ pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
         MemberId::from(room_owner)
     );
 
+    // A nickname refused earlier for this room is no longer the one asked.
+    JOIN_NICKNAME_REFUSALS.with_mut(|refusals| {
+        refusals.remove(&room_owner);
+    });
+
     // Add to pending invites
     PENDING_INVITES.with_mut(|pending_invites| {
         pending_invites.map.insert(
@@ -1272,6 +1335,78 @@ pub(crate) fn adopt_and_purge_legacy_persisted_invitation_once() {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    /// The invitation GET path hands a nickname refusal to
+    /// `refuse_join_for_nickname` from a deferred closure, before any member
+    /// info is signed.
+    #[test]
+    fn the_join_path_returns_a_nickname_refusal_to_the_prompt() {
+        let src: String = include_str!("../app/freenet_api/response_handler/get_response.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let refusal = src
+            .find("member_info::nickname_refusal(")
+            .expect("the join checks the nickname");
+        let after = &src[refusal..];
+        let deferred = after.find("crate::util::defer(move||{").expect("deferred");
+        let handed = after
+            .find(&format!(
+                "{}{}",
+                "receive_invitation_modal::", "refuse_join_for_nickname("
+            ))
+            .expect("handed to the prompt");
+        let signed = after
+            .find("AuthorizedMemberInfo::new_with_member_key(")
+            .expect("signing");
+        assert!(deferred < handed && handed < signed);
+    }
+
+    /// A join the room refused for its nickname is no longer pending (so
+    /// the dialog returns to the nickname prompt, not to Retry), the reason
+    /// is kept for the prompt, and Accept stays disabled until the nickname
+    /// differs from the refused one. Accepting again clears the reason.
+    #[test]
+    fn a_nickname_refusal_returns_the_join_to_the_prompt() {
+        let room = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        let mut pending = crate::invites::PendingInvites::default();
+        pending.map.insert(
+            room,
+            PendingRoomJoin {
+                authorized_member: AuthorizedMember {
+                    member: river_core::room_state::member::Member {
+                        owner_member_id: MemberId::from(room),
+                        invited_by: MemberId::from(room),
+                        member_vk: room,
+                    },
+                    signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+                },
+                invitee_signing_key: SigningKey::from_bytes(&[43u8; 32]),
+                preferred_nickname: "a very long name".into(),
+                status: PendingRoomStatus::Subscribing,
+                subscribing_since: None,
+                retry_count: 0,
+                room_secrets: vec![],
+            },
+        );
+        let mut refusals = std::collections::HashMap::new();
+        record_nickname_refusal(
+            &mut pending,
+            &mut refusals,
+            room,
+            "a very long name".into(),
+            "too long".into(),
+        );
+        assert!(!pending.map.contains_key(&room), "no longer pending");
+        let refusal = refusals.get(&room).cloned();
+        assert_eq!(
+            refusal.as_ref().map(|r| r.reason.as_str()),
+            Some("too long")
+        );
+        assert!(nickname_was_refused(refusal.as_ref(), "a very long name"));
+        assert!(!nickname_was_refused(refusal.as_ref(), "short"));
+        assert!(!nickname_was_refused(None, "a very long name"));
+    }
     use river_core::room_state::member::Member;
 
     /// The pending invitation must never be written to durable browser
