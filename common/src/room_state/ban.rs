@@ -133,16 +133,14 @@ impl BansV1 {
         ban.verify_signature(&vk).is_ok()
     }
 
-    /// Drop every ban whose issuer is known here (the owner, or a record in
-    /// `members_by_id`) but whose key does not verify it. A peer that did not
-    /// know the issuer could store one (`verify` has no key to check it
-    /// against there); a peer that knows the issuer skips it on arrival. Both
-    /// `post_apply_cleanup` (before the cap counts) and the DM apply's
-    /// enforced-ban set run this, so such a ban never takes a cap slot one
-    /// way only (freenet/river#703). A ban whose issuer is known nowhere is
-    /// kept here; cleanup step 4 sweeps it. Returns whether anything was
-    /// dropped.
-    pub fn drop_bans_their_known_issuer_did_not_sign(
+    /// Drop every ban that no key known here verifies: one whose issuer is
+    /// the owner or a record in `members_by_id` and whose key does not verify
+    /// it, and one whose issuer is known nowhere (cleanup step 4 sweeps that
+    /// one in the same pass). Both `post_apply_cleanup` (before the cap
+    /// counts) and the DM apply's enforced-ban set run this when the bans are
+    /// over the cap, so such a ban never takes a cap slot from a stored one
+    /// (freenet/river#703). Returns whether anything was dropped.
+    pub fn drop_bans_no_known_key_verifies(
         bans: &mut Vec<AuthorizedUserBan>,
         members_by_id: &HashMap<MemberId, &AuthorizedMember>,
         owner_id: MemberId,
@@ -150,8 +148,7 @@ impl BansV1 {
     ) -> bool {
         let before = bans.len();
         bans.retain(|b| {
-            let known = b.banned_by == owner_id || members_by_id.contains_key(&b.banned_by);
-            !known || Self::ban_signature_matches_current_key(b, members_by_id, owner_id, owner_vk)
+            Self::ban_signature_matches_current_key(b, members_by_id, owner_id, owner_vk)
         });
         bans.len() != before
     }

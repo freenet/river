@@ -12,7 +12,7 @@ use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, Memb
 use river_core::room_state::message::{
     AuthorizedMessageV1, MessageV1, MessagesV1, RoomMessageBody,
 };
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::time::{Duration, SystemTime};
 
 fn sk(b: u64) -> SigningKey {
@@ -308,4 +308,51 @@ fn a_held_ban_its_issuers_key_does_not_verify_takes_no_cap_slot() {
         ..Default::default()
     });
     r.assert_one_exchange_agrees(&a, &b);
+}
+
+/// A ban whose issuer is known nowhere is swept by the same cleanup that
+/// receives it, so it takes no cap slot: a room at its ban cap that receives
+/// one keeps every ban it held, in one apply and in both merge directions.
+#[test]
+fn a_ban_whose_issuer_is_known_nowhere_takes_no_cap_slot() {
+    let r = Room::new();
+    let (m, n, unknown) = (sk(2), sk(3), sk(4));
+    let members = MembersV1 {
+        members: vec![r.rec(&m, &r.o), r.rec(&n, &m)],
+    };
+    let msgs = MessagesV1 {
+        messages: vec![r.msg(&m, 1), r.msg(&n, 2)],
+        ..Default::default()
+    };
+    // N bans its own inviter (takes no effect) and the owner bans an id held
+    // nowhere: two stored bans, at the cap.
+    let held = r.settle(ChatRoomStateV1 {
+        configuration: r.cfg(1, 2),
+        members: members.clone(),
+        recent_messages: msgs.clone(),
+        bans: BansV1(vec![r.ban(&n, id(&m), 5), r.ban(&r.o, id(&sk(90)), 6)]),
+        ..Default::default()
+    });
+    assert_eq!(held.bans.0.len(), 2, "premise");
+    let arriving = r.ban(&unknown, id(&sk(91)), 20);
+
+    let mut applied = held.clone();
+    applied
+        .apply_delta(
+            &held,
+            &r.p,
+            &Some(ChatRoomStateV1Delta {
+                bans: Some(vec![arriving.clone()]),
+                ..Default::default()
+            }),
+        )
+        .expect("applies");
+    assert_eq!(applied.bans, held.bans, "nothing the room held is evicted");
+
+    // A peer that holds the same room plus that ban, still on an older
+    // configuration with room for it.
+    let mut other = held.clone();
+    other.configuration = r.cfg(0, 3);
+    other.bans.0.push(arriving);
+    r.assert_one_exchange_agrees(&held, &other);
 }

@@ -461,23 +461,19 @@ impl ChatRoomStateV1 {
             .map(|(id, m)| (id, m.clone()))
             .collect();
 
-        // 0-sig. A ban whose known issuer's key does not verify it counts for
-        //     nothing: dropped before the cap counts it, as the same ban is
-        //     skipped on arrival at a peer that knows its issuer
-        //     (`BansV1::drop_bans_their_known_issuer_did_not_sign`; the DM
-        //     apply's enforced-ban set drops it the same way). Only the cap
-        //     can be swayed by one (resolution ignores a ban whose signature
-        //     does not verify, and step 4 sweeps it), so the signatures are
-        //     checked only when the bans are over the cap.
+        // 0-sig. A ban no known key verifies counts for nothing: one whose
+        //     known issuer's key does not verify it (skipped on arrival at a
+        //     peer that knows the issuer) and one whose issuer is known
+        //     nowhere (step 4 sweeps it in this pass) are dropped before the
+        //     cap counts them (`BansV1::drop_bans_no_known_key_verifies`; the
+        //     DM apply's enforced-ban set drops them the same way). Only the
+        //     cap can be swayed by one (resolution ignores such a ban, and
+        //     step 4 sweeps it), so this runs only when the bans are over the
+        //     cap.
         if self.bans.0.len() > self.configuration.configuration.max_user_bans {
             let known = self.ban_evidence.lookup(&self.members, owner_id);
             let mut bans = std::mem::take(&mut self.bans.0);
-            BansV1::drop_bans_their_known_issuer_did_not_sign(
-                &mut bans,
-                &known,
-                owner_id,
-                &parameters.owner,
-            );
+            BansV1::drop_bans_no_known_key_verifies(&mut bans, &known, owner_id, &parameters.owner);
             self.bans.0 = bans;
         }
 

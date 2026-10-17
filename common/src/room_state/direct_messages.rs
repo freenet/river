@@ -900,10 +900,10 @@ pub(crate) fn enforced_ban_set_of(
             parameters,
         );
     }
-    // The bans `post_apply_cleanup` counts at the cap: without any its known
-    // issuer's key does not verify (step 0-sig, which runs only over the cap).
+    // The bans `post_apply_cleanup` counts at the cap: without any no known
+    // key verifies (step 0-sig, which runs only over the cap).
     let mut capped: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
-    BansV1::drop_bans_their_known_issuer_did_not_sign(
+    BansV1::drop_bans_no_known_key_verifies(
         &mut capped,
         &evidence.lookup(&parent_state.members, parameters.owner_id()),
         parameters.owner_id(),
