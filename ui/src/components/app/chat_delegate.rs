@@ -4758,9 +4758,9 @@ mod tests {
             .expect("must reset the guard when no probe dispatched");
         let reset_block = &body[reset_pos..(reset_pos + 200).min(body.len())];
         assert!(
-            reset_block.contains("load_attempt_is_current(attempt)")
+            reset_block.contains("SWEEP_EPOCH.load(Ordering::Relaxed) == epoch")
                 && reset_block.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"),
-            "all-sends-failed (still current) must reset LEGACY_MIGRATION_ATTEMPTED so a reconnect re-probes"
+            "all-sends-failed (latest sweep) must reset LEGACY_MIGRATION_ATTEMPTED so a reconnect re-probes"
         );
     }
 
@@ -11391,8 +11391,8 @@ pub(crate) fn room_set_complete_core(latch: u32, attempt: u32, current_attempt: 
 /// recovery (#352), which fires only after a per-room load read every slot,
 /// and saves room by room through a CAS read-merge-write. Besides
 /// `retry_rooms_load` and that recovery, a sweep that a reconnect interrupts
-/// mid-pacing re-enables it, at most `MAX_SWEEP_REARMS` times a session
-/// (freenet/river#809).
+/// mid-pacing re-enables it, or the new attempt starts over it; the two
+/// share `MAX_SWEEP_REARMS` per session (freenet/river#809).
 pub(crate) fn begin_load_attempt() {
     LOAD_ATTEMPT_GEN.fetch_add(1, Ordering::Relaxed);
     PENDING_LOADS.store(0, Ordering::Relaxed);
@@ -11447,7 +11447,8 @@ pub(crate) fn retry_rooms_load() {
     // Retry-only (deliberately NOT in `begin_load_attempt`): re-enable the legacy
     // probe so a legacy source that failed THIS session is retried (P1b). A plain
     // reconnect must not force this (re-probe spam on every reconnect), except
-    // one that interrupts a pacing sweep (`stop_sweep`, capped). Set
+    // one that interrupts a pacing sweep (`stop_sweep`, or a new attempt
+    // starting over it; both capped by `MAX_SWEEP_REARMS`). Set
     // BEFORE the re-setup so `fire_legacy_migration_request` sees it cleared.
     LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     crate::util::safe_spawn_local(async {
@@ -11749,8 +11750,10 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // Gated on still-current (P2#1): a stale probe must not reopen the guard for
     // the new attempt (whose own probe already ran / set it).
     // The probe never went out, so this is not a re-probe and costs no
-    // re-arm; only the latest sweep clears the guard (freenet/river#809).
-    if !any_dispatched && load_attempt_is_current(attempt) {
+    // re-arm, whether or not a reconnect began a new attempt meanwhile. The
+    // still-current check above is now the latest-sweep check: a newer sweep
+    // (that attempt's own probe) owns the guard (freenet/river#809).
+    if !any_dispatched {
         if SWEEP_EPOCH.load(Ordering::Relaxed) == epoch {
             LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
             SWEEP_RUNNING_FOR.store(0, Ordering::Relaxed);
@@ -11816,9 +11819,11 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
                 return;
             }
         }
+        // The last wave has no next wave to notice an attempt change, so it
+        // is awaited here too, and the end re-arms if the attempt changed
+        // while it was out (its replies may have gone down with the socket).
+        await_sweep_wave(wave).await;
         disarm_sweep_wave(wave);
-        // An attempt change during the LAST wave has no next wave to notice
-        // it, so the end re-arms too in that case.
         stop_sweep(epoch, !load_attempt_is_current(attempt));
     });
 
