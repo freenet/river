@@ -773,9 +773,10 @@ pub(crate) struct DmCutoffPlan {
 ///
 /// **Advance (OlderSnapshot only).** [`seed_dm_last_seen_if_needed`] treats
 /// every inbound DM in the FIRST non-empty `ROOMS` as already seen, once per
-/// session. During a migration that first observation is usually the OLDEST
-/// legacy generation's snapshot (probes go out oldest-first), so DMs only a
-/// newer generation held all showed as unread. A copy merged as
+/// session. During a migration that first observation was usually the OLDEST
+/// legacy generation's snapshot (probes went out oldest-first until
+/// freenet/river#809), so DMs only a newer generation held all showed as
+/// unread. Any generation can still answer first. A copy merged as
 /// `OlderSnapshot` (a legacy generation, the crate walk's import, the current
 /// delegate's pre-per-room `rooms_data` blob) was written by an EARLIER
 /// session, so its DMs that landed count as seen: the seed's own

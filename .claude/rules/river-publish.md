@@ -284,7 +284,14 @@ where stale legacy data overwrites newer state on the current delegate
    gateway's sandboxed iframe, so in production neither ever persisted, and an
    interrupted migration stranded rooms for good (#760). The journal, stored
    in the current delegate, is the only authority.
-4. `fire_legacy_migration_request` probes each legacy delegate TWO ways:
+4. `fire_legacy_migration_request` probes each legacy delegate TWO ways,
+   newest generation first, in waves of 4 generations (freenet/river#809:
+   every delegate request on a node shares one admission queue capped at 100,
+   and a request refused there comes back naming no delegate). The first wave
+   goes out before it returns; the rest follow from a background task that
+   holds a load worker, each once the previous wave is answered or after 2 s.
+   A pacing sweep stops when a newer sweep starts or the load attempt
+   changes, and may be re-armed at most twice a session:
    (a) fixed `GetRequest` for `[ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY]`
    (the pre-#345 single-blob format + DM cache), and (b) a `ListRequest` to
    discover the legacy delegate's **dynamic per-room keys** — without (b), the

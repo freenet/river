@@ -2747,8 +2747,9 @@ impl Rooms {
         // against the combined set, which lost that ordering entirely: an ancient
         // "you left this room" deleted a room you had since rejoined, and the
         // migration's re-save wrote the tombstone to the current delegate, taking
-        // `self_sk` with it. Probes dispatch oldest-first, so the oldest
-        // generation usually answers while the map is still empty — which is why
+        // `self_sk` with it. Probes dispatched oldest-first (until
+        // freenet/river#809), so the oldest generation usually answered while the
+        // map was still empty, and any generation still can — which is why
         // guarding only "is it in the map right now" is not enough.
         //
         // An `Authoritative` source (the current delegate, or a deliberate
@@ -2824,10 +2825,11 @@ impl Rooms {
         for (vk, mut room_data) in other.map {
             // Honour tombstones — never re-add a room the user has left — UNLESS
             // this observation comes from a strictly NEWER source than the one
-            // that tombstoned it (freenet/river#590). Probes are dispatched
-            // oldest-first, so without this a stale "you left" from the oldest
-            // generation suppresses the newest generation's `Present` and the
-            // re-save then tombstones the room on the current delegate.
+            // that tombstoned it (freenet/river#590). Generations answer in any
+            // order, so without this a stale "you left" from an older
+            // generation that answers first suppresses a newer generation's
+            // `Present` and the re-save then tombstones the room on the
+            // current delegate.
             if self.removed_rooms.contains(&vk) {
                 if !ranks.presence_survives_tombstone(&vk.to_bytes(), incoming_rank) {
                     continue;
@@ -3970,10 +3972,11 @@ mod tests {
     // freenet/river#527 — identity conflicts resolve by DELEGATE GENERATION,
     // not by which probe answered first.
     //
-    // `fire_legacy_migration_request` probes every legacy generation at once
-    // and each hydrates independently, so for a long-time user whose rooms
-    // exist under many generations these merges arrive in a racy order —
-    // dispatched oldest-first, so the oldest copy usually lands first.
+    // `fire_legacy_migration_request` probes every legacy generation and each
+    // hydrates independently, so for a long-time user whose rooms exist under
+    // many generations these merges arrive in a racy order. (Dispatched
+    // oldest-first until freenet/river#809, newest-first in waves since; the
+    // ranking must hold for either order.)
     // =====================================================================
 
     fn empty_rooms_for_merge() -> Rooms {
@@ -4129,7 +4132,7 @@ mod tests {
     // =====================================================================
     // freenet/river#801: a room's read marker across a legacy migration.
     //
-    // The fan-out delivers one copy per delegate generation, oldest first,
+    // The fan-out delivers one copy per delegate generation, in any order,
     // and an old generation's frozen snapshot carries a weeks-old marker. The
     // merged room must keep the marker furthest along in the MERGED buffer,
     // whichever copy arrived first and whichever generation it came from.
@@ -4174,7 +4177,7 @@ mod tests {
         assert_eq!(
             merged_marker(vk, (stale.clone(), 3), (fresh.clone(), 20)),
             Some(ids[2].clone()),
-            "oldest generation first (the fan-out's usual order): its stale \
+            "oldest generation first (one possible order): its stale \
              marker must not stick"
         );
         assert_eq!(
@@ -4694,9 +4697,10 @@ mod tests {
     /// freenet/river#590, PROBE-B — the interleaving that probe order makes the
     /// LIKELY one, and that a "is it in the map right now" guard cannot see.
     ///
-    /// `fire_legacy_migration_request` dispatches `LEGACY_DELEGATES.iter()` in
-    /// file order, oldest generation first, so the OLDEST generation usually
-    /// answers while the map is still empty. Its stale tombstone lands
+    /// `fire_legacy_migration_request` dispatched `LEGACY_DELEGATES.iter()` in
+    /// file order, oldest generation first, until freenet/river#809 (newest
+    /// first since), so the OLDEST generation usually answered while the map
+    /// was still empty. The interleaving stays possible on any order. Its stale tombstone lands
     /// unopposed; the newest generation's `Present` then arrives and is skipped
     /// by the tombstone check; and the re-save writes `room:R = Tombstone` to the
     /// current delegate, taking `self_sk` with it.
@@ -10022,8 +10026,8 @@ mod tests {
         assert_eq!(owed_rekey_merge(&placeholder), None);
     }
 
-    /// The legacy fan-out after a delegate re-key answers oldest generation
-    /// first. The marker a room keeps must come from the NEWEST delegate
+    /// The legacy fan-out after a delegate re-key answers in any order. The
+    /// marker a room keeps must come from the NEWEST delegate
     /// generation's copy (it knows the key the device last saved under), not
     /// from whichever copy got there first (freenet/river#769).
     #[test]
