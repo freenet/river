@@ -14,13 +14,16 @@ import {
   expectRowHeld,
   expectSettledAtBottom,
   fillHistory,
+  gateResizeObservers,
   hideChatBehindMembers,
+  holdResizeObservations,
   holdTestImage,
   knownFailure,
   nextFrames,
   openRoomAtBottom,
   readerScrollsWithoutGesture,
   readingRow,
+  releaseResizeObservations,
   rowOffset,
   scrollMetrics,
   withheld,
@@ -316,6 +319,43 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await nextFrames(page);
 
     await expectRowHeld(page, row.key, row.top, "a drain while the breakpoint hid the chat moved the reader's row");
+  });
+
+  // The same, when no rendering update falls between the hide and the reveal
+  // (the page was busy): the ResizeObserver, which compares sizes only at a
+  // rendering update, never reports the hide, so the drain's own patch has to
+  // note it. Unforced, this was the intermittent failure of the test above.
+  test("a drain behind a breakpoint hide the ResizeObserver never reported keeps the reader's row", async ({
+    page,
+  }) => {
+    await gateResizeObservers(page);
+    await openRoomAtBottom(page, "Capped History Room", "/?deep-history-room=1");
+    await hideChatBehindMembers(page);
+    await page.setViewportSize({ width: 1280, height: 844 });
+    await expect(page.locator("#chat-scroll-container")).toBeVisible();
+    await nextFrames(page);
+    const row = await parkAboveEnd(page);
+    const rowsBefore = await page.locator("[data-item-key]").count();
+
+    await holdResizeObservations(page);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator("#chat-scroll-container"), "premise: the breakpoint hid the chat").toBeHidden();
+    // A rendering update while held: the hide's report is the one withheld.
+    await nextFrames(page);
+    await callRiverTest(page, "appendMessages", HIDDEN_DRAIN_BATCH);
+    await expectRowCountAbove(page, rowsBefore + 30, "premise: the batch should patch the hidden history");
+    await nextFrames(page);
+    expect(await releaseResizeObservations(page), "premise: the hide's report was withheld").toBeGreaterThan(0);
+    await page.setViewportSize({ width: 1280, height: 844 });
+    await expect(page.locator("#chat-scroll-container")).toBeVisible();
+    await nextFrames(page);
+
+    await expectRowHeld(
+      page,
+      row.key,
+      row.top,
+      "a drain behind a hide the ResizeObserver never reported moved the reader's row",
+    );
   });
 
   // A burst past the ceiling while hidden: the range keeps the reader's row

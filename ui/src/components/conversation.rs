@@ -39,8 +39,8 @@ use self::emoji_picker::FREQUENT_EMOJIS;
 #[cfg(target_arch = "wasm32")]
 use self::history_scroll::{
     complete_scroll_request, correct_view_after_patch, follow_arrival_at_end,
-    install_scroll_settle_listener, land_at_end, note_newest_seen, observe_history_resize,
-    ROOM_HISTORY,
+    install_scroll_settle_listener, land_at_end, note_newest_seen, note_patch_while_hidden,
+    observe_history_resize, ROOM_HISTORY,
 };
 use self::history_scroll::{remember_reading_position, resolve_rendered_range, ReaderPosition};
 use self::history_window::{grown_window, BACKFILL_LEAD_PX, INITIAL_WINDOW_ITEMS};
@@ -1739,9 +1739,10 @@ pub fn Conversation() -> Element {
         });
     }
 
-    // After each render that can move rows: the patch corrections, which
-    // stand down while a request is pending, then the pending request, then
-    // the read rule against what the render left on screen.
+    // After each render that can move rows: a patch behind a hidden panel is
+    // noted for the reveal, then the patch corrections, which stand down
+    // while a request is pending, then the pending request, then the read
+    // rule against what the render left on screen.
     #[cfg(target_arch = "wasm32")]
     {
         let reader_position = reader_position.clone();
@@ -1750,6 +1751,7 @@ pub fn Conversation() -> Element {
             // and heads swap on content changes too.
             let _ = message_groups.read().is_some();
             let _ = window_items();
+            note_patch_while_hidden(&reader_position);
             correct_view_after_patch(&reader_position);
             complete_scroll_request(&reader_position, opening_snap_done);
             note_newest_seen(&reader_position);

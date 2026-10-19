@@ -78,10 +78,15 @@ pub(super) struct ReaderPosition {
     pub(super) window_overgrown: std::cell::Cell<bool>,
     /// See [`ReadingAnchor`].
     pub(super) anchor: std::cell::RefCell<Option<ReadingAnchor>>,
-    /// Whether the ResizeObserver last saw the container without layout
-    /// (behind a mobile panel). The next resize with layout restores.
+    /// Whether the container was last seen without layout (behind a mobile
+    /// panel), by the ResizeObserver or by a patch (`note_patch_while_hidden`).
+    /// The next resize with layout restores.
     #[cfg(target_arch = "wasm32")]
     hidden: std::cell::Cell<bool>,
+    /// The ResizeObserver `observe_history_resize` installed, so a patch that
+    /// finds the container hidden can re-arm its observation.
+    #[cfg(target_arch = "wasm32")]
+    resize_observer: std::cell::RefCell<Option<web_sys::ResizeObserver>>,
     /// The last render's `HistoryWindow::has_newer`.
     pub(super) has_newer: std::cell::Cell<bool>,
     /// The pending explicit scroll, if any. While newer items are held back
@@ -927,10 +932,39 @@ pub(super) fn install_scroll_settle_listener(
     true
 }
 
-/// A size change of the history. The container's size is the history's only
+/// A patch landed while the history had no layout, and the ResizeObserver has
+/// not reported the hide yet. Note the hide now, so the reveal restores the
+/// reader.
+///
+/// The observer reports sizes only at a rendering update, against the size it
+/// last reported. A hide and a reveal with no rendering update between them (a
+/// breakpoint crossed and crossed back while the page was busy) reach it as no
+/// change at all, yet a patch in between, such as an at-cap drain removing
+/// rows above the reader, moves the rows under the scroll position the browser
+/// keeps. So the container is observed afresh as well: a new observation
+/// reports the revealed size whatever was reported before, and the reveal
+/// reaches [`on_history_resize`] even when no observed size changed.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn note_patch_while_hidden(reader: &ReaderPosition) {
+    let Some(container) = ROOM_HISTORY.container() else {
+        return;
+    };
+    if has_layout(&container) || reader.hidden.replace(true) {
+        return;
+    }
+    // The view the hold kept is gone.
+    reader.end_hold.set(None);
+    if let Some(observer) = reader.resize_observer.borrow().as_ref() {
+        observer.unobserve(&container);
+        observer.observe(&container);
+    }
+}
+
+/// A size change of the history. The container's size is the history's
 /// notice that the chat panel was hidden (it measures 0 behind the mobile
-/// Rooms or Members panel) or shown again. While the end hold is on, any size
-/// change, of the container (the composer, the phone keyboard) or of
+/// Rooms or Members panel) or shown again; a patch that lands while it is
+/// hidden notes the hide too (`note_patch_while_hidden`). While the end hold
+/// is on, any size change, of the container (the composer, the phone keyboard) or of
 /// `#chat-content` (a row growing), takes the view back to the end. Otherwise
 /// the browser keeps the top edge.
 #[cfg(target_arch = "wasm32")]
@@ -977,8 +1011,9 @@ pub(super) fn observe_history_resize(
     let Some(container) = ROOM_HISTORY.container() else {
         return false;
     };
+    let callback_reader = reader.clone();
     let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
-        on_history_resize(&reader, opening_snap_done);
+        on_history_resize(&callback_reader, opening_snap_done);
     }) as Box<dyn FnMut(js_sys::Array)>);
     let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) else {
         return false;
@@ -992,6 +1027,7 @@ pub(super) fn observe_history_resize(
     }
     // Leaked for the same reason as the settle listener's closures.
     cb.forget();
+    *reader.resize_observer.borrow_mut() = Some(observer);
     true
 }
 
