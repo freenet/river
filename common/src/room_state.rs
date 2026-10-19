@@ -1197,27 +1197,54 @@ fn trim_to_work_bounds(
     if let Some(members) = delta.members.as_mut() {
         if members.added().len() > members_bound {
             let depth = depth_in_sender();
-            // The authors of the messages the delta keeps, and their invite
-            // chains, go first, so a trimmed delta always delivers messages
-            // with their authors (otherwise the two trims can choose disjoint
-            // sets, every message is then left out, and the receiver prunes
-            // the members it took: the same delta forever).
+            // The authors of the messages the delta keeps go first, newest
+            // message first, each with its WHOLE missing invite chain (every
+            // member of the chain the receiver's summary does not list), so
+            // a trimmed delta always delivers messages with authors the
+            // receiver can verify and keeps: otherwise the two trims can
+            // choose disjoint sets, or deliver part of a chain, the receiver
+            // prunes the members it took, and the same delta repeats forever.
+            // A chain is taken only while the chains fit the bound; an author
+            // whose chain does not fit, or does not reach the owner here, is
+            // skipped, and its messages are dropped below. The receiver
+            // counts new member records against this same bound.
             let mut needed: HashSet<MemberId> = HashSet::new();
-            for author in delta
+            let mut authors: Vec<(crate::room_state::message::MessageOrderKey, MemberId)> = delta
                 .recent_messages
                 .iter()
                 .flatten()
-                .map(|m| m.message.author)
-            {
+                .map(|m| (m.order_key(), m.message.author))
+                .collect();
+            authors.sort_by(|a, b| b.cmp(a));
+            let mut seen_authors: HashSet<MemberId> = HashSet::new();
+            for (_, author) in authors {
+                if !seen_authors.insert(author) {
+                    continue;
+                }
+                let mut chain: Vec<MemberId> = Vec::new();
                 let mut current = author;
+                let mut complete = true;
                 while current != owner_id
                     && !summary.members.contains(&current)
-                    && needed.insert(current)
+                    && !needed.contains(&current)
                 {
-                    match known.get(&current) {
-                        Some(m) => current = m.member.invited_by,
-                        None => break,
+                    if chain.len() >= members_bound {
+                        complete = false;
+                        break;
                     }
+                    match known.get(&current) {
+                        Some(m) => {
+                            chain.push(current);
+                            current = m.member.invited_by;
+                        }
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if complete && needed.len() + chain.len() <= members_bound {
+                    needed.extend(chain);
                 }
             }
             // Rank by (not needed, depth, id), but keep the kept records in

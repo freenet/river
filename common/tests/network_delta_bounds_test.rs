@@ -735,6 +735,74 @@ fn every_trimmed_network_delta_advances_the_receiver() {
     );
 }
 
+/// More missing members than one delta may carry, in 100 disjoint invite
+/// chains of depth 11 with one message by the deepest member of each: an
+/// author only verifies with its whole chain, so the trim takes authors as
+/// whole chains while they fit and leaves out the messages of the rest.
+/// Every trimmed delta advances the receiver, and the exchange converges.
+#[test]
+fn every_trimmed_network_delta_advances_the_receiver_on_floor_caps() {
+    let r = Room::new();
+    let mut members = Vec::new();
+    let mut messages = Vec::new();
+    for a in 0..100u64 {
+        let mut inviter = r.o.clone();
+        for d in 0..11u64 {
+            let m = sk(1_000_000 + a * 100 + d);
+            members.push(r.rec(&m.verifying_key(), &inviter));
+            if d == 10 {
+                messages.push(r.msg(&m, 10 + a));
+            }
+            inviter = m;
+        }
+    }
+    let mut held = MessagesV1 {
+        messages,
+        ..Default::default()
+    };
+    held.rebuild_actions_state();
+    let sender = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| {
+            c.max_members = 5_000;
+            c.max_recent_messages = 1_000;
+        }),
+        members: MembersV1 { members },
+        recent_messages: held,
+        ..Default::default()
+    });
+    assert_eq!(sender.members.members.len(), 1_100, "premise");
+    // The receiver's newer configuration (same caps) is unknown to the
+    // sender, so each delta is held to the floors.
+    let mut receiver = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(2, |c| {
+            c.max_members = 5_000;
+            c.max_recent_messages = 1_000;
+        }),
+        ..Default::default()
+    });
+    let mut converged = false;
+    for _ in 0..5 {
+        let summary = receiver.summarize(&receiver, &r.p);
+        if sender.delta_within_work_bounds(&r.p, &summary).is_none() {
+            converged = true;
+            break;
+        }
+        let before = (
+            receiver.members.members.len(),
+            receiver.recent_messages.messages.len(),
+        );
+        receiver = r.exchange(&sender, &receiver).expect("applies");
+        let after = (
+            receiver.members.members.len(),
+            receiver.recent_messages.messages.len(),
+        );
+        assert_ne!(before, after, "every trimmed delta advances the receiver");
+    }
+    assert!(converged, "the exchange converges within 5 rounds");
+    assert_eq!(receiver.members.members.len(), 1_100);
+    assert_eq!(receiver.recent_messages.messages.len(), 100);
+}
+
 /// A receiver that pruned a member (no record, no messages of theirs) is
 /// sent that member's record with their new message, so the message
 /// verifies on arrival (freenet/river#145).
