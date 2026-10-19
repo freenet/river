@@ -24,20 +24,23 @@ both of these hold at the moment it arrives:
    showing). The tab need not be visible, and a DM thread open over the room
    does not stop the room following: a reader who left the end in view (a
    background tab, an occluded or minimized window, a phone with its screen
-   off, a DM thread) comes back to the end. Gating this on the foreground, as
-   #753 did, parked such a reader above every arrival, and once the newest
-   message sat past the band no later arrival followed either, so the history
-   looked as if it had stopped following.
+   off, a DM thread) comes back to the end. Gated on the foreground, such a
+   reader would stay parked above every arrival, and once the newest message
+   sat past the band no later arrival would follow either.
 2. **The reader is at the end or near it:** before the patch, the newest
    item's bottom (`bottom-sentinel` / `dm-bottom-sentinel`, the same edge as
    Latest and the read rule, not the scroller's absolute end) sits at most
    `FOLLOW_BAND_PX` (100) below the view's bottom edge, in a room and in a DM
    thread alike.
 
-Following never marks anything read. The read rule below still requires the
+Following does not get around the read rule, which still requires the
 foreground (`foreground::in_foreground`: the tab visible, the history with
-layout, and for the room no DM thread open), so arrivals followed while away
-stay unread until the reader is back and they are on screen.
+layout, and for the room no DM thread open). Arrivals followed while away stay
+unread until the reader is back. Then the newest is on screen, and the read
+rule marks everything up to it read, including arrivals that scrolled above
+the view while the reader was away, as it does for a burst in a visible tab.
+An unread divider ([#459](https://github.com/freenet/river/issues/459)) is
+what would show the reader where they left off.
 
 **Only an arrival follows.** A tab becoming visible, a DM thread closing, or a
 mobile panel revealing the chat never scrolls. Messages that arrived while a
@@ -151,8 +154,8 @@ Known limitations:
 - Latest appears when the newest message's bottom is more than 4px below
   the visible area, or a held range withholds newer messages. The margin is
   measured against the message, not the padding below it.
-- A room's read marker advances when the history is in the foreground (same
-  predicate as following), has completed its reveal restore, the rendered
+- A room's read marker advances when the history is in the foreground (not
+  required for following), has completed its reveal restore, the rendered
   range reaches the room's latest message, and that message's bottom is on
   screen within the same 4px margin. It re-checks when the tab becomes
   visible (`DOCUMENT_VISIBLE`) or a DM thread closes (`OPEN_DM_THREAD`),

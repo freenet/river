@@ -22,7 +22,7 @@ pub fn has_layout(container: &web_sys::Element) -> bool {
 
 /// Is a DM thread open over the room? Peeked, not read: called from render and
 /// raw DOM callbacks, which must not subscribe. A contended read counts as
-/// open, the answer that neither follows nor reads.
+/// open, the answer that does not read.
 #[cfg(target_arch = "wasm32")]
 fn dm_thread_open() -> bool {
     use dioxus::prelude::*;

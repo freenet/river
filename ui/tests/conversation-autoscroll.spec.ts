@@ -43,8 +43,8 @@ import { DM_PEER, closeThread, newestHistoryDm, openThread } from "./dm-thread";
 const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
 
 // An arrival follows a reader at the end: the newest message's bottom within
-// FOLLOW_BAND_PX of the view's bottom edge before the patch, in the
-// foreground. Anywhere else it keeps the reader's place, and the Latest button
+// FOLLOW_BAND_PX of the view's bottom edge before the patch, whether or not
+// the tab is visible. Anywhere else it keeps the reader's place, and the Latest button
 // is how a reader reaches what arrived below them.
 // Rationale: .claude/rules/history-scrolling.md.
 //
@@ -1749,8 +1749,9 @@ test.describe("Browser scroll anchoring is off on the history", () => {
 
 // An arrival follows a reader at the end, measured before the patch: the
 // newest message's bottom within FOLLOW_BAND_PX of the view's bottom
-// edge, in a visible tab, with no DM thread over the history. Nothing else
-// follows, and nothing scrolls when the tab comes back or the thread closes.
+// edge, in a visible tab or a hidden one, with or without a DM thread over
+// the history. Nothing else follows, and nothing scrolls when the tab comes
+// back or the thread closes.
 // Rationale: .claude/rules/history-scrolling.md.
 test.describe("An arrival follows a reader at the end", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
@@ -1803,14 +1804,19 @@ test.describe("An arrival follows a reader at the end", () => {
     const before = await hiddenTitleCount(page);
     for (let i = 1; i <= 6; i++) {
       await deliverOffscreen(page, `arrival ${i} in a hidden tab`);
+      await expectSettledAtBottom(page, `arrival ${i} in a hidden tab left a reader at the end parked above it`);
     }
-    await expectSettledAtBottom(page, "arrivals in a hidden tab left a reader at the end parked above them");
     expect(await hiddenTitleCount(page), "arrivals followed in a hidden tab were marked read").toBe(before + 6);
     await setTabVisibility(page, "visible");
     await expectSettledAtBottom(page, "the tab coming back moved the view");
     await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);
     await deliverOffscreen(page, "arrival after the tab came back");
     await expectFollowed(page, "arrival after the tab came back", "an arrival after the tab came back did not follow");
+    await selectListedRoom(page, "Public Discussion Room");
+    await expect(
+      roomUnreadBadge(page, "Team Chat Room"),
+      "the tab came back on the newest message and the room still counts it unread",
+    ).toHaveCount(0);
   });
 
   test("an arrival in a hidden tab does not move a parked reader, nor does the tab coming back", { tag: "@chromium-only" }, async ({ page }) => {
@@ -1844,8 +1850,8 @@ test.describe("An arrival under a DM thread", { tag: "@chromium-only" }, () => {
 
     for (let i = 1; i <= 6; i++) {
       await deliverOffscreen(page, `arrival ${i} under a DM thread`);
+      await expectSettledAtBottom(page, `arrival ${i} under a DM thread left a reader at the end parked above it`);
     }
-    await expectSettledAtBottom(page, "arrivals under a DM thread left a reader at the end parked above them");
     await closeThread(page);
     await expectSettledAtBottom(page, "closing the DM thread moved the history");
     await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);

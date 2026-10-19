@@ -426,5 +426,4 @@ test.describe("DM thread follows a reader at the end", () => {
     await expect(railBadge(page, OTHER_DM_PEER), "the tab came back on the DMs and they still count unread").toHaveCount(0);
     await expect(page.getByTestId(LATEST)).toHaveCount(0);
   });
-
 });
