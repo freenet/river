@@ -233,6 +233,45 @@ impl BansV1 {
             return;
         }
         bans.sort_by_cached_key(|b| (b.ban.banned_at, b.id(), crate::util::record_digest(b)));
+        // The DM apply's enforced-ban set and cleanup step 0-cap run this on
+        // the same inputs within one apply; the second gets the first's
+        // answer (`signature_memo::cap_result`).
+        let inputs = signature_memo::cap_inputs_digest(
+            bans,
+            max_bans,
+            depth_cap,
+            members,
+            evidence,
+            member_info,
+            parameters,
+        );
+        if let Some(kept) = signature_memo::cap_result(&inputs) {
+            *bans = kept;
+            return;
+        }
+        Self::keep_in_authority_order(
+            bans,
+            max_bans,
+            depth_cap,
+            members,
+            evidence,
+            member_info,
+            parameters,
+        );
+        signature_memo::record_cap_result(inputs, bans);
+    }
+
+    /// The body of [`Self::enforce_user_ban_cap`] over the canonically
+    /// ordered, over-cap `bans`.
+    fn keep_in_authority_order(
+        bans: &mut Vec<AuthorizedUserBan>,
+        max_bans: usize,
+        depth_cap: usize,
+        members: &MembersV1,
+        evidence: &BanEvidenceV1,
+        member_info: &MemberInfoV1,
+        parameters: &ChatRoomParametersV1,
+    ) {
         let owner_id = parameters.owner_id();
         let known = evidence.lookup(members, owner_id);
         let stable = Self::stable_known(members, evidence, owner_id, depth_cap);
@@ -780,7 +819,8 @@ mod ban_digest_golden {
 /// The ban signature checks of one cleanup or whole-state merge, remembered
 /// so each ban is verified at most once however many times the ban cap (in
 /// the DM apply's enforced-ban set and in cleanup), the cleanup steps and the
-/// fixpoint passes ask. Keyed by the signature, the verifying key and every
+/// fixpoint passes ask; and the ban cap's choice per input, so the cap runs
+/// once for the inputs the DM apply and cleanup share. Keyed by the signature, the verifying key and every
 /// field of the signed record, the whole input of the check (two bans can
 /// share signature bytes), so a remembered answer is the answer the check
 /// would give. Active only inside [`active_while`].
@@ -794,6 +834,42 @@ pub(crate) mod signature_memo {
 
     thread_local! {
         static MEMO: RefCell<Option<HashMap<Key, bool>>> = const { RefCell::new(None) };
+        static CAP: RefCell<Option<HashMap<[u8; 32], Vec<super::AuthorizedUserBan>>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// A digest of everything the ban cap's choice depends on.
+    pub(crate) fn cap_inputs_digest(
+        bans: &[super::AuthorizedUserBan],
+        max_bans: usize,
+        depth_cap: usize,
+        members: &super::MembersV1,
+        evidence: &super::BanEvidenceV1,
+        member_info: &super::MemberInfoV1,
+        parameters: &super::ChatRoomParametersV1,
+    ) -> [u8; 32] {
+        crate::util::record_digest(&(
+            bans,
+            max_bans as u64,
+            depth_cap as u64,
+            members,
+            evidence,
+            member_info,
+            parameters,
+        ))
+    }
+
+    /// The bans the cap kept for these inputs earlier in this scope.
+    pub(crate) fn cap_result(inputs: &[u8; 32]) -> Option<Vec<super::AuthorizedUserBan>> {
+        CAP.with(|c| c.borrow().as_ref().and_then(|c| c.get(inputs).cloned()))
+    }
+
+    pub(crate) fn record_cap_result(inputs: [u8; 32], kept: &[super::AuthorizedUserBan]) {
+        CAP.with(|c| {
+            if let Some(c) = c.borrow_mut().as_mut() {
+                c.insert(inputs, kept.to_vec());
+            }
+        });
     }
 
     pub(crate) fn lookup(key: &Key) -> Option<bool> {
@@ -814,8 +890,10 @@ pub(crate) mod signature_memo {
     #[cfg(debug_assertions)]
     pub(crate) fn set_aside<R>(f: impl FnOnce() -> R) -> R {
         let held = MEMO.with(|m| m.borrow_mut().take());
+        let held_caps = CAP.with(|c| c.borrow_mut().take());
         let r = f();
         MEMO.with(|m| *m.borrow_mut() = held);
+        CAP.with(|c| *c.borrow_mut() = held_caps);
         r
     }
 
@@ -828,12 +906,14 @@ pub(crate) mod signature_memo {
         impl Drop for Clear {
             fn drop(&mut self) {
                 MEMO.with(|m| *m.borrow_mut() = None);
+                CAP.with(|c| *c.borrow_mut() = None);
             }
         }
         let outermost = MEMO.with(|m| {
             let mut m = m.borrow_mut();
             if m.is_none() {
                 *m = Some(HashMap::new());
+                CAP.with(|c| *c.borrow_mut() = Some(HashMap::new()));
                 true
             } else {
                 false

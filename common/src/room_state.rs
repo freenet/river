@@ -4009,15 +4009,11 @@ mod tests {
         );
     }
 
-    /// A cleanup holding twice `max_user_bans` live bans (issuers present
-    /// members, targets known nowhere) at the default caps: every ban
-    /// signature is verified at most once across the whole call, the cap
-    /// resolves bans about once per ban it judges, the fixpoint step stops
-    /// within its bound, and the call fits a time budget. All three passes
-    /// are forced, as the worst case pays for them.
-    #[test]
-    fn cleanup_cost_stays_quadratic_and_memoized() {
-        let caps = 200usize;
+    /// `caps` members (10 owner-invited roots, the rest one level below),
+    /// one message each, and `2 * caps` live bans (issuers present members,
+    /// targets known nowhere), at `max_members = max_user_bans =
+    /// max_recent_messages = caps`: twice what the ban cap keeps.
+    fn ban_cap_cost_fixture(caps: usize) -> (ChatRoomStateV1, ChatRoomParametersV1) {
         let key = |b: u64| {
             let mut x = [0u8; 32];
             x[..8].copy_from_slice(&b.to_le_bytes());
@@ -4098,6 +4094,53 @@ mod tests {
         };
         state.recent_messages.rebuild_actions_state();
 
+        (state, params)
+    }
+
+    /// A whole-state merge that takes a room over its ban cap runs the cap
+    /// once: the DM apply's enforced-ban set and cleanup step 0-cap judge the
+    /// same inputs, and the second takes the first's answer. Each ban
+    /// signature is verified at most once across the merge.
+    #[test]
+    fn a_merge_over_the_ban_cap_judges_the_bans_once() {
+        let caps = 200usize;
+        let (full, params) = ban_cap_cost_fixture(caps);
+        let half = |range: std::ops::Range<usize>| {
+            let mut s = full.clone();
+            s.bans = BansV1(full.bans.0[range].to_vec());
+            s.post_apply_cleanup(&params).unwrap();
+            s
+        };
+        let (mut a, b) = (half(0..caps), half(caps..2 * caps));
+        cleanup_counters::reset();
+        a.merge_from(&params, &b).unwrap();
+        let (verified, resolved, _) = cleanup_counters::read();
+        assert_eq!(a.bans.0.len(), caps);
+        assert!(
+            verified <= 2 * caps,
+            "{verified} signature checks for {} bans",
+            2 * caps
+        );
+        // The cap judges at most each held ban once per phase it reaches;
+        // here every ban is live, so about `caps` judgments, plus one
+        // resolution per cleanup pass. Running the cap twice would double it.
+        assert!(
+            resolved <= caps + 10,
+            "{resolved} resolutions: the cap ran more than once"
+        );
+    }
+
+    /// A cleanup holding twice `max_user_bans` live bans (issuers present
+    /// members, targets known nowhere) at the default caps: every ban
+    /// signature is verified at most once across the whole call, the cap
+    /// resolves bans about once per ban it judges, the fixpoint step stops
+    /// within its bound, and the call fits a time budget. All three passes
+    /// are forced, as the worst case pays for them.
+    #[test]
+    fn cleanup_cost_stays_quadratic_and_memoized() {
+        let caps = 200usize;
+        let held_bans = 2 * caps;
+        let (mut state, params) = ban_cap_cost_fixture(caps);
         cleanup_counters::reset();
         let started = std::time::Instant::now();
         cleanup_counters::forcing_all_passes(|| state.post_apply_cleanup(&params)).unwrap();
