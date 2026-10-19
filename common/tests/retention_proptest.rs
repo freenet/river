@@ -3,8 +3,12 @@
 //!
 //! # Why these exist
 //!
-//! `MessagesV1` and `DirectMessagesV1` REMOVE entries during `apply_delta`
-//! (newest-`max_recent_messages`, newest-`MAX_DM_MESSAGES_PER_PAIR`-per-pair).
+//! `MessagesV1` and `DirectMessagesV1` REMOVE entries when a room delta is
+//! applied (newest-`max_recent_messages`, newest-`MAX_DM_MESSAGES_PER_PAIR`-
+//! per-pair, then the global DM cap). The caps are ROOM rules, applied by
+//! `ChatRoomStateV1::post_apply_cleanup` after every field; the field applies
+//! only add, dedup and sort. So every property here that depends on a cap
+//! builds whole room states and applies its deltas at room level.
 //! Pruning is correct and stays: "newest N by `(time, id)`" IS a valid join,
 //! because everything it drops is older than everything it keeps and can never
 //! re-enter. The state converges fine.
@@ -47,7 +51,9 @@ use river_core::room_state::member::{AuthorizedMember, Member, MemberId, Members
 use river_core::room_state::message::{
     AuthorizedMessageV1, MessageOrderKey, MessageV1, MessagesV1, RoomMessageBody,
 };
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Summary};
+use river_core::room_state::{
+    ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary,
+};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -91,6 +97,16 @@ struct Fixture {
     dms_forward: Vec<AuthorizedDirectMessage>,
     /// DMs for the ordered pair `(peer -> author)`, ascending by timestamp.
     dms_reverse: Vec<AuthorizedDirectMessage>,
+    /// One DM `(author -> peer)`, outside both pools, held by every room the
+    /// MESSAGE properties build. Cleanup prunes a member nothing needs, so a
+    /// room whose capped window ended empty (cap 0, or no messages) would
+    /// otherwise drop the author, and every message it was later offered
+    /// would be skipped as unauthorized. A DM keeps both its participants.
+    anchor_dm: AuthorizedDirectMessage,
+    /// One room message from each member, outside the message pool, held by
+    /// every room the DM properties build, for the same reason: a room
+    /// holding no DMs would otherwise prune both participants.
+    anchor_messages: Vec<AuthorizedMessageV1>,
 }
 
 /// Signing is the expensive part of every case, so the pools are built exactly
@@ -187,6 +203,31 @@ fn build_fixture() -> Fixture {
         })
         .collect();
 
+    let anchor_dm = sign_direct_message(
+        &author_sk,
+        author_id,
+        peer_id,
+        &owner_vk,
+        BASE_SECS - 1,
+        vec![0xA5; 8],
+    )
+    .expect("sign anchor dm");
+
+    let anchor_messages = [(&author_sk, author_id), (&peer_sk, peer_id)]
+        .into_iter()
+        .map(|(sk, author)| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author,
+                    time: SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS - 1),
+                    content: RoomMessageBody::public("anchor".to_string()),
+                },
+                sk,
+            )
+        })
+        .collect();
+
     Fixture {
         params: ChatRoomParametersV1 { owner: owner_vk },
         owner_sk,
@@ -194,6 +235,8 @@ fn build_fixture() -> Fixture {
         messages,
         dms_forward,
         dms_reverse,
+        anchor_dm,
+        anchor_messages,
     }
 }
 
@@ -322,15 +365,72 @@ fn two_orders(indices: BoxedStrategy<Vec<usize>>) -> BoxedStrategy<(Vec<usize>, 
 // Builders and oracles
 // ---------------------------------------------------------------------------
 
-/// `MessagesV1` holding the pool entries at `idx`, normalised through
-/// `apply_delta` (sorted and pruned) exactly as a real peer's stored state is.
-fn messages_from(parent: &ChatRoomStateV1, idx: &[usize]) -> MessagesV1 {
+/// Apply `delta` to `room` as a whole room delta: every field, then
+/// `post_apply_cleanup`, which applies the message and DM caps.
+fn apply_room_delta(room: &mut ChatRoomStateV1, delta: ChatRoomStateV1Delta) -> Result<(), String> {
+    // The macro's `apply_delta` ignores its outer parent (it re-reads `self`
+    // per field), so a cheap default stands in for it.
+    room.apply_delta(&ChatRoomStateV1::default(), &fixture().params, &Some(delta))
+}
+
+/// The room `parent` (which carries the cap) holding the message-pool entries
+/// at `idx`, normalised through a room-level apply (sorted, and truncated to
+/// the cap by cleanup) exactly as a real peer's stored state is. It also holds
+/// the fixture's anchor DM, so both members stay in the room whatever its
+/// message window holds.
+fn room_with_messages(parent: &ChatRoomStateV1, idx: &[usize]) -> ChatRoomStateV1 {
     let f = fixture();
-    let mut m = MessagesV1::default();
+    let mut room = parent.clone();
+    room.direct_messages.messages.push(f.anchor_dm.clone());
     let delta: Vec<AuthorizedMessageV1> = idx.iter().map(|i| f.messages[*i].clone()).collect();
-    m.apply_delta(parent, &f.params, &Some(delta))
-        .expect("fixture messages must apply");
-    m
+    apply_room_delta(
+        &mut room,
+        ChatRoomStateV1Delta {
+            recent_messages: Some(delta),
+            ..Default::default()
+        },
+    )
+    .expect("fixture messages must apply");
+    room
+}
+
+/// `MessagesV1` holding the pool entries at `idx`, normalised exactly as a
+/// real peer's stored state is (see [`room_with_messages`]).
+fn messages_from(parent: &ChatRoomStateV1, idx: &[usize]) -> MessagesV1 {
+    room_with_messages(parent, idx).recent_messages
+}
+
+/// `receiver` absorbs what `sender` offers on the messages field: the
+/// receiver's messages summary, read against its own room (so its own cap sets
+/// the horizon), and the sender's messages delta against it, applied as a room
+/// delta so cleanup applies the cap. This is `MessagesV1`'s
+/// `ComposableState::merge`, at room level; the receiver keeps its own
+/// configuration, so the two caps may differ.
+fn absorb_messages(receiver: &mut ChatRoomStateV1, sender: &ChatRoomStateV1) -> Result<(), String> {
+    let params = &fixture().params;
+    let summary = receiver.recent_messages.summarize(receiver, params);
+    let offered = sender.recent_messages.delta(sender, params, &summary);
+    apply_room_delta(
+        receiver,
+        ChatRoomStateV1Delta {
+            recent_messages: offered,
+            ..Default::default()
+        },
+    )
+}
+
+/// The DM counterpart of [`absorb_messages`].
+fn absorb_dms(receiver: &mut ChatRoomStateV1, sender: &ChatRoomStateV1) -> Result<(), String> {
+    let params = &fixture().params;
+    let summary = receiver.direct_messages.summarize(receiver, params);
+    let offered = sender.direct_messages.delta(sender, params, &summary);
+    apply_room_delta(
+        receiver,
+        ChatRoomStateV1Delta {
+            direct_messages: offered,
+            ..Default::default()
+        },
+    )
 }
 
 fn message_keys(m: &MessagesV1) -> Vec<MessageOrderKey> {
@@ -358,37 +458,49 @@ fn message_key_union(a: &MessagesV1, b: &MessagesV1) -> Vec<MessageOrderKey> {
     keys
 }
 
-/// `DirectMessagesV1` holding the pool entries at `fwd` (author -> peer) and
-/// `rev` (peer -> author), normalised (trimmed to the per-pair cap and sorted)
-/// exactly as a real peer's stored state is.
+/// The room `parent` (which carries the caps) holding the DM-pool entries at
+/// `fwd` (author -> peer) and `rev` (peer -> author), normalised (sorted, and
+/// trimmed to the per-pair and global caps by cleanup) exactly as a real
+/// peer's stored state is. It also holds the fixture's anchor messages, so
+/// both members stay in the room whatever DMs it holds.
 ///
-/// The messages are assembled directly and normalised with an EMPTY delta
-/// rather than fed in as `new_messages`. `apply_delta`'s trim and sort still
-/// run — those are what "normalised" means — but its per-message ed25519
-/// verification is skipped for pool entries already known to be valid. That
-/// verification dominates the runtime of an unoptimised test build and buys
-/// nothing here: the merge UNDER TEST still drives the full
-/// verify-and-accept path for everything the sender offers.
-fn dms_from(parent: &ChatRoomStateV1, fwd: &[usize], rev: &[usize]) -> DirectMessagesV1 {
+/// The DMs are assembled directly and normalised by a room delta whose DM
+/// sub-delta is EMPTY rather than fed in as `new_messages`. The sort and
+/// cleanup's caps still run — those are what "normalised" means — but the
+/// per-message ed25519 verification is skipped for pool entries already
+/// known to be valid. That verification dominates the runtime of an
+/// unoptimised test build and buys nothing here: the merge UNDER TEST still
+/// drives the full verify-and-accept path for everything the sender offers.
+fn room_with_dms(parent: &ChatRoomStateV1, fwd: &[usize], rev: &[usize]) -> ChatRoomStateV1 {
     let f = fixture();
     let mut messages: Vec<AuthorizedDirectMessage> =
         fwd.iter().map(|i| f.dms_forward[*i].clone()).collect();
     messages.extend(rev.iter().map(|i| f.dms_reverse[*i].clone()));
 
-    let mut d = DirectMessagesV1 {
+    let mut room = parent.clone();
+    room.direct_messages = DirectMessagesV1 {
         messages,
         ..Default::default()
     };
-    d.apply_delta(
-        parent,
-        &f.params,
-        &Some(DirectMessagesDelta {
-            new_messages: vec![],
-            advanced_purges: vec![],
-        }),
+    apply_room_delta(
+        &mut room,
+        ChatRoomStateV1Delta {
+            recent_messages: Some(f.anchor_messages.clone()),
+            direct_messages: Some(DirectMessagesDelta {
+                new_messages: vec![],
+                advanced_purges: vec![],
+            }),
+            ..Default::default()
+        },
     )
     .expect("fixture dms must normalise");
-    d
+    room
+}
+
+/// `DirectMessagesV1` holding the pool entries at `fwd` and `rev`, normalised
+/// exactly as a real peer's stored state is (see [`room_with_dms`]).
+fn dms_from(parent: &ChatRoomStateV1, fwd: &[usize], rev: &[usize]) -> DirectMessagesV1 {
+    room_with_dms(parent, fwd, rev).direct_messages
 }
 
 type PairKeys = BTreeMap<(MemberId, MemberId), Vec<DmOrderKey>>;
@@ -455,16 +567,17 @@ fn merging_a_peer_leaves_it_with_nothing_further_to_offer() {
             let parent_a = parent_with_cap(cap_a);
             let parent_b = parent_with_cap(cap_b);
 
-            let mut a = messages_from(&parent_a, &idx_a);
-            let b = messages_from(&parent_b, &idx_b);
+            let mut a = room_with_messages(&parent_a, &idx_a);
+            let b = room_with_messages(&parent_b, &idx_b);
 
-            // The receiver always merges against its OWN parent state — that is
-            // what the contract and `merge_incoming_state` do, and it is why
-            // the caps may differ.
-            a.merge(&parent_a, &f.params, &b).expect("a.merge(b)");
+            // The receiver always merges against its OWN room — that is what
+            // the contract and `merge_incoming_state` do, and it is why the
+            // caps may differ.
+            absorb_messages(&mut a, &b).expect("a absorbs b");
 
             prop_assert_eq!(
-                b.delta(&parent_a, &f.params, &a.summarize(&parent_a, &f.params)),
+                b.recent_messages
+                    .delta(&b, &f.params, &a.recent_messages.summarize(&a, &f.params)),
                 None,
                 "B still had a payload for A after A merged it — this is the resend loop"
             );
@@ -493,20 +606,24 @@ fn re_merging_the_same_peer_changes_neither_state_nor_traffic() {
             let parent_a = parent_with_cap(cap_a);
             let parent_b = parent_with_cap(cap_b);
 
-            let mut once = messages_from(&parent_a, &idx_a);
-            let b = messages_from(&parent_b, &idx_b);
-            once.merge(&parent_a, &f.params, &b).expect("first merge");
+            let mut once = room_with_messages(&parent_a, &idx_a);
+            let b = room_with_messages(&parent_b, &idx_b);
+            absorb_messages(&mut once, &b).expect("first merge");
 
             let mut twice = once.clone();
-            twice.merge(&parent_a, &f.params, &b).expect("second merge");
+            absorb_messages(&mut twice, &b).expect("second merge");
 
             prop_assert_eq!(
-                message_keys(&twice),
-                message_keys(&once),
+                message_keys(&twice.recent_messages),
+                message_keys(&once.recent_messages),
                 "a second merge of the same peer changed the retained window"
             );
             prop_assert_eq!(
-                b.delta(&parent_a, &f.params, &twice.summarize(&parent_a, &f.params)),
+                b.recent_messages.delta(
+                    &b,
+                    &f.params,
+                    &twice.recent_messages.summarize(&twice, &f.params)
+                ),
                 None,
                 "a second merge of the same peer still produced traffic"
             );
@@ -522,20 +639,17 @@ fn re_merging_the_same_peer_changes_neither_state_nor_traffic() {
 /// already holds.
 #[test]
 fn merging_a_peer_with_itself_is_the_identity() {
-    let f = fixture();
     check(256, (held_indices(MSG_POOL), 0..=MAX_CAP), |(idx, cap)| {
         let parent = parent_with_cap(cap);
-        let original = messages_from(&parent, &idx);
+        let original = room_with_messages(&parent, &idx);
 
         let mut merged = original.clone();
         let other = original.clone();
-        merged
-            .merge(&parent, &f.params, &other)
-            .expect("self merge");
+        absorb_messages(&mut merged, &other).expect("self merge");
 
         prop_assert_eq!(
-            message_keys(&merged),
-            message_keys(&original),
+            message_keys(&merged.recent_messages),
+            message_keys(&original.recent_messages),
             "merging a state with itself changed it"
         );
         Ok(())
@@ -558,7 +672,6 @@ fn merging_a_peer_with_itself_is_the_identity() {
 ///   `cap` and also FAILS.
 #[test]
 fn a_merge_retains_exactly_the_newest_cap_entries_of_the_union() {
-    let f = fixture();
     check(
         512,
         (
@@ -571,14 +684,18 @@ fn a_merge_retains_exactly_the_newest_cap_entries_of_the_union() {
             let parent_a = parent_with_cap(cap_a);
             let parent_b = parent_with_cap(cap_b);
 
-            let mut a = messages_from(&parent_a, &idx_a);
-            let b = messages_from(&parent_b, &idx_b);
-            let expected = newest_message_keys(message_key_union(&a, &b), cap_a);
+            let mut a = room_with_messages(&parent_a, &idx_a);
+            let b = room_with_messages(&parent_b, &idx_b);
+            let expected = newest_message_keys(
+                message_key_union(&a.recent_messages, &b.recent_messages),
+                cap_a,
+            );
 
-            a.merge(&parent_a, &f.params, &b).expect("a.merge(b)");
+            // A absorbs B in its own room, so A's cap decides.
+            absorb_messages(&mut a, &b).expect("a absorbs b");
 
             prop_assert_eq!(
-                message_keys(&a),
+                message_keys(&a.recent_messages),
                 expected,
                 "the merge did not retain exactly the newest {} of the union",
                 cap_a
@@ -592,7 +709,6 @@ fn a_merge_retains_exactly_the_newest_cap_entries_of_the_union() {
 /// same window.
 #[test]
 fn absorbing_two_peers_is_commutative() {
-    let f = fixture();
     check(
         256,
         (
@@ -603,21 +719,21 @@ fn absorbing_two_peers_is_commutative() {
         ),
         |(idx_base, idx_b, idx_c, cap)| {
             let parent = parent_with_cap(cap);
-            let base = messages_from(&parent, &idx_base);
-            let b = messages_from(&parent, &idx_b);
-            let c = messages_from(&parent, &idx_c);
+            let base = room_with_messages(&parent, &idx_base);
+            let b = room_with_messages(&parent, &idx_b);
+            let c = room_with_messages(&parent, &idx_c);
 
             let mut bc = base.clone();
-            bc.merge(&parent, &f.params, &b).expect("merge b");
-            bc.merge(&parent, &f.params, &c).expect("merge c");
+            absorb_messages(&mut bc, &b).expect("absorb b");
+            absorb_messages(&mut bc, &c).expect("absorb c");
 
             let mut cb = base.clone();
-            cb.merge(&parent, &f.params, &c).expect("merge c");
-            cb.merge(&parent, &f.params, &b).expect("merge b");
+            absorb_messages(&mut cb, &c).expect("absorb c");
+            absorb_messages(&mut cb, &b).expect("absorb b");
 
             prop_assert_eq!(
-                message_keys(&bc),
-                message_keys(&cb),
+                message_keys(&bc.recent_messages),
+                message_keys(&cb.recent_messages),
                 "the retained window depended on which neighbour was merged first"
             );
             Ok(())
@@ -632,7 +748,6 @@ fn absorbing_two_peers_is_commutative() {
 /// same union for their own N, which is the retention invariant above).
 #[test]
 fn absorbing_two_peers_is_associative() {
-    let f = fixture();
     check(
         256,
         (
@@ -643,24 +758,24 @@ fn absorbing_two_peers_is_associative() {
         ),
         |(idx_a, idx_b, idx_c, cap)| {
             let parent = parent_with_cap(cap);
-            let a = messages_from(&parent, &idx_a);
-            let b = messages_from(&parent, &idx_b);
-            let c = messages_from(&parent, &idx_c);
+            let a = room_with_messages(&parent, &idx_a);
+            let b = room_with_messages(&parent, &idx_b);
+            let c = room_with_messages(&parent, &idx_c);
 
             // (A . B) . C
             let mut left = a.clone();
-            left.merge(&parent, &f.params, &b).expect("a.merge(b)");
-            left.merge(&parent, &f.params, &c).expect("(ab).merge(c)");
+            absorb_messages(&mut left, &b).expect("a absorbs b");
+            absorb_messages(&mut left, &c).expect("(ab) absorbs c");
 
             // A . (B . C)
             let mut bc = b.clone();
-            bc.merge(&parent, &f.params, &c).expect("b.merge(c)");
+            absorb_messages(&mut bc, &c).expect("b absorbs c");
             let mut right = a.clone();
-            right.merge(&parent, &f.params, &bc).expect("a.merge(bc)");
+            absorb_messages(&mut right, &bc).expect("a absorbs bc");
 
             prop_assert_eq!(
-                message_keys(&left),
-                message_keys(&right),
+                message_keys(&left.recent_messages),
+                message_keys(&right.recent_messages),
                 "grouping changed the retained window"
             );
             Ok(())
@@ -682,26 +797,23 @@ fn a_zero_cap_peer_retains_nothing_and_is_offered_nothing() {
             let parent_zero = parent_with_cap(0);
             let parent_b = parent_with_cap(cap_b);
 
-            let mut a = messages_from(&parent_zero, &idx_a);
-            let b = messages_from(&parent_b, &idx_b);
+            let mut a = room_with_messages(&parent_zero, &idx_a);
+            let b = room_with_messages(&parent_b, &idx_b);
 
             prop_assert!(
-                a.messages.is_empty(),
+                a.recent_messages.messages.is_empty(),
                 "a peer with max_recent_messages = 0 must retain nothing"
             );
             prop_assert_eq!(
-                b.delta(
-                    &parent_zero,
-                    &f.params,
-                    &a.summarize(&parent_zero, &f.params)
-                ),
+                b.recent_messages
+                    .delta(&b, &f.params, &a.recent_messages.summarize(&a, &f.params)),
                 None,
                 "a peer that retains nothing was still offered messages"
             );
 
-            a.merge(&parent_zero, &f.params, &b).expect("merge");
+            absorb_messages(&mut a, &b).expect("merge");
             prop_assert!(
-                a.messages.is_empty(),
+                a.recent_messages.messages.is_empty(),
                 "a zero-cap peer retained messages after a merge"
             );
             Ok(())
@@ -730,13 +842,14 @@ fn merging_a_dm_peer_leaves_it_with_nothing_further_to_offer() {
             dm_held_indices(),
         ),
         |(fwd_a, rev_a, fwd_b, rev_b)| {
-            let mut a = dms_from(&parent, &fwd_a, &rev_a);
-            let b = dms_from(&parent, &fwd_b, &rev_b);
+            let mut a = room_with_dms(&parent, &fwd_a, &rev_a);
+            let b = room_with_dms(&parent, &fwd_b, &rev_b);
 
-            a.merge(&parent, &f.params, &b).expect("a.merge(b)");
+            absorb_dms(&mut a, &b).expect("a absorbs b");
 
             prop_assert_eq!(
-                b.delta(&parent, &f.params, &a.summarize(&parent, &f.params)),
+                b.direct_messages
+                    .delta(&b, &f.params, &a.direct_messages.summarize(&a, &f.params)),
                 None,
                 "B still had DMs for A after A merged them — the DM resend loop"
             );
@@ -755,7 +868,6 @@ fn merging_a_dm_peer_leaves_it_with_nothing_further_to_offer() {
 /// DM from that sender used to be dropped forever.
 #[test]
 fn a_dm_merge_retains_exactly_the_newest_per_pair_cap() {
-    let f = fixture();
     let parent = parent_with_cap(MAX_CAP);
     check(
         64,
@@ -766,14 +878,14 @@ fn a_dm_merge_retains_exactly_the_newest_per_pair_cap() {
             dm_held_indices(),
         ),
         |(fwd_a, rev_a, fwd_b, rev_b)| {
-            let mut a = dms_from(&parent, &fwd_a, &rev_a);
-            let b = dms_from(&parent, &fwd_b, &rev_b);
-            let expected = newest_dm_keys(dm_key_union(&a, &b));
+            let mut a = room_with_dms(&parent, &fwd_a, &rev_a);
+            let b = room_with_dms(&parent, &fwd_b, &rev_b);
+            let expected = newest_dm_keys(dm_key_union(&a.direct_messages, &b.direct_messages));
 
-            a.merge(&parent, &f.params, &b).expect("a.merge(b)");
+            absorb_dms(&mut a, &b).expect("a absorbs b");
 
             prop_assert_eq!(
-                dm_keys(&a),
+                dm_keys(&a.direct_messages),
                 expected,
                 "the DM merge did not retain exactly the newest {} per pair",
                 MAX_DM_MESSAGES_PER_PAIR
@@ -787,7 +899,6 @@ fn a_dm_merge_retains_exactly_the_newest_per_pair_cap() {
 /// DMs a peer ended up holding depended on the order neighbours were merged in.
 #[test]
 fn absorbing_two_dm_peers_is_commutative() {
-    let f = fixture();
     let parent = parent_with_cap(MAX_CAP);
     check(
         64,
@@ -800,21 +911,21 @@ fn absorbing_two_dm_peers_is_commutative() {
             dm_held_indices(),
         ),
         |(fwd_base, rev_base, fwd_b, rev_b, fwd_c, rev_c)| {
-            let base = dms_from(&parent, &fwd_base, &rev_base);
-            let b = dms_from(&parent, &fwd_b, &rev_b);
-            let c = dms_from(&parent, &fwd_c, &rev_c);
+            let base = room_with_dms(&parent, &fwd_base, &rev_base);
+            let b = room_with_dms(&parent, &fwd_b, &rev_b);
+            let c = room_with_dms(&parent, &fwd_c, &rev_c);
 
             let mut bc = base.clone();
-            bc.merge(&parent, &f.params, &b).expect("merge b");
-            bc.merge(&parent, &f.params, &c).expect("merge c");
+            absorb_dms(&mut bc, &b).expect("absorb b");
+            absorb_dms(&mut bc, &c).expect("absorb c");
 
             let mut cb = base.clone();
-            cb.merge(&parent, &f.params, &c).expect("merge c");
-            cb.merge(&parent, &f.params, &b).expect("merge b");
+            absorb_dms(&mut cb, &c).expect("absorb c");
+            absorb_dms(&mut cb, &b).expect("absorb b");
 
             prop_assert_eq!(
-                dm_keys(&bc),
-                dm_keys(&cb),
+                dm_keys(&bc.direct_messages),
+                dm_keys(&cb.direct_messages),
                 "the retained DM set depended on which neighbour was merged first"
             );
             Ok(())
@@ -825,7 +936,6 @@ fn absorbing_two_dm_peers_is_commutative() {
 /// Associativity for DMs.
 #[test]
 fn absorbing_two_dm_peers_is_associative() {
-    let f = fixture();
     let parent = parent_with_cap(MAX_CAP);
     check(
         64,
@@ -838,22 +948,22 @@ fn absorbing_two_dm_peers_is_associative() {
             dm_held_indices(),
         ),
         |(fwd_a, rev_a, fwd_b, rev_b, fwd_c, rev_c)| {
-            let a = dms_from(&parent, &fwd_a, &rev_a);
-            let b = dms_from(&parent, &fwd_b, &rev_b);
-            let c = dms_from(&parent, &fwd_c, &rev_c);
+            let a = room_with_dms(&parent, &fwd_a, &rev_a);
+            let b = room_with_dms(&parent, &fwd_b, &rev_b);
+            let c = room_with_dms(&parent, &fwd_c, &rev_c);
 
             let mut left = a.clone();
-            left.merge(&parent, &f.params, &b).expect("a.merge(b)");
-            left.merge(&parent, &f.params, &c).expect("(ab).merge(c)");
+            absorb_dms(&mut left, &b).expect("a absorbs b");
+            absorb_dms(&mut left, &c).expect("(ab) absorbs c");
 
             let mut bc = b.clone();
-            bc.merge(&parent, &f.params, &c).expect("b.merge(c)");
+            absorb_dms(&mut bc, &c).expect("b absorbs c");
             let mut right = a.clone();
-            right.merge(&parent, &f.params, &bc).expect("a.merge(bc)");
+            absorb_dms(&mut right, &bc).expect("a absorbs bc");
 
             prop_assert_eq!(
-                dm_keys(&left),
-                dm_keys(&right),
+                dm_keys(&left.direct_messages),
+                dm_keys(&right.direct_messages),
                 "grouping changed the retained DM set"
             );
             Ok(())
@@ -867,10 +977,9 @@ fn absorbing_two_dm_peers_is_associative() {
 /// must not be counted as covering it.** A self-merge produces `delta == None`,
 /// so the horizon FILTER in `delta` is not on this path at all.
 ///
-/// (Since freenet/river#519 the `None` arm of `DirectMessagesV1::apply_delta`
-/// does run the trims, via `enforce_caps_and_sort`, so they are technically on
-/// this path — but only as a no-op, because the state was already normalised
-/// when it was built. The property remains weak.)
+/// (The merge is a room-level apply, so `post_apply_cleanup`'s trims do run
+/// on this path — but only as a no-op, because the state was already
+/// normalised when it was built. The property remains weak.)
 ///
 /// Kept because it is the base case of the monoid and would catch a `delta`
 /// that offered entries the receiver already holds. Labelled explicitly so it
@@ -882,19 +991,16 @@ fn absorbing_two_dm_peers_is_associative() {
 /// weak for the same reason and is labelled the same way.)
 #[test]
 fn merging_a_dm_peer_with_itself_is_the_identity() {
-    let f = fixture();
     let parent = parent_with_cap(MAX_CAP);
     check(64, (dm_held_indices(), dm_held_indices()), |(fwd, rev)| {
-        let original = dms_from(&parent, &fwd, &rev);
+        let original = room_with_dms(&parent, &fwd, &rev);
         let mut merged = original.clone();
         let other = original.clone();
-        merged
-            .merge(&parent, &f.params, &other)
-            .expect("self merge");
+        absorb_dms(&mut merged, &other).expect("self merge");
 
         prop_assert_eq!(
-            dm_keys(&merged),
-            dm_keys(&original),
+            dm_keys(&merged.direct_messages),
+            dm_keys(&original.direct_messages),
             "merging a DM state with itself changed it"
         );
         Ok(())
@@ -908,7 +1014,7 @@ fn merging_a_dm_peer_with_itself_is_the_identity() {
 /// `re_merging_the_same_peer_changes_neither_state_nor_traffic`, and it exists
 /// because the self-merge property above is structurally unable to reach the
 /// trim or the pair horizon. Here the FIRST merge carries a real non-empty
-/// delta, so `apply_delta` runs all the way through `trim_pairs_to_cap`, and
+/// delta, applied at room level so cleanup's per-pair trim runs on it, and
 /// the second merge is the actual fixpoint assertion.
 #[test]
 fn re_merging_the_same_dm_peer_changes_neither_state_nor_traffic() {
@@ -923,20 +1029,24 @@ fn re_merging_the_same_dm_peer_changes_neither_state_nor_traffic() {
             dm_held_indices(),
         ),
         |(fwd_a, rev_a, fwd_b, rev_b)| {
-            let mut once = dms_from(&parent, &fwd_a, &rev_a);
-            let b = dms_from(&parent, &fwd_b, &rev_b);
-            once.merge(&parent, &f.params, &b).expect("first merge");
+            let mut once = room_with_dms(&parent, &fwd_a, &rev_a);
+            let b = room_with_dms(&parent, &fwd_b, &rev_b);
+            absorb_dms(&mut once, &b).expect("first merge");
 
             let mut twice = once.clone();
-            twice.merge(&parent, &f.params, &b).expect("second merge");
+            absorb_dms(&mut twice, &b).expect("second merge");
 
             prop_assert_eq!(
-                dm_keys(&twice),
-                dm_keys(&once),
+                dm_keys(&twice.direct_messages),
+                dm_keys(&once.direct_messages),
                 "a second merge of the same DM peer changed the retained set"
             );
             prop_assert_eq!(
-                b.delta(&parent, &f.params, &twice.summarize(&parent, &f.params)),
+                b.direct_messages.delta(
+                    &b,
+                    &f.params,
+                    &twice.direct_messages.summarize(&twice, &f.params)
+                ),
                 None,
                 "a second merge of the same DM peer still produced traffic"
             );
@@ -1128,29 +1238,29 @@ fn newest_dm_keys_globally_capped(union: PairKeys, dm_cap: usize) -> PairKeys {
 /// cap fails rather than passing vacuously.
 #[test]
 fn a_dm_merge_retains_exactly_the_newest_global_cap_of_the_union() {
-    let f = fixture();
     check(
         64,
         (dm_held_indices(), dm_held_indices(), 1..=MAX_DM_CAP),
         |(fwd, rev, dm_cap)| {
             let parent = parent_with_dm_cap(dm_cap);
-            let mut a = dms_from(&parent, &fwd, &[]);
-            let b = dms_from(&parent, &[], &rev);
+            let mut a = room_with_dms(&parent, &fwd, &[]);
+            let b = room_with_dms(&parent, &[], &rev);
 
-            let expected = newest_dm_keys_globally_capped(dm_key_union(&a, &b), dm_cap);
+            let expected = newest_dm_keys_globally_capped(
+                dm_key_union(&a.direct_messages, &b.direct_messages),
+                dm_cap,
+            );
 
-            let delta = b.delta(&parent, &f.params, &a.summarize(&parent, &f.params));
-            a.apply_delta(&parent, &f.params, &delta)
-                .expect("apply dm delta");
+            absorb_dms(&mut a, &b).expect("apply dm delta");
 
             prop_assert!(
-                a.messages.len() <= dm_cap,
+                a.direct_messages.messages.len() <= dm_cap,
                 "the merged state exceeds the global cap: {} > {}",
-                a.messages.len(),
+                a.direct_messages.messages.len(),
                 dm_cap
             );
             prop_assert_eq!(
-                dm_keys(&a),
+                dm_keys(&a.direct_messages),
                 expected,
                 "the merge did not retain exactly the newest {} of the union",
                 dm_cap
@@ -1170,15 +1280,14 @@ fn merging_a_dm_peer_under_a_global_cap_leaves_it_with_nothing_further_to_offer(
         (dm_held_indices(), dm_held_indices(), 1..=MAX_DM_CAP),
         |(fwd, rev, dm_cap)| {
             let parent = parent_with_dm_cap(dm_cap);
-            let mut a = dms_from(&parent, &fwd, &rev);
-            let b = dms_from(&parent, &rev, &fwd);
+            let mut a = room_with_dms(&parent, &fwd, &rev);
+            let b = room_with_dms(&parent, &rev, &fwd);
 
-            let delta = b.delta(&parent, &f.params, &a.summarize(&parent, &f.params));
-            a.apply_delta(&parent, &f.params, &delta)
-                .expect("apply dm delta");
+            absorb_dms(&mut a, &b).expect("apply dm delta");
 
             prop_assert_eq!(
-                b.delta(&parent, &f.params, &a.summarize(&parent, &f.params)),
+                b.direct_messages
+                    .delta(&b, &f.params, &a.direct_messages.summarize(&a, &f.params)),
                 None,
                 "B still had a DM payload for A after A merged it — the resend loop, \
                  now on the global axis"
@@ -1193,7 +1302,6 @@ fn merging_a_dm_peer_under_a_global_cap_leaves_it_with_nothing_further_to_offer(
 /// than of arrival order.
 #[test]
 fn absorbing_two_dm_peers_under_a_global_cap_is_commutative() {
-    let f = fixture();
     check(
         48,
         (
@@ -1204,17 +1312,15 @@ fn absorbing_two_dm_peers_under_a_global_cap_is_commutative() {
         ),
         |(base, x, y, dm_cap)| {
             let parent = parent_with_dm_cap(dm_cap);
-            let peer_x = dms_from(&parent, &x, &[]);
-            let peer_y = dms_from(&parent, &[], &y);
+            let peer_x = room_with_dms(&parent, &x, &[]);
+            let peer_y = room_with_dms(&parent, &[], &y);
 
-            let absorb = |first: &DirectMessagesV1, second: &DirectMessagesV1| {
-                let mut s = dms_from(&parent, &base, &[]);
+            let absorb = |first: &ChatRoomStateV1, second: &ChatRoomStateV1| {
+                let mut s = room_with_dms(&parent, &base, &[]);
                 for peer in [first, second] {
-                    let delta = peer.delta(&parent, &f.params, &s.summarize(&parent, &f.params));
-                    s.apply_delta(&parent, &f.params, &delta)
-                        .expect("apply dm delta");
+                    absorb_dms(&mut s, peer).expect("apply dm delta");
                 }
-                s
+                s.direct_messages
             };
 
             prop_assert_eq!(
