@@ -1810,13 +1810,15 @@ test.describe("An arrival follows a reader at the end", () => {
     await setTabVisibility(page, "visible");
     await expectSettledAtBottom(page, "the tab coming back moved the view");
     await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);
+    // Read on return alone, before any later arrival could read the room.
+    await settle(page);
+    expect(
+      await hiddenTitleCount(page),
+      "the tab came back on the newest message and the room still counts the arrivals unread",
+    ).toBe(before);
+    await setTabVisibility(page, "visible");
     await deliverOffscreen(page, "arrival after the tab came back");
     await expectFollowed(page, "arrival after the tab came back", "an arrival after the tab came back did not follow");
-    await selectListedRoom(page, "Public Discussion Room");
-    await expect(
-      roomUnreadBadge(page, "Team Chat Room"),
-      "the tab came back on the newest message and the room still counts it unread",
-    ).toHaveCount(0);
   });
 
   test("an arrival in a hidden tab does not move a parked reader, nor does the tab coming back", { tag: "@chromium-only" }, async ({ page }) => {
