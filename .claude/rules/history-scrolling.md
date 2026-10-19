@@ -152,7 +152,8 @@ Known limitations:
   which also re-observes the container), so a reveal restores the reader even
   when the ResizeObserver never reported the hide: a hide and reveal with no
   rendering update between them look like no change to it
-  ([#799](https://github.com/freenet/river/issues/799)). Deleting the reading row uses the row above
+  ([#799](https://github.com/freenet/river/issues/799)). Deleting the
+  reading row uses the row above
   as the preferred fallback. The reading row is the first row whose top lies
   inside the view, else the row the view's top cuts through (a message
   taller than the view, not the row starting below the fold).
