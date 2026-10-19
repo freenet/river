@@ -35,13 +35,14 @@ import {
 
 // Where a DM thread's view goes: opening it lands on the
 // newest DM, an own send jumps to the end once, and Latest jumps there on
-// request. An inbound DM follows a reader at the end of a thread in the
-// foreground (FOLLOW_BAND_PX); anywhere else it lands below and Latest
-// offers it. Nothing else moves the view.
+// request. An inbound DM follows a reader at the end of a thread
+// (FOLLOW_BAND_PX), in a hidden tab too; anywhere else it lands below and
+// Latest offers it. Nothing else moves the view.
 //
 // And when the thread counts as seen: only up to an inbound DM that was on
 // screen while the thread was in the foreground. One that lands below the
-// fold, or arrives while the tab is hidden, stays unread.
+// fold stays unread, and one that arrives while the tab is hidden stays
+// unread until the tab is visible.
 //
 // The thread is populated through the `appendDmsForPeer` / `deliverDmForPeer`
 // test hooks, which add sender-signed DMs from a test member (DM_PEER unless
@@ -100,11 +101,6 @@ async function openEmptyThread(page: Page) {
   await page.goto("/");
   await waitForApp(page);
   await selectRoom(page, "Team Chat Room");
-  await openEmptyThreadHere(page);
-}
-
-/// `openEmptyThread` without the reload, so this session's earlier sends stand.
-async function openEmptyThreadHere(page: Page) {
   await callRiverTest(page, "admitDmPeer", OTHER_DM_PEER.index);
   await memberRows(page).filter({ hasText: OTHER_DM_PEER.name }).first().click();
   await expect(page.getByTestId("member-info-modal")).toBeVisible({ timeout: 5_000 });
@@ -112,23 +108,6 @@ async function openEmptyThreadHere(page: Page) {
   await expect(page.locator(THREAD)).toBeVisible({ timeout: 5_000 });
   await expect(page.getByText(/no messages yet/i), "premise: the thread opened empty").toBeVisible();
   await settle(page);
-}
-
-/// In a hidden tab, a burst that overflows the open empty thread leaves it at
-/// the top (`why` if not); the tab coming back does not move it and Latest shows.
-async function expectHiddenBurstStaysAtTop(page: Page, why: string) {
-  await setTabVisibility(page, "hidden");
-  // One mutation, so the burst's last DM is the thread's first bubble.
-  await callRiverTest(page, "appendDmsForPeer", OTHER_DM_PEER.index, HISTORY);
-  await expect(dm(page, newestHistoryDm(OTHER_DM_PEER))).toHaveCount(1, { timeout: 5_000 });
-  await settle(page);
-  const { max, top } = await scrollMetrics(page, DM_VIEW);
-  expect(max, "premise: the burst overflows the thread").toBeGreaterThan(0);
-  expect(top, why).toBeLessThanOrEqual(1);
-  await recordScrolls(page);
-  await setTabVisibility(page, "visible");
-  await expectStill(page, "the tab coming back moved the thread");
-  await expect(page.getByTestId(LATEST)).toBeVisible();
 }
 
 test.describe("DM thread scroll position", () => {
@@ -297,17 +276,38 @@ test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
     expect(errors).toEqual([]);
   });
 
-  test("an inbound DM at the end in a hidden tab lands below the view, offers Latest, and stays unread until the reader scrolls to it", async ({
+  // A reader who left the end in view and switched away comes back to the
+  // end. Parked above the arrival instead, they were soon past the band, so
+  // no later DM followed either.
+  test("an inbound DM at the end in a hidden tab follows, and stays unread until the tab is visible", async ({
     page,
   }) => {
     await openThreadWithHistory(page);
     await expect(railBadge(page), "premise: opening the thread marked it seen").toHaveCount(0);
+
+    await setTabVisibility(page, "hidden");
+    await deliverDm(page, "followed in a hidden tab");
+    await expectAtEnd(page, "an inbound DM in a hidden tab left a reader at the end parked above it");
+    await settle(page);
+    await expect(railBadge(page), "a DM followed in a hidden tab was marked seen").toHaveText("1");
+
+    await setTabVisibility(page, "visible");
+    await expect(railBadge(page), "the tab came back on the DM and the thread still counts it unread").toHaveCount(0);
+    await expectAtEnd(page, "the tab coming back moved the thread");
+    await expect(page.getByTestId(LATEST)).toHaveCount(0);
+  });
+
+  test("an inbound DM in a hidden tab does not move a parked reader, offers Latest, and stays unread until the reader scrolls to it", async ({
+    page,
+  }) => {
+    await openThreadWithHistory(page);
+    await expect(railBadge(page), "premise: opening the thread marked it seen").toHaveCount(0);
+    await readerParksNewestBelow(page, FOLLOW_BAND_PX + 20, DM_VIEW);
     await recordScrolls(page);
 
-    // A hidden tab is not in the foreground, so the DM is not followed.
     await setTabVisibility(page, "hidden");
     await deliverDm(page, "unseen below the fold");
-    await expectStill(page, "an inbound DM in a hidden tab moved the view");
+    await expectStill(page, "an inbound DM in a hidden tab moved a parked reader");
     expect(await belowFold(page, "unseen below the fold"), "the inbound DM should sit below the view").toBeGreaterThan(
       NEWEST_IN_VIEW_SLACK_PX,
     );
@@ -364,8 +364,8 @@ test.describe("DM thread read rule", { tag: "@chromium-only" }, () => {
 
 // An inbound DM follows a reader at the end of the thread: the newest DM's
 // bottom within FOLLOW_BAND_PX of the view's bottom edge before the patch,
-// in a visible tab. Nothing else follows, and nothing scrolls when the tab
-// comes back.
+// in a visible tab or a hidden one. Nothing else follows, and nothing
+// scrolls when the tab comes back.
 // Rationale: .claude/rules/history-scrolling.md.
 test.describe("DM thread follows a reader at the end", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
@@ -407,20 +407,23 @@ test.describe("DM thread follows a reader at the end", () => {
     await expectAtEnd(page, "the thread is not at its end");
   });
 
-  test("DMs arriving in a hidden tab into a thread opened empty leave it at the top", async ({ page }) => {
+  test("DMs arriving in a hidden tab into a thread opened empty land at its end, unread until the tab is visible", async ({
+    page,
+  }) => {
     await openEmptyThread(page);
-    await expectHiddenBurstStaysAtTop(page, "the thread jumped past DMs that arrived in a hidden tab");
-  });
+    await setTabVisibility(page, "hidden");
+    // One mutation, so the burst's last DM is the thread's first bubble.
+    await callRiverTest(page, "appendDmsForPeer", OTHER_DM_PEER.index, HISTORY);
+    await expect(dm(page, newestHistoryDm(OTHER_DM_PEER))).toHaveCount(1, { timeout: 5_000 });
+    await settle(page);
+    expect((await scrollMetrics(page, DM_VIEW)).max, "premise: the burst overflows the thread").toBeGreaterThan(0);
+    await expectAtEnd(page, "DMs that arrived in a hidden tab left the thread above them");
+    await expect(railBadge(page, OTHER_DM_PEER), "DMs followed in a hidden tab were marked seen").toHaveText(
+      String(HISTORY),
+    );
 
-  test("a send in another thread earlier in the session does not move a thread opened empty", async ({ page }) => {
-    await prepareThread(page, 3);
-    const composer = page.getByPlaceholder("Type a direct message...");
-    await composer.fill("own DM elsewhere");
-    await composer.press("Enter");
-    await expect(dm(page, "own DM elsewhere")).toHaveCount(1, { timeout: 5_000 });
-    await closeThread(page);
-    // No reload: the send above stays this session's.
-    await openEmptyThreadHere(page);
-    await expectHiddenBurstStaysAtTop(page, "another thread's send moved a thread opened empty");
+    await setTabVisibility(page, "visible");
+    await expect(railBadge(page, OTHER_DM_PEER), "the tab came back on the DMs and they still count unread").toHaveCount(0);
+    await expect(page.getByTestId(LATEST)).toHaveCount(0);
   });
 });
