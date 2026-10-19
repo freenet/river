@@ -172,16 +172,10 @@ impl ComposableState for MembersV1 {
             }
         }
 
-        // Remove members the owner has banned now, so the `max_members` trim
-        // below does not count them. Everything else waits for
-        // `post_apply_cleanup` step 0, which has the converged deputy grants
-        // (`member_info` applies after this field). See
-        // `remove_owner_banned_members` for why this cannot change step 0's
-        // answer (#410, freenet/river#423, #702).
-        self.remove_owner_banned_members(&parent_state.bans, parameters);
-
-        // Always enforce max members limit
-        self.remove_excess_members(parameters, max_members);
+        // Bans and the `max_members` cap are not applied here: the member set
+        // may exceed `max_members` until `post_apply_cleanup`, which removes
+        // banned members first, then prunes and caps what is left, so a
+        // member that cleanup removes never takes a cap slot.
 
         // Sort for deterministic ordering (CRDT convergence requirement)
         self.members.sort_by_key(|m| m.member.id());
@@ -567,8 +561,8 @@ impl MembersV1 {
     }
 
     /// Every member id removed by a verifiable OWNER ban, over `members`
-    /// alone: each target plus its invite subtree. Used by the early removal
-    /// in [`ComposableState::apply_delta`]; see [`Self::resolve_bans`] step 0.
+    /// alone: each target plus its invite subtree; see
+    /// [`Self::resolve_bans`] step 0.
     pub fn owner_removed_ids(
         &self,
         bans_v1: &BansV1,
@@ -581,14 +575,10 @@ impl MembersV1 {
         )
     }
 
-    /// The early ban removal run from `MembersV1::apply_delta`, before
-    /// `member_info` (deputy grants) has been applied: it removes exactly the
-    /// members an owner ban removes ([`Self::owner_removed_ids`]).
-    ///
-    /// This cannot change what `post_apply_cleanup` step 0 decides: an
-    /// owner-removed member contributes no edge to the ban graph, and step 0
-    /// removes the same set from the same bans. Bans by ancestors or deputies
-    /// are left to step 0, which has the converged grants.
+    /// Remove exactly the members an owner ban removes
+    /// ([`Self::owner_removed_ids`]). Test helper: the apply no longer
+    /// removes banned members; `post_apply_cleanup` step 0 does.
+    #[cfg(test)]
     fn remove_owner_banned_members(&mut self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) {
         let removed = self.owner_removed_ids(bans_v1, parameters);
         if !removed.is_empty() {
@@ -873,7 +863,11 @@ impl MembersV1 {
     /// If the number of members exceeds the specified limit, remove the members with the longest invite chains
     /// until the limit is satisfied. When chain lengths are equal, remove the member with the highest MemberId
     /// for deterministic ordering (CRDT convergence requirement).
-    fn remove_excess_members(&mut self, parameters: &ChatRoomParametersV1, max_members: usize) {
+    pub(crate) fn remove_excess_members(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        max_members: usize,
+    ) {
         if self.members.len() <= max_members {
             return;
         }

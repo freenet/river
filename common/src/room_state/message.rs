@@ -39,9 +39,10 @@ pub struct MessagesV1 {
     pub actions_state: MessageActionsState,
 }
 
-/// The total order [`MessagesV1::apply_delta`] retains by: it sorts ascending
-/// on `(time, id)` and keeps the newest `max_recent_messages`, so this key
-/// alone decides whether a message survives a merge.
+/// The total order the `max_recent_messages` cap retains by: messages sort
+/// ascending on `(time, id)` and `post_apply_cleanup` keeps the newest
+/// `max_recent_messages` of those whose authors it keeps, so this key
+/// decides which of them survives a merge.
 ///
 /// `id` breaks ties deterministically; without it two messages sharing a
 /// timestamp would order differently on different peers.
@@ -57,7 +58,7 @@ pub struct MessageOrderKey {
 ///
 /// # Why this exists
 ///
-/// `apply_delta` DROPS the oldest messages over `max_recent_messages`, which
+/// The merge (`post_apply_cleanup`) DROPS the oldest messages over `max_recent_messages`, which
 /// makes the merge non-monotonic: without a horizon, `delta` is a pure
 /// "everything you don't have" set-difference, so a peer holding an older
 /// window re-offers the same messages on every fan-out, the receiver re-prunes
@@ -312,22 +313,6 @@ impl ComposableState for MessagesV1 {
         self.messages
             .retain(|m| admissible_in_room(m, parent_state));
 
-        // Drop messages whose authors `post_apply_cleanup` removes in this
-        // apply before applying the cap below; `enforced_ban_set_of` computes
-        // that set, as `DirectMessagesV1::apply_delta` does. When the held
-        // messages fit the cap, cleanup removes the same messages, so the set
-        // is computed only when they exceed it (in a room at its cap, on every
-        // delta that adds a message). The owner is never a member and so never
-        // in that set; the owner check is defence in depth, matching cleanup,
-        // which always keeps the owner's messages.
-        if self.messages.len() > max_recent_messages {
-            let enforced_banned =
-                crate::room_state::direct_messages::enforced_ban_set_of(parent_state, parameters);
-            self.messages.retain(|m| {
-                m.message.author == owner_id || !enforced_banned.contains(&m.message.author)
-            });
-        }
-
         // Sort messages by time, with MessageId as secondary sort for deterministic ordering
         // (CRDT convergence requirement - without this, ties produce non-deterministic order)
         self.messages.sort_by(|a, b| {
@@ -337,17 +322,13 @@ impl ComposableState for MessagesV1 {
                 .then_with(|| a.id().cmp(&b.id()))
         });
 
-        // Remove oldest messages if there are too many.
-        //
-        // This removal is what makes the merge non-monotonic, so it MUST stay
+        // The `max_recent_messages` cap is not applied here:
+        // `post_apply_cleanup` applies it after bans and pruning, keeping the
+        // newest by `(time, id)` among the messages whose authors it keeps,
+        // so a message of a member cleanup removes never takes a slot. That
+        // truncation is what makes the merge non-monotonic, so it MUST stay
         // paired with the retention horizon that `summarize` publishes and
-        // `delta` filters on — see [`RetentionHorizon`]. Changing the retention
-        // rule here (a different sort key, a cap on a different axis) without
-        // teaching `retention_horizon` about it re-opens the resend loop.
-        if self.messages.len() > max_recent_messages {
-            self.messages
-                .drain(0..self.messages.len() - max_recent_messages);
-        }
+        // `delta` filters on — see [`RetentionHorizon`].
 
         // Rebuild computed state from action messages
         self.rebuild_actions_state();

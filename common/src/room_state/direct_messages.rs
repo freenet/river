@@ -1187,17 +1187,13 @@ impl ComposableState for DirectMessagesV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        let max_direct_messages = parent_state
-            .configuration
-            .configuration
-            .effective_max_direct_messages();
-
         let owner_id = parameters.owner_id();
         let members_by_id = parent_state.members.members_by_member_id();
 
         let Some(delta) = delta else {
-            // Sweep unresolvable endpoints, then enforce the caps and
-            // re-sort, even when THIS field has no delta. What that converges:
+            // Sweep unresolvable endpoints, then dedup and re-sort, even when
+            // THIS field has no delta (the caps are `post_apply_cleanup`'s,
+            // after bans and pruning). What that converges:
             // a state that ARRIVED unnormalised — over-cap, or holding DMs
             // whose endpoints `members` has since dropped — by a path that
             // skips this function, namely a full-state PUT or the #292
@@ -1210,7 +1206,7 @@ impl ComposableState for DirectMessagesV1 {
                 &member_ids_of(&members_by_id),
                 &enforced_ban_set_of(parent_state, parameters),
             );
-            enforce_caps_and_sort(self, max_direct_messages);
+            dedup_and_sort(self);
             return Ok(());
         };
 
@@ -1354,19 +1350,20 @@ impl ComposableState for DirectMessagesV1 {
         });
 
         // ---- 4. Drop held DMs whose endpoints are no longer members ----
-        // MUST run before the caps: a DM the room can no longer keep must not
-        // be ranked against ones it can, or it wins a slot and evicts a
-        // legitimate message before `post_apply_cleanup` step 6 deletes it
-        // anyway (freenet/river#671). Applies to the held set the same
-        // membership rule step 2 above applies to arrivals.
+        // The same membership rule step 2 above applies to arrivals, with the
+        // enforced-ban set `post_apply_cleanup` step 0 computes, so this
+        // never deletes a DM cleanup keeps (freenet/river#671, #675).
         self.sweep_after_membership_change(
             owner_id,
             &member_ids_of(&members_by_id),
             &enforced_ban_set_of(parent_state, parameters),
         );
 
-        // ---- 5. Enforce the caps, newest-first, then sort ----
-        enforce_caps_and_sort(self, max_direct_messages);
+        // ---- 5. Dedup and sort ----
+        // The per-pair and global caps are not applied here:
+        // `post_apply_cleanup` applies them after bans and pruning, so a DM
+        // of a member cleanup removes never takes a slot (step 6).
+        dedup_and_sort(self);
 
         Ok(())
     }
@@ -1387,10 +1384,17 @@ impl ComposableState for DirectMessagesV1 {
 /// Every step is a pure function of the held set, so the composition is too:
 /// two peers reaching the same union converge to the same state, and running
 /// this twice changes nothing after the first pass (idempotent).
-fn enforce_caps_and_sort(s: &mut DirectMessagesV1, max_direct_messages: usize) {
+pub(crate) fn enforce_caps_and_sort(s: &mut DirectMessagesV1, max_direct_messages: usize) {
     dedup_by_signature(s);
     trim_pairs_to_cap(s);
     trim_to_global_cap(s, max_direct_messages);
+    sort_state(s);
+}
+
+/// What the apply normalizes: duplicates dropped and the canonical stored
+/// order restored. The caps wait for `post_apply_cleanup`.
+fn dedup_and_sort(s: &mut DirectMessagesV1) {
+    dedup_by_signature(s);
     sort_state(s);
 }
 

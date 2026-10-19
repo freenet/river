@@ -560,13 +560,10 @@ impl ChatRoomStateV1 {
 
         // 0. Enforce bans from the CONVERGED (now capped) state, deputy-aware (#410).
         //
-        // `MembersV1::apply_delta` already removed the members an owner ban
-        // removes, which never affects the answer here (an owner-removed
-        // member has no ban authority). It ran BEFORE the sibling
-        // `member_info` field (which carries deputy grants) was applied, so it
-        // left every other ban to this step. This pass runs after every field
-        // has been applied, so
-        // `self.member_info` is converged. `MembersV1::resolve_bans` decides
+        // The field applies remove no banned member: this step removes every
+        // one, owner-banned included. It runs after every field has been
+        // applied, so `self.member_info` (which carries deputy grants) is
+        // converged. `MembersV1::resolve_bans` decides
         // which bans take effect (a ban whose issuer is removed does not,
         // except the bans of a mutual-ban cycle, whose members are all
         // removed: freenet/river#423, #702). Because the result is a pure
@@ -609,143 +606,24 @@ impl ChatRoomStateV1 {
             .members
             .retain(|m| !enforced_banned_ids.contains(&m.member.id()));
 
-        // 1. Collect message author IDs + DM participants + secret recipients.
-        //
-        // Secret recipients (i.e. members for whom the owner has issued an
-        // `encrypted_secrets` blob AT THE CURRENT VERSION) are exempt
-        // from inactivity-prune. The owner explicitly chose to issue
-        // them a per-version room secret, so the owner clearly considers
-        // them a member — and post_apply cleanup running on an
-        // invitee's first state ingestion (which arrives before the
-        // invitee has authored any join_event) must not silently delete
-        // that membership. See issue #110 / Bug #3 PR B (Ivvor
-        // 2026-05-17).
-        //
-        // The exemption is restricted to recipients at `current_version`
-        // so cleanup still prunes genuinely-inactive members whose
-        // blobs are only present at older versions (a member who joined,
-        // received v0, never authored anything, and was never re-issued
-        // a blob at v1+ is "stale" by the same definition as a member
-        // who joined and never authored). Without this scoping the
-        // exemption would keep every ever-recipient + their entire
-        // invite chain ancestor set exempt from cleanup forever,
-        // defeating the prune. See IMPORTANT item #5 on PR #272
-        // review round 2.
-        let message_authors: HashSet<MemberId> = self
-            .recent_messages
-            .messages
-            .iter()
-            .map(|m| m.message.author)
-            .collect();
-        // DM participants are counted only from DMs that will SURVIVE the
-        // step-6 sweep below — both endpoints a live, non-enforced-banned
-        // member (owner implicit). Counting every held DM (the old
-        // `active_participants()`) made this exemption strictly weaker than
-        // the sweep that runs later in the SAME pass, so a member held alive
-        // only by a DM with a banned counterparty was kept on pass 1 and
-        // pruned on pass 2 — `cleanup(S) != cleanup(cleanup(S))`, measured on
-        // live Official-room state in freenet/river#671. Same defect and same
-        // remedy as the banner exemption in #411 round 4: the exemption
-        // predicate must BE the sweep predicate, not merely resemble it, and
-        // both now call `dm_endpoint_is_live`. Not circular — see the note on
-        // `participants_of_surviving_dms`.
-        //
-        // The member set passed here is post-step-0 (enforced-banned members
-        // are already gone) and pre-step-3, which is exactly what step 6 will
-        // see for every id this loop can add: a counted participant lands in
-        // `required_ids` and therefore survives step 3 unchanged.
-        //
-        // `enforced_banned_ids` is passed so this predicate is IDENTICAL to
-        // step 6's by construction, which is the entire property this fix is
-        // about. Step 0 has already removed every enforced-banned member, so
-        // the ban check is inert here; it is kept for that identity.
+        // 1-3. Inactivity prune and the `max_members` cap, repeated until a
+        //      pass removes no member (`prune_and_cap_members`). The cap
+        //      removes the deepest members of the PRUNED set, and a member it
+        //      removes can leave an ancestor that only it needed, which the
+        //      next pass prunes. Every pass but the last removes at least one
+        //      member, so there are at most (members after step 0) + 1
+        //      passes. The member, message and DM caps are decided here, after
+        //      bans and pruning, never in the field applies, so a member this
+        //      cleanup removes never takes a cap slot.
         let members_after_ban_enforcement: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
-        let dm_participants: HashSet<MemberId> =
-            self.direct_messages.participants_of_surviving_dms(
-                owner_id,
-                &members_after_ban_enforcement,
-                &enforced_banned_ids,
-            );
-        let current_secret_version = self.secrets.current_version;
-        let secret_recipients: HashSet<MemberId> = self
-            .secrets
-            .encrypted_secrets
-            .iter()
-            .filter(|s| s.secret.secret_version == current_secret_version)
-            .map(|s| s.secret.member_id)
-            .collect();
-
-        // 2. Compute required members: authors + DM participants + secret
-        //    recipients + their invite chains.
-        let required_ids = {
-            let members_by_id = self.members.members_by_member_id();
-            let mut required_ids: HashSet<MemberId> = HashSet::new();
-
-            for author_id in &message_authors {
-                if *author_id != owner_id && members_by_id.contains_key(author_id) {
-                    required_ids.insert(*author_id);
-                }
+        let required_ids = loop {
+            let before = self.members.members.len();
+            let required = self.prune_and_cap_members(parameters, owner_id, &enforced_banned_ids);
+            if self.members.members.len() == before {
+                break required;
             }
-
-            for participant_id in &dm_participants {
-                if *participant_id != owner_id && members_by_id.contains_key(participant_id) {
-                    required_ids.insert(*participant_id);
-                }
-            }
-
-            for recipient_id in &secret_recipients {
-                if *recipient_id != owner_id && members_by_id.contains_key(recipient_id) {
-                    required_ids.insert(*recipient_id);
-                }
-            }
-
-            // A current member who is the ISSUER of a stored ban with a
-            // matching signature is exempt from inactivity-prune (#411 round 3
-            // item B). Since freenet/river#702 this is no longer what keeps
-            // such a ban verifiable (a pruned issuer's record would become ban
-            // evidence), but it is kept deliberately: every room stored today
-            // was produced with it, so dropping it would make those states
-            // stop being fixpoints of this function and rewrite them on their
-            // first merge (fdev verify-merge `transition_path_agreement` on the
-            // real Official-room corpus). `self.bans.0` was already capped at
-            // step 0-cap, and step 0 has already removed every banned member,
-            // so this exempts exactly the present issuers of surviving bans.
-            // It uses the step-5 predicate, so exemption <=> retention (#411
-            // round 4/5).
-            for ban in &self.bans.0 {
-                let banner = ban.banned_by;
-                if banner != owner_id
-                    && BansV1::ban_signature_matches_current_key(
-                        ban,
-                        &members_by_id,
-                        owner_id,
-                        &parameters.owner,
-                    )
-                {
-                    required_ids.insert(banner);
-                }
-            }
-
-            // Walk invite chains upward, adding all ancestors (stop at owner)
-            let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
-            while let Some(member_id) = to_process.pop() {
-                if let Some(member) = members_by_id.get(&member_id) {
-                    let inviter_id = member.member.invited_by;
-                    if inviter_id != owner_id && !required_ids.contains(&inviter_id) {
-                        required_ids.insert(inviter_id);
-                        to_process.push(inviter_id);
-                    }
-                }
-            }
-
-            required_ids
         };
-
-        // 3. Prune members not in required set
-        self.members
-            .members
-            .retain(|m| required_ids.contains(&m.member.id()));
 
         // 4. Sweep any ban whose issuer is unknown or whose signature does
         //    not match the issuer's key (#411 round 3 item A.3, round 4 item
@@ -796,11 +674,9 @@ impl ChatRoomStateV1 {
             // are always available, and it removes its target and subtree
             // whatever else is known. A record an owner ban removes is never
             // kept as evidence, even when another ban names it: such a
-            // record reaching this point as a member is already gone
-            // (`MembersV1::apply_delta` removes owner-banned members before
-            // cleanup), so keeping it only when it arrived as evidence made
-            // the result depend on how the record arrived (freenet/river#703
-            // review). Nothing needs it: a ban its member issued is swept in
+            // record reaching this point as a member was removed by step 0,
+            // so keeping it only when it arrived as evidence made the result
+            // depend on how the record arrived (freenet/river#703 review). Nothing needs it: a ban its member issued is swept in
             // step 4, and a ban naming it ranks as one whose target is held
             // nowhere. `BanEvidenceV1::verify` checks stored evidence against
             // `referenced_by_bans`, which this only narrows.
@@ -880,6 +756,17 @@ impl ChatRoomStateV1 {
         self.recent_messages.messages.retain(|m| {
             m.message.author == owner_id || current_member_ids.contains(&m.message.author)
         });
+        // Then the `max_recent_messages` cap over what is left, newest by
+        // `(time, id)` kept: the cap step 1 counted, so every author it
+        // counted keeps a message.
+        {
+            let cap = self.configuration.configuration.max_recent_messages;
+            let messages = &mut self.recent_messages.messages;
+            messages.sort_by_key(|m| m.order_key());
+            if messages.len() > cap {
+                messages.drain(0..messages.len() - cap);
+            }
+        }
 
         // Rebuild the PUBLIC `actions_state` cache now that removed authors'
         // messages are gone (#411 round 7 / Codex P2 #4). `MessagesV1::apply_delta`
@@ -936,6 +823,14 @@ impl ChatRoomStateV1 {
             &active_member_ids_for_sweep,
             &enforced_banned_ids,
         );
+        // Then the per-pair and global DM caps over what is left, the caps
+        // step 1 counted.
+        crate::room_state::direct_messages::enforce_caps_and_sort(
+            &mut self.direct_messages,
+            self.configuration
+                .configuration
+                .effective_max_direct_messages(),
+        );
 
         // 7. Re-sort for deterministic ordering
         self.members.members.sort_by_key(|m| m.member.id());
@@ -944,6 +839,108 @@ impl ChatRoomStateV1 {
             .sort_by_key(|info| info.member_info.member_id);
 
         Ok(())
+    }
+}
+
+impl ChatRoomStateV1 {
+    /// One pass of `post_apply_cleanup` steps 1-3: keep the members something
+    /// live needs, with their invite chains, then apply the `max_members`
+    /// cap to what is kept. Returns the ids the prune kept (before the cap).
+    ///
+    /// A member is needed as:
+    /// - the author of one of the newest `max_recent_messages` messages whose
+    ///   authors are live in THIS pass (the owner, or a member not
+    ///   enforced-banned), so a message of a member this cleanup removes
+    ///   never takes a slot;
+    /// - a participant of a DM that survives step 6 and the DM caps, judged
+    ///   against the members of THIS pass (`participants_of_surviving_dms`,
+    ///   the predicate step 6 applies, freenet/river#671);
+    /// - a recipient of a secret blob at the current secret version
+    ///   (issue #110; scoped to the current version so members whose blobs
+    ///   are only at older versions are still pruned);
+    /// - the issuer of a stored ban whose signature matches the issuer's
+    ///   current key (#411 round 3 item B; kept so stored rooms stay
+    ///   fixpoints, see the history in freenet/river#702);
+    /// - an invite ancestor of any of these.
+    fn prune_and_cap_members(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        owner_id: MemberId,
+        enforced_banned_ids: &HashSet<MemberId>,
+    ) -> HashSet<MemberId> {
+        let members_now: HashSet<MemberId> =
+            self.members.members.iter().map(|m| m.member.id()).collect();
+        let message_authors: HashSet<MemberId> = {
+            let mut live: Vec<&crate::room_state::message::AuthorizedMessageV1> = self
+                .recent_messages
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.message.author == owner_id
+                        || (members_now.contains(&m.message.author)
+                            && !enforced_banned_ids.contains(&m.message.author))
+                })
+                .collect();
+            live.sort_by_key(|m| std::cmp::Reverse(m.order_key()));
+            live.truncate(self.configuration.configuration.max_recent_messages);
+            live.into_iter().map(|m| m.message.author).collect()
+        };
+        let dm_participants: HashSet<MemberId> = {
+            let mut dms = self.direct_messages.clone();
+            dms.sweep_after_membership_change(owner_id, &members_now, enforced_banned_ids);
+            crate::room_state::direct_messages::enforce_caps_and_sort(
+                &mut dms,
+                self.configuration
+                    .configuration
+                    .effective_max_direct_messages(),
+            );
+            dms.participants_of_surviving_dms(owner_id, &members_now, enforced_banned_ids)
+        };
+        let current_secret_version = self.secrets.current_version;
+        let secret_recipients = self
+            .secrets
+            .encrypted_secrets
+            .iter()
+            .filter(|s| s.secret.secret_version == current_secret_version)
+            .map(|s| s.secret.member_id);
+
+        let members_by_id = self.members.members_by_member_id();
+        let mut required_ids: HashSet<MemberId> = message_authors
+            .into_iter()
+            .chain(dm_participants)
+            .chain(secret_recipients)
+            .filter(|id| *id != owner_id && members_by_id.contains_key(id))
+            .collect();
+        for ban in &self.bans.0 {
+            let banner = ban.banned_by;
+            if banner != owner_id
+                && BansV1::ban_signature_matches_current_key(
+                    ban,
+                    &members_by_id,
+                    owner_id,
+                    &parameters.owner,
+                )
+            {
+                required_ids.insert(banner);
+            }
+        }
+        // Walk invite chains upward, adding all ancestors (stop at owner).
+        let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
+        while let Some(member_id) = to_process.pop() {
+            if let Some(member) = members_by_id.get(&member_id) {
+                let inviter_id = member.member.invited_by;
+                if inviter_id != owner_id && required_ids.insert(inviter_id) {
+                    to_process.push(inviter_id);
+                }
+            }
+        }
+
+        self.members
+            .members
+            .retain(|m| required_ids.contains(&m.member.id()));
+        let max_members = self.configuration.configuration.max_members;
+        self.members.remove_excess_members(parameters, max_members);
+        required_ids
     }
 }
 
@@ -2936,8 +2933,8 @@ mod tests {
 
         // State D: the same shape, but the counterparty is banned by a DEPUTY
         // rather than the owner. `post_apply_cleanup` sees the converged
-        // `member_info`, so step 0 DOES enforce this ban — the deputy gap is in
-        // `MembersV1::apply_delta`, not here (freenet/river#675). Cleanup must
+        // `member_info`, so step 0 DOES enforce this ban (freenet/river#675).
+        // Cleanup must
         // still be a fixpoint.
         {
             let dep_sk = SigningKey::generate(rng);

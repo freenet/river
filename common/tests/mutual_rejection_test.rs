@@ -2549,24 +2549,28 @@ fn a_plain_members_random_target_flood_evicts_owner_bans_down_to_the_share() {
     );
 }
 
-/// An evidence record whose inviter leaves `members` at the `max_members` trim
-/// (which runs before cleanup) no longer reaches the owner, so every reader
-/// leaves it out and cleanup drops it. The result verifies and cleanup is a
-/// fixpoint. (The issuer's own record is lost to the trim before it can
-/// become evidence, a documented residual, so its ban is swept.)
+/// The `max_members` cap runs in cleanup, after the pass has taken the
+/// records it knows at its start. A ban's issuer the cap removes therefore
+/// moves to ban evidence like any other member that leaves `members` while a
+/// stored ban references it (freenet/river#702), the ban stays, and the
+/// evidence record the issuer invited still reaches the owner through it. The
+/// result verifies and cleanup is a fixpoint. (Before the cap moved into
+/// cleanup, the issuer was trimmed before it could become evidence, so its
+/// ban was swept and its invitee's record dropped.)
 #[test]
-fn evidence_whose_inviter_is_trimmed_is_dropped() {
+fn a_ban_issuer_the_member_cap_removes_moves_to_evidence_with_its_invitee() {
     let room = Room::new();
     let mut people: Vec<Person> = (0..4).map(|_| room.person()).collect();
     people.sort_by_key(|p| p.id);
-    // The trim evicts the highest id among equal chain lengths.
+    // The cap evicts the highest id among equal chain lengths.
     let i = people.pop().unwrap();
     let e = room.person_invited_by(&i);
     let mut members: Vec<&Person> = people.iter().collect();
     members.push(&i);
     members.push(&e);
     let s = room.modded_state(&members, &[], vec![]);
-    let s = apply_checked(&s, bans_delta(vec![room.ban(&i, &e, 10)]), &room.params);
+    let ban = room.ban(&i, &e, 10);
+    let s = apply_checked(&s, bans_delta(vec![ban.clone()]), &room.params);
     assert!(evidence_ids(&s).contains(&e.id), "precondition");
 
     let lower = AuthorizedConfigurationV1::new(
@@ -2587,11 +2591,15 @@ fn evidence_whose_inviter_is_trimmed_is_dropped() {
     );
     assert!(
         !member_ids(&after).contains(&i.id),
-        "precondition: I is trimmed"
+        "precondition: I is removed by the cap"
     );
     assert!(
-        evidence_ids(&after).is_empty(),
-        "E no longer reaches the owner"
+        evidence_ids(&after).contains(&i.id) && evidence_ids(&after).contains(&e.id),
+        "I moves to evidence and E still reaches the owner through it"
+    );
+    assert!(
+        has_ban(&after, &ban),
+        "I's ban stays verifiable and is kept"
     );
 }
 
