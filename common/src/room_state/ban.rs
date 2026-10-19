@@ -1,5 +1,5 @@
 use crate::room_state::ban_evidence::{BanEvidenceV1, EvidenceDigest};
-use crate::room_state::member::{AuthorizedMember, BanResolution, MemberId, MembersV1};
+use crate::room_state::member::{AuthorizedMember, BanContext, BanResolution, MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, verify_struct};
@@ -287,14 +287,17 @@ impl BansV1 {
 
         let mut accepted = vec![false; n];
         let mut accepted_pairs: HashSet<(MemberId, MemberId)> = HashSet::new();
-        // (live, safe) of ban `i` judged over the accepted bans plus itself.
+        // The records every judgment resolves over, built once.
+        let context = BanContext::new(members, evidence, parameters);
+        // (live, safe) of ban `i` judged over the accepted bans plus itself,
+        // by the full resolution of that set.
         let judge = |i: usize, accepted: &[bool]| -> (bool, bool) {
             let ban = &bans[i];
-            let set: Vec<AuthorizedUserBan> = (0..n)
+            let set: Vec<&AuthorizedUserBan> = (0..n)
                 .filter(|j| *j == i || accepted[*j])
-                .map(|j| bans[j].clone())
+                .map(|j| &bans[j])
                 .collect();
-            let res = members.resolve_bans(evidence, &BansV1(set), member_info, parameters);
+            let res = context.resolve(set.iter().copied(), member_info, parameters);
             let safe = !res.owner_removed.contains(&ban.banned_by)
                 && (0..n).all(|j| !accepted[j] || !res.owner_removed.contains(&bans[j].banned_by));
             if res.tier(&ban.id()) > BanResolution::INERT {
@@ -685,7 +688,9 @@ impl AuthorizedUserBan {
         let key = (
             self.signature.to_bytes(),
             banner_verifying_key.to_bytes(),
-            crate::util::record_digest(&self.ban),
+            self.ban.owner_member_id,
+            self.ban.banned_at,
+            self.ban.banned_user,
         );
         if let Some(ok) = signature_memo::lookup(&key) {
             return if ok {
@@ -775,15 +780,17 @@ mod ban_digest_golden {
 /// The ban signature checks of one cleanup or whole-state merge, remembered
 /// so each ban is verified at most once however many times the ban cap (in
 /// the DM apply's enforced-ban set and in cleanup), the cleanup steps and the
-/// fixpoint passes ask. Keyed by the signature, the verifying key and the
-/// digest of the signed record, the three inputs of the check (two bans can
+/// fixpoint passes ask. Keyed by the signature, the verifying key and every
+/// field of the signed record, the whole input of the check (two bans can
 /// share signature bytes), so a remembered answer is the answer the check
 /// would give. Active only inside [`active_while`].
 pub(crate) mod signature_memo {
+    use crate::room_state::member::MemberId;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::time::SystemTime;
 
-    type Key = ([u8; 64], [u8; 32], [u8; 32]);
+    type Key = ([u8; 64], [u8; 32], MemberId, SystemTime, MemberId);
 
     thread_local! {
         static MEMO: RefCell<Option<HashMap<Key, bool>>> = const { RefCell::new(None) };
@@ -853,7 +860,8 @@ mod tests {
     /// only the outermost scope clears it.
     #[test]
     fn a_nested_memo_scope_keeps_the_outer_memo() {
-        let key = ([1u8; 64], [2u8; 32], [3u8; 32]);
+        let id = MemberId::from(&SigningKey::from_bytes(&[3u8; 32]).verifying_key());
+        let key = ([1u8; 64], [2u8; 32], id, SystemTime::UNIX_EPOCH, id);
         signature_memo::active_while(|| {
             signature_memo::record(key, true);
             signature_memo::active_while(|| {

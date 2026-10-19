@@ -1,4 +1,4 @@
-use crate::room_state::ban::{BanId, BansV1};
+use crate::room_state::ban::{AuthorizedUserBan, BanId, BansV1};
 use crate::room_state::ban_evidence::{evidence_digest, BanEvidenceV1, EvidenceDigest};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
@@ -570,8 +570,9 @@ impl MembersV1 {
     ) -> HashSet<MemberId> {
         owner_removed_in(
             &children_by_inviter(self.members.iter()),
-            bans_v1,
+            &bans_v1.0,
             parameters,
+            |ban| ban.verify_signature(&parameters.owner).is_ok(),
         )
     }
 
@@ -675,47 +676,115 @@ impl MembersV1 {
         member_info: &MemberInfoV1,
         parameters: &ChatRoomParametersV1,
     ) -> BanResolution {
+        BanContext::new(self, evidence, parameters).resolve(&bans_v1.0, member_info, parameters)
+    }
+}
+
+/// The records [`MembersV1::resolve_bans`] reads, built once for a member
+/// set and its ban evidence, so a caller that resolves many ban sets over
+/// the same records (the ban cap) does not rebuild them for each. It also
+/// remembers, per ban, whether the ban's signature verifies against its
+/// issuer's key here, and its id. The bans passed to one context are
+/// borrowed for its whole life, so each is one fixed record.
+pub(crate) struct BanContext<'a> {
+    lookup: HashMap<MemberId, &'a AuthorizedMember>,
+    children: HashMap<MemberId, Vec<MemberId>>,
+    per_ban: std::cell::RefCell<HashMap<*const AuthorizedUserBan, (BanId, bool)>>,
+}
+
+impl<'a> BanContext<'a> {
+    pub(crate) fn new(
+        members: &'a MembersV1,
+        evidence: &'a BanEvidenceV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> Self {
+        let lookup = evidence.lookup(members, parameters.owner_id());
+        let children = children_by_inviter(lookup.values().copied());
+        BanContext {
+            lookup,
+            children,
+            per_ban: Default::default(),
+        }
+    }
+
+    /// `ban`'s id, and whether its signature verifies against its issuer's
+    /// key here ([`BansV1::ban_signature_matches_current_key`]; the owner's
+    /// key for an owner ban).
+    fn id_and_signature(
+        &self,
+        ban: &'a AuthorizedUserBan,
+        parameters: &ChatRoomParametersV1,
+    ) -> (BanId, bool) {
+        let key: *const AuthorizedUserBan = ban;
+        if let Some(known) = self.per_ban.borrow().get(&key) {
+            return known.clone();
+        }
+        let ok = BansV1::ban_signature_matches_current_key(
+            ban,
+            &self.lookup,
+            parameters.owner_id(),
+            &parameters.owner,
+        );
+        let entry = (ban.id(), ok);
+        self.per_ban.borrow_mut().insert(key, entry.clone());
+        entry
+    }
+
+    /// [`MembersV1::resolve_bans`] over `bans`.
+    pub(crate) fn resolve(
+        &self,
+        bans: impl IntoIterator<Item = &'a AuthorizedUserBan> + Clone,
+        member_info: &MemberInfoV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> BanResolution {
         #[cfg(any(test, feature = "cleanup-counters"))]
         crate::room_state::cleanup_counters::count_resolve_bans();
         let owner_id = parameters.owner_id();
-        let lookup = evidence.lookup(self, owner_id);
-        let children = children_by_inviter(lookup.values().copied());
+        let lookup = &self.lookup;
+        let children = &self.children;
 
         // Step 0: the owner's bans.
-        let owner_removed = owner_removed_in(&children, bans_v1, parameters);
+        let owner_removed = owner_removed_in(children, bans.clone(), parameters, |ban| {
+            self.id_and_signature(ban, parameters).1
+        });
         let mut ban_tiers: HashMap<BanId, u8> = HashMap::new();
         let mut verified: HashSet<BanId> = HashSet::new();
-        for ban in &bans_v1.0 {
-            if ban.banned_by == owner_id
-                && ban.ban.banned_user != owner_id
-                && ban.verify_signature(&parameters.owner).is_ok()
-            {
-                ban_tiers.insert(ban.id(), BanResolution::OWNER);
-                verified.insert(ban.id());
+        for ban in bans.clone() {
+            if ban.banned_by == owner_id && ban.ban.banned_user != owner_id {
+                let (id, ok) = self.id_and_signature(ban, parameters);
+                if ok {
+                    ban_tiers.insert(id.clone(), BanResolution::OWNER);
+                    verified.insert(id);
+                }
             }
         }
 
         // Steps 1-3: the valid bans, grouped by issuer, each with its reach.
         let mut valid: BTreeMap<MemberId, Vec<(BanId, BTreeSet<MemberId>)>> = BTreeMap::new();
-        for ban in &bans_v1.0 {
+        for ban in bans {
             let issuer = ban.banned_by;
             if issuer == owner_id || owner_removed.contains(&issuer) {
                 continue;
             }
-            if !BansV1::ban_signature_matches_current_key(ban, &lookup, owner_id, &parameters.owner)
-            {
+            let (id, ok) = self.id_and_signature(ban, parameters);
+            if !ok {
                 continue;
             }
-            verified.insert(ban.id());
-            if !Self::is_ban_authorized(issuer, ban.ban.banned_user, &lookup, member_info, owner_id)
-            {
+            verified.insert(id.clone());
+            if !MembersV1::is_ban_authorized(
+                issuer,
+                ban.ban.banned_user,
+                lookup,
+                member_info,
+                owner_id,
+            ) {
                 continue;
             }
-            let reach = reach_in(&children, ban.ban.banned_user);
+            let reach = reach_in(children, ban.ban.banned_user);
             if reach.contains(&issuer) {
                 continue; // step 3: self-removing, void
             }
-            valid.entry(issuer).or_default().push((ban.id(), reach));
+            valid.entry(issuer).or_default().push((id, reach));
         }
 
         // Step 4: the graph. Nodes are issuers and the members they reach.
@@ -756,7 +825,7 @@ impl MembersV1 {
             }
             if in_cycle {
                 for member in &component {
-                    removed.extend(reach_in(&children, *member));
+                    removed.extend(reach_in(children, *member));
                 }
             }
         }
@@ -771,7 +840,9 @@ impl MembersV1 {
             verified,
         }
     }
+}
 
+impl MembersV1 {
     /// Whether `banner` is currently authorized to ban `target` (#410).
     ///
     /// `banner` is authorized if any of these holds:
@@ -1059,18 +1130,16 @@ fn children_by_inviter<'a>(
 }
 
 /// Every id a verifiable owner ban removes: target plus invite subtree.
-fn owner_removed_in(
+fn owner_removed_in<'b>(
     children: &HashMap<MemberId, Vec<MemberId>>,
-    bans_v1: &BansV1,
+    bans: impl IntoIterator<Item = &'b AuthorizedUserBan>,
     parameters: &ChatRoomParametersV1,
+    signed_by_owner: impl Fn(&'b AuthorizedUserBan) -> bool,
 ) -> HashSet<MemberId> {
     let owner_id = parameters.owner_id();
     let mut removed = HashSet::new();
-    for ban in &bans_v1.0 {
-        if ban.banned_by != owner_id
-            || ban.ban.banned_user == owner_id
-            || ban.verify_signature(&parameters.owner).is_err()
-        {
+    for ban in bans {
+        if ban.banned_by != owner_id || ban.ban.banned_user == owner_id || !signed_by_owner(ban) {
             continue;
         }
         removed.extend(reach_in(children, ban.ban.banned_user));
