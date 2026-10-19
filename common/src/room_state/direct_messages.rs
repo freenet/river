@@ -903,16 +903,8 @@ fn enforced_ban_set_of_inner(
         ),
     );
     let evidence = pruned.as_ref().unwrap_or(&parent_state.ban_evidence);
-    if parent_state.bans.0.len() <= max_bans {
-        return parent_state.members.banned_member_ids(
-            evidence,
-            &parent_state.bans,
-            &parent_state.member_info,
-            parameters,
-        );
-    }
     // The bans `post_apply_cleanup` counts at the cap: without any no known
-    // key verifies (step 0-sig, which runs only over the cap), judged against
+    // key verifies (step 0-sig, on every pass), judged against
     // the same pass-start records (`BansV1::stable_known`).
     let depth_cap = crate::room_state::ban_evidence::evidence_depth_cap(
         parent_state.configuration.configuration.max_members,

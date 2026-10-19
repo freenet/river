@@ -101,8 +101,9 @@ drops. A ban that takes no effect given the kept bans, or repeats a kept
 (issuer, target) pair, only fills the slots left at the end. Under the cap
 the function changes nothing. The cap, cleanup step 0-sig and step 4 read
 the records known at the start of the pass within the ban evidence depth
-cap (`BansV1::stable_known`); a ban whose issuer sits deeper counts for
-nothing.
+cap (`BansV1::stable_known`). A ban whose issuer sits deeper, present or
+not, takes no effect: step 0-sig drops it on every pass, before the cap or
+ban resolution sees it, so no delivery order lets it remove anyone.
 
 Within one merge or cleanup each ban signature is verified at most once
 (`ban::signature_memo`): the cap re-judges bans many times, and an
@@ -127,8 +128,8 @@ would drop, so every state an apply or merge produces is a fixpoint of
 `merge(S, S)`. Cleanup checks that itself: it runs its pass again on the
 result and keeps going until a pass changes nothing, with at most two extra
 passes (a pass can change what the next decides, for example when the
-member cap removes a ban's issuer). `verify` itself stays as it is: tightening it would make the
-migration PUT reject states rooms hold today.
+member cap removes a ban's issuer). `verify` itself stays as it is:
+tightening it would make the migration PUT reject states rooms hold today.
 
 One limit, which predates #703: the contract does not apply an empty delta,
 so a state stored by a full-state PUT that holds records the rules drop (for

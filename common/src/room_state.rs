@@ -627,16 +627,17 @@ impl ChatRoomStateV1 {
         let stable_known: std::collections::HashMap<MemberId, &AuthorizedMember> =
             stable_known.iter().map(|(id, m)| (*id, m)).collect();
 
-        // 0-sig. A ban no known key verifies counts for nothing: one whose
-        //     known issuer's key does not verify it (skipped on arrival at a
-        //     peer that knows the issuer) and one whose issuer is known
-        //     nowhere (step 4 sweeps it in this pass) are dropped before the
-        //     cap counts them (`BansV1::drop_bans_no_known_key_verifies`; the
-        //     DM apply's enforced-ban set drops them the same way). Only the
-        //     cap can be swayed by one (resolution ignores such a ban, and
-        //     step 4 sweeps it), so this runs only when the bans are over the
-        //     cap.
-        if self.bans.0.len() > self.configuration.configuration.max_user_bans {
+        // 0-sig. A ban no known key verifies counts for nothing, and is
+        //     dropped on every pass before anything judges it: one whose known
+        //     issuer's key does not verify it (skipped on arrival at a peer
+        //     that knows the issuer), one whose issuer is known nowhere, and
+        //     one whose issuer sits deeper than the ban evidence depth cap
+        //     (`stable_known`), present or not. Dropping it here, rather than
+        //     only at step 4, keeps such a ban from taking a cap slot or from
+        //     removing anyone at step 0 in the pass that then sweeps it, which
+        //     would make the outcome depend on delivery order. The DM apply's
+        //     enforced-ban set drops them the same way.
+        {
             let mut bans = std::mem::take(&mut self.bans.0);
             BansV1::drop_bans_no_known_key_verifies(
                 &mut bans,

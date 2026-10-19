@@ -2897,14 +2897,12 @@ fn person_at_depth(room: &Room, depth: usize) -> (Person, Vec<Person>) {
 }
 
 /// Mutual bans between moderators deeper than `MAX_EVIDENCE_DEPTH` invites
-/// (intended under the depth cap; no real room has such a member, the
-/// deepest chain seen is 3). Two deep moderators who ban each other in one
-/// delta are both removed, and both bans lapse with their records, so both
-/// may return. Delivered one at a time, the first ban removes the other
-/// moderator and the second is swept with its issuer's record, so the outcome
-/// depends on delivery order; every pair of peers still converges.
+/// (no real room has such a member; the deepest chain seen is 3). A ban
+/// whose issuer sits deeper than the evidence depth cap takes no effect,
+/// present or not, so neither ban removes anyone and both are dropped, in
+/// every delivery order; every pair of peers converges.
 #[test]
-fn a_mutual_ban_between_deep_moderators_lapses_and_converges() {
+fn a_mutual_ban_between_deep_moderators_takes_no_effect_in_any_order() {
     use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
     let room = capped_room(40, 10);
     let (a, a_up) = person_at_depth(&room, MAX_EVIDENCE_DEPTH + 1);
@@ -2914,12 +2912,6 @@ fn a_mutual_ban_between_deep_moderators_lapses_and_converges() {
     let s = room.modded_state(&members, &[&a, &b], vec![]);
     let (ab, ba) = (room.ban(&a, &b, 10), room.ban(&b, &a, 11));
     let both = apply_checked(&s, bans_delta(vec![ab.clone(), ba.clone()]), &room.params);
-    let ids = member_ids(&both);
-    assert!(!ids.contains(&a.id) && !ids.contains(&b.id), "both removed");
-    assert!(
-        !has_ban(&both, &ab) && !has_ban(&both, &ba),
-        "both bans lapse"
-    );
     let a_first = apply_checked(
         &apply_checked(&s, bans_delta(vec![ab.clone()]), &room.params),
         bans_delta(vec![ba.clone()]),
@@ -2930,8 +2922,18 @@ fn a_mutual_ban_between_deep_moderators_lapses_and_converges() {
         bans_delta(vec![ab.clone()]),
         &room.params,
     );
-    assert!(member_ids(&a_first).contains(&a.id) && !member_ids(&a_first).contains(&b.id));
-    assert!(member_ids(&b_first).contains(&b.id) && !member_ids(&b_first).contains(&a.id));
+    for state in [&both, &a_first, &b_first] {
+        let ids = member_ids(state);
+        assert!(
+            ids.contains(&a.id) && ids.contains(&b.id),
+            "nobody is removed"
+        );
+        assert!(
+            !has_ban(state, &ab) && !has_ban(state, &ba),
+            "both bans are dropped"
+        );
+        assert_eq!(ser(state), ser(&both), "every delivery order ends the same");
+    }
     for (x, y) in [(&a_first, &b_first), (&both, &a_first), (&both, &b_first)] {
         let (p, q) = (
             merge(x, y, &room.params).unwrap(),
@@ -2942,13 +2944,12 @@ fn a_mutual_ban_between_deep_moderators_lapses_and_converges() {
     }
 }
 
-/// One moderator deeper than the cap, one shallow, banning each other. The
-/// deep one's ban lapses with its record; the shallow one's ban stands and
-/// keeps the deep one out. Whether the shallow one is removed depends on
-/// delivery order (removed when both bans arrive together, kept when its own
-/// ban arrives first); peers converge either way.
+/// One moderator deeper than the evidence depth cap, one shallow, banning
+/// each other. The deep one's ban takes no effect; the shallow one's ban
+/// removes the deep one and stays. The same in every delivery order, and
+/// peers converge.
 #[test]
-fn a_mutual_ban_with_one_deep_moderator_converges() {
+fn a_mutual_ban_with_one_deep_moderator_ends_the_same_in_any_order() {
     use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
     let room = capped_room(40, 10);
     let (a, a_up) = person_at_depth(&room, MAX_EVIDENCE_DEPTH + 1);
@@ -2968,14 +2969,14 @@ fn a_mutual_ban_with_one_deep_moderator_converges() {
         bans_delta(vec![ab.clone()]),
         &room.params,
     );
-    assert!(!member_ids(&both).contains(&b.id), "together: B is removed");
-    assert!(
-        member_ids(&b_first).contains(&b.id),
-        "B's ban first: B stays"
-    );
     for state in [&both, &a_first, &b_first] {
-        assert!(!member_ids(state).contains(&a.id));
+        assert!(
+            !member_ids(state).contains(&a.id),
+            "A is removed by B's ban"
+        );
+        assert!(member_ids(state).contains(&b.id), "A's ban takes no effect");
         assert!(has_ban(state, &ba) && !has_ban(state, &ab));
+        assert_eq!(ser(state), ser(&both), "every delivery order ends the same");
     }
     for (x, y) in [(&a_first, &b_first), (&both, &a_first), (&both, &b_first)] {
         let (agreed, _) = gossip_until_equal(x, y, &room.params, 4);
