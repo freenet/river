@@ -1602,9 +1602,10 @@ mod tests {
         assert_eq!(evidence.len(), 200);
         assert!(shallow.iter().all(|m| evidence.contains(m)));
 
-        // Bans over the bound: the cap's choice at the bound (the owner's
-        // ban, then the newest others) is kept, and evidence only a trimmed
-        // ban references is not sent.
+        // Bans over the bound: the cap's choice at the bound is kept. Here
+        // the other bans' issuer is a record the sender does not hold, so
+        // no signature of theirs can be checked and the cap keeps only the
+        // owner's ban; evidence only a trimmed ban references is not sent.
         let target_ban = |by: &SigningKey, secs: u64, target: &AuthorizedMember| {
             AuthorizedUserBan::new(
                 UserBan {
@@ -1628,20 +1629,29 @@ mod tests {
             ..Default::default()
         };
         trim_to_work_bounds(&mut delta, &config, &sender, &summary, &parameters);
-        let bans = delta.bans.unwrap();
-        assert_eq!(bans.len(), MIN_BANS_DELTA_BOUND);
-        assert!(bans.contains(&owner_ban));
-        let oldest_kept = bans
-            .iter()
-            .filter(|b| b.banned_by != owner_id)
-            .map(|b| b.ban.banned_at)
-            .min()
-            .unwrap();
-        assert_eq!(
-            oldest_kept,
-            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(110)
+        let trimmed = delta.bans.clone().unwrap();
+        // The cap keeps no ban whose issuer's signature it cannot check.
+        assert_eq!(trimmed, vec![owner_ban.clone()]);
+        assert!(delta.ban_evidence.clone().unwrap().is_empty());
+        // The receiver still converges: the sender's own cleanup sweeps the
+        // bans whose issuer it does not know, so once it is normalized it
+        // offers the receiver nothing further.
+        let mut receiver = ChatRoomStateV1::default();
+        receiver
+            .apply_delta(&ChatRoomStateV1::default(), &parameters, &Some(delta))
+            .expect("the receiver applies the trimmed delta");
+        let mut normalized = sender.clone();
+        normalized.post_apply_cleanup(&parameters).unwrap();
+        assert_eq!(normalized.bans.0, vec![owner_ban.clone()]);
+        let next = normalized.delta(
+            &normalized,
+            &parameters,
+            &receiver.summarize(&receiver, &parameters),
         );
-        assert_eq!(delta.ban_evidence.unwrap(), vec![shallow[1].clone()]);
+        assert!(
+            next.as_ref().is_none_or(|d| d.bans.is_none()),
+            "no ban is left to send"
+        );
     }
 
     #[test]

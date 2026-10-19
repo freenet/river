@@ -1817,11 +1817,12 @@ fn a_mutual_ban_removes_only_the_cycle_members() {
 
 /// Round 5 Must Fix 2, revised for freenet/river#796: an ordinary member X
 /// deputizes sybils it invited and has them ban each other in pairs with
-/// far-future dates. Every pair is a cycle, so the bans are live and compete
-/// on recency in the non-owner pool. The owner pool keeps its half of the cap,
-/// so the owner's ban survives the flood. A moderator's older ban in the
-/// non-owner pool is evicted: that is the accepted future-dating residual
-/// (freenet/river#413), and the evicted ban's target is back.
+/// far-future dates. Every pair is a cycle, so the bans are live. The owner
+/// pool keeps its half of the cap, so the owner's ban survives the flood.
+/// The cap's authority order ranks a ban by how high in the invite tree its
+/// authority sits, not by its date, so the moderator's ban on a member
+/// invited by the owner ranks above the sybils' bans on members two levels
+/// down, and is kept too.
 #[test]
 fn a_sybil_deputy_cycle_flood_cannot_evict_owner_bans() {
     let room = capped_room(20, 4);
@@ -1853,9 +1854,11 @@ fn a_sybil_deputy_cycle_flood_cannot_evict_owner_bans() {
         !member_ids(&after).contains(&v.id),
         "the owner's ban still takes effect"
     );
+    // Authority order: D's ban on W ranks at W's depth minus one (0), the
+    // sybils' bans at depth 1.
     assert!(
-        !has_ban(&after, &d_bans_w),
-        "accepted residual (#413): the older non-owner ban is evicted"
+        has_ban(&after, &d_bans_w),
+        "the moderator's ban ranks above the flood"
     );
 }
 
@@ -2035,9 +2038,13 @@ fn empty_ban_evidence_is_not_serialized() {
 }
 
 /// A ban that closes a mutual-ban cycle is live at the `max_user_bans` cap
-/// even when an earlier ban already removed its issuer (Ian, 2026-09-24: both
-/// bans of a mutual ban stand). Under cap pressure the cycle's bans are kept
-/// and bans that take no effect go first.
+/// (Ian, 2026-09-24: both bans of a mutual ban stand). The cap judges each
+/// ban over the bans kept before it in its authority order (newest first
+/// within a level here), so the cycle's tier is decided over that prefix: B's
+/// newer bans on T and U, then B's ban on A, then A's ban on B closing the
+/// cycle, fill the cap, and C's older ban on A, judged last, is left out. A
+/// and B are removed as a mutual pair, which makes B's other bans take no
+/// effect, so T and U stay. A re-merge changes nothing.
 #[test]
 fn cycle_bans_rank_mutual_after_an_earlier_removal() {
     let room = capped_room(20, 4);
@@ -2064,12 +2071,25 @@ fn cycle_bans_rank_mutual_after_an_earlier_removal() {
 
     // Two later bans by B that take no effect push the room over the cap.
     let extra = vec![room.ban(&b, &t, 1_000_000), room.ban(&b, &u, 1_000_001)];
-    let after = apply_checked(&s, bans_delta(extra), &room.params);
-    assert!(has_ban(&after, &c_bans_a));
+    let after = apply_checked(&s, bans_delta(extra.clone()), &room.params);
+    // Judged over the kept prefix, newest first: C's ban is reached last.
+    assert!(!has_ban(&after, &c_bans_a));
     assert!(has_ban(&after, &a_bans_b) && has_ban(&after, &b_bans_a));
+    assert!(extra.iter().all(|b| has_ban(&after, b)));
+    let resolution = after.members.resolve_bans(
+        &after.ban_evidence,
+        &after.bans,
+        &after.member_info,
+        &room.params,
+    );
+    assert_eq!(resolution.tier(&a_bans_b.id()), BanResolution::MUTUAL);
+    assert_eq!(resolution.tier(&b_bans_a.id()), BanResolution::MUTUAL);
     let active = active_ids(&after, &room.params);
     assert!(!active.contains(&a.id) && !active.contains(&b.id));
     assert!(active.contains(&t.id) && active.contains(&u.id));
+    let mut again = after.clone();
+    again.merge_from(&room.params, &after).expect("re-merge");
+    assert_eq!(ser(&again), ser(&after), "a re-merge gives the same");
 }
 
 /// Only signature-verified bans compete for the one ranked slot per
@@ -2174,11 +2194,12 @@ fn a_pruned_moderator_held_as_evidence_keeps_ban_authority() {
     );
 }
 
-/// Only one ban per (issuer, target) is live at the `max_user_bans` cap: a
-/// later duplicate of an effective ban is a dead entry, evicted before any
-/// live ban however old.
+/// Only one ban per (issuer, target) is judged live at the `max_user_bans`
+/// cap: the one the authority order reaches first (the newest within its
+/// level). A second ban for the pair can only fill a slot left at the end,
+/// so it never takes a slot from another pair's ban.
 #[test]
-fn cap_evicts_a_duplicate_before_any_live_ban() {
+fn a_duplicate_never_takes_another_pairs_slot() {
     let room = capped_room(20, 3);
     let (d, x, y, z) = (room.person(), room.person(), room.person(), room.person());
     let s = room.modded_state(&[&d, &x, &y, &z], &[&d], vec![]);
@@ -2197,11 +2218,9 @@ fn cap_evicts_a_duplicate_before_any_live_ban() {
     );
     let after = apply_checked(&s, bans_delta(vec![d_bans_y_again.clone()]), &room.params);
     assert!(has_ban(&after, &owner_bans_x));
-    assert!(has_ban(&after, &d_bans_y) && has_ban(&after, &d_bans_z));
-    assert!(
-        !has_ban(&after, &d_bans_y_again),
-        "the duplicate goes first"
-    );
+    assert!(has_ban(&after, &d_bans_z), "no other pair loses its ban");
+    // The pair keeps the ban the order reaches first; the cap is then full.
+    assert!(has_ban(&after, &d_bans_y_again) && !has_ban(&after, &d_bans_y));
 }
 
 /// freenet/river#796: with the ban list full of OWNER bans, a deputy's new ban
@@ -2297,10 +2316,11 @@ fn a_new_owner_ban_evicts_the_oldest_ban_of_the_pool_over_its_share() {
     assert!(has_ban(&after, &d_bans[1]) && has_ban(&after, &d_bans[2]));
 }
 
-/// An odd cap's spare slot goes to the newer ban, whichever pool it is in.
-/// Cap 3: each pool is guaranteed one slot and the third is shared by age.
+/// An odd cap's spare slot goes to the next ban in the authority order,
+/// whatever its age. Cap 3: each pool is guaranteed one slot, and the third
+/// goes to the older owner ban, as owner bans rank first.
 #[test]
-fn an_odd_caps_spare_slot_goes_to_the_newer_ban() {
+fn an_odd_caps_spare_slot_goes_to_the_next_ban_in_authority_order() {
     for owner_older in [true, false] {
         let room = capped_room(20, 3);
         let d = room.person();
@@ -2319,17 +2339,14 @@ fn an_odd_caps_spare_slot_goes_to_the_newer_ban() {
         let after = apply_checked(&s, bans_delta(vec![d2.clone()]), &room.params);
         assert_eq!(after.bans.0.len(), 3);
         assert!(has_ban(&after, &o2) && has_ban(&after, &d2));
-        if owner_older {
-            assert!(!has_ban(&after, &o1) && has_ban(&after, &d1));
-        } else {
-            assert!(has_ban(&after, &o1) && !has_ban(&after, &d1));
-        }
+        assert!(has_ban(&after, &o1) && !has_ban(&after, &d1));
     }
 }
 
-/// At cap 1 neither pool is guaranteed a slot, so the newer ban wins.
+/// At cap 1 neither pool is guaranteed a slot, and the one slot goes to the
+/// first ban in the authority order: the owner's ban, newer or older.
 #[test]
-fn cap_one_keeps_the_newer_ban_whatever_its_pool() {
+fn cap_one_keeps_the_owner_ban_over_a_newer_ban() {
     for owner_newer in [true, false] {
         let room = capped_room(20, 1);
         let d = room.person();
@@ -2341,18 +2358,18 @@ fn cap_one_keeps_the_newer_ban_whatever_its_pool() {
         let s = apply_checked(&s, bans_delta(vec![o.clone()]), &room.params);
         let after = apply_checked(&s, bans_delta(vec![db.clone()]), &room.params);
         assert_eq!(after.bans.0.len(), 1);
-        assert_eq!(has_ban(&after, &o), owner_newer);
-        assert_eq!(has_ban(&after, &db), !owner_newer);
+        assert!(has_ban(&after, &o) && !has_ban(&after, &db));
     }
 }
 
-/// One cap pass that drops a dead entry AND then evicts from a pool: cap 4,
+/// One cap pass over a duplicate pair AND a pool over its share: cap 4,
 /// three owner bans, a deputy's ban plus a later duplicate of it, and another
-/// deputy ban. Six bans, two to go: the duplicate (dead) first, then the
-/// oldest owner ban, the owner pool being the only one over its share. The
+/// deputy ban. Six bans, two to go: the owner pool keeps its newest two, and
+/// the deputy's pair keeps the ban the authority order reaches first (the
+/// newer one), so the older ban of the pair and the oldest owner ban go. The
 /// result does not depend on input order, and a second pass changes nothing.
 #[test]
-fn a_dead_entry_and_a_pool_eviction_in_one_pass() {
+fn a_duplicate_pair_and_a_pool_eviction_in_one_pass() {
     let room = capped_room(20, 4);
     let (d, x, y) = (room.person(), room.person(), room.person());
     let s = room.modded_state(&[&d, &x, &y], &[&d], vec![]);
@@ -2385,13 +2402,13 @@ fn a_dead_entry_and_a_pool_eviction_in_one_pass() {
     };
     let out = cap(&input);
     let ids: Vec<_> = out.iter().map(|b| b.id()).collect();
-    let want: Vec<_> = [&owner_bans[1], &owner_bans[2], &d_bans_x, &d_bans_y]
+    let want: Vec<_> = [&owner_bans[1], &owner_bans[2], &d_bans_y, &d_bans_x_again]
         .iter()
         .map(|b| b.id())
         .collect();
     assert_eq!(
         ids, want,
-        "duplicate and oldest owner ban evicted, in stored order"
+        "the pair's older ban and the oldest owner ban go, in stored order"
     );
 
     let mut reversed = input.clone();
@@ -2403,12 +2420,13 @@ fn a_dead_entry_and_a_pool_eviction_in_one_pass() {
     assert_eq!(cap(&out), out, "a second pass changes nothing");
 }
 
-/// More dead entries than the overflow: only the oldest dead entries go, and
-/// no live ban is touched. Cap 5 with four live bans, then three later
-/// duplicates of the deputy's pairs (dead): two over, so the two oldest
-/// duplicates go and the newest stays.
+/// More duplicates than the overflow: each (issuer, target) pair keeps the
+/// ban the authority order reaches first (the newest), no pair is left
+/// without a ban, and the remaining bans only fill the slots left, in the
+/// same order. Cap 5 with four bans, then three later bans on the deputy's
+/// two pairs: seven against cap 5.
 #[test]
-fn surplus_dead_entries_go_oldest_first_and_spare_live_bans() {
+fn surplus_duplicates_only_fill_free_slots() {
     let room = capped_room(20, 5);
     let (d, x, y) = (room.person(), room.person(), room.person());
     let s = room.modded_state(&[&d, &x, &y], &[&d], vec![]);
@@ -2422,9 +2440,7 @@ fn surplus_dead_entries_go_oldest_first_and_spare_live_bans() {
         bans_delta(vec![o1.clone(), o2.clone(), dx.clone(), dy.clone()]),
         &room.params,
     );
-    // Three duplicates of live pairs: all dead. 7 bans against cap 5, so two
-    // go: the two OLDEST duplicates. The newest duplicate stays as a dead
-    // entry, since the set is then within the cap.
+    // Three later bans on the deputy's two pairs: 7 bans against cap 5.
     let dup1 = room.ban(&d, &x, 20);
     let dup2 = room.ban(&d, &y, 21);
     let dup3 = room.ban(&d, &x, 22);
@@ -2433,19 +2449,22 @@ fn surplus_dead_entries_go_oldest_first_and_spare_live_bans() {
         bans_delta(vec![dup1.clone(), dup2.clone(), dup3.clone()]),
         &room.params,
     );
-    for live in [&o1, &o2, &dx, &dy] {
-        assert!(has_ban(&after, live), "no live ban is evicted");
-    }
-    assert!(!has_ban(&after, &dup1) && !has_ban(&after, &dup2));
-    assert!(has_ban(&after, &dup3), "only the overflow is evicted");
+    assert!(
+        has_ban(&after, &o1) && has_ban(&after, &o2),
+        "owner bans stay"
+    );
+    // D->X keeps dup3, D->Y keeps dup2 (each pair's newest); the fifth slot
+    // goes to the next ban in order, dup1; the oldest bans of the pairs go.
+    assert!(has_ban(&after, &dup3) && has_ban(&after, &dup2));
+    assert!(has_ban(&after, &dup1), "a duplicate fills a free slot");
+    assert!(!has_ban(&after, &dx) && !has_ban(&after, &dy));
 }
 
 /// Both pools over their share with several evictions in one pass. Cap 4
 /// (share 2): owner bans at 10, 30, 40, 50 and deputy bans at 20, 60, 70.
-/// Seven live, three go: each pool's bans beyond its share, oldest first, so
-/// the newest two of each pool survive. (With an even cap and both pools at
-/// or over their share, the candidates number exactly the overflow; the age
-/// choice between pools is pinned by `an_odd_caps_spare_slot_goes_to_the_newer_ban`.)
+/// Seven live, three go: each pool keeps its newest two, its share. (The
+/// choice of a spare slot between pools is pinned by
+/// `an_odd_caps_spare_slot_goes_to_the_next_ban_in_authority_order`.)
 #[test]
 fn several_evictions_take_each_pools_oldest_beyond_its_share() {
     let room = capped_room(20, 4);
