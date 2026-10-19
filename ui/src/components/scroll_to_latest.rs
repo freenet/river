@@ -52,14 +52,18 @@ impl HistoryDom {
         element_by_id(self.sentinel_id)
     }
 
-    /// Does an arrival rendering now follow? Only into a history in the
-    /// foreground whose newest item's bottom sat at most [`FOLLOW_BAND_PX`]
-    /// below the view. Called from render, before the patch.
+    /// Does an arrival rendering now follow? Only into a history with layout
+    /// whose newest item's bottom sat at most [`FOLLOW_BAND_PX`] below the
+    /// view. Called from render, before the patch.
+    ///
+    /// Not gated on the foreground: a reader who left the end in view (a
+    /// hidden tab, an occluded window, a phone with its screen off, a DM
+    /// thread over the room) comes back to the end. Gating it left them parked
+    /// above every arrival, and past the band no later arrival followed
+    /// either. Reading still waits for the foreground ([`Self::end_seen`]).
     pub fn arrival_follows(&self) -> bool {
-        self.container().is_some_and(|container| {
-            crate::components::foreground::in_foreground(self.under_dm_thread, &container)
-                && self.newest_bottom_below_view(&container) <= FOLLOW_BAND_PX
-        })
+        self.container()
+            .is_some_and(|container| self.newest_bottom_below_view(&container) <= FOLLOW_BAND_PX)
     }
 
     /// Is the history in the foreground with its newest item's bottom on

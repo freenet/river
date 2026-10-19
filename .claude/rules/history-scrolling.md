@@ -20,21 +20,29 @@ globs:
 An arrival scrolls a room or a DM thread to its newest message only when
 both of these hold at the moment it arrives:
 
-1. **The conversation is in the foreground** (`foreground::in_foreground`):
-   the tab is visible and the history has layout (on mobile, the chat panel
-   is the one showing). For the room, no DM thread is open
-   (`OPEN_DM_THREAD`). No other dialog or popover counts, the thread's own
-   confirmation included.
+1. **The history has layout** (on mobile, the chat panel is the one
+   showing). The tab need not be visible, and a DM thread open over the room
+   does not stop the room following: a reader who left the end in view (a
+   background tab, an occluded or minimized window, a phone with its screen
+   off, a DM thread) comes back to the end. Gating this on the foreground, as
+   #753 did, parked such a reader above every arrival, and once the newest
+   message sat past the band no later arrival followed either, so the history
+   looked as if it had stopped following.
 2. **The reader is at the end or near it:** before the patch, the newest
    item's bottom (`bottom-sentinel` / `dm-bottom-sentinel`, the same edge as
    Latest and the read rule, not the scroller's absolute end) sits at most
    `FOLLOW_BAND_PX` (100) below the view's bottom edge, in a room and in a DM
    thread alike.
 
+Following never marks anything read. The read rule below still requires the
+foreground (`foreground::in_foreground`: the tab visible, the history with
+layout, and for the room no DM thread open), so arrivals followed while away
+stay unread until the reader is back and they are on screen.
+
 **Only an arrival follows.** A tab becoming visible, a DM thread closing, or a
-mobile panel revealing the chat never scrolls: messages that arrived in the
-meantime stay below, Latest appears, and they stay unread until the reader
-reaches them.
+mobile panel revealing the chat never scrolls. Messages that arrived while a
+mobile panel hid the chat stay below, Latest appears, and they stay unread
+until the reader reaches them.
 
 While another mobile panel replaces the chat, Latest is hidden with it, so
 the open room's unread count, under its notification mode, shows in one place
@@ -83,11 +91,12 @@ Current behavior:
 - A reader dragging within the band when an arrival lands is taken to the
   end. There is no gesture guard: remembering that the reader had moved up
   (`reader_moved_up_since`) is the latch that caused #508.
-- The history follows, and is read, under every dialog and popover except a
-  DM thread over the room: member info, room settings, invite and ban
-  dialogs, the message action menu and the reaction picker. The reader is at
-  the end anyway when the dialog closes, but those arrivals count as read
-  without having been on screen unobstructed.
+- The history follows under every dialog and popover, a DM thread over the
+  room included, and is read under all of them except that DM thread: member
+  info, room settings, invite and ban dialogs, the message action menu and
+  the reaction picker. The reader is at the end anyway when the dialog
+  closes, but those arrivals count as read without having been on screen
+  unobstructed.
 
 Known limitations:
 
@@ -162,7 +171,7 @@ DM threads share the policy: opening, own send and Latest jump instantly,
 an own send being one to this thread (a send completing in another thread,
 counted per `(room, peer)`, never moves it), and an inbound DM follows a reader at the end by the rule above, with the
 same band. A thread opened empty has no opening to place, so its first DMs
-follow by the same rule (in a hidden tab they leave it at the top). Latest
+follow by the same rule, in a hidden tab too. Latest
 uses the same 4px message-bottom margin. The thread updates its read cutoff
 to the newest rendered inbound DM timestamp only when it is in the foreground
 and the newest DM's bottom is on screen, and re-checks when the tab becomes

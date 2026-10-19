@@ -1,10 +1,11 @@
 //! Whether a conversation is in the foreground: the tab is visible, its
-//! history has layout, and, for the room, no DM thread covers it. Following an
-//! arrival and the read rule both ask this, for the room history and the DM
-//! thread alike (`.claude/rules/history-scrolling.md`).
+//! history has layout, and, for the room, no DM thread covers it. The read
+//! rule asks this, for the room history and the DM thread alike
+//! (`.claude/rules/history-scrolling.md`). Following an arrival does not: it
+//! needs only layout.
 //!
-//! Other dialogs and popovers do not count: an arrival under them follows and
-//! is read as if they were not there.
+//! Other dialogs and popovers do not count: an arrival under them is read as
+//! if they were not there.
 //!
 //! The read rule re-checks when either input changes without a scroll, a
 //! resize or an observer report: its effects subscribe to
