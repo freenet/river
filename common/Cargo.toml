@@ -86,6 +86,9 @@ own-purges = []
 # `resolve_bans` calls, cleanup passes), read by out-of-tree measurement
 # tools. No WASM or client build enables it.
 cleanup-counters = []
+# Every cleanup runs all of its passes, as its worst case does. For timing
+# the room-contract WASM out of tree only; no published build enables it.
+force-all-cleanup-passes = []
 
 [build-dependencies]
 # Parses legacy_room_contracts.toml, validates every hash, and generates the

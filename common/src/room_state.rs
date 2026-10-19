@@ -553,6 +553,8 @@ impl ChatRoomStateV1 {
                 *self = next;
                 #[cfg(test)]
                 let last_changed = last_changed || cleanup_counters::all_passes_forced();
+                #[cfg(feature = "force-all-cleanup-passes")]
+                let last_changed = true;
                 if !last_changed {
                     break;
                 }
