@@ -4097,10 +4097,10 @@ mod tests {
         (state, params)
     }
 
-    /// A whole-state merge that takes a room over its ban cap runs the cap
-    /// once: the DM apply's enforced-ban set and cleanup step 0-cap judge the
-    /// same inputs, and the second takes the first's answer. Each ban
-    /// signature is verified at most once across the merge.
+    /// A whole-state merge, or a delta, that takes a room over its ban cap
+    /// runs the cap once: the DM apply's enforced-ban set and cleanup step
+    /// 0-cap judge the same inputs, and the second takes the first's answer.
+    /// Each ban signature is verified at most once across the merge.
     #[test]
     fn a_merge_over_the_ban_cap_judges_the_bans_once() {
         let caps = 200usize;
@@ -4127,6 +4127,26 @@ mod tests {
         assert!(
             resolved <= caps + 10,
             "{resolved} resolutions: the cap ran more than once"
+        );
+
+        // The same through a delta (the contract's update path).
+        let (mut a, b) = (half(0..caps), half(caps..2 * caps));
+        let parent = a.clone();
+        cleanup_counters::reset();
+        a.apply_delta(
+            &parent,
+            &params,
+            &Some(ChatRoomStateV1Delta {
+                bans: Some(b.bans.0.clone()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let (_, resolved, _) = cleanup_counters::read();
+        assert_eq!(a.bans.0.len(), caps);
+        assert!(
+            resolved <= caps + 10,
+            "{resolved} resolutions on the delta path: the cap ran more than once"
         );
     }
 
