@@ -1474,6 +1474,9 @@ mod tests {
 
     #[test]
     fn test_messages_apply_delta() {
+        use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        use crate::room_state::ChatRoomStateV1Delta;
+
         // Setup
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
@@ -1483,17 +1486,30 @@ mod tests {
         let author_verifying_key = author_signing_key.verifying_key();
         let author_id = MemberId::from(&author_verifying_key);
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration.configuration.max_recent_messages = 3;
-        parent_state.configuration.configuration.max_message_size = 100;
-        parent_state.members.members = vec![crate::room_state::member::AuthorizedMember {
-            member: crate::room_state::member::Member {
+        // The `max_recent_messages` cap is a room rule applied by
+        // `post_apply_cleanup`, so deltas are applied to the whole room. The
+        // author is a member with a valid invitation, so cleanup keeps them
+        // (as the author of the kept messages).
+        let mut room = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_recent_messages: 3,
+                    max_message_size: 100,
+                    ..Configuration::default()
+                },
+                &owner_signing_key,
+            ),
+            ..Default::default()
+        };
+        room.members.members = vec![crate::room_state::member::AuthorizedMember::new(
+            crate::room_state::member::Member {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
                 member_vk: author_verifying_key,
             },
-            signature: owner_signing_key.try_sign(&[0; 32]).unwrap(),
-        }];
+            &owner_signing_key,
+        )];
 
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
@@ -1517,16 +1533,19 @@ mod tests {
         let message4 = create_message(now);
 
         // Initial room_state with 2 messages
-        let mut messages = MessagesV1 {
+        room.recent_messages = MessagesV1 {
             messages: vec![message1.clone(), message2.clone()],
             ..Default::default()
         };
 
         // Apply delta with 2 new messages
-        let delta = vec![message3.clone(), message4.clone()];
-        assert!(messages
-            .apply_delta(&parent_state, &parameters, &Some(delta))
-            .is_ok());
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![message3.clone(), message4.clone()]),
+            ..Default::default()
+        };
+        let parent = room.clone();
+        assert!(room.apply_delta(&parent, &parameters, &Some(delta)).is_ok());
+        let messages = &room.recent_messages;
 
         // Check results
         assert_eq!(
@@ -1553,10 +1572,13 @@ mod tests {
 
         // Apply delta with an older message
         let old_message = create_message(now - Duration::from_secs(4));
-        let delta = vec![old_message.clone()];
-        assert!(messages
-            .apply_delta(&parent_state, &parameters, &Some(delta))
-            .is_ok());
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![old_message.clone()]),
+            ..Default::default()
+        };
+        let parent = room.clone();
+        assert!(room.apply_delta(&parent, &parameters, &Some(delta)).is_ok());
+        let messages = &room.recent_messages;
 
         // Check results
         assert_eq!(messages.messages.len(), 3, "Should still have 3 messages");

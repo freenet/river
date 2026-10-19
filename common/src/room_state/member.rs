@@ -2556,37 +2556,73 @@ pub(crate) mod tests {
         let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
-        let (member2, _) = create_test_member(owner_id, member1.id());
-        let (member3, _) = create_test_member(owner_id, member1.id());
-        let (member4, _) = create_test_member(owner_id, member1.id());
+        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
+        let (member3, member3_signing_key) = create_test_member(owner_id, member1.id());
+        let (member4, member4_signing_key) = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
         let authorized_member3 = AuthorizedMember::new(member3.clone(), &member1_signing_key);
         let authorized_member4 = AuthorizedMember::new(member4.clone(), &member1_signing_key);
 
-        let mut members = MembersV1 {
-            members: vec![authorized_member1.clone(), authorized_member2.clone()],
+        // One message per member, signed by that member, so
+        // `post_apply_cleanup`'s prune keeps every member and only the
+        // `max_members` cap decides who goes.
+        let message = |author: &Member, sk: &SigningKey, secs: u64| {
+            crate::room_state::message::AuthorizedMessageV1::new(
+                crate::room_state::message::MessageV1 {
+                    room_owner: owner_id,
+                    author: author.id(),
+                    time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                    content: crate::room_state::message::RoomMessageBody::public("hi".to_string()),
+                },
+                sk,
+            )
         };
+        let message1 = message(&member1, &member1_signing_key, 1);
+        let message2 = message(&member2, &member2_signing_key, 2);
+        let message3 = message(&member3, &member3_signing_key, 3);
+        let message4 = message(&member4, &member4_signing_key, 4);
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration.configuration.max_members = 3;
+        // The `max_members` cap is a room rule applied by
+        // `post_apply_cleanup`, so the delta is applied to the whole room.
+        let mut room = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_members: 3,
+                    ..Configuration::default()
+                },
+                &owner_signing_key,
+            ),
+            members: MembersV1 {
+                members: vec![authorized_member1.clone(), authorized_member2.clone()],
+            },
+            ..Default::default()
+        };
+        room.recent_messages.messages = vec![message1.clone(), message2.clone()];
 
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
         // Test applying delta that would exceed max_members
-        // Now ALL members are added first, then excess removed deterministically:
+        // Now ALL members are added first, then cleanup removes the excess deterministically:
         // - member1 has shortest invite chain (invited by owner)
         // - member2, member3, member4 all have same chain length (invited by member1)
         // - One of member2/3/4 is removed based on highest MemberId (deterministic tie-breaker)
-        let delta = MembersDelta {
-            added: vec![authorized_member3.clone(), authorized_member4.clone()],
+        let delta = crate::room_state::ChatRoomStateV1Delta {
+            members: Some(MembersDelta {
+                added: vec![authorized_member3.clone(), authorized_member4.clone()],
+            }),
+            recent_messages: Some(vec![message3.clone(), message4.clone()]),
+            ..Default::default()
         };
 
-        let result = members.apply_delta(&parent_state, &parameters, &Some(delta));
-        assert!(result.is_ok());
+        let parent = room.clone();
+        let result = room.apply_delta(&parent, &parameters, &Some(delta));
+        assert!(result.is_ok(), "{result:?}");
+        let members = &room.members;
         assert_eq!(members.members.len(), 3);
         // member1 is always kept (shortest invite chain)
         assert!(members
@@ -2603,14 +2639,20 @@ pub(crate) mod tests {
             "Exactly 2 of the 3 equal-chain-length members should be kept"
         );
 
-        // Test applying delta with already existing member
-        let delta = MembersDelta {
-            added: vec![authorized_member2.clone()],
+        // Test applying delta with already existing member (with its
+        // message, so it has a reason to stay if the cap admits it)
+        let delta = crate::room_state::ChatRoomStateV1Delta {
+            members: Some(MembersDelta {
+                added: vec![authorized_member2.clone()],
+            }),
+            recent_messages: Some(vec![message2.clone()]),
+            ..Default::default()
         };
 
-        let result = members.apply_delta(&parent_state, &parameters, &Some(delta));
-        assert!(result.is_ok());
-        assert_eq!(members.members.len(), 3);
+        let parent = room.clone();
+        let result = room.apply_delta(&parent, &parameters, &Some(delta));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(room.members.members.len(), 3);
     }
 
     #[test]
