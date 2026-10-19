@@ -122,10 +122,30 @@ fn exchange(
     a: &ChatRoomStateV1,
     b: &ChatRoomStateV1,
 ) -> (ChatRoomStateV1, ChatRoomStateV1) {
-    let merged = |x: &ChatRoomStateV1, y: &ChatRoomStateV1| {
+    exchange_by(a, b, |x, y| {
         let mut out = x.clone();
         out.merge_from(params, y).map(|()| out)
-    };
+    })
+}
+
+/// [`exchange`] where each side merges through its own summary, as the UI
+/// does (`merge_through_summary`).
+fn exchange_through_summary(
+    params: &ChatRoomParametersV1,
+    a: &ChatRoomStateV1,
+    b: &ChatRoomStateV1,
+) -> (ChatRoomStateV1, ChatRoomStateV1) {
+    exchange_by(a, b, |x, y| {
+        let mut out = x.clone();
+        out.merge_through_summary(params, y).map(|_| out)
+    })
+}
+
+fn exchange_by(
+    a: &ChatRoomStateV1,
+    b: &ChatRoomStateV1,
+    merged: impl Fn(&ChatRoomStateV1, &ChatRoomStateV1) -> Result<ChatRoomStateV1, String>,
+) -> (ChatRoomStateV1, ChatRoomStateV1) {
     match (merged(a, b), merged(b, a)) {
         (Ok(ab), Ok(ba)) => (ab, ba),
         (Err(e), Ok(ba)) => {
@@ -242,8 +262,8 @@ fn bans_are_judged_after_the_merged_member_cap() {
     let r = Room::new();
     let (w, x) = (sk(3), sk(2));
     let mut bans: Vec<AuthorizedUserBan> =
-        (0..60).map(|i| r.ban(&x, target(i), 10_000 + i)).collect();
-    bans.extend((0..30).map(|i| r.ban(&w, target(1_000 + i), 100 + i)));
+        (0..120).map(|i| r.ban(&x, target(i), 10_000 + i)).collect();
+    bans.extend((0..60).map(|i| r.ban(&w, target(1_000 + i), 100 + i)));
     let sender = r.settled(ChatRoomStateV1 {
         configuration: r.cfg(1, |c| c.max_user_bans = 300),
         members: MembersV1 {
@@ -256,7 +276,7 @@ fn bans_are_judged_after_the_merged_member_cap() {
         recent_messages: r.messages(vec![r.msg(&w, 1), r.msg(&x, 2)]),
         ..Default::default()
     });
-    assert_eq!(sender.bans.0.len(), 90, "premise");
+    assert_eq!(sender.bans.0.len(), 180, "premise");
     let receiver = r.settled(ChatRoomStateV1 {
         configuration: r.cfg(2, |c| {
             c.max_user_bans = 10;
@@ -269,10 +289,13 @@ fn bans_are_judged_after_the_merged_member_cap() {
         ser(&rs) == ser(&sr),
         "one exchange gives the same state both ways"
     );
-    let mut ui = receiver.clone();
-    ui.merge_through_summary(&r.p, &sender).expect("UI path");
+    // The sender holds more bans than one delta may carry in the receiver's
+    // room, under a configuration that does not outrank it, so the UI path
+    // refuses it one way too; it ends where merge_from does after the
+    // exchange.
+    let (ui_rs, ui_sr) = exchange_through_summary(&r.p, &receiver, &sender);
     assert!(
-        ser(&ui) == ser(&rs),
+        ser(&ui_rs) == ser(&rs) && ser(&ui_sr) == ser(&rs),
         "the UI path ends where merge_from does"
     );
 }
@@ -300,6 +323,8 @@ fn a_ban_the_cap_evicts_still_decides_liveness_in_both_directions() {
         ..Default::default()
     });
     let mut sb = vec![r.ban(&y, id(&x), 50)];
+    // 90 bans, not the 150 this shape could hold: a larger flood here falls
+    // in an open merge-law item in the ban cap.
     sb.extend((0..90).map(|i| r.ban(&w, target(1_000 + i), 1_000 + i)));
     let sender = r.settled(ChatRoomStateV1 {
         configuration: r.cfg(1, |c| c.max_user_bans = 300),

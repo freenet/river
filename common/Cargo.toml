@@ -82,6 +82,10 @@ mentions = []
 # `migration` and `mentions`, so the room-contract and chat-delegate WASM
 # (and their keys) stay byte-identical.
 own-purges = []
+# Work counters for `post_apply_cleanup` (ban signatures verified,
+# `resolve_bans` calls, cleanup passes), read by out-of-tree measurement
+# tools. No WASM or client build enables it.
+cleanup-counters = []
 
 [build-dependencies]
 # Parses legacy_room_contracts.toml, validates every hash, and generates the

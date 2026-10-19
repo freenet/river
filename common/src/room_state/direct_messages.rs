@@ -901,17 +901,27 @@ pub(crate) fn enforced_ban_set_of(
         );
     }
     // The bans `post_apply_cleanup` counts at the cap: without any no known
-    // key verifies (step 0-sig, which runs only over the cap).
+    // key verifies (step 0-sig, which runs only over the cap), judged against
+    // the same pass-start records (`BansV1::stable_known`).
+    let depth_cap = crate::room_state::ban_evidence::evidence_depth_cap(
+        parent_state.configuration.configuration.max_members,
+    );
     let mut capped: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
     BansV1::drop_bans_no_known_key_verifies(
         &mut capped,
-        &evidence.lookup(&parent_state.members, parameters.owner_id()),
+        &BansV1::stable_known(
+            &parent_state.members,
+            evidence,
+            parameters.owner_id(),
+            depth_cap,
+        ),
         parameters.owner_id(),
         &parameters.owner,
     );
     BansV1::enforce_user_ban_cap(
         &mut capped,
         max_bans,
+        depth_cap,
         &parent_state.members,
         evidence,
         &parent_state.member_info,

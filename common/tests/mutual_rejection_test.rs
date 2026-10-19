@@ -2096,6 +2096,9 @@ fn pair_ranking_counts_only_verified_bans() {
     BansV1::enforce_user_ban_cap(
         &mut bans,
         2,
+        river_core::room_state::ban_evidence::evidence_depth_cap(
+            s.configuration.configuration.max_members,
+        ),
         &s.members,
         &s.ban_evidence,
         &s.member_info,
@@ -2370,6 +2373,9 @@ fn a_dead_entry_and_a_pool_eviction_in_one_pass() {
         BansV1::enforce_user_ban_cap(
             &mut bans,
             4,
+            river_core::room_state::ban_evidence::evidence_depth_cap(
+                s.configuration.configuration.max_members,
+            ),
             &s.members,
             &s.ban_evidence,
             &s.member_info,
@@ -2507,6 +2513,9 @@ fn an_absent_target_ban_by_an_absent_issuer_is_dead() {
     BansV1::enforce_user_ban_cap(
         &mut bans,
         2,
+        river_core::room_state::ban_evidence::evidence_depth_cap(
+            s.configuration.configuration.max_members,
+        ),
         &s.members,
         &s.ban_evidence,
         &s.member_info,
@@ -3215,6 +3224,9 @@ fn cap_both_orders(
         BansV1::enforce_user_ban_cap(
             &mut b,
             cap,
+            river_core::room_state::ban_evidence::evidence_depth_cap(
+                s.configuration.configuration.max_members,
+            ),
             &s.members,
             &s.ban_evidence,
             &s.member_info,

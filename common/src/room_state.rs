@@ -13,6 +13,90 @@ pub mod secret;
 pub mod upgrade;
 pub mod version;
 
+/// Work counters for one `post_apply_cleanup` call: ban signatures actually
+/// verified (memo misses), `MembersV1::resolve_bans` calls, and cleanup
+/// passes. Compiled only for tests and the `cleanup-counters` feature (which
+/// no WASM build enables), so the contracts pay nothing.
+#[cfg(any(test, feature = "cleanup-counters"))]
+pub mod cleanup_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BAN_SIGNATURE_VERIFICATIONS: Cell<usize> = const { Cell::new(0) };
+        static RESOLVE_BANS_CALLS: Cell<usize> = const { Cell::new(0) };
+        static CLEANUP_PASSES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The counters since the last [`reset`]: (ban signatures verified,
+    /// `resolve_bans` calls, passes of the last outermost cleanup).
+    pub fn read() -> (usize, usize, usize) {
+        (
+            BAN_SIGNATURE_VERIFICATIONS.with(|c| c.get()),
+            RESOLVE_BANS_CALLS.with(|c| c.get()),
+            CLEANUP_PASSES.with(|c| c.get()),
+        )
+    }
+
+    pub fn reset() {
+        BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(0));
+        RESOLVE_BANS_CALLS.with(|c| c.set(0));
+        CLEANUP_PASSES.with(|c| c.set(0));
+    }
+
+    thread_local! {
+        static PAUSED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn count_ban_signature_verification() {
+        if !PAUSED.with(|p| p.get()) {
+            BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    pub(crate) fn count_resolve_bans() {
+        if !PAUSED.with(|p| p.get()) {
+            RESOLVE_BANS_CALLS.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// Run `f` without counting its work: the debug-build cross-check that
+    /// recomputes the DM apply's enforced-ban set, which release builds do
+    /// not run.
+    pub(crate) fn not_counting<R>(f: impl FnOnce() -> R) -> R {
+        let was = PAUSED.with(|p| p.replace(true));
+        let r = f();
+        PAUSED.with(|p| p.set(was));
+        r
+    }
+
+    pub(crate) fn set_cleanup_passes(n: usize) {
+        CLEANUP_PASSES.with(|c| c.set(n));
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static FORCE_ALL_PASSES: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Run `f` with every cleanup running all of its passes, as the worst
+    /// case does (cost tests).
+    #[cfg(test)]
+    pub(crate) fn forcing_all_passes<R>(f: impl FnOnce() -> R) -> R {
+        FORCE_ALL_PASSES.with(|c| c.set(true));
+        let r = f();
+        FORCE_ALL_PASSES.with(|c| c.set(false));
+        r
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_passes_forced() -> bool {
+        FORCE_ALL_PASSES.with(|c| c.get())
+    }
+}
+
+/// The most passes one `post_apply_cleanup` runs (see its FIXPOINT note).
+const MAX_CLEANUP_PASSES: usize = 3;
+
 /// Whether the per-delta work bounds (the most new messages, bans, members
 /// and ban-evidence records one delta may add) are lifted for the apply in
 /// progress. A whole-state merge lifts them: it holds the incoming state to
@@ -438,6 +522,36 @@ impl ChatRoomStateV1 {
     /// pruned (orphaning their DMs). See
     /// `direct_messages.rs` module docs, "Interaction with bans".
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
+        crate::room_state::ban::signature_memo::within_one_cleanup(|| {
+            // FIXPOINT: a pass is followed by another on its result, and the
+            // result is kept only once a pass changes nothing, so the state
+            // this returns is one `merge(S, S)` leaves as it is. A pass can
+            // change what the next pass decides (a member the member cap
+            // removes takes its issuer record out of `members`), so the bound
+            // is two passes after the first; at the bound the last pass's
+            // state is returned.
+            self.cleanup_pass(parameters)?;
+            let mut passes = 1;
+            while passes < MAX_CLEANUP_PASSES {
+                let mut next = self.clone();
+                next.cleanup_pass(parameters)?;
+                passes += 1;
+                let unchanged = next == *self;
+                *self = next;
+                #[cfg(test)]
+                let unchanged = unchanged && !cleanup_counters::all_passes_forced();
+                if unchanged {
+                    break;
+                }
+            }
+            #[cfg(any(test, feature = "cleanup-counters"))]
+            cleanup_counters::set_cleanup_passes(passes);
+            Ok(())
+        })
+    }
+
+    /// One pass of [`Self::post_apply_cleanup`].
+    fn cleanup_pass(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
         let depth_cap = crate::room_state::ban_evidence::evidence_depth_cap(
             self.configuration.configuration.max_members,
@@ -462,6 +576,17 @@ impl ChatRoomStateV1 {
             .into_iter()
             .map(|(id, m)| (id, m.clone()))
             .collect();
+        // The records this pass looks a ban's issuer, target and depth up in
+        // (`BansV1::stable_known`): every member present at the start of the
+        // pass, at any depth, and evidence within the depth cap. Steps 0-sig,
+        // 0-cap and 4 read THIS, never anything computed later in the pass.
+        let stable_known: std::collections::HashMap<MemberId, AuthorizedMember> =
+            BansV1::stable_known(&self.members, &self.ban_evidence, owner_id, depth_cap)
+                .into_iter()
+                .map(|(id, m)| (id, m.clone()))
+                .collect();
+        let stable_known: std::collections::HashMap<MemberId, &AuthorizedMember> =
+            stable_known.iter().map(|(id, m)| (*id, m)).collect();
 
         // 0-sig. A ban no known key verifies counts for nothing: one whose
         //     known issuer's key does not verify it (skipped on arrival at a
@@ -473,9 +598,13 @@ impl ChatRoomStateV1 {
         //     step 4 sweeps it), so this runs only when the bans are over the
         //     cap.
         if self.bans.0.len() > self.configuration.configuration.max_user_bans {
-            let known = self.ban_evidence.lookup(&self.members, owner_id);
             let mut bans = std::mem::take(&mut self.bans.0);
-            BansV1::drop_bans_no_known_key_verifies(&mut bans, &known, owner_id, &parameters.owner);
+            BansV1::drop_bans_no_known_key_verifies(
+                &mut bans,
+                &stable_known,
+                owner_id,
+                &parameters.owner,
+            );
             self.bans.0 = bans;
         }
 
@@ -490,73 +619,40 @@ impl ChatRoomStateV1 {
         #[cfg(debug_assertions)]
         let dm_apply_time_ban_set = {
             let snapshot = self.clone();
-            crate::room_state::direct_messages::enforced_ban_set_of(&snapshot, parameters)
+            let recompute = || {
+                crate::room_state::ban::signature_memo::set_aside(|| {
+                    crate::room_state::direct_messages::enforced_ban_set_of(&snapshot, parameters)
+                })
+            };
+            #[cfg(any(test, feature = "cleanup-counters"))]
+            let recompute = || cleanup_counters::not_counting(recompute);
+            recompute()
         };
 
-        // 0-cap. Enforce `max_user_bans` FIRST — BEFORE ban enforcement (step 0)
-        //     and the ban evidence (step 4a) — so both read
-        //     the FINAL surviving (post-cap) ban set (#411 round 7 / Codex P1
-        //     #1+#2). Running the cap here, on the converged pre-enforcement
-        //     state, is what keeps `post_apply_cleanup` IDEMPOTENT and identical
-        //     across peers:
-        //       * #1: an over-cap ban that WILL be evicted must not one-shot a
-        //         member removal at step 0 that the capped converged state
-        //         cannot reproduce — a peer that only ever sees the capped state
-        //         (e.g. via a full-state PUT that bypasses cleanup) would keep
-        //         that member, so removing it here would diverge the member set.
-        //       * #2: a record the evicted ban was the only reference to must
-        //         not survive in `ban_evidence` on pass 1 and vanish on pass 2
-        //         (`cleanup(S) != cleanup(cleanup(S))`, which permanently
-        //         diverges peers that run cleanup a different number of times).
-        //     Eviction drops bans that take no effect first, judged by
-        //     `MembersV1::resolve_bans` over the uncapped set, one per
-        //     (issuer, target) (#410 review round 1, freenet/river#702), then
-        //     evicts the oldest within two pools, owner bans and the rest, each
-        //     guaranteed `max_user_bans / 2` (freenet/river#796). A flood of
-        //     forged, revoked-deputy or banned-issuer bans, which `verify`
-        //     accepts, is dead and goes first. A flood of LIVE far-future-dated
-        //     bans, which any member can mint against its own invitees or
-        //     against ids known nowhere, evicts older non-owner bans and owner
-        //     bans beyond the guaranteed half; see `enforce_user_ban_cap` and
-        //     freenet/river#413 (Limitation 2).
-        //
-        //     CONVERGENCE HONESTY: the enforcing/inert classification is a
-        //     deterministic function of the member set it runs against, but that
-        //     member set is the INTERMEDIATE (pre-step-0) set as `apply_delta`
-        //     left it, which is order-dependent (cascade removal is arrival-order
-        //     sensitive). So two peers applying the same delta multiset in a
-        //     different order can evict DIFFERENT bans and NOT be byte-equal
-        //     without a further exchange; anti-entropy `merge` reconciles them to
-        //     the same top-set (River's ban summary is a full BanId set, so
-        //     anti-entropy always converges — pinned by
-        //     `cap_eviction_reconciles_via_merge`; tracked in freenet/river#413,
-        //     Limitation 1). Do NOT claim the eviction is order-independent per
-        //     delta. (`enforce_user_ban_cap` is independent of the order of the
-        //     ban list it is handed; the arrival-order dependence is in the
-        //     member set it judges against.)
-        //     `verify`'s hard cap ceiling still rejects any stored state left over
-        //     the cap. The signature sweep (step 4) still runs AFTER enforcement
-        //     to drop bans orphaned by a banner's removal, and only removes bans,
-        //     so the ban count stays <= the cap.
+        // 0-cap. Enforce `max_user_bans` FIRST, before ban enforcement (step 0)
+        //     and the ban evidence (step 4a), so both read the bans the cap
+        //     keeps and never a ban it drops (#411 round 7): an over-cap ban
+        //     that is dropped must not remove a member at step 0, nor keep a
+        //     record in `ban_evidence`, that the capped state cannot
+        //     reproduce. The cap (`BansV1::enforce_user_ban_cap`, one
+        //     definition shared with `DirectMessagesV1::apply_delta`'s
+        //     enforced-ban set, freenet/river#675) keeps bans greedily in a
+        //     fixed order, owner bans first and then by how high in the
+        //     invite tree each ban's authority sits, judging each ban over the
+        //     bans kept before it, so the kept set does not depend on any ban
+        //     it drops. Step 4 only removes bans, so the count stays <= the
+        //     cap, and the cap refuses an owner ban that would make step 4
+        //     sweep a ban it kept.
         let max_bans = self.configuration.configuration.max_user_bans;
-        {
-            // The eviction ORDERING lives in `BansV1::enforce_user_ban_cap` —
-            // one definition, shared with `DirectMessagesV1::apply_delta`,
-            // which needs the same surviving ban set to decide which held DMs
-            // the caps may rank (freenet/river#675). A DM swept at apply time
-            // against a DIFFERENT surviving ban set than this step produces is
-            // data loss, so the two must agree by construction rather than by
-            // two copies happening to match — which is exactly what drifted in
-            // #671 and in #411 round 4.
-            BansV1::enforce_user_ban_cap(
-                &mut self.bans.0,
-                max_bans,
-                &self.members,
-                &self.ban_evidence,
-                &self.member_info,
-                parameters,
-            );
-        }
+        BansV1::enforce_user_ban_cap(
+            &mut self.bans.0,
+            max_bans,
+            depth_cap,
+            &self.members,
+            &self.ban_evidence,
+            &self.member_info,
+            parameters,
+        );
 
         // 0. Enforce bans from the CONVERGED (now capped) state, deputy-aware (#410).
         //
@@ -630,13 +726,16 @@ impl ChatRoomStateV1 {
         //    A; AGENTS.md State Authorization Rule), and every ban by a member
         //    an owner ban removes: the owner's ban wins over everything, so
         //    such a ban can never take effect while it stands.
-        //    "Known" means present in `members` now, or known at the START of
-        //    this pass and within the evidence depth cap, so a ban whose
-        //    issuer this pass removes or prunes stays exactly when the
-        //    issuer's record moves to evidence just below (freenet/river#702).
-        //    This runs before the evidence recomputation, which reads the
-        //    swept ban set, and it only removes bans, so the count stays <=
-        //    the cap.
+        //    "Known" is `stable_known`: present in `members` at the START of
+        //    this pass (at any depth), or ban evidence within the depth cap,
+        //    the facts the cap judged by, so this never sweeps a ban the cap
+        //    kept for a reason the cap did not see. A ban whose issuer this
+        //    pass removes or prunes stays this pass; the issuer's record
+        //    moves to evidence just below when it is within the depth cap
+        //    (freenet/river#702), and the next pass sweeps the ban when it is
+        //    not. This runs before the evidence recomputation, which reads
+        //    the swept ban set, and it only removes bans, so the count stays
+        //    <= the cap.
         let all_known: std::collections::HashMap<MemberId, &AuthorizedMember> =
             known_at_start.iter().map(|(id, m)| (*id, m)).collect();
         let present: HashSet<MemberId> =
@@ -655,7 +754,7 @@ impl ChatRoomStateV1 {
             !resolution.owner_removed.contains(&ban.banned_by)
                 && BansV1::ban_signature_matches_current_key(
                     ban,
-                    &known_by_id,
+                    &stable_known,
                     owner_id,
                     &parameters.owner,
                 )
@@ -1150,6 +1249,7 @@ fn trim_to_work_bounds(
             crate::room_state::ban::BansV1::enforce_user_ban_cap(
                 bans,
                 bans_bound,
+                evidence_depth_cap(config.max_members),
                 &sender.members,
                 &sender.ban_evidence,
                 &sender.member_info,
@@ -3858,6 +3958,116 @@ mod tests {
             state.member_info.deputies_of(m_id),
             &[] as &[MemberId],
             "deputies_of agrees with the deduped canonical record"
+        );
+    }
+
+    /// A cleanup holding twice `max_user_bans` live bans (issuers present
+    /// members, targets known nowhere) at the default caps: every ban
+    /// signature is verified at most once across the whole call, the cap
+    /// resolves bans about once per ban it judges, the fixpoint step stops
+    /// within its bound, and the call fits a time budget. All three passes
+    /// are forced, as the worst case pays for them.
+    #[test]
+    fn cleanup_cost_stays_quadratic_and_memoized() {
+        let caps = 200usize;
+        let key = |b: u64| {
+            let mut x = [0u8; 32];
+            x[..8].copy_from_slice(&b.to_le_bytes());
+            x[31] = 9;
+            SigningKey::from_bytes(&x)
+        };
+        let at =
+            |t: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + t);
+        let owner_sk = key(1);
+        let owner: MemberId = owner_sk.verifying_key().into();
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let keys: Vec<SigningKey> = (0..caps as u64).map(|i| key(1_000 + i)).collect();
+        let members: Vec<AuthorizedMember> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let inviter = if i < 10 { &owner_sk } else { &keys[i % 10] };
+                AuthorizedMember::new(
+                    Member {
+                        owner_member_id: owner,
+                        invited_by: inviter.verifying_key().into(),
+                        member_vk: k.verifying_key(),
+                    },
+                    inviter,
+                )
+            })
+            .collect();
+        let messages: Vec<AuthorizedMessageV1> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: owner,
+                        author: k.verifying_key().into(),
+                        time: at(i as u64),
+                        content: RoomMessageBody::public("x".into()),
+                    },
+                    k,
+                )
+            })
+            .collect();
+        let held_bans = 2 * caps;
+        let bans: Vec<AuthorizedUserBan> = (0..held_bans as u64)
+            .map(|i| {
+                let by = &keys[i as usize % caps];
+                AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner,
+                        banned_at: at(100_000 + i),
+                        banned_user: key(10_000_000 + i).verifying_key().into(),
+                    },
+                    by.verifying_key().into(),
+                    by,
+                )
+            })
+            .collect();
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner,
+                    max_members: caps,
+                    max_user_bans: caps,
+                    max_recent_messages: caps,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            members: MembersV1 { members },
+            recent_messages: crate::room_state::message::MessagesV1 {
+                messages,
+                ..Default::default()
+            },
+            bans: BansV1(bans),
+            ..Default::default()
+        };
+        state.recent_messages.rebuild_actions_state();
+
+        cleanup_counters::reset();
+        let started = std::time::Instant::now();
+        cleanup_counters::forcing_all_passes(|| state.post_apply_cleanup(&params)).unwrap();
+        let elapsed = started.elapsed();
+        let (verified, resolved, passes) = cleanup_counters::read();
+        assert_eq!(state.bans.0.len(), caps, "the cap keeps max_user_bans");
+        assert!(
+            verified <= held_bans,
+            "each ban signature is verified at most once: {verified} for {held_bans} bans"
+        );
+        assert!(
+            resolved <= held_bans + 1,
+            "about one resolution per judged ban: {resolved} for {held_bans} bans"
+        );
+        assert_eq!(passes, 3, "all three passes ran");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "cleanup at {caps}/{caps} took {elapsed:?}"
         );
     }
 }

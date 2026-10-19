@@ -8,7 +8,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
@@ -153,91 +153,78 @@ impl BansV1 {
         bans.len() != before
     }
 
-    /// THE single definition of the `max_user_bans` eviction (#411 round 7).
+    /// The records a ban's issuer, target and depth are looked up in by one
+    /// cleanup pass, fixed at the start of the pass so nothing the pass
+    /// later decides about membership changes them: every present member
+    /// (at any depth), and every ban-evidence record whose chain reaches the
+    /// owner within `depth_cap`. A ban whose present issuer is deep in the
+    /// invite tree is therefore never swept for depth while the issuer stays
+    /// a member.
+    pub(crate) fn stable_known<'a>(
+        members: &'a MembersV1,
+        evidence: &'a BanEvidenceV1,
+        owner_id: MemberId,
+        depth_cap: usize,
+    ) -> HashMap<MemberId, &'a AuthorizedMember> {
+        let pool = evidence.lookup(members, owner_id);
+        let present: HashSet<MemberId> = members.members.iter().map(|m| m.member.id()).collect();
+        pool.iter()
+            .filter(|(id, m)| {
+                present.contains(*id)
+                    || super::ban_evidence::within_depth(m, &pool, owner_id, depth_cap)
+            })
+            .map(|(id, m)| (*id, *m))
+            .collect()
+    }
+
+    /// THE single definition of the `max_user_bans` cap. Two sites need to
+    /// know which bans survive it: `post_apply_cleanup` step 0-cap, which
+    /// stores the result, and `DirectMessagesV1::apply_delta`, which sweeps
+    /// DMs against the resulting enforced-ban set (freenet/river#675). One
+    /// function is what makes them agree by construction. The network-delta
+    /// trim uses it too, at the delta's bound.
     ///
-    /// Two sites need to know which bans survive the cap: `post_apply_cleanup`
-    /// step 0-cap, which stores the result, and
-    /// `DirectMessagesV1::apply_delta`, which needs the resulting
-    /// enforced-ban set to decide which held DMs the caps may rank
-    /// (freenet/river#675). They MUST agree exactly — a DM swept at apply time
-    /// against a different surviving ban set than step 6 uses is data loss.
-    /// One function rather than two matching copies is what makes that hold by
-    /// construction; two copies of an almost-identical predicate is precisely
-    /// what drifted in freenet/river#671 and in #411 round 4.
+    /// A no-op when the bans fit the cap, so a room under its cap keeps
+    /// every ban. Over the cap, the kept set is chosen greedily over ONE
+    /// fixed order, so it does not depend on any ban the cap rejects:
     ///
-    /// Evicts by RECENCY within two pools (freenet/river#796, Ian
-    /// 2026-10-16). When the set is over the cap:
+    /// - The order (the "authority order"): owner bans first, newest first;
+    ///   then every other ban by how high in the invite tree its authority
+    ///   sits. A ban on a target whose record is known ranks at the target's
+    ///   depth minus one (its authority, an ancestor or a deputy's granter,
+    ///   sits strictly above the target); a ban on an id known nowhere ranks
+    ///   at its issuer's depth. Within a level the newer ban comes first.
+    ///   Ties in time are broken by `(banned_at, id, record digest)`, the
+    ///   canonical stored order.
+    /// - A ban is judged over the bans accepted so far plus itself, by the
+    ///   full [`MembersV1::resolve_bans`]. It is LIVE if that gives it a tier
+    ///   above [`BanResolution::INERT`], or if its target is known nowhere,
+    ///   its issuer is a known member (not the owner) and no ban removes the
+    ///   issuer (such a ban removes nobody until the target returns). It is
+    ///   SAFE if no accepted ban's issuer, nor its own, becomes owner-removed,
+    ///   so step 4 never sweeps a ban the cap kept.
+    /// - Phase 1: owner bans, live and safe, up to `max_bans / 2`; then the
+    ///   other bans, live and safe, up to `max_bans / 2`. Phase 2: the rest
+    ///   in order, live and safe, up to `max_bans`. In phases 1 and 2 a
+    ///   second ban for an already accepted `(issuer, target)` pair is
+    ///   refused. Phase 3 fills the slots left with the remaining bans in
+    ///   order whose signature verifies and that are safe, duplicates of an
+    ///   accepted pair included.
     ///
-    /// 1. Dead entries go first, oldest first: records whose own signature
-    ///    does not verify against their claimed issuer's key, bans that take
-    ///    no effect, and later duplicates of an `(issuer, target)` pair
-    ///    (below).
-    /// 2. Then live bans are split into OWNER bans and all OTHER bans (deputy,
-    ///    inviter and mutual bans alike). Each pool is guaranteed
-    ///    `max_bans / 2` slots. Only a pool's bans beyond its guarantee can be
-    ///    evicted, and among those the oldest by `(banned_at, id)` go first.
-    ///    With an odd cap and both pools over their share, the spare slot
-    ///    goes to the newest ban beyond either pool's share; with one pool
-    ///    under its share, the other keeps it. Within a pool
-    ///    nothing ranks above anything else.
+    /// So each pool is guaranteed `max_bans / 2` slots for bans that take
+    /// effect, a flood of bans that take no effect given the kept ones only
+    /// fills free slots, and a mutual-ban cycle's tier is decided over the
+    /// bans accepted before it. The issuer, target and depth lookups read
+    /// [`Self::stable_known`] with `depth_cap`; signatures are checked against
+    /// it. Within one cleanup every ban signature is verified at most once
+    /// (see [`AuthorizedUserBan::verify_signature`]).
     ///
-    /// Owner bans are often rare, so the guarantee is a floor, not an
-    /// allocation: slots one pool does not use are open to the other, and a
-    /// room with few owner bans gives other bans nearly the whole cap.
-    ///
-    /// Why two pools and not one. #702 ranked owner bans above every other
-    /// ban, so a list full of owner bans evicted each new deputy ban the
-    /// moment it was added, and the Official room's deputies could not ban
-    /// anyone. Pure recency over one pool would fix that but let any member
-    /// flush every ban, owner bans included: `banned_at` is signed by the
-    /// issuer and the contract has no clock, so far-future-dated bans always
-    /// count as newest.
-    ///
-    /// What the two pools do NOT bound, stated plainly. ANY current member can
-    /// mint live, far-future-dated bans without moderator rights: against
-    /// throwaway members they invited (an inviter may ban its invitees, and
-    /// sybils it deputizes may ban each other in mutual pairs), or against
-    /// random ids whose record is held nowhere (counted live, below). Such a
-    /// flood evicts:
-    ///
-    /// - every older OTHER ban, deputies' included, except in slots owner
-    ///   bans leave unused. This was already true under #702, where inviter
-    ///   bans ranked with deputy bans; only owner bans were immune. While the
-    ///   flood stands, a new deputy ban dated now is the oldest in its pool
-    ///   and is evicted at once, which is the #796 symptom on purpose
-    ///   (freenet/river#413);
-    /// - OWNER bans beyond the newest `max_bans / 2`. This is new: under #702
-    ///   no non-owner ban could evict an owner ban.
-    ///
-    /// An owner ban on the flooder makes all their bans dead, so the next cap
-    /// pass drops them first; bans already evicted stay evicted, and the
-    /// members they named can rejoin. A room that
-    /// wants every owner ban protected sets `max_user_bans` to at least twice
-    /// its owner-ban count.
-    ///
-    /// A ban takes no effect when [`MembersV1::resolve_bans`] over the uncapped
-    /// set gives it [`BanResolution::INERT`]: its issuer is removed, its
-    /// deputy grant is revoked, the issuer has no authority over the target,
-    /// or its signature cannot be checked. A ban whose target's record is held
-    /// nowhere cannot have its authority judged and removes nobody until the
-    /// target returns; it counts as live (in the other pool) when its issuer
-    /// is a present member whose signature verifies and whom no ban removes,
-    /// as such bans ranked before ban evidence, so bans stored before the
-    /// upgrade keep their place. Only one signature-verified ban per
-    /// `(issuer, target)` pair is live (the oldest by `(banned_at, id)`).
-    ///
-    /// Liveness is judged once, over the uncapped set. Evicting one half of a
-    /// mutual pair can make the surviving half take effect in the post-cap
-    /// resolution, as under #702.
-    ///
-    /// The result is in the canonical `(banned_at, id)` stored order and does
-    /// not depend on the order of `bans` as passed in. (It still depends on
-    /// `members`, which can differ between peers mid-merge; see the
-    /// CONVERGENCE HONESTY note at step 0-cap in `post_apply_cleanup`.) A
-    /// no-op when already within the cap.
+    /// The result is in the canonical `(banned_at, id, record digest)` stored
+    /// order and does not depend on the order of `bans` as passed in.
     pub fn enforce_user_ban_cap(
         bans: &mut Vec<AuthorizedUserBan>,
         max_bans: usize,
+        depth_cap: usize,
         members: &MembersV1,
         evidence: &BanEvidenceV1,
         member_info: &MemberInfoV1,
@@ -246,114 +233,139 @@ impl BansV1 {
         if bans.len() <= max_bans {
             return;
         }
-        // Canonical stored order, oldest first; every pass below walks it, and
-        // the per-record indices below refer to it. Records can share
-        // `(banned_at, id)` (an id hashes the signature alone), so the record
-        // digest breaks the tie and the eviction never depends on arrival
-        // order.
         bans.sort_by_cached_key(|b| (b.ban.banned_at, b.id(), crate::util::record_digest(b)));
-        let resolution =
-            members.resolve_bans(evidence, &BansV1(bans.clone()), member_info, parameters);
         let owner_id = parameters.owner_id();
-        let present = members.members_by_member_id();
         let known = evidence.lookup(members, owner_id);
-        // Each record is judged by its own signature against its claimed
-        // issuer's key; one that does not verify is dead. `resolution` is
-        // keyed by `BanId`, so its lookups below are used only for records
-        // whose own signature verifies.
-        let own_signature_ok: Vec<bool> = bans
+        let stable = Self::stable_known(members, evidence, owner_id, depth_cap);
+        let sig_ok: Vec<bool> = bans
             .iter()
             .map(|b| {
-                Self::ban_signature_matches_current_key(b, &known, owner_id, &parameters.owner)
+                Self::ban_signature_matches_current_key(b, &stable, owner_id, &parameters.owner)
             })
             .collect();
-        // Only bans whose own signature verifies compete for their pair, so a
-        // forged earlier copy cannot displace the real one.
-        let mut first_of_pair: HashMap<(MemberId, MemberId), (SystemTime, BanId)> = HashMap::new();
-        for ban in bans
-            .iter()
-            .zip(&own_signature_ok)
-            .filter(|(_, ok)| **ok)
-            .map(|(b, _)| b)
-        {
-            let key = (ban.banned_by, ban.ban.banned_user);
-            let rank = (ban.ban.banned_at, ban.id());
-            first_of_pair
-                .entry(key)
-                .and_modify(|best| {
-                    if rank < *best {
-                        *best = rank.clone();
+        let n = bans.len();
+        // Invite depth over the known records, the owner at 0, by one walk
+        // down from the owner; a record whose chain does not reach the owner
+        // ranks last.
+        let depth: HashMap<MemberId, usize> = {
+            let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+            for (id, m) in &known {
+                children.entry(m.member.invited_by).or_default().push(*id);
+            }
+            let mut depth = HashMap::from([(owner_id, 0usize)]);
+            let mut frontier = vec![owner_id];
+            let mut level = 0;
+            while !frontier.is_empty() {
+                level += 1;
+                let mut next = Vec::new();
+                for inviter in &frontier {
+                    for child in children.get(inviter).into_iter().flatten() {
+                        if !depth.contains_key(child) {
+                            depth.insert(*child, level);
+                            next.push(*child);
+                        }
                     }
-                })
-                .or_insert(rank);
-        }
-        // A dead entry: a record whose own signature does not verify, a later
-        // duplicate of its (issuer, target) pair, or a ban that takes no
-        // effect.
-        let live = |i: usize, ban: &AuthorizedUserBan| {
-            if !own_signature_ok[i] {
-                return false;
-            }
-            let first = first_of_pair
-                .get(&(ban.banned_by, ban.ban.banned_user))
-                .is_some_and(|(at, id)| *at == ban.ban.banned_at && *id == ban.id());
-            if !first {
-                return false;
-            }
-            if resolution.tier(&ban.id()) > BanResolution::INERT {
-                return true;
-            }
-            // A ban whose target's record is held nowhere: live when its
-            // issuer is a present member whose signature verifies and whom no
-            // ban removes (see the doc comment).
-            ban.banned_by != owner_id
-                && ban.ban.banned_user != owner_id
-                && present.contains_key(&ban.banned_by)
-                && !known.contains_key(&ban.ban.banned_user)
-                && !resolution.removed.contains(&ban.banned_by)
-        };
-
-        let mut to_remove = bans.len() - max_bans;
-        let mut evict = vec![false; bans.len()];
-        let mut owner_live = Vec::new();
-        let mut other_live = Vec::new();
-        for (i, ban) in bans.iter().enumerate() {
-            if !live(i, ban) {
-                if to_remove > 0 {
-                    evict[i] = true;
-                    to_remove -= 1;
                 }
-            } else if resolution.tier(&ban.id()) == BanResolution::OWNER {
-                owner_live.push(i);
+                frontier = next;
+            }
+            depth
+        };
+        let depth_of = |id: &MemberId| depth.get(id).copied().unwrap_or(usize::MAX);
+        // The authority order, best first: indices into the canonical order,
+        // newest first within a level.
+        let mut order: Vec<usize> = (0..n).rev().collect();
+        order.sort_by_key(|&i| {
+            let ban = &bans[i];
+            let level = if ban.banned_by == owner_id {
+                0
+            } else if stable.contains_key(&ban.ban.banned_user) {
+                depth_of(&ban.ban.banned_user).saturating_sub(1)
             } else {
-                other_live.push(i);
+                depth_of(&ban.banned_by)
+            };
+            (level, std::cmp::Reverse(i))
+        });
+
+        let mut accepted = vec![false; n];
+        let mut accepted_pairs: HashSet<(MemberId, MemberId)> = HashSet::new();
+        // (live, safe) of ban `i` judged over the accepted bans plus itself.
+        let judge = |i: usize, accepted: &[bool]| -> (bool, bool) {
+            let ban = &bans[i];
+            let set: Vec<AuthorizedUserBan> = (0..n)
+                .filter(|j| *j == i || accepted[*j])
+                .map(|j| bans[j].clone())
+                .collect();
+            let res = members.resolve_bans(evidence, &BansV1(set), member_info, parameters);
+            let safe = !res.owner_removed.contains(&ban.banned_by)
+                && (0..n).all(|j| !accepted[j] || !res.owner_removed.contains(&bans[j].banned_by));
+            if res.tier(&ban.id()) > BanResolution::INERT {
+                return (true, safe);
+            }
+            let live = ban.banned_by != owner_id
+                && ban.ban.banned_user != owner_id
+                && stable.contains_key(&ban.banned_by)
+                && !known.contains_key(&ban.ban.banned_user)
+                && !res.removed.contains(&ban.banned_by);
+            (live, safe)
+        };
+        let pair = |i: usize| (bans[i].banned_by, bans[i].ban.banned_user);
+
+        let share = max_bans / 2;
+        let mut total = 0usize;
+        // Phase 1: each pool up to its share.
+        for owner_pool in [true, false] {
+            let mut count = 0;
+            for &i in &order {
+                if count >= share {
+                    break;
+                }
+                if (bans[i].banned_by == owner_id) != owner_pool
+                    || !sig_ok[i]
+                    || accepted_pairs.contains(&pair(i))
+                {
+                    continue;
+                }
+                let (live, safe) = judge(i, &accepted);
+                if live && safe {
+                    accepted[i] = true;
+                    accepted_pairs.insert(pair(i));
+                    count += 1;
+                    total += 1;
+                }
             }
         }
-        if to_remove > 0 {
-            // Each pool keeps at least `max_bans / 2`; only a pool's bans
-            // beyond that are candidates, and the oldest candidates go first.
-            // With an odd cap the remaining slot goes to the newer ban,
-            // whichever pool it is in. The live total exceeds the cap by
-            // `to_remove` and the two shares sum to at most the cap, so the
-            // pools' excesses sum to at least `to_remove`: the candidates
-            // suffice.
-            let share = max_bans / 2;
-            let owner_excess = owner_live.len().saturating_sub(share);
-            let other_excess = other_live.len().saturating_sub(share);
-            let mut candidates: Vec<usize> = owner_live[..owner_excess]
-                .iter()
-                .chain(&other_live[..other_excess])
-                .copied()
-                .collect();
-            // Indices follow the canonical order, so sorting them sorts by age.
-            candidates.sort_unstable();
-            for i in candidates.into_iter().take(to_remove) {
-                evict[i] = true;
+        // Phase 2: the rest in order.
+        for &i in &order {
+            if total >= max_bans {
+                break;
+            }
+            if accepted[i] || !sig_ok[i] || accepted_pairs.contains(&pair(i)) {
+                continue;
+            }
+            let (live, safe) = judge(i, &accepted);
+            if live && safe {
+                accepted[i] = true;
+                accepted_pairs.insert(pair(i));
+                total += 1;
+            }
+        }
+        // Phase 3: fill the slots left with any ban whose signature verifies
+        // and that is safe, duplicates of an accepted pair included.
+        for &i in &order {
+            if total >= max_bans {
+                break;
+            }
+            if accepted[i] || !sig_ok[i] {
+                continue;
+            }
+            if judge(i, &accepted).1 {
+                accepted[i] = true;
+                total += 1;
             }
         }
         let mut i = 0;
         bans.retain(|_| {
-            let keep = !evict[i];
+            let keep = accepted[i];
             i += 1;
             keep
         });
@@ -671,8 +683,24 @@ impl AuthorizedUserBan {
     pub fn verify_signature(&self, banner_verifying_key: &VerifyingKey) -> Result<(), String> {
         #[cfg(test)]
         tests::BAN_SIGNATURE_CHECKS.with(|c| c.set(c.get() + 1));
-        verify_struct(&self.ban, &self.signature, banner_verifying_key)
-            .map_err(|e| format!("Invalid ban signature: {}", e))
+        let key = (
+            self.signature.to_bytes(),
+            banner_verifying_key.to_bytes(),
+            crate::util::record_digest(&self.ban),
+        );
+        if let Some(ok) = signature_memo::lookup(&key) {
+            return if ok {
+                Ok(())
+            } else {
+                Err("Invalid ban signature".to_string())
+            };
+        }
+        #[cfg(any(test, feature = "cleanup-counters"))]
+        crate::room_state::cleanup_counters::count_ban_signature_verification();
+        let result = verify_struct(&self.ban, &self.signature, banner_verifying_key)
+            .map_err(|e| format!("Invalid ban signature: {}", e));
+        signature_memo::record(key, result.is_ok());
+        result
     }
 
     /// Generates a unique identifier for this ban based on its signature
@@ -742,6 +770,69 @@ mod ban_digest_golden {
         assert_eq!(cbor.len(), 17, "a CBOR byte string of 16 bytes");
         assert_eq!(cbor[0], 0x50);
         assert_eq!(&cbor[1..], &EXPECTED);
+    }
+}
+
+/// The ban signature checks of one `post_apply_cleanup` call, remembered so
+/// each ban is verified at most once however many times the cap, the
+/// cleanup steps and the fixpoint passes ask. Keyed by the signature, the
+/// verifying key and the digest of the signed record, the three inputs of
+/// the check (two bans can share signature bytes), so a remembered answer is
+/// the answer the check would give. Active only inside [`within_one_cleanup`].
+pub(crate) mod signature_memo {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    type Key = ([u8; 64], [u8; 32], [u8; 32]);
+
+    thread_local! {
+        static MEMO: RefCell<Option<HashMap<Key, bool>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn lookup(key: &Key) -> Option<bool> {
+        MEMO.with(|m| m.borrow().as_ref().and_then(|m| m.get(key).copied()))
+    }
+
+    pub(crate) fn record(key: Key, verified: bool) {
+        MEMO.with(|m| {
+            if let Some(m) = m.borrow_mut().as_mut() {
+                m.insert(key, verified);
+            }
+        });
+    }
+
+    /// Run `f` with the memo set aside (neither read nor written), restoring
+    /// it afterwards: for the debug-build cross-check in cleanup, so debug
+    /// builds verify the same signatures release builds do.
+    #[cfg(debug_assertions)]
+    pub(crate) fn set_aside<R>(f: impl FnOnce() -> R) -> R {
+        let held = MEMO.with(|m| m.borrow_mut().take());
+        let r = f();
+        MEMO.with(|m| *m.borrow_mut() = held);
+        r
+    }
+
+    /// Run `f` with the memo active. A nested call (a cleanup run inside
+    /// another) shares the outer memo and leaves it in place; the outermost
+    /// call clears it when it returns, also if `f` panics.
+    pub(crate) fn within_one_cleanup<R>(f: impl FnOnce() -> R) -> R {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                MEMO.with(|m| *m.borrow_mut() = None);
+            }
+        }
+        let outermost = MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.is_none() {
+                *m = Some(HashMap::new());
+                true
+            } else {
+                false
+            }
+        });
+        let _clear = outermost.then_some(Clear);
+        f()
     }
 }
 
