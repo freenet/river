@@ -64,35 +64,37 @@ live in `common/src/room_state/direct_messages.rs`.
   `ChatRoomStateV1::post_apply_cleanup` sweeps DMs whose sender or
   recipient is now banned or no longer a member. Mirrors `MessagesV1`'s
   precedent and keeps `verify` stable across ban-state changes.
-- **ONE predicate, applied at TWO points, and the order between them is
-  load-bearing** (freenet/river#671, #675).
+- **ONE predicate, applied at TWO points, and the caps after both**
+  (freenet/river#671, #675).
   `DirectMessagesV1::sweep_after_membership_change` is the only definition of
-  "this DM survives", and it runs BOTH inside `apply_delta` — before
-  `enforce_caps_and_sort` — and again as `post_apply_cleanup` step 6. The
-  apply-time call is what makes step 6 a provable no-op in the normal case.
-  When the sweep ran ONLY at step 6, a DM destined for deletion was still
-  ranked by the global cap, so in a saturated room it won a slot and evicted a
-  legitimate DM between two current members — measured on live Official-room
-  state — and the merge stopped being commutative and associative.
+  "this DM survives", and it runs BOTH inside `apply_delta` and again as
+  `post_apply_cleanup` step 6. The per-pair and global caps
+  (`enforce_caps_and_sort`) run only in cleanup, AFTER the step-6 sweep, so a
+  DM destined for deletion never takes a cap slot. (When the caps ran in the
+  apply before the sweep, a DM destined for deletion won a slot in a
+  saturated room and evicted a legitimate DM between two current members,
+  measured on live Official-room state, and the merge stopped being
+  commutative and associative.)
   - The apply-time call needs the enforced-ban set as of THAT point.
     `enforced_ban_set_of` derives it from `parent_state`, which is exact rather
     than approximate because the `#[composable]` macro applies fields in
     declaration order, so `configuration`, `bans`, `members` and `member_info`
     are all final by then. It reuses `BansV1::enforce_user_ban_cap` and
-    `MembersV1::banned_member_ids` — the same two functions step 0-cap and step
-    0 call — so nothing is re-implemented and the two sites cannot drift.
+    `MembersV1::banned_member_ids`, the same two functions step 0-cap and step
+    0 call, so nothing is re-implemented and the two sites cannot drift
+    (a debug assertion in cleanup compares them).
   - Do NOT reintroduce a membership-only variant at apply time. An earlier
     revision of this fix did, on the belief that the enforced-ban set was not
     knowable there; that was false, and the gap it left was
-    freenet/river#675 — a DEPUTY-issued ban leaves its target a member through
-    the DM field's apply, because `MembersV1::apply_delta` is handed an empty
-    `MemberInfoV1` and can only enforce owner/ancestor authority. That is the
-    flow the Official room's moderators actually use.
-  - Do NOT move `trim_to_global_cap` into cleanup after step 6: step 1's
-    exemption reads the DM set, so a trim running after it re-creates the same
-    defect one layer up (two reviewers proposed exactly that; pinned by
-    `cleanup_is_a_fixpoint_after_the_trim_discards_a_members_only_dm`, and by
-    `post_apply_cleanup_stays_idempotent_under_the_global_cap`).
+    freenet/river#675: a DEPUTY-issued ban left its target a member through
+    the DM field's apply. That is the flow the Official room's moderators
+    actually use.
+  - Cleanup's member prune counts a DM participant only from the DMs that
+    survive the sweep AND the caps, computed on a copy before the members are
+    decided (`prune_and_cap_members`), so the exemption is exactly the set
+    step 6 keeps. Pinned by
+    `cleanup_is_a_fixpoint_after_the_trim_discards_a_members_only_dm` and
+    `post_apply_cleanup_stays_idempotent_under_the_global_cap`.
 
 - `seal_dm_for_recipient` / `unseal_dm_from_sender` in
   `common/src/ecies.rs` carry the per-message ECIES envelope. Distinct
@@ -359,7 +361,7 @@ The inbound-only anchoring works because `sweep_after_membership_change`
 retains on `alive(sender) && alive(recipient)`, and every DM in a pair shares
 the same sender/recipient set, so the sweep is **all-or-nothing per pair** and
 cannot leave a thread partially swept. Note it now runs at TWO points — inside
-`apply_delta` before the caps, and again as cleanup step 6 (freenet/river#671)
+`apply_delta`, and again as cleanup step 6 before the caps (freenet/river#671)
 — so an argument that cites only step 6 is incomplete; the apply-time call is
 the one that fires first in the common case. Both are the same function, so the
 per-pair atomicity holds at either.
