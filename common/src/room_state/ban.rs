@@ -155,11 +155,14 @@ impl BansV1 {
 
     /// The records a ban's issuer, target and depth are looked up in by one
     /// cleanup pass, fixed at the start of the pass so nothing the pass
-    /// later decides about membership changes them: every present member
-    /// (at any depth), and every ban-evidence record whose chain reaches the
-    /// owner within `depth_cap`. A ban whose present issuer is deep in the
-    /// invite tree is therefore never swept for depth while the issuer stays
-    /// a member.
+    /// later decides about membership changes them: every record of the pool
+    /// (present members plus ban evidence) whose invite chain reaches the
+    /// owner through the pool within `depth_cap`. A ban whose issuer sits
+    /// deeper than that, present or not, counts for nothing: the cap does not
+    /// keep it and cleanup step 4 sweeps it. Judging present and absent
+    /// issuers by one depth rule is what keeps a ban's standing from changing
+    /// when the pass that removes its issuer moves the issuer's record out of
+    /// `members`.
     pub(crate) fn stable_known<'a>(
         members: &'a MembersV1,
         evidence: &'a BanEvidenceV1,
@@ -167,12 +170,8 @@ impl BansV1 {
         depth_cap: usize,
     ) -> HashMap<MemberId, &'a AuthorizedMember> {
         let pool = evidence.lookup(members, owner_id);
-        let present: HashSet<MemberId> = members.members.iter().map(|m| m.member.id()).collect();
         pool.iter()
-            .filter(|(id, m)| {
-                present.contains(*id)
-                    || super::ban_evidence::within_depth(m, &pool, owner_id, depth_cap)
-            })
+            .filter(|(_, m)| super::ban_evidence::within_depth(m, &pool, owner_id, depth_cap))
             .map(|(id, m)| (*id, *m))
             .collect()
     }
@@ -773,12 +772,13 @@ mod ban_digest_golden {
     }
 }
 
-/// The ban signature checks of one `post_apply_cleanup` call, remembered so
-/// each ban is verified at most once however many times the cap, the
-/// cleanup steps and the fixpoint passes ask. Keyed by the signature, the
-/// verifying key and the digest of the signed record, the three inputs of
-/// the check (two bans can share signature bytes), so a remembered answer is
-/// the answer the check would give. Active only inside [`within_one_cleanup`].
+/// The ban signature checks of one cleanup or whole-state merge, remembered
+/// so each ban is verified at most once however many times the ban cap (in
+/// the DM apply's enforced-ban set and in cleanup), the cleanup steps and the
+/// fixpoint passes ask. Keyed by the signature, the verifying key and the
+/// digest of the signed record, the three inputs of the check (two bans can
+/// share signature bytes), so a remembered answer is the answer the check
+/// would give. Active only inside [`active_while`].
 pub(crate) mod signature_memo {
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -812,10 +812,11 @@ pub(crate) mod signature_memo {
         r
     }
 
-    /// Run `f` with the memo active. A nested call (a cleanup run inside
-    /// another) shares the outer memo and leaves it in place; the outermost
-    /// call clears it when it returns, also if `f` panics.
-    pub(crate) fn within_one_cleanup<R>(f: impl FnOnce() -> R) -> R {
+    /// Run `f` with the memo active. A nested call (a cleanup inside a
+    /// merge, or one cleanup inside another) shares the outer memo and leaves
+    /// it in place; the outermost call clears it when it returns, also if `f`
+    /// panics.
+    pub(crate) fn active_while<R>(f: impl FnOnce() -> R) -> R {
         struct Clear;
         impl Drop for Clear {
             fn drop(&mut self) {
@@ -831,7 +832,7 @@ pub(crate) mod signature_memo {
                 false
             }
         });
-        let _clear = outermost.then_some(Clear);
+        let _clear = outermost.then(|| Clear);
         f()
     }
 }
@@ -845,6 +846,30 @@ mod tests {
         /// Ban signature checks (`AuthorizedUserBan::verify_signature`).
         pub(super) static BAN_SIGNATURE_CHECKS: std::cell::Cell<usize> =
             const { std::cell::Cell::new(0) };
+    }
+
+    /// A nested memo scope (the DM apply's enforced-ban set inside a merge, a
+    /// cleanup inside a merge) shares the outer memo and leaves it in place;
+    /// only the outermost scope clears it.
+    #[test]
+    fn a_nested_memo_scope_keeps_the_outer_memo() {
+        let key = ([1u8; 64], [2u8; 32], [3u8; 32]);
+        signature_memo::active_while(|| {
+            signature_memo::record(key, true);
+            signature_memo::active_while(|| {
+                assert_eq!(signature_memo::lookup(&key), Some(true), "shared inside");
+            });
+            assert_eq!(
+                signature_memo::lookup(&key),
+                Some(true),
+                "still held after the nested scope returns"
+            );
+        });
+        assert_eq!(
+            signature_memo::lookup(&key),
+            None,
+            "cleared by the outermost scope"
+        );
     }
 
     /// `BansV1::verify` rejects more bans than `max_user_bans` before

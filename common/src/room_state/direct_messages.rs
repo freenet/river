@@ -881,6 +881,17 @@ pub(crate) fn enforced_ban_set_of(
     parent_state: &ChatRoomStateV1,
     parameters: &ChatRoomParametersV1,
 ) -> HashSet<MemberId> {
+    // The ban cap verifies each ban signature at most once with the memo
+    // active (shared with the merge or cleanup this runs inside, if any).
+    crate::room_state::ban::signature_memo::active_while(|| {
+        enforced_ban_set_of_inner(parent_state, parameters)
+    })
+}
+
+fn enforced_ban_set_of_inner(
+    parent_state: &ChatRoomStateV1,
+    parameters: &ChatRoomParametersV1,
+) -> HashSet<MemberId> {
     let max_bans = parent_state.configuration.configuration.max_user_bans;
     // The evidence `post_apply_cleanup` reads: without records deeper than
     // the cap, which it drops first.

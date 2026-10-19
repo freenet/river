@@ -321,6 +321,18 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
     ) -> Result<(), String> {
+        // One signature memo across the whole merge: the DM apply's
+        // enforced-ban set and cleanup judge the same bans.
+        crate::room_state::ban::signature_memo::active_while(|| {
+            self.merge_from_inner(parameters, other_state)
+        })
+    }
+
+    fn merge_from_inner(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        other_state: &ChatRoomStateV1,
+    ) -> Result<(), String> {
         refuse_beyond_own_bounds(other_state, parameters)?;
         let config_delta = configuration_delta_for_merge(self, parameters, other_state);
         refuse_beyond_receiver_bounds(self, other_state, &config_delta)?;
@@ -405,6 +417,16 @@ impl ChatRoomStateV1 {
     /// incoming record is applied, and the merged room's caps decide what is
     /// kept. Returns the delta applied (`None` when the two already agree).
     pub fn merge_through_summary(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        other_state: &ChatRoomStateV1,
+    ) -> Result<Option<ChatRoomStateV1Delta>, String> {
+        crate::room_state::ban::signature_memo::active_while(|| {
+            self.merge_through_summary_inner(parameters, other_state)
+        })
+    }
+
+    fn merge_through_summary_inner(
         &mut self,
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
@@ -534,7 +556,7 @@ impl ChatRoomStateV1 {
     /// pruned (orphaning their DMs). See
     /// `direct_messages.rs` module docs, "Interaction with bans".
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
-        crate::room_state::ban::signature_memo::within_one_cleanup(|| {
+        crate::room_state::ban::signature_memo::active_while(|| {
             // FIXPOINT: a pass is followed by another on its result, and the
             // result is kept only once a pass changes nothing, so the state
             // this returns is one `merge(S, S)` leaves as it is. A pass can
@@ -593,9 +615,10 @@ impl ChatRoomStateV1 {
             .map(|(id, m)| (id, m.clone()))
             .collect();
         // The records this pass looks a ban's issuer, target and depth up in
-        // (`BansV1::stable_known`): every member present at the start of the
-        // pass, at any depth, and evidence within the depth cap. Steps 0-sig,
-        // 0-cap and 4 read THIS, never anything computed later in the pass.
+        // (`BansV1::stable_known`): every member and evidence record known at
+        // the start of the pass whose chain reaches the owner within the
+        // depth cap. Steps 0-sig, 0-cap and 4 read THIS, never anything
+        // computed later in the pass.
         let stable_known: std::collections::HashMap<MemberId, AuthorizedMember> =
             BansV1::stable_known(&self.members, &self.ban_evidence, owner_id, depth_cap)
                 .into_iter()
@@ -742,16 +765,15 @@ impl ChatRoomStateV1 {
         //    A; AGENTS.md State Authorization Rule), and every ban by a member
         //    an owner ban removes: the owner's ban wins over everything, so
         //    such a ban can never take effect while it stands.
-        //    "Known" is `stable_known`: present in `members` at the START of
-        //    this pass (at any depth), or ban evidence within the depth cap,
-        //    the facts the cap judged by, so this never sweeps a ban the cap
-        //    kept for a reason the cap did not see. A ban whose issuer this
-        //    pass removes or prunes stays this pass; the issuer's record
-        //    moves to evidence just below when it is within the depth cap
-        //    (freenet/river#702), and the next pass sweeps the ban when it is
-        //    not. This runs before the evidence recomputation, which reads
-        //    the swept ban set, and it only removes bans, so the count stays
-        //    <= the cap.
+        //    "Known" is `stable_known`: known at the START of this pass and
+        //    within the evidence depth cap, the facts the cap judged by, so
+        //    this never sweeps a ban the cap kept for a reason the cap did not
+        //    see, and a ban whose issuer this pass removes or prunes stays
+        //    exactly when the issuer's record moves to evidence just below
+        //    (freenet/river#702). A ban by an issuer deeper than the cap is
+        //    swept whether or not the issuer is present. This runs before the
+        //    evidence recomputation, which reads the swept ban set, and it
+        //    only removes bans, so the count stays <= the cap.
         let all_known: std::collections::HashMap<MemberId, &AuthorizedMember> =
             known_at_start.iter().map(|(id, m)| (*id, m)).collect();
         let present: HashSet<MemberId> =

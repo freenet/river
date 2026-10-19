@@ -2,8 +2,8 @@
 //! then by how high in the invite tree the ban's authority sits), judging
 //! each ban over the bans already kept. These pin what that order must not
 //! give up: a member a ban removes cannot keep itself in the room by adding
-//! bans of its own, and a ban by a present member deep in the invite tree
-//! is never dropped for its issuer's depth.
+//! bans of its own; and which bans count is decided by one depth rule for
+//! present and absent issuers alike.
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
@@ -194,12 +194,14 @@ fn a_member_removed_by_a_deputys_ban_cannot_keep_itself_with_bans_of_its_own() {
     );
 }
 
-/// A present member six levels down the invite tree (deeper than the ban
-/// evidence depth cap) issues more bans than the cap holds, against ids
-/// known nowhere. Its bans are judged like any other member's: the cap keeps
-/// `max_user_bans` of them, and the result is a fixpoint.
+/// A ban counts only when its issuer's invite chain reaches the owner
+/// within the ban evidence depth cap (4 here), whether or not the issuer is
+/// present: issuers are judged by one depth rule, so a ban's standing does
+/// not change when the pass that removes its issuer moves the issuer's
+/// record out of `members`. A ban by a member four levels down is kept; one
+/// by a member six levels down is removed. The result is a fixpoint.
 #[test]
-fn a_present_issuer_deeper_than_the_evidence_cap_keeps_its_bans() {
+fn a_ban_counts_only_when_its_issuer_is_within_the_evidence_depth_cap() {
     let r = Room::new();
     let chain: Vec<SigningKey> = (0..6).map(|i| sk(10 + i)).collect();
     let mut members = Vec::new();
@@ -208,7 +210,7 @@ fn a_present_issuer_deeper_than_the_evidence_cap_keeps_its_bans() {
         members.push(r.rec(m, inviter));
         inviter = m;
     }
-    let deep = chain.last().unwrap();
+    let (at_cap, deep) = (&chain[3], &chain[5]);
     let base = r.settled(ChatRoomStateV1 {
         configuration: r.cfg(|c| c.max_user_bans = 3),
         members: MembersV1 { members },
@@ -216,36 +218,26 @@ fn a_present_issuer_deeper_than_the_evidence_cap_keeps_its_bans() {
         ..Default::default()
     });
     assert_eq!(base.members.members.len(), 6, "premise: the chain is kept");
-
-    // Under the cap: every ban stays.
-    let mut under = base.clone();
-    under
+    let kept = r.ban(at_cap, target(0), 100);
+    let swept = r.ban(deep, target(1), 101);
+    let mut after = base.clone();
+    after
         .apply_delta(
             &base,
             &r.p,
             &Some(ChatRoomStateV1Delta {
-                bans: Some(vec![r.ban(deep, target(0), 100)]),
+                bans: Some(vec![kept.clone(), swept.clone()]),
                 ..Default::default()
             }),
         )
         .expect("apply");
-    assert_eq!(under.bans.0.len(), 1, "a deep issuer's ban stays");
-
-    // Over the cap: the cap keeps three of the deep issuer's bans.
-    let mut over = base.clone();
-    over.apply_delta(
-        &base,
-        &r.p,
-        &Some(ChatRoomStateV1Delta {
-            bans: Some((0..5).map(|i| r.ban(deep, target(i), 100 + i)).collect()),
-            ..Default::default()
-        }),
-    )
-    .expect("apply");
-    over.verify(&over, &r.p).expect("verifies");
-    assert_eq!(over.bans.0.len(), 3, "the cap keeps a deep issuer's bans");
-    assert!(over.bans.0.iter().all(|b| b.banned_by == id(deep)));
-    let mut again = over.clone();
-    again.merge_from(&r.p, &over).expect("self-merge");
-    assert!(ser(&again) == ser(&over), "a fixpoint");
+    after.verify(&after, &r.p).expect("verifies");
+    assert!(after.bans.0.contains(&kept), "an issuer at depth 4 counts");
+    assert!(
+        !after.bans.0.contains(&swept),
+        "an issuer at depth 6 does not"
+    );
+    let mut again = after.clone();
+    again.merge_from(&r.p, &after).expect("self-merge");
+    assert!(ser(&again) == ser(&after), "a fixpoint");
 }
