@@ -459,7 +459,7 @@ export async function releaseSettleEvents(page: Page) {
 /// the app is then told every report the browser makes.
 export async function gateResizeObservers(page: Page) {
   await page.addInitScript(() => {
-    const gate = { held: false, withheld: 0 };
+    const gate = { held: false, withheld: 0, delivered: [] as string[] };
     (window as any).__riverResizeGate = gate;
     const Native = window.ResizeObserver;
     const told = new WeakMap<ResizeObserver, Map<Element, string>>();
@@ -475,6 +475,7 @@ export async function gateResizeObservers(page: Page) {
             const size = `${entry.contentRect.width}x${entry.contentRect.height}`;
             if (sizes.get(entry.target) === size) return false;
             sizes.set(entry.target, size);
+            gate.delivered.push(entry.target.id);
             return true;
           });
           if (changed.length > 0) callback(changed, observer);
@@ -502,8 +503,14 @@ export async function releaseResizeObservations(page: Page): Promise<number> {
   return page.evaluate(() => {
     const gate = (window as any).__riverResizeGate;
     gate.held = false;
+    gate.delivered = [];
     return gate.withheld as number;
   });
+}
+
+/// The ids of the elements whose reports reached the app since the release.
+export function deliveredResizeTargets(page: Page): Promise<string[]> {
+  return page.evaluate(() => (window as any).__riverResizeGate.delivered as string[]);
 }
 
 const TEST_IMAGE_SVG =

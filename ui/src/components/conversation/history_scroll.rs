@@ -949,24 +949,31 @@ pub(super) fn note_patch_while_hidden(reader: &ReaderPosition) {
     let Some(container) = ROOM_HISTORY.container() else {
         return;
     };
-    if has_layout(&container) || reader.hidden.replace(true) {
+    if has_layout(&container) || reader.hidden.get() {
         return;
     }
+    // Without the observer nothing would report the reveal, and `hidden`
+    // would never clear.
+    let observer = reader.resize_observer.borrow();
+    let Some(observer) = observer.as_ref() else {
+        return;
+    };
+    reader.hidden.set(true);
     // The view the hold kept is gone.
     reader.end_hold.set(None);
-    if let Some(observer) = reader.resize_observer.borrow().as_ref() {
-        observer.unobserve(&container);
-        observer.observe(&container);
-    }
+    // `observe` alone restarts an observed target too (per spec); the
+    // `unobserve` says so rather than leaving it to that rule.
+    observer.unobserve(&container);
+    observer.observe(&container);
 }
 
 /// A size change of the history. The container's size is the history's
 /// notice that the chat panel was hidden (it measures 0 behind the mobile
 /// Rooms or Members panel) or shown again; a patch that lands while it is
 /// hidden notes the hide too (`note_patch_while_hidden`). While the end hold
-/// is on, any size change, of the container (the composer, the phone keyboard) or of
-/// `#chat-content` (a row growing), takes the view back to the end. Otherwise
-/// the browser keeps the top edge.
+/// is on, any size change, of the container (the composer, the phone
+/// keyboard) or of `#chat-content` (a row growing), takes the view back to
+/// the end. Otherwise the browser keeps the top edge.
 #[cfg(target_arch = "wasm32")]
 fn on_history_resize(reader: &ReaderPosition, opening_snap_done: Signal<bool>) {
     let Some(container) = ROOM_HISTORY.container() else {

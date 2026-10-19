@@ -24,6 +24,7 @@ import {
   readerScrollsWithoutGesture,
   readingRow,
   releaseResizeObservations,
+  deliveredResizeTargets,
   rowOffset,
   scrollMetrics,
   withheld,
@@ -356,6 +357,13 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
       row.top,
       "a drain behind a hide the ResizeObserver never reported moved the reader's row",
     );
+    // The container itself is back at the size the app last saw, so only a
+    // fresh observation reports its reveal: the drain growing #chat-content is
+    // not what the reveal may depend on.
+    expect(
+      await deliveredResizeTargets(page),
+      "the container's reveal was not reported once the patch noted the hide",
+    ).toContain("chat-scroll-container");
   });
 
   // A burst past the ceiling while hidden: the range keeps the reader's row
