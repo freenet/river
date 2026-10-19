@@ -25,6 +25,7 @@ pub mod cleanup_counters {
         static BAN_SIGNATURE_VERIFICATIONS: Cell<usize> = const { Cell::new(0) };
         static RESOLVE_BANS_CALLS: Cell<usize> = const { Cell::new(0) };
         static CLEANUP_PASSES: Cell<usize> = const { Cell::new(0) };
+        static BOUND_REACHED: Cell<usize> = const { Cell::new(0) };
     }
 
     /// The counters since the last [`reset`]: (ban signatures verified,
@@ -37,10 +38,18 @@ pub mod cleanup_counters {
         )
     }
 
+    /// How many outermost cleanups since the last [`reset`] ended at the
+    /// pass bound with their last pass still changing the state, so the
+    /// result was returned without a pass confirming it.
+    pub fn bound_reached() -> usize {
+        BOUND_REACHED.with(|c| c.get())
+    }
+
     pub fn reset() {
         BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(0));
         RESOLVE_BANS_CALLS.with(|c| c.set(0));
         CLEANUP_PASSES.with(|c| c.set(0));
+        BOUND_REACHED.with(|c| c.set(0));
     }
 
     thread_local! {
@@ -69,8 +78,11 @@ pub mod cleanup_counters {
         r
     }
 
-    pub(crate) fn set_cleanup_passes(n: usize) {
+    pub(crate) fn set_cleanup_passes(n: usize, last_changed: bool) {
         CLEANUP_PASSES.with(|c| c.set(n));
+        if n >= super::MAX_CLEANUP_PASSES && last_changed {
+            BOUND_REACHED.with(|c| c.set(c.get() + 1));
+        }
     }
 
     #[cfg(test)]
@@ -532,20 +544,22 @@ impl ChatRoomStateV1 {
             // state is returned.
             self.cleanup_pass(parameters)?;
             let mut passes = 1;
+            let mut last_changed = true;
             while passes < MAX_CLEANUP_PASSES {
                 let mut next = self.clone();
                 next.cleanup_pass(parameters)?;
                 passes += 1;
-                let unchanged = next == *self;
+                last_changed = next != *self;
                 *self = next;
                 #[cfg(test)]
-                let unchanged = unchanged && !cleanup_counters::all_passes_forced();
-                if unchanged {
+                let last_changed = last_changed || cleanup_counters::all_passes_forced();
+                if !last_changed {
                     break;
                 }
             }
             #[cfg(any(test, feature = "cleanup-counters"))]
-            cleanup_counters::set_cleanup_passes(passes);
+            cleanup_counters::set_cleanup_passes(passes, last_changed);
+            let _ = last_changed;
             Ok(())
         })
     }
