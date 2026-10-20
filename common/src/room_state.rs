@@ -5200,6 +5200,83 @@ mod member_loop_tests {
         );
     }
 
+    /// A delta at the work-bound floor (1000 new members, one newer message
+    /// each) into a room with `max_members` 20, a window of 21 and a full
+    /// default DM set (300 at the largest ciphertext) among its own members,
+    /// which hold the lowest ids so the cap keeps them and their DMs to the
+    /// end. The loop runs many passes; none copies the DMs, each builds only
+    /// the members it needs, and the apply stays within a time budget.
+    #[test]
+    fn a_floor_delta_into_a_room_holding_a_full_dm_set_copies_no_dms() {
+        use crate::room_state::direct_messages::MAX_DM_CIPHERTEXT_BYTES;
+        use crate::room_state::member::MembersDelta;
+        let o = key(1);
+        let ow = id(&o);
+        let p = params(&o);
+        let n = 1_000usize;
+        let mut pool: Vec<SigningKey> = (0..(20 + n) as u64).map(|i| key(20_000 + i)).collect();
+        pool.sort_by_key(id);
+        let incoming = pool.split_off(20);
+        let room_keys = pool;
+        let mut base = room(&o, 20, 21);
+        base.members.members = room_keys.iter().map(|k| rec(ow, k, &o)).collect();
+        base.recent_messages.messages = room_keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| msg(ow, k, i as u64))
+            .collect();
+        base.recent_messages.rebuild_actions_state();
+        base.direct_messages.messages = (0..300u64)
+            .map(|t| {
+                let i = t as usize % 20;
+                dm(
+                    &o,
+                    &room_keys[i],
+                    &room_keys[(i + 1) % 20],
+                    t,
+                    MAX_DM_CIPHERTEXT_BYTES,
+                )
+            })
+            .collect();
+        let mut settled = base.clone();
+        settled.merge_from(&p, &base).unwrap();
+        let base = settled;
+        assert_eq!(base.direct_messages.messages.len(), 300, "premise");
+        let delta = ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(
+                incoming.iter().map(|k| rec(ow, k, &o)).collect(),
+            )),
+            recent_messages: Some(
+                incoming
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| msg(ow, k, 10_000 + i as u64))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let mut s = base.clone();
+        cleanup_counters::reset();
+        let started = std::time::Instant::now();
+        s.apply_delta(&base, &p, &Some(delta)).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(s.direct_messages.messages.len(), 300, "the DMs stay");
+        assert_eq!(
+            cleanup_counters::member_loop_dms_copied(),
+            0,
+            "no pass copies the DMs"
+        );
+        let built = cleanup_counters::member_records_built();
+        assert!(
+            built <= 20 * n,
+            "{built} member records built for {n} members"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "the apply took {elapsed:?}"
+        );
+    }
+
     /// The member loop needs three passes (C, then G, is capped out), and
     /// the second pass drops E, two levels below capped-out C: only F, the
     /// newest author who fits, stays.
