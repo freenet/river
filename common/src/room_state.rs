@@ -738,25 +738,42 @@ impl ChatRoomStateV1 {
             self.members.members.iter().map(|m| m.member.id()).collect();
         let candidates = self.members.members.clone();
         let mut capped_out: HashSet<MemberId> = HashSet::new();
-        let required_ids = loop {
+        let mut required_ids = HashSet::new();
+        // Each pass that does not end the loop caps out at least one id the
+        // pass held, and a capped-out id is never held again, so the loop
+        // ends within (distinct candidate ids) + 1 passes; the bound makes
+        // that structural.
+        for _ in 0..=candidates.len() {
             self.members.members = candidates
                 .iter()
                 .filter(|m| !capped_out.contains(&m.member.id()))
                 .cloned()
                 .collect();
+            let held: HashSet<MemberId> =
+                self.members.members.iter().map(|m| m.member.id()).collect();
             let required = self.prune_and_cap_members(parameters, owner_id, &enforced_banned_ids);
             let kept: HashSet<MemberId> =
                 self.members.members.iter().map(|m| m.member.id()).collect();
+            // Only an id this pass held can be capped out: the prune also
+            // names the inviters of needed members, which this pass may not
+            // hold (a record whose inviter the cap already removed).
             let newly_capped: Vec<MemberId> = required
                 .iter()
-                .filter(|id| !kept.contains(id))
+                .filter(|id| held.contains(id) && !kept.contains(id))
                 .copied()
                 .collect();
+            // The members kept: the prune's needed ids that this pass holds
+            // and the cap left (an inviter the pass does not hold is not one,
+            // and its `member_info` is not kept for it, step 5).
+            required_ids = required
+                .into_iter()
+                .filter(|id| kept.contains(id))
+                .collect();
             if newly_capped.is_empty() {
-                break required;
+                break;
             }
             capped_out.extend(newly_capped);
-        };
+        }
 
         // 4. Sweep any ban whose issuer is unknown or whose signature does
         //    not match the issuer's key (#411 round 3 item A.3, round 4 item
@@ -4371,6 +4388,41 @@ mod cleanup_pass_tests {
             cleanup_counters::read().2,
             2,
             "one pass plus a confirming pass"
+        );
+    }
+
+    /// The member loop ends even when a kept member's inviter is not a
+    /// member (here a hand-built state; across passes, a member whose inviter
+    /// the cap removed through another of its records): the prune names the
+    /// inviter as needed, and an id the pass does not hold is never counted
+    /// as removed by the cap.
+    #[test]
+    fn the_member_loop_ends_when_an_inviter_is_not_held() {
+        let o = pass_key(1);
+        let owner: MemberId = o.verifying_key().into();
+        let params = ChatRoomParametersV1 {
+            owner: o.verifying_key(),
+        };
+        let (absent, x) = (pass_key(2), pass_key(3));
+        let mut s = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner,
+                    ..Default::default()
+                },
+                &o,
+            ),
+            members: MembersV1 {
+                members: vec![pass_rec(owner, &x, &absent)],
+            },
+            ..Default::default()
+        };
+        s.recent_messages.messages = vec![pass_msg(owner, &x, 1)];
+        cleanup_counters::reset();
+        s.post_apply_cleanup(&params).unwrap();
+        assert!(
+            cleanup_counters::read().2 <= 2,
+            "one pass plus the confirming pass"
         );
     }
 
