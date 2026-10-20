@@ -446,6 +446,73 @@ export async function releaseSettleEvents(page: Page) {
   });
 }
 
+/// Let a test withhold the app's ResizeObserver reports, so that a hide and a
+/// reveal reach the app as they do when no rendering update falls between
+/// them (the page was busy): as no change at all. Call before the page loads,
+/// since the app creates its observer at startup.
+///
+/// A browser reports a size only when it differs from the size it last
+/// reported, and a fresh `observe` starts that comparison over. The gate keeps
+/// the same rule against what the APP was last told, so a report withheld
+/// while held is one the app never saw: a target back at the size the app last
+/// saw reports nothing when it is released. Ungated, it changes nothing, since
+/// the app is then told every report the browser makes.
+export async function gateResizeObservers(page: Page) {
+  await page.addInitScript(() => {
+    const gate = { held: false, withheld: 0, delivered: [] as string[] };
+    (window as any).__riverResizeGate = gate;
+    const Native = window.ResizeObserver;
+    const told = new WeakMap<ResizeObserver, Map<Element, string>>();
+    window.ResizeObserver = class extends Native {
+      constructor(callback: ResizeObserverCallback) {
+        super((entries, observer) => {
+          if (gate.held) {
+            gate.withheld += entries.length;
+            return;
+          }
+          const sizes = told.get(observer)!;
+          const changed = entries.filter((entry) => {
+            const size = `${entry.contentRect.width}x${entry.contentRect.height}`;
+            if (sizes.get(entry.target) === size) return false;
+            sizes.set(entry.target, size);
+            gate.delivered.push(entry.target.id);
+            return true;
+          });
+          if (changed.length > 0) callback(changed, observer);
+        });
+        told.set(this, new Map());
+      }
+      observe(target: Element, options?: ResizeObserverOptions) {
+        told.get(this)!.delete(target);
+        super.observe(target, options);
+      }
+      unobserve(target: Element) {
+        told.get(this)!.delete(target);
+        super.unobserve(target);
+      }
+    };
+  });
+}
+
+export async function holdResizeObservations(page: Page) {
+  await page.evaluate(() => ((window as any).__riverResizeGate.held = true));
+}
+
+/// Release the gate. Returns how many reports it withheld.
+export async function releaseResizeObservations(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const gate = (window as any).__riverResizeGate;
+    gate.held = false;
+    gate.delivered = [];
+    return gate.withheld as number;
+  });
+}
+
+/// The ids of the elements whose reports reached the app since the release.
+export function deliveredResizeTargets(page: Page): Promise<string[]> {
+  return page.evaluate(() => (window as any).__riverResizeGate.delivered as string[]);
+}
+
 const TEST_IMAGE_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="#888"/></svg>';
 

@@ -147,7 +147,13 @@ Known limitations:
 - Outside that hold, a size change gets no correction: when the composer
   grows or the phone keyboard opens, the browser keeps the view's top edge,
   so the bottom of the view is covered. Paging and panel reveals retain their
-  reading-position corrections; deleting the reading row uses the row above
+  reading-position corrections. A hide is noticed from the container's size
+  or from a patch landing while it has no layout (`note_patch_while_hidden`,
+  which also re-observes the container), so a reveal restores the reader even
+  when the ResizeObserver never reported the hide: a hide and reveal with no
+  rendering update between them look like no change to it
+  ([#799](https://github.com/freenet/river/issues/799)). Deleting the
+  reading row uses the row above
   as the preferred fallback. The reading row is the first row whose top lies
   inside the view, else the row the view's top cuts through (a message
   taller than the view, not the row starting below the fold).
