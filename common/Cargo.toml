@@ -82,13 +82,6 @@ mentions = []
 # `migration` and `mentions`, so the room-contract and chat-delegate WASM
 # (and their keys) stay byte-identical.
 own-purges = []
-# Work counters for `post_apply_cleanup` (ban signatures verified,
-# `resolve_bans` calls, cleanup passes), read by out-of-tree measurement
-# tools. No WASM or client build enables it.
-cleanup-counters = []
-# Every cleanup runs all of its passes, as its worst case does. For timing
-# the room-contract WASM out of tree only; no published build enables it.
-force-all-cleanup-passes = []
 
 [build-dependencies]
 # Parses legacy_room_contracts.toml, validates every hash, and generates the
@@ -112,3 +105,12 @@ proptest = { version = "1.11", default-features = false, features = ["std", "bit
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+
+# Measurement switches for out-of-tree tools only, set with RUSTFLAGS, never
+# Cargo features, so no published build or feature unification can turn them
+# on: `--cfg river_cleanup_counters` exposes `room_state::cleanup_counters`
+# (ban signatures verified, `resolve_bans` calls, cleanup passes), and
+# `--cfg river_force_all_cleanup_passes` makes every cleanup run all of its
+# passes (timing the worst case).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(river_cleanup_counters)', 'cfg(river_force_all_cleanup_passes)'] }

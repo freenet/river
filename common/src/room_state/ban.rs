@@ -764,7 +764,7 @@ impl AuthorizedUserBan {
                 Err("Invalid ban signature".to_string())
             };
         }
-        #[cfg(any(test, feature = "cleanup-counters"))]
+        #[cfg(any(test, river_cleanup_counters))]
         crate::room_state::cleanup_counters::count_ban_signature_verification();
         let result = verify_struct(&self.ban, &self.signature, banner_verifying_key)
             .map_err(|e| format!("Invalid ban signature: {}", e));

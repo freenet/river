@@ -15,9 +15,10 @@ pub mod version;
 
 /// Work counters for one `post_apply_cleanup` call: ban signatures actually
 /// verified (memo misses), `MembersV1::resolve_bans` calls, and cleanup
-/// passes. Compiled only for tests and the `cleanup-counters` feature (which
-/// no WASM build enables), so the contracts pay nothing.
-#[cfg(any(test, feature = "cleanup-counters"))]
+/// passes. Compiled only for tests and under `--cfg river_cleanup_counters`
+/// (RUSTFLAGS, for out-of-tree measurement; not a Cargo feature), so no
+/// published build carries it.
+#[cfg(any(test, river_cleanup_counters))]
 pub mod cleanup_counters {
     use std::cell::Cell;
 
@@ -108,6 +109,18 @@ pub mod cleanup_counters {
 
 /// The most passes one `post_apply_cleanup` runs (see its FIXPOINT note).
 const MAX_CLEANUP_PASSES: usize = 3;
+
+/// Whether every cleanup runs all of its passes, as the worst case does:
+/// under the cost tests, and under `--cfg river_force_all_cleanup_passes` for
+/// out-of-tree timing. Always false in a published build.
+fn all_passes_forced() -> bool {
+    #[cfg(river_force_all_cleanup_passes)]
+    return true;
+    #[cfg(all(test, not(river_force_all_cleanup_passes)))]
+    return cleanup_counters::all_passes_forced();
+    #[cfg(not(any(test, river_force_all_cleanup_passes)))]
+    false
+}
 
 /// Whether the per-delta work bounds (the most new messages, bans, members
 /// and ban-evidence records one delta may add) are lifted for the apply in
@@ -558,12 +571,15 @@ impl ChatRoomStateV1 {
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         crate::room_state::ban::signature_memo::active_while(|| {
             // FIXPOINT: a pass is followed by another on its result, and the
-            // result is kept only once a pass changes nothing, so the state
-            // this returns is one `merge(S, S)` leaves as it is. A pass can
-            // change what the next pass decides (a member the member cap
-            // removes takes its issuer record out of `members`), so the bound
-            // is two passes after the first; at the bound the last pass's
-            // state is returned.
+            // result stands once a pass changes nothing, so that state is one
+            // `merge(S, S)` leaves as it is. A pass can change what the next
+            // decides (a member the member cap removes takes its issuer record
+            // out of `members`), so up to two passes follow the first. If the
+            // third pass still changes the state, its result is returned
+            // unconfirmed: the bound is a safety net, not a guarantee. No
+            // input measured (randomized merges and the captured rooms) has
+            // needed more than the first pass since step 0-sig runs on every
+            // pass.
             self.cleanup_pass(parameters)?;
             let mut passes = 1;
             let mut last_changed = true;
@@ -573,16 +589,13 @@ impl ChatRoomStateV1 {
                 passes += 1;
                 last_changed = next != *self;
                 *self = next;
-                #[cfg(test)]
-                let last_changed = last_changed || cleanup_counters::all_passes_forced();
-                #[cfg(feature = "force-all-cleanup-passes")]
-                let last_changed = true;
-                if !last_changed {
+                if !last_changed && !all_passes_forced() {
                     break;
                 }
             }
-            #[cfg(any(test, feature = "cleanup-counters"))]
+            #[cfg(any(test, river_cleanup_counters))]
             cleanup_counters::set_cleanup_passes(passes, last_changed);
+            #[cfg(not(any(test, river_cleanup_counters)))]
             let _ = last_changed;
             Ok(())
         })
@@ -664,7 +677,7 @@ impl ChatRoomStateV1 {
                     crate::room_state::direct_messages::enforced_ban_set_of(&snapshot, parameters)
                 })
             };
-            #[cfg(any(test, feature = "cleanup-counters"))]
+            #[cfg(any(test, river_cleanup_counters))]
             let recompute = || cleanup_counters::not_counting(recompute);
             recompute()
         };

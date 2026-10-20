@@ -131,9 +131,11 @@ Every apply (an empty delta included) normalizes what is held by the same
 rules arrivals meet, and `post_apply_cleanup` leaves nothing a later apply
 would drop, so every state an apply or merge produces is a fixpoint of
 `merge(S, S)`. Cleanup checks that itself: it runs its pass again on the
-result and keeps going until a pass changes nothing, with at most two extra
-passes (a pass can change what the next decides, for example when the
-member cap removes a ban's issuer). `verify` itself stays as it is:
+result, up to two extra passes, and stops at the first pass that changes
+nothing (a pass can change what the next decides, for example when the
+member cap removes a ban's issuer). If the third pass still changes the
+state, that result is returned without a confirming pass: the bound is a
+safety net, not a guarantee. No measured input has needed it. `verify` itself stays as it is:
 tightening it would make the migration PUT reject states rooms hold today.
 
 One limit, which predates #703: the contract does not apply an empty delta,

@@ -737,7 +737,7 @@ impl<'a> BanContext<'a> {
         member_info: &MemberInfoV1,
         parameters: &ChatRoomParametersV1,
     ) -> BanResolution {
-        #[cfg(any(test, feature = "cleanup-counters"))]
+        #[cfg(any(test, river_cleanup_counters))]
         crate::room_state::cleanup_counters::count_resolve_bans();
         let owner_id = parameters.owner_id();
         let lookup = &self.lookup;
