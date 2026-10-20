@@ -77,6 +77,10 @@ const GET_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// This is the anchor riverctl used to have as its ONLY anchor, and the thing
 /// the pointer record is compared against.
+pub fn bundled_room_code_hash() -> [u8; 32] {
+    *blake3::hash(ROOM_CONTRACT_WASM).as_bytes()
+}
+
 /// Why `issuer` may not sign a ban in `room_state`, if it may not: the
 /// contract drops a ban whose issuer is deeper in the invite tree than the
 /// ban evidence depth cap (`min(max_members, 4)` invites below the owner).
@@ -100,10 +104,6 @@ fn ban_depth_refusal(
          in this room, and you joined further down, so a ban from you would have no \
          effect. Ask a moderator closer to the owner."
     ))
-}
-
-pub fn bundled_room_code_hash() -> [u8; 32] {
-    *blake3::hash(ROOM_CONTRACT_WASM).as_bytes()
 }
 
 /// [`PointerIo`] over riverctl's existing node connection.
@@ -14575,5 +14575,30 @@ mod ban_depth_refusal_tests {
         assert_eq!(ban_depth_refusal(&state, owner_id, owner_id), None);
         state.configuration.configuration.max_members = 3;
         assert!(ban_depth_refusal(&state, id(3), owner_id).is_some());
+    }
+    /// The ban command asks `ban_depth_refusal` before it signs the ban, and
+    /// returns its reason as the error, so a member deeper than the cap is
+    /// refused rather than handed a ban the contract drops.
+    #[test]
+    fn the_ban_command_checks_the_depth_cap_before_signing() {
+        let src = include_str!("api.rs");
+        let start = src
+            .find("pub async fn ban_member_with_safety(")
+            .expect("the ban command exists");
+        let sign_at = start
+            + src[start..]
+                .find("AuthorizedUserBan::new(")
+                .expect("the ban command signs a ban");
+        let body: String = src[start..sign_at]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains(
+                "if let Some(reason) = ban_depth_refusal(&room_state, my_member_id, owner_member_id)"
+            ) && body.contains("return Err(anyhow!(reason));"),
+            "the ban command must refuse with ban_depth_refusal's reason before signing"
+        );
     }
 }

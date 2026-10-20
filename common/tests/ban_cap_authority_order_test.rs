@@ -634,3 +634,32 @@ fn an_owner_ban_is_kept_ahead_of_a_newer_ban_at_the_owners_level() {
         assert!(has(&s, &o) && !has(&s, &dx), "the owner ban is kept");
     }
 }
+
+/// Under `max_user_bans` the cap keeps even an owner ban it would refuse
+/// while it binds: here the oldest of three owner bans removes D, the issuer
+/// of a ban already in the room (over the cap, the newer owner bans take the
+/// owner pool and D's ban the other, so this one would come last and be
+/// refused). Under the cap it is kept, D goes, and cleanup sweeps D's ban.
+#[test]
+fn under_the_cap_an_owner_ban_on_a_bans_issuer_is_kept() {
+    let r = Room::new();
+    let (a, b, d) = (sk(2), sk(3), sk(4));
+    let base = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(|c| c.max_user_bans = 5),
+        members: MembersV1 {
+            members: vec![r.rec(&a, &r.o), r.rec(&b, &r.o), r.rec(&d, &a)],
+        },
+        recent_messages: r.messages(vec![r.msg(&a, 1), r.msg(&b, 2), r.msg(&d, 3)]),
+        ..Default::default()
+    });
+    let on_d = owner_ban(&r, id(&d), 5);
+    let newer = [owner_ban(&r, target(2), 50), owner_ban(&r, target(4), 40)];
+    let by_d = r.ban(&d, target(5), 30);
+    let mut bans = newer.to_vec();
+    bans.extend([on_d.clone(), by_d.clone()]);
+    let s = apply(&r, &base, bans);
+    assert!(has(&s, &on_d), "the owner ban on D is kept");
+    assert!(newer.iter().all(|b| has(&s, b)));
+    assert!(!is_member(&s, &d), "D is removed");
+    assert!(!has(&s, &by_d), "D's ban is swept");
+}

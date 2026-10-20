@@ -4552,6 +4552,19 @@ mod tests {
             prod.contains("ban_gate("),
             "the modal must gate Ban through `ban_gate` (#478)"
         );
+        // ...with the room's own member limit, which sets the depth cap a
+        // ban's issuer must be within (the contract drops a ban from deeper).
+        let gate_at = prod.find("ban_gate(").expect("checked above");
+        let gate_args: String = prod[gate_at..]
+            .split_once("})")
+            .map(|(args, _)| args)
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        assert!(
+            gate_args.contains("room_state.room_state.configuration.configuration.max_members"),
+            "the modal must pass the room's max_members to `ban_gate`: {gate_args}"
+        );
         // The reason must be RENDERED, not merely computed. Checking only that
         // the gate is destructured would let someone delete the explanation
         // element and keep the pin green — a Ban button that vanishes with no

@@ -891,3 +891,143 @@ fn a_new_message_arrives_with_its_authors_record() {
         .iter()
         .any(|x| x.member.id() == id(&m)));
 }
+
+/// One author whose missing invite chain is exactly the receiver's member
+/// bound (1000 at the floor), plus a few shallower members the receiver
+/// also lacks: the trimmed delta takes the whole chain, so the author and
+/// its message arrive, rather than filling the bound with the shallower
+/// records first. (Checked on the delta itself: applying a 1000-deep chain
+/// verifies every link of every record.)
+#[test]
+fn a_chain_that_exactly_fills_the_member_bound_is_sent_whole() {
+    let r = Room::new();
+    let mut members = Vec::new();
+    let mut inviter = r.o.clone();
+    let mut author = r.o.clone();
+    for d in 0..1_000u64 {
+        let m = sk(3_000_000 + d);
+        members.push(r.rec(&m.verifying_key(), &inviter));
+        inviter = m.clone();
+        author = m;
+    }
+    for e in 0..5u64 {
+        members.push(r.rec(&sk(4_000_000 + e).verifying_key(), &r.o));
+    }
+    members.sort_by_key(|m| m.member.id());
+    let mut messages = MessagesV1 {
+        messages: vec![r.msg(&author, 10)],
+        ..Default::default()
+    };
+    messages.rebuild_actions_state();
+    let sender = ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| {
+            c.max_members = 5_000;
+            c.max_recent_messages = 1_000;
+        }),
+        members: MembersV1 { members },
+        recent_messages: messages,
+        ..Default::default()
+    };
+    // The receiver's newer configuration is unknown to the sender, so the
+    // delta is held to the floor bound.
+    let receiver = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(2, |c| {
+            c.max_members = 5_000;
+            c.max_recent_messages = 1_000;
+        }),
+        ..Default::default()
+    });
+    let summary = receiver.summarize(&receiver, &r.p);
+    let delta = sender
+        .delta_within_work_bounds(&r.p, &summary)
+        .expect("a delta");
+    let sent: Vec<MemberId> = delta
+        .members
+        .as_ref()
+        .expect("members")
+        .added()
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
+    assert_eq!(sent.len(), 1_000, "the delta fills the bound");
+    let author_id: MemberId = author.verifying_key().into();
+    assert!(
+        sent.contains(&author_id),
+        "the author's whole chain is sent"
+    );
+    let sent_messages = delta.recent_messages.as_ref().map_or(0, |m| m.len());
+    assert_eq!(sent_messages, 1, "and its message");
+}
+
+/// The receiver already holds the top of an author's invite chain: the
+/// chain the trim counts stops at the first member the receiver lists, so
+/// the 1000 records it lacks fit the floor bound exactly and are sent with
+/// the author's message, though the whole chain (1050) would not fit.
+#[test]
+fn a_chain_counts_only_the_members_the_receiver_lacks() {
+    let r = Room::new();
+    let mut chain = Vec::new();
+    let mut inviter = r.o.clone();
+    for d in 0..1_050u64 {
+        let m = sk(5_000_000 + d);
+        chain.push(r.rec(&m.verifying_key(), &inviter));
+        inviter = m;
+    }
+    let author = inviter;
+    let top_holder = sk(5_000_000 + 49);
+    let config = |version| {
+        r.cfg(version, |c| {
+            c.max_members = 5_000;
+            c.max_recent_messages = 1_000;
+        })
+    };
+    let messages = |list: Vec<AuthorizedMessageV1>| {
+        let mut m = MessagesV1 {
+            messages: list,
+            ..Default::default()
+        };
+        m.rebuild_actions_state();
+        m
+    };
+    let mut members = chain.clone();
+    for e in 0..5u64 {
+        members.push(r.rec(&sk(6_000_000 + e).verifying_key(), &r.o));
+    }
+    members.sort_by_key(|m| m.member.id());
+    let sender = ChatRoomStateV1 {
+        configuration: config(1),
+        members: MembersV1 { members },
+        recent_messages: messages(vec![r.msg(&top_holder, 5), r.msg(&author, 10)]),
+        ..Default::default()
+    };
+    // The receiver holds the top 50 records (its member at depth 50 has a
+    // message, so they stay) on a newer configuration the sender lacks.
+    let receiver = r.settled(ChatRoomStateV1 {
+        configuration: config(2),
+        members: MembersV1 {
+            members: chain[..50].to_vec(),
+        },
+        recent_messages: messages(vec![r.msg(&top_holder, 5)]),
+        ..Default::default()
+    });
+    assert_eq!(receiver.members.members.len(), 50, "premise");
+    let summary = receiver.summarize(&receiver, &r.p);
+    let delta = sender
+        .delta_within_work_bounds(&r.p, &summary)
+        .expect("a delta");
+    let sent: Vec<MemberId> = delta
+        .members
+        .as_ref()
+        .expect("members")
+        .added()
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
+    let author_id: MemberId = author.verifying_key().into();
+    assert!(
+        sent.contains(&author_id),
+        "the 1000 missing records are sent"
+    );
+    let sent_messages = delta.recent_messages.as_ref().map_or(0, |m| m.len());
+    assert_eq!(sent_messages, 1, "and the author's message");
+}
