@@ -803,6 +803,52 @@ fn every_trimmed_network_delta_advances_the_receiver_on_floor_caps() {
     assert_eq!(receiver.recent_messages.messages.len(), 100);
 }
 
+/// A receiver whose configuration outranks the sender's is sent a delta held
+/// to the floor bounds. The bans trimmed to that bound are judged against
+/// the sender's own records: a moderator two invites down still has 100 of
+/// its 150 bans sent, not none.
+#[test]
+fn a_floor_trimmed_delta_sends_bans_by_an_issuer_below_the_first_level() {
+    let r = Room::new();
+    let (a, d) = (sk(70), sk(71));
+    let bans: Vec<AuthorizedUserBan> = (0..150u64)
+        .map(|i| r.ban(&d, id(&sk(80_000 + i)), 100 + i))
+        .collect();
+    let mut held = MessagesV1 {
+        messages: vec![r.msg(&a, 1), r.msg(&d, 2)],
+        ..Default::default()
+    };
+    held.rebuild_actions_state();
+    let sender = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(1, |c| c.max_user_bans = 200),
+        members: MembersV1 {
+            members: vec![
+                r.rec(&a.verifying_key(), &r.o),
+                r.rec(&d.verifying_key(), &a),
+            ],
+        },
+        recent_messages: held,
+        bans: BansV1(bans),
+        ..Default::default()
+    });
+    assert_eq!(sender.bans.0.len(), 150, "premise");
+    let receiver = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(2, |c| c.max_user_bans = 200),
+        ..Default::default()
+    });
+    let summary = receiver.summarize(&receiver, &r.p);
+    let delta = sender
+        .delta_within_work_bounds(&r.p, &summary)
+        .expect("a delta");
+    assert_eq!(
+        delta.bans.as_ref().map(|b| b.len()),
+        Some(100),
+        "the floor bound of bans is sent"
+    );
+    let after = r.exchange(&sender, &receiver).expect("applies");
+    assert_eq!(after.bans.0.len(), 100);
+}
+
 /// A receiver that pruned a member (no record, no messages of theirs) is
 /// sent that member's record with their new message, so the message
 /// verifies on arrival (freenet/river#145).

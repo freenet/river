@@ -1302,10 +1302,14 @@ fn trim_to_work_bounds(
     if let Some(bans) = delta.bans.as_mut() {
         if bans.len() > bans_bound {
             let before: Vec<_> = bans.iter().map(ban_digest).collect();
+            // Judged against the sender's own records at the sender's own
+            // depth cap: `config` may be the floor caps (a receiver whose
+            // configuration outranks), whose `max_members` of 1 would leave
+            // only owner-invited issuers known and send no other ban.
             crate::room_state::ban::BansV1::enforce_user_ban_cap(
                 bans,
                 bans_bound,
-                evidence_depth_cap(config.max_members),
+                evidence_depth_cap(sender.configuration.configuration.max_members),
                 &sender.members,
                 &sender.ban_evidence,
                 &sender.member_info,
