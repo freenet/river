@@ -693,6 +693,11 @@ type Reach = std::rc::Rc<BTreeSet<MemberId>>;
 /// target, its reach. All of these depend only on the records, so they hold
 /// for the context's whole life. The bans passed to one context are borrowed
 /// for its whole life, so each is one fixed record.
+///
+/// A context is built inside one call ([`MembersV1::resolve_bans`], or one
+/// run of the ban cap) over that call's records and dropped when it
+/// returns; nothing stores one, so no cache outlives the records it was
+/// found from, and no two calls, merges or cleanup passes share one.
 pub(crate) struct BanContext<'a> {
     lookup: HashMap<MemberId, &'a AuthorizedMember>,
     children: HashMap<MemberId, Vec<MemberId>>,
@@ -750,9 +755,12 @@ impl<'a> BanContext<'a> {
         reach
     }
 
-    /// Adds `target` and its subtree to `set`, which holds only whole
-    /// subtrees: a target already in it brings nothing new, since its
-    /// subtree lies inside the one that put it there.
+    /// Adds `target` and its subtree to `set`. Every set this is used on
+    /// (the owner-removed members, an issuer's reached members, the removed
+    /// members) is a union of whole subtrees, each added here or by
+    /// [`reach_in`]: a member in one is a descendant-or-self of some added
+    /// target, so the target's own subtree is already in it, and skipping
+    /// it changes nothing.
     fn add_reach(&self, set: &mut HashSet<MemberId>, target: MemberId) {
         if !set.contains(&target) {
             set.extend(self.reach_of(target).iter().copied());
@@ -1161,8 +1169,8 @@ pub struct BanResolution {
     pub owner_removed: HashSet<MemberId>,
     /// Why each ban takes effect ([`Self::OWNER`], [`Self::EFFECTIVE`],
     /// [`Self::MUTUAL`]). A ban absent here takes no effect ([`Self::INERT`]);
-    /// the `max_user_bans` eviction drops those first, then evicts by age
-    /// within an owner pool and an everyone-else pool (freenet/river#796).
+    /// the `max_user_bans` cap ([`BansV1::enforce_user_ban_cap`]) judges each
+    /// ban by its tier over the bans it keeps.
     pub ban_tiers: HashMap<BanId, u8>,
     /// The bans whose signature was checked against their issuer's key and
     /// verified. Bans by owner-removed issuers are not checked.
@@ -2919,5 +2927,140 @@ pub(crate) mod tests {
         assert!(result
             .unwrap_err()
             .contains("Owner should not be included in the members list"));
+    }
+}
+
+#[cfg(test)]
+mod ban_context_tests {
+    //! `BanContext` remembers each ban's authority and each target's reach
+    //! for its life, and adds a reach to a set only when its target is not
+    //! already in it. These check that a context answers from its own
+    //! records, and that the shortcut gives the full union in any ban order.
+    use super::*;
+    use crate::room_state::ban::UserBan;
+    use std::time::{Duration, SystemTime};
+
+    fn key(b: u64) -> SigningKey {
+        let mut x = [0u8; 32];
+        x[..8].copy_from_slice(&b.to_le_bytes());
+        x[31] = 43;
+        SigningKey::from_bytes(&x)
+    }
+    fn id(k: &SigningKey) -> MemberId {
+        k.verifying_key().into()
+    }
+    fn rec(owner: MemberId, who: &SigningKey, inviter: &SigningKey) -> AuthorizedMember {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: owner,
+                invited_by: id(inviter),
+                member_vk: who.verifying_key(),
+            },
+            inviter,
+        )
+    }
+    fn ban(owner: MemberId, by: &SigningKey, target: &SigningKey, t: u64) -> AuthorizedUserBan {
+        AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner,
+                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                banned_user: id(target),
+            },
+            id(by),
+            by,
+        )
+    }
+    fn ids(ks: &[&SigningKey]) -> HashSet<MemberId> {
+        ks.iter().map(|k| id(k)).collect()
+    }
+
+    /// One ban resolved in three contexts over different records: each
+    /// answers from its own records, whichever ran first.
+    #[test]
+    fn each_context_answers_from_its_own_records() {
+        let o = key(1);
+        let ow = id(&o);
+        let params = ChatRoomParametersV1 {
+            owner: o.verifying_key(),
+        };
+        let (x, t, u) = (key(2), key(3), key(4));
+        let b = ban(ow, &x, &t, 1);
+        let deep = MembersV1 {
+            members: vec![rec(ow, &x, &o), rec(ow, &t, &x), rec(ow, &u, &t)],
+        };
+        let shallow = MembersV1 {
+            members: vec![rec(ow, &x, &o), rec(ow, &t, &x)],
+        };
+        let elsewhere = MembersV1 {
+            members: vec![rec(ow, &x, &o), rec(ow, &t, &o)],
+        };
+        let evidence = BanEvidenceV1::default();
+        let info = MemberInfoV1::default();
+        let resolve =
+            |m: &MembersV1| BanContext::new(m, &evidence, &info, &params).resolve([&b], &params);
+        for _ in 0..2 {
+            assert_eq!(resolve(&deep).removed, ids(&[&t, &u]));
+            assert_eq!(resolve(&shallow).removed, ids(&[&t]));
+            assert!(
+                resolve(&elsewhere).removed.is_empty(),
+                "X has no authority over T here"
+            );
+        }
+    }
+
+    /// Bans on a target and on members inside its subtree, in both orders,
+    /// by the owner and by an ancestor: the removed sets are the whole
+    /// union, and every ban keeps its tier.
+    #[test]
+    fn nested_reaches_give_the_whole_union_in_any_order() {
+        let o = key(1);
+        let ow = id(&o);
+        let params = ChatRoomParametersV1 {
+            owner: o.verifying_key(),
+        };
+        let (x, t, u, v, w) = (key(2), key(3), key(4), key(5), key(6));
+        // O -> X -> T -> U -> V, and X -> W.
+        let members = MembersV1 {
+            members: vec![
+                rec(ow, &x, &o),
+                rec(ow, &t, &x),
+                rec(ow, &u, &t),
+                rec(ow, &v, &u),
+                rec(ow, &w, &x),
+            ],
+        };
+        let evidence = BanEvidenceV1::default();
+        let info = MemberInfoV1::default();
+        let by_x = [
+            ban(ow, &x, &v, 1),
+            ban(ow, &x, &t, 2),
+            ban(ow, &x, &u, 3),
+            ban(ow, &x, &w, 4),
+        ];
+        let by_owner = [ban(ow, &o, &u, 5), ban(ow, &o, &t, 6)];
+        for reversed in [false, true] {
+            let mut bans: Vec<&AuthorizedUserBan> = by_x.iter().collect();
+            if reversed {
+                bans.reverse();
+            }
+            let res = BanContext::new(&members, &evidence, &info, &params)
+                .resolve(bans.iter().copied(), &params);
+            assert_eq!(res.removed, ids(&[&t, &u, &v, &w]), "reversed: {reversed}");
+            for b in &by_x {
+                assert_eq!(res.tier(&b.id()), BanResolution::EFFECTIVE);
+            }
+            let mut owners: Vec<&AuthorizedUserBan> = by_owner.iter().collect();
+            if reversed {
+                owners.reverse();
+            }
+            let res = BanContext::new(&members, &evidence, &info, &params)
+                .resolve(owners.iter().copied().chain(by_x.iter()), &params);
+            assert_eq!(
+                res.owner_removed,
+                ids(&[&t, &u, &v]),
+                "reversed: {reversed}"
+            );
+            assert_eq!(res.removed, ids(&[&t, &u, &v, &w]), "reversed: {reversed}");
+        }
     }
 }
