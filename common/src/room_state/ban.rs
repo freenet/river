@@ -387,7 +387,7 @@ impl BansV1 {
         let mut accepted = vec![false; n];
         let mut accepted_pairs: HashSet<(MemberId, MemberId)> = HashSet::new();
         // The records every judgment resolves over, built once.
-        let context = BanContext::new(members, evidence, parameters);
+        let context = BanContext::new(members, evidence, member_info, parameters);
         // (live, safe) of ban `i` judged over the accepted bans plus itself,
         // by the full resolution of that set.
         let judge = |i: usize, accepted: &[bool]| -> (bool, bool) {
@@ -396,7 +396,7 @@ impl BansV1 {
                 .filter(|j| *j == i || accepted[*j])
                 .map(|j| &bans[j])
                 .collect();
-            let res = context.resolve(set.iter().copied(), member_info, parameters);
+            let res = context.resolve(set.iter().copied(), parameters);
             let safe = !res.owner_removed.contains(&ban.banned_by)
                 && (0..n).all(|j| !accepted[j] || !res.owner_removed.contains(&bans[j].banned_by));
             if res.tier(&ban.id()) > BanResolution::INERT {

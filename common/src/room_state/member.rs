@@ -677,26 +677,36 @@ impl MembersV1 {
         member_info: &MemberInfoV1,
         parameters: &ChatRoomParametersV1,
     ) -> BanResolution {
-        BanContext::new(self, evidence, parameters).resolve(&bans_v1.0, member_info, parameters)
+        BanContext::new(self, evidence, member_info, parameters).resolve(&bans_v1.0, parameters)
     }
 }
+
+/// A ban's reach (its target and that target's invite subtree), shared
+/// between the resolutions of one [`BanContext`].
+type Reach = std::rc::Rc<BTreeSet<MemberId>>;
 
 /// The records [`MembersV1::resolve_bans`] reads, built once for a member
 /// set and its ban evidence, so a caller that resolves many ban sets over
 /// the same records (the ban cap) does not rebuild them for each. It also
-/// remembers, per ban, whether the ban's signature verifies against its
-/// issuer's key here, and its id. The bans passed to one context are
-/// borrowed for its whole life, so each is one fixed record.
+/// remembers, per ban, its id, whether its signature verifies against its
+/// issuer's key here and whether its issuer may ban its target, and per
+/// target, its reach. All of these depend only on the records, so they hold
+/// for the context's whole life. The bans passed to one context are borrowed
+/// for its whole life, so each is one fixed record.
 pub(crate) struct BanContext<'a> {
     lookup: HashMap<MemberId, &'a AuthorizedMember>,
     children: HashMap<MemberId, Vec<MemberId>>,
+    member_info: &'a MemberInfoV1,
     per_ban: std::cell::RefCell<HashMap<*const AuthorizedUserBan, (BanId, bool)>>,
+    authorized: std::cell::RefCell<HashMap<*const AuthorizedUserBan, bool>>,
+    reach: std::cell::RefCell<HashMap<MemberId, Reach>>,
 }
 
 impl<'a> BanContext<'a> {
     pub(crate) fn new(
         members: &'a MembersV1,
         evidence: &'a BanEvidenceV1,
+        member_info: &'a MemberInfoV1,
         parameters: &ChatRoomParametersV1,
     ) -> Self {
         let lookup = evidence.lookup(members, parameters.owner_id());
@@ -704,7 +714,48 @@ impl<'a> BanContext<'a> {
         BanContext {
             lookup,
             children,
+            member_info,
             per_ban: Default::default(),
+            authorized: Default::default(),
+            reach: Default::default(),
+        }
+    }
+
+    /// Whether `ban`'s issuer may ban its target here
+    /// ([`MembersV1::is_ban_authorized`]), keyed by address like
+    /// [`Self::id_and_signature`].
+    fn is_authorized(&self, ban: &'a AuthorizedUserBan, owner_id: MemberId) -> bool {
+        let key: *const AuthorizedUserBan = ban;
+        if let Some(known) = self.authorized.borrow().get(&key) {
+            return *known;
+        }
+        let ok = MembersV1::is_ban_authorized(
+            ban.banned_by,
+            ban.ban.banned_user,
+            &self.lookup,
+            self.member_info,
+            owner_id,
+        );
+        self.authorized.borrow_mut().insert(key, ok);
+        ok
+    }
+
+    /// `target` and its whole invite subtree ([`reach_in`]).
+    fn reach_of(&self, target: MemberId) -> Reach {
+        if let Some(known) = self.reach.borrow().get(&target) {
+            return known.clone();
+        }
+        let reach = std::rc::Rc::new(reach_in(&self.children, target));
+        self.reach.borrow_mut().insert(target, reach.clone());
+        reach
+    }
+
+    /// Adds `target` and its subtree to `set`, which holds only whole
+    /// subtrees: a target already in it brings nothing new, since its
+    /// subtree lies inside the one that put it there.
+    fn add_reach(&self, set: &mut HashSet<MemberId>, target: MemberId) {
+        if !set.contains(&target) {
+            set.extend(self.reach_of(target).iter().copied());
         }
     }
 
@@ -742,19 +793,23 @@ impl<'a> BanContext<'a> {
     pub(crate) fn resolve(
         &self,
         bans: impl IntoIterator<Item = &'a AuthorizedUserBan> + Clone,
-        member_info: &MemberInfoV1,
         parameters: &ChatRoomParametersV1,
     ) -> BanResolution {
         #[cfg(any(test, river_cleanup_counters))]
         crate::room_state::cleanup_counters::count_resolve_bans();
         let owner_id = parameters.owner_id();
-        let lookup = &self.lookup;
-        let children = &self.children;
-
-        // Step 0: the owner's bans.
-        let owner_removed = owner_removed_in(children, bans.clone(), parameters, |ban| {
-            self.id_and_signature(ban, parameters).1
-        });
+        // Step 0: the owner's bans. Every set of removed members below is a
+        // union of whole subtrees, so `add_reach` skips a target already in
+        // it.
+        let mut owner_removed: HashSet<MemberId> = HashSet::new();
+        for ban in bans.clone() {
+            if ban.banned_by == owner_id
+                && ban.ban.banned_user != owner_id
+                && self.id_and_signature(ban, parameters).1
+            {
+                self.add_reach(&mut owner_removed, ban.ban.banned_user);
+            }
+        }
         let mut ban_tiers: HashMap<BanId, u8> = HashMap::new();
         let mut verified: HashSet<BanId> = HashSet::new();
         for ban in bans.clone() {
@@ -768,7 +823,7 @@ impl<'a> BanContext<'a> {
         }
 
         // Steps 1-3: the valid bans, grouped by issuer, each with its reach.
-        let mut valid: BTreeMap<MemberId, Vec<(BanId, BTreeSet<MemberId>)>> = BTreeMap::new();
+        let mut valid: BTreeMap<MemberId, Vec<(BanId, MemberId, Reach)>> = BTreeMap::new();
         for ban in bans {
             let issuer = ban.banned_by;
             if issuer == owner_id || owner_removed.contains(&issuer) {
@@ -779,28 +834,33 @@ impl<'a> BanContext<'a> {
                 continue;
             }
             verified.insert(id.clone());
-            if !MembersV1::is_ban_authorized(
-                issuer,
-                ban.ban.banned_user,
-                lookup,
-                member_info,
-                owner_id,
-            ) {
+            if !self.is_authorized(ban, owner_id) {
                 continue;
             }
-            let reach = reach_in(children, ban.ban.banned_user);
+            let reach = self.reach_of(ban.ban.banned_user);
             if reach.contains(&issuer) {
                 continue; // step 3: self-removing, void
             }
-            valid.entry(issuer).or_default().push((id, reach));
+            valid
+                .entry(issuer)
+                .or_default()
+                .push((id, ban.ban.banned_user, reach));
+        }
+        // Largest reach first, so a ban whose target lies inside an earlier
+        // ban's reach adds nothing below. Each ban's tier is decided on its
+        // own, so the order within an issuer changes no result.
+        for bans in valid.values_mut() {
+            bans.sort_by_key(|(_, _, reach)| std::cmp::Reverse(reach.len()));
         }
 
         // Step 4: the graph. Nodes are issuers and the members they reach.
         let mut adjacency: BTreeMap<MemberId, BTreeSet<MemberId>> = BTreeMap::new();
         for (issuer, bans) in &valid {
             let out = adjacency.entry(*issuer).or_default();
-            for (_, reach) in bans {
-                out.extend(reach.iter().copied());
+            for (_, target, reach) in bans {
+                if !out.contains(target) {
+                    out.extend(reach.iter().copied());
+                }
             }
         }
         let targets: Vec<MemberId> = adjacency.values().flatten().copied().collect();
@@ -818,22 +878,22 @@ impl<'a> BanContext<'a> {
                     continue;
                 };
                 let removed_earlier = removed.contains(issuer);
-                for (ban_id, reach) in bans {
+                for (ban_id, target, reach) in bans {
                     if in_cycle {
                         // A cycle ban holds the cycle together whether or
                         // not an earlier ban already removed its issuer.
-                        if reach.iter().any(|y| component.contains(y)) {
+                        if component.iter().any(|y| reach.contains(y)) {
                             ban_tiers.insert(ban_id.clone(), BanResolution::MUTUAL);
                         }
                     } else if !removed_earlier {
-                        removed.extend(reach.iter().copied());
+                        self.add_reach(&mut removed, *target);
                         ban_tiers.insert(ban_id.clone(), BanResolution::EFFECTIVE);
                     }
                 }
             }
             if in_cycle {
                 for member in &component {
-                    removed.extend(reach_in(children, *member));
+                    self.add_reach(&mut removed, *member);
                 }
             }
         }
@@ -904,6 +964,8 @@ impl MembersV1 {
             }
             current = members_by_id.get(&c).map(|m| m.member.invited_by);
         }
+        #[cfg(any(test, river_cleanup_counters))]
+        crate::room_state::cleanup_counters::count_invite_tree_steps(visited.len());
 
         // 2. Genuine strict ancestor. The chain walk above only reaches
         //    records in `members_by_id`, so this grant already implies the
@@ -1169,6 +1231,8 @@ fn reach_in(children: &HashMap<MemberId, Vec<MemberId>>, target: MemberId) -> BT
             }
         }
     }
+    #[cfg(any(test, river_cleanup_counters))]
+    crate::room_state::cleanup_counters::count_invite_tree_steps(reach.len());
     reach
 }
 

@@ -27,6 +27,7 @@ pub mod cleanup_counters {
         static RESOLVE_BANS_CALLS: Cell<usize> = const { Cell::new(0) };
         static CLEANUP_PASSES: Cell<usize> = const { Cell::new(0) };
         static BOUND_REACHED: Cell<usize> = const { Cell::new(0) };
+        static INVITE_TREE_STEPS: Cell<usize> = const { Cell::new(0) };
     }
 
     /// The counters since the last [`reset`]: (ban signatures verified,
@@ -46,7 +47,15 @@ pub mod cleanup_counters {
         BOUND_REACHED.with(|c| c.get())
     }
 
+    /// Members visited walking the invite tree for ban resolution since the
+    /// last [`reset`]: each member put into a ban's reach, and each ancestor
+    /// an authority check walks up through.
+    pub fn invite_tree_steps() -> usize {
+        INVITE_TREE_STEPS.with(|c| c.get())
+    }
+
     pub fn reset() {
+        INVITE_TREE_STEPS.with(|c| c.set(0));
         BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(0));
         RESOLVE_BANS_CALLS.with(|c| c.set(0));
         CLEANUP_PASSES.with(|c| c.set(0));
@@ -60,6 +69,12 @@ pub mod cleanup_counters {
     pub(crate) fn count_ban_signature_verification() {
         if !PAUSED.with(|p| p.get()) {
             BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    pub(crate) fn count_invite_tree_steps(n: usize) {
+        if !PAUSED.with(|p| p.get()) {
+            INVITE_TREE_STEPS.with(|c| c.set(c.get() + n));
         }
     }
 
@@ -4261,6 +4276,104 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(10),
             "cleanup at {caps}/{caps} took {elapsed:?}"
+        );
+    }
+
+    /// A deep invite chain: member X, invited by the owner, invites a chain
+    /// of `n - 1` members, and holds twice `max_user_bans` bans on members
+    /// spread down that chain, so each ban reaches a long subtree. The cap
+    /// judges every ban over the bans kept before it; the invite-tree walks
+    /// that needs stay within a small multiple of `n * n` (each ban's reach
+    /// and authority found once per cap), where walking them again for
+    /// every judgment grows with the bans judged times the chain.
+    #[test]
+    fn a_deep_invite_chain_keeps_the_ban_cap_walks_quadratic() {
+        let n = 120usize;
+        let key = |b: u64| {
+            let mut x = [0u8; 32];
+            x[..8].copy_from_slice(&b.to_le_bytes());
+            x[31] = 11;
+            SigningKey::from_bytes(&x)
+        };
+        let at =
+            |t: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + t);
+        let owner_sk = key(1);
+        let owner: MemberId = owner_sk.verifying_key().into();
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let x = key(2);
+        let chain: Vec<SigningKey> = (0..n as u64 - 1).map(|i| key(3 + i)).collect();
+        let record = |who: &SigningKey, inviter: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner,
+                    invited_by: inviter.verifying_key().into(),
+                    member_vk: who.verifying_key(),
+                },
+                inviter,
+            )
+        };
+        let mut members = vec![record(&x, &owner_sk)];
+        let mut inviter = &x;
+        for c in &chain {
+            members.push(record(c, inviter));
+            inviter = c;
+        }
+        let deepest = chain.last().unwrap();
+        let bans: Vec<AuthorizedUserBan> = (0..2 * n as u64)
+            .map(|i| {
+                AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner,
+                        banned_at: at(100_000 + i),
+                        banned_user: chain[i as usize % chain.len()].verifying_key().into(),
+                    },
+                    x.verifying_key().into(),
+                    &x,
+                )
+            })
+            .collect();
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner,
+                    max_members: n,
+                    max_user_bans: n,
+                    max_recent_messages: n,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            members: MembersV1 { members },
+            recent_messages: MessagesV1 {
+                messages: vec![AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: owner,
+                        author: deepest.verifying_key().into(),
+                        time: at(1),
+                        content: RoomMessageBody::public("x".into()),
+                    },
+                    deepest,
+                )],
+                ..Default::default()
+            },
+            bans: BansV1(bans),
+            ..Default::default()
+        };
+        state.recent_messages.rebuild_actions_state();
+        cleanup_counters::reset();
+        cleanup_counters::forcing_all_passes(|| state.post_apply_cleanup(&params)).unwrap();
+        let steps = cleanup_counters::invite_tree_steps();
+        let (_, resolved, _) = cleanup_counters::read();
+        assert_eq!(state.bans.0.len(), n, "the cap keeps max_user_bans");
+        assert!(
+            resolved > n,
+            "the cap judged the bans: {resolved} resolutions"
+        );
+        assert!(
+            steps <= 4 * n * n,
+            "{steps} invite-tree steps for a chain of {n} and {resolved} resolutions"
         );
     }
 }
