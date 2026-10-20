@@ -28,6 +28,7 @@ pub mod cleanup_counters {
         static CLEANUP_PASSES: Cell<usize> = const { Cell::new(0) };
         static BOUND_REACHED: Cell<usize> = const { Cell::new(0) };
         static INVITE_TREE_STEPS: Cell<usize> = const { Cell::new(0) };
+        static MEMBER_RECORDS_BUILT: Cell<usize> = const { Cell::new(0) };
     }
 
     /// The counters since the last [`reset`]: (ban signatures verified,
@@ -54,7 +55,14 @@ pub mod cleanup_counters {
         INVITE_TREE_STEPS.with(|c| c.get())
     }
 
+    /// Member records the member loop's passes put in `members` since the
+    /// last [`reset`], before each pass's cap.
+    pub fn member_records_built() -> usize {
+        MEMBER_RECORDS_BUILT.with(|c| c.get())
+    }
+
     pub fn reset() {
+        MEMBER_RECORDS_BUILT.with(|c| c.set(0));
         INVITE_TREE_STEPS.with(|c| c.set(0));
         BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(0));
         RESOLVE_BANS_CALLS.with(|c| c.set(0));
@@ -69,6 +77,12 @@ pub mod cleanup_counters {
     pub(crate) fn count_ban_signature_verification() {
         if !PAUSED.with(|p| p.get()) {
             BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    pub(crate) fn count_member_records(n: usize) {
+        if !PAUSED.with(|p| p.get()) {
+            MEMBER_RECORDS_BUILT.with(|c| c.set(c.get() + n));
         }
     }
 
@@ -751,67 +765,14 @@ impl ChatRoomStateV1 {
         //      (members after step 0) + 1 passes.
         let members_after_ban_enforcement: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
-        let candidates = self.members.members.clone();
-        let mut capped_out: HashSet<MemberId> = HashSet::new();
-        let mut required_ids = HashSet::new();
-        // Each pass that does not end the loop caps out at least one id the
-        // pass held, and a capped-out id is never held again, so the loop
-        // ends within (distinct candidate ids) + 1 passes; the bound makes
-        // that structural.
-        for _ in 0..=candidates.len() {
-            // This pass's members: the candidates the cap has not removed,
-            // and none whose inviter that leaves out (a member is never held
-            // without its inviter, so the subtree of a capped-out member goes
-            // with it).
-            let mut held: HashSet<MemberId> = candidates
-                .iter()
-                .map(|m| m.member.id())
-                .filter(|id| !capped_out.contains(id))
-                .collect();
-            loop {
-                // An id stays while at least one of its records has its
-                // inviter (the owner or a held id).
-                let anchored: HashSet<MemberId> = candidates
-                    .iter()
-                    .filter(|m| {
-                        m.member.invited_by == owner_id || held.contains(&m.member.invited_by)
-                    })
-                    .map(|m| m.member.id())
-                    .collect();
-                let before = held.len();
-                held.retain(|id| anchored.contains(id));
-                if held.len() == before {
-                    break;
-                }
-            }
-            self.members.members = candidates
-                .iter()
-                .filter(|m| held.contains(&m.member.id()))
-                .cloned()
-                .collect();
-            let required = self.prune_and_cap_members(parameters, owner_id, &enforced_banned_ids);
-            let kept: HashSet<MemberId> =
-                self.members.members.iter().map(|m| m.member.id()).collect();
-            // Only an id this pass held can be capped out: the prune also
-            // names the inviters of needed members, which this pass may not
-            // hold (a record whose inviter the cap already removed).
-            let newly_capped: Vec<MemberId> = required
-                .iter()
-                .filter(|id| held.contains(id) && !kept.contains(id))
-                .copied()
-                .collect();
-            // The members kept: the prune's needed ids that this pass holds
-            // and the cap left (an inviter the pass does not hold is not one,
-            // and its `member_info` is not kept for it, step 5).
-            required_ids = required
-                .into_iter()
-                .filter(|id| kept.contains(id))
-                .collect();
-            if newly_capped.is_empty() {
-                break;
-            }
-            capped_out.extend(newly_capped);
-        }
+        #[cfg(test)]
+        let required_ids = if member_loop_reference::in_use() {
+            self.member_loop_reference(parameters, owner_id, &enforced_banned_ids)
+        } else {
+            self.member_loop(parameters, owner_id, &enforced_banned_ids)
+        };
+        #[cfg(not(test))]
+        let required_ids = self.member_loop(parameters, owner_id, &enforced_banned_ids);
 
         // 4. Sweep any ban whose issuer is unknown or whose signature does
         //    not match the issuer's key (#411 round 3 item A.3, round 4 item
@@ -1033,6 +994,232 @@ impl ChatRoomStateV1 {
 }
 
 impl ChatRoomStateV1 {
+    /// `post_apply_cleanup` steps 1-3: the inactivity prune and the
+    /// `max_members` cap, repeated until the cap removes no one. Leaves the
+    /// last pass's members in `self.members` and returns the ids that pass
+    /// needed and kept.
+    ///
+    /// Each pass holds every member left after step 0 except those an
+    /// earlier pass's CAP removed and the invite subtrees of those (a member
+    /// is never held without its inviter); a member only pruned (nothing
+    /// needed it) is held again. So when the cap removes the author of the
+    /// newest message, the next pass's message window reaches older messages
+    /// by members who do fit. Every pass but the last caps out at least one
+    /// held id, which is never held again, so there are at most (distinct
+    /// ids) + 1 passes.
+    ///
+    /// A pass can cap out a single member, so with a message window just
+    /// over `max_members` the loop runs about one pass per member. Each pass
+    /// therefore reads only what it needs: the held set is kept up to date
+    /// as ids leave it, the messages are put in window order once, and the
+    /// pass's members are built from the ids it needs. The result is the one
+    /// the plain pass ([`Self::prune_and_cap_members`], kept for tests)
+    /// gives on the same held set.
+    fn member_loop(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        owner_id: MemberId,
+        enforced_banned_ids: &HashSet<MemberId>,
+    ) -> HashSet<MemberId> {
+        let candidates = self.members.members.clone();
+        let mut lp = MemberLoop::new(&candidates, &self.recent_messages, owner_id);
+        let mut required_ids = HashSet::new();
+        for _ in 0..=candidates.len() {
+            let required =
+                self.prune_and_cap_pass(&mut lp, parameters, owner_id, enforced_banned_ids);
+            let kept: HashSet<MemberId> =
+                self.members.members.iter().map(|m| m.member.id()).collect();
+            // Only an id this pass held can be capped out: the prune also
+            // names the inviters of needed members, which this pass may not
+            // hold (a record whose inviter the cap already removed).
+            let newly_capped: Vec<MemberId> = required
+                .iter()
+                .filter(|id| lp.held.contains(id) && !kept.contains(id))
+                .copied()
+                .collect();
+            // The members kept: the prune's needed ids that this pass holds
+            // and the cap left (an inviter the pass does not hold is not one,
+            // and its `member_info` is not kept for it, step 5).
+            required_ids = required
+                .into_iter()
+                .filter(|id| kept.contains(id))
+                .collect();
+            if newly_capped.is_empty() {
+                break;
+            }
+            lp.remove(newly_capped, owner_id);
+        }
+        required_ids
+    }
+
+    /// One pass of [`Self::member_loop`] over `lp.held`: what
+    /// [`Self::prune_and_cap_members`] does with `self.members` set to the
+    /// held candidates, reading the indexes in `lp` instead of scanning every
+    /// candidate.
+    fn prune_and_cap_pass(
+        &mut self,
+        lp: &mut MemberLoop<'_>,
+        parameters: &ChatRoomParametersV1,
+        owner_id: MemberId,
+        enforced_banned_ids: &HashSet<MemberId>,
+    ) -> HashSet<MemberId> {
+        let held = &lp.held;
+        let live = |author: &MemberId| {
+            *author == owner_id || (held.contains(author) && !enforced_banned_ids.contains(author))
+        };
+        // The newest `max_recent_messages` live messages. Liveness only goes
+        // (the held set only shrinks), so a message found not live is dropped
+        // from the order for good.
+        let window = self.configuration.configuration.max_recent_messages;
+        let mut message_authors: HashSet<MemberId> = HashSet::new();
+        let mut taken = 0;
+        let mut scanned = 0;
+        while taken < window && scanned < lp.newest_first.len() {
+            if live(&lp.newest_first[scanned]) {
+                message_authors.insert(lp.newest_first[scanned]);
+                taken += 1;
+            }
+            scanned += 1;
+        }
+        let mut order = std::mem::take(&mut lp.newest_first);
+        let rest = order.split_off(scanned);
+        order.retain(|a| live(a));
+        order.extend(rest);
+        lp.newest_first = order;
+
+        let held = &lp.held;
+        let dm_participants: HashSet<MemberId> = {
+            let mut dms = self.direct_messages.clone();
+            dms.sweep_after_membership_change(owner_id, held, enforced_banned_ids);
+            crate::room_state::direct_messages::enforce_caps_and_sort(
+                &mut dms,
+                self.configuration
+                    .configuration
+                    .effective_max_direct_messages(),
+            );
+            dms.participants_of_surviving_dms(owner_id, held, enforced_banned_ids)
+        };
+        let current_secret_version = self.secrets.current_version;
+        let secret_recipients = self
+            .secrets
+            .encrypted_secrets
+            .iter()
+            .filter(|s| s.secret.secret_version == current_secret_version)
+            .map(|s| s.secret.member_id);
+        // A held id's record, as `members_by_member_id` of the held records
+        // gives it: every record of a held id is held, so the last one.
+        let record = |id: &MemberId| {
+            if held.contains(id) {
+                lp.by_id.get(id).copied()
+            } else {
+                None
+            }
+        };
+        let mut required_ids: HashSet<MemberId> = message_authors
+            .into_iter()
+            .chain(dm_participants)
+            .chain(secret_recipients)
+            .filter(|id| *id != owner_id && held.contains(id))
+            .collect();
+        for ban in &self.bans.0 {
+            let banner = ban.banned_by;
+            if banner != owner_id
+                && held.contains(&banner)
+                && BansV1::ban_signature_matches_current_key(
+                    ban,
+                    &lp.by_id,
+                    owner_id,
+                    &parameters.owner,
+                )
+            {
+                required_ids.insert(banner);
+            }
+        }
+        // Walk invite chains upward, adding all ancestors (stop at owner).
+        let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
+        while let Some(member_id) = to_process.pop() {
+            if let Some(member) = record(&member_id) {
+                let inviter_id = member.member.invited_by;
+                if inviter_id != owner_id && required_ids.insert(inviter_id) {
+                    to_process.push(inviter_id);
+                }
+            }
+        }
+
+        // The held records of the needed ids, in candidate order.
+        let mut kept: Vec<usize> = required_ids
+            .iter()
+            .filter(|id| held.contains(id))
+            .flat_map(|id| lp.records_of.get(id).into_iter().flatten().copied())
+            .collect();
+        kept.sort_unstable();
+        self.members.members = kept.into_iter().map(|i| lp.candidates[i].clone()).collect();
+        #[cfg(any(test, river_cleanup_counters))]
+        cleanup_counters::count_member_records(self.members.members.len());
+        let max_members = self.configuration.configuration.max_members;
+        self.members.remove_excess_members(parameters, max_members);
+        required_ids
+    }
+
+    /// The member loop as first written, every pass rebuilding its members
+    /// from all candidates: the reference [`Self::member_loop`] is tested
+    /// against.
+    #[cfg(test)]
+    fn member_loop_reference(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        owner_id: MemberId,
+        enforced_banned_ids: &HashSet<MemberId>,
+    ) -> HashSet<MemberId> {
+        let candidates = self.members.members.clone();
+        let mut capped_out: HashSet<MemberId> = HashSet::new();
+        let mut required_ids = HashSet::new();
+        for _ in 0..=candidates.len() {
+            let mut held: HashSet<MemberId> = candidates
+                .iter()
+                .map(|m| m.member.id())
+                .filter(|id| !capped_out.contains(id))
+                .collect();
+            loop {
+                let anchored: HashSet<MemberId> = candidates
+                    .iter()
+                    .filter(|m| {
+                        m.member.invited_by == owner_id || held.contains(&m.member.invited_by)
+                    })
+                    .map(|m| m.member.id())
+                    .collect();
+                let before = held.len();
+                held.retain(|id| anchored.contains(id));
+                if held.len() == before {
+                    break;
+                }
+            }
+            self.members.members = candidates
+                .iter()
+                .filter(|m| held.contains(&m.member.id()))
+                .cloned()
+                .collect();
+            cleanup_counters::count_member_records(self.members.members.len());
+            let required = self.prune_and_cap_members(parameters, owner_id, enforced_banned_ids);
+            let kept: HashSet<MemberId> =
+                self.members.members.iter().map(|m| m.member.id()).collect();
+            let newly_capped: Vec<MemberId> = required
+                .iter()
+                .filter(|id| held.contains(id) && !kept.contains(id))
+                .copied()
+                .collect();
+            required_ids = required
+                .into_iter()
+                .filter(|id| kept.contains(id))
+                .collect();
+            if newly_capped.is_empty() {
+                break;
+            }
+            capped_out.extend(newly_capped);
+        }
+        required_ids
+    }
+
     /// One pass of `post_apply_cleanup` steps 1-3: keep the members something
     /// live needs, with their invite chains, then apply the `max_members`
     /// cap to what is kept. Returns the ids the prune kept (before the cap).
@@ -1052,6 +1239,7 @@ impl ChatRoomStateV1 {
     ///   current key (#411 round 3 item B; kept so stored rooms stay
     ///   fixpoints, see the history in freenet/river#702);
     /// - an invite ancestor of any of these.
+    #[cfg(test)]
     fn prune_and_cap_members(
         &mut self,
         parameters: &ChatRoomParametersV1,
@@ -1131,6 +1319,116 @@ impl ChatRoomStateV1 {
         let max_members = self.configuration.configuration.max_members;
         self.members.remove_excess_members(parameters, max_members);
         required_ids
+    }
+}
+
+/// The candidates of cleanup's member loop, indexed once for all its passes,
+/// and the ids the current pass holds.
+struct MemberLoop<'c> {
+    candidates: &'c [AuthorizedMember],
+    /// Record indexes per member id, ascending.
+    records_of: std::collections::HashMap<MemberId, Vec<usize>>,
+    /// Record indexes per inviter id.
+    invited_by: std::collections::HashMap<MemberId, Vec<usize>>,
+    /// The last record of each id, as `MembersV1::members_by_member_id`.
+    by_id: std::collections::HashMap<MemberId, &'c AuthorizedMember>,
+    /// The ids the pass holds: no capped-out id, and only ids with a record
+    /// whose inviter is the owner or held.
+    held: HashSet<MemberId>,
+    /// Message authors, newest message first (the order the window takes),
+    /// less messages already found not live.
+    newest_first: Vec<MemberId>,
+}
+
+impl<'c> MemberLoop<'c> {
+    fn new(candidates: &'c [AuthorizedMember], messages: &MessagesV1, owner_id: MemberId) -> Self {
+        let mut records_of: std::collections::HashMap<MemberId, Vec<usize>> = Default::default();
+        let mut invited_by: std::collections::HashMap<MemberId, Vec<usize>> = Default::default();
+        let mut by_id = std::collections::HashMap::new();
+        for (i, m) in candidates.iter().enumerate() {
+            let id = m.member.id();
+            records_of.entry(id).or_default().push(i);
+            invited_by.entry(m.member.invited_by).or_default().push(i);
+            by_id.insert(id, m);
+        }
+        // A stable sort by newest first, as the plain pass sorts its live
+        // messages: filtering this order gives the same order.
+        let mut order: Vec<(crate::room_state::message::MessageOrderKey, MemberId)> = messages
+            .messages
+            .iter()
+            .map(|m| (m.order_key(), m.message.author))
+            .collect();
+        order.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut lp = MemberLoop {
+            candidates,
+            records_of,
+            invited_by,
+            by_id,
+            held: HashSet::new(),
+            newest_first: order.into_iter().map(|(_, a)| a).collect(),
+        };
+        // The first pass holds every candidate id with a record whose
+        // inviter is the owner or held: drop ids until none is left without
+        // one. (Ids that only invite each other stay, as they always have.)
+        lp.held = lp.records_of.keys().copied().collect();
+        let unanchored: Vec<MemberId> = lp
+            .records_of
+            .iter()
+            .filter(|(_, records)| {
+                !records.iter().any(|&j| {
+                    let inviter = lp.candidates[j].member.invited_by;
+                    inviter == owner_id || lp.held.contains(&inviter)
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        lp.remove(unanchored, owner_id);
+        lp
+    }
+
+    /// Takes `ids` (held ids the cap removed) out of the held set, and with
+    /// them every id left with no record whose inviter is the owner or held.
+    /// Only a removed id's invitees can lose their anchor.
+    fn remove(&mut self, ids: Vec<MemberId>, owner_id: MemberId) {
+        let mut gone = ids;
+        for id in &gone {
+            self.held.remove(id);
+        }
+        while let Some(id) = gone.pop() {
+            for &i in self.invited_by.get(&id).into_iter().flatten() {
+                let child = self.candidates[i].member.id();
+                if !self.held.contains(&child) {
+                    continue;
+                }
+                let anchored = self.records_of[&child].iter().any(|&j| {
+                    let inviter = self.candidates[j].member.invited_by;
+                    inviter == owner_id || self.held.contains(&inviter)
+                });
+                if !anchored {
+                    self.held.remove(&child);
+                    gone.push(child);
+                }
+            }
+        }
+    }
+}
+
+/// Tests run cleanup's member loop as first written through this switch, to
+/// compare it with [`ChatRoomStateV1::member_loop`].
+#[cfg(test)]
+pub(crate) mod member_loop_reference {
+    use std::cell::Cell;
+    thread_local! {
+        static IN_USE: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn in_use() -> bool {
+        IN_USE.with(|c| c.get())
+    }
+    pub(crate) fn using<R>(f: impl FnOnce() -> R) -> R {
+        let was = IN_USE.with(|c| c.replace(true));
+        let r = f();
+        IN_USE.with(|c| c.set(was));
+        r
     }
 }
 
@@ -4581,5 +4879,308 @@ mod cleanup_pass_tests {
             assert!(ban.verify_signature(&other.verifying_key()).is_err());
             assert!(ban.verify_signature(&o.verifying_key()).is_ok());
         });
+    }
+}
+
+#[cfg(test)]
+mod member_loop_tests {
+    //! Cleanup's member loop (`ChatRoomStateV1::member_loop`) reads indexes
+    //! kept across its passes; the loop as first written
+    //! (`member_loop_reference`) rebuilds every pass from all candidates.
+    //! These hold the two to the same result, and the first to its cost.
+    use super::*;
+    use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+    use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use crate::room_state::member::{AuthorizedMember, Member};
+    use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+    use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    use ed25519_dalek::SigningKey;
+    use std::time::{Duration, SystemTime};
+
+    fn key(b: u64) -> SigningKey {
+        let mut x = [0u8; 32];
+        x[..8].copy_from_slice(&b.to_le_bytes());
+        x[31] = 41;
+        SigningKey::from_bytes(&x)
+    }
+    fn id(k: &SigningKey) -> MemberId {
+        k.verifying_key().into()
+    }
+    fn rec(owner: MemberId, who: &SigningKey, inviter: &SigningKey) -> AuthorizedMember {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: owner,
+                invited_by: id(inviter),
+                member_vk: who.verifying_key(),
+            },
+            inviter,
+        )
+    }
+    fn msg(owner: MemberId, who: &SigningKey, t: u64) -> AuthorizedMessageV1 {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner,
+                author: id(who),
+                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                content: RoomMessageBody::public(format!("m{t}")),
+            },
+            who,
+        )
+    }
+    fn ban(owner: MemberId, by: &SigningKey, target: MemberId, t: u64) -> AuthorizedUserBan {
+        AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner,
+                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                banned_user: target,
+            },
+            id(by),
+            by,
+        )
+    }
+    fn room(o: &SigningKey, max_members: usize, max_msgs: usize) -> ChatRoomStateV1 {
+        ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: id(o),
+                    max_members,
+                    max_recent_messages: max_msgs,
+                    ..Default::default()
+                },
+                o,
+            ),
+            ..Default::default()
+        }
+    }
+    fn params(o: &SigningKey) -> ChatRoomParametersV1 {
+        ChatRoomParametersV1 {
+            owner: o.verifying_key(),
+        }
+    }
+
+    /// Cleanup with the member loop and with the reference loop: the same
+    /// state, and the same `post_apply_cleanup` result or error.
+    fn assert_both_loops_agree(s: &ChatRoomStateV1, p: &ChatRoomParametersV1, what: &str) {
+        let mut fast = s.clone();
+        let fast_result = fast.post_apply_cleanup(p);
+        let mut reference = s.clone();
+        let reference_result = member_loop_reference::using(|| reference.post_apply_cleanup(p));
+        assert_eq!(fast_result, reference_result, "{what}: results");
+        assert!(fast == reference, "{what}: states differ");
+    }
+
+    /// A message window one over `max_members`, the shape that makes the
+    /// loop cap out one member per pass.
+    fn window_just_over_the_cap(n: usize) -> (ChatRoomStateV1, ChatRoomParametersV1) {
+        let o = key(1);
+        let ow = id(&o);
+        let keys: Vec<SigningKey> = (0..n as u64).map(|i| key(100 + i)).collect();
+        let mut s = room(&o, 10, 11);
+        s.members.members = keys.iter().map(|k| rec(ow, k, &o)).collect();
+        s.recent_messages.messages = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| msg(ow, k, i as u64))
+            .collect();
+        s.recent_messages.rebuild_actions_state();
+        (s, params(&o))
+    }
+
+    #[test]
+    fn the_member_loop_matches_the_reference_on_fixed_shapes() {
+        let (s, p) = window_just_over_the_cap(60);
+        assert_both_loops_agree(&s, &p, "window just over the cap");
+
+        // A chain, a second record for a member under another inviter, two
+        // ids that only invite each other, a member whose inviter is held
+        // nowhere, and a ban issuer the prune must keep.
+        let o = key(1);
+        let ow = id(&o);
+        let ks: Vec<SigningKey> = (0..12u64).map(|i| key(200 + i)).collect();
+        let mut s = room(&o, 4, 3);
+        s.members.members = vec![
+            rec(ow, &ks[0], &o),
+            rec(ow, &ks[1], &ks[0]),
+            rec(ow, &ks[2], &ks[1]),
+            rec(ow, &ks[3], &ks[2]),
+            rec(ow, &ks[3], &o),
+            rec(ow, &ks[4], &ks[5]),
+            rec(ow, &ks[5], &ks[4]),
+            rec(ow, &ks[6], &ks[11]),
+            rec(ow, &ks[7], &o),
+            rec(ow, &ks[8], &ks[7]),
+            rec(ow, &ks[9], &ks[8]),
+        ];
+        s.recent_messages.messages = vec![
+            msg(ow, &ks[3], 9),
+            msg(ow, &ks[9], 8),
+            msg(ow, &ks[2], 7),
+            msg(ow, &ks[4], 6),
+            msg(ow, &ks[6], 5),
+            msg(ow, &ks[1], 4),
+        ];
+        s.recent_messages.rebuild_actions_state();
+        s.bans.0 = vec![ban(ow, &ks[8], id(&key(999)), 3)];
+        assert_both_loops_agree(&s, &params(&o), "chain, duplicates, cycle");
+    }
+
+    /// Small generated rooms: random invite trees with second records,
+    /// dangling inviters, messages, bans and member_info, at random caps.
+    #[test]
+    fn the_member_loop_matches_the_reference_on_generated_rooms() {
+        let mut seed = 0x5eed_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n.max(1)
+        };
+        for round in 0..300u64 {
+            let o = key(1);
+            let ow = id(&o);
+            let n = 2 + next(24) as usize;
+            let ks: Vec<SigningKey> = (0..n as u64)
+                .map(|i| key(1_000 * (round + 1) + i))
+                .collect();
+            let mut s = room(&o, 1 + next(n as u64) as usize, next(n as u64 + 3) as usize);
+            let mut members = Vec::new();
+            for i in 0..n {
+                let inviter = match next(8) {
+                    0 => key(9_999_999),
+                    1..=3 => o.clone(),
+                    _ => ks[next(n as u64) as usize].clone(),
+                };
+                members.push(rec(ow, &ks[i], &inviter));
+                if next(6) == 0 {
+                    members.push(rec(ow, &ks[i], &ks[next(n as u64) as usize]));
+                }
+            }
+            s.members.members = members;
+            s.recent_messages.messages = (0..next(2 * n as u64))
+                .map(|t| msg(ow, &ks[next(n as u64) as usize], next(50) * 100 + t))
+                .collect();
+            s.recent_messages.rebuild_actions_state();
+            s.bans.0 = (0..next(4))
+                .map(|t| ban(ow, &ks[next(n as u64) as usize], id(&key(5_000_000 + t)), t))
+                .collect();
+            let who = &ks[next(n as u64) as usize];
+            s.member_info.member_info = vec![AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo::new_public(id(who), 1, "x".into()),
+                who,
+            )];
+            assert_both_loops_agree(&s, &params(&o), &format!("round {round}"));
+        }
+    }
+
+    /// With the window one over `max_members`, the loop caps out one member
+    /// per pass, so it runs about one pass per member. Each pass builds only
+    /// the members it needs (about the window), not every candidate.
+    #[test]
+    fn a_window_just_over_the_member_cap_keeps_each_pass_small() {
+        let n = 400;
+        let (mut s, p) = window_just_over_the_cap(n);
+        cleanup_counters::reset();
+        s.post_apply_cleanup(&p).unwrap();
+        let built = cleanup_counters::member_records_built();
+        assert_eq!(s.members.members.len(), 10);
+        assert!(
+            built <= 20 * n,
+            "{built} member records built for {n} members"
+        );
+    }
+
+    /// The member loop needs three passes (C, then G, is capped out), and
+    /// the second pass drops E, two levels below capped-out C: only F, the
+    /// newest author who fits, stays.
+    #[test]
+    fn three_member_loop_passes_drop_a_two_level_subtree() {
+        let o = key(1);
+        let ow = id(&o);
+        let (p_, q, c, g, d, e, f) = (key(2), key(3), key(4), key(5), key(6), key(7), key(8));
+        let mut s = room(&o, 2, 1);
+        s.members.members = vec![
+            rec(ow, &p_, &o),
+            rec(ow, &q, &p_),
+            rec(ow, &c, &q),
+            rec(ow, &g, &q),
+            rec(ow, &d, &c),
+            rec(ow, &e, &d),
+            rec(ow, &f, &o),
+        ];
+        s.recent_messages.messages = vec![
+            msg(ow, &f, 1),
+            msg(ow, &e, 5),
+            msg(ow, &g, 8),
+            msg(ow, &c, 10),
+        ];
+        s.recent_messages.rebuild_actions_state();
+        assert_both_loops_agree(&s, &params(&o), "three passes");
+        cleanup_counters::reset();
+        s.post_apply_cleanup(&params(&o)).unwrap();
+        s.verify(&s, &params(&o)).expect("verifies");
+        let ids: Vec<MemberId> = s.members.members.iter().map(|m| m.member.id()).collect();
+        assert_eq!(ids, vec![id(&f)], "only F, the newest author who fits");
+        assert_eq!(
+            cleanup_counters::read().2,
+            2,
+            "one pass plus a confirming pass"
+        );
+    }
+
+    /// X holds two records (invited by the owner, and by A, listed last); A,
+    /// three invites down, has the newest message. Lowering the cap to 2
+    /// caps A out, X's message enters the window, and the prune names A as
+    /// X's inviter, which the pass does not hold. The loop ends (on a thread
+    /// with a deadline, so a loop that does not end fails rather than hangs),
+    /// X stays, and A's member_info goes with A.
+    #[test]
+    fn a_needed_inviter_the_pass_does_not_hold_ends_the_loop() {
+        let o = key(1);
+        let ow = id(&o);
+        let (b1, b2, a, x) = (key(12), key(13), key(14), key(15));
+        let mut s = room(&o, 2, 1);
+        s.members.members = vec![
+            rec(ow, &b1, &o),
+            rec(ow, &b2, &b1),
+            rec(ow, &a, &b2),
+            rec(ow, &x, &o),
+            rec(ow, &x, &a),
+        ];
+        s.recent_messages.messages = vec![msg(ow, &x, 1), msg(ow, &a, 9)];
+        s.recent_messages.rebuild_actions_state();
+        s.member_info.member_info = vec![AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(id(&a), 1, "a".into()),
+            &a,
+        )];
+        let mut wide = s.clone();
+        wide.configuration = room(&o, 10, 1).configuration;
+        wide.verify(&wide, &params(&o))
+            .expect("premise: verifies before the cap is lowered");
+        let p = params(&o);
+        let (done, result) = std::sync::mpsc::channel();
+        let input = s.clone();
+        std::thread::spawn(move || {
+            let mut s = input;
+            cleanup_counters::reset();
+            s.post_apply_cleanup(&p).unwrap();
+            let passes = cleanup_counters::read().2;
+            let _ = done.send((s, passes));
+        });
+        let (s, passes) = result
+            .recv_timeout(Duration::from_secs(60))
+            .expect("cleanup ends");
+        let ids: HashSet<MemberId> = s.members.members.iter().map(|m| m.member.id()).collect();
+        assert!(ids.contains(&id(&x)) && !ids.contains(&id(&a)), "{ids:?}");
+        assert!(
+            s.member_info
+                .member_info
+                .iter()
+                .all(|i| i.member_info.member_id != id(&a)),
+            "A's member_info goes with A"
+        );
+        assert!(passes <= 2);
+        let mut again = s.clone();
+        again.post_apply_cleanup(&params(&o)).unwrap();
+        assert!(again == s, "a fixpoint");
     }
 }
