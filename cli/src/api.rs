@@ -77,6 +77,31 @@ const GET_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// This is the anchor riverctl used to have as its ONLY anchor, and the thing
 /// the pointer record is compared against.
+/// Why `issuer` may not sign a ban in `room_state`, if it may not: the
+/// contract drops a ban whose issuer is deeper in the invite tree than the
+/// ban evidence depth cap (`min(max_members, 4)` invites below the owner).
+fn ban_depth_refusal(
+    room_state: &ChatRoomStateV1,
+    issuer: MemberId,
+    owner_id: MemberId,
+) -> Option<String> {
+    let max_members = room_state.configuration.configuration.max_members;
+    if river_core::room_state::ban::BansV1::issuer_within_depth_cap(
+        issuer,
+        &room_state.members,
+        owner_id,
+        max_members,
+    ) {
+        return None;
+    }
+    let cap = river_core::room_state::ban_evidence::evidence_depth_cap(max_members);
+    Some(format!(
+        "Bans only take effect from members at most {cap} invites below the room owner \
+         in this room, and you joined further down, so a ban from you would have no \
+         effect. Ask a moderator closer to the owner."
+    ))
+}
+
 pub fn bundled_room_code_hash() -> [u8; 32] {
     *blake3::hash(ROOM_CONTRACT_WASM).as_bytes()
 }
@@ -6481,11 +6506,12 @@ impl ApiClient {
             return Err(anyhow!("Cannot ban the room owner"));
         }
 
-        // Verify authorization using the SAME `is_ban_authorized` predicate the
-        // contract enforces (owner OR strict-ancestor-of-target OR
-        // owner-appointed global moderator OR deputy-of-an-ancestor), so
-        // client-side rejection stays in lockstep with
-        // on-contract enforcement (#410).
+        // Verify authorization using the SAME predicates the contract
+        // enforces: `is_ban_authorized` (owner OR strict-ancestor-of-target OR
+        // owner-appointed global moderator OR deputy-of-an-ancestor, #410) and
+        // `issuer_within_depth_cap` (cleanup drops a ban whose issuer is
+        // deeper in the invite tree than the ban evidence depth cap), so a ban
+        // the contract would ignore is refused here instead of being signed.
         if my_member_id != owner_member_id {
             let members_by_id = room_state.members.members_by_member_id();
             let authorized = river_core::room_state::member::MembersV1::is_ban_authorized(
@@ -6501,6 +6527,9 @@ impl ApiClient {
                      (directly or indirectly), or members within a subtree you have been \
                      deputized over."
                 ));
+            }
+            if let Some(reason) = ban_depth_refusal(&room_state, my_member_id, owner_member_id) {
+                return Err(anyhow!(reason));
             }
         }
 
@@ -14502,5 +14531,49 @@ mod await_response_tests {
             .expect("an UpdateResponse for the new contract answers a re-PUT");
         assert_eq!(conn.reads, 2);
         assert_eq!(stored_key(&storage, &owner_vk), key().id().to_string());
+    }
+}
+
+#[cfg(test)]
+mod ban_depth_refusal_tests {
+    use super::ban_depth_refusal;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersV1};
+    use river_core::room_state::ChatRoomStateV1;
+
+    /// `riverctl` refuses to sign a ban whose issuer sits deeper in the
+    /// invite tree than the ban evidence depth cap, which the contract would
+    /// drop: four invites down is allowed, five is refused with a reason, a
+    /// member limit below 4 lowers the cap, and the owner always may.
+    #[test]
+    fn a_ban_from_deeper_than_the_depth_cap_is_refused() {
+        let owner = SigningKey::from_bytes(&[1; 32]);
+        let owner_id: MemberId = owner.verifying_key().into();
+        let chain: Vec<SigningKey> = (2..8u8).map(|b| SigningKey::from_bytes(&[b; 32])).collect();
+        let mut members = Vec::new();
+        let mut inviter = &owner;
+        for sk in &chain {
+            members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: inviter.verifying_key().into(),
+                    member_vk: sk.verifying_key(),
+                },
+                inviter,
+            ));
+            inviter = sk;
+        }
+        let mut state = ChatRoomStateV1 {
+            members: MembersV1 { members },
+            ..Default::default()
+        };
+        state.configuration.configuration.max_members = 200;
+        let id = |i: usize| -> MemberId { chain[i].verifying_key().into() };
+        assert_eq!(ban_depth_refusal(&state, id(3), owner_id), None);
+        let reason = ban_depth_refusal(&state, id(4), owner_id).expect("refused");
+        assert!(reason.contains("at most 4 invites"), "{reason}");
+        assert_eq!(ban_depth_refusal(&state, owner_id, owner_id), None);
+        state.configuration.configuration.max_members = 3;
+        assert!(ban_depth_refusal(&state, id(3), owner_id).is_some());
     }
 }

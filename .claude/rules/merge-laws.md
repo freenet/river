@@ -103,7 +103,12 @@ the function changes nothing. The cap, cleanup step 0-sig and step 4 read
 the records known at the start of the pass within the ban evidence depth
 cap (`BansV1::stable_known`). A ban whose issuer sits deeper, present or
 not, takes no effect: step 0-sig drops it on every pass, before the cap or
-ban resolution sees it, so no delivery order lets it remove anyone.
+ban resolution sees it, so no delivery order lets it remove anyone. This
+applies to bans carried across a re-key too, and lowering `max_members`
+below 4 lowers the cap with it, so existing bans by issuers deeper than the
+new cap stop counting and are dropped (raising it again does not restore
+them). The UI's Ban gate and `riverctl ban` refuse to sign such a ban
+(`BansV1::issuer_within_depth_cap`).
 
 Within one merge or cleanup each ban signature is verified at most once
 (`ban::signature_memo`): the cap re-judges bans many times, and an

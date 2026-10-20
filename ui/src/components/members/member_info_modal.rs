@@ -232,12 +232,17 @@ pub fn MemberInfoModal() -> Element {
                     me,
                     member_id,
                     MemberId::from(&*owner),
+                    room_state
+                        .room_state
+                        .configuration
+                        .configuration
+                        .max_members,
                 )
             })
             .unwrap_or(BanGate::NoAuthority);
         let can_ban = gate == BanGate::Allowed;
         let ban_refusal = match gate {
-            BanGate::WouldRemoveViewer(reason) => Some(reason),
+            BanGate::WouldRemoveViewer(reason) | BanGate::IssuerTooDeep(reason) => Some(reason),
             BanGate::Allowed | BanGate::NoAuthority => None,
         };
 
@@ -832,6 +837,50 @@ mod ban_gate_tests {
         AuthorizedMemberInfo::new_with_member_key(mi, sk)
     }
 
+    /// A member with authority over the target, but deeper in the invite tree
+    /// than the room counts bans from, is not offered Ban: the contract drops
+    /// a ban by an issuer deeper than the ban evidence depth cap
+    /// (`min(max_members, 4)`), so the gate explains instead of signing one.
+    #[test]
+    fn a_ban_from_deeper_than_the_depth_cap_is_refused_with_a_reason() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner.verifying_key().into();
+        let chain: Vec<SigningKey> = (0..6).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let mut members = Vec::new();
+        let (mut inviter_id, mut inviter_sk) = (owner_id, &owner);
+        for sk in &chain {
+            members.push(member(sk, inviter_id, inviter_sk, owner_id));
+            inviter_id = sk.verifying_key().into();
+            inviter_sk = sk;
+        }
+        let members = MembersV1 { members };
+        let member_info = MemberInfoV1 {
+            member_info: vec![],
+        };
+        let id = |i: usize| -> MemberId { chain[i].verifying_key().into() };
+        let target = id(5); // six invites down
+                            // Four invites down: within the cap.
+        assert_eq!(
+            ban_gate(&members, &member_info, id(3), target, owner_id, 200),
+            BanGate::Allowed
+        );
+        // Five invites down: deeper than the cap.
+        assert!(matches!(
+            ban_gate(&members, &member_info, id(4), target, owner_id, 200),
+            BanGate::IssuerTooDeep(_)
+        ));
+        // A member limit below 4 lowers the cap with it.
+        assert!(matches!(
+            ban_gate(&members, &member_info, id(3), target, owner_id, 3),
+            BanGate::IssuerTooDeep(_)
+        ));
+        // The owner is never too deep.
+        assert_eq!(
+            ban_gate(&members, &member_info, owner_id, target, owner_id, 1),
+            BanGate::Allowed
+        );
+    }
+
     /// #411 round 4 D: the Ban-button gate uses `is_ban_authorized`, so a deputy
     /// sees Ban for a target in their deputizer's subtree — which the old bare
     /// downstream-ancestry gate (`is_downstream`) would have hidden.
@@ -864,23 +913,23 @@ mod ban_gate_tests {
 
         // Owner can ban anyone.
         assert_eq!(
-            ban_gate(&members, &member_info, owner_id, v_id, owner_id),
+            ban_gate(&members, &member_info, owner_id, v_id, owner_id, 200),
             BanGate::Allowed
         );
         // D (owner's deputy) can ban V even though D is NOT an ancestor of V, so
         // the old `is_downstream` gate would have hidden the Ban button.
         assert_eq!(
-            ban_gate(&members, &member_info, d_id, v_id, owner_id),
+            ban_gate(&members, &member_info, d_id, v_id, owner_id, 200),
             BanGate::Allowed
         );
         // An unrelated member cannot ban V.
         assert_eq!(
-            ban_gate(&members, &member_info, u_id, v_id, owner_id),
+            ban_gate(&members, &member_info, u_id, v_id, owner_id, 200),
             BanGate::NoAuthority
         );
         // Nobody can ban the owner.
         assert_eq!(
-            ban_gate(&members, &member_info, d_id, owner_id, owner_id),
+            ban_gate(&members, &member_info, d_id, owner_id, owner_id, 200),
             BanGate::NoAuthority
         );
     }

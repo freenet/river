@@ -176,6 +176,32 @@ impl BansV1 {
             .collect()
     }
 
+    /// Whether a ban signed by `issuer` can take effect in a room with
+    /// `max_members`: the issuer is the owner, or a member whose invite chain
+    /// reaches the owner through `members` within the ban evidence depth cap
+    /// ([`super::ban_evidence::evidence_depth_cap`]). Cleanup drops a ban by
+    /// a deeper issuer before ban resolution sees it (step 0-sig reads
+    /// [`Self::stable_known`]), so clients use this to refuse to sign one.
+    pub fn issuer_within_depth_cap(
+        issuer: MemberId,
+        members: &MembersV1,
+        owner_id: MemberId,
+        max_members: usize,
+    ) -> bool {
+        if issuer == owner_id {
+            return true;
+        }
+        let by_id = members.members_by_member_id();
+        by_id.get(&issuer).is_some_and(|m| {
+            super::ban_evidence::within_depth(
+                m,
+                &by_id,
+                owner_id,
+                super::ban_evidence::evidence_depth_cap(max_members),
+            )
+        })
+    }
+
     /// THE single definition of the `max_user_bans` cap. Two sites need to
     /// know which bans survive it: `post_apply_cleanup` step 0-cap, which
     /// stores the result, and `DirectMessagesV1::apply_delta`, which sweeps
