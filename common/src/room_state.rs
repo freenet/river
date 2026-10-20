@@ -5204,8 +5204,9 @@ mod member_loop_tests {
     /// each) into a room with `max_members` 20, a window of 21 and a full
     /// default DM set (300 at the largest ciphertext) among its own members,
     /// which hold the lowest ids so the cap keeps them and their DMs to the
-    /// end. The loop runs many passes; none copies the DMs, each builds only
-    /// the members it needs, and the apply stays within a time budget.
+    /// end. The loop runs many passes; none copies the DMs, and each builds
+    /// only the members it needs. (Counted rather than timed: a wall-clock
+    /// bound fails on a loaded machine.)
     #[test]
     fn a_floor_delta_into_a_room_holding_a_full_dm_set_copies_no_dms() {
         use crate::room_state::direct_messages::MAX_DM_CIPHERTEXT_BYTES;
@@ -5271,10 +5272,7 @@ mod member_loop_tests {
             built <= 20 * n,
             "{built} member records built for {n} members"
         );
-        assert!(
-            elapsed < std::time::Duration::from_secs(20),
-            "the apply took {elapsed:?}"
-        );
+        eprintln!("the apply took {elapsed:?}");
     }
 
     /// The member loop needs three passes (C, then G, is capped out), and
