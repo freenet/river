@@ -323,8 +323,7 @@ fn a_ban_the_cap_evicts_still_decides_liveness_in_both_directions() {
         ..Default::default()
     });
     let mut sb = vec![r.ban(&y, id(&x), 50)];
-    // 90 bans, not the 150 this shape could hold: a larger flood here falls
-    // in an open merge-law item in the ban cap.
+    // Kept at 90 bans; see the merge-law tracker.
     sb.extend((0..90).map(|i| r.ban(&w, target(1_000 + i), 1_000 + i)));
     let sender = r.settled(ChatRoomStateV1 {
         configuration: r.cfg(1, |c| c.max_user_bans = 300),

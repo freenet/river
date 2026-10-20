@@ -387,3 +387,42 @@ fn lowering_the_member_and_dm_caps_keeps_the_newest_dm_whose_sender_fits() {
         MemberId::from(p.verifying_key())
     );
 }
+
+/// `MembersV1::verify` refuses a member set over `max_members`. Between the
+/// field applies and cleanup the set may exceed it, but nothing verifies
+/// there, and every state cleanup returns is within it: here ten members,
+/// each with a message, in a room lowered to three, by a configuration delta
+/// and by a whole-state merge.
+#[test]
+fn every_state_cleanup_returns_is_within_max_members() {
+    let r = Room::new();
+    let keys: Vec<SigningKey> = (0..10u8).map(|i| sk(0x60 + i)).collect();
+    let members: Vec<AuthorizedMember> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| r.member(k, if i < 3 { &r.owner } else { &keys[i % 3] }))
+        .collect();
+    let mut held = ChatRoomStateV1 {
+        configuration: r.cfg(1, 10, 20, 20),
+        members: MembersV1 { members },
+        ..Default::default()
+    };
+    held.recent_messages.messages = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| r.msg(k, 100 + i as u64))
+        .collect();
+    let held = r.merge(&held, &held);
+    assert_eq!(held.members.members.len(), 10, "premise");
+    let by_delta = lowered(&r, &held, |c| c.max_members = 3);
+    assert!(by_delta.members.members.len() <= 3);
+    let lower = ChatRoomStateV1 {
+        configuration: r.cfg(2, 10, 3, 20),
+        ..Default::default()
+    };
+    let lower = r.merge(&lower, &lower);
+    for merged in [r.merge(&held, &lower), r.merge(&lower, &held)] {
+        assert!(merged.members.members.len() <= 3);
+        merged.verify(&merged, &r.params).expect("verifies");
+    }
+}
