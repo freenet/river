@@ -899,39 +899,22 @@ fn enforced_ban_set_of_inner(
         ),
     );
     let evidence = pruned.as_ref().unwrap_or(&parent_state.ban_evidence);
-    // The bans `post_apply_cleanup` counts at the cap: without any no known
-    // key verifies (step 0-sig, on every pass), judged against
-    // the same pass-start records (`BansV1::stable_known`).
+    // The decision `post_apply_cleanup` makes (0-sig, 0-cap and 0), by the
+    // same function.
     let depth_cap = crate::room_state::ban_evidence::evidence_depth_cap(
         parent_state.configuration.configuration.max_members,
     );
-    let mut capped: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
-    BansV1::drop_bans_no_known_key_verifies(
-        &mut capped,
-        &BansV1::stable_known(
-            &parent_state.members,
-            evidence,
-            parameters.owner_id(),
-            depth_cap,
-        ),
-        parameters.owner_id(),
-        &parameters.owner,
-    );
-    BansV1::enforce_user_ban_cap(
-        &mut capped,
+    let mut bans: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
+    BansV1::decide_enforced(
+        &mut bans,
         max_bans,
         depth_cap,
         &parent_state.members,
         evidence,
         &parent_state.member_info,
         parameters,
-    );
-    parent_state.members.banned_member_ids(
-        evidence,
-        &BansV1(capped),
-        &parent_state.member_info,
-        parameters,
     )
+    .removed
 }
 
 /// Whether a DM endpoint is still a live participant: the room owner (implicit,

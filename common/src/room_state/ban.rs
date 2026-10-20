@@ -170,6 +170,44 @@ impl BansV1 {
             .collect()
     }
 
+    /// Which of `bans` the room enforces: THE single decision cleanup step
+    /// 0 makes and the DM apply's enforced-ban set reuses (freenet/river#675).
+    /// Drops every ban no key in [`Self::stable_known`] verifies (step
+    /// 0-sig, on every pass), keeps at most `max_bans` of the rest in the
+    /// authority order ([`Self::enforce_user_ban_cap`], step 0-cap), and
+    /// resolves what is kept ([`MembersV1::resolve_bans`], step 0). `bans`
+    /// is left as the kept set.
+    pub(crate) fn decide_enforced(
+        bans: &mut Vec<AuthorizedUserBan>,
+        max_bans: usize,
+        depth_cap: usize,
+        members: &MembersV1,
+        evidence: &BanEvidenceV1,
+        member_info: &MemberInfoV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> BanResolution {
+        let owner_id = parameters.owner_id();
+        Self::drop_bans_no_known_key_verifies(
+            bans,
+            &Self::stable_known(members, evidence, owner_id, depth_cap),
+            owner_id,
+            &parameters.owner,
+        );
+        Self::enforce_user_ban_cap(
+            bans,
+            max_bans,
+            depth_cap,
+            members,
+            evidence,
+            member_info,
+            parameters,
+        );
+        let kept = BansV1(std::mem::take(bans));
+        let resolution = members.resolve_bans(evidence, &kept, member_info, parameters);
+        *bans = kept.0;
+        resolution
+    }
+
     /// Whether a ban signed by `issuer` can take effect in a room with
     /// `max_members`: the issuer is the owner, or a member whose invite chain
     /// reaches the owner through `members` within the ban evidence depth cap
