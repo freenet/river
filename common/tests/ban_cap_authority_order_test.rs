@@ -607,3 +607,30 @@ fn under_the_cap_every_ban_is_kept() {
     merged.merge_from(&r.p, &s).expect("merge");
     assert!(ser(&merged) == ser(&s), "a merge keeps them too");
 }
+
+/// With a cap of one, an owner ban is kept ahead of a newer ban by a deputy
+/// on a member the owner invited, which ranks at the owner's level.
+#[test]
+fn an_owner_ban_is_kept_ahead_of_a_newer_ban_at_the_owners_level() {
+    let r = Room::new();
+    let (d, x) = (sk(2), sk(3));
+    let mut grant = MemberInfo::new_public(r.owner, 1, "o".into());
+    grant.deputies = vec![id(&d)];
+    let base = r.settled(ChatRoomStateV1 {
+        configuration: r.cfg(|c| c.max_user_bans = 1),
+        members: MembersV1 {
+            members: vec![r.rec(&d, &r.o), r.rec(&x, &r.o)],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![AuthorizedMemberInfo::new(grant, &r.o)],
+        },
+        recent_messages: r.messages(vec![r.msg(&d, 1), r.msg(&x, 2)]),
+        ..Default::default()
+    });
+    let o = owner_ban(&r, target(1), 10);
+    let dx = r.ban(&d, id(&x), 20);
+    for bans in [vec![o.clone(), dx.clone()], vec![dx.clone(), o.clone()]] {
+        let s = apply(&r, &base, bans);
+        assert!(has(&s, &o) && !has(&s, &dx), "the owner ban is kept");
+    }
+}

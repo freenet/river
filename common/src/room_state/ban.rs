@@ -250,7 +250,8 @@ impl BansV1 {
     ///   sits. A ban on a target whose record is known ranks at the target's
     ///   depth minus one (its authority, an ancestor or a deputy's granter,
     ///   sits strictly above the target); a ban on an id known nowhere ranks
-    ///   at its issuer's depth. Within a level the newer ban comes first.
+    ///   at its issuer's depth. Owner bans rank at level 0 ahead of every
+    ///   other ban there; otherwise the newer ban comes first within a level.
     ///   Ties in time are broken by `(banned_at, id, record digest)`, the
     ///   canonical stored order.
     /// - A ban is judged over the bans accepted so far plus itself, by the
@@ -379,7 +380,8 @@ impl BansV1 {
             } else {
                 depth_of(&ban.banned_by)
             };
-            (level, std::cmp::Reverse(i))
+            // An owner ban comes before any other ban at its level.
+            (level, ban.banned_by != owner_id, std::cmp::Reverse(i))
         });
 
         let mut accepted = vec![false; n];
