@@ -1,6 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
-import { roomUnreadBadge, selectListedRoom, setTabVisibility } from "./example-room";
+import { hiddenTitleCount, roomUnreadBadge, selectListedRoom, setTabVisibility } from "./example-room";
 import {
   AT_BOTTOM_EPSILON_PX,
   BAND_EDGES,
@@ -43,8 +43,8 @@ import { DM_PEER, closeThread, newestHistoryDm, openThread } from "./dm-thread";
 const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
 
 // An arrival follows a reader at the end: the newest message's bottom within
-// FOLLOW_BAND_PX of the view's bottom edge before the patch, in the
-// foreground. Anywhere else it keeps the reader's place, and the Latest button
+// FOLLOW_BAND_PX of the view's bottom edge before the patch, whether or not
+// the tab is visible. Anywhere else it keeps the reader's place, and the Latest button
 // is how a reader reaches what arrived below them.
 // Rationale: .claude/rules/history-scrolling.md.
 //
@@ -1280,17 +1280,16 @@ test.describe("The end holds after an explicit request", () => {
   const imageRow = (page: Page) => page.locator("[data-item-key]", { hasText: "image fixture" });
 
   /// An image row, still loading, two short messages above the end of the
-  /// open room. All three arrive in a hidden tab, so nothing follows them and
-  /// the room is unread.
+  /// open room. All three arrive while the reader is parked at the top, so
+  /// nothing follows them and the room is unread.
   async function addLoadingImageAboveTheEnd(page: Page, image: { requested: () => number }) {
-    await setTabVisibility(page, "hidden");
+    await readerScrollsWithoutGesture(page, 0);
     // The Markdown renders to text plus an <img>, so wait on the plain words.
     await callRiverTest(page, "appendMessage", "image fixture ![fixture](/test-image.svg) above the end");
     await expect(imageRow(page)).toHaveCount(1, { timeout: 5_000 });
     await deliverOffscreen(page, "below the image 1");
     await deliverOffscreen(page, "below the image 2");
     await expect.poll(image.requested, { message: "premise: the image is requested and held" }).toBeGreaterThan(0);
-    await setTabVisibility(page, "visible");
   }
 
   /// Let the image load, and wait for its row to grow.
@@ -1750,8 +1749,9 @@ test.describe("Browser scroll anchoring is off on the history", () => {
 
 // An arrival follows a reader at the end, measured before the patch: the
 // newest message's bottom within FOLLOW_BAND_PX of the view's bottom
-// edge, in a visible tab, with no DM thread over the history. Nothing else
-// follows, and nothing scrolls when the tab comes back or the thread closes.
+// edge, in a visible tab or a hidden one, with or without a DM thread over
+// the history. Nothing else follows, and nothing scrolls when the tab comes
+// back or the thread closes.
 // Rationale: .claude/rules/history-scrolling.md.
 test.describe("An arrival follows a reader at the end", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
@@ -1792,14 +1792,44 @@ test.describe("An arrival follows a reader at the end", () => {
     await expectSettledAtBottom(page, "a tall arrival did not follow a reader at the end");
   });
 
-  test("an arrival in a hidden tab does not follow, nor does the tab coming back", { tag: "@chromium-only" }, async ({ page }) => {
+  // A reader who left the end in view and switched away (a background tab, an
+  // occluded window, a phone screen turned off) comes back to the end. Parked
+  // above every arrival instead, they were soon past the band, so no later
+  // arrival followed either.
+  test("arrivals in a hidden tab follow a reader at the end, and stay unread until the tab is visible", { tag: "@chromium-only" }, async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
+
+    await setTabVisibility(page, "hidden");
+    const before = await hiddenTitleCount(page);
+    for (let i = 1; i <= 6; i++) {
+      await deliverOffscreen(page, `arrival ${i} in a hidden tab`);
+      await expectSettledAtBottom(page, `arrival ${i} in a hidden tab left a reader at the end parked above it`);
+    }
+    expect(await hiddenTitleCount(page), "arrivals followed in a hidden tab were marked read").toBe(before + 6);
+    await setTabVisibility(page, "visible");
+    await expectSettledAtBottom(page, "the tab coming back moved the view");
+    await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);
+    // Read on return alone, before any later arrival could read the room.
+    await settle(page);
+    expect(
+      await hiddenTitleCount(page),
+      "the tab came back on the newest message and the room still counts the arrivals unread",
+    ).toBe(before);
+    await setTabVisibility(page, "visible");
+    await deliverOffscreen(page, "arrival after the tab came back");
+    await expectFollowed(page, "arrival after the tab came back", "an arrival after the tab came back did not follow");
+  });
+
+  test("an arrival in a hidden tab does not move a parked reader, nor does the tab coming back", { tag: "@chromium-only" }, async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await readerParksNewestBelow(page, FOLLOW_BAND_PX + 20);
     const row = await expectReadingRow(page);
 
     await setTabVisibility(page, "hidden");
     await deliverOffscreen(page, "arrival in a hidden tab");
-    await expectRowHeld(page, row.key, row.top, "an arrival in a hidden tab moved the view");
+    await expectRowHeld(page, row.key, row.top, "an arrival in a hidden tab moved a parked reader");
     await setTabVisibility(page, "visible");
     await expectRowHeld(page, row.key, row.top, "the tab coming back moved the view");
     await expect(page.getByTestId("scroll-to-bottom")).toBeVisible();
@@ -1811,15 +1841,34 @@ test.describe("An arrival follows a reader at the end", () => {
 test.describe("An arrival under a DM thread", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  test("an arrival under a DM thread does not follow, nor does closing it, and stays unread", async ({ page }) => {
+  // That such an arrival stays unread while the thread is open is
+  // room-unread-badge.spec.ts's "an arrival on screen under a DM thread stays
+  // unread".
+  test("an arrival under a DM thread follows a reader at the end, and closing it keeps the end", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
     await callRiverTest(page, "appendDmsForPeer", DM_PEER.index, 1);
+    await openThread(page, DM_PEER, newestHistoryDm(DM_PEER, 1));
+
+    for (let i = 1; i <= 6; i++) {
+      await deliverOffscreen(page, `arrival ${i} under a DM thread`);
+      await expectSettledAtBottom(page, `arrival ${i} under a DM thread left a reader at the end parked above it`);
+    }
+    await closeThread(page);
+    await expectSettledAtBottom(page, "closing the DM thread moved the history");
+    await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);
+  });
+
+  test("an arrival under a DM thread does not move a parked reader, nor does closing it, and stays unread", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await callRiverTest(page, "appendDmsForPeer", DM_PEER.index, 1);
+    await readerParksNewestBelow(page, FOLLOW_BAND_PX + 20);
     const row = await expectReadingRow(page);
     await openThread(page, DM_PEER, newestHistoryDm(DM_PEER, 1));
 
     await deliverOffscreen(page, "arrival under a DM thread");
-    await expectRowHeld(page, row.key, row.top, "an arrival under a DM thread moved the history");
+    await expectRowHeld(page, row.key, row.top, "an arrival under a DM thread moved a parked reader");
     await closeThread(page);
     await expectRowHeld(page, row.key, row.top, "closing the DM thread moved the history");
     await expect(page.getByTestId("scroll-to-bottom")).toBeVisible();
