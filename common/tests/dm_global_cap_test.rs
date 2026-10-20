@@ -15,8 +15,10 @@
 //!
 //! # The fix, and the two things that could break production
 //!
-//! A global cap (`Configuration::effective_max_direct_messages`) trimmed in
-//! `apply_delta`. Two hazards, each pinned below:
+//! A global cap (`Configuration::effective_max_direct_messages`) trimmed by
+//! `ChatRoomStateV1::post_apply_cleanup` (step 6), which runs after every
+//! room-level `apply_delta` and whole-state merge. Two hazards, each pinned
+//! below:
 //!
 //! 1. **The resend loop.** Trimming makes the merge non-monotonic, so `delta`
 //!    must not offer a DM the receiver would discard on arrival — otherwise the
@@ -41,7 +43,7 @@ use river_core::room_state::direct_messages::{
     DmRetentionHorizon, MAX_DM_MESSAGES_PER_PAIR,
 };
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersV1};
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -153,8 +155,10 @@ fn spread(
         .collect()
 }
 
-/// `DirectMessagesV1` holding the given DMs, normalised through `apply_delta`
-/// against `parent` exactly as a real peer's stored state always is.
+/// `DirectMessagesV1` holding the given DMs, normalised through a ROOM-level
+/// `apply_delta` on `parent` exactly as a real peer's stored state always is.
+/// The DM caps are room rules (`post_apply_cleanup` step 6), so the field's
+/// own `apply_delta` alone would leave the set uncapped.
 fn dms_holding_under(
     parent: &ChatRoomStateV1,
     params: &ChatRoomParametersV1,
@@ -165,21 +169,49 @@ fn dms_holding_under(
     d
 }
 
+/// Applies `msgs` to `d` as a room-level delta. The room is `parent` with `d`
+/// inside it; the room-level apply runs every field and then
+/// `post_apply_cleanup`, which sweeps and caps the DMs.
 fn apply(
     d: &mut DirectMessagesV1,
     parent: &ChatRoomStateV1,
     params: &ChatRoomParametersV1,
     msgs: Vec<AuthorizedDirectMessage>,
 ) {
-    d.apply_delta(
+    apply_room_delta(
+        d,
         parent,
         params,
-        &Some(DirectMessagesDelta {
-            new_messages: msgs,
-            advanced_purges: vec![],
-        }),
-    )
-    .expect("dms must apply");
+        ChatRoomStateV1Delta {
+            direct_messages: Some(DirectMessagesDelta {
+                new_messages: msgs,
+                advanced_purges: vec![],
+            }),
+            ..Default::default()
+        },
+    );
+}
+
+/// Applies an EMPTY room-level delta (`Some` with every field `None`) to `d`
+/// inside `parent`, the shape a whole-state merge uses to normalize a held
+/// state. A `None` room delta applies nothing, cleanup included.
+fn apply_empty(d: &mut DirectMessagesV1, parent: &ChatRoomStateV1, params: &ChatRoomParametersV1) {
+    apply_room_delta(d, parent, params, ChatRoomStateV1Delta::default());
+}
+
+fn apply_room_delta(
+    d: &mut DirectMessagesV1,
+    parent: &ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+    delta: ChatRoomStateV1Delta,
+) {
+    let mut room = ChatRoomStateV1 {
+        direct_messages: std::mem::take(d),
+        ..parent.clone()
+    };
+    room.apply_delta(&parent.clone(), params, &Some(delta))
+        .expect("room delta must apply");
+    *d = room.direct_messages;
 }
 
 /// The timestamp offsets a `DirectMessagesV1` currently retains, ascending.
@@ -410,9 +442,9 @@ fn global_trim_is_deterministic_across_arrival_orders() {
 }
 
 /// Re-applying the same delta must not change the state, and neither must
-/// applying an EMPTY delta — the latter runs the caps unconditionally so a
-/// state that arrived over-cap by a path that skips `apply_delta` converges
-/// down instead of sitting over-cap forever.
+/// applying an EMPTY room delta — the latter still runs `post_apply_cleanup`,
+/// and with it the caps, so a state that arrived over-cap by a path that
+/// skips `apply_delta` converges down instead of sitting over-cap forever.
 #[test]
 fn apply_delta_is_idempotent_under_the_global_cap() {
     let r = room(6, Some(20));
@@ -424,15 +456,14 @@ fn apply_delta_is_idempotent_under_the_global_cap() {
     apply(&mut d, &r.state, &r.params, msgs);
     assert_eq!(d, once, "re-applying the same DMs changed the state");
 
-    d.apply_delta(&r.state, &r.params, &None)
-        .expect("empty delta must apply");
+    apply_empty(&mut d, &r.state, &r.params);
     assert_eq!(d, once, "an empty delta changed the state");
 }
 
 /// An over-cap state that arrived by a path bypassing the trim (a full-state
 /// PUT, or the #292 migration PUT carrying a legacy set larger than the room's
-/// current cap) converges down on the next `apply_delta`, including an empty
-/// one.
+/// current cap) converges down on the next room-level `apply_delta`, including
+/// an empty one, because `post_apply_cleanup` caps what is held.
 #[test]
 fn an_over_cap_state_converges_down_on_the_next_apply() {
     let r = room(6, Some(10));
@@ -442,8 +473,7 @@ fn an_over_cap_state_converges_down_on_the_next_apply() {
     let mut d = dms_holding_under(&slack, &r.params, spread(&r, 0..50, 3));
     assert_eq!(d.messages.len(), 50, "test premise: state starts over-cap");
 
-    d.apply_delta(&r.state, &r.params, &None)
-        .expect("empty delta must apply");
+    apply_empty(&mut d, &r.state, &r.params);
     assert_eq!(
         held(&d),
         (40..50).collect::<Vec<u64>>(),
@@ -680,9 +710,7 @@ fn zero_global_cap_suppresses_the_delta_instead_of_looping() {
 
     // And a zero-cap peer that somehow holds DMs drops them on the next apply.
     let mut holding = dms_holding_under(&r.state, &r.params, spread(&r, 0..20, 3));
-    holding
-        .apply_delta(&zero, &r.params, &None)
-        .expect("empty delta must apply");
+    apply_empty(&mut holding, &zero, &r.params);
     assert!(holding.messages.is_empty());
 }
 
@@ -846,8 +874,8 @@ fn merge_incoming_state(
 /// WHOLE-STATE gossip through the real client merge path, asserting `verify()`
 /// after every round.
 ///
-/// The field-level tests above drive `DirectMessagesV1` against a FIXED parent
-/// whose member list never changes. That misses the feedback loop this change
+/// The tests above apply each DM delta to a room rebuilt from a FIXED parent
+/// whose member list never changes between applies. That misses the feedback loop this change
 /// creates: trimming DMs makes `post_apply_cleanup` prune members (step 3 is an
 /// unconditional `retain`, NOT gated on `max_members`), and the pruned member
 /// set feeds straight back into `apply_delta`'s silent `resolve_member_vk` drop
@@ -1031,7 +1059,7 @@ fn member_prune_reoffer_loop_mechanism_predates_the_dm_cap() {
 
 /// Duplicate entries must not defeat the cap.
 ///
-/// `apply_delta` dedupes on insert, but `verify` has no distinct-signature
+/// `apply_delta` dedupes what it holds, but `verify` has no distinct-signature
 /// check, so a hand-built or hostile full-state PUT can carry duplicates. Both
 /// trims key off `DmOrderKey`, and duplicates share one — so without
 /// `dedup_by_signature` the global trim's cutoff can land on a repeated key and
@@ -1059,8 +1087,7 @@ fn duplicate_entries_do_not_defeat_the_global_cap() {
         messages,
         ..Default::default()
     };
-    d.apply_delta(&r.state, &r.params, &None)
-        .expect("empty delta must apply");
+    apply_empty(&mut d, &r.state, &r.params);
 
     assert_eq!(
         d.messages.len(),
@@ -1158,7 +1185,7 @@ fn legacy_configuration_bytes_still_verify_after_adding_the_field() {
 /// room whose stored DM set is larger than the new cap — or any room whose
 /// owner lowers the cap below the stored count — would be REJECTED outright if
 /// `verify` enforced the bound, stranding the room on an unreachable contract
-/// key with no recovery path. Retention is an `apply_delta` concern; `verify`
+/// key with no recovery path. Retention is a `post_apply_cleanup` concern; `verify`
 /// stays stable across configuration changes. Mirrors `MessagesV1`, which does
 /// not enforce `max_recent_messages` in `verify` either.
 #[test]

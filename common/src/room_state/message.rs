@@ -39,9 +39,10 @@ pub struct MessagesV1 {
     pub actions_state: MessageActionsState,
 }
 
-/// The total order [`MessagesV1::apply_delta`] retains by: it sorts ascending
-/// on `(time, id)` and keeps the newest `max_recent_messages`, so this key
-/// alone decides whether a message survives a merge.
+/// The total order the `max_recent_messages` cap retains by: messages sort
+/// ascending on `(time, id)` and `post_apply_cleanup` keeps the newest
+/// `max_recent_messages` of those whose authors it keeps, so this key
+/// decides which of them survives a merge.
 ///
 /// `id` breaks ties deterministically; without it two messages sharing a
 /// timestamp would order differently on different peers.
@@ -57,8 +58,8 @@ pub struct MessageOrderKey {
 ///
 /// # Why this exists
 ///
-/// `apply_delta` DROPS the oldest messages over `max_recent_messages`, which
-/// makes the merge non-monotonic: without a horizon, `delta` is a pure
+/// The merge (`post_apply_cleanup`) DROPS the oldest messages over
+/// `max_recent_messages`, which makes the merge non-monotonic: without a horizon, `delta` is a pure
 /// "everything you don't have" set-difference, so a peer holding an older
 /// window re-offers the same messages on every fan-out, the receiver re-prunes
 /// them, and neither side's summary ever changes. `delta` never returns `None`,
@@ -312,22 +313,6 @@ impl ComposableState for MessagesV1 {
         self.messages
             .retain(|m| admissible_in_room(m, parent_state));
 
-        // Drop messages whose authors `post_apply_cleanup` removes in this
-        // apply before applying the cap below; `enforced_ban_set_of` computes
-        // that set, as `DirectMessagesV1::apply_delta` does. When the held
-        // messages fit the cap, cleanup removes the same messages, so the set
-        // is computed only when they exceed it (in a room at its cap, on every
-        // delta that adds a message). The owner is never a member and so never
-        // in that set; the owner check is defence in depth, matching cleanup,
-        // which always keeps the owner's messages.
-        if self.messages.len() > max_recent_messages {
-            let enforced_banned =
-                crate::room_state::direct_messages::enforced_ban_set_of(parent_state, parameters);
-            self.messages.retain(|m| {
-                m.message.author == owner_id || !enforced_banned.contains(&m.message.author)
-            });
-        }
-
         // Sort messages by time, with MessageId as secondary sort for deterministic ordering
         // (CRDT convergence requirement - without this, ties produce non-deterministic order)
         self.messages.sort_by(|a, b| {
@@ -337,17 +322,13 @@ impl ComposableState for MessagesV1 {
                 .then_with(|| a.id().cmp(&b.id()))
         });
 
-        // Remove oldest messages if there are too many.
-        //
-        // This removal is what makes the merge non-monotonic, so it MUST stay
+        // The `max_recent_messages` cap is not applied here:
+        // `post_apply_cleanup` applies it after bans and pruning, keeping the
+        // newest by `(time, id)` among the messages whose authors it keeps,
+        // so a message of a member cleanup removes never takes a slot. That
+        // truncation is what makes the merge non-monotonic, so it MUST stay
         // paired with the retention horizon that `summarize` publishes and
-        // `delta` filters on — see [`RetentionHorizon`]. Changing the retention
-        // rule here (a different sort key, a cap on a different axis) without
-        // teaching `retention_horizon` about it re-opens the resend loop.
-        if self.messages.len() > max_recent_messages {
-            self.messages
-                .drain(0..self.messages.len() - max_recent_messages);
-        }
+        // `delta` filters on — see [`RetentionHorizon`].
 
         // Rebuild computed state from action messages
         self.rebuild_actions_state();
@@ -1493,6 +1474,9 @@ mod tests {
 
     #[test]
     fn test_messages_apply_delta() {
+        use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        use crate::room_state::ChatRoomStateV1Delta;
+
         // Setup
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
@@ -1502,17 +1486,30 @@ mod tests {
         let author_verifying_key = author_signing_key.verifying_key();
         let author_id = MemberId::from(&author_verifying_key);
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration.configuration.max_recent_messages = 3;
-        parent_state.configuration.configuration.max_message_size = 100;
-        parent_state.members.members = vec![crate::room_state::member::AuthorizedMember {
-            member: crate::room_state::member::Member {
+        // The `max_recent_messages` cap is a room rule applied by
+        // `post_apply_cleanup`, so deltas are applied to the whole room. The
+        // author is a member with a valid invitation, so cleanup keeps them
+        // (as the author of the kept messages).
+        let mut room = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_recent_messages: 3,
+                    max_message_size: 100,
+                    ..Configuration::default()
+                },
+                &owner_signing_key,
+            ),
+            ..Default::default()
+        };
+        room.members.members = vec![crate::room_state::member::AuthorizedMember::new(
+            crate::room_state::member::Member {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
                 member_vk: author_verifying_key,
             },
-            signature: owner_signing_key.try_sign(&[0; 32]).unwrap(),
-        }];
+            &owner_signing_key,
+        )];
 
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
@@ -1536,16 +1533,19 @@ mod tests {
         let message4 = create_message(now);
 
         // Initial room_state with 2 messages
-        let mut messages = MessagesV1 {
+        room.recent_messages = MessagesV1 {
             messages: vec![message1.clone(), message2.clone()],
             ..Default::default()
         };
 
         // Apply delta with 2 new messages
-        let delta = vec![message3.clone(), message4.clone()];
-        assert!(messages
-            .apply_delta(&parent_state, &parameters, &Some(delta))
-            .is_ok());
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![message3.clone(), message4.clone()]),
+            ..Default::default()
+        };
+        let parent = room.clone();
+        assert!(room.apply_delta(&parent, &parameters, &Some(delta)).is_ok());
+        let messages = &room.recent_messages;
 
         // Check results
         assert_eq!(
@@ -1572,10 +1572,13 @@ mod tests {
 
         // Apply delta with an older message
         let old_message = create_message(now - Duration::from_secs(4));
-        let delta = vec![old_message.clone()];
-        assert!(messages
-            .apply_delta(&parent_state, &parameters, &Some(delta))
-            .is_ok());
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![old_message.clone()]),
+            ..Default::default()
+        };
+        let parent = room.clone();
+        assert!(room.apply_delta(&parent, &parameters, &Some(delta)).is_ok());
+        let messages = &room.recent_messages;
 
         // Check results
         assert_eq!(messages.messages.len(), 3, "Should still have 3 messages");

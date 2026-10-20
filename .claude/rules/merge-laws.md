@@ -70,10 +70,49 @@ A network delta is sent against a summary, without the receiver's state, so
 it is trimmed (`trim_network_delta`) to the work bounds of the receiver's
 room: the sender's caps when the receiver will end with the sender's
 configuration, otherwise the least bounds any room has. The rest follows in
-later rounds. The trim keeps first the authors of the messages it keeps
-(with their invite chains), so every trimmed delta delivers messages the
-receiver can verify; anything that adds records to a network delta runs
-before the trim.
+later rounds. The trim keeps first the authors of the messages it keeps,
+newest message first, each with its WHOLE missing invite chain while the
+chains fit the receiver's member bound; an author whose chain does not fit
+is left out with its messages. So every trimmed delta delivers messages
+with members the receiver keeps, and the exchange always makes progress.
+Anything that adds records to a network delta runs before the trim.
+
+## Caps are decided in cleanup, after removals
+
+The field applies never remove a banned member or apply the
+`max_members`, `max_recent_messages` or direct-message caps: they add,
+dedup and sort. `post_apply_cleanup` caps bans first, removes banned
+members, then repeats the inactivity prune and the member cap (deepest
+invite chain first, then highest id) until a pass removes no member, and
+only then truncates messages and direct messages to their caps. A member
+cleanup removes therefore never takes a member, message or DM slot. A
+member set may exceed `max_members` between the field applies and cleanup;
+nothing reads it there.
+
+## The ban cap keeps bans in a fixed order
+
+Over `max_user_bans`, `BansV1::enforce_user_ban_cap` keeps bans greedily in
+one order: owner bans first (up to half the cap), then the other bans by
+how high in the invite tree each ban's authority sits (a ban on a known
+target at the target's depth minus one, a ban on an id known nowhere at its
+issuer's depth), newest first within a level. Each ban is judged over the
+bans kept before it, so the kept set does not depend on a ban the cap
+drops. A ban that takes no effect given the kept bans, or repeats a kept
+(issuer, target) pair, only fills the slots left at the end. Under the cap
+the function changes nothing. The cap, cleanup step 0-sig and step 4 read
+the records known at the start of the pass within the ban evidence depth
+cap (`BansV1::stable_known`). A ban whose issuer sits deeper, present or
+not, takes no effect: step 0-sig drops it on every pass, before the cap or
+ban resolution sees it, so no delivery order lets it remove anyone. This
+applies to bans carried across a re-key too, and lowering `max_members`
+below 4 lowers the cap with it, so existing bans by issuers deeper than the
+new cap stop counting and are dropped (raising it again does not restore
+them). The UI's Ban gate and `riverctl ban` refuse to sign such a ban
+(`BansV1::issuer_within_depth_cap`).
+
+Within one merge or cleanup each ban signature is verified at most once
+(`ban::signature_memo`): the cap re-judges bans many times, and an
+unmemoized cap at 200 bans costs tens of thousands of checks.
 
 ## Summaries carry a rank, with a digest tie-break
 
@@ -91,8 +130,13 @@ peers holding different records unreconciled for good. See
 Every apply (an empty delta included) normalizes what is held by the same
 rules arrivals meet, and `post_apply_cleanup` leaves nothing a later apply
 would drop, so every state an apply or merge produces is a fixpoint of
-`merge(S, S)`. `verify` itself stays as it is: tightening it would make the
-migration PUT reject states rooms hold today.
+`merge(S, S)`. Cleanup checks that itself: it runs its pass again on the
+result, up to two extra passes, and stops at the first pass that changes
+nothing (a pass can change what the next decides, for example when the
+member cap removes a ban's issuer). If the third pass still changes the
+state, that result is returned without a confirming pass: the bound is a
+safety net, not a guarantee. No measured input has needed it. `verify` itself stays as it is:
+tightening it would make the migration PUT reject states rooms hold today.
 
 One limit, which predates #703: the contract does not apply an empty delta,
 so a state stored by a full-state PUT that holds records the rules drop (for

@@ -1752,12 +1752,16 @@ fn apply_delta_evicts_the_oldest_to_admit_a_newer_message_at_the_pair_cap() {
         MAX_DM_MESSAGES_PER_PAIR as u64 + 100,
         b"over",
     );
-    let delta = DirectMessagesDelta {
-        new_messages: vec![newcomer.clone()],
-        advanced_purges: vec![],
+    // Applied at ROOM level: the per-pair cap is a room rule, enforced by
+    // `post_apply_cleanup` after every field has applied.
+    let delta = ChatRoomStateV1Delta {
+        direct_messages: Some(DirectMessagesDelta {
+            new_messages: vec![newcomer.clone()],
+            advanced_purges: vec![],
+        }),
+        ..Default::default()
     };
     state
-        .direct_messages
         .apply_delta(&state.clone(), &f.params, &Some(delta))
         .expect("apply_delta must NOT fail at the per-pair cap");
 

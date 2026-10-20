@@ -200,8 +200,8 @@ impl BanEvidenceV1 {
     /// Every record ban resolution may read: `members`, then each evidence
     /// record whose inviter is the owner or is itself in the map. A record
     /// whose chain no longer reaches the owner (an ancestor was lost, for
-    /// example to the `max_members` trim, which runs before cleanup) is left
-    /// out for every reader at once, and `post_apply_cleanup` drops it.
+    /// example to the `max_members` cap) is left out for every reader at
+    /// once, and `post_apply_cleanup` drops it.
     ///
     /// Linear in the records: a walk down from the owner and the members
     /// through the evidence records each one invited. Evidence holds at most

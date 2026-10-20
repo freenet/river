@@ -7,7 +7,28 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "Building room-contract and chat-delegate WASMs..."
+# The committed WASMs must be built with the toolchain rust-toolchain.toml
+# pins: a different rustc gives different bytes, so a different contract and
+# delegate key. rustup picks the toolchain from the directory cargo is started
+# in, and exports RUSTUP_TOOLCHAIN to everything it starts, so `cargo make
+# --cwd <repo> sync-wasm` run from outside the repo builds with that
+# directory's toolchain even after the `cd` above. Refuse rather than build
+# with the wrong one.
+PINNED=$(sed -n 's/^channel *= *"\(.*\)".*/\1/p' rust-toolchain.toml)
+[ -n "$PINNED" ] || { echo "ERROR: no channel in rust-toolchain.toml"; exit 1; }
+if [ -n "${RUSTUP_TOOLCHAIN:-}" ] && [ "${RUSTUP_TOOLCHAIN%%-*}" != "$PINNED" ]; then
+    echo "ERROR: RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN overrides the pinned toolchain $PINNED (rust-toolchain.toml)."
+    echo "       Run from inside the repo, e.g.: env -C $REPO_ROOT cargo make sync-wasm"
+    exit 1
+fi
+USING=$(rustc --version | awk '{print $2}')
+if [ "$USING" != "$PINNED" ]; then
+    echo "ERROR: rustc $USING would build the WASMs, but rust-toolchain.toml pins $PINNED."
+    echo "       Run from inside the repo, e.g.: env -C $REPO_ROOT cargo make sync-wasm"
+    exit 1
+fi
+
+echo "Building room-contract and chat-delegate WASMs with rustc $USING..."
 # `--locked` is critical: if Cargo.lock drifts on a release machine, the
 # produced WASM bytes (and therefore the delegate / contract key) drift
 # silently. Anyone running this script must be operating from the

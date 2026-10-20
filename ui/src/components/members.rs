@@ -849,6 +849,14 @@ pub(crate) fn self_removing_ban_reason(
     })
 }
 
+/// Why a viewer with ban authority but too deep in the invite tree is not
+/// offered Ban (the contract would drop the ban).
+pub(crate) const ISSUER_TOO_DEEP_REASON: &str =
+    "Bans only take effect from members at most four invites below the room \
+     owner (fewer in rooms with a very small member limit). You joined further \
+     down, so a ban from you would have no effect. Ask a moderator closer to \
+     the owner.";
+
 /// Whether the Ban action is offered for one (viewer, target) pair, and if not,
 /// whether the viewer is owed an explanation.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -860,6 +868,10 @@ pub(crate) enum BanGate {
     /// the action is withheld from someone who would otherwise have had it, so
     /// silently hiding it would read as a bug.
     WouldRemoveViewer(&'static str),
+    /// The viewer holds ban authority, but sits deeper in the invite tree than
+    /// the room counts bans from, so a ban they signed would take no effect
+    /// (`BansV1::issuer_within_depth_cap`). Carries the user-visible reason.
+    IssuerTooDeep(&'static str),
     /// The viewer has no ban authority over this target. Nothing is owed — the
     /// action has never been offered here, so an explanation would just be noise
     /// for a capability they never had.
@@ -885,10 +897,19 @@ pub(crate) fn ban_gate(
     viewer: MemberId,
     target: MemberId,
     owner_id: MemberId,
+    max_members: usize,
 ) -> BanGate {
     let members_by_id = members.members_by_member_id();
     if !MembersV1::is_ban_authorized(viewer, target, &members_by_id, member_info, owner_id) {
         return BanGate::NoAuthority;
+    }
+    if !river_core::room_state::ban::BansV1::issuer_within_depth_cap(
+        viewer,
+        members,
+        owner_id,
+        max_members,
+    ) {
+        return BanGate::IssuerTooDeep(ISSUER_TOO_DEEP_REASON);
     }
     match self_removing_ban_reason(members, viewer, target) {
         Some(reason) => BanGate::WouldRemoveViewer(reason),
@@ -4344,6 +4365,7 @@ mod tests {
                 viewer,
                 target,
                 self.owner_id,
+                200,
             )
         }
 
@@ -4529,6 +4551,19 @@ mod tests {
         assert!(
             prod.contains("ban_gate("),
             "the modal must gate Ban through `ban_gate` (#478)"
+        );
+        // ...with the room's own member limit, which sets the depth cap a
+        // ban's issuer must be within (the contract drops a ban from deeper).
+        let gate_at = prod.find("ban_gate(").expect("checked above");
+        let gate_args: String = prod[gate_at..]
+            .split_once("})")
+            .map(|(args, _)| args)
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        assert!(
+            gate_args.contains("room_state.room_state.configuration.configuration.max_members"),
+            "the modal must pass the room's max_members to `ban_gate`: {gate_args}"
         );
         // The reason must be RENDERED, not merely computed. Checking only that
         // the gate is destructured would let someone delete the explanation

@@ -132,8 +132,12 @@ mod tests {
         // (freenet/river#703): its whole-state merge read retention horizons,
         // its configuration summary carried only the version, and its
         // apply_delta rejected re-delivered records.
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 36);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "93b6bba9b8d1beb3");
+        //
+        // V37 registers the generation before the cleanup merge-law change:
+        // its ban cap evicted over the uncapped ban set, and its member,
+        // message and direct-message caps ran in the field applies.
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 37);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "a0133435bbd075cf");
     }
 
     #[test]

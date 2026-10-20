@@ -18,7 +18,7 @@ use river_core::room_state::member::{AuthorizedMember, Member, MemberId, Members
 use river_core::room_state::message::{
     AuthorizedMessageV1, MessageId, MessageV1, MessagesV1, RoomMessageBody,
 };
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::time::SystemTime;
 
 /// Helper to create a test member that's invited by a given inviter
@@ -57,6 +57,55 @@ fn create_test_msg(
     )
 }
 
+/// A room owned by `owner_sk`, holding nothing but an owner-signed
+/// configuration: the default one with `edit` applied.
+fn room_with_config(
+    owner_sk: &SigningKey,
+    edit: impl FnOnce(&mut Configuration),
+) -> ChatRoomStateV1 {
+    let mut config = Configuration {
+        owner_member_id: owner_sk.verifying_key().into(),
+        ..Default::default()
+    };
+    edit(&mut config);
+    ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(config, owner_sk),
+        ..Default::default()
+    }
+}
+
+/// Apply `delta` to `room` at ROOM level: every field's `apply_delta`, then
+/// `post_apply_cleanup`, which is where the `max_members` cap, owner-ban
+/// member removal and the `max_recent_messages` cap are decided.
+fn apply_room_delta(
+    room: &mut ChatRoomStateV1,
+    parameters: &ChatRoomParametersV1,
+    delta: ChatRoomStateV1Delta,
+) {
+    let parent = room.clone();
+    room.apply_delta(&parent, parameters, &Some(delta))
+        .expect("room apply_delta should succeed");
+}
+
+/// Normalize a room's held state: apply an empty-but-present room delta, so
+/// every field re-applies its rules on what it holds and
+/// `post_apply_cleanup` caps it.
+fn normalize_room(room: &mut ChatRoomStateV1, parameters: &ChatRoomParametersV1) {
+    apply_room_delta(room, parameters, ChatRoomStateV1Delta::default());
+}
+
+/// One message per member, signed by that member, so cleanup's prune has a
+/// reason to keep each of them and only the cap decides who goes.
+fn one_message_each(
+    owner_id: MemberId,
+    members: &[(AuthorizedMember, SigningKey)],
+) -> Vec<AuthorizedMessageV1> {
+    members
+        .iter()
+        .map(|(m, sk)| create_test_msg(owner_id, m.member.id(), sk, 0))
+        .collect()
+}
+
 // =============================================================================
 // MEMBER TRUNCATION CONVERGENCE TEST
 // =============================================================================
@@ -91,33 +140,56 @@ fn test_member_add_order_convergence() {
     let owner_id: MemberId = owner_verifying_key.into();
 
     // Create two members to be added
-    let (member_a, _) = create_test_member(owner_id, owner_id);
-    let (member_b, _) = create_test_member(owner_id, owner_id);
+    let (member_a, sk_a) = create_test_member(owner_id, owner_id);
+    let (member_b, sk_b) = create_test_member(owner_id, owner_id);
 
     let auth_member_a = create_authorized_member(member_a.clone(), &owner_signing_key);
     let auth_member_b = create_authorized_member(member_b.clone(), &owner_signing_key);
 
-    // Create parent state with max_members = 1 (only room for one new member)
-    let mut parent_state = ChatRoomStateV1::default();
-    parent_state.configuration.configuration.max_members = 1;
+    // Each member carries a message, so cleanup's prune keeps both and only
+    // the cap decides.
+    let msg_a = create_test_msg(owner_id, member_a.id(), &sk_a, 0);
+    let msg_b = create_test_msg(owner_id, member_b.id(), &sk_b, 1);
+
+    // Room with max_members = 1 (only room for one new member). The cap is
+    // applied by `post_apply_cleanup` when the whole room delta is applied.
+    let base = room_with_config(&owner_signing_key, |c| c.max_members = 1);
 
     let parameters = ChatRoomParametersV1 {
         owner: owner_verifying_key,
     };
 
     // State A: Apply delta with order [member_a, member_b]
-    let mut state_a = MembersV1::default();
-    let delta_ab = MembersDelta::new(vec![auth_member_a.clone(), auth_member_b.clone()]);
-    state_a
-        .apply_delta(&parent_state, &parameters, &Some(delta_ab))
-        .expect("apply_delta should succeed");
+    let mut room_a = base.clone();
+    apply_room_delta(
+        &mut room_a,
+        &parameters,
+        ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(vec![
+                auth_member_a.clone(),
+                auth_member_b.clone(),
+            ])),
+            recent_messages: Some(vec![msg_a.clone(), msg_b.clone()]),
+            ..Default::default()
+        },
+    );
+    let state_a = room_a.members;
 
     // State B: Apply delta with order [member_b, member_a]
-    let mut state_b = MembersV1::default();
-    let delta_ba = MembersDelta::new(vec![auth_member_b.clone(), auth_member_a.clone()]);
-    state_b
-        .apply_delta(&parent_state, &parameters, &Some(delta_ba))
-        .expect("apply_delta should succeed");
+    let mut room_b = base.clone();
+    apply_room_delta(
+        &mut room_b,
+        &parameters,
+        ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(vec![
+                auth_member_b.clone(),
+                auth_member_a.clone(),
+            ])),
+            recent_messages: Some(vec![msg_b.clone(), msg_a.clone()]),
+            ..Default::default()
+        },
+    );
+    let state_b = room_b.members;
 
     // Both states should have exactly 1 member (due to max_members limit)
     assert_eq!(state_a.members.len(), 1, "State A should have 1 member");
@@ -210,45 +282,57 @@ fn test_member_removal_tiebreak_convergence() {
     let owner_id: MemberId = owner_verifying_key.into();
 
     // Create three members, all invited directly by owner (same invite chain length = 0)
-    let (member_a, _) = create_test_member(owner_id, owner_id);
-    let (member_b, _) = create_test_member(owner_id, owner_id);
-    let (member_c, _) = create_test_member(owner_id, owner_id);
+    let (member_a, sk_a) = create_test_member(owner_id, owner_id);
+    let (member_b, sk_b) = create_test_member(owner_id, owner_id);
+    let (member_c, sk_c) = create_test_member(owner_id, owner_id);
 
     let auth_member_a = create_authorized_member(member_a.clone(), &owner_signing_key);
     let auth_member_b = create_authorized_member(member_b.clone(), &owner_signing_key);
     let auth_member_c = create_authorized_member(member_c.clone(), &owner_signing_key);
 
-    // Create parent state with max_members = 2 (need to remove 1 of 3)
-    let mut parent_state = ChatRoomStateV1::default();
-    parent_state.configuration.configuration.max_members = 2;
+    // One message each, so cleanup's prune keeps all three and only the cap
+    // decides.
+    let messages = one_message_each(
+        owner_id,
+        &[
+            (auth_member_a.clone(), sk_a),
+            (auth_member_b.clone(), sk_b),
+            (auth_member_c.clone(), sk_c),
+        ],
+    );
+
+    // Room with max_members = 2 (need to remove 1 of 3)
+    let base = room_with_config(&owner_signing_key, |c| c.max_members = 2);
 
     let parameters = ChatRoomParametersV1 {
         owner: owner_verifying_key,
     };
 
     // State A: Members in order [A, B, C]
-    let mut state_a = MembersV1 {
+    let mut room_a = base.clone();
+    room_a.members = MembersV1 {
         members: vec![
             auth_member_a.clone(),
             auth_member_b.clone(),
             auth_member_c.clone(),
         ],
     };
-    state_a
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    room_a.recent_messages.messages = messages.clone();
+    normalize_room(&mut room_a, &parameters);
+    let state_a = room_a.members;
 
     // State B: Members in order [C, B, A] (reversed)
-    let mut state_b = MembersV1 {
+    let mut room_b = base.clone();
+    room_b.members = MembersV1 {
         members: vec![
             auth_member_c.clone(),
             auth_member_b.clone(),
             auth_member_a.clone(),
         ],
     };
-    state_b
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    room_b.recent_messages.messages = messages.iter().rev().cloned().collect();
+    normalize_room(&mut room_b, &parameters);
+    let state_b = room_b.members;
 
     // Both should have 2 members after removing excess
     assert_eq!(state_a.members.len(), 2, "State A should have 2 members");
@@ -448,32 +532,34 @@ fn test_message_prune_order_convergence() {
         &owner_signing_key,
     );
 
-    // Create parent state with max_recent_messages = 2 (need to remove 1 of 3)
-    let mut parent_state = ChatRoomStateV1::default();
-    parent_state.configuration.configuration.max_recent_messages = 2;
-    parent_state.configuration.configuration.max_message_size = 1000;
+    // Room with max_recent_messages = 2 (need to remove 1 of 3); cleanup
+    // applies the cap.
+    let base = room_with_config(&owner_signing_key, |c| {
+        c.max_recent_messages = 2;
+        c.max_message_size = 1000;
+    });
 
     let parameters = ChatRoomParametersV1 {
         owner: owner_verifying_key,
     };
 
     // State A: Messages in order [A, B, C]
-    let mut state_a = MessagesV1 {
+    let mut room_a = base.clone();
+    room_a.recent_messages = MessagesV1 {
         messages: vec![msg_a.clone(), msg_b.clone(), msg_c.clone()],
         ..Default::default()
     };
-    state_a
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    normalize_room(&mut room_a, &parameters);
+    let state_a = room_a.recent_messages;
 
     // State B: Messages in order [C, B, A] (reversed)
-    let mut state_b = MessagesV1 {
+    let mut room_b = base.clone();
+    room_b.recent_messages = MessagesV1 {
         messages: vec![msg_c.clone(), msg_b.clone(), msg_a.clone()],
         ..Default::default()
     };
-    state_b
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    normalize_room(&mut room_b, &parameters);
+    let state_b = room_b.recent_messages;
 
     // Both should have 2 messages after pruning
     assert_eq!(state_a.messages.len(), 2, "State A should have 2 messages");
@@ -713,9 +799,11 @@ fn test_member_convergence_stress_50_members() {
 
     assert_eq!(all_members.len(), 50);
 
-    // Set max_members to 30 (need to remove 20)
-    let mut parent_state = ChatRoomStateV1::default();
-    parent_state.configuration.configuration.max_members = 30;
+    // Set max_members to 30 (need to remove 20). Every member carries a
+    // message (max_recent_messages 100 > 50), so cleanup's prune keeps all 50
+    // and only the cap decides.
+    let base = room_with_config(&owner_signing_key, |c| c.max_members = 30);
+    let messages = one_message_each(owner_id, &all_members);
 
     let parameters = ChatRoomParametersV1 {
         owner: owner_verifying_key,
@@ -723,30 +811,26 @@ fn test_member_convergence_stress_50_members() {
 
     // Create multiple permutations of the member list
     let auth_members: Vec<AuthorizedMember> = all_members.iter().map(|(m, _)| m.clone()).collect();
+    let capped = |members: Vec<AuthorizedMember>| {
+        let mut room = base.clone();
+        room.members = MembersV1 { members };
+        room.recent_messages.messages = messages.clone();
+        normalize_room(&mut room, &parameters);
+        room.members
+    };
 
     // State A: Original order
-    let mut state_a = MembersV1 {
-        members: auth_members.clone(),
-    };
-    state_a
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_a = capped(auth_members.clone());
 
     // State B: Reversed order
     let mut reversed = auth_members.clone();
     reversed.reverse();
-    let mut state_b = MembersV1 { members: reversed };
-    state_b
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_b = capped(reversed);
 
     // State C: Shuffled order (rotate by 17)
     let mut rotated = auth_members.clone();
     rotated.rotate_left(17);
-    let mut state_c = MembersV1 { members: rotated };
-    state_c
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_c = capped(rotated);
 
     // All states should have exactly 30 members
     assert_eq!(state_a.members.len(), 30, "State A should have 30 members");
@@ -800,34 +884,32 @@ fn test_message_convergence_stress_100_messages() {
         messages.push(msg);
     }
 
-    // Set max_recent_messages to 50
-    let mut parent_state = ChatRoomStateV1::default();
-    parent_state.configuration.configuration.max_recent_messages = 50;
-    parent_state.configuration.configuration.max_message_size = 1000;
+    // Set max_recent_messages to 50; cleanup applies the cap.
+    let base = room_with_config(&owner_signing_key, |c| {
+        c.max_recent_messages = 50;
+        c.max_message_size = 1000;
+    });
 
     let parameters = ChatRoomParametersV1 {
         owner: owner_verifying_key,
     };
+    let capped = |messages: Vec<AuthorizedMessageV1>| {
+        let mut room = base.clone();
+        room.recent_messages = MessagesV1 {
+            messages,
+            ..Default::default()
+        };
+        normalize_room(&mut room, &parameters);
+        room.recent_messages
+    };
 
     // State A: Original order
-    let mut state_a = MessagesV1 {
-        messages: messages.clone(),
-        ..Default::default()
-    };
-    state_a
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_a = capped(messages.clone());
 
     // State B: Reversed order
     let mut reversed = messages.clone();
     reversed.reverse();
-    let mut state_b = MessagesV1 {
-        messages: reversed,
-        ..Default::default()
-    };
-    state_b
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_b = capped(reversed);
 
     // State C: Shuffled (interleaved)
     let mut interleaved: Vec<AuthorizedMessageV1> = Vec::new();
@@ -836,13 +918,7 @@ fn test_message_convergence_stress_100_messages() {
         interleaved.push(messages[i].clone());
         interleaved.push(messages[half + i].clone());
     }
-    let mut state_c = MessagesV1 {
-        messages: interleaved,
-        ..Default::default()
-    };
-    state_c
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_c = capped(interleaved);
 
     // All states should have exactly 50 messages
     assert_eq!(state_a.messages.len(), 50);
@@ -1113,28 +1189,27 @@ fn test_message_varying_limits_convergence() {
 
     // Test with different max_recent_messages limits
     for max_messages in [5, 10, 15, 20, 25] {
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration.configuration.max_recent_messages = max_messages;
-        parent_state.configuration.configuration.max_message_size = 1000;
+        // Cleanup applies the `max_recent_messages` cap.
+        let base = room_with_config(&owner_signing_key, |c| {
+            c.max_recent_messages = max_messages;
+            c.max_message_size = 1000;
+        });
+        let capped = |messages: Vec<AuthorizedMessageV1>| {
+            let mut room = base.clone();
+            room.recent_messages = MessagesV1 {
+                messages,
+                ..Default::default()
+            };
+            normalize_room(&mut room, &parameters);
+            room.recent_messages
+        };
 
         // Apply messages in different orders
-        let mut state_forward = MessagesV1 {
-            messages: messages.clone(),
-            ..Default::default()
-        };
-        state_forward
-            .apply_delta(&parent_state, &parameters, &None)
-            .expect("apply_delta should succeed");
+        let state_forward = capped(messages.clone());
 
         let mut reversed = messages.clone();
         reversed.reverse();
-        let mut state_backward = MessagesV1 {
-            messages: reversed,
-            ..Default::default()
-        };
-        state_backward
-            .apply_delta(&parent_state, &parameters, &None)
-            .expect("apply_delta should succeed");
+        let state_backward = capped(reversed);
 
         // Verify convergence
         assert_eq!(
@@ -1222,36 +1297,37 @@ fn test_member_one_over_capacity() {
     let owner_verifying_key = owner_signing_key.verifying_key();
     let owner_id: MemberId = owner_verifying_key.into();
 
-    // Create 6 members (one over capacity of 5)
-    let mut members: Vec<AuthorizedMember> = Vec::new();
+    // Create 6 members (one over capacity of 5), each with a message so
+    // cleanup's prune keeps all six and only the cap decides.
+    let mut with_keys: Vec<(AuthorizedMember, SigningKey)> = Vec::new();
     for _ in 0..6 {
-        let (member, _) = create_test_member(owner_id, owner_id);
+        let (member, sk) = create_test_member(owner_id, owner_id);
         let auth_member = create_authorized_member(member, &owner_signing_key);
-        members.push(auth_member);
+        with_keys.push((auth_member, sk));
     }
+    let members: Vec<AuthorizedMember> = with_keys.iter().map(|(m, _)| m.clone()).collect();
+    let messages = one_message_each(owner_id, &with_keys);
 
-    let mut parent_state = ChatRoomStateV1::default();
-    parent_state.configuration.configuration.max_members = 5;
+    let base = room_with_config(&owner_signing_key, |c| c.max_members = 5);
 
     let parameters = ChatRoomParametersV1 {
         owner: owner_verifying_key,
     };
+    let capped = |members: Vec<AuthorizedMember>| {
+        let mut room = base.clone();
+        room.members = MembersV1 { members };
+        room.recent_messages.messages = messages.clone();
+        normalize_room(&mut room, &parameters);
+        room.members
+    };
 
     // State A: Original order
-    let mut state_a = MembersV1 {
-        members: members.clone(),
-    };
-    state_a
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_a = capped(members.clone());
 
     // State B: Reversed order
     let mut reversed = members.clone();
     reversed.reverse();
-    let mut state_b = MembersV1 { members: reversed };
-    state_b
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_b = capped(reversed);
 
     // Both should have exactly 5 members
     assert_eq!(state_a.members.len(), 5);
@@ -1366,39 +1442,40 @@ fn test_deep_invite_chains() {
     }
 
     // Also create 3 members at depth 0 (invited by owner)
-    let mut depth_0_members: Vec<AuthorizedMember> = Vec::new();
+    let mut depth_0_members: Vec<(AuthorizedMember, SigningKey)> = Vec::new();
     for _ in 0..3 {
-        let (member, _) = create_test_member(owner_id, owner_id);
+        let (member, sk) = create_test_member(owner_id, owner_id);
         let auth_member = create_authorized_member(member, &owner_signing_key);
-        depth_0_members.push(auth_member);
+        depth_0_members.push((auth_member, sk));
     }
 
-    // Combine all members
-    let mut all_members: Vec<AuthorizedMember> = chain.iter().map(|(m, _)| m.clone()).collect();
-    all_members.extend(depth_0_members);
+    // Combine all members. Each carries a message, so cleanup's prune keeps
+    // all 15 and only the cap decides.
+    let mut all_with_keys: Vec<(AuthorizedMember, SigningKey)> = chain.clone();
+    all_with_keys.extend(depth_0_members);
+    let all_members: Vec<AuthorizedMember> = all_with_keys.iter().map(|(m, _)| m.clone()).collect();
+    let messages = one_message_each(owner_id, &all_with_keys);
 
     // Set max_members to 10 (need to remove 5)
-    let mut parent_state = ChatRoomStateV1::default();
-    parent_state.configuration.configuration.max_members = 10;
+    let base = room_with_config(&owner_signing_key, |c| c.max_members = 10);
 
     let parameters = ChatRoomParametersV1 {
         owner: owner_verifying_key,
     };
+    let capped = |members: Vec<AuthorizedMember>| {
+        let mut room = base.clone();
+        room.members = MembersV1 { members };
+        room.recent_messages.messages = messages.clone();
+        normalize_room(&mut room, &parameters);
+        room.members
+    };
 
     // The deepest members (end of chain) should be removed first
-    let mut state_a = MembersV1 {
-        members: all_members.clone(),
-    };
-    state_a
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_a = capped(all_members.clone());
 
     let mut reversed = all_members.clone();
     reversed.reverse();
-    let mut state_b = MembersV1 { members: reversed };
-    state_b
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_b = capped(reversed);
 
     assert_eq!(state_a.members.len(), 10);
     assert_eq!(state_b.members.len(), 10);
@@ -1430,13 +1507,16 @@ fn test_concurrent_adds_and_bans() {
     let owner_verifying_key = owner_signing_key.verifying_key();
     let owner_id: MemberId = owner_verifying_key.into();
 
-    // Create 8 members
-    let mut members: Vec<AuthorizedMember> = Vec::new();
+    // Create 8 members, each with a message so cleanup's prune keeps every
+    // unbanned one and only the bans and the cap decide.
+    let mut with_keys: Vec<(AuthorizedMember, SigningKey)> = Vec::new();
     for _ in 0..8 {
-        let (member, _) = create_test_member(owner_id, owner_id);
+        let (member, sk) = create_test_member(owner_id, owner_id);
         let auth_member = create_authorized_member(member, &owner_signing_key);
-        members.push(auth_member);
+        with_keys.push((auth_member, sk));
     }
+    let members: Vec<AuthorizedMember> = with_keys.iter().map(|(m, _)| m.clone()).collect();
+    let messages = one_message_each(owner_id, &with_keys);
 
     // Ban 2 of them
     let ban_time = SystemTime::now();
@@ -1461,29 +1541,30 @@ fn test_concurrent_adds_and_bans() {
         ),
     ]);
 
-    let mut parent_state = ChatRoomStateV1::default();
-    parent_state.configuration.configuration.max_members = 5;
-    parent_state.configuration.configuration.max_user_bans = 10;
-    parent_state.bans = bans;
+    // The room holds the bans; cleanup removes the banned members, then caps.
+    let mut base = room_with_config(&owner_signing_key, |c| {
+        c.max_members = 5;
+        c.max_user_bans = 10;
+    });
+    base.bans = bans;
 
     let parameters = ChatRoomParametersV1 {
         owner: owner_verifying_key,
     };
+    let capped = |members: Vec<AuthorizedMember>| {
+        let mut room = base.clone();
+        room.members = MembersV1 { members };
+        room.recent_messages.messages = messages.clone();
+        normalize_room(&mut room, &parameters);
+        room.members
+    };
 
     // Apply members in different orders
-    let mut state_a = MembersV1 {
-        members: members.clone(),
-    };
-    state_a
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_a = capped(members.clone());
 
     let mut reversed = members.clone();
     reversed.reverse();
-    let mut state_b = MembersV1 { members: reversed };
-    state_b
-        .apply_delta(&parent_state, &parameters, &None)
-        .expect("apply_delta should succeed");
+    let state_b = capped(reversed);
 
     // Both should have 5 members (8 - 2 banned = 6, then capped to 5)
     assert_eq!(state_a.members.len(), 5);
@@ -1515,16 +1596,18 @@ fn test_regression_member_truncation_order_dependent() {
     let owner_verifying_key = owner_signing_key.verifying_key();
     let owner_id: MemberId = owner_verifying_key.into();
 
-    // Create 5 members with same invite chain length
-    let mut members: Vec<AuthorizedMember> = Vec::new();
+    // Create 5 members with same invite chain length, each with a message so
+    // cleanup's prune keeps all five and only the cap decides.
+    let mut with_keys: Vec<(AuthorizedMember, SigningKey)> = Vec::new();
     for _ in 0..5 {
-        let (member, _) = create_test_member(owner_id, owner_id);
+        let (member, sk) = create_test_member(owner_id, owner_id);
         let auth_member = create_authorized_member(member, &owner_signing_key);
-        members.push(auth_member);
+        with_keys.push((auth_member, sk));
     }
+    let members: Vec<AuthorizedMember> = with_keys.iter().map(|(m, _)| m.clone()).collect();
+    let messages = one_message_each(owner_id, &with_keys);
 
-    let mut parent_state = ChatRoomStateV1::default();
-    parent_state.configuration.configuration.max_members = 2;
+    let base = room_with_config(&owner_signing_key, |c| c.max_members = 2);
 
     let parameters = ChatRoomParametersV1 {
         owner: owner_verifying_key,
@@ -1536,22 +1619,29 @@ fn test_regression_member_truncation_order_dependent() {
     // Result: Different states!
 
     // NEW BEHAVIOR (after fix):
-    // - All members are added first, then excess removed by longest chain + highest ID
+    // - All members are added first, then `post_apply_cleanup` removes the
+    //   excess by longest chain + highest ID
     // - Since all have same chain length, the 2 members with LOWEST MemberIds are kept
 
-    let mut state_a = MembersV1::default();
-    let delta_a = MembersDelta::new(members.clone());
-    state_a
-        .apply_delta(&parent_state, &parameters, &Some(delta_a))
-        .expect("apply_delta should succeed");
+    let applied = |members: Vec<AuthorizedMember>, messages: Vec<AuthorizedMessageV1>| {
+        let mut room = base.clone();
+        apply_room_delta(
+            &mut room,
+            &parameters,
+            ChatRoomStateV1Delta {
+                members: Some(MembersDelta::new(members)),
+                recent_messages: Some(messages),
+                ..Default::default()
+            },
+        );
+        room.members
+    };
+
+    let state_a = applied(members.clone(), messages.clone());
 
     let mut reversed = members.clone();
     reversed.reverse();
-    let mut state_b = MembersV1::default();
-    let delta_b = MembersDelta::new(reversed);
-    state_b
-        .apply_delta(&parent_state, &parameters, &Some(delta_b))
-        .expect("apply_delta should succeed");
+    let state_b = applied(reversed, messages.iter().rev().cloned().collect());
 
     // Both should have exactly 2 members
     assert_eq!(state_a.members.len(), 2);
@@ -1589,16 +1679,18 @@ fn test_regression_member_excess_removal_tiebreak() {
     let owner_verifying_key = owner_signing_key.verifying_key();
     let owner_id: MemberId = owner_verifying_key.into();
 
-    // Create 10 members all at same depth (invited by owner)
-    let mut members: Vec<AuthorizedMember> = Vec::new();
+    // Create 10 members all at same depth (invited by owner), each with a
+    // message so cleanup's prune keeps all ten and only the cap decides.
+    let mut with_keys: Vec<(AuthorizedMember, SigningKey)> = Vec::new();
     for _ in 0..10 {
-        let (member, _) = create_test_member(owner_id, owner_id);
+        let (member, sk) = create_test_member(owner_id, owner_id);
         let auth_member = create_authorized_member(member, &owner_signing_key);
-        members.push(auth_member);
+        with_keys.push((auth_member, sk));
     }
+    let members: Vec<AuthorizedMember> = with_keys.iter().map(|(m, _)| m.clone()).collect();
+    let messages = one_message_each(owner_id, &with_keys);
 
-    let mut parent_state = ChatRoomStateV1::default();
-    parent_state.configuration.configuration.max_members = 5;
+    let base = room_with_config(&owner_signing_key, |c| c.max_members = 5);
 
     let parameters = ChatRoomParametersV1 {
         owner: owner_verifying_key,
@@ -1619,10 +1711,11 @@ fn test_regression_member_excess_removal_tiebreak() {
         let mut rotated = members.clone();
         rotated.rotate_left(rotation);
 
-        let mut state = MembersV1 { members: rotated };
-        state
-            .apply_delta(&parent_state, &parameters, &None)
-            .expect("apply_delta should succeed");
+        let mut room = base.clone();
+        room.members = MembersV1 { members: rotated };
+        room.recent_messages.messages = messages.clone();
+        normalize_room(&mut room, &parameters);
+        let state = room.members;
 
         let mut ids: Vec<_> = state.members.iter().map(|m| m.member.id()).collect();
         ids.sort();

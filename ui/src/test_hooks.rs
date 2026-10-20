@@ -490,8 +490,8 @@ fn push_test_message(
 }
 
 /// What a real arrival does once the room is at `max_recent_messages`: drain
-/// the oldest. Mirrors `MessagesV1::apply_delta`
-/// (common/src/room_state/message.rs) — without this, the hooks grow the
+/// the oldest. Mirrors the room's `post_apply_cleanup` message cap
+/// (common/src/room_state.rs) — without this, the hooks grow the
 /// message list unboundedly and the at-cap index-shift path (#505)
 /// is unreachable from the browser suite.
 fn prune_to_cap(room: &mut RoomData) {

@@ -1,4 +1,4 @@
-use crate::room_state::ban::{BanId, BansV1};
+use crate::room_state::ban::{AuthorizedUserBan, BanId, BansV1};
 use crate::room_state::ban_evidence::{evidence_digest, BanEvidenceV1, EvidenceDigest};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
@@ -124,7 +124,8 @@ impl ComposableState for MembersV1 {
             // rule: each added member costs a signature check, and a delta
             // much past `MIN_MEMBERS_DELTA_BOUND` members would exceed the
             // contract's compute limit anyway. Deltas larger than
-            // `max_members` within the bound are accepted and trimmed below.
+            // `max_members` within the bound are accepted; the
+            // `max_members` cap is applied by `post_apply_cleanup`.
             // A peer still holding a larger set from before a big
             // `max_members` reduction can produce a delta over the bound; it
             // is rejected only until that peer receives the new
@@ -172,16 +173,10 @@ impl ComposableState for MembersV1 {
             }
         }
 
-        // Remove members the owner has banned now, so the `max_members` trim
-        // below does not count them. Everything else waits for
-        // `post_apply_cleanup` step 0, which has the converged deputy grants
-        // (`member_info` applies after this field). See
-        // `remove_owner_banned_members` for why this cannot change step 0's
-        // answer (#410, freenet/river#423, #702).
-        self.remove_owner_banned_members(&parent_state.bans, parameters);
-
-        // Always enforce max members limit
-        self.remove_excess_members(parameters, max_members);
+        // Bans and the `max_members` cap are not applied here: the member set
+        // may exceed `max_members` until `post_apply_cleanup`, which removes
+        // banned members first, then prunes and caps what is left, so a
+        // member that cleanup removes never takes a cap slot.
 
         // Sort for deterministic ordering (CRDT convergence requirement)
         self.members.sort_by_key(|m| m.member.id());
@@ -567,8 +562,8 @@ impl MembersV1 {
     }
 
     /// Every member id removed by a verifiable OWNER ban, over `members`
-    /// alone: each target plus its invite subtree. Used by the early removal
-    /// in [`ComposableState::apply_delta`]; see [`Self::resolve_bans`] step 0.
+    /// alone: each target plus its invite subtree; see
+    /// [`Self::resolve_bans`] step 0.
     pub fn owner_removed_ids(
         &self,
         bans_v1: &BansV1,
@@ -576,19 +571,16 @@ impl MembersV1 {
     ) -> HashSet<MemberId> {
         owner_removed_in(
             &children_by_inviter(self.members.iter()),
-            bans_v1,
+            &bans_v1.0,
             parameters,
+            |ban| ban.verify_signature(&parameters.owner).is_ok(),
         )
     }
 
-    /// The early ban removal run from `MembersV1::apply_delta`, before
-    /// `member_info` (deputy grants) has been applied: it removes exactly the
-    /// members an owner ban removes ([`Self::owner_removed_ids`]).
-    ///
-    /// This cannot change what `post_apply_cleanup` step 0 decides: an
-    /// owner-removed member contributes no edge to the ban graph, and step 0
-    /// removes the same set from the same bans. Bans by ancestors or deputies
-    /// are left to step 0, which has the converged grants.
+    /// Remove exactly the members an owner ban removes
+    /// ([`Self::owner_removed_ids`]). Test helper: the apply no longer
+    /// removes banned members; `post_apply_cleanup` step 0 does.
+    #[cfg(test)]
     fn remove_owner_banned_members(&mut self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) {
         let removed = self.owner_removed_ids(bans_v1, parameters);
         if !removed.is_empty() {
@@ -685,53 +677,198 @@ impl MembersV1 {
         member_info: &MemberInfoV1,
         parameters: &ChatRoomParametersV1,
     ) -> BanResolution {
-        let owner_id = parameters.owner_id();
-        let lookup = evidence.lookup(self, owner_id);
-        let children = children_by_inviter(lookup.values().copied());
+        BanContext::new(self, evidence, member_info, parameters).resolve(&bans_v1.0, parameters)
+    }
+}
 
-        // Step 0: the owner's bans.
-        let owner_removed = owner_removed_in(&children, bans_v1, parameters);
-        let mut ban_tiers: HashMap<BanId, u8> = HashMap::new();
-        let mut verified: HashSet<BanId> = HashSet::new();
-        for ban in &bans_v1.0 {
+/// A ban's reach (its target and that target's invite subtree), shared
+/// between the resolutions of one [`BanContext`].
+type Reach = std::rc::Rc<BTreeSet<MemberId>>;
+
+/// The records [`MembersV1::resolve_bans`] reads, built once for a member
+/// set and its ban evidence, so a caller that resolves many ban sets over
+/// the same records (the ban cap) does not rebuild them for each. It also
+/// remembers, per ban, its id, whether its signature verifies against its
+/// issuer's key here and whether its issuer may ban its target, and per
+/// target, its reach. All of these depend only on the records, so they hold
+/// for the context's whole life. The bans passed to one context are borrowed
+/// for its whole life, so each is one fixed record.
+///
+/// A context is built inside one call ([`MembersV1::resolve_bans`], or one
+/// run of the ban cap) over that call's records and dropped when it
+/// returns; nothing stores one, so no cache outlives the records it was
+/// found from, and no two calls, merges or cleanup passes share one.
+pub(crate) struct BanContext<'a> {
+    lookup: HashMap<MemberId, &'a AuthorizedMember>,
+    children: HashMap<MemberId, Vec<MemberId>>,
+    member_info: &'a MemberInfoV1,
+    per_ban: std::cell::RefCell<HashMap<*const AuthorizedUserBan, (BanId, bool)>>,
+    authorized: std::cell::RefCell<HashMap<*const AuthorizedUserBan, bool>>,
+    reach: std::cell::RefCell<HashMap<MemberId, Reach>>,
+}
+
+impl<'a> BanContext<'a> {
+    pub(crate) fn new(
+        members: &'a MembersV1,
+        evidence: &'a BanEvidenceV1,
+        member_info: &'a MemberInfoV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> Self {
+        let lookup = evidence.lookup(members, parameters.owner_id());
+        let children = children_by_inviter(lookup.values().copied());
+        BanContext {
+            lookup,
+            children,
+            member_info,
+            per_ban: Default::default(),
+            authorized: Default::default(),
+            reach: Default::default(),
+        }
+    }
+
+    /// Whether `ban`'s issuer may ban its target here
+    /// ([`MembersV1::is_ban_authorized`]), keyed by address like
+    /// [`Self::id_and_signature`].
+    fn is_authorized(&self, ban: &'a AuthorizedUserBan, owner_id: MemberId) -> bool {
+        let key: *const AuthorizedUserBan = ban;
+        if let Some(known) = self.authorized.borrow().get(&key) {
+            return *known;
+        }
+        let ok = MembersV1::is_ban_authorized(
+            ban.banned_by,
+            ban.ban.banned_user,
+            &self.lookup,
+            self.member_info,
+            owner_id,
+        );
+        self.authorized.borrow_mut().insert(key, ok);
+        ok
+    }
+
+    /// `target` and its whole invite subtree ([`reach_in`]).
+    fn reach_of(&self, target: MemberId) -> Reach {
+        if let Some(known) = self.reach.borrow().get(&target) {
+            return known.clone();
+        }
+        let reach = std::rc::Rc::new(reach_in(&self.children, target));
+        self.reach.borrow_mut().insert(target, reach.clone());
+        reach
+    }
+
+    /// Adds `target` and its subtree to `set`. Every set this is used on
+    /// (the owner-removed members, an issuer's reached members, the removed
+    /// members) is a union of whole subtrees, each added here or by
+    /// [`reach_in`]: a member in one is a descendant-or-self of some added
+    /// target, so the target's own subtree is already in it, and skipping
+    /// it changes nothing.
+    fn add_reach(&self, set: &mut HashSet<MemberId>, target: MemberId) {
+        if !set.contains(&target) {
+            set.extend(self.reach_of(target).iter().copied());
+        }
+    }
+
+    /// `ban`'s id, and whether its signature verifies against its issuer's
+    /// key here ([`BansV1::ban_signature_matches_current_key`]; the owner's
+    /// key for an owner ban).
+    fn id_and_signature(
+        &self,
+        ban: &'a AuthorizedUserBan,
+        parameters: &ChatRoomParametersV1,
+    ) -> (BanId, bool) {
+        // Keyed by address: every ban passed to this context is borrowed for
+        // its lifetime `'a`, so one address is one record. Debug builds check
+        // that a hit is the same record.
+        let key: *const AuthorizedUserBan = ban;
+        if let Some(known) = self.per_ban.borrow().get(&key) {
+            debug_assert!(
+                known.0 == ban.id(),
+                "a cached ban entry names another record"
+            );
+            return known.clone();
+        }
+        let ok = BansV1::ban_signature_matches_current_key(
+            ban,
+            &self.lookup,
+            parameters.owner_id(),
+            &parameters.owner,
+        );
+        let entry = (ban.id(), ok);
+        self.per_ban.borrow_mut().insert(key, entry.clone());
+        entry
+    }
+
+    /// [`MembersV1::resolve_bans`] over `bans`.
+    pub(crate) fn resolve(
+        &self,
+        bans: impl IntoIterator<Item = &'a AuthorizedUserBan> + Clone,
+        parameters: &ChatRoomParametersV1,
+    ) -> BanResolution {
+        #[cfg(any(test, river_cleanup_counters))]
+        crate::room_state::cleanup_counters::count_resolve_bans();
+        let owner_id = parameters.owner_id();
+        // Step 0: the owner's bans. Every set of removed members below is a
+        // union of whole subtrees, so `add_reach` skips a target already in
+        // it.
+        let mut owner_removed: HashSet<MemberId> = HashSet::new();
+        for ban in bans.clone() {
             if ban.banned_by == owner_id
                 && ban.ban.banned_user != owner_id
-                && ban.verify_signature(&parameters.owner).is_ok()
+                && self.id_and_signature(ban, parameters).1
             {
-                ban_tiers.insert(ban.id(), BanResolution::OWNER);
-                verified.insert(ban.id());
+                self.add_reach(&mut owner_removed, ban.ban.banned_user);
+            }
+        }
+        let mut ban_tiers: HashMap<BanId, u8> = HashMap::new();
+        let mut verified: HashSet<BanId> = HashSet::new();
+        for ban in bans.clone() {
+            if ban.banned_by == owner_id && ban.ban.banned_user != owner_id {
+                let (id, ok) = self.id_and_signature(ban, parameters);
+                if ok {
+                    ban_tiers.insert(id.clone(), BanResolution::OWNER);
+                    verified.insert(id);
+                }
             }
         }
 
         // Steps 1-3: the valid bans, grouped by issuer, each with its reach.
-        let mut valid: BTreeMap<MemberId, Vec<(BanId, BTreeSet<MemberId>)>> = BTreeMap::new();
-        for ban in &bans_v1.0 {
+        let mut valid: BTreeMap<MemberId, Vec<(BanId, MemberId, Reach)>> = BTreeMap::new();
+        for ban in bans {
             let issuer = ban.banned_by;
             if issuer == owner_id || owner_removed.contains(&issuer) {
                 continue;
             }
-            if !BansV1::ban_signature_matches_current_key(ban, &lookup, owner_id, &parameters.owner)
-            {
+            let (id, ok) = self.id_and_signature(ban, parameters);
+            if !ok {
                 continue;
             }
-            verified.insert(ban.id());
-            if !Self::is_ban_authorized(issuer, ban.ban.banned_user, &lookup, member_info, owner_id)
-            {
+            verified.insert(id.clone());
+            if !self.is_authorized(ban, owner_id) {
                 continue;
             }
-            let reach = reach_in(&children, ban.ban.banned_user);
+            let reach = self.reach_of(ban.ban.banned_user);
             if reach.contains(&issuer) {
                 continue; // step 3: self-removing, void
             }
-            valid.entry(issuer).or_default().push((ban.id(), reach));
+            valid
+                .entry(issuer)
+                .or_default()
+                .push((id, ban.ban.banned_user, reach));
+        }
+        // Largest reach first, so a ban whose target lies inside an earlier
+        // ban's reach adds nothing below. Each ban's tier is decided on its
+        // own, so the order within an issuer changes no result.
+        for bans in valid.values_mut() {
+            bans.sort_by_key(|(_, _, reach)| std::cmp::Reverse(reach.len()));
         }
 
         // Step 4: the graph. Nodes are issuers and the members they reach.
         let mut adjacency: BTreeMap<MemberId, BTreeSet<MemberId>> = BTreeMap::new();
         for (issuer, bans) in &valid {
             let out = adjacency.entry(*issuer).or_default();
-            for (_, reach) in bans {
-                out.extend(reach.iter().copied());
+            for (_, target, reach) in bans {
+                if !out.contains(target) {
+                    out.extend(reach.iter().copied());
+                }
             }
         }
         let targets: Vec<MemberId> = adjacency.values().flatten().copied().collect();
@@ -749,22 +886,22 @@ impl MembersV1 {
                     continue;
                 };
                 let removed_earlier = removed.contains(issuer);
-                for (ban_id, reach) in bans {
+                for (ban_id, target, reach) in bans {
                     if in_cycle {
                         // A cycle ban holds the cycle together whether or
                         // not an earlier ban already removed its issuer.
-                        if reach.iter().any(|y| component.contains(y)) {
+                        if component.iter().any(|y| reach.contains(y)) {
                             ban_tiers.insert(ban_id.clone(), BanResolution::MUTUAL);
                         }
                     } else if !removed_earlier {
-                        removed.extend(reach.iter().copied());
+                        self.add_reach(&mut removed, *target);
                         ban_tiers.insert(ban_id.clone(), BanResolution::EFFECTIVE);
                     }
                 }
             }
             if in_cycle {
                 for member in &component {
-                    removed.extend(reach_in(&children, *member));
+                    self.add_reach(&mut removed, *member);
                 }
             }
         }
@@ -779,7 +916,9 @@ impl MembersV1 {
             verified,
         }
     }
+}
 
+impl MembersV1 {
     /// Whether `banner` is currently authorized to ban `target` (#410).
     ///
     /// `banner` is authorized if any of these holds:
@@ -833,6 +972,8 @@ impl MembersV1 {
             }
             current = members_by_id.get(&c).map(|m| m.member.invited_by);
         }
+        #[cfg(any(test, river_cleanup_counters))]
+        crate::room_state::cleanup_counters::count_invite_tree_steps(visited.len());
 
         // 2. Genuine strict ancestor. The chain walk above only reaches
         //    records in `members_by_id`, so this grant already implies the
@@ -873,7 +1014,11 @@ impl MembersV1 {
     /// If the number of members exceeds the specified limit, remove the members with the longest invite chains
     /// until the limit is satisfied. When chain lengths are equal, remove the member with the highest MemberId
     /// for deterministic ordering (CRDT convergence requirement).
-    fn remove_excess_members(&mut self, parameters: &ChatRoomParametersV1, max_members: usize) {
+    pub(crate) fn remove_excess_members(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        max_members: usize,
+    ) {
         if self.members.len() <= max_members {
             return;
         }
@@ -1024,8 +1169,8 @@ pub struct BanResolution {
     pub owner_removed: HashSet<MemberId>,
     /// Why each ban takes effect ([`Self::OWNER`], [`Self::EFFECTIVE`],
     /// [`Self::MUTUAL`]). A ban absent here takes no effect ([`Self::INERT`]);
-    /// the `max_user_bans` eviction drops those first, then evicts by age
-    /// within an owner pool and an everyone-else pool (freenet/river#796).
+    /// the `max_user_bans` cap ([`BansV1::enforce_user_ban_cap`]) judges each
+    /// ban by its tier over the bans it keeps.
     pub ban_tiers: HashMap<BanId, u8>,
     /// The bans whose signature was checked against their issuer's key and
     /// verified. Bans by owner-removed issuers are not checked.
@@ -1063,18 +1208,16 @@ fn children_by_inviter<'a>(
 }
 
 /// Every id a verifiable owner ban removes: target plus invite subtree.
-fn owner_removed_in(
+fn owner_removed_in<'b>(
     children: &HashMap<MemberId, Vec<MemberId>>,
-    bans_v1: &BansV1,
+    bans: impl IntoIterator<Item = &'b AuthorizedUserBan>,
     parameters: &ChatRoomParametersV1,
+    signed_by_owner: impl Fn(&'b AuthorizedUserBan) -> bool,
 ) -> HashSet<MemberId> {
     let owner_id = parameters.owner_id();
     let mut removed = HashSet::new();
-    for ban in &bans_v1.0 {
-        if ban.banned_by != owner_id
-            || ban.ban.banned_user == owner_id
-            || ban.verify_signature(&parameters.owner).is_err()
-        {
+    for ban in bans {
+        if ban.banned_by != owner_id || ban.ban.banned_user == owner_id || !signed_by_owner(ban) {
             continue;
         }
         removed.extend(reach_in(children, ban.ban.banned_user));
@@ -1096,6 +1239,8 @@ fn reach_in(children: &HashMap<MemberId, Vec<MemberId>>, target: MemberId) -> BT
             }
         }
     }
+    #[cfg(any(test, river_cleanup_counters))]
+    crate::room_state::cleanup_counters::count_invite_tree_steps(reach.len());
     reach
 }
 
@@ -2562,37 +2707,73 @@ pub(crate) mod tests {
         let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
-        let (member2, _) = create_test_member(owner_id, member1.id());
-        let (member3, _) = create_test_member(owner_id, member1.id());
-        let (member4, _) = create_test_member(owner_id, member1.id());
+        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
+        let (member3, member3_signing_key) = create_test_member(owner_id, member1.id());
+        let (member4, member4_signing_key) = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
         let authorized_member3 = AuthorizedMember::new(member3.clone(), &member1_signing_key);
         let authorized_member4 = AuthorizedMember::new(member4.clone(), &member1_signing_key);
 
-        let mut members = MembersV1 {
-            members: vec![authorized_member1.clone(), authorized_member2.clone()],
+        // One message per member, signed by that member, so
+        // `post_apply_cleanup`'s prune keeps every member and only the
+        // `max_members` cap decides who goes.
+        let message = |author: &Member, sk: &SigningKey, secs: u64| {
+            crate::room_state::message::AuthorizedMessageV1::new(
+                crate::room_state::message::MessageV1 {
+                    room_owner: owner_id,
+                    author: author.id(),
+                    time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                    content: crate::room_state::message::RoomMessageBody::public("hi".to_string()),
+                },
+                sk,
+            )
         };
+        let message1 = message(&member1, &member1_signing_key, 1);
+        let message2 = message(&member2, &member2_signing_key, 2);
+        let message3 = message(&member3, &member3_signing_key, 3);
+        let message4 = message(&member4, &member4_signing_key, 4);
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration.configuration.max_members = 3;
+        // The `max_members` cap is a room rule applied by
+        // `post_apply_cleanup`, so the delta is applied to the whole room.
+        let mut room = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_members: 3,
+                    ..Configuration::default()
+                },
+                &owner_signing_key,
+            ),
+            members: MembersV1 {
+                members: vec![authorized_member1.clone(), authorized_member2.clone()],
+            },
+            ..Default::default()
+        };
+        room.recent_messages.messages = vec![message1.clone(), message2.clone()];
 
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
         // Test applying delta that would exceed max_members
-        // Now ALL members are added first, then excess removed deterministically:
+        // Now ALL members are added first, then cleanup removes the excess deterministically:
         // - member1 has shortest invite chain (invited by owner)
         // - member2, member3, member4 all have same chain length (invited by member1)
         // - One of member2/3/4 is removed based on highest MemberId (deterministic tie-breaker)
-        let delta = MembersDelta {
-            added: vec![authorized_member3.clone(), authorized_member4.clone()],
+        let delta = crate::room_state::ChatRoomStateV1Delta {
+            members: Some(MembersDelta {
+                added: vec![authorized_member3.clone(), authorized_member4.clone()],
+            }),
+            recent_messages: Some(vec![message3.clone(), message4.clone()]),
+            ..Default::default()
         };
 
-        let result = members.apply_delta(&parent_state, &parameters, &Some(delta));
-        assert!(result.is_ok());
+        let parent = room.clone();
+        let result = room.apply_delta(&parent, &parameters, &Some(delta));
+        assert!(result.is_ok(), "{result:?}");
+        let members = &room.members;
         assert_eq!(members.members.len(), 3);
         // member1 is always kept (shortest invite chain)
         assert!(members
@@ -2609,14 +2790,20 @@ pub(crate) mod tests {
             "Exactly 2 of the 3 equal-chain-length members should be kept"
         );
 
-        // Test applying delta with already existing member
-        let delta = MembersDelta {
-            added: vec![authorized_member2.clone()],
+        // Test applying delta with already existing member (with its
+        // message, so it has a reason to stay if the cap admits it)
+        let delta = crate::room_state::ChatRoomStateV1Delta {
+            members: Some(MembersDelta {
+                added: vec![authorized_member2.clone()],
+            }),
+            recent_messages: Some(vec![message2.clone()]),
+            ..Default::default()
         };
 
-        let result = members.apply_delta(&parent_state, &parameters, &Some(delta));
-        assert!(result.is_ok());
-        assert_eq!(members.members.len(), 3);
+        let parent = room.clone();
+        let result = room.apply_delta(&parent, &parameters, &Some(delta));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(room.members.members.len(), 3);
     }
 
     #[test]
@@ -2740,5 +2927,140 @@ pub(crate) mod tests {
         assert!(result
             .unwrap_err()
             .contains("Owner should not be included in the members list"));
+    }
+}
+
+#[cfg(test)]
+mod ban_context_tests {
+    //! `BanContext` remembers each ban's authority and each target's reach
+    //! for its life, and adds a reach to a set only when its target is not
+    //! already in it. These check that a context answers from its own
+    //! records, and that the shortcut gives the full union in any ban order.
+    use super::*;
+    use crate::room_state::ban::UserBan;
+    use std::time::{Duration, SystemTime};
+
+    fn key(b: u64) -> SigningKey {
+        let mut x = [0u8; 32];
+        x[..8].copy_from_slice(&b.to_le_bytes());
+        x[31] = 43;
+        SigningKey::from_bytes(&x)
+    }
+    fn id(k: &SigningKey) -> MemberId {
+        k.verifying_key().into()
+    }
+    fn rec(owner: MemberId, who: &SigningKey, inviter: &SigningKey) -> AuthorizedMember {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: owner,
+                invited_by: id(inviter),
+                member_vk: who.verifying_key(),
+            },
+            inviter,
+        )
+    }
+    fn ban(owner: MemberId, by: &SigningKey, target: &SigningKey, t: u64) -> AuthorizedUserBan {
+        AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner,
+                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                banned_user: id(target),
+            },
+            id(by),
+            by,
+        )
+    }
+    fn ids(ks: &[&SigningKey]) -> HashSet<MemberId> {
+        ks.iter().map(|k| id(k)).collect()
+    }
+
+    /// One ban resolved in three contexts over different records: each
+    /// answers from its own records, whichever ran first.
+    #[test]
+    fn each_context_answers_from_its_own_records() {
+        let o = key(1);
+        let ow = id(&o);
+        let params = ChatRoomParametersV1 {
+            owner: o.verifying_key(),
+        };
+        let (x, t, u) = (key(2), key(3), key(4));
+        let b = ban(ow, &x, &t, 1);
+        let deep = MembersV1 {
+            members: vec![rec(ow, &x, &o), rec(ow, &t, &x), rec(ow, &u, &t)],
+        };
+        let shallow = MembersV1 {
+            members: vec![rec(ow, &x, &o), rec(ow, &t, &x)],
+        };
+        let elsewhere = MembersV1 {
+            members: vec![rec(ow, &x, &o), rec(ow, &t, &o)],
+        };
+        let evidence = BanEvidenceV1::default();
+        let info = MemberInfoV1::default();
+        let resolve =
+            |m: &MembersV1| BanContext::new(m, &evidence, &info, &params).resolve([&b], &params);
+        for _ in 0..2 {
+            assert_eq!(resolve(&deep).removed, ids(&[&t, &u]));
+            assert_eq!(resolve(&shallow).removed, ids(&[&t]));
+            assert!(
+                resolve(&elsewhere).removed.is_empty(),
+                "X has no authority over T here"
+            );
+        }
+    }
+
+    /// Bans on a target and on members inside its subtree, in both orders,
+    /// by the owner and by an ancestor: the removed sets are the whole
+    /// union, and every ban keeps its tier.
+    #[test]
+    fn nested_reaches_give_the_whole_union_in_any_order() {
+        let o = key(1);
+        let ow = id(&o);
+        let params = ChatRoomParametersV1 {
+            owner: o.verifying_key(),
+        };
+        let (x, t, u, v, w) = (key(2), key(3), key(4), key(5), key(6));
+        // O -> X -> T -> U -> V, and X -> W.
+        let members = MembersV1 {
+            members: vec![
+                rec(ow, &x, &o),
+                rec(ow, &t, &x),
+                rec(ow, &u, &t),
+                rec(ow, &v, &u),
+                rec(ow, &w, &x),
+            ],
+        };
+        let evidence = BanEvidenceV1::default();
+        let info = MemberInfoV1::default();
+        let by_x = [
+            ban(ow, &x, &v, 1),
+            ban(ow, &x, &t, 2),
+            ban(ow, &x, &u, 3),
+            ban(ow, &x, &w, 4),
+        ];
+        let by_owner = [ban(ow, &o, &u, 5), ban(ow, &o, &t, 6)];
+        for reversed in [false, true] {
+            let mut bans: Vec<&AuthorizedUserBan> = by_x.iter().collect();
+            if reversed {
+                bans.reverse();
+            }
+            let res = BanContext::new(&members, &evidence, &info, &params)
+                .resolve(bans.iter().copied(), &params);
+            assert_eq!(res.removed, ids(&[&t, &u, &v, &w]), "reversed: {reversed}");
+            for b in &by_x {
+                assert_eq!(res.tier(&b.id()), BanResolution::EFFECTIVE);
+            }
+            let mut owners: Vec<&AuthorizedUserBan> = by_owner.iter().collect();
+            if reversed {
+                owners.reverse();
+            }
+            let res = BanContext::new(&members, &evidence, &info, &params)
+                .resolve(owners.iter().copied().chain(by_x.iter()), &params);
+            assert_eq!(
+                res.owner_removed,
+                ids(&[&t, &u, &v]),
+                "reversed: {reversed}"
+            );
+            assert_eq!(res.removed, ids(&[&t, &u, &v, &w]), "reversed: {reversed}");
+        }
     }
 }

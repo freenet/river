@@ -13,6 +13,158 @@ pub mod secret;
 pub mod upgrade;
 pub mod version;
 
+/// Work counters for one `post_apply_cleanup` call: ban signatures actually
+/// verified (memo misses), `MembersV1::resolve_bans` calls, and cleanup
+/// passes. Compiled only for tests and under `--cfg river_cleanup_counters`
+/// (RUSTFLAGS, for out-of-tree measurement; not a Cargo feature), so no
+/// published build carries it.
+#[cfg(any(test, river_cleanup_counters))]
+pub mod cleanup_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BAN_SIGNATURE_VERIFICATIONS: Cell<usize> = const { Cell::new(0) };
+        static RESOLVE_BANS_CALLS: Cell<usize> = const { Cell::new(0) };
+        static CLEANUP_PASSES: Cell<usize> = const { Cell::new(0) };
+        static BOUND_REACHED: Cell<usize> = const { Cell::new(0) };
+        static INVITE_TREE_STEPS: Cell<usize> = const { Cell::new(0) };
+        static MEMBER_RECORDS_BUILT: Cell<usize> = const { Cell::new(0) };
+        static MEMBER_LOOP_DMS_COPIED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The counters since the last [`reset`]: (ban signatures verified,
+    /// `resolve_bans` calls, passes of the last outermost cleanup).
+    pub fn read() -> (usize, usize, usize) {
+        (
+            BAN_SIGNATURE_VERIFICATIONS.with(|c| c.get()),
+            RESOLVE_BANS_CALLS.with(|c| c.get()),
+            CLEANUP_PASSES.with(|c| c.get()),
+        )
+    }
+
+    /// How many outermost cleanups since the last [`reset`] ended at the
+    /// pass bound with their last pass still changing the state, so the
+    /// result was returned without a pass confirming it.
+    pub fn bound_reached() -> usize {
+        BOUND_REACHED.with(|c| c.get())
+    }
+
+    /// Members visited walking the invite tree for ban resolution since the
+    /// last [`reset`]: each member put into a ban's reach, and each ancestor
+    /// an authority check walks up through.
+    pub fn invite_tree_steps() -> usize {
+        INVITE_TREE_STEPS.with(|c| c.get())
+    }
+
+    /// Member records the member loop's passes put in `members` since the
+    /// last [`reset`], before each pass's cap.
+    pub fn member_records_built() -> usize {
+        MEMBER_RECORDS_BUILT.with(|c| c.get())
+    }
+
+    /// Direct messages the member loop's passes copied since the last
+    /// [`reset`].
+    pub fn member_loop_dms_copied() -> usize {
+        MEMBER_LOOP_DMS_COPIED.with(|c| c.get())
+    }
+
+    pub fn reset() {
+        MEMBER_LOOP_DMS_COPIED.with(|c| c.set(0));
+        MEMBER_RECORDS_BUILT.with(|c| c.set(0));
+        INVITE_TREE_STEPS.with(|c| c.set(0));
+        BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(0));
+        RESOLVE_BANS_CALLS.with(|c| c.set(0));
+        CLEANUP_PASSES.with(|c| c.set(0));
+        BOUND_REACHED.with(|c| c.set(0));
+    }
+
+    thread_local! {
+        static PAUSED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn count_ban_signature_verification() {
+        if !PAUSED.with(|p| p.get()) {
+            BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    pub(crate) fn count_member_loop_dms_copied(n: usize) {
+        if !PAUSED.with(|p| p.get()) {
+            MEMBER_LOOP_DMS_COPIED.with(|c| c.set(c.get() + n));
+        }
+    }
+
+    pub(crate) fn count_member_records(n: usize) {
+        if !PAUSED.with(|p| p.get()) {
+            MEMBER_RECORDS_BUILT.with(|c| c.set(c.get() + n));
+        }
+    }
+
+    pub(crate) fn count_invite_tree_steps(n: usize) {
+        if !PAUSED.with(|p| p.get()) {
+            INVITE_TREE_STEPS.with(|c| c.set(c.get() + n));
+        }
+    }
+
+    pub(crate) fn count_resolve_bans() {
+        if !PAUSED.with(|p| p.get()) {
+            RESOLVE_BANS_CALLS.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// Run `f` without counting its work: the debug-build cross-check that
+    /// recomputes the DM apply's enforced-ban set, which release builds do
+    /// not run.
+    pub(crate) fn not_counting<R>(f: impl FnOnce() -> R) -> R {
+        let was = PAUSED.with(|p| p.replace(true));
+        let r = f();
+        PAUSED.with(|p| p.set(was));
+        r
+    }
+
+    pub(crate) fn set_cleanup_passes(n: usize, last_changed: bool) {
+        CLEANUP_PASSES.with(|c| c.set(n));
+        if n >= super::MAX_CLEANUP_PASSES && last_changed {
+            BOUND_REACHED.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static FORCE_ALL_PASSES: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Run `f` with every cleanup running all of its passes, as the worst
+    /// case does (cost tests).
+    #[cfg(test)]
+    pub(crate) fn forcing_all_passes<R>(f: impl FnOnce() -> R) -> R {
+        FORCE_ALL_PASSES.with(|c| c.set(true));
+        let r = f();
+        FORCE_ALL_PASSES.with(|c| c.set(false));
+        r
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_passes_forced() -> bool {
+        FORCE_ALL_PASSES.with(|c| c.get())
+    }
+}
+
+/// The most passes one `post_apply_cleanup` runs (see its FIXPOINT note).
+const MAX_CLEANUP_PASSES: usize = 3;
+
+/// Whether every cleanup runs all of its passes, as the worst case does:
+/// under the cost tests, and under `--cfg river_force_all_cleanup_passes` for
+/// out-of-tree timing. Always false in a published build.
+fn all_passes_forced() -> bool {
+    #[cfg(river_force_all_cleanup_passes)]
+    return true;
+    #[cfg(all(test, not(river_force_all_cleanup_passes)))]
+    return cleanup_counters::all_passes_forced();
+    #[cfg(not(any(test, river_force_all_cleanup_passes)))]
+    false
+}
+
 /// Whether the per-delta work bounds (the most new messages, bans, members
 /// and ban-evidence records one delta may add) are lifted for the apply in
 /// progress. A whole-state merge lifts them: it holds the incoming state to
@@ -225,6 +377,18 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
     ) -> Result<(), String> {
+        // One signature memo across the whole merge: the DM apply's
+        // enforced-ban set and cleanup judge the same bans.
+        crate::room_state::ban::signature_memo::active_while(|| {
+            self.merge_from_inner(parameters, other_state)
+        })
+    }
+
+    fn merge_from_inner(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        other_state: &ChatRoomStateV1,
+    ) -> Result<(), String> {
         refuse_beyond_own_bounds(other_state, parameters)?;
         let config_delta = configuration_delta_for_merge(self, parameters, other_state);
         refuse_beyond_receiver_bounds(self, other_state, &config_delta)?;
@@ -309,6 +473,16 @@ impl ChatRoomStateV1 {
     /// incoming record is applied, and the merged room's caps decide what is
     /// kept. Returns the delta applied (`None` when the two already agree).
     pub fn merge_through_summary(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        other_state: &ChatRoomStateV1,
+    ) -> Result<Option<ChatRoomStateV1Delta>, String> {
+        crate::room_state::ban::signature_memo::active_while(|| {
+            self.merge_through_summary_inner(parameters, other_state)
+        })
+    }
+
+    fn merge_through_summary_inner(
         &mut self,
         parameters: &ChatRoomParametersV1,
         other_state: &ChatRoomStateV1,
@@ -438,6 +612,40 @@ impl ChatRoomStateV1 {
     /// pruned (orphaning their DMs). See
     /// `direct_messages.rs` module docs, "Interaction with bans".
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
+        crate::room_state::ban::signature_memo::active_while(|| {
+            // FIXPOINT: a pass is followed by another on its result, and the
+            // result stands once a pass changes nothing, so that state is one
+            // `merge(S, S)` leaves as it is. A pass can change what the next
+            // decides (a member the member cap removes takes its issuer record
+            // out of `members`), so up to two passes follow the first. If the
+            // third pass still changes the state, its result is returned
+            // unconfirmed: the bound is a safety net, not a guarantee. No
+            // input measured (randomized merges and the captured rooms) has
+            // needed more than the first pass since step 0-sig runs on every
+            // pass.
+            self.cleanup_pass(parameters)?;
+            let mut passes = 1;
+            let mut last_changed = true;
+            while passes < MAX_CLEANUP_PASSES {
+                let mut next = self.clone();
+                next.cleanup_pass(parameters)?;
+                passes += 1;
+                last_changed = next != *self;
+                *self = next;
+                if !last_changed && !all_passes_forced() {
+                    break;
+                }
+            }
+            #[cfg(any(test, river_cleanup_counters))]
+            cleanup_counters::set_cleanup_passes(passes, last_changed);
+            #[cfg(not(any(test, river_cleanup_counters)))]
+            let _ = last_changed;
+            Ok(())
+        })
+    }
+
+    /// One pass of [`Self::post_apply_cleanup`].
+    fn cleanup_pass(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
         let depth_cap = crate::room_state::ban_evidence::evidence_depth_cap(
             self.configuration.configuration.max_members,
@@ -462,121 +670,69 @@ impl ChatRoomStateV1 {
             .into_iter()
             .map(|(id, m)| (id, m.clone()))
             .collect();
+        // The records this pass looks a ban's issuer, target and depth up in
+        // (`BansV1::stable_known`): every member and evidence record known at
+        // the start of the pass whose chain reaches the owner within the
+        // depth cap. Step 4 reads THIS, and steps 0-sig and 0-cap compute the
+        // same set from the same records (`BansV1::decide_enforced`), never
+        // from anything computed later in the pass.
+        let stable_known: std::collections::HashMap<MemberId, AuthorizedMember> =
+            BansV1::stable_known(&self.members, &self.ban_evidence, owner_id, depth_cap)
+                .into_iter()
+                .map(|(id, m)| (id, m.clone()))
+                .collect();
+        let stable_known: std::collections::HashMap<MemberId, &AuthorizedMember> =
+            stable_known.iter().map(|(id, m)| (*id, m)).collect();
 
-        // 0-sig. A ban no known key verifies counts for nothing: one whose
-        //     known issuer's key does not verify it (skipped on arrival at a
-        //     peer that knows the issuer) and one whose issuer is known
-        //     nowhere (step 4 sweeps it in this pass) are dropped before the
-        //     cap counts them (`BansV1::drop_bans_no_known_key_verifies`; the
-        //     DM apply's enforced-ban set drops them the same way). Only the
-        //     cap can be swayed by one (resolution ignores such a ban, and
-        //     step 4 sweeps it), so this runs only when the bans are over the
-        //     cap.
-        if self.bans.0.len() > self.configuration.configuration.max_user_bans {
-            let known = self.ban_evidence.lookup(&self.members, owner_id);
-            let mut bans = std::mem::take(&mut self.bans.0);
-            BansV1::drop_bans_no_known_key_verifies(&mut bans, &known, owner_id, &parameters.owner);
-            self.bans.0 = bans;
-        }
-
-        // Snapshot for the equality assert below. Taken HERE, before step 0-cap
-        // mutates `self.bans`, because this is the one point where `self` still
-        // holds what `parent_state` held when the `direct_messages` field
-        // applied: the five inputs `enforced_ban_set_of` reads
-        // (`configuration`, `bans`, `members`, `ban_evidence`, `member_info`)
-        // are all final by then, and the only change since is the evidence
-        // deeper than the cap dropped above, which `enforced_ban_set_of` drops
-        // the same way.
+        // Snapshot for the equality assert below, taken BEFORE this pass
+        // touches the bans: this is what `parent_state` held when the
+        // `direct_messages` field applied (the five inputs
+        // `enforced_ban_set_of` reads, `configuration`, `bans`, `members`,
+        // `ban_evidence` and `member_info`, are final by then), except the
+        // evidence deeper than the cap dropped above, which
+        // `enforced_ban_set_of` drops the same way.
         #[cfg(debug_assertions)]
         let dm_apply_time_ban_set = {
             let snapshot = self.clone();
-            crate::room_state::direct_messages::enforced_ban_set_of(&snapshot, parameters)
+            let recompute = || {
+                crate::room_state::ban::signature_memo::set_aside(|| {
+                    crate::room_state::direct_messages::enforced_ban_set_of(&snapshot, parameters)
+                })
+            };
+            #[cfg(any(test, river_cleanup_counters))]
+            let recompute = || cleanup_counters::not_counting(recompute);
+            recompute()
         };
 
-        // 0-cap. Enforce `max_user_bans` FIRST — BEFORE ban enforcement (step 0)
-        //     and the ban evidence (step 4a) — so both read
-        //     the FINAL surviving (post-cap) ban set (#411 round 7 / Codex P1
-        //     #1+#2). Running the cap here, on the converged pre-enforcement
-        //     state, is what keeps `post_apply_cleanup` IDEMPOTENT and identical
-        //     across peers:
-        //       * #1: an over-cap ban that WILL be evicted must not one-shot a
-        //         member removal at step 0 that the capped converged state
-        //         cannot reproduce — a peer that only ever sees the capped state
-        //         (e.g. via a full-state PUT that bypasses cleanup) would keep
-        //         that member, so removing it here would diverge the member set.
-        //       * #2: a record the evicted ban was the only reference to must
-        //         not survive in `ban_evidence` on pass 1 and vanish on pass 2
-        //         (`cleanup(S) != cleanup(cleanup(S))`, which permanently
-        //         diverges peers that run cleanup a different number of times).
-        //     Eviction drops bans that take no effect first, judged by
-        //     `MembersV1::resolve_bans` over the uncapped set, one per
-        //     (issuer, target) (#410 review round 1, freenet/river#702), then
-        //     evicts the oldest within two pools, owner bans and the rest, each
-        //     guaranteed `max_user_bans / 2` (freenet/river#796). A flood of
-        //     forged, revoked-deputy or banned-issuer bans, which `verify`
-        //     accepts, is dead and goes first. A flood of LIVE far-future-dated
-        //     bans, which any member can mint against its own invitees or
-        //     against ids known nowhere, evicts older non-owner bans and owner
-        //     bans beyond the guaranteed half; see `enforce_user_ban_cap` and
-        //     freenet/river#413 (Limitation 2).
-        //
-        //     CONVERGENCE HONESTY: the enforcing/inert classification is a
-        //     deterministic function of the member set it runs against, but that
-        //     member set is the INTERMEDIATE (pre-step-0) set as `apply_delta`
-        //     left it, which is order-dependent (cascade removal is arrival-order
-        //     sensitive). So two peers applying the same delta multiset in a
-        //     different order can evict DIFFERENT bans and NOT be byte-equal
-        //     without a further exchange; anti-entropy `merge` reconciles them to
-        //     the same top-set (River's ban summary is a full BanId set, so
-        //     anti-entropy always converges — pinned by
-        //     `cap_eviction_reconciles_via_merge`; tracked in freenet/river#413,
-        //     Limitation 1). Do NOT claim the eviction is order-independent per
-        //     delta. (`enforce_user_ban_cap` is independent of the order of the
-        //     ban list it is handed; the arrival-order dependence is in the
-        //     member set it judges against.)
-        //     `verify`'s hard cap ceiling still rejects any stored state left over
-        //     the cap. The signature sweep (step 4) still runs AFTER enforcement
-        //     to drop bans orphaned by a banner's removal, and only removes bans,
-        //     so the ban count stays <= the cap.
+        // 0-sig, 0-cap and 0: which bans the room enforces, decided by ONE
+        // function (`BansV1::decide_enforced`) that the DM apply's
+        // enforced-ban set also calls, so the two cannot drift
+        // (freenet/river#675):
+        //   * 0-sig drops, on every pass, every ban no key known at the start
+        //     of the pass verifies (its known issuer's key does not verify
+        //     it, its issuer is known nowhere, or its issuer sits deeper than
+        //     the ban evidence depth cap, present or not), so such a ban never
+        //     takes a cap slot or removes anyone;
+        //   * 0-cap keeps at most `max_user_bans` in the fixed authority order
+        //     (`BansV1::enforce_user_ban_cap`), BEFORE ban enforcement and the
+        //     ban evidence (step 4a), so both read the bans the cap keeps and
+        //     never one it drops (#411 round 7); it refuses an owner ban that
+        //     would make step 4 sweep a ban it kept;
+        //   * 0 resolves the kept bans (`MembersV1::resolve_bans`) over the
+        //     converged state, deputy grants included (#410): a ban whose
+        //     issuer is removed takes no effect, except the bans of a
+        //     mutual-ban cycle, whose members are all removed
+        //     (freenet/river#423, #702). The field applies remove no banned
+        //     member; this step removes every one, owner-banned included.
+        //     Kept here (NOT in verify) so verify stays stable across
+        //     ban/deputy changes.
         let max_bans = self.configuration.configuration.max_user_bans;
-        {
-            // The eviction ORDERING lives in `BansV1::enforce_user_ban_cap` —
-            // one definition, shared with `DirectMessagesV1::apply_delta`,
-            // which needs the same surviving ban set to decide which held DMs
-            // the caps may rank (freenet/river#675). A DM swept at apply time
-            // against a DIFFERENT surviving ban set than this step produces is
-            // data loss, so the two must agree by construction rather than by
-            // two copies happening to match — which is exactly what drifted in
-            // #671 and in #411 round 4.
-            BansV1::enforce_user_ban_cap(
-                &mut self.bans.0,
-                max_bans,
-                &self.members,
-                &self.ban_evidence,
-                &self.member_info,
-                parameters,
-            );
-        }
-
-        // 0. Enforce bans from the CONVERGED (now capped) state, deputy-aware (#410).
-        //
-        // `MembersV1::apply_delta` already removed the members an owner ban
-        // removes, which never affects the answer here (an owner-removed
-        // member has no ban authority). It ran BEFORE the sibling
-        // `member_info` field (which carries deputy grants) was applied, so it
-        // left every other ban to this step. This pass runs after every field
-        // has been applied, so
-        // `self.member_info` is converged. `MembersV1::resolve_bans` decides
-        // which bans take effect (a ban whose issuer is removed does not,
-        // except the bans of a mutual-ban cycle, whose members are all
-        // removed: freenet/river#423, #702). Because the result is a pure
-        // function of the converged (members + deputies + bans) state, every
-        // peer converges to the same member set regardless of delta order.
-        // Kept in post_apply_cleanup (NOT verify) so verify stays stable
-        // across ban/deputy changes, mirroring the DM ban-sweep precedent.
-        let resolution = self.members.resolve_bans(
+        let resolution = BansV1::decide_enforced(
+            &mut self.bans.0,
+            max_bans,
+            depth_cap,
+            &self.members,
             &self.ban_evidence,
-            &self.bans,
             &self.member_info,
             parameters,
         );
@@ -609,156 +765,43 @@ impl ChatRoomStateV1 {
             .members
             .retain(|m| !enforced_banned_ids.contains(&m.member.id()));
 
-        // 1. Collect message author IDs + DM participants + secret recipients.
-        //
-        // Secret recipients (i.e. members for whom the owner has issued an
-        // `encrypted_secrets` blob AT THE CURRENT VERSION) are exempt
-        // from inactivity-prune. The owner explicitly chose to issue
-        // them a per-version room secret, so the owner clearly considers
-        // them a member — and post_apply cleanup running on an
-        // invitee's first state ingestion (which arrives before the
-        // invitee has authored any join_event) must not silently delete
-        // that membership. See issue #110 / Bug #3 PR B (Ivvor
-        // 2026-05-17).
-        //
-        // The exemption is restricted to recipients at `current_version`
-        // so cleanup still prunes genuinely-inactive members whose
-        // blobs are only present at older versions (a member who joined,
-        // received v0, never authored anything, and was never re-issued
-        // a blob at v1+ is "stale" by the same definition as a member
-        // who joined and never authored). Without this scoping the
-        // exemption would keep every ever-recipient + their entire
-        // invite chain ancestor set exempt from cleanup forever,
-        // defeating the prune. See IMPORTANT item #5 on PR #272
-        // review round 2.
-        let message_authors: HashSet<MemberId> = self
-            .recent_messages
-            .messages
-            .iter()
-            .map(|m| m.message.author)
-            .collect();
-        // DM participants are counted only from DMs that will SURVIVE the
-        // step-6 sweep below — both endpoints a live, non-enforced-banned
-        // member (owner implicit). Counting every held DM (the old
-        // `active_participants()`) made this exemption strictly weaker than
-        // the sweep that runs later in the SAME pass, so a member held alive
-        // only by a DM with a banned counterparty was kept on pass 1 and
-        // pruned on pass 2 — `cleanup(S) != cleanup(cleanup(S))`, measured on
-        // live Official-room state in freenet/river#671. Same defect and same
-        // remedy as the banner exemption in #411 round 4: the exemption
-        // predicate must BE the sweep predicate, not merely resemble it, and
-        // both now call `dm_endpoint_is_live`. Not circular — see the note on
-        // `participants_of_surviving_dms`.
-        //
-        // The member set passed here is post-step-0 (enforced-banned members
-        // are already gone) and pre-step-3, which is exactly what step 6 will
-        // see for every id this loop can add: a counted participant lands in
-        // `required_ids` and therefore survives step 3 unchanged.
-        //
-        // `enforced_banned_ids` is passed so this predicate is IDENTICAL to
-        // step 6's by construction, which is the entire property this fix is
-        // about. Step 0 has already removed every enforced-banned member, so
-        // the ban check is inert here; it is kept for that identity.
+        // 1-3. Inactivity prune and the `max_members` cap, repeated until the
+        //      cap removes no one (`prune_and_cap_members`). Each pass starts
+        //      from every member left after step 0 except those an earlier
+        //      pass's CAP removed: a member only pruned (nothing needed it) is
+        //      a candidate again, so when the cap removes the author of the
+        //      newest message, the next pass's message window reaches older
+        //      messages by members who do fit, and their authors are still
+        //      there. The window, the DM caps and the cap itself are decided
+        //      over that pass's members, never in the field applies, so a
+        //      member this cleanup removes never takes a cap slot. Every pass
+        //      but the last caps at least one member out, so there are at most
+        //      (members after step 0) + 1 passes.
         let members_after_ban_enforcement: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
-        let dm_participants: HashSet<MemberId> =
-            self.direct_messages.participants_of_surviving_dms(
-                owner_id,
-                &members_after_ban_enforcement,
-                &enforced_banned_ids,
-            );
-        let current_secret_version = self.secrets.current_version;
-        let secret_recipients: HashSet<MemberId> = self
-            .secrets
-            .encrypted_secrets
-            .iter()
-            .filter(|s| s.secret.secret_version == current_secret_version)
-            .map(|s| s.secret.member_id)
-            .collect();
-
-        // 2. Compute required members: authors + DM participants + secret
-        //    recipients + their invite chains.
-        let required_ids = {
-            let members_by_id = self.members.members_by_member_id();
-            let mut required_ids: HashSet<MemberId> = HashSet::new();
-
-            for author_id in &message_authors {
-                if *author_id != owner_id && members_by_id.contains_key(author_id) {
-                    required_ids.insert(*author_id);
-                }
-            }
-
-            for participant_id in &dm_participants {
-                if *participant_id != owner_id && members_by_id.contains_key(participant_id) {
-                    required_ids.insert(*participant_id);
-                }
-            }
-
-            for recipient_id in &secret_recipients {
-                if *recipient_id != owner_id && members_by_id.contains_key(recipient_id) {
-                    required_ids.insert(*recipient_id);
-                }
-            }
-
-            // A current member who is the ISSUER of a stored ban with a
-            // matching signature is exempt from inactivity-prune (#411 round 3
-            // item B). Since freenet/river#702 this is no longer what keeps
-            // such a ban verifiable (a pruned issuer's record would become ban
-            // evidence), but it is kept deliberately: every room stored today
-            // was produced with it, so dropping it would make those states
-            // stop being fixpoints of this function and rewrite them on their
-            // first merge (fdev verify-merge `transition_path_agreement` on the
-            // real Official-room corpus). `self.bans.0` was already capped at
-            // step 0-cap, and step 0 has already removed every banned member,
-            // so this exempts exactly the present issuers of surviving bans.
-            // It uses the step-5 predicate, so exemption <=> retention (#411
-            // round 4/5).
-            for ban in &self.bans.0 {
-                let banner = ban.banned_by;
-                if banner != owner_id
-                    && BansV1::ban_signature_matches_current_key(
-                        ban,
-                        &members_by_id,
-                        owner_id,
-                        &parameters.owner,
-                    )
-                {
-                    required_ids.insert(banner);
-                }
-            }
-
-            // Walk invite chains upward, adding all ancestors (stop at owner)
-            let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
-            while let Some(member_id) = to_process.pop() {
-                if let Some(member) = members_by_id.get(&member_id) {
-                    let inviter_id = member.member.invited_by;
-                    if inviter_id != owner_id && !required_ids.contains(&inviter_id) {
-                        required_ids.insert(inviter_id);
-                        to_process.push(inviter_id);
-                    }
-                }
-            }
-
-            required_ids
+        #[cfg(test)]
+        let required_ids = if member_loop_reference::in_use() {
+            self.member_loop_reference(parameters, owner_id, &enforced_banned_ids)
+        } else {
+            self.member_loop(parameters, owner_id, &enforced_banned_ids)
         };
-
-        // 3. Prune members not in required set
-        self.members
-            .members
-            .retain(|m| required_ids.contains(&m.member.id()));
+        #[cfg(not(test))]
+        let required_ids = self.member_loop(parameters, owner_id, &enforced_banned_ids);
 
         // 4. Sweep any ban whose issuer is unknown or whose signature does
         //    not match the issuer's key (#411 round 3 item A.3, round 4 item
         //    A; AGENTS.md State Authorization Rule), and every ban by a member
         //    an owner ban removes: the owner's ban wins over everything, so
         //    such a ban can never take effect while it stands.
-        //    "Known" means present in `members` now, or known at the START of
-        //    this pass and within the evidence depth cap, so a ban whose
-        //    issuer this pass removes or prunes stays exactly when the
-        //    issuer's record moves to evidence just below (freenet/river#702).
-        //    This runs before the evidence recomputation, which reads the
-        //    swept ban set, and it only removes bans, so the count stays <=
-        //    the cap.
+        //    "Known" is `stable_known`: known at the START of this pass and
+        //    within the evidence depth cap, the facts the cap judged by, so
+        //    this never sweeps a ban the cap kept for a reason the cap did not
+        //    see, and a ban whose issuer this pass removes or prunes stays
+        //    exactly when the issuer's record moves to evidence just below
+        //    (freenet/river#702). A ban by an issuer deeper than the cap is
+        //    swept whether or not the issuer is present. This runs before the
+        //    evidence recomputation, which reads the swept ban set, and it
+        //    only removes bans, so the count stays <= the cap.
         let all_known: std::collections::HashMap<MemberId, &AuthorizedMember> =
             known_at_start.iter().map(|(id, m)| (*id, m)).collect();
         let present: HashSet<MemberId> =
@@ -777,7 +820,7 @@ impl ChatRoomStateV1 {
             !resolution.owner_removed.contains(&ban.banned_by)
                 && BansV1::ban_signature_matches_current_key(
                     ban,
-                    &known_by_id,
+                    &stable_known,
                     owner_id,
                     &parameters.owner,
                 )
@@ -796,13 +839,11 @@ impl ChatRoomStateV1 {
             // are always available, and it removes its target and subtree
             // whatever else is known. A record an owner ban removes is never
             // kept as evidence, even when another ban names it: such a
-            // record reaching this point as a member is already gone
-            // (`MembersV1::apply_delta` removes owner-banned members before
-            // cleanup), so keeping it only when it arrived as evidence made
-            // the result depend on how the record arrived (freenet/river#703
-            // review). Nothing needs it: a ban its member issued is swept in
-            // step 4, and a ban naming it ranks as one whose target is held
-            // nowhere. `BanEvidenceV1::verify` checks stored evidence against
+            // record reaching this point as a member was removed by step 0,
+            // so keeping it only when it arrived as evidence made the result
+            // depend on how the record arrived (freenet/river#703 review).
+            // Nothing needs it: a ban its member issued is swept in step 4,
+            // and a ban naming it ranks as one whose target is held nowhere. `BanEvidenceV1::verify` checks stored evidence against
             // `referenced_by_bans`, which this only narrows.
             // Walked through the records that can be kept only, so a record
             // referenced only through an owner-removed descendant is not kept
@@ -880,6 +921,17 @@ impl ChatRoomStateV1 {
         self.recent_messages.messages.retain(|m| {
             m.message.author == owner_id || current_member_ids.contains(&m.message.author)
         });
+        // Then the `max_recent_messages` cap over what is left, newest by
+        // `(time, id)` kept: the cap step 1 counted, so every author it
+        // counted keeps a message.
+        {
+            let cap = self.configuration.configuration.max_recent_messages;
+            let messages = &mut self.recent_messages.messages;
+            messages.sort_by_key(|m| m.order_key());
+            if messages.len() > cap {
+                messages.drain(0..messages.len() - cap);
+            }
+        }
 
         // Rebuild the PUBLIC `actions_state` cache now that removed authors'
         // messages are gone (#411 round 7 / Codex P2 #4). `MessagesV1::apply_delta`
@@ -936,6 +988,14 @@ impl ChatRoomStateV1 {
             &active_member_ids_for_sweep,
             &enforced_banned_ids,
         );
+        // Then the per-pair and global DM caps over what is left, the caps
+        // step 1 counted.
+        crate::room_state::direct_messages::enforce_caps_and_sort(
+            &mut self.direct_messages,
+            self.configuration
+                .configuration
+                .effective_max_direct_messages(),
+        );
 
         // 7. Re-sort for deterministic ordering
         self.members.members.sort_by_key(|m| m.member.id());
@@ -944,6 +1004,457 @@ impl ChatRoomStateV1 {
             .sort_by_key(|info| info.member_info.member_id);
 
         Ok(())
+    }
+}
+
+impl ChatRoomStateV1 {
+    /// `post_apply_cleanup` steps 1-3: the inactivity prune and the
+    /// `max_members` cap, repeated until the cap removes no one. Leaves the
+    /// last pass's members in `self.members` and returns the ids that pass
+    /// needed and kept.
+    ///
+    /// Each pass holds every member left after step 0 except those an
+    /// earlier pass's CAP removed and the invite subtrees of those (a member
+    /// is never held without its inviter); a member only pruned (nothing
+    /// needed it) is held again. So when the cap removes the author of the
+    /// newest message, the next pass's message window reaches older messages
+    /// by members who do fit. Every pass but the last caps out at least one
+    /// held id, which is never held again, so there are at most (distinct
+    /// ids) + 1 passes.
+    ///
+    /// A pass can cap out a single member, so with a message window just
+    /// over `max_members` the loop runs about one pass per member. Each pass
+    /// therefore reads only what it needs: the held set is kept up to date
+    /// as ids leave it, the messages are put in window order once, the DMs
+    /// are read through an index without their ciphertext, and the pass's
+    /// members are built from the ids it needs. The result is the one
+    /// the plain pass ([`Self::prune_and_cap_members`], kept for tests)
+    /// gives on the same held set.
+    fn member_loop(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        owner_id: MemberId,
+        enforced_banned_ids: &HashSet<MemberId>,
+    ) -> HashSet<MemberId> {
+        let candidates = self.members.members.clone();
+        let mut lp = MemberLoop::new(
+            &candidates,
+            &self.recent_messages,
+            &self.direct_messages,
+            owner_id,
+        );
+        let mut required_ids = HashSet::new();
+        for _ in 0..=candidates.len() {
+            let required =
+                self.prune_and_cap_pass(&mut lp, parameters, owner_id, enforced_banned_ids);
+            let kept: HashSet<MemberId> =
+                self.members.members.iter().map(|m| m.member.id()).collect();
+            // Only an id this pass held can be capped out: the prune also
+            // names the inviters of needed members, which this pass may not
+            // hold (a record whose inviter the cap already removed).
+            let newly_capped: Vec<MemberId> = required
+                .iter()
+                .filter(|id| lp.held.contains(id) && !kept.contains(id))
+                .copied()
+                .collect();
+            // The members kept: the prune's needed ids that this pass holds
+            // and the cap left (an inviter the pass does not hold is not one,
+            // and its `member_info` is not kept for it, step 5).
+            required_ids = required
+                .into_iter()
+                .filter(|id| kept.contains(id))
+                .collect();
+            if newly_capped.is_empty() {
+                break;
+            }
+            lp.remove(newly_capped, owner_id);
+        }
+        required_ids
+    }
+
+    /// One pass of [`Self::member_loop`] over `lp.held`: what
+    /// [`Self::prune_and_cap_members`] does with `self.members` set to the
+    /// held candidates, reading the indexes in `lp` instead of scanning every
+    /// candidate.
+    fn prune_and_cap_pass(
+        &mut self,
+        lp: &mut MemberLoop<'_>,
+        parameters: &ChatRoomParametersV1,
+        owner_id: MemberId,
+        enforced_banned_ids: &HashSet<MemberId>,
+    ) -> HashSet<MemberId> {
+        let held = &lp.held;
+        let live = |author: &MemberId| {
+            *author == owner_id || (held.contains(author) && !enforced_banned_ids.contains(author))
+        };
+        // The newest `max_recent_messages` live messages. Liveness only goes
+        // (the held set only shrinks), so a message found not live is dropped
+        // from the order for good.
+        let window = self.configuration.configuration.max_recent_messages;
+        let mut message_authors: HashSet<MemberId> = HashSet::new();
+        let mut taken = 0;
+        let mut scanned = 0;
+        while taken < window && scanned < lp.newest_first.len() {
+            if live(&lp.newest_first[scanned]) {
+                message_authors.insert(lp.newest_first[scanned]);
+                taken += 1;
+            }
+            scanned += 1;
+        }
+        let mut order = std::mem::take(&mut lp.newest_first);
+        let rest = order.split_off(scanned);
+        order.retain(|a| live(a));
+        order.extend(rest);
+        lp.newest_first = order;
+
+        let held = &lp.held;
+        let dm_participants = lp.dms.participants(
+            owner_id,
+            held,
+            enforced_banned_ids,
+            self.configuration
+                .configuration
+                .effective_max_direct_messages(),
+        );
+        let current_secret_version = self.secrets.current_version;
+        let secret_recipients = self
+            .secrets
+            .encrypted_secrets
+            .iter()
+            .filter(|s| s.secret.secret_version == current_secret_version)
+            .map(|s| s.secret.member_id);
+        // A held id's record, as `members_by_member_id` of the held records
+        // gives it: every record of a held id is held, so the last one.
+        let record = |id: &MemberId| {
+            if held.contains(id) {
+                lp.by_id.get(id).copied()
+            } else {
+                None
+            }
+        };
+        let mut required_ids: HashSet<MemberId> = message_authors
+            .into_iter()
+            .chain(dm_participants)
+            .chain(secret_recipients)
+            .filter(|id| *id != owner_id && held.contains(id))
+            .collect();
+        for ban in &self.bans.0 {
+            let banner = ban.banned_by;
+            if banner != owner_id
+                && held.contains(&banner)
+                && BansV1::ban_signature_matches_current_key(
+                    ban,
+                    &lp.by_id,
+                    owner_id,
+                    &parameters.owner,
+                )
+            {
+                required_ids.insert(banner);
+            }
+        }
+        // Walk invite chains upward, adding all ancestors (stop at owner).
+        let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
+        while let Some(member_id) = to_process.pop() {
+            if let Some(member) = record(&member_id) {
+                let inviter_id = member.member.invited_by;
+                if inviter_id != owner_id && required_ids.insert(inviter_id) {
+                    to_process.push(inviter_id);
+                }
+            }
+        }
+
+        // The held records of the needed ids, in candidate order.
+        let mut kept: Vec<usize> = required_ids
+            .iter()
+            .filter(|id| held.contains(id))
+            .flat_map(|id| lp.records_of.get(id).into_iter().flatten().copied())
+            .collect();
+        kept.sort_unstable();
+        self.members.members = kept.into_iter().map(|i| lp.candidates[i].clone()).collect();
+        #[cfg(any(test, river_cleanup_counters))]
+        cleanup_counters::count_member_records(self.members.members.len());
+        let max_members = self.configuration.configuration.max_members;
+        self.members.remove_excess_members(parameters, max_members);
+        required_ids
+    }
+
+    /// The member loop as first written, every pass rebuilding its members
+    /// from all candidates: the reference [`Self::member_loop`] is tested
+    /// against.
+    #[cfg(test)]
+    fn member_loop_reference(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        owner_id: MemberId,
+        enforced_banned_ids: &HashSet<MemberId>,
+    ) -> HashSet<MemberId> {
+        let candidates = self.members.members.clone();
+        let mut capped_out: HashSet<MemberId> = HashSet::new();
+        let mut required_ids = HashSet::new();
+        for _ in 0..=candidates.len() {
+            let mut held: HashSet<MemberId> = candidates
+                .iter()
+                .map(|m| m.member.id())
+                .filter(|id| !capped_out.contains(id))
+                .collect();
+            loop {
+                let anchored: HashSet<MemberId> = candidates
+                    .iter()
+                    .filter(|m| {
+                        m.member.invited_by == owner_id || held.contains(&m.member.invited_by)
+                    })
+                    .map(|m| m.member.id())
+                    .collect();
+                let before = held.len();
+                held.retain(|id| anchored.contains(id));
+                if held.len() == before {
+                    break;
+                }
+            }
+            self.members.members = candidates
+                .iter()
+                .filter(|m| held.contains(&m.member.id()))
+                .cloned()
+                .collect();
+            cleanup_counters::count_member_records(self.members.members.len());
+            let required = self.prune_and_cap_members(parameters, owner_id, enforced_banned_ids);
+            let kept: HashSet<MemberId> =
+                self.members.members.iter().map(|m| m.member.id()).collect();
+            let newly_capped: Vec<MemberId> = required
+                .iter()
+                .filter(|id| held.contains(id) && !kept.contains(id))
+                .copied()
+                .collect();
+            required_ids = required
+                .into_iter()
+                .filter(|id| kept.contains(id))
+                .collect();
+            if newly_capped.is_empty() {
+                break;
+            }
+            capped_out.extend(newly_capped);
+        }
+        required_ids
+    }
+
+    /// One pass of `post_apply_cleanup` steps 1-3: keep the members something
+    /// live needs, with their invite chains, then apply the `max_members`
+    /// cap to what is kept. Returns the ids the prune kept (before the cap).
+    ///
+    /// A member is needed as:
+    /// - the author of one of the newest `max_recent_messages` messages whose
+    ///   authors are live in THIS pass (the owner, or a member not
+    ///   enforced-banned), so a message of a member this cleanup removes
+    ///   never takes a slot;
+    /// - a participant of a DM that survives step 6 and the DM caps, judged
+    ///   against the members of THIS pass (`participants_of_surviving_dms`,
+    ///   the predicate step 6 applies, freenet/river#671);
+    /// - a recipient of a secret blob at the current secret version
+    ///   (issue #110; scoped to the current version so members whose blobs
+    ///   are only at older versions are still pruned);
+    /// - the issuer of a stored ban whose signature matches the issuer's
+    ///   current key (#411 round 3 item B; kept so stored rooms stay
+    ///   fixpoints, see the history in freenet/river#702);
+    /// - an invite ancestor of any of these.
+    #[cfg(test)]
+    fn prune_and_cap_members(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        owner_id: MemberId,
+        enforced_banned_ids: &HashSet<MemberId>,
+    ) -> HashSet<MemberId> {
+        let members_now: HashSet<MemberId> =
+            self.members.members.iter().map(|m| m.member.id()).collect();
+        let message_authors: HashSet<MemberId> = {
+            let mut live: Vec<&crate::room_state::message::AuthorizedMessageV1> = self
+                .recent_messages
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.message.author == owner_id
+                        || (members_now.contains(&m.message.author)
+                            && !enforced_banned_ids.contains(&m.message.author))
+                })
+                .collect();
+            live.sort_by_key(|m| std::cmp::Reverse(m.order_key()));
+            live.truncate(self.configuration.configuration.max_recent_messages);
+            live.into_iter().map(|m| m.message.author).collect()
+        };
+        let dm_participants: HashSet<MemberId> = {
+            let mut dms = self.direct_messages.clone();
+            cleanup_counters::count_member_loop_dms_copied(dms.messages.len());
+            dms.sweep_after_membership_change(owner_id, &members_now, enforced_banned_ids);
+            crate::room_state::direct_messages::enforce_caps_and_sort(
+                &mut dms,
+                self.configuration
+                    .configuration
+                    .effective_max_direct_messages(),
+            );
+            dms.participants_of_surviving_dms(owner_id, &members_now, enforced_banned_ids)
+        };
+        let current_secret_version = self.secrets.current_version;
+        let secret_recipients = self
+            .secrets
+            .encrypted_secrets
+            .iter()
+            .filter(|s| s.secret.secret_version == current_secret_version)
+            .map(|s| s.secret.member_id);
+
+        let members_by_id = self.members.members_by_member_id();
+        let mut required_ids: HashSet<MemberId> = message_authors
+            .into_iter()
+            .chain(dm_participants)
+            .chain(secret_recipients)
+            .filter(|id| *id != owner_id && members_by_id.contains_key(id))
+            .collect();
+        for ban in &self.bans.0 {
+            let banner = ban.banned_by;
+            if banner != owner_id
+                && BansV1::ban_signature_matches_current_key(
+                    ban,
+                    &members_by_id,
+                    owner_id,
+                    &parameters.owner,
+                )
+            {
+                required_ids.insert(banner);
+            }
+        }
+        // Walk invite chains upward, adding all ancestors (stop at owner).
+        let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
+        while let Some(member_id) = to_process.pop() {
+            if let Some(member) = members_by_id.get(&member_id) {
+                let inviter_id = member.member.invited_by;
+                if inviter_id != owner_id && required_ids.insert(inviter_id) {
+                    to_process.push(inviter_id);
+                }
+            }
+        }
+
+        self.members
+            .members
+            .retain(|m| required_ids.contains(&m.member.id()));
+        let max_members = self.configuration.configuration.max_members;
+        self.members.remove_excess_members(parameters, max_members);
+        required_ids
+    }
+}
+
+/// The candidates of cleanup's member loop, indexed once for all its passes,
+/// and the ids the current pass holds.
+struct MemberLoop<'c> {
+    candidates: &'c [AuthorizedMember],
+    /// Record indexes per member id, ascending.
+    records_of: std::collections::HashMap<MemberId, Vec<usize>>,
+    /// Record indexes per inviter id.
+    invited_by: std::collections::HashMap<MemberId, Vec<usize>>,
+    /// The last record of each id, as `MembersV1::members_by_member_id`.
+    by_id: std::collections::HashMap<MemberId, &'c AuthorizedMember>,
+    /// The ids the pass holds: no capped-out id, and only ids with a record
+    /// whose inviter is the owner or held.
+    held: HashSet<MemberId>,
+    /// Message authors, newest message first (the order the window takes),
+    /// less messages already found not live.
+    newest_first: Vec<MemberId>,
+    /// The stored DMs, for the participants of those a pass keeps.
+    dms: crate::room_state::direct_messages::DmParticipantIndex,
+}
+
+impl<'c> MemberLoop<'c> {
+    fn new(
+        candidates: &'c [AuthorizedMember],
+        messages: &MessagesV1,
+        direct_messages: &DirectMessagesV1,
+        owner_id: MemberId,
+    ) -> Self {
+        let mut records_of: std::collections::HashMap<MemberId, Vec<usize>> = Default::default();
+        let mut invited_by: std::collections::HashMap<MemberId, Vec<usize>> = Default::default();
+        let mut by_id = std::collections::HashMap::new();
+        for (i, m) in candidates.iter().enumerate() {
+            let id = m.member.id();
+            records_of.entry(id).or_default().push(i);
+            invited_by.entry(m.member.invited_by).or_default().push(i);
+            by_id.insert(id, m);
+        }
+        // A stable sort by newest first, as the plain pass sorts its live
+        // messages: filtering this order gives the same order.
+        let mut order: Vec<(crate::room_state::message::MessageOrderKey, MemberId)> = messages
+            .messages
+            .iter()
+            .map(|m| (m.order_key(), m.message.author))
+            .collect();
+        order.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut lp = MemberLoop {
+            candidates,
+            records_of,
+            invited_by,
+            by_id,
+            held: HashSet::new(),
+            newest_first: order.into_iter().map(|(_, a)| a).collect(),
+            dms: crate::room_state::direct_messages::DmParticipantIndex::new(direct_messages),
+        };
+        // The first pass holds every candidate id with a record whose
+        // inviter is the owner or held: drop ids until none is left without
+        // one. (Ids that only invite each other stay, as they always have.)
+        lp.held = lp.records_of.keys().copied().collect();
+        let unanchored: Vec<MemberId> = lp
+            .records_of
+            .iter()
+            .filter(|(_, records)| {
+                !records.iter().any(|&j| {
+                    let inviter = lp.candidates[j].member.invited_by;
+                    inviter == owner_id || lp.held.contains(&inviter)
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        lp.remove(unanchored, owner_id);
+        lp
+    }
+
+    /// Takes `ids` (held ids the cap removed) out of the held set, and with
+    /// them every id left with no record whose inviter is the owner or held.
+    /// Only a removed id's invitees can lose their anchor.
+    fn remove(&mut self, ids: Vec<MemberId>, owner_id: MemberId) {
+        let mut gone = ids;
+        for id in &gone {
+            self.held.remove(id);
+        }
+        while let Some(id) = gone.pop() {
+            for &i in self.invited_by.get(&id).into_iter().flatten() {
+                let child = self.candidates[i].member.id();
+                if !self.held.contains(&child) {
+                    continue;
+                }
+                let anchored = self.records_of[&child].iter().any(|&j| {
+                    let inviter = self.candidates[j].member.invited_by;
+                    inviter == owner_id || self.held.contains(&inviter)
+                });
+                if !anchored {
+                    self.held.remove(&child);
+                    gone.push(child);
+                }
+            }
+        }
+    }
+}
+
+/// Tests run cleanup's member loop as first written through this switch, to
+/// compare it with [`ChatRoomStateV1::member_loop`].
+#[cfg(test)]
+pub(crate) mod member_loop_reference {
+    use std::cell::Cell;
+    thread_local! {
+        static IN_USE: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn in_use() -> bool {
+        IN_USE.with(|c| c.get())
+    }
+    pub(crate) fn using<R>(f: impl FnOnce() -> R) -> R {
+        let was = IN_USE.with(|c| c.replace(true));
+        let r = f();
+        IN_USE.with(|c| c.set(was));
+        r
     }
 }
 
@@ -1150,9 +1661,14 @@ fn trim_to_work_bounds(
     if let Some(bans) = delta.bans.as_mut() {
         if bans.len() > bans_bound {
             let before: Vec<_> = bans.iter().map(ban_digest).collect();
+            // Judged against the sender's own records at the sender's own
+            // depth cap: `config` may be the floor caps (a receiver whose
+            // configuration outranks), whose `max_members` of 1 would leave
+            // only owner-invited issuers known and send no other ban.
             crate::room_state::ban::BansV1::enforce_user_ban_cap(
                 bans,
                 bans_bound,
+                evidence_depth_cap(sender.configuration.configuration.max_members),
                 &sender.members,
                 &sender.ban_evidence,
                 &sender.member_info,
@@ -1200,27 +1716,54 @@ fn trim_to_work_bounds(
     if let Some(members) = delta.members.as_mut() {
         if members.added().len() > members_bound {
             let depth = depth_in_sender();
-            // The authors of the messages the delta keeps, and their invite
-            // chains, go first, so a trimmed delta always delivers messages
-            // with their authors (otherwise the two trims can choose disjoint
-            // sets, every message is then left out, and the receiver prunes
-            // the members it took: the same delta forever).
+            // The authors of the messages the delta keeps go first, newest
+            // message first, each with its WHOLE missing invite chain (every
+            // member of the chain the receiver's summary does not list), so
+            // a trimmed delta always delivers messages with authors the
+            // receiver can verify and keeps: otherwise the two trims can
+            // choose disjoint sets, or deliver part of a chain, the receiver
+            // prunes the members it took, and the same delta repeats forever.
+            // A chain is taken only while the chains fit the bound; an author
+            // whose chain does not fit, or does not reach the owner here, is
+            // skipped, and its messages are dropped below. The receiver
+            // counts new member records against this same bound.
             let mut needed: HashSet<MemberId> = HashSet::new();
-            for author in delta
+            let mut authors: Vec<(crate::room_state::message::MessageOrderKey, MemberId)> = delta
                 .recent_messages
                 .iter()
                 .flatten()
-                .map(|m| m.message.author)
-            {
+                .map(|m| (m.order_key(), m.message.author))
+                .collect();
+            authors.sort_by(|a, b| b.cmp(a));
+            let mut seen_authors: HashSet<MemberId> = HashSet::new();
+            for (_, author) in authors {
+                if !seen_authors.insert(author) {
+                    continue;
+                }
+                let mut chain: Vec<MemberId> = Vec::new();
                 let mut current = author;
+                let mut complete = true;
                 while current != owner_id
                     && !summary.members.contains(&current)
-                    && needed.insert(current)
+                    && !needed.contains(&current)
                 {
-                    match known.get(&current) {
-                        Some(m) => current = m.member.invited_by,
-                        None => break,
+                    if chain.len() >= members_bound {
+                        complete = false;
+                        break;
                     }
+                    match known.get(&current) {
+                        Some(m) => {
+                            chain.push(current);
+                            current = m.member.invited_by;
+                        }
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if complete && needed.len() + chain.len() <= members_bound {
+                    needed.extend(chain);
                 }
             }
             // Rank by (not needed, depth, id), but keep the kept records in
@@ -1402,9 +1945,12 @@ mod tests {
     use std::time::SystemTime;
 
     /// Over its bound, a network delta's ban evidence keeps the shallowest
-    /// records, its bans keep what the ban cap keeps at the bound (here the
-    /// owner's live ban and the newest of the rest), and evidence only a
-    /// trimmed ban references is not sent (freenet/river#703).
+    /// records, and its bans keep what the ban cap keeps at the bound, judged
+    /// in the sender's state: only the owner's ban when the sender holds no
+    /// record of the other bans' issuer (no one could verify them), the
+    /// owner's ban and the newest live bans of a member it does hold
+    /// otherwise; evidence only a trimmed ban references is not sent
+    /// (freenet/river#703).
     #[test]
     fn a_network_delta_trim_keeps_what_the_caps_keep() {
         let owner_sk = SigningKey::from_bytes(&[1; 32]);
@@ -1478,9 +2024,10 @@ mod tests {
         assert_eq!(evidence.len(), 200);
         assert!(shallow.iter().all(|m| evidence.contains(m)));
 
-        // Bans over the bound: the cap's choice at the bound (the owner's
-        // ban, then the newest others) is kept, and evidence only a trimmed
-        // ban references is not sent.
+        // Bans over the bound: the cap's choice at the bound is kept. Here
+        // the other bans' issuer is a record the sender does not hold, so
+        // no signature of theirs can be checked and the cap keeps only the
+        // owner's ban; evidence only a trimmed ban references is not sent.
         let target_ban = |by: &SigningKey, secs: u64, target: &AuthorizedMember| {
             AuthorizedUserBan::new(
                 UserBan {
@@ -1504,20 +2051,67 @@ mod tests {
             ..Default::default()
         };
         trim_to_work_bounds(&mut delta, &config, &sender, &summary, &parameters);
-        let bans = delta.bans.unwrap();
-        assert_eq!(bans.len(), MIN_BANS_DELTA_BOUND);
-        assert!(bans.contains(&owner_ban));
-        let oldest_kept = bans
+        let trimmed = delta.bans.clone().unwrap();
+        // The cap keeps no ban whose issuer's signature it cannot check.
+        assert_eq!(trimmed, vec![owner_ban.clone()]);
+        assert!(delta.ban_evidence.clone().unwrap().is_empty());
+        // The receiver still converges: the sender's own cleanup sweeps the
+        // bans whose issuer it does not know, so once it is normalized it
+        // offers the receiver nothing further.
+        let mut receiver = ChatRoomStateV1::default();
+        receiver
+            .apply_delta(&ChatRoomStateV1::default(), &parameters, &Some(delta))
+            .expect("the receiver applies the trimmed delta");
+        let mut normalized = sender.clone();
+        normalized.post_apply_cleanup(&parameters).unwrap();
+        assert_eq!(normalized.bans.0, vec![owner_ban.clone()]);
+        let next = normalized.delta(
+            &normalized,
+            &parameters,
+            &receiver.summarize(&receiver, &parameters),
+        );
+        assert!(
+            next.as_ref().is_none_or(|d| d.bans.is_none()),
+            "no ban is left to send"
+        );
+
+        // The same bans when the sender holds their issuer's record: the
+        // issuer's bans are live (their targets are held nowhere, or are
+        // evidence it may reach), so the trim keeps the owner's ban and the
+        // newest of them up to the bound.
+        let mut sender = sender.clone();
+        let issuer = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member_sk.verifying_key(),
+            },
+            &owner_sk,
+        );
+        sender.members.members.push(issuer);
+        let mut delta = ChatRoomStateV1Delta {
+            bans: Some(sender.bans.0.clone()),
+            ..Default::default()
+        };
+        trim_to_work_bounds(&mut delta, &config, &sender, &summary, &parameters);
+        let trimmed = delta.bans.unwrap();
+        assert_eq!(trimmed.len(), MIN_BANS_DELTA_BOUND);
+        assert!(trimmed.contains(&owner_ban));
+        let newest_member_ban = sender
+            .bans
+            .0
             .iter()
             .filter(|b| b.banned_by != owner_id)
-            .map(|b| b.ban.banned_at)
-            .min()
+            .max_by_key(|b| b.ban.banned_at)
             .unwrap();
-        assert_eq!(
-            oldest_kept,
-            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(110)
+        assert!(
+            trimmed.contains(newest_member_ban),
+            "the newest live ban is sent"
         );
-        assert_eq!(delta.ban_evidence.unwrap(), vec![shallow[1].clone()]);
+        assert!(
+            trimmed.iter().filter(|b| b.banned_by != owner_id).count() == MIN_BANS_DELTA_BOUND - 1,
+            "the rest of the bound is the member's live bans"
+        );
     }
 
     #[test]
@@ -2936,9 +3530,8 @@ mod tests {
 
         // State D: the same shape, but the counterparty is banned by a DEPUTY
         // rather than the owner. `post_apply_cleanup` sees the converged
-        // `member_info`, so step 0 DOES enforce this ban — the deputy gap is in
-        // `MembersV1::apply_delta`, not here (freenet/river#675). Cleanup must
-        // still be a fixpoint.
+        // `member_info`, so step 0 DOES enforce this ban (freenet/river#675).
+        // Cleanup must still be a fixpoint.
         {
             let dep_sk = SigningKey::generate(rng);
             let m_sk = SigningKey::generate(rng);
@@ -3835,5 +4428,945 @@ mod tests {
             &[] as &[MemberId],
             "deputies_of agrees with the deduped canonical record"
         );
+    }
+
+    /// `caps` members (10 owner-invited roots, the rest one level below),
+    /// one message each, and `2 * caps` live bans (issuers present members,
+    /// targets known nowhere), at `max_members = max_user_bans =
+    /// max_recent_messages = caps`: twice what the ban cap keeps.
+    fn ban_cap_cost_fixture(caps: usize) -> (ChatRoomStateV1, ChatRoomParametersV1) {
+        let key = |b: u64| {
+            let mut x = [0u8; 32];
+            x[..8].copy_from_slice(&b.to_le_bytes());
+            x[31] = 9;
+            SigningKey::from_bytes(&x)
+        };
+        let at =
+            |t: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + t);
+        let owner_sk = key(1);
+        let owner: MemberId = owner_sk.verifying_key().into();
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let keys: Vec<SigningKey> = (0..caps as u64).map(|i| key(1_000 + i)).collect();
+        let members: Vec<AuthorizedMember> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let inviter = if i < 10 { &owner_sk } else { &keys[i % 10] };
+                AuthorizedMember::new(
+                    Member {
+                        owner_member_id: owner,
+                        invited_by: inviter.verifying_key().into(),
+                        member_vk: k.verifying_key(),
+                    },
+                    inviter,
+                )
+            })
+            .collect();
+        let messages: Vec<AuthorizedMessageV1> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: owner,
+                        author: k.verifying_key().into(),
+                        time: at(i as u64),
+                        content: RoomMessageBody::public("x".into()),
+                    },
+                    k,
+                )
+            })
+            .collect();
+        let held_bans = 2 * caps;
+        let bans: Vec<AuthorizedUserBan> = (0..held_bans as u64)
+            .map(|i| {
+                let by = &keys[i as usize % caps];
+                AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner,
+                        banned_at: at(100_000 + i),
+                        banned_user: key(10_000_000 + i).verifying_key().into(),
+                    },
+                    by.verifying_key().into(),
+                    by,
+                )
+            })
+            .collect();
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner,
+                    max_members: caps,
+                    max_user_bans: caps,
+                    max_recent_messages: caps,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            members: MembersV1 { members },
+            recent_messages: crate::room_state::message::MessagesV1 {
+                messages,
+                ..Default::default()
+            },
+            bans: BansV1(bans),
+            ..Default::default()
+        };
+        state.recent_messages.rebuild_actions_state();
+
+        (state, params)
+    }
+
+    /// A whole-state merge, or a delta, that takes a room over its ban cap
+    /// runs the cap once: the DM apply's enforced-ban set and cleanup step
+    /// 0-cap judge the same inputs, and the second takes the first's answer.
+    /// Each ban signature is verified at most once across the merge.
+    #[test]
+    fn a_merge_over_the_ban_cap_judges_the_bans_once() {
+        let caps = 200usize;
+        let (full, params) = ban_cap_cost_fixture(caps);
+        let half = |range: std::ops::Range<usize>| {
+            let mut s = full.clone();
+            s.bans = BansV1(full.bans.0[range].to_vec());
+            s.post_apply_cleanup(&params).unwrap();
+            s
+        };
+        let (mut a, b) = (half(0..caps), half(caps..2 * caps));
+        cleanup_counters::reset();
+        a.merge_from(&params, &b).unwrap();
+        let (verified, resolved, _) = cleanup_counters::read();
+        assert_eq!(a.bans.0.len(), caps);
+        assert!(
+            verified <= 2 * caps,
+            "{verified} signature checks for {} bans",
+            2 * caps
+        );
+        // The cap judges at most each held ban once per phase it reaches;
+        // here every ban is live, so about `caps` judgments, plus one
+        // resolution per cleanup pass. Running the cap twice would double it.
+        assert!(
+            resolved <= caps + 10,
+            "{resolved} resolutions: the cap ran more than once"
+        );
+
+        // The same through a delta (the contract's update path).
+        let (mut a, b) = (half(0..caps), half(caps..2 * caps));
+        let parent = a.clone();
+        cleanup_counters::reset();
+        a.apply_delta(
+            &parent,
+            &params,
+            &Some(ChatRoomStateV1Delta {
+                bans: Some(b.bans.0.clone()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let (_, resolved, _) = cleanup_counters::read();
+        assert_eq!(a.bans.0.len(), caps);
+        assert!(
+            resolved <= caps + 10,
+            "{resolved} resolutions on the delta path: the cap ran more than once"
+        );
+    }
+
+    /// A cleanup holding twice `max_user_bans` live bans (issuers present
+    /// members, targets known nowhere) at the default caps: every ban
+    /// signature is verified at most once across the whole call, the cap
+    /// resolves bans about once per ban it judges, the fixpoint step stops
+    /// within its bound, and the call fits a time budget. All three passes
+    /// are forced, as the worst case pays for them.
+    #[test]
+    fn cleanup_cost_stays_quadratic_and_memoized() {
+        let caps = 200usize;
+        let held_bans = 2 * caps;
+        let (mut state, params) = ban_cap_cost_fixture(caps);
+        cleanup_counters::reset();
+        let started = std::time::Instant::now();
+        cleanup_counters::forcing_all_passes(|| state.post_apply_cleanup(&params)).unwrap();
+        let elapsed = started.elapsed();
+        let (verified, resolved, passes) = cleanup_counters::read();
+        assert_eq!(state.bans.0.len(), caps, "the cap keeps max_user_bans");
+        assert!(
+            verified <= held_bans,
+            "each ban signature is verified at most once: {verified} for {held_bans} bans"
+        );
+        assert!(
+            resolved <= held_bans + 1,
+            "about one resolution per judged ban: {resolved} for {held_bans} bans"
+        );
+        assert_eq!(passes, 3, "all three passes ran");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "cleanup at {caps}/{caps} took {elapsed:?}"
+        );
+    }
+
+    /// A deep invite chain: member X, invited by the owner, invites a chain
+    /// of `n - 1` members, and holds twice `max_user_bans` bans on members
+    /// spread down that chain, so each ban reaches a long subtree. The cap
+    /// judges every ban over the bans kept before it; the invite-tree walks
+    /// that needs stay within a small multiple of `n * n` (each ban's reach
+    /// and authority found once per cap), where walking them again for
+    /// every judgment grows with the bans judged times the chain.
+    #[test]
+    fn a_deep_invite_chain_keeps_the_ban_cap_walks_quadratic() {
+        let n = 120usize;
+        let key = |b: u64| {
+            let mut x = [0u8; 32];
+            x[..8].copy_from_slice(&b.to_le_bytes());
+            x[31] = 11;
+            SigningKey::from_bytes(&x)
+        };
+        let at =
+            |t: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + t);
+        let owner_sk = key(1);
+        let owner: MemberId = owner_sk.verifying_key().into();
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let x = key(2);
+        let chain: Vec<SigningKey> = (0..n as u64 - 1).map(|i| key(3 + i)).collect();
+        let record = |who: &SigningKey, inviter: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner,
+                    invited_by: inviter.verifying_key().into(),
+                    member_vk: who.verifying_key(),
+                },
+                inviter,
+            )
+        };
+        let mut members = vec![record(&x, &owner_sk)];
+        let mut inviter = &x;
+        for c in &chain {
+            members.push(record(c, inviter));
+            inviter = c;
+        }
+        let deepest = chain.last().unwrap();
+        let bans: Vec<AuthorizedUserBan> = (0..2 * n as u64)
+            .map(|i| {
+                AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner,
+                        banned_at: at(100_000 + i),
+                        banned_user: chain[i as usize % chain.len()].verifying_key().into(),
+                    },
+                    x.verifying_key().into(),
+                    &x,
+                )
+            })
+            .collect();
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner,
+                    max_members: n,
+                    max_user_bans: n,
+                    max_recent_messages: n,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            members: MembersV1 { members },
+            recent_messages: MessagesV1 {
+                messages: vec![AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: owner,
+                        author: deepest.verifying_key().into(),
+                        time: at(1),
+                        content: RoomMessageBody::public("x".into()),
+                    },
+                    deepest,
+                )],
+                ..Default::default()
+            },
+            bans: BansV1(bans),
+            ..Default::default()
+        };
+        state.recent_messages.rebuild_actions_state();
+        cleanup_counters::reset();
+        cleanup_counters::forcing_all_passes(|| state.post_apply_cleanup(&params)).unwrap();
+        let steps = cleanup_counters::invite_tree_steps();
+        let (_, resolved, _) = cleanup_counters::read();
+        assert_eq!(state.bans.0.len(), n, "the cap keeps max_user_bans");
+        assert!(
+            resolved > n,
+            "the cap judged the bans: {resolved} resolutions"
+        );
+        assert!(
+            steps <= 4 * n * n,
+            "{steps} invite-tree steps for a chain of {n} and {resolved} resolutions"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_pass_tests {
+    //! A cleanup pass that is not itself idempotent is repaired by the
+    //! fixpoint step, so its output alone cannot show it: these assert the
+    //! pass count too (one pass plus the confirming pass).
+    use super::*;
+    use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+    use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use crate::room_state::member::{AuthorizedMember, Member};
+    use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    use ed25519_dalek::SigningKey;
+    use std::time::{Duration, SystemTime};
+
+    fn pass_key(b: u64) -> SigningKey {
+        let mut x = [0u8; 32];
+        x[..8].copy_from_slice(&b.to_le_bytes());
+        x[31] = 23;
+        SigningKey::from_bytes(&x)
+    }
+    fn pass_rec(owner: MemberId, who: &SigningKey, inviter: &SigningKey) -> AuthorizedMember {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: owner,
+                invited_by: inviter.verifying_key().into(),
+                member_vk: who.verifying_key(),
+            },
+            inviter,
+        )
+    }
+    fn pass_msg(owner: MemberId, who: &SigningKey, t: u64) -> AuthorizedMessageV1 {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner,
+                author: who.verifying_key().into(),
+                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                content: RoomMessageBody::public(format!("m{t}")),
+            },
+            who,
+        )
+    }
+
+    /// The member cap removes the deepest member K; its inviter P was needed
+    /// only by K, so the SAME pass prunes P (the inner loop), and the
+    /// confirming pass changes nothing.
+    #[test]
+    fn the_member_loop_settles_within_one_pass() {
+        let o = pass_key(1);
+        let owner: MemberId = o.verifying_key().into();
+        let params = ChatRoomParametersV1 {
+            owner: o.verifying_key(),
+        };
+        let mut ks: Vec<SigningKey> = (0..3).map(|i| pass_key(10 + i)).collect();
+        ks.sort_by_key(|k| MemberId::from(k.verifying_key()));
+        let (p, q, rr) = (ks[0].clone(), ks[1].clone(), ks[2].clone()); // P lowest id, survives the id tiebreak
+        let k = pass_key(99);
+        let mut s = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner,
+                    max_members: 2,
+                    ..Default::default()
+                },
+                &o,
+            ),
+            members: MembersV1 {
+                members: vec![
+                    pass_rec(owner, &p, &o),
+                    pass_rec(owner, &q, &o),
+                    pass_rec(owner, &rr, &o),
+                    pass_rec(owner, &k, &p),
+                ],
+            },
+            ..Default::default()
+        };
+        s.recent_messages.messages = vec![
+            pass_msg(owner, &q, 1),
+            pass_msg(owner, &rr, 2),
+            pass_msg(owner, &k, 3),
+        ];
+        s.recent_messages.rebuild_actions_state();
+        cleanup_counters::reset();
+        s.post_apply_cleanup(&params).unwrap();
+        let ids: Vec<MemberId> = s.members.members.iter().map(|m| m.member.id()).collect();
+        assert!(
+            !ids.contains(&MemberId::from(k.verifying_key()))
+                && !ids.contains(&MemberId::from(p.verifying_key())),
+            "{ids:?}"
+        );
+        assert_eq!(
+            cleanup_counters::read().2,
+            2,
+            "one pass plus a confirming pass"
+        );
+    }
+
+    /// A member whose only DM the global DM cap evicts is pruned in the same
+    /// pass: the prune counts only DMs that survive the caps.
+    #[test]
+    fn the_dm_claim_counts_only_capped_dms() {
+        let o = pass_key(1);
+        let owner: MemberId = o.verifying_key().into();
+        let params = ChatRoomParametersV1 {
+            owner: o.verifying_key(),
+        };
+        let (a, b, c) = (pass_key(2), pass_key(3), pass_key(4));
+        let id = |k: &SigningKey| MemberId::from(k.verifying_key());
+        let dm = |f: &SigningKey, t: &SigningKey, ts: u64| {
+            crate::room_state::direct_messages::sign_direct_message(
+                f,
+                id(f),
+                id(t),
+                &params.owner,
+                1_700_000_000 + ts,
+                vec![1; 8],
+            )
+            .unwrap()
+        };
+        let mut s = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner,
+                    max_direct_messages: Some(1),
+                    ..Default::default()
+                },
+                &o,
+            ),
+            members: MembersV1 {
+                members: vec![
+                    pass_rec(owner, &a, &o),
+                    pass_rec(owner, &b, &o),
+                    pass_rec(owner, &c, &o),
+                ],
+            },
+            ..Default::default()
+        };
+        s.direct_messages.messages = vec![dm(&a, &b, 9), dm(&c, &b, 5)];
+        cleanup_counters::reset();
+        s.post_apply_cleanup(&params).unwrap();
+        assert!(
+            !s.members.members.iter().any(|m| m.member.id() == id(&c)),
+            "C pruned"
+        );
+        assert_eq!(
+            cleanup_counters::read().2,
+            2,
+            "one pass plus a confirming pass"
+        );
+    }
+
+    /// The member loop ends even when a kept member's inviter is not a
+    /// member (here a hand-built state; across passes, a member whose inviter
+    /// the cap removed through another of its records): the prune names the
+    /// inviter as needed, and an id the pass does not hold is never counted
+    /// as removed by the cap.
+    #[test]
+    fn the_member_loop_ends_when_an_inviter_is_not_held() {
+        let o = pass_key(1);
+        let owner: MemberId = o.verifying_key().into();
+        let params = ChatRoomParametersV1 {
+            owner: o.verifying_key(),
+        };
+        let (absent, x) = (pass_key(2), pass_key(3));
+        let mut s = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner,
+                    ..Default::default()
+                },
+                &o,
+            ),
+            members: MembersV1 {
+                members: vec![pass_rec(owner, &x, &absent)],
+            },
+            ..Default::default()
+        };
+        s.recent_messages.messages = vec![pass_msg(owner, &x, 1)];
+        cleanup_counters::reset();
+        s.post_apply_cleanup(&params).unwrap();
+        assert!(
+            cleanup_counters::read().2 <= 2,
+            "one pass plus the confirming pass"
+        );
+    }
+
+    /// The signature memo must key on the verifying key: a ban checked
+    /// against the wrong key first still verifies against the right one.
+    #[test]
+    fn the_signature_memo_keys_on_the_verifying_key() {
+        let (o, other) = (pass_key(1), pass_key(2));
+        let owner: MemberId = o.verifying_key().into();
+        let ban = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner,
+                banned_at: SystemTime::UNIX_EPOCH,
+                banned_user: other.verifying_key().into(),
+            },
+            owner,
+            &o,
+        );
+        crate::room_state::ban::signature_memo::active_while(|| {
+            assert!(ban.verify_signature(&other.verifying_key()).is_err());
+            assert!(ban.verify_signature(&o.verifying_key()).is_ok());
+        });
+    }
+}
+
+#[cfg(test)]
+mod member_loop_tests {
+    //! Cleanup's member loop (`ChatRoomStateV1::member_loop`) reads indexes
+    //! kept across its passes; the loop as first written
+    //! (`member_loop_reference`) rebuilds every pass from all candidates.
+    //! These hold the two to the same result, and the first to its cost.
+    use super::*;
+    use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+    use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use crate::room_state::member::{AuthorizedMember, Member};
+    use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+    use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    use ed25519_dalek::SigningKey;
+    use std::time::{Duration, SystemTime};
+
+    fn key(b: u64) -> SigningKey {
+        let mut x = [0u8; 32];
+        x[..8].copy_from_slice(&b.to_le_bytes());
+        x[31] = 41;
+        SigningKey::from_bytes(&x)
+    }
+    fn id(k: &SigningKey) -> MemberId {
+        k.verifying_key().into()
+    }
+    fn rec(owner: MemberId, who: &SigningKey, inviter: &SigningKey) -> AuthorizedMember {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: owner,
+                invited_by: id(inviter),
+                member_vk: who.verifying_key(),
+            },
+            inviter,
+        )
+    }
+    fn msg(owner: MemberId, who: &SigningKey, t: u64) -> AuthorizedMessageV1 {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner,
+                author: id(who),
+                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                content: RoomMessageBody::public(format!("m{t}")),
+            },
+            who,
+        )
+    }
+    fn ban(owner: MemberId, by: &SigningKey, target: MemberId, t: u64) -> AuthorizedUserBan {
+        AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner,
+                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                banned_user: target,
+            },
+            id(by),
+            by,
+        )
+    }
+    fn room(o: &SigningKey, max_members: usize, max_msgs: usize) -> ChatRoomStateV1 {
+        room_with_dm_cap(o, max_members, max_msgs, None)
+    }
+    fn room_with_dm_cap(
+        o: &SigningKey,
+        max_members: usize,
+        max_msgs: usize,
+        max_direct_messages: Option<usize>,
+    ) -> ChatRoomStateV1 {
+        ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: id(o),
+                    max_members,
+                    max_recent_messages: max_msgs,
+                    max_direct_messages,
+                    ..Default::default()
+                },
+                o,
+            ),
+            ..Default::default()
+        }
+    }
+    fn dm(
+        o: &SigningKey,
+        from: &SigningKey,
+        to: &SigningKey,
+        t: u64,
+        bytes: usize,
+    ) -> crate::room_state::direct_messages::AuthorizedDirectMessage {
+        crate::room_state::direct_messages::sign_direct_message(
+            from,
+            id(from),
+            id(to),
+            &o.verifying_key(),
+            1_700_000_000 + t,
+            vec![7u8; bytes],
+        )
+        .expect("a DM")
+    }
+    fn params(o: &SigningKey) -> ChatRoomParametersV1 {
+        ChatRoomParametersV1 {
+            owner: o.verifying_key(),
+        }
+    }
+
+    /// Cleanup with the member loop and with the reference loop: the same
+    /// state, and the same `post_apply_cleanup` result or error.
+    fn assert_both_loops_agree(s: &ChatRoomStateV1, p: &ChatRoomParametersV1, what: &str) {
+        let mut fast = s.clone();
+        let fast_result = fast.post_apply_cleanup(p);
+        let mut reference = s.clone();
+        let reference_result = member_loop_reference::using(|| reference.post_apply_cleanup(p));
+        assert_eq!(fast_result, reference_result, "{what}: results");
+        assert!(fast == reference, "{what}: states differ");
+    }
+
+    /// A message window one over `max_members`, the shape that makes the
+    /// loop cap out one member per pass.
+    fn window_just_over_the_cap(n: usize) -> (ChatRoomStateV1, ChatRoomParametersV1) {
+        let o = key(1);
+        let ow = id(&o);
+        let keys: Vec<SigningKey> = (0..n as u64).map(|i| key(100 + i)).collect();
+        let mut s = room(&o, 10, 11);
+        s.members.members = keys.iter().map(|k| rec(ow, k, &o)).collect();
+        s.recent_messages.messages = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| msg(ow, k, i as u64))
+            .collect();
+        s.recent_messages.rebuild_actions_state();
+        (s, params(&o))
+    }
+
+    #[test]
+    fn the_member_loop_matches_the_reference_on_fixed_shapes() {
+        let (s, p) = window_just_over_the_cap(60);
+        assert_both_loops_agree(&s, &p, "window just over the cap");
+
+        // The same with DMs: 130 between two members (over the per-pair cap
+        // of 100), a duplicate, and DMs between other pairs; then with a
+        // global DM cap below the count.
+        for dm_cap in [None, Some(40), Some(0)] {
+            let o = key(1);
+            let (mut s, p) = window_just_over_the_cap(60);
+            s.configuration = room_with_dm_cap(&o, 10, 11, dm_cap).configuration;
+            let keys: Vec<SigningKey> = (0..60u64).map(|i| key(100 + i)).collect();
+            let mut dms: Vec<_> = (0..130u64)
+                .map(|t| dm(&o, &keys[59], &keys[58], t, 16))
+                .collect();
+            dms.push(dms[3].clone());
+            for i in 0..40usize {
+                dms.push(dm(
+                    &o,
+                    &keys[i],
+                    &keys[(i * 7 + 1) % 60],
+                    500 + i as u64,
+                    16,
+                ));
+            }
+            s.direct_messages.messages = dms;
+            assert_both_loops_agree(&s, &p, &format!("with DMs, cap {dm_cap:?}"));
+        }
+
+        // A chain, a second record for a member under another inviter, two
+        // ids that only invite each other, a member whose inviter is held
+        // nowhere, and a ban issuer the prune must keep.
+        let o = key(1);
+        let ow = id(&o);
+        let ks: Vec<SigningKey> = (0..12u64).map(|i| key(200 + i)).collect();
+        let mut s = room(&o, 4, 3);
+        s.members.members = vec![
+            rec(ow, &ks[0], &o),
+            rec(ow, &ks[1], &ks[0]),
+            rec(ow, &ks[2], &ks[1]),
+            rec(ow, &ks[3], &ks[2]),
+            rec(ow, &ks[3], &o),
+            rec(ow, &ks[4], &ks[5]),
+            rec(ow, &ks[5], &ks[4]),
+            rec(ow, &ks[6], &ks[11]),
+            rec(ow, &ks[7], &o),
+            rec(ow, &ks[8], &ks[7]),
+            rec(ow, &ks[9], &ks[8]),
+        ];
+        s.recent_messages.messages = vec![
+            msg(ow, &ks[3], 9),
+            msg(ow, &ks[9], 8),
+            msg(ow, &ks[2], 7),
+            msg(ow, &ks[4], 6),
+            msg(ow, &ks[6], 5),
+            msg(ow, &ks[1], 4),
+        ];
+        s.recent_messages.rebuild_actions_state();
+        s.bans.0 = vec![ban(ow, &ks[8], id(&key(999)), 3)];
+        assert_both_loops_agree(&s, &params(&o), "chain, duplicates, cycle");
+    }
+
+    /// Small generated rooms: random invite trees with second records,
+    /// dangling inviters, messages, bans and member_info, at random caps.
+    #[test]
+    fn the_member_loop_matches_the_reference_on_generated_rooms() {
+        let mut seed = 0x5eed_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n.max(1)
+        };
+        for round in 0..300u64 {
+            let o = key(1);
+            let ow = id(&o);
+            let n = 2 + next(24) as usize;
+            let ks: Vec<SigningKey> = (0..n as u64)
+                .map(|i| key(1_000 * (round + 1) + i))
+                .collect();
+            let dm_cap = match next(3) {
+                0 => None,
+                _ => Some(next(8) as usize),
+            };
+            let mut s = room_with_dm_cap(
+                &o,
+                1 + next(n as u64) as usize,
+                next(n as u64 + 3) as usize,
+                dm_cap,
+            );
+            let mut members = Vec::new();
+            for i in 0..n {
+                let inviter = match next(8) {
+                    0 => key(9_999_999),
+                    1..=3 => o.clone(),
+                    _ => ks[next(n as u64) as usize].clone(),
+                };
+                members.push(rec(ow, &ks[i], &inviter));
+                if next(6) == 0 {
+                    members.push(rec(ow, &ks[i], &ks[next(n as u64) as usize]));
+                }
+            }
+            s.members.members = members;
+            s.recent_messages.messages = (0..next(2 * n as u64))
+                .map(|t| msg(ow, &ks[next(n as u64) as usize], next(50) * 100 + t))
+                .collect();
+            s.recent_messages.rebuild_actions_state();
+            s.bans.0 = (0..next(4))
+                .map(|t| ban(ow, &ks[next(n as u64) as usize], id(&key(5_000_000 + t)), t))
+                .collect();
+            let mut dms = Vec::new();
+            for t in 0..next(12) {
+                let from = next(n as u64) as usize;
+                let to = (from + 1 + next(n as u64 - 1) as usize) % n;
+                let from_key = if next(5) == 0 { &o } else { &ks[from] };
+                dms.push(dm(&o, from_key, &ks[to], next(20) * 10 + t, 8));
+            }
+            s.direct_messages.messages = dms;
+            let who = &ks[next(n as u64) as usize];
+            s.member_info.member_info = vec![AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo::new_public(id(who), 1, "x".into()),
+                who,
+            )];
+            assert_both_loops_agree(&s, &params(&o), &format!("round {round}"));
+        }
+    }
+
+    /// With the window one over `max_members`, the loop caps out one member
+    /// per pass, so it runs about one pass per member. Each pass builds only
+    /// the members it needs (about the window), not every candidate, and
+    /// reads the DMs through an index rather than a copy.
+    #[test]
+    fn a_window_just_over_the_member_cap_keeps_each_pass_small() {
+        let n = 400;
+        let (mut s, p) = window_just_over_the_cap(n);
+        // A full default DM set among the members the cap keeps last (the
+        // lowest ids), so the DMs stay through every pass.
+        let o = key(1);
+        let mut keys: Vec<SigningKey> = (0..n as u64).map(|i| key(100 + i)).collect();
+        keys.sort_by_key(id);
+        s.direct_messages.messages = (0..300u64)
+            .map(|t| {
+                let i = t as usize % 10;
+                dm(&o, &keys[i], &keys[(i + 1) % 10], t, 1_024)
+            })
+            .collect();
+        cleanup_counters::reset();
+        s.post_apply_cleanup(&p).unwrap();
+        let built = cleanup_counters::member_records_built();
+        assert_eq!(s.members.members.len(), 10);
+        assert!(
+            built <= 20 * n,
+            "{built} member records built for {n} members"
+        );
+        assert_eq!(
+            cleanup_counters::member_loop_dms_copied(),
+            0,
+            "no pass copies the DMs"
+        );
+    }
+
+    /// A delta at the work-bound floor (1000 new members, one newer message
+    /// each) into a room with `max_members` 20, a window of 21 and a full
+    /// default DM set (300 at the largest ciphertext) among its own members,
+    /// which hold the lowest ids so the cap keeps them and their DMs to the
+    /// end. The loop runs many passes; none copies the DMs, and each builds
+    /// only the members it needs. (Counted rather than timed: a wall-clock
+    /// bound fails on a loaded machine.)
+    #[test]
+    fn a_floor_delta_into_a_room_holding_a_full_dm_set_copies_no_dms() {
+        use crate::room_state::direct_messages::MAX_DM_CIPHERTEXT_BYTES;
+        use crate::room_state::member::MembersDelta;
+        let o = key(1);
+        let ow = id(&o);
+        let p = params(&o);
+        let n = 1_000usize;
+        let mut pool: Vec<SigningKey> = (0..(20 + n) as u64).map(|i| key(20_000 + i)).collect();
+        pool.sort_by_key(id);
+        let incoming = pool.split_off(20);
+        let room_keys = pool;
+        let mut base = room(&o, 20, 21);
+        base.members.members = room_keys.iter().map(|k| rec(ow, k, &o)).collect();
+        base.recent_messages.messages = room_keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| msg(ow, k, i as u64))
+            .collect();
+        base.recent_messages.rebuild_actions_state();
+        base.direct_messages.messages = (0..300u64)
+            .map(|t| {
+                let i = t as usize % 20;
+                dm(
+                    &o,
+                    &room_keys[i],
+                    &room_keys[(i + 1) % 20],
+                    t,
+                    MAX_DM_CIPHERTEXT_BYTES,
+                )
+            })
+            .collect();
+        let mut settled = base.clone();
+        settled.merge_from(&p, &base).unwrap();
+        let base = settled;
+        assert_eq!(base.direct_messages.messages.len(), 300, "premise");
+        let delta = ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(
+                incoming.iter().map(|k| rec(ow, k, &o)).collect(),
+            )),
+            recent_messages: Some(
+                incoming
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| msg(ow, k, 10_000 + i as u64))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let mut s = base.clone();
+        cleanup_counters::reset();
+        let started = std::time::Instant::now();
+        s.apply_delta(&base, &p, &Some(delta)).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(s.direct_messages.messages.len(), 300, "the DMs stay");
+        assert_eq!(
+            cleanup_counters::member_loop_dms_copied(),
+            0,
+            "no pass copies the DMs"
+        );
+        let built = cleanup_counters::member_records_built();
+        assert!(
+            built <= 20 * n,
+            "{built} member records built for {n} members"
+        );
+        eprintln!("the apply took {elapsed:?}");
+    }
+
+    /// The member loop needs three passes (C, then G, is capped out), and
+    /// the second pass drops E, two levels below capped-out C: only F, the
+    /// newest author who fits, stays.
+    #[test]
+    fn three_member_loop_passes_drop_a_two_level_subtree() {
+        let o = key(1);
+        let ow = id(&o);
+        let (p_, q, c, g, d, e, f) = (key(2), key(3), key(4), key(5), key(6), key(7), key(8));
+        let mut s = room(&o, 2, 1);
+        s.members.members = vec![
+            rec(ow, &p_, &o),
+            rec(ow, &q, &p_),
+            rec(ow, &c, &q),
+            rec(ow, &g, &q),
+            rec(ow, &d, &c),
+            rec(ow, &e, &d),
+            rec(ow, &f, &o),
+        ];
+        s.recent_messages.messages = vec![
+            msg(ow, &f, 1),
+            msg(ow, &e, 5),
+            msg(ow, &g, 8),
+            msg(ow, &c, 10),
+        ];
+        s.recent_messages.rebuild_actions_state();
+        assert_both_loops_agree(&s, &params(&o), "three passes");
+        cleanup_counters::reset();
+        s.post_apply_cleanup(&params(&o)).unwrap();
+        s.verify(&s, &params(&o)).expect("verifies");
+        let ids: Vec<MemberId> = s.members.members.iter().map(|m| m.member.id()).collect();
+        assert_eq!(ids, vec![id(&f)], "only F, the newest author who fits");
+        assert_eq!(
+            cleanup_counters::read().2,
+            2,
+            "one pass plus a confirming pass"
+        );
+    }
+
+    /// X holds two records (invited by the owner, and by A, listed last); A,
+    /// three invites down, has the newest message. Lowering the cap to 2
+    /// caps A out, X's message enters the window, and the prune names A as
+    /// X's inviter, which the pass does not hold. The loop ends (on a thread
+    /// with a deadline, so a loop that does not end fails rather than hangs),
+    /// X stays, and A's member_info goes with A.
+    #[test]
+    fn a_needed_inviter_the_pass_does_not_hold_ends_the_loop() {
+        let o = key(1);
+        let ow = id(&o);
+        let (b1, b2, a, x) = (key(12), key(13), key(14), key(15));
+        let mut s = room(&o, 2, 1);
+        s.members.members = vec![
+            rec(ow, &b1, &o),
+            rec(ow, &b2, &b1),
+            rec(ow, &a, &b2),
+            rec(ow, &x, &o),
+            rec(ow, &x, &a),
+        ];
+        s.recent_messages.messages = vec![msg(ow, &x, 1), msg(ow, &a, 9)];
+        s.recent_messages.rebuild_actions_state();
+        s.member_info.member_info = vec![AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(id(&a), 1, "a".into()),
+            &a,
+        )];
+        let mut wide = s.clone();
+        wide.configuration = room(&o, 10, 1).configuration;
+        wide.verify(&wide, &params(&o))
+            .expect("premise: verifies before the cap is lowered");
+        let p = params(&o);
+        let (done, result) = std::sync::mpsc::channel();
+        let input = s.clone();
+        std::thread::spawn(move || {
+            let mut s = input;
+            cleanup_counters::reset();
+            s.post_apply_cleanup(&p).unwrap();
+            let passes = cleanup_counters::read().2;
+            let _ = done.send((s, passes));
+        });
+        let (s, passes) = result
+            .recv_timeout(Duration::from_secs(60))
+            .expect("cleanup ends");
+        let ids: HashSet<MemberId> = s.members.members.iter().map(|m| m.member.id()).collect();
+        assert!(ids.contains(&id(&x)) && !ids.contains(&id(&a)), "{ids:?}");
+        assert!(
+            s.member_info
+                .member_info
+                .iter()
+                .all(|i| i.member_info.member_id != id(&a)),
+            "A's member_info goes with A"
+        );
+        assert!(passes <= 2);
+        let mut again = s.clone();
+        again.post_apply_cleanup(&params(&o)).unwrap();
+        assert!(again == s, "a fixpoint");
     }
 }
