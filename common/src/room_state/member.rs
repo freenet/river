@@ -124,7 +124,8 @@ impl ComposableState for MembersV1 {
             // rule: each added member costs a signature check, and a delta
             // much past `MIN_MEMBERS_DELTA_BOUND` members would exceed the
             // contract's compute limit anyway. Deltas larger than
-            // `max_members` within the bound are accepted and trimmed below.
+            // `max_members` within the bound are accepted; the
+            // `max_members` cap is applied by `post_apply_cleanup`.
             // A peer still holding a larger set from before a big
             // `max_members` reduction can produce a delta over the bound; it
             // is rejected only until that peer receives the new
@@ -715,8 +716,15 @@ impl<'a> BanContext<'a> {
         ban: &'a AuthorizedUserBan,
         parameters: &ChatRoomParametersV1,
     ) -> (BanId, bool) {
+        // Keyed by address: every ban passed to this context is borrowed for
+        // its lifetime `'a`, so one address is one record. Debug builds check
+        // that a hit is the same record.
         let key: *const AuthorizedUserBan = ban;
         if let Some(known) = self.per_ban.borrow().get(&key) {
+            debug_assert!(
+                known.0 == ban.id(),
+                "a cached ban entry names another record"
+            );
             return known.clone();
         }
         let ok = BansV1::ban_signature_matches_current_key(

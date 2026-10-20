@@ -108,9 +108,9 @@
 //!   conversation but nothing bounded the set as a whole, and because
 //!   `ChatRoomStateV1::post_apply_cleanup` exempts every DM participant from
 //!   inactivity-prune (via [`DirectMessagesV1::participants_of_surviving_dms`]), an
-//!   unbounded DM set pinned an unbounded member set. Enforced in
-//!   `apply_delta` only, NEVER in `verify` — see the note on
-//!   [`DmRetentionHorizon`] and `trim_to_global_cap`.
+//!   unbounded DM set pinned an unbounded member set. Enforced by
+//!   `post_apply_cleanup` (step 6, after the sweep), NEVER in `verify` — see
+//!   the note on [`DmRetentionHorizon`] and `trim_to_global_cap`.
 //! - [`MAX_DM_MESSAGES_PER_PAIR`]: per (sender, recipient) ordered pair.
 //! - [`MAX_DM_CIPHERTEXT_BYTES`]: per-message ciphertext size cap.
 //! - [`MAX_PURGED_TOMBSTONES_PER_RECIPIENT`]: cap on per-recipient
@@ -863,15 +863,11 @@ fn member_ids_of(members_by_id: &HashMap<MemberId, &AuthorizedMember>) -> HashSe
 /// # Why this exists
 ///
 /// It is what lets the apply-time sweep use the FULL step-6 predicate instead
-/// of a membership-only approximation. Without it, a **deputy-issued** ban left
-/// its target a member through this field's apply — `MembersV1::apply_delta` is
-/// handed an empty `MemberInfoV1`, so it can only enforce owner and ancestor
-/// authority, and a deputy grant lives in `member_info.deputies` where it
-/// cannot see it. The target's DMs were therefore still ranked by
-/// [`trim_to_global_cap`] and only removed afterwards by step 6: the
-/// freenet/river#671 data loss, reachable on the flow the Official room's
-/// moderators actually use. Measured on that reproduction, five legitimate DMs
-/// were destroyed per merge; with this, zero.
+/// of a membership-only approximation, so the apply never deletes a DM that
+/// cleanup keeps and never keeps one cleanup deletes: the sweep must see a
+/// **deputy-issued** ban, whose grant lives in `member_info.deputies`, as
+/// step 0 does (freenet/river#671, #675). The DM caps themselves run only in
+/// cleanup, after step 6.
 ///
 /// An earlier revision of this file asserted the enforced-ban set was "not
 /// knowable here" and treated membership-only as forced. It was not knowable
@@ -1642,7 +1638,7 @@ pub enum DmRetentionHorizon {
 ///
 /// # Why this exists
 ///
-/// [`DirectMessagesV1::apply_delta`] caps each ordered pair at
+/// `post_apply_cleanup` caps each ordered pair at
 /// [`MAX_DM_MESSAGES_PER_PAIR`], which makes the merge non-monotonic in exactly
 /// the way [`crate::room_state::message::RetentionHorizon`] documents for room
 /// messages. Without a horizon, `delta` is a pure signature-set difference: a

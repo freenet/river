@@ -366,8 +366,9 @@ cannot leave a thread partially swept. Note it now runs at TWO points — inside
 the one that fires first in the common case. Both are the same function, so the
 per-pair atomicity holds at either.
 
-`trim_to_global_cap` is NOT per-pair-atomic and never was — it keeps the newest
-N room-wide, so it can leave a thread partially present. That is a pre-existing
+`trim_to_global_cap` (cleanup step 6, after the sweep) is NOT per-pair-atomic
+and never was — it keeps the newest N room-wide, so it can leave a thread
+partially present. That is a pre-existing
 caveat this invariant has always carried rather than something #671 introduced;
 the archive cutoff is anchored on the pair's inbound max, which is unaffected by
 how many of the pair's DMs the global trim happened to keep.

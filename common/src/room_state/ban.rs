@@ -30,22 +30,16 @@ use std::time::SystemTime;
 /// current member, or a member held in `ban_evidence` (a removed or pruned
 /// member whom a stored ban still references), and its signature must verify
 /// against that record's key. [`crate::room_state::ChatRoomStateV1::post_apply_cleanup`]
-/// sweeps any ban whose issuer is known nowhere. The `max_user_bans` cap is
-/// enforced there too, by recency within an owner pool and an everyone-else
-/// pool, each guaranteed `max_user_bans / 2` (see
-/// [`Self::enforce_user_ban_cap`]), and
-/// [`ComposableState::apply_delta`] bounds a single delta to `max_user_bans`
-/// new bans so a forged flood cannot make signature verification unbounded.
+/// sweeps any ban whose issuer is known nowhere, and any ban whose issuer is
+/// deeper in the invite tree than the ban evidence depth cap. The
+/// `max_user_bans` cap is enforced there too, in a fixed authority order
+/// (owner bans first, up to `max_user_bans / 2`, then by how high in the
+/// invite tree each ban's authority sits; see [`Self::enforce_user_ban_cap`]),
+/// and [`ComposableState::apply_delta`] bounds a single delta to
+/// `max_user_bans` new bans so signature verification stays bounded.
 ///
-/// KNOWN, ACCEPTED, self-limiting residual (Ian confirmed, #411 round 3 D;
-/// widened by #796): a current member can flood bans against ABSENT targets
-/// (each such ban takes effect because its issuer is not removed), and
-/// `banned_at` is signed by the issuer, so they can evict older non-owner
-/// bans and owner bans beyond the newest `max_user_bans / 2` (see
-/// [`Self::enforce_user_ban_cap`]). The
-/// flooder is identifiable on every junk ban, and an OWNER ban makes all of
-/// their bans inert. The second #411 residual (slot-squatting through the
-/// banner prune exemption, which #702 keeps for fixpoint stability) remains.
+/// An owner ban on a member makes all of that member's bans inert, and the
+/// cap then keeps them only in slots no ban that takes effect needs.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
@@ -462,7 +456,7 @@ impl ComposableState for BansV1 {
     ///   (`verify_ban_signatures`), AND
     /// - the number of bans does not exceed `max_user_bans` (the hard ceiling
     ///   on stored state; a legitimately-produced state is already ≤ the cap
-    ///   because `post_apply_cleanup` evicts inert-first down to it).
+    ///   because `post_apply_cleanup` caps it).
     fn verify(
         &self,
         parent_state: &Self::ParentState,
@@ -525,14 +519,13 @@ impl ComposableState for BansV1 {
     /// - Adds the new bans to the collection
     ///
     /// It deliberately does NOT enforce `max_user_bans` here. The cap is
-    /// enforced in `ChatRoomStateV1::post_apply_cleanup`, which evicts INERT
-    /// (currently-unauthorized) bans before enforcing ones — using the converged
-    /// `member_info`, which is not yet available at this point in the field-apply
-    /// order. Capping here (by oldest, as before) would let a flood of
-    /// forged/inert bans evict the real moderator bans and un-ban spammers
-    /// (#410 review round 1). The transient over-cap set is capped by
-    /// post_apply_cleanup at the end of the same whole-state apply; `verify`
-    /// still rejects any stored state that is over the cap.
+    /// enforced in `ChatRoomStateV1::post_apply_cleanup`, which keeps bans in
+    /// its fixed authority order judged over the converged state (the
+    /// `member_info` deputy grants are not yet applied at this point in the
+    /// field-apply order). Capping here would judge bans before the grants
+    /// that decide whether they take effect (#410 review round 1). The
+    /// transient over-cap set is capped by post_apply_cleanup at the end of
+    /// the same apply; `verify` still rejects any stored state over the cap.
     ///
     /// Returns an error if the delta carries more new bans than the work bound
     /// allows. A new ban whose known issuer's key does not verify it is
@@ -842,15 +835,22 @@ mod ban_digest_golden {
     }
 }
 
-/// The ban signature checks of one cleanup or whole-state merge, remembered
-/// so each ban is verified at most once however many times the ban cap (in
-/// the DM apply's enforced-ban set and in cleanup), the cleanup steps and the
-/// fixpoint passes ask. The last ban cap computed (inputs digest and
-/// choice) is remembered too, outside any scope, so the cap runs once for
-/// the inputs the DM apply and cleanup share. Keyed by the signature, the verifying key and every
-/// field of the signed record, the whole input of the check (two bans can
-/// share signature bytes), so a remembered answer is the answer the check
-/// would give. Active only inside [`active_while`].
+/// Two caches for the ban cap's cost, both exact.
+///
+/// - The signature memo: the ban signature checks of one cleanup or
+///   whole-state merge, remembered so each ban is verified at most once
+///   however many times the cap, the cleanup steps and the fixpoint passes
+///   ask. Keyed by the signature, the verifying key and every field of the
+///   signed record, the whole input of the check (two bans can share
+///   signature bytes), so a remembered answer is the answer the check would
+///   give. Active only inside [`active_while`]; outside it nothing is
+///   remembered.
+/// - The last cap: the inputs digest and choice of the last ban cap computed
+///   on this thread, kept outside any scope (one entry, at most
+///   `max_user_bans` bans), so the DM apply's enforced-ban set and cleanup
+///   step 0-cap, which judge the same inputs, run the cap once on every
+///   apply path. The digest is BLAKE3 over the CBOR of every input the cap
+///   reads; a hit returns the choice those inputs determine.
 pub(crate) mod signature_memo {
     use crate::room_state::member::MemberId;
     use std::cell::RefCell;

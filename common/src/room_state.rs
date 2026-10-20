@@ -844,9 +844,9 @@ impl ChatRoomStateV1 {
             // kept as evidence, even when another ban names it: such a
             // record reaching this point as a member was removed by step 0,
             // so keeping it only when it arrived as evidence made the result
-            // depend on how the record arrived (freenet/river#703 review). Nothing needs it: a ban its member issued is swept in
-            // step 4, and a ban naming it ranks as one whose target is held
-            // nowhere. `BanEvidenceV1::verify` checks stored evidence against
+            // depend on how the record arrived (freenet/river#703 review).
+            // Nothing needs it: a ban its member issued is swept in step 4,
+            // and a ban naming it ranks as one whose target is held nowhere. `BanEvidenceV1::verify` checks stored evidence against
             // `referenced_by_bans`, which this only narrows.
             // Walked through the records that can be kept only, so a record
             // referenced only through an owner-removed descendant is not kept
@@ -3144,8 +3144,7 @@ mod tests {
         // State D: the same shape, but the counterparty is banned by a DEPUTY
         // rather than the owner. `post_apply_cleanup` sees the converged
         // `member_info`, so step 0 DOES enforce this ban (freenet/river#675).
-        // Cleanup must
-        // still be a fixpoint.
+        // Cleanup must still be a fixpoint.
         {
             let dep_sk = SigningKey::generate(rng);
             let m_sk = SigningKey::generate(rng);

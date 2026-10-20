@@ -58,8 +58,8 @@ pub struct MessageOrderKey {
 ///
 /// # Why this exists
 ///
-/// The merge (`post_apply_cleanup`) DROPS the oldest messages over `max_recent_messages`, which
-/// makes the merge non-monotonic: without a horizon, `delta` is a pure
+/// The merge (`post_apply_cleanup`) DROPS the oldest messages over
+/// `max_recent_messages`, which makes the merge non-monotonic: without a horizon, `delta` is a pure
 /// "everything you don't have" set-difference, so a peer holding an older
 /// window re-offers the same messages on every fan-out, the receiver re-prunes
 /// them, and neither side's summary ever changes. `delta` never returns `None`,
