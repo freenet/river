@@ -1376,6 +1376,90 @@ impl ComposableState for DirectMessagesV1 {
 /// Every step is a pure function of the held set, so the composition is too:
 /// two peers reaching the same union converge to the same state, and running
 /// this twice changes nothing after the first pass (idempotent).
+/// The members of the DMs that survive a membership sweep and the caps,
+/// computed once per member-loop pass from an index of the stored DMs
+/// rather than a copy of them (their ciphertext is never read).
+pub(crate) struct DmParticipantIndex {
+    /// Each stored DM's (sender, recipient, order key), in stored order.
+    messages: Vec<(MemberId, MemberId, DmOrderKey)>,
+    purge_recipients: Vec<MemberId>,
+}
+
+impl DmParticipantIndex {
+    pub(crate) fn new(s: &DirectMessagesV1) -> Self {
+        DmParticipantIndex {
+            messages: s
+                .messages
+                .iter()
+                .map(|m| (m.message.sender, m.message.recipient, m.order_key()))
+                .collect(),
+            purge_recipients: s.purges.iter().map(|p| p.recipient_id).collect(),
+        }
+    }
+
+    /// What `participants_of_surviving_dms` gives on a copy of the DMs after
+    /// `sweep_after_membership_change` and `enforce_caps_and_sort`, step for
+    /// step: the sweep, the signature dedup (first kept), the per-pair cap
+    /// (newest kept) and the global cap (newest kept). Sorting changes no
+    /// participant, so it is not done.
+    pub(crate) fn participants(
+        &self,
+        owner_id: MemberId,
+        active_member_ids: &HashSet<MemberId>,
+        banned_ids: &HashSet<MemberId>,
+        max_direct_messages: usize,
+    ) -> HashSet<MemberId> {
+        let alive = |id: MemberId| dm_endpoint_is_live(id, owner_id, active_member_ids, banned_ids);
+        let mut seen: HashSet<SignatureBytes> = HashSet::new();
+        let mut kept: Vec<&(MemberId, MemberId, DmOrderKey)> = self
+            .messages
+            .iter()
+            .filter(|(from, to, _)| alive(*from) && alive(*to))
+            .filter(|(_, _, key)| seen.insert(key.signature))
+            .collect();
+        if kept.len() > MAX_DM_MESSAGES_PER_PAIR {
+            let mut by_pair: HashMap<(MemberId, MemberId), Vec<&DmOrderKey>> = HashMap::new();
+            for (from, to, key) in &kept {
+                by_pair.entry((*from, *to)).or_default().push(key);
+            }
+            let mut dropped: HashSet<SignatureBytes> = HashSet::new();
+            for keys in by_pair.values_mut() {
+                if keys.len() > MAX_DM_MESSAGES_PER_PAIR {
+                    keys.sort();
+                    let excess = keys.len() - MAX_DM_MESSAGES_PER_PAIR;
+                    dropped.extend(keys.iter().take(excess).map(|k| k.signature));
+                }
+            }
+            if !dropped.is_empty() {
+                kept.retain(|(_, _, key)| !dropped.contains(&key.signature));
+            }
+        }
+        if kept.len() > max_direct_messages {
+            if max_direct_messages == 0 {
+                kept.clear();
+            } else {
+                let mut keys: Vec<&DmOrderKey> = kept.iter().map(|(_, _, key)| key).collect();
+                let excess = keys.len() - max_direct_messages;
+                keys.select_nth_unstable(excess);
+                let cutoff = keys[excess].clone();
+                kept.retain(|(_, _, key)| *key >= cutoff);
+            }
+        }
+        let mut out = HashSet::with_capacity(kept.len() * 2 + self.purge_recipients.len());
+        for (from, to, _) in kept {
+            out.insert(*from);
+            out.insert(*to);
+        }
+        out.extend(
+            self.purge_recipients
+                .iter()
+                .copied()
+                .filter(|id| alive(*id)),
+        );
+        out
+    }
+}
+
 pub(crate) fn enforce_caps_and_sort(s: &mut DirectMessagesV1, max_direct_messages: usize) {
     dedup_by_signature(s);
     trim_pairs_to_cap(s);
@@ -1684,4 +1768,76 @@ mod tests {
     // Unit tests for this module live in
     // `common/tests/direct_messages_test.rs` so they exercise the
     // public API the same way downstream consumers will.
+}
+
+#[cfg(test)]
+mod participant_index_tests {
+    use super::*;
+
+    fn key(b: u64) -> SigningKey {
+        let mut x = [0u8; 32];
+        x[..8].copy_from_slice(&b.to_le_bytes());
+        x[31] = 47;
+        SigningKey::from_bytes(&x)
+    }
+
+    /// `DmParticipantIndex::participants` against what the member loop's
+    /// plain pass does (a copy of the DMs, swept, capped, then
+    /// `participants_of_surviving_dms`), on generated DM sets: pairs over the
+    /// per-pair cap, repeated DMs, global caps from 0 up, and active and
+    /// banned sets drawn at random.
+    #[test]
+    fn the_index_gives_the_participants_the_copy_gives() {
+        let owner = key(1);
+        let owner_id: MemberId = owner.verifying_key().into();
+        let keys: Vec<SigningKey> = (0..6u64).map(|i| key(10 + i)).collect();
+        let ids: Vec<MemberId> = keys.iter().map(|k| k.verifying_key().into()).collect();
+        let mut seed = 0xd1_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n.max(1)
+        };
+        for round in 0..120 {
+            let mut messages = Vec::new();
+            for pair in 0..next(5) + 1 {
+                let from = next(7) as usize;
+                let to = (from + 1 + next(6) as usize) % 7;
+                let k = |i: usize| if i == 6 { &owner } else { &keys[i] };
+                let id = |i: usize| if i == 6 { owner_id } else { ids[i] };
+                let count = [1, 3, 60, 101, 140][next(5) as usize];
+                let base = next(1_000);
+                for t in 0..count {
+                    let m = sign_direct_message(
+                        k(from),
+                        id(from),
+                        id(to),
+                        &owner.verifying_key(),
+                        1_700_000_000 + base + t * (1 + pair),
+                        vec![round as u8; 4],
+                    )
+                    .unwrap();
+                    if next(20) == 0 {
+                        messages.push(m.clone());
+                    }
+                    messages.push(m);
+                }
+            }
+            let held = DirectMessagesV1 {
+                messages,
+                ..Default::default()
+            };
+            let active: HashSet<MemberId> = ids.iter().copied().filter(|_| next(5) != 0).collect();
+            let banned: HashSet<MemberId> = ids.iter().copied().filter(|_| next(8) == 0).collect();
+            let cap = [0, 5, 50, 120, 300][next(5) as usize];
+
+            let mut copy = held.clone();
+            copy.sweep_after_membership_change(owner_id, &active, &banned);
+            enforce_caps_and_sort(&mut copy, cap);
+            let expected = copy.participants_of_surviving_dms(owner_id, &active, &banned);
+            let got = DmParticipantIndex::new(&held).participants(owner_id, &active, &banned, cap);
+            assert_eq!(got, expected, "round {round}, cap {cap}");
+        }
+    }
 }

@@ -29,6 +29,7 @@ pub mod cleanup_counters {
         static BOUND_REACHED: Cell<usize> = const { Cell::new(0) };
         static INVITE_TREE_STEPS: Cell<usize> = const { Cell::new(0) };
         static MEMBER_RECORDS_BUILT: Cell<usize> = const { Cell::new(0) };
+        static MEMBER_LOOP_DMS_COPIED: Cell<usize> = const { Cell::new(0) };
     }
 
     /// The counters since the last [`reset`]: (ban signatures verified,
@@ -61,7 +62,14 @@ pub mod cleanup_counters {
         MEMBER_RECORDS_BUILT.with(|c| c.get())
     }
 
+    /// Direct messages the member loop's passes copied since the last
+    /// [`reset`].
+    pub fn member_loop_dms_copied() -> usize {
+        MEMBER_LOOP_DMS_COPIED.with(|c| c.get())
+    }
+
     pub fn reset() {
+        MEMBER_LOOP_DMS_COPIED.with(|c| c.set(0));
         MEMBER_RECORDS_BUILT.with(|c| c.set(0));
         INVITE_TREE_STEPS.with(|c| c.set(0));
         BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(0));
@@ -77,6 +85,12 @@ pub mod cleanup_counters {
     pub(crate) fn count_ban_signature_verification() {
         if !PAUSED.with(|p| p.get()) {
             BAN_SIGNATURE_VERIFICATIONS.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    pub(crate) fn count_member_loop_dms_copied(n: usize) {
+        if !PAUSED.with(|p| p.get()) {
+            MEMBER_LOOP_DMS_COPIED.with(|c| c.set(c.get() + n));
         }
     }
 
@@ -1011,8 +1025,9 @@ impl ChatRoomStateV1 {
     /// A pass can cap out a single member, so with a message window just
     /// over `max_members` the loop runs about one pass per member. Each pass
     /// therefore reads only what it needs: the held set is kept up to date
-    /// as ids leave it, the messages are put in window order once, and the
-    /// pass's members are built from the ids it needs. The result is the one
+    /// as ids leave it, the messages are put in window order once, the DMs
+    /// are read through an index without their ciphertext, and the pass's
+    /// members are built from the ids it needs. The result is the one
     /// the plain pass ([`Self::prune_and_cap_members`], kept for tests)
     /// gives on the same held set.
     fn member_loop(
@@ -1022,7 +1037,12 @@ impl ChatRoomStateV1 {
         enforced_banned_ids: &HashSet<MemberId>,
     ) -> HashSet<MemberId> {
         let candidates = self.members.members.clone();
-        let mut lp = MemberLoop::new(&candidates, &self.recent_messages, owner_id);
+        let mut lp = MemberLoop::new(
+            &candidates,
+            &self.recent_messages,
+            &self.direct_messages,
+            owner_id,
+        );
         let mut required_ids = HashSet::new();
         for _ in 0..=candidates.len() {
             let required =
@@ -1088,17 +1108,14 @@ impl ChatRoomStateV1 {
         lp.newest_first = order;
 
         let held = &lp.held;
-        let dm_participants: HashSet<MemberId> = {
-            let mut dms = self.direct_messages.clone();
-            dms.sweep_after_membership_change(owner_id, held, enforced_banned_ids);
-            crate::room_state::direct_messages::enforce_caps_and_sort(
-                &mut dms,
-                self.configuration
-                    .configuration
-                    .effective_max_direct_messages(),
-            );
-            dms.participants_of_surviving_dms(owner_id, held, enforced_banned_ids)
-        };
+        let dm_participants = lp.dms.participants(
+            owner_id,
+            held,
+            enforced_banned_ids,
+            self.configuration
+                .configuration
+                .effective_max_direct_messages(),
+        );
         let current_secret_version = self.secrets.current_version;
         let secret_recipients = self
             .secrets
@@ -1265,6 +1282,7 @@ impl ChatRoomStateV1 {
         };
         let dm_participants: HashSet<MemberId> = {
             let mut dms = self.direct_messages.clone();
+            cleanup_counters::count_member_loop_dms_copied(dms.messages.len());
             dms.sweep_after_membership_change(owner_id, &members_now, enforced_banned_ids);
             crate::room_state::direct_messages::enforce_caps_and_sort(
                 &mut dms,
@@ -1338,10 +1356,17 @@ struct MemberLoop<'c> {
     /// Message authors, newest message first (the order the window takes),
     /// less messages already found not live.
     newest_first: Vec<MemberId>,
+    /// The stored DMs, for the participants of those a pass keeps.
+    dms: crate::room_state::direct_messages::DmParticipantIndex,
 }
 
 impl<'c> MemberLoop<'c> {
-    fn new(candidates: &'c [AuthorizedMember], messages: &MessagesV1, owner_id: MemberId) -> Self {
+    fn new(
+        candidates: &'c [AuthorizedMember],
+        messages: &MessagesV1,
+        direct_messages: &DirectMessagesV1,
+        owner_id: MemberId,
+    ) -> Self {
         let mut records_of: std::collections::HashMap<MemberId, Vec<usize>> = Default::default();
         let mut invited_by: std::collections::HashMap<MemberId, Vec<usize>> = Default::default();
         let mut by_id = std::collections::HashMap::new();
@@ -1366,6 +1391,7 @@ impl<'c> MemberLoop<'c> {
             by_id,
             held: HashSet::new(),
             newest_first: order.into_iter().map(|(_, a)| a).collect(),
+            dms: crate::room_state::direct_messages::DmParticipantIndex::new(direct_messages),
         };
         // The first pass holds every candidate id with a record whose
         // inviter is the owner or held: drop ids until none is left without
@@ -4939,18 +4965,44 @@ mod member_loop_tests {
         )
     }
     fn room(o: &SigningKey, max_members: usize, max_msgs: usize) -> ChatRoomStateV1 {
+        room_with_dm_cap(o, max_members, max_msgs, None)
+    }
+    fn room_with_dm_cap(
+        o: &SigningKey,
+        max_members: usize,
+        max_msgs: usize,
+        max_direct_messages: Option<usize>,
+    ) -> ChatRoomStateV1 {
         ChatRoomStateV1 {
             configuration: AuthorizedConfigurationV1::new(
                 Configuration {
                     owner_member_id: id(o),
                     max_members,
                     max_recent_messages: max_msgs,
+                    max_direct_messages,
                     ..Default::default()
                 },
                 o,
             ),
             ..Default::default()
         }
+    }
+    fn dm(
+        o: &SigningKey,
+        from: &SigningKey,
+        to: &SigningKey,
+        t: u64,
+        bytes: usize,
+    ) -> crate::room_state::direct_messages::AuthorizedDirectMessage {
+        crate::room_state::direct_messages::sign_direct_message(
+            from,
+            id(from),
+            id(to),
+            &o.verifying_key(),
+            1_700_000_000 + t,
+            vec![7u8; bytes],
+        )
+        .expect("a DM")
     }
     fn params(o: &SigningKey) -> ChatRoomParametersV1 {
         ChatRoomParametersV1 {
@@ -4990,6 +5042,31 @@ mod member_loop_tests {
     fn the_member_loop_matches_the_reference_on_fixed_shapes() {
         let (s, p) = window_just_over_the_cap(60);
         assert_both_loops_agree(&s, &p, "window just over the cap");
+
+        // The same with DMs: 130 between two members (over the per-pair cap
+        // of 100), a duplicate, and DMs between other pairs; then with a
+        // global DM cap below the count.
+        for dm_cap in [None, Some(40), Some(0)] {
+            let o = key(1);
+            let (mut s, p) = window_just_over_the_cap(60);
+            s.configuration = room_with_dm_cap(&o, 10, 11, dm_cap).configuration;
+            let keys: Vec<SigningKey> = (0..60u64).map(|i| key(100 + i)).collect();
+            let mut dms: Vec<_> = (0..130u64)
+                .map(|t| dm(&o, &keys[59], &keys[58], t, 16))
+                .collect();
+            dms.push(dms[3].clone());
+            for i in 0..40usize {
+                dms.push(dm(
+                    &o,
+                    &keys[i],
+                    &keys[(i * 7 + 1) % 60],
+                    500 + i as u64,
+                    16,
+                ));
+            }
+            s.direct_messages.messages = dms;
+            assert_both_loops_agree(&s, &p, &format!("with DMs, cap {dm_cap:?}"));
+        }
 
         // A chain, a second record for a member under another inviter, two
         // ids that only invite each other, a member whose inviter is held
@@ -5042,7 +5119,16 @@ mod member_loop_tests {
             let ks: Vec<SigningKey> = (0..n as u64)
                 .map(|i| key(1_000 * (round + 1) + i))
                 .collect();
-            let mut s = room(&o, 1 + next(n as u64) as usize, next(n as u64 + 3) as usize);
+            let dm_cap = match next(3) {
+                0 => None,
+                _ => Some(next(8) as usize),
+            };
+            let mut s = room_with_dm_cap(
+                &o,
+                1 + next(n as u64) as usize,
+                next(n as u64 + 3) as usize,
+                dm_cap,
+            );
             let mut members = Vec::new();
             for i in 0..n {
                 let inviter = match next(8) {
@@ -5063,6 +5149,14 @@ mod member_loop_tests {
             s.bans.0 = (0..next(4))
                 .map(|t| ban(ow, &ks[next(n as u64) as usize], id(&key(5_000_000 + t)), t))
                 .collect();
+            let mut dms = Vec::new();
+            for t in 0..next(12) {
+                let from = next(n as u64) as usize;
+                let to = (from + 1 + next(n as u64 - 1) as usize) % n;
+                let from_key = if next(5) == 0 { &o } else { &ks[from] };
+                dms.push(dm(&o, from_key, &ks[to], next(20) * 10 + t, 8));
+            }
+            s.direct_messages.messages = dms;
             let who = &ks[next(n as u64) as usize];
             s.member_info.member_info = vec![AuthorizedMemberInfo::new_with_member_key(
                 MemberInfo::new_public(id(who), 1, "x".into()),
@@ -5074,11 +5168,23 @@ mod member_loop_tests {
 
     /// With the window one over `max_members`, the loop caps out one member
     /// per pass, so it runs about one pass per member. Each pass builds only
-    /// the members it needs (about the window), not every candidate.
+    /// the members it needs (about the window), not every candidate, and
+    /// reads the DMs through an index rather than a copy.
     #[test]
     fn a_window_just_over_the_member_cap_keeps_each_pass_small() {
         let n = 400;
         let (mut s, p) = window_just_over_the_cap(n);
+        // A full default DM set among the members the cap keeps last (the
+        // lowest ids), so the DMs stay through every pass.
+        let o = key(1);
+        let mut keys: Vec<SigningKey> = (0..n as u64).map(|i| key(100 + i)).collect();
+        keys.sort_by_key(id);
+        s.direct_messages.messages = (0..300u64)
+            .map(|t| {
+                let i = t as usize % 10;
+                dm(&o, &keys[i], &keys[(i + 1) % 10], t, 1_024)
+            })
+            .collect();
         cleanup_counters::reset();
         s.post_apply_cleanup(&p).unwrap();
         let built = cleanup_counters::member_records_built();
@@ -5086,6 +5192,11 @@ mod member_loop_tests {
         assert!(
             built <= 20 * n,
             "{built} member records built for {n} members"
+        );
+        assert_eq!(
+            cleanup_counters::member_loop_dms_copied(),
+            0,
+            "no pass copies the DMs"
         );
     }
 
