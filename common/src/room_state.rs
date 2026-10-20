@@ -1566,9 +1566,12 @@ mod tests {
     use std::time::SystemTime;
 
     /// Over its bound, a network delta's ban evidence keeps the shallowest
-    /// records, its bans keep what the ban cap keeps at the bound (here the
-    /// owner's live ban and the newest of the rest), and evidence only a
-    /// trimmed ban references is not sent (freenet/river#703).
+    /// records, and its bans keep what the ban cap keeps at the bound, judged
+    /// in the sender's state: only the owner's ban when the sender holds no
+    /// record of the other bans' issuer (no one could verify them), the
+    /// owner's ban and the newest live bans of a member it does hold
+    /// otherwise; evidence only a trimmed ban references is not sent
+    /// (freenet/river#703).
     #[test]
     fn a_network_delta_trim_keeps_what_the_caps_keep() {
         let owner_sk = SigningKey::from_bytes(&[1; 32]);
@@ -1691,6 +1694,44 @@ mod tests {
         assert!(
             next.as_ref().is_none_or(|d| d.bans.is_none()),
             "no ban is left to send"
+        );
+
+        // The same bans when the sender holds their issuer's record: the
+        // issuer's bans are live (their targets are held nowhere, or are
+        // evidence it may reach), so the trim keeps the owner's ban and the
+        // newest of them up to the bound.
+        let mut sender = sender.clone();
+        let issuer = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member_sk.verifying_key(),
+            },
+            &owner_sk,
+        );
+        sender.members.members.push(issuer);
+        let mut delta = ChatRoomStateV1Delta {
+            bans: Some(sender.bans.0.clone()),
+            ..Default::default()
+        };
+        trim_to_work_bounds(&mut delta, &config, &sender, &summary, &parameters);
+        let trimmed = delta.bans.unwrap();
+        assert_eq!(trimmed.len(), MIN_BANS_DELTA_BOUND);
+        assert!(trimmed.contains(&owner_ban));
+        let newest_member_ban = sender
+            .bans
+            .0
+            .iter()
+            .filter(|b| b.banned_by != owner_id)
+            .max_by_key(|b| b.ban.banned_at)
+            .unwrap();
+        assert!(
+            trimmed.contains(newest_member_ban),
+            "the newest live ban is sent"
+        );
+        assert!(
+            trimmed.iter().filter(|b| b.banned_by != owner_id).count() == MIN_BANS_DELTA_BOUND - 1,
+            "the rest of the bound is the member's live bans"
         );
     }
 
