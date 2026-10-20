@@ -286,3 +286,104 @@ fn the_member_cap_counts_only_members_cleanup_keeps() {
         "K (newest message) and its inviter Q fill the member cap"
     );
 }
+
+/// P (owner-invited) and K (three invites down: A1 -> A2 -> K), and a room
+/// lowered to `max_members = 2` with one slot for a message or a DM. K's
+/// record is newest but K needs three member slots, so the member cap
+/// removes K; the record kept is then P's older one, by a member that fits,
+/// rather than nothing.
+fn deep_and_shallow(r: &Room) -> (SigningKey, SigningKey, Vec<AuthorizedMember>) {
+    let (p, a1, a2, k) = (sk(0x51), sk(0x52), sk(0x53), sk(0x54));
+    let members = vec![
+        r.member(&p, &r.owner),
+        r.member(&a1, &r.owner),
+        r.member(&a2, &a1),
+        r.member(&k, &a2),
+    ];
+    (p, k, members)
+}
+
+fn lowered(
+    r: &Room,
+    held: &ChatRoomStateV1,
+    f: impl FnOnce(&mut Configuration),
+) -> ChatRoomStateV1 {
+    let mut c = held.configuration.configuration.clone();
+    c.configuration_version += 1;
+    f(&mut c);
+    let delta = ChatRoomStateV1Delta {
+        configuration: Some(AuthorizedConfigurationV1::new(c, &r.owner)),
+        ..Default::default()
+    };
+    let mut out = held.clone();
+    out.apply_delta(held, &r.params, &Some(delta))
+        .expect("apply");
+    out.verify(&out, &r.params).expect("verifies");
+    let mut again = out.clone();
+    again.merge_from(&r.params, &out).expect("self-merge");
+    assert!(ser(&again) == ser(&out), "a fixpoint");
+    out
+}
+
+#[test]
+fn lowering_the_member_and_message_caps_keeps_the_newest_message_whose_author_fits() {
+    let r = Room::new();
+    let (p, k, members) = deep_and_shallow(&r);
+    let mut held = ChatRoomStateV1 {
+        configuration: r.cfg(1, 10, 10, 10),
+        members: MembersV1 { members },
+        ..Default::default()
+    };
+    held.recent_messages.messages = vec![r.msg(&p, 100), r.msg(&k, 200)];
+    let held = r.merge(&held, &held);
+    assert_eq!(held.members.members.len(), 4, "premise");
+    let out = lowered(&r, &held, |c| {
+        c.max_members = 2;
+        c.max_recent_messages = 1;
+    });
+    let ids: Vec<MemberId> = out.members.members.iter().map(|m| m.member.id()).collect();
+    assert_eq!(ids, vec![MemberId::from(p.verifying_key())], "P stays");
+    assert_eq!(out.recent_messages.messages.len(), 1, "P's message stays");
+    assert_eq!(
+        out.recent_messages.messages[0].message.author,
+        MemberId::from(p.verifying_key())
+    );
+}
+
+#[test]
+fn lowering_the_member_and_dm_caps_keeps_the_newest_dm_whose_sender_fits() {
+    use river_core::room_state::direct_messages::sign_direct_message;
+    let r = Room::new();
+    let (p, k, members) = deep_and_shallow(&r);
+    let dm = |from: &SigningKey, ts: u64| {
+        sign_direct_message(
+            from,
+            from.verifying_key().into(),
+            r.oid,
+            &r.params.owner,
+            1_700_000_000 + ts,
+            vec![1; 8],
+        )
+        .expect("sign dm")
+    };
+    let mut held = ChatRoomStateV1 {
+        configuration: r.cfg(1, 10, 10, 10),
+        members: MembersV1 { members },
+        ..Default::default()
+    };
+    held.direct_messages.messages = vec![dm(&p, 100), dm(&k, 200)];
+    let held = r.merge(&held, &held);
+    assert_eq!(held.members.members.len(), 4, "premise");
+    assert_eq!(held.direct_messages.messages.len(), 2, "premise");
+    let out = lowered(&r, &held, |c| {
+        c.max_members = 2;
+        c.max_direct_messages = Some(1);
+    });
+    let ids: Vec<MemberId> = out.members.members.iter().map(|m| m.member.id()).collect();
+    assert_eq!(ids, vec![MemberId::from(p.verifying_key())], "P stays");
+    assert_eq!(out.direct_messages.messages.len(), 1, "P's DM stays");
+    assert_eq!(
+        out.direct_messages.messages[0].message.sender,
+        MemberId::from(p.verifying_key())
+    );
+}

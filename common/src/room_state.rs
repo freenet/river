@@ -742,23 +742,40 @@ impl ChatRoomStateV1 {
             .members
             .retain(|m| !enforced_banned_ids.contains(&m.member.id()));
 
-        // 1-3. Inactivity prune and the `max_members` cap, repeated until a
-        //      pass removes no member (`prune_and_cap_members`). The cap
-        //      removes the deepest members of the PRUNED set, and a member it
-        //      removes can leave an ancestor that only it needed, which the
-        //      next pass prunes. Every pass but the last removes at least one
-        //      member, so there are at most (members after step 0) + 1
-        //      passes. The member, message and DM caps are decided here, after
-        //      bans and pruning, never in the field applies, so a member this
-        //      cleanup removes never takes a cap slot.
+        // 1-3. Inactivity prune and the `max_members` cap, repeated until the
+        //      cap removes no one (`prune_and_cap_members`). Each pass starts
+        //      from every member left after step 0 except those an earlier
+        //      pass's CAP removed: a member only pruned (nothing needed it) is
+        //      a candidate again, so when the cap removes the author of the
+        //      newest message, the next pass's message window reaches older
+        //      messages by members who do fit, and their authors are still
+        //      there. The window, the DM caps and the cap itself are decided
+        //      over that pass's members, never in the field applies, so a
+        //      member this cleanup removes never takes a cap slot. Every pass
+        //      but the last caps at least one member out, so there are at most
+        //      (members after step 0) + 1 passes.
         let members_after_ban_enforcement: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
+        let candidates = self.members.members.clone();
+        let mut capped_out: HashSet<MemberId> = HashSet::new();
         let required_ids = loop {
-            let before = self.members.members.len();
+            self.members.members = candidates
+                .iter()
+                .filter(|m| !capped_out.contains(&m.member.id()))
+                .cloned()
+                .collect();
             let required = self.prune_and_cap_members(parameters, owner_id, &enforced_banned_ids);
-            if self.members.members.len() == before {
+            let kept: HashSet<MemberId> =
+                self.members.members.iter().map(|m| m.member.id()).collect();
+            let newly_capped: Vec<MemberId> = required
+                .iter()
+                .filter(|id| !kept.contains(id))
+                .copied()
+                .collect();
+            if newly_capped.is_empty() {
                 break required;
             }
+            capped_out.extend(newly_capped);
         };
 
         // 4. Sweep any ban whose issuer is unknown or whose signature does
