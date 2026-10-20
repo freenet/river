@@ -744,13 +744,36 @@ impl ChatRoomStateV1 {
         // ends within (distinct candidate ids) + 1 passes; the bound makes
         // that structural.
         for _ in 0..=candidates.len() {
+            // This pass's members: the candidates the cap has not removed,
+            // and none whose inviter that leaves out (a member is never held
+            // without its inviter, so the subtree of a capped-out member goes
+            // with it).
+            let mut held: HashSet<MemberId> = candidates
+                .iter()
+                .map(|m| m.member.id())
+                .filter(|id| !capped_out.contains(id))
+                .collect();
+            loop {
+                // An id stays while at least one of its records has its
+                // inviter (the owner or a held id).
+                let anchored: HashSet<MemberId> = candidates
+                    .iter()
+                    .filter(|m| {
+                        m.member.invited_by == owner_id || held.contains(&m.member.invited_by)
+                    })
+                    .map(|m| m.member.id())
+                    .collect();
+                let before = held.len();
+                held.retain(|id| anchored.contains(id));
+                if held.len() == before {
+                    break;
+                }
+            }
             self.members.members = candidates
                 .iter()
-                .filter(|m| !capped_out.contains(&m.member.id()))
+                .filter(|m| held.contains(&m.member.id()))
                 .cloned()
                 .collect();
-            let held: HashSet<MemberId> =
-                self.members.members.iter().map(|m| m.member.id()).collect();
             let required = self.prune_and_cap_members(parameters, owner_id, &enforced_banned_ids);
             let kept: HashSet<MemberId> =
                 self.members.members.iter().map(|m| m.member.id()).collect();
