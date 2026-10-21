@@ -20,21 +20,32 @@ globs:
 An arrival scrolls a room or a DM thread to its newest message only when
 both of these hold at the moment it arrives:
 
-1. **The conversation is in the foreground** (`foreground::in_foreground`):
-   the tab is visible and the history has layout (on mobile, the chat panel
-   is the one showing). For the room, no DM thread is open
-   (`OPEN_DM_THREAD`). No other dialog or popover counts, the thread's own
-   confirmation included.
+1. **The history has layout** (on mobile, the chat panel is the one
+   showing). The tab need not be visible, and a DM thread open over the room
+   does not stop the room following: a reader who left the end in view (a
+   background tab, an occluded or minimized window, a phone with its screen
+   off, a DM thread) comes back to the end. Gated on the foreground, such a
+   reader would stay parked above every arrival, and once the newest message
+   sat past the band no later arrival would follow either.
 2. **The reader is at the end or near it:** before the patch, the newest
    item's bottom (`bottom-sentinel` / `dm-bottom-sentinel`, the same edge as
    Latest and the read rule, not the scroller's absolute end) sits at most
    `FOLLOW_BAND_PX` (100) below the view's bottom edge, in a room and in a DM
    thread alike.
 
+Following does not get around the read rule, which still requires the
+foreground (`foreground::in_foreground`: the tab visible, the history with
+layout, and for the room no DM thread open). Arrivals followed while away stay
+unread until the reader is back. Then the newest is on screen, and the read
+rule marks everything up to it read, including arrivals that scrolled above
+the view while the reader was away, as it does for a burst in a visible tab.
+An unread divider ([#459](https://github.com/freenet/river/issues/459)) is
+what would show the reader where they left off.
+
 **Only an arrival follows.** A tab becoming visible, a DM thread closing, or a
-mobile panel revealing the chat never scrolls: messages that arrived in the
-meantime stay below, Latest appears, and they stay unread until the reader
-reaches them.
+mobile panel revealing the chat never scrolls. Messages that arrived while a
+mobile panel hid the chat stay below, Latest appears, and they stay unread
+until the reader reaches them.
 
 While another mobile panel replaces the chat, Latest is hidden with it, so
 the open room's unread count, under its notification mode, shows in one place
@@ -83,11 +94,12 @@ Current behavior:
 - A reader dragging within the band when an arrival lands is taken to the
   end. There is no gesture guard: remembering that the reader had moved up
   (`reader_moved_up_since`) is the latch that caused #508.
-- The history follows, and is read, under every dialog and popover except a
-  DM thread over the room: member info, room settings, invite and ban
-  dialogs, the message action menu and the reaction picker. The reader is at
-  the end anyway when the dialog closes, but those arrivals count as read
-  without having been on screen unobstructed.
+- The history follows under every dialog and popover, a DM thread over the
+  room included, and is read under all of them except that DM thread: member
+  info, room settings, invite and ban dialogs, the message action menu and
+  the reaction picker. The reader is at the end anyway when the dialog
+  closes, but those arrivals count as read without having been on screen
+  unobstructed.
 
 Known limitations:
 
@@ -135,15 +147,21 @@ Known limitations:
 - Outside that hold, a size change gets no correction: when the composer
   grows or the phone keyboard opens, the browser keeps the view's top edge,
   so the bottom of the view is covered. Paging and panel reveals retain their
-  reading-position corrections; deleting the reading row uses the row above
+  reading-position corrections. A hide is noticed from the container's size
+  or from a patch landing while it has no layout (`note_patch_while_hidden`,
+  which also re-observes the container), so a reveal restores the reader even
+  when the ResizeObserver never reported the hide: a hide and reveal with no
+  rendering update between them look like no change to it
+  ([#799](https://github.com/freenet/river/issues/799)). Deleting the
+  reading row uses the row above
   as the preferred fallback. The reading row is the first row whose top lies
   inside the view, else the row the view's top cuts through (a message
   taller than the view, not the row starting below the fold).
 - Latest appears when the newest message's bottom is more than 4px below
   the visible area, or a held range withholds newer messages. The margin is
   measured against the message, not the padding below it.
-- A room's read marker advances when the history is in the foreground (same
-  predicate as following), has completed its reveal restore, the rendered
+- A room's read marker advances when the history is in the foreground (not
+  required for following), has completed its reveal restore, the rendered
   range reaches the room's latest message, and that message's bottom is on
   screen within the same 4px margin. It re-checks when the tab becomes
   visible (`DOCUMENT_VISIBLE`) or a DM thread closes (`OPEN_DM_THREAD`),
@@ -162,7 +180,7 @@ DM threads share the policy: opening, own send and Latest jump instantly,
 an own send being one to this thread (a send completing in another thread,
 counted per `(room, peer)`, never moves it), and an inbound DM follows a reader at the end by the rule above, with the
 same band. A thread opened empty has no opening to place, so its first DMs
-follow by the same rule (in a hidden tab they leave it at the top). Latest
+follow by the same rule, in a hidden tab too. Latest
 uses the same 4px message-bottom margin. The thread updates its read cutoff
 to the newest rendered inbound DM timestamp only when it is in the foreground
 and the newest DM's bottom is on screen, and re-checks when the tab becomes

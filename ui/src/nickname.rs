@@ -28,8 +28,8 @@ use ed25519_dalek::VerifyingKey;
 /// to 50 bytes. `handles_fit_the_default_nickname_limit` checks the real
 /// default rather than trusting this number, and
 /// `handles_are_within_max_handle_len` checks this one, so a future word
-/// that blows the budget fails CI instead of producing a nickname the
-/// room contract rejects.
+/// that blows the budget fails CI instead of producing a nickname clients
+/// refuse to sign.
 pub const MAX_HANDLE_LEN: usize = 20;
 
 /// First half of the handle. Exactly 100 entries — see `pools_are_100`.
@@ -429,10 +429,11 @@ mod tests {
 
     #[test]
     fn handles_fit_the_default_nickname_limit() {
-        // The room contract rejects a member_info whose nickname exceeds the
-        // room's `max_nickname_size`, so a generated default that does not
-        // fit would make the join / self-heal UPDATE fail outright. Check
-        // against the real default rather than a hardcoded copy of it.
+        // Clients refuse to sign a nickname over the room's
+        // `max_nickname_size` (the room itself holds nicknames only to a fixed
+        // ceiling), so a generated default that does not fit could not be
+        // published. Check against the real default rather than a hardcoded
+        // copy of it.
         let limit =
             river_core::room_state::configuration::Configuration::default().max_nickname_size;
         for handle in all_handles() {

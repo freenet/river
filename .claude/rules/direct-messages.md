@@ -19,42 +19,82 @@ live in `common/src/room_state/direct_messages.rs`.
 
 - Each DM is sender-signed over canonical bytes prefixed by domain tag
   `b'M'`; recipient purge envelopes use `b'P'`. Per-recipient purge
-  envelopes are monotonically versioned (Configuration pattern) and the
-  tombstone set is BLAKE3-derived `PurgeToken`s, which prevents
-  signature-grinding attacks against tombstones.
+  envelopes are resolved by `PurgeRank` (the higher `version`, then the
+  greater signature digest), as the configuration is, and the summary
+  carries that rank, so peers holding different envelopes converge on one
+  (freenet/river#703). The tombstone set is BLAKE3-derived `PurgeToken`s,
+  which prevents signature-grinding attacks against tombstones.
+- **Own-purge re-sign (client-side, no contract change).** A recipient's
+  purge envelope is ONE record per recipient, so two devices of one member
+  that purge at the same version each sign a version-`v` envelope and one
+  wins by rank; the loser's tokens are no longer tombstoned. Each client
+  records the tokens it purged (`river_core::own_purges::OwnPurges`, behind
+  the client-only `own-purges` feature): the UI in `RoomData::own_purges`
+  (recorded by `RoomData::apply_own_purge`, persisted with the room, unioned
+  wherever two copies of the room merge), riverctl in
+  `StoredRoomInfo::own_purges` (`rooms.json`, recorded by `dm purge` under
+  the room's stored identity only). When the room's winning envelope for the
+  member's own id omits a recorded token, `OwnPurges::heal` re-signs the
+  union of the winning list and the recorded tokens at the next version with
+  `advance_recipient_purges`, so the UI and riverctl sign byte-identical
+  envelopes. It fires only when a recorded token is missing, only for the
+  recipient id the token was recorded as, only while that id is a member, at
+  most once per winning version observed (`healed_at`), and never past the
+  tombstone cap. `OwnPurges::prune` first drops the record of any recipient
+  that is no longer a member (of a state whose configuration the owner
+  signed). The envelope carries no room secret; it needs the room's own
+  signing key, like every self-signed record, and riverctl skips it under a
+  `--signing-key` override that is not the stored identity. riverctl stores
+  the re-signed state and `healed_at` only once the publish succeeds, so an
+  envelope that did not go out is signed again on the next read.
+  Trigger points: in the UI every path that brings network state into a held
+  room — the subscription paths (`apply_delta_inner`,
+  `update_room_state_inner`) and the GET paths (re-accept refresh, join,
+  imported-room replacement, refresh merge, a backward probe's recovered
+  state) — each marking the room for sync; in riverctl, `get_room` (every
+  read). A build without the field drops it when it saves the room
+  (unknown fields are ignored). Pinned by `own_purges::tests`,
+  `a_full_state_ingestion_re_signs_a_lost_purge`,
+  `a_delta_ingestion_re_signs_a_lost_purge`,
+  `every_get_ingestion_path_heals_own_purges`,
+  `a_device_whose_purge_lost_re_signs_the_union`,
+  `a_purge_that_lost_is_re_signed_as_the_union` and the riverctl
+  `heal_own_purges_in` tests.
 - Bans are NOT enforced in `DirectMessagesV1::verify` — instead,
   `ChatRoomStateV1::post_apply_cleanup` sweeps DMs whose sender or
   recipient is now banned or no longer a member. Mirrors `MessagesV1`'s
   precedent and keeps `verify` stable across ban-state changes.
-- **ONE predicate, applied at TWO points, and the order between them is
-  load-bearing** (freenet/river#671, #675).
+- **ONE predicate, applied at TWO points, and the caps after both**
+  (freenet/river#671, #675).
   `DirectMessagesV1::sweep_after_membership_change` is the only definition of
-  "this DM survives", and it runs BOTH inside `apply_delta` — before
-  `enforce_caps_and_sort` — and again as `post_apply_cleanup` step 6. The
-  apply-time call is what makes step 6 a provable no-op in the normal case.
-  When the sweep ran ONLY at step 6, a DM destined for deletion was still
-  ranked by the global cap, so in a saturated room it won a slot and evicted a
-  legitimate DM between two current members — measured on live Official-room
-  state — and the merge stopped being commutative and associative.
+  "this DM survives", and it runs BOTH inside `apply_delta` and again as
+  `post_apply_cleanup` step 6. The per-pair and global caps
+  (`enforce_caps_and_sort`) run only in cleanup, AFTER the step-6 sweep, so a
+  DM destined for deletion never takes a cap slot. (When the caps ran in the
+  apply before the sweep, a DM destined for deletion won a slot in a
+  saturated room and evicted a legitimate DM between two current members,
+  measured on live Official-room state, and the merge stopped being
+  commutative and associative.)
   - The apply-time call needs the enforced-ban set as of THAT point.
     `enforced_ban_set_of` derives it from `parent_state`, which is exact rather
     than approximate because the `#[composable]` macro applies fields in
     declaration order, so `configuration`, `bans`, `members` and `member_info`
     are all final by then. It reuses `BansV1::enforce_user_ban_cap` and
-    `MembersV1::banned_member_ids` — the same two functions step 0-cap and step
-    0 call — so nothing is re-implemented and the two sites cannot drift.
+    `MembersV1::banned_member_ids`, the same two functions step 0-cap and step
+    0 call, so nothing is re-implemented and the two sites cannot drift
+    (a debug assertion in cleanup compares them).
   - Do NOT reintroduce a membership-only variant at apply time. An earlier
     revision of this fix did, on the belief that the enforced-ban set was not
     knowable there; that was false, and the gap it left was
-    freenet/river#675 — a DEPUTY-issued ban leaves its target a member through
-    the DM field's apply, because `MembersV1::apply_delta` is handed an empty
-    `MemberInfoV1` and can only enforce owner/ancestor authority. That is the
-    flow the Official room's moderators actually use.
-  - Do NOT move `trim_to_global_cap` into cleanup after step 6: step 1's
-    exemption reads the DM set, so a trim running after it re-creates the same
-    defect one layer up (two reviewers proposed exactly that; pinned by
-    `cleanup_is_a_fixpoint_after_the_trim_discards_a_members_only_dm`, and by
-    `post_apply_cleanup_stays_idempotent_under_the_global_cap`).
+    freenet/river#675: a DEPUTY-issued ban left its target a member through
+    the DM field's apply. That is the flow the Official room's moderators
+    actually use.
+  - Cleanup's member prune counts a DM participant only from the DMs that
+    survive the sweep AND the caps, computed on a copy before the members are
+    decided (`prune_and_cap_members`), so the exemption is exactly the set
+    step 6 keeps. Pinned by
+    `cleanup_is_a_fixpoint_after_the_trim_discards_a_members_only_dm` and
+    `post_apply_cleanup_stays_idempotent_under_the_global_cap`.
 
 - `seal_dm_for_recipient` / `unseal_dm_from_sender` in
   `common/src/ecies.rs` carry the per-message ECIES envelope. Distinct
@@ -76,7 +116,30 @@ seeds `DM_LAST_SEEN` from the max inbound DM timestamp per
 `(room, peer)` exactly once on first hydration; a one-shot
 `DM_LAST_SEEN_SEEDED` flag prevents re-seeding — otherwise every
 arriving inbound DM would be instantly marked seen and never surface as
-unread.
+unread. The seed is one-shot (a re-run inside the one-macrotask window before
+its deferred latch lands seeds again, as it always has); in addition, both
+delegate-load merge sites (the sweep's hydrate and the crate walk's import)
+apply `dm_cutoff_plan` (freenet/river#801), because during a migration the
+first hydration is usually the OLDEST generation's stale copy:
+
+- A frozen snapshot (`MergeAuthority::OlderSnapshot`: a legacy generation, the
+  walk's import, the `rooms_data` blob) advances the cutoffs, max-merged, to
+  cover its inbound DMs that landed in the merged room under its identity.
+  The current delegate's own copy (`Authoritative`) never advances: on a
+  reload it may hold DMs received unread this session. Its one exception is
+  the next bullet.
+- A merge that REPLACES a room's identity resets ALL of that room's cutoffs
+  (including ones read this session) to the adopted copy's landed DMs,
+  whatever the adopting copy's authority, since cutoffs are keyed by
+  `(room, peer)` and every other write max-merges. It does not add DMs the
+  room held only from the network, though the one-shot seed does if it reads
+  `ROOMS` after the adoption. The plan is committed through `defer`; it
+  relies on same-delay timers running in queue order.
+
+Cutoffs are per-peer timestamp maxima, so either rule also covers a DM from
+that peer stamped at or below the cutoff, as the seed does. Residual: a tab
+still open on the previous build keeps writing to the newest predecessor, so a
+DM it saved unread there is marked seen when this session re-reads it.
 
 **Read rule and scrolling.** The follow-at-end policy and its rationale live
 in [history-scrolling.md](history-scrolling.md).
@@ -298,13 +361,14 @@ The inbound-only anchoring works because `sweep_after_membership_change`
 retains on `alive(sender) && alive(recipient)`, and every DM in a pair shares
 the same sender/recipient set, so the sweep is **all-or-nothing per pair** and
 cannot leave a thread partially swept. Note it now runs at TWO points — inside
-`apply_delta` before the caps, and again as cleanup step 6 (freenet/river#671)
+`apply_delta`, and again as cleanup step 6 before the caps (freenet/river#671)
 — so an argument that cites only step 6 is incomplete; the apply-time call is
 the one that fires first in the common case. Both are the same function, so the
 per-pair atomicity holds at either.
 
-`trim_to_global_cap` is NOT per-pair-atomic and never was — it keeps the newest
-N room-wide, so it can leave a thread partially present. That is a pre-existing
+`trim_to_global_cap` (cleanup step 6, after the sweep) is NOT per-pair-atomic
+and never was — it keeps the newest N room-wide, so it can leave a thread
+partially present. That is a pre-existing
 caveat this invariant has always carried rather than something #671 introduced;
 the archive cutoff is anchored on the pair's inbound max, which is unaffected by
 how many of the pair's DMs the global trim happened to keep.

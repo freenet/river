@@ -520,7 +520,7 @@ fn rotation_emits_one_encrypted_secret_per_member_plus_owner() {
 // the corrected behaviour: the helper must RECOVER prior secrets from
 // the owner's existing encrypted_secrets in the state, and must dedup
 // by (member, version) directly against state to avoid emitting
-// duplicates the contract would reject. See PR #245 reviews (Ivvor's
+// duplicates the room already holds. See PR #245 reviews (Ivvor's
 // report 2026-05-14).
 // =============================================================================
 

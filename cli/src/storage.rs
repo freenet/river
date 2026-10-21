@@ -77,6 +77,15 @@ pub struct StoredRoomInfo {
     /// the room owner (who is never pruned, so never rejoins).
     #[serde(default)]
     pub self_nickname: Option<String>,
+    /// The DM purges this client signed in the room, per recipient id, and
+    /// the winning purge-envelope version it last re-signed against:
+    /// `ApiClient::heal_own_purges` re-publishes a recorded purge the room's
+    /// winning envelope omits (another device of the member won a concurrent
+    /// envelope). Recorded by `dm purge`. A riverctl from before this field
+    /// that rewrites `rooms.json` drops it (unknown fields are ignored); the
+    /// purges recorded until then are then no longer re-published.
+    #[serde(default)]
+    pub own_purges: river_core::own_purges::OwnPurges,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -812,6 +821,7 @@ impl Storage {
                 previous_contract_key: None,
                 invitation_secrets,
                 self_nickname: None,
+                own_purges: Default::default(),
             };
 
             storage.rooms.insert(owner_key_str, room_info);
@@ -840,6 +850,7 @@ impl Storage {
     /// previous_contract_key  KEEP    (room-scoped #292 migration pointer)
     /// invitation_secrets     MERGE-same-key (union, existing wins) / REPLACE-diff
     /// self_nickname          MERGE-same-key (keep-if-absent) / REPLACE-different
+    /// own_purges             KEEP    (keyed by the recipient id each purge was signed as)
     /// ```
     #[allow(dead_code)]
     fn _stored_room_info_overwrite_classification(r: StoredRoomInfo) {
@@ -852,6 +863,7 @@ impl Storage {
             previous_contract_key: _,
             invitation_secrets: _,
             self_nickname: _,
+            own_purges: _,
         } = r;
     }
 
@@ -998,6 +1010,7 @@ impl Storage {
                         previous_contract_key: None,
                         invitation_secrets,
                         self_nickname,
+                        own_purges: Default::default(),
                     },
                 );
             }
@@ -1071,6 +1084,50 @@ impl Storage {
         } else {
             Ok(None)
         }
+    }
+
+    /// Record that `signing_key` purged `tokens` in a room, when
+    /// `signing_key` is the room's stored identity (under a signing-key
+    /// override for another identity, nothing is recorded: the record is the
+    /// stored identity's). Returns whether it was recorded.
+    pub fn record_own_purges(
+        &self,
+        owner_vk: &VerifyingKey,
+        signing_key: &SigningKey,
+        tokens: impl IntoIterator<Item = river_core::room_state::direct_messages::PurgeToken>,
+    ) -> Result<bool> {
+        self.with_lock(|| {
+            let mut storage = self.load_rooms_unlocked()?;
+            let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+            let Some(info) = storage.rooms.get_mut(&owner_key_str) else {
+                return Ok(false);
+            };
+            if info.signing_key_bytes != signing_key.to_bytes() {
+                return Ok(false);
+            }
+            info.own_purges
+                .record(MemberId::from(&signing_key.verifying_key()), tokens);
+            self.save_rooms_unlocked(&storage)?;
+            Ok(true)
+        })
+    }
+
+    /// Change a room's record of the DM purges this client signed, under the
+    /// storage lock (a no-op for a room not stored).
+    pub fn update_own_purges(
+        &self,
+        owner_vk: &VerifyingKey,
+        change: impl FnOnce(&mut river_core::own_purges::OwnPurges),
+    ) -> Result<()> {
+        self.with_lock(|| {
+            let mut storage = self.load_rooms_unlocked()?;
+            let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+            if let Some(info) = storage.rooms.get_mut(&owner_key_str) {
+                change(&mut info.own_purges);
+                self.save_rooms_unlocked(&storage)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn update_room_state(&self, owner_vk: &VerifyingKey, state: ChatRoomStateV1) -> Result<()> {
@@ -1358,6 +1415,7 @@ mod tests {
             previous_contract_key: None,
             invitation_secrets: HashMap::new(),
             self_nickname: None,
+            own_purges: Default::default(),
         }
     }
 
@@ -2062,6 +2120,85 @@ mod tests {
         );
     }
 
+    /// The DM purge record `dm purge` and the re-sign write is stored in
+    /// rooms.json, survives a reload, and a later update unions with what is
+    /// stored (it never replaces it); a room that is not stored is a no-op.
+    #[test]
+    fn own_purges_are_stored_and_unioned() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        use river_core::room_state::member::MemberId;
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let key = expected_contract_key(&owner_vk);
+        storage.add_room(&owner_vk, &owner_sk, state, &key).unwrap();
+        let me = MemberId::from(&owner_vk);
+        let key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+
+        storage
+            .update_own_purges(&owner_vk, |own| own.record(me, [PurgeToken([1; 16])]))
+            .unwrap();
+        let mut other = river_core::own_purges::OwnPurges::default();
+        other.record(me, [PurgeToken([2; 16])]);
+        storage
+            .update_own_purges(&owner_vk, |held| held.union(&other))
+            .unwrap();
+        let stored = storage.load_rooms().unwrap().rooms[&key_str]
+            .own_purges
+            .clone();
+        assert_eq!(
+            stored.purged,
+            vec![(me, PurgeToken([1; 16])), (me, PurgeToken([2; 16]))]
+        );
+
+        let stranger = create_test_signing_key().verifying_key();
+        storage
+            .update_own_purges(&stranger, |own| own.record(me, [PurgeToken([9; 16])]))
+            .unwrap();
+        assert!(storage.load_rooms().unwrap().rooms.len() == 1);
+    }
+
+    /// A purge is recorded under the room's stored identity, and not under a
+    /// signing-key override for another identity.
+    #[test]
+    fn a_purge_is_recorded_only_as_the_stored_identity() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        // The room's stored identity: a member key, not the owner's.
+        let member_sk = create_test_signing_key();
+        storage
+            .add_room(
+                &owner_vk,
+                &member_sk,
+                create_test_state(&owner_sk),
+                &expected_contract_key(&owner_vk),
+            )
+            .unwrap();
+        let other = create_test_signing_key();
+        assert!(!storage
+            .record_own_purges(&owner_vk, &other, [PurgeToken([1; 16])])
+            .unwrap());
+        assert!(!storage
+            .record_own_purges(&owner_vk, &owner_sk, [PurgeToken([3; 16])])
+            .unwrap());
+        assert!(storage
+            .record_own_purges(&owner_vk, &member_sk, [PurgeToken([2; 16])])
+            .unwrap());
+        let key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        assert_eq!(
+            storage.load_rooms().unwrap().rooms[&key_str]
+                .own_purges
+                .purged,
+            vec![(
+                MemberId::from(&member_sk.verifying_key()),
+                PurgeToken([2; 16])
+            )]
+        );
+    }
+
     /// Source-grep pins guarding the rejoin-nickname wiring against silent
     /// refactor regressions (testing-reviewer findings on PR #321). These live
     /// in storage.rs — NOT api.rs/identity.rs — so the pinned strings are not
@@ -2076,7 +2213,7 @@ mod tests {
              `rejoin_preferred_nickname` (which seals for private rooms and \
              clamps to max_nickname_size). Do NOT inline an unconditional \
              public placeholder, or a private-room nickname could leak / an \
-             over-long nickname could block rejoin."
+             over-long nickname could be signed."
         );
         assert!(
             api_src.contains("update_self_nickname(&room_owner_vk, nickname)"),
@@ -2434,6 +2571,7 @@ mod tests {
             previous_contract_key: None,
             invitation_secrets: HashMap::new(),
             self_nickname: Some("Alice".to_string()),
+            own_purges: Default::default(),
         };
         let mut value = serde_json::to_value(&info).unwrap();
         value

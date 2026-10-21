@@ -97,8 +97,8 @@ pub(super) struct RangeHold {
 /// started at, remembered by KEY, with the index it held as a relocation hint.
 ///
 /// The anchor is by IDENTITY, not position, because positions are not stable:
-/// `MessagesV1::apply_delta` drains the oldest message once a room exceeds
-/// `max_recent_messages` (the steady state of every busy room), so an arrival
+/// the room's cleanup (`post_apply_cleanup`) drains the oldest message once a
+/// room exceeds `max_recent_messages` (the steady state of every busy room), so an arrival
 /// shifts every index down by one. A positional anchor then renders a head one
 /// item LATER in identity — the top rendered row is removed in the same patch
 /// that appends the arrival, which is the #501 slide reproduced in content

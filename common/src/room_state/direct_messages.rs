@@ -18,7 +18,8 @@
 //!   recipient. Each recipient signs a single, monotonically-versioned
 //!   list of [`PurgeToken`] entries identifying messages they've purged.
 //!   The recipient is the sole signer of their own purge envelope;
-//!   concurrent updates are resolved by strict-monotonic `version`. A
+//!   concurrent updates are resolved by [`PurgeRank`]: the higher
+//!   `version`, then the greater signature digest (freenet/river#703). A
 //!   `Vec` (rather than `HashMap<MemberId, _>`) is used so the state
 //!   round-trips through `serde_json` - `MemberId` is a struct and is
 //!   rejected as a JSON object key (see bug-prevention-patterns
@@ -53,12 +54,16 @@
 //! [`PurgeToken`] of a sender's signature, ANY incoming message whose
 //! signature hashes to the same token is dropped on merge. Versioning of
 //! the purge envelope follows the `Configuration` monotonic-version
-//! pattern (one signed envelope per recipient, strictly-greater version
-//! replaces older); the drop-on-merge filtering effect matches `BansV1`'s
+//! pattern (one signed envelope per recipient, the higher-ranked one
+//! replaces the other); the drop-on-merge filtering effect matches `BansV1`'s
 //! treatment of banned members. Stale peers re-merging a purged message
-//! are blocked by the current `purges` state. Each new envelope MUST
-//! contain a superset of the previous version's tombstones (no
-//! un-purging) - enforced in [`ComposableState::apply_delta`].
+//! are blocked by the current `purges` state. Each envelope a client signs
+//! carries the previous version's tombstones forward
+//! ([`advance_recipient_purges`] unions them), but the contract does not
+//! require it: of two envelopes for one recipient, the higher
+//! [`PurgeRank`] (version, then signature digest) always wins, so every
+//! peer converges on the same envelope whatever order it sees them in
+//! (freenet/river#703).
 //!
 //! # Interaction with bans
 //!
@@ -103,9 +108,9 @@
 //!   conversation but nothing bounded the set as a whole, and because
 //!   `ChatRoomStateV1::post_apply_cleanup` exempts every DM participant from
 //!   inactivity-prune (via [`DirectMessagesV1::participants_of_surviving_dms`]), an
-//!   unbounded DM set pinned an unbounded member set. Enforced in
-//!   `apply_delta` only, NEVER in `verify` — see the note on
-//!   [`DmRetentionHorizon`] and `trim_to_global_cap`.
+//!   unbounded DM set pinned an unbounded member set. Enforced by
+//!   `post_apply_cleanup` (step 6, after the sweep), NEVER in `verify` — see
+//!   the note on [`DmRetentionHorizon`] and `trim_to_global_cap`.
 //! - [`MAX_DM_MESSAGES_PER_PAIR`]: per (sender, recipient) ordered pair.
 //! - [`MAX_DM_CIPHERTEXT_BYTES`]: per-message ciphertext size cap.
 //! - [`MAX_PURGED_TOMBSTONES_PER_RECIPIENT`]: cap on per-recipient
@@ -117,6 +122,7 @@
 
 use crate::room_state::ban::{AuthorizedUserBan, BansV1};
 use crate::room_state::member::{AuthorizedMember, MemberId};
+use crate::room_state::member_info::{outranks, sig_digest, SigDigest};
 use crate::room_state::ChatRoomParametersV1;
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -282,6 +288,11 @@ pub struct DirectMessage {
     pub ciphertext: Vec<u8>,
 }
 
+/// A purge envelope's place in the order peers resolve it by: higher
+/// `version` wins, and at an equal version the greater signature digest
+/// wins, as for the configuration and `member_info` (freenet/river#703).
+pub type PurgeRank = (u64, SigDigest);
+
 /// A recipient-signed purge envelope.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthorizedRecipientPurges {
@@ -300,9 +311,10 @@ pub struct RecipientPurges {
     /// Monotonically increasing per-recipient. `0` is reserved as the
     /// "no purge envelope yet" sentinel: the first envelope MUST use
     /// `version >= 1`, and each subsequent envelope MUST use a strictly
-    /// greater `version`. A version-bump MUST also be a superset of the
-    /// previous list - un-purging is not allowed (`apply_delta` rejects
-    /// any shrinking purge list).
+    /// greater `version`. Clients carry the previous list forward
+    /// ([`advance_recipient_purges`]); `apply_delta` keeps the
+    /// higher-ranked envelope whatever its list holds (freenet/river#703),
+    /// so a later envelope that omits a token lifts that tombstone.
     #[serde(default)]
     pub version: u64,
 
@@ -661,6 +673,11 @@ impl AuthorizedDirectMessage {
 }
 
 impl AuthorizedRecipientPurges {
+    /// This envelope's [`PurgeRank`].
+    pub fn rank(&self) -> PurgeRank {
+        (self.state.version, sig_digest(&self.recipient_signature))
+    }
+
     /// Verify the recipient signature against the resolved recipient
     /// verifying key.
     pub fn verify_signature(
@@ -846,21 +863,28 @@ fn member_ids_of(members_by_id: &HashMap<MemberId, &AuthorizedMember>) -> HashSe
 /// # Why this exists
 ///
 /// It is what lets the apply-time sweep use the FULL step-6 predicate instead
-/// of a membership-only approximation. Without it, a **deputy-issued** ban left
-/// its target a member through this field's apply — `MembersV1::apply_delta` is
-/// handed an empty `MemberInfoV1`, so it can only enforce owner and ancestor
-/// authority, and a deputy grant lives in `member_info.deputies` where it
-/// cannot see it. The target's DMs were therefore still ranked by
-/// [`trim_to_global_cap`] and only removed afterwards by step 6: the
-/// freenet/river#671 data loss, reachable on the flow the Official room's
-/// moderators actually use. Measured on that reproduction, five legitimate DMs
-/// were destroyed per merge; with this, zero.
+/// of a membership-only approximation, so the apply never deletes a DM that
+/// cleanup keeps and never keeps one cleanup deletes: the sweep must see a
+/// **deputy-issued** ban, whose grant lives in `member_info.deputies`, as
+/// step 0 does (freenet/river#671, #675). The DM caps themselves run only in
+/// cleanup, after step 6.
 ///
 /// An earlier revision of this file asserted the enforced-ban set was "not
 /// knowable here" and treated membership-only as forced. It was not knowable
 /// only in the sense that nobody had computed it; the claim was wrong and is
 /// recorded here so it is not re-derived.
 pub(crate) fn enforced_ban_set_of(
+    parent_state: &ChatRoomStateV1,
+    parameters: &ChatRoomParametersV1,
+) -> HashSet<MemberId> {
+    // The ban cap verifies each ban signature at most once with the memo
+    // active (shared with the merge or cleanup this runs inside, if any).
+    crate::room_state::ban::signature_memo::active_while(|| {
+        enforced_ban_set_of_inner(parent_state, parameters)
+    })
+}
+
+fn enforced_ban_set_of_inner(
     parent_state: &ChatRoomStateV1,
     parameters: &ChatRoomParametersV1,
 ) -> HashSet<MemberId> {
@@ -875,30 +899,22 @@ pub(crate) fn enforced_ban_set_of(
         ),
     );
     let evidence = pruned.as_ref().unwrap_or(&parent_state.ban_evidence);
-
-    if parent_state.bans.0.len() <= max_bans {
-        return parent_state.members.banned_member_ids(
-            evidence,
-            &parent_state.bans,
-            &parent_state.member_info,
-            parameters,
-        );
-    }
-    let mut capped: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
-    BansV1::enforce_user_ban_cap(
-        &mut capped,
+    // The decision `post_apply_cleanup` makes (0-sig, 0-cap and 0), by the
+    // same function.
+    let depth_cap = crate::room_state::ban_evidence::evidence_depth_cap(
+        parent_state.configuration.configuration.max_members,
+    );
+    let mut bans: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
+    BansV1::decide_enforced(
+        &mut bans,
         max_bans,
+        depth_cap,
         &parent_state.members,
         evidence,
         &parent_state.member_info,
         parameters,
-    );
-    parent_state.members.banned_member_ids(
-        evidence,
-        &BansV1(capped),
-        &parent_state.member_info,
-        parameters,
     )
+    .removed
 }
 
 /// Whether a DM endpoint is still a live participant: the room owner (implicit,
@@ -1068,11 +1084,11 @@ impl ComposableState for DirectMessagesV1 {
             .map(|m| SignatureBytes(m.sender_signature.to_bytes()))
             .collect();
 
-        let purge_versions: Vec<(MemberId, u64)> = {
-            let mut v: Vec<(MemberId, u64)> = self
+        let purge_versions: Vec<(MemberId, PurgeRank)> = {
+            let mut v: Vec<(MemberId, PurgeRank)> = self
                 .purges
                 .iter()
-                .map(|p| (p.recipient_id, p.state.version))
+                .map(|p| (p.recipient_id, p.rank()))
                 .collect();
             v.sort_by_key(|(k, _)| *k);
             v
@@ -1097,7 +1113,7 @@ impl ComposableState for DirectMessagesV1 {
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let prior_versions: HashMap<MemberId, u64> =
+        let prior_ranks: HashMap<MemberId, PurgeRank> =
             old_state_summary.purge_versions.iter().copied().collect();
 
         // A DM the receiver's per-pair cap would discard the instant it applied
@@ -1140,12 +1156,10 @@ impl ComposableState for DirectMessagesV1 {
             .purges
             .iter()
             .filter_map(|p| {
-                let prior = prior_versions.get(&p.recipient_id).copied().unwrap_or(0);
-                if p.state.version > prior {
-                    Some(p.clone())
-                } else {
-                    None
-                }
+                let advanced = prior_ranks
+                    .get(&p.recipient_id)
+                    .is_none_or(|prior| outranks(p.rank(), *prior));
+                advanced.then(|| p.clone())
             })
             .collect();
 
@@ -1165,17 +1179,13 @@ impl ComposableState for DirectMessagesV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        let max_direct_messages = parent_state
-            .configuration
-            .configuration
-            .effective_max_direct_messages();
-
         let owner_id = parameters.owner_id();
         let members_by_id = parent_state.members.members_by_member_id();
 
         let Some(delta) = delta else {
-            // Sweep unresolvable endpoints, then enforce the caps and
-            // re-sort, even when THIS field has no delta. What that converges:
+            // Sweep unresolvable endpoints, then dedup and re-sort, even when
+            // THIS field has no delta (the caps are `post_apply_cleanup`'s,
+            // after bans and pruning). What that converges:
             // a state that ARRIVED unnormalised — over-cap, or holding DMs
             // whose endpoints `members` has since dropped — by a path that
             // skips this function, namely a full-state PUT or the #292
@@ -1188,18 +1198,19 @@ impl ComposableState for DirectMessagesV1 {
                 &member_ids_of(&members_by_id),
                 &enforced_ban_set_of(parent_state, parameters),
             );
-            enforce_caps_and_sort(self, max_direct_messages);
+            dedup_and_sort(self);
             return Ok(());
         };
 
         // ---- 1. Apply purge advances first ----
         //
         // The recipient is the sole signer of their own envelope, so
-        // strict-monotonic `version` is the entire ordering rule. A
-        // duplicate-version with different content is a protocol error
-        // (the same signer wouldn't sign two different envelopes at
-        // the same version). Each new version's purge list MUST be a
-        // superset of the previous version's list (no un-purging).
+        // `PurgeRank` (version, then signature digest) is the entire
+        // ordering rule: the higher-ranked envelope replaces the held one,
+        // whatever either lists. Any rule that also looks at the contents
+        // makes the choice depend on which envelope a peer saw first, and
+        // peers that saw them in different orders would never converge
+        // (freenet/river#703).
         for advance in &delta.advanced_purges {
             if advance.state.version == 0 {
                 return Err(format!(
@@ -1235,35 +1246,9 @@ impl ComposableState for DirectMessagesV1 {
                 .position(|p| p.recipient_id == advance.recipient_id);
             match pos {
                 Some(idx) => {
-                    let current = &self.purges[idx];
-                    if current.state.version > advance.state.version {
-                        continue; // already up to date
+                    if outranks(advance.rank(), self.purges[idx].rank()) {
+                        self.purges[idx] = advance.clone();
                     }
-                    if current.state.version == advance.state.version {
-                        // Same-version-different-content is a recipient
-                        // signing bug (a multi-device user who didn't
-                        // coordinate version numbers, or a malicious
-                        // client). Drop the incoming envelope silently
-                        // - first-seen wins. Returning Err here would
-                        // poison the whole delta merge, taking
-                        // unrelated `new_messages` and other recipients'
-                        // `advanced_purges` with it. The recipient is
-                        // expected to bump the version to converge.
-                        continue;
-                    }
-                    // Monotonic-content: new must be a superset of old.
-                    let current_set: HashSet<PurgeToken> =
-                        current.state.purged.iter().copied().collect();
-                    let advance_set: HashSet<PurgeToken> =
-                        advance.state.purged.iter().copied().collect();
-                    if !current_set.is_subset(&advance_set) {
-                        // Recipient is trying to un-purge tokens by
-                        // shrinking the list across a version bump.
-                        // Silent-drop the malformed envelope rather
-                        // than failing the whole delta.
-                        continue;
-                    }
-                    self.purges[idx] = advance.clone();
                 }
                 None => {
                     self.purges.push(advance.clone());
@@ -1357,19 +1342,20 @@ impl ComposableState for DirectMessagesV1 {
         });
 
         // ---- 4. Drop held DMs whose endpoints are no longer members ----
-        // MUST run before the caps: a DM the room can no longer keep must not
-        // be ranked against ones it can, or it wins a slot and evicts a
-        // legitimate message before `post_apply_cleanup` step 6 deletes it
-        // anyway (freenet/river#671). Applies to the held set the same
-        // membership rule step 2 above applies to arrivals.
+        // The same membership rule step 2 above applies to arrivals, with the
+        // enforced-ban set `post_apply_cleanup` step 0 computes, so this
+        // never deletes a DM cleanup keeps (freenet/river#671, #675).
         self.sweep_after_membership_change(
             owner_id,
             &member_ids_of(&members_by_id),
             &enforced_ban_set_of(parent_state, parameters),
         );
 
-        // ---- 5. Enforce the caps, newest-first, then sort ----
-        enforce_caps_and_sort(self, max_direct_messages);
+        // ---- 5. Dedup and sort ----
+        // The per-pair and global caps are not applied here:
+        // `post_apply_cleanup` applies them after bans and pruning, so a DM
+        // of a member cleanup removes never takes a slot (step 6).
+        dedup_and_sort(self);
 
         Ok(())
     }
@@ -1390,10 +1376,101 @@ impl ComposableState for DirectMessagesV1 {
 /// Every step is a pure function of the held set, so the composition is too:
 /// two peers reaching the same union converge to the same state, and running
 /// this twice changes nothing after the first pass (idempotent).
-fn enforce_caps_and_sort(s: &mut DirectMessagesV1, max_direct_messages: usize) {
+/// The members of the DMs that survive a membership sweep and the caps,
+/// computed once per member-loop pass from an index of the stored DMs
+/// rather than a copy of them (their ciphertext is never read).
+pub(crate) struct DmParticipantIndex {
+    /// Each stored DM's (sender, recipient, order key), in stored order.
+    messages: Vec<(MemberId, MemberId, DmOrderKey)>,
+    purge_recipients: Vec<MemberId>,
+}
+
+impl DmParticipantIndex {
+    pub(crate) fn new(s: &DirectMessagesV1) -> Self {
+        DmParticipantIndex {
+            messages: s
+                .messages
+                .iter()
+                .map(|m| (m.message.sender, m.message.recipient, m.order_key()))
+                .collect(),
+            purge_recipients: s.purges.iter().map(|p| p.recipient_id).collect(),
+        }
+    }
+
+    /// What `participants_of_surviving_dms` gives on a copy of the DMs after
+    /// `sweep_after_membership_change` and `enforce_caps_and_sort`, step for
+    /// step: the sweep, the signature dedup (first kept), the per-pair cap
+    /// (newest kept) and the global cap (newest kept). Sorting changes no
+    /// participant, so it is not done.
+    pub(crate) fn participants(
+        &self,
+        owner_id: MemberId,
+        active_member_ids: &HashSet<MemberId>,
+        banned_ids: &HashSet<MemberId>,
+        max_direct_messages: usize,
+    ) -> HashSet<MemberId> {
+        let alive = |id: MemberId| dm_endpoint_is_live(id, owner_id, active_member_ids, banned_ids);
+        let mut seen: HashSet<SignatureBytes> = HashSet::new();
+        let mut kept: Vec<&(MemberId, MemberId, DmOrderKey)> = self
+            .messages
+            .iter()
+            .filter(|(from, to, _)| alive(*from) && alive(*to))
+            .filter(|(_, _, key)| seen.insert(key.signature))
+            .collect();
+        if kept.len() > MAX_DM_MESSAGES_PER_PAIR {
+            let mut by_pair: HashMap<(MemberId, MemberId), Vec<&DmOrderKey>> = HashMap::new();
+            for (from, to, key) in &kept {
+                by_pair.entry((*from, *to)).or_default().push(key);
+            }
+            let mut dropped: HashSet<SignatureBytes> = HashSet::new();
+            for keys in by_pair.values_mut() {
+                if keys.len() > MAX_DM_MESSAGES_PER_PAIR {
+                    keys.sort();
+                    let excess = keys.len() - MAX_DM_MESSAGES_PER_PAIR;
+                    dropped.extend(keys.iter().take(excess).map(|k| k.signature));
+                }
+            }
+            if !dropped.is_empty() {
+                kept.retain(|(_, _, key)| !dropped.contains(&key.signature));
+            }
+        }
+        if kept.len() > max_direct_messages {
+            if max_direct_messages == 0 {
+                kept.clear();
+            } else {
+                let mut keys: Vec<&DmOrderKey> = kept.iter().map(|(_, _, key)| key).collect();
+                let excess = keys.len() - max_direct_messages;
+                keys.select_nth_unstable(excess);
+                let cutoff = keys[excess].clone();
+                kept.retain(|(_, _, key)| *key >= cutoff);
+            }
+        }
+        let mut out = HashSet::with_capacity(kept.len() * 2 + self.purge_recipients.len());
+        for (from, to, _) in kept {
+            out.insert(*from);
+            out.insert(*to);
+        }
+        out.extend(
+            self.purge_recipients
+                .iter()
+                .copied()
+                .filter(|id| alive(*id)),
+        );
+        out
+    }
+}
+
+pub(crate) fn enforce_caps_and_sort(s: &mut DirectMessagesV1, max_direct_messages: usize) {
     dedup_by_signature(s);
     trim_pairs_to_cap(s);
     trim_to_global_cap(s, max_direct_messages);
+    sort_state(s);
+}
+
+/// What the apply normalizes: duplicates dropped and the canonical stored
+/// order restored. The caps wait for `post_apply_cleanup`.
+fn dedup_and_sort(s: &mut DirectMessagesV1) {
+    dedup_by_signature(s);
     sort_state(s);
 }
 
@@ -1534,12 +1611,14 @@ pub struct DirectMessagesSummary {
     #[serde(default)]
     pub message_signatures: BTreeSet<SignatureBytes>,
 
-    /// Per-recipient purge-envelope version known locally. Stored as a
+    /// Per-recipient purge-envelope [`PurgeRank`] known locally: the
+    /// version and the envelope's signature digest, so two envelopes at the
+    /// same version are told apart (freenet/river#703). Stored as a
     /// sorted `Vec` (not `HashMap`) so the type round-trips through
     /// `serde_json` - `MemberId` is a struct and `serde_json` rejects
     /// it as a map key.
     #[serde(default)]
-    pub purge_versions: Vec<(MemberId, u64)>,
+    pub purge_versions: Vec<(MemberId, PurgeRank)>,
 
     /// One entry per ordered `(sender, recipient)` pair that has reached
     /// [`MAX_DM_MESSAGES_PER_PAIR`], carrying the oldest message that pair
@@ -1614,9 +1693,9 @@ pub enum DmRetentionHorizon {
     OldestRetained(DmOrderKey),
     /// The cap is `0`: the peer retains no direct messages at all.
     ///
-    /// `AuthorizedConfigurationV1::apply_delta` rejects a zero cap, but
-    /// `verify` does not, so an owner-signed zero can still arrive on the
-    /// full-state path. Represented explicitly rather than folded into
+    /// A configuration with a zero cap fails the value checks and ranks below
+    /// every valid one, but `verify` does not check it, so an owner-signed
+    /// zero can still be held after a full-state PUT. Represented explicitly rather than folded into
     /// `OldestRetained` so the sender suppresses the delta instead of looping
     /// against a peer that keeps nothing.
     Closed,
@@ -1626,7 +1705,7 @@ pub enum DmRetentionHorizon {
 ///
 /// # Why this exists
 ///
-/// [`DirectMessagesV1::apply_delta`] caps each ordered pair at
+/// `post_apply_cleanup` caps each ordered pair at
 /// [`MAX_DM_MESSAGES_PER_PAIR`], which makes the merge non-monotonic in exactly
 /// the way [`crate::room_state::message::RetentionHorizon`] documents for room
 /// messages. Without a horizon, `delta` is a pure signature-set difference: a
@@ -1689,4 +1768,76 @@ mod tests {
     // Unit tests for this module live in
     // `common/tests/direct_messages_test.rs` so they exercise the
     // public API the same way downstream consumers will.
+}
+
+#[cfg(test)]
+mod participant_index_tests {
+    use super::*;
+
+    fn key(b: u64) -> SigningKey {
+        let mut x = [0u8; 32];
+        x[..8].copy_from_slice(&b.to_le_bytes());
+        x[31] = 47;
+        SigningKey::from_bytes(&x)
+    }
+
+    /// `DmParticipantIndex::participants` against what the member loop's
+    /// plain pass does (a copy of the DMs, swept, capped, then
+    /// `participants_of_surviving_dms`), on generated DM sets: pairs over the
+    /// per-pair cap, repeated DMs, global caps from 0 up, and active and
+    /// banned sets drawn at random.
+    #[test]
+    fn the_index_gives_the_participants_the_copy_gives() {
+        let owner = key(1);
+        let owner_id: MemberId = owner.verifying_key().into();
+        let keys: Vec<SigningKey> = (0..6u64).map(|i| key(10 + i)).collect();
+        let ids: Vec<MemberId> = keys.iter().map(|k| k.verifying_key().into()).collect();
+        let mut seed = 0xd1_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n.max(1)
+        };
+        for round in 0..120 {
+            let mut messages = Vec::new();
+            for pair in 0..next(5) + 1 {
+                let from = next(7) as usize;
+                let to = (from + 1 + next(6) as usize) % 7;
+                let k = |i: usize| if i == 6 { &owner } else { &keys[i] };
+                let id = |i: usize| if i == 6 { owner_id } else { ids[i] };
+                let count = [1, 3, 60, 101, 140][next(5) as usize];
+                let base = next(1_000);
+                for t in 0..count {
+                    let m = sign_direct_message(
+                        k(from),
+                        id(from),
+                        id(to),
+                        &owner.verifying_key(),
+                        1_700_000_000 + base + t * (1 + pair),
+                        vec![round as u8; 4],
+                    )
+                    .unwrap();
+                    if next(20) == 0 {
+                        messages.push(m.clone());
+                    }
+                    messages.push(m);
+                }
+            }
+            let held = DirectMessagesV1 {
+                messages,
+                ..Default::default()
+            };
+            let active: HashSet<MemberId> = ids.iter().copied().filter(|_| next(5) != 0).collect();
+            let banned: HashSet<MemberId> = ids.iter().copied().filter(|_| next(8) == 0).collect();
+            let cap = [0, 5, 50, 120, 300][next(5) as usize];
+
+            let mut copy = held.clone();
+            copy.sweep_after_membership_change(owner_id, &active, &banned);
+            enforce_caps_and_sort(&mut copy, cap);
+            let expected = copy.participants_of_surviving_dms(owner_id, &active, &banned);
+            let got = DmParticipantIndex::new(&held).participants(owner_id, &active, &banned, cap);
+            assert_eq!(got, expected, "round {round}, cap {cap}");
+        }
+    }
 }

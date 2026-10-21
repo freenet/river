@@ -18,7 +18,7 @@
 use ed25519_dalek::{Signature, SigningKey};
 use freenet_scaffold::util::FastHash;
 use freenet_scaffold::ComposableState;
-use river_core::room_state::ban::{BanId, BansV1};
+use river_core::room_state::ban::BansV1;
 use river_core::room_state::direct_messages::{
     DirectMessagesSummary, DmOrderKey, DmPairHorizon, DmRetentionHorizon, SignatureBytes,
 };
@@ -53,8 +53,10 @@ fn cbor<T: serde::Serialize>(v: &T) -> Vec<u8> {
 /// FAILS if a summary field regresses back to `HashSet`/`HashMap`.
 const N: i64 = 24;
 
-fn ban_id(i: i64) -> BanId {
-    BanId(FastHash(i))
+/// A distinct ban-record digest per index (the bans summary is keyed by
+/// whole-record digest since freenet/river#703).
+fn ban_id(i: i64) -> river_core::room_state::ban_evidence::EvidenceDigest {
+    river_core::room_state::ban_evidence::EvidenceDigest(sig_rank(i).0)
 }
 fn member_id(i: i64) -> MemberId {
     MemberId(FastHash(i))
@@ -122,11 +124,12 @@ fn member_info_summary_serialization_is_order_independent() {
 
 #[test]
 fn secrets_summary_serialization_is_order_independent() {
-    let version_ids_fwd: Vec<u32> = (0..N as u32).collect();
-    let version_ids_rev: Vec<u32> = (0..N as u32).rev().collect();
-    let member_secrets_fwd: Vec<(u32, MemberId)> =
-        (0..N).map(|i| (i as u32, member_id(i))).collect();
-    let member_secrets_rev: Vec<(u32, MemberId)> =
+    let version_ids_fwd: Vec<(u32, SigDigest)> = (0..N).map(|i| (i as u32, sig_rank(i))).collect();
+    let version_ids_rev: Vec<(u32, SigDigest)> = version_ids_fwd.iter().rev().copied().collect();
+    let member_secrets_fwd: Vec<((u32, MemberId), SigDigest)> = (0..N)
+        .map(|i| ((i as u32, member_id(i)), sig_rank(i)))
+        .collect();
+    let member_secrets_rev: Vec<((u32, MemberId), SigDigest)> =
         member_secrets_fwd.iter().rev().copied().collect();
 
     let s_fwd = SecretsSummary {
@@ -222,7 +225,9 @@ fn direct_messages_summary_serialization_is_order_independent() {
     let sigs_fwd: Vec<SignatureBytes> = (0..N).map(|i| SignatureBytes([i as u8; 64])).collect();
     let sigs_rev: Vec<SignatureBytes> = sigs_fwd.iter().rev().copied().collect();
     // purge_versions is already a sorted Vec in `summarize`; identical on both.
-    let purge_versions: Vec<(MemberId, u64)> = (0..N).map(|i| (member_id(i), i as u64)).collect();
+    let purge_versions: Vec<(MemberId, (u64, SigDigest))> = (0..N)
+        .map(|i| (member_id(i), (i as u64, sig_rank(i))))
+        .collect();
 
     // pair_horizons is already a sorted Vec in `summarize`; identical on both.
     let pair_horizons: Vec<DmPairHorizon> = (0..N)
@@ -292,13 +297,16 @@ fn top_level_summary_serialization_is_order_independent() {
             .collect();
         let secrets = SecretsSummary {
             current_version: N as u32,
-            version_ids: (0..N as u32)
-                .map(|i| if reversed { N as u32 - 1 - i } else { i })
+            version_ids: (0..N)
+                .map(|i| {
+                    let j = order(i);
+                    (j as u32, sig_rank(j))
+                })
                 .collect(),
             member_secrets: (0..N)
                 .map(|i| {
                     let j = order(i);
-                    (j as u32, member_id(j))
+                    ((j as u32, member_id(j)), sig_rank(j))
                 })
                 .collect(),
         };
@@ -315,7 +323,9 @@ fn top_level_summary_serialization_is_order_independent() {
             message_signatures: (0..N)
                 .map(|i| SignatureBytes([order(i) as u8; 64]))
                 .collect(),
-            purge_versions: (0..N).map(|i| (member_id(i), i as u64)).collect(),
+            purge_versions: (0..N)
+                .map(|i| (member_id(i), (i as u64, sig_rank(i))))
+                .collect(),
             pair_horizons: (0..N)
                 .map(|i| DmPairHorizon {
                     sender: member_id(i),
@@ -333,7 +343,7 @@ fn top_level_summary_serialization_is_order_independent() {
         };
 
         ChatRoomStateV1Summary {
-            configuration: 7,
+            configuration: (true, 7, sig_rank(7)),
             bans,
             members,
             ban_evidence,
@@ -548,5 +558,128 @@ fn ban_evidence_summary_bytes_per_entry() {
         per_entry - before_per_entry >= 17.0,
         "the digest must be in every entry (got {per_entry:.2} vs \
          {before_per_entry:.2} B/entry)"
+    );
+}
+
+/// The members summary carries member ids only (main's shape): a peer keeps
+/// the record it holds for an id, so the summary need not tell two records
+/// apart (freenet/river#703). Measured against the `(id, record digest)`
+/// shape this branch used before that decision, rebuilt from the same
+/// records with real keys.
+#[test]
+fn members_summary_bytes_per_entry() {
+    use river_core::room_state::member::{AuthorizedMember, Member};
+    const MEMBERS: u64 = 470; // the official room's rough membership
+
+    let owner_sk = SigningKey::from_bytes(blake3::hash(b"owner").as_bytes());
+    let owner_id = MemberId::from(&owner_sk.verifying_key());
+    let members: Vec<AuthorizedMember> = (0..MEMBERS)
+        .map(|i| {
+            let sk = SigningKey::from_bytes(blake3::hash(&i.to_le_bytes()).as_bytes());
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        })
+        .collect();
+    let state = MembersV1 { members };
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+
+    let summary: MemberSummary = state.summarize(&ChatRoomStateV1::default(), &parameters);
+    assert_eq!(summary.len() as u64, MEMBERS, "one entry per member");
+    let bytes = cbor(&summary).len();
+    let per_entry = bytes as f64 / MEMBERS as f64;
+
+    let with_digest: BTreeMap<MemberId, river_core::room_state::ban_evidence::EvidenceDigest> =
+        state
+            .members
+            .iter()
+            .map(|m| {
+                (
+                    m.member.id(),
+                    river_core::room_state::ban_evidence::evidence_digest(m),
+                )
+            })
+            .collect();
+    let digest_bytes = cbor(&with_digest).len();
+    let digest_per_entry = digest_bytes as f64 / MEMBERS as f64;
+
+    println!(
+        "members summary over {MEMBERS} members:\n  \
+         ids only:     {bytes} B = {per_entry:.2} B/entry\n  \
+         (id, digest): {digest_bytes} B = {digest_per_entry:.2} B/entry"
+    );
+
+    // Measured 9.01 B/entry (4.2 KB at 470 members), against 26.01 for the
+    // (id, digest) shape (12.2 KB): a real key's `MemberId` is about 9 CBOR
+    // bytes, and nothing else goes in an entry.
+    assert!(
+        per_entry < 9.5,
+        "members summary must carry ids only (got {per_entry:.2} B/entry)"
+    );
+    assert!(
+        digest_per_entry - per_entry >= 17.0,
+        "the comparison shape must carry a 17-byte digest per entry (got \
+         {digest_per_entry:.2} vs {per_entry:.2} B/entry)"
+    );
+}
+
+/// The bans summary is keyed by each ban's whole-record digest
+/// (freenet/river#703) instead of its signature-only `BanId`. Measured against
+/// the `BanId` shape it replaced, rebuilt from the same bans.
+#[test]
+fn bans_summary_bytes_per_entry() {
+    use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+    use std::collections::BTreeSet;
+    const BANS: u64 = 100;
+
+    let owner_sk = SigningKey::from_bytes(blake3::hash(b"owner").as_bytes());
+    let owner_id = MemberId::from(&owner_sk.verifying_key());
+    let bans: Vec<AuthorizedUserBan> = (0..BANS)
+        .map(|i| {
+            let target = SigningKey::from_bytes(blake3::hash(&i.to_le_bytes()).as_bytes());
+            AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + i),
+                    banned_user: MemberId::from(&target.verifying_key()),
+                },
+                owner_id,
+                &owner_sk,
+            )
+        })
+        .collect();
+    let state = BansV1(bans);
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+
+    let summary: BanSummary = state.summarize(&ChatRoomStateV1::default(), &parameters);
+    assert_eq!(summary.len() as u64, BANS, "one entry per ban");
+    let bytes = cbor(&summary).len();
+    let per_entry = bytes as f64 / BANS as f64;
+
+    let before: BTreeSet<river_core::room_state::ban::BanId> =
+        state.0.iter().map(|b| b.id()).collect();
+    let before_bytes = cbor(&before).len();
+    let before_per_entry = before_bytes as f64 / BANS as f64;
+
+    println!(
+        "bans summary over {BANS} bans:\n  \
+         before (BanId):         {before_bytes} B = {before_per_entry:.2} B/entry\n  \
+         after  (record digest): {bytes} B = {per_entry:.2} B/entry"
+    );
+
+    // Measured 9.02 -> 17.02 B/entry at 100 bans: a 16-byte digest is a
+    // 17-byte CBOR byte string per entry, where a `BanId` took about 9.
+    assert!(
+        (17.0..18.0).contains(&per_entry),
+        "each entry must be one 17-byte digest (got {per_entry:.2} B/entry)"
     );
 }

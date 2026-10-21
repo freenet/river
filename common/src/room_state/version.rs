@@ -23,7 +23,14 @@ pub struct StateVersion(pub u32);
 impl ComposableState for StateVersion {
     type ParentState = ChatRoomStateV1;
     type Summary = u32;
-    type Delta = ();
+    /// The sender's version, offered when it is higher than the receiver's.
+    /// Merging takes the higher of two versions both this contract reads:
+    /// a total order's maximum, so merges of version 0 and 1 states commute
+    /// and every existing state (merge(S, S) == S) is left as it is. Pinning
+    /// every state to the current version instead would rewrite each
+    /// version-0 state on its first merge (freenet/river#703).
+    /// Changing this type re-keys the contract.
+    type Delta = u32;
     type Parameters = ChatRoomParametersV1;
 
     fn verify(
@@ -55,20 +62,24 @@ impl ComposableState for StateVersion {
         &self,
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
-        _old_state_summary: &Self::Summary,
+        old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        // Version never changes via delta
-        None
+        (self.0 > *old_state_summary).then_some(self.0)
     }
 
     fn apply_delta(
         &mut self,
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
-        _delta: &Option<Self::Delta>,
+        delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        // Version doesn't change via delta
-        // When migrating, the contract would set this directly
+        // A version this contract does not read is ignored, as `verify`
+        // would reject a state carrying it.
+        if let Some(v) = delta {
+            if *v > self.0 && *v <= CURRENT_STATE_VERSION {
+                self.0 = *v;
+            }
+        }
         Ok(())
     }
 }

@@ -234,6 +234,12 @@ script = '''
 # runs on the same workstation — they would race the read-modify-write.
 # Wrap in `flock` if you need that:
 #     flock published-contract/contract-version.txt cargo make publish-river
+#
+# Before anything is bumped: refuse a UI that does not watch River's real
+# pointer records (built with RIVER_POINTER_RECORDS for a test). Its open tabs
+# would never reload after a re-key (freenet/river#580). Checked on the
+# archive itself, since what matters is what was built, not this shell's env.
+./scripts/check-webapp-pointer-author.sh target/webapp/webapp.tar.xz pointer-records.toml || exit 1
 version_file="published-contract/contract-version.txt"
 if [ ! -f "$version_file" ]; then
     echo "ERROR: $version_file missing. Seed it with the current on-network version."
@@ -326,6 +332,18 @@ description = "Run tests for chat-delegate"
 command = "cargo"
 args = ["test", "--package", "chat-delegate", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
 
+# The river-ui crate's native unit tests. build-tailwind first: the crate's
+# `asset!("/assets/styles.css")` fails to compile without the generated,
+# gitignored ui/assets/styles.css ("Asset at /assets/styles.css doesn't
+# exist"). CI's build job generates it in its `cargo make build` step.
+[tasks.test-ui]
+description = "Run river-ui unit tests (featureless, then example-data,no-sync)"
+dependencies = ["build-tailwind"]
+script = '''
+cargo test -p river-ui --bins
+cargo test -p river-ui --bins --features example-data,no-sync
+'''
+
 [tasks.test]
 description = "Run all tests"
 dependencies = ["test-web-container", "test-web-container-integration", "test-room-contract", "test-scaffold", "test-common", "test-chat-delegate"]
@@ -370,13 +388,14 @@ echo "Please commit the changes to git"
 # the new WASM would silently re-key the on-network contract with NO CI
 # trip-wire and orphan every user's room data.
 #
-# The same republish also invalidates our POINTER RECORDS, which are what third
-# parties resolve instead of pinning a key (FREENET.md, pointer-records.toml).
+# The same republish also invalidates our POINTER RECORDS, which third parties
+# resolve instead of pinning a key (FREENET.md, pointer-records.toml), and which
+# our users' already-open tabs watch to know they must reload (#580).
 # Run `cargo make sign-pointer-records` in the same PR — CI's
 # check-pointer-freshness demands it — and `cargo make publish-pointer-records`
-# from main after the merge. Migration entries carry OUR users forward; the
-# pointer tells everyone ELSE where the artifact went. Same trigger, two
-# different sets of people who lose if it is skipped.
+# from main after the merge and after this UI publish (river-publish.md step 7).
+# Migration entries carry our users' DATA forward; the pointer carries their
+# open tabs and everyone else. Skipped, open tabs stay on the old keys.
 description = "Publish River to Freenet using the committed contract version"
 dependencies = ["sign-webapp"]
 script = '''
@@ -415,6 +434,9 @@ fdev network publish \
 
 if [ "$publish_rc" -eq 0 ]; then
     echo "Publish OK. Remember to commit $version_file."
+    echo "If this publish re-keyed the room contract or chat delegate, run"
+    echo "\`cargo make publish-pointer-records\` from main ~2 minutes from now:"
+    echo "open River tabs reload only when the new pointer lands (river-publish.md, step 7)."
 else
     # The counter is NOT rolled back — see the lifecycle note in
     # [tasks.sign-webapp]. Version $version is burned whether or not the
@@ -759,12 +781,14 @@ echo "Don't forget to: git push origin main"
 description = "Check if delegate WASM changed and migration entry is needed"
 script = ["scripts/check-migration.sh"]
 
-# --- Pointer records (stable identity for third parties) ---------------------
+# --- Pointer records (stable identity; the re-key signal) --------------------
 #
 # These are the OTHER half of a re-key. The migration registries above carry
-# OUR users' data forward across a re-key; a pointer record tells THIRD PARTIES
-# where the artifact moved to. Different problem, same trigger — so whenever you
-# run `add-migration`, you almost certainly also need `sign-pointer-records`.
+# OUR users' data forward across a re-key; a pointer record says where the
+# artifact moved to, for THIRD PARTIES and for our users' already-open tabs,
+# which reload only when a newer record lands (#580). Different problem, same
+# trigger — so whenever you run `add-migration`, you almost certainly also need
+# `sign-pointer-records`, and `publish-pointer-records` after the UI publish.
 #
 # See FREENET.md and pointer-records.toml.
 

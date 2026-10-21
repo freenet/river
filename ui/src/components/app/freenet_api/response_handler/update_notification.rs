@@ -227,6 +227,10 @@ pub fn handle_update_notification(
     update: UpdateData,
 ) -> Result<(), SynchronizerError> {
     info!("Received update notification for key: {key}");
+    // River's own pointer records (freenet/river#580): not a room.
+    if crate::components::app::freenet_api::generation_watch::deliver_update(key.id(), &update) {
+        return Ok(());
+    }
     // Get contract info, return early if not found
     let room_owner_vk = match SYNC_INFO.read().get_owner_vk_for_instance_id(key.id()) {
         Some(vk) => vk,

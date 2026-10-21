@@ -57,17 +57,16 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-
     
-    - name: Cache cargo-make
-      uses: actions/cache@v3
-      with:
-        path: ~/.cargo/bin/cargo-make
-        key: ${{ runner.os }}-cargo-make
-    
+    # Prebuilt binary rather than `cargo install`: compiling cargo-make from
+    # source broke when its `zip ^2` dependency was yanked from crates.io, and
+    # `--force` meant every run recompiled it regardless of the cache.
     - name: Install cargo-make
-      uses: actions-rs/cargo@v1
+      uses: taiki-e/install-action@v2
       with:
-        command: install
-        args: --force cargo-make
+        tool: cargo-make@0.37.24
+        # Fail loudly if no prebuilt binary exists rather than silently
+        # falling back to the source build this step exists to avoid.
+        fallback: none
 
     - name: Install cargo-binstall
       uses: taiki-e/install-action@cargo-binstall
@@ -318,17 +317,16 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-
 
-    - name: Cache cargo-make
-      uses: actions/cache@v3
-      with:
-        path: ~/.cargo/bin/cargo-make
-        key: ${{ runner.os }}-cargo-make
-
+    # Prebuilt binary rather than `cargo install`: compiling cargo-make from
+    # source broke when its `zip ^2` dependency was yanked from crates.io, and
+    # `--force` meant every run recompiled it regardless of the cache.
     - name: Install cargo-make
-      uses: actions-rs/cargo@v1
+      uses: taiki-e/install-action@v2
       with:
-        command: install
-        args: --force cargo-make
+        tool: cargo-make@0.37.24
+        # Fail loudly if no prebuilt binary exists rather than silently
+        # falling back to the source build this step exists to avoid.
+        fallback: none
 
     - name: Install cargo-binstall
       uses: taiki-e/install-action@cargo-binstall

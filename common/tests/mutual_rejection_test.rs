@@ -336,11 +336,13 @@ fn a_banned_moderator_cannot_act_through_a_same_delta_re_add() {
     let _ = b_bans_t;
 }
 
-/// A forged signature is still rejected at apply time when the banner is known
+/// A forged signature is still refused at apply time when the banner is known
 /// here: dropping the orphaned-ban rule must not have dropped the signature
-/// check with it.
+/// check with it. The forged ban is skipped, not stored, and the rest of the
+/// delta applies (freenet/river#703: an error would fail every merge with a
+/// peer that holds it validly, not knowing the banner).
 #[test]
-fn a_forged_ban_by_a_current_member_is_still_rejected() {
+fn a_forged_ban_by_a_current_member_is_still_refused() {
     let room = Room::new();
     let (t, x) = (room.person(), room.person());
     let a = room.state(&[&t, &x], vec![], vec![room.msg(&t, 1), room.msg(&x, 2)]);
@@ -352,10 +354,14 @@ fn a_forged_ban_by_a_current_member_is_still_rejected() {
         ..Default::default()
     };
     let mut after = a.clone();
-    let err = after
+    after
         .apply_delta(&a, &room.params, &Some(delta))
-        .expect_err("a forged ban attributed to a current member must be rejected");
-    assert!(err.contains("signature"), "unexpected error: {err}");
+        .expect("a forged ban is skipped, not an error");
+    assert!(after.bans.0.is_empty(), "the forged ban is not stored");
+    assert!(
+        after.members.members.iter().any(|m| m.member.id() == t.id),
+        "the forged ban removes nobody"
+    );
 }
 
 /// The old draft of #672 made `MemberInfoV1::verify` accept a record for an
@@ -1195,9 +1201,10 @@ fn a_removed_members_invitee_is_removed_and_stays_removed() {
 
 /// A removed moderator editing their own `deputies` cannot escape a cycle
 /// whose other edge rests on ABSOLUTE authority (owner-appointed moderator).
-/// Their record is ban evidence, so the update applies, but a `deputies` list
-/// grants authority only over its author's own subtree and never voids a ban
-/// on its author. No stored ban needs the grant, so cleanup does not keep it.
+/// Their record is ban evidence, so the update applies and is kept (every
+/// evidence record keeps its `member_info`, freenet/river#703), but a
+/// `deputies` list grants authority only over its author's own subtree and
+/// never voids a ban on its author.
 #[test]
 fn a_removed_moderator_cannot_escape_by_deputizing_its_partner() {
     let room = Room::new();
@@ -1209,11 +1216,11 @@ fn a_removed_moderator_cannot_escape_by_deputizing_its_partner() {
         ..Default::default()
     };
     // The record is signed by A, whose record is ban evidence, so the
-    // update applies. It cannot be used to escape, and nothing needs it.
+    // update applies, and it is kept. It cannot be used to escape.
     let after = apply_checked(&s, delta, &room.params);
     assert!(
-        !after.member_info.deputies_of(a.id).contains(&b.id),
-        "an evidence-only member's grant no ban needs is not kept"
+        after.member_info.deputies_of(a.id).contains(&b.id),
+        "an evidence-only member's member_info is kept"
     );
     let active = active_ids(&after, &room.params);
     assert!(!active.contains(&a.id) && !active.contains(&b.id));
@@ -1808,12 +1815,16 @@ fn a_mutual_ban_removes_only_the_cycle_members() {
     );
 }
 
-/// Round 5 Must Fix 2: an ordinary member X deputizes sybils it invited and
-/// has them ban each other in pairs with far-future dates. Every pair is a
-/// cycle, but mutual bans rank below the owner's ban and below a moderator's
-/// ban that takes effect, so the cap evicts sybil bans instead.
+/// Round 5 Must Fix 2, revised for freenet/river#796: an ordinary member X
+/// deputizes sybils it invited and has them ban each other in pairs with
+/// far-future dates. Every pair is a cycle, so the bans are live. The owner
+/// pool keeps its half of the cap, so the owner's ban survives the flood.
+/// The cap's authority order ranks a ban by how high in the invite tree its
+/// authority sits, not by its date, so the moderator's ban on a member
+/// invited by the owner ranks above the sybils' bans on members two levels
+/// down, and is kept too.
 #[test]
-fn a_sybil_deputy_cycle_flood_cannot_evict_real_bans() {
+fn a_sybil_deputy_cycle_flood_cannot_evict_owner_bans() {
     let room = capped_room(20, 4);
     let (v, w, d, x) = (room.person(), room.person(), room.person(), room.person());
     let sybils: Vec<Person> = (0..4).map(|_| room.person_invited_by(&x)).collect();
@@ -1839,9 +1850,57 @@ fn a_sybil_deputy_cycle_flood_cannot_evict_real_bans() {
     ];
     let after = apply_checked(&s, bans_delta(flood), &room.params);
     assert!(has_ban(&after, &owner_bans_v), "the owner's ban survives");
-    assert!(has_ban(&after, &d_bans_w), "the moderator's ban survives");
-    let ids = member_ids(&after);
-    assert!(!ids.contains(&v.id) && !ids.contains(&w.id));
+    assert!(
+        !member_ids(&after).contains(&v.id),
+        "the owner's ban still takes effect"
+    );
+    // Authority order: D's ban on W ranks at W's depth minus one (0), the
+    // sybils' bans at depth 1.
+    assert!(
+        has_ban(&after, &d_bans_w),
+        "the moderator's ban ranks above the flood"
+    );
+}
+
+/// The owner pool's guarantee holds under a flood even when the owner has more
+/// bans than its share: with a cap of 4 and three owner bans, a flood of
+/// far-future non-owner bans evicts only the OLDEST owner ban, and the newest
+/// two (half the cap) survive.
+#[test]
+fn a_flood_leaves_the_newest_half_cap_of_owner_bans() {
+    let room = capped_room(20, 4);
+    let x = room.person();
+    let sybils: Vec<Person> = (0..4).map(|_| room.person_invited_by(&x)).collect();
+    let mut members: Vec<&Person> = vec![&x];
+    members.extend(sybils.iter());
+    let mut s = room.modded_state(&members, &[], vec![]);
+    s.member_info
+        .member_info
+        .push(deputies_record(&x, 1, &sybils.iter().collect::<Vec<_>>()));
+    s.verify(&s, &room.params).expect("fixture");
+    let gone: Vec<Person> = (0..3).map(|_| room.person()).collect();
+    let owner_bans: Vec<AuthorizedUserBan> = gone
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.owner_ban(p, 10 + i as u64))
+        .collect();
+    let s = apply_checked(&s, bans_delta(owner_bans.clone()), &room.params);
+    let far = 3_000_000_000;
+    let flood = vec![
+        room.ban(&sybils[0], &sybils[1], far),
+        room.ban(&sybils[1], &sybils[0], far),
+        room.ban(&sybils[2], &sybils[3], far + 1),
+        room.ban(&sybils[3], &sybils[2], far + 1),
+    ];
+    let after = apply_checked(&s, bans_delta(flood), &room.params);
+    assert!(
+        !has_ban(&after, &owner_bans[0]),
+        "the oldest owner ban goes"
+    );
+    assert!(
+        has_ban(&after, &owner_bans[1]) && has_ban(&after, &owner_bans[2]),
+        "the newest half-cap of owner bans survives"
+    );
 }
 
 /// Round 5 Must Fix 2: a member removed by a moderator's ban re-adds
@@ -1978,10 +2037,14 @@ fn empty_ban_evidence_is_not_serialized() {
     assert_eq!(ser(&back), bytes);
 }
 
-/// A ban that closes a mutual-ban cycle ranks with the mutual bans at the
-/// `max_user_bans` cap even when an earlier ban already removed its issuer
-/// (Ian, 2026-09-24: both bans of a mutual ban stand). Under cap pressure the
-/// cycle's bans are kept and other bans that take no effect go first.
+/// A ban that closes a mutual-ban cycle is live at the `max_user_bans` cap
+/// (Ian, 2026-09-24: both bans of a mutual ban stand). The cap judges each
+/// ban over the bans kept before it in its authority order (newest first
+/// within a level here), so the cycle's tier is decided over that prefix: B's
+/// newer bans on T and U, then B's ban on A, then A's ban on B closing the
+/// cycle, fill the cap, and C's older ban on A, judged last, is left out. A
+/// and B are removed as a mutual pair, which makes B's other bans take no
+/// effect, so T and U stay. A re-merge changes nothing.
 #[test]
 fn cycle_bans_rank_mutual_after_an_earlier_removal() {
     let room = capped_room(20, 4);
@@ -2008,12 +2071,25 @@ fn cycle_bans_rank_mutual_after_an_earlier_removal() {
 
     // Two later bans by B that take no effect push the room over the cap.
     let extra = vec![room.ban(&b, &t, 1_000_000), room.ban(&b, &u, 1_000_001)];
-    let after = apply_checked(&s, bans_delta(extra), &room.params);
-    assert!(has_ban(&after, &c_bans_a));
+    let after = apply_checked(&s, bans_delta(extra.clone()), &room.params);
+    // Judged over the kept prefix, newest first: C's ban is reached last.
+    assert!(!has_ban(&after, &c_bans_a));
     assert!(has_ban(&after, &a_bans_b) && has_ban(&after, &b_bans_a));
+    assert!(extra.iter().all(|b| has_ban(&after, b)));
+    let resolution = after.members.resolve_bans(
+        &after.ban_evidence,
+        &after.bans,
+        &after.member_info,
+        &room.params,
+    );
+    assert_eq!(resolution.tier(&a_bans_b.id()), BanResolution::MUTUAL);
+    assert_eq!(resolution.tier(&b_bans_a.id()), BanResolution::MUTUAL);
     let active = active_ids(&after, &room.params);
     assert!(!active.contains(&a.id) && !active.contains(&b.id));
     assert!(active.contains(&t.id) && active.contains(&u.id));
+    let mut again = after.clone();
+    again.merge_from(&room.params, &after).expect("re-merge");
+    assert_eq!(ser(&again), ser(&after), "a re-merge gives the same");
 }
 
 /// Only signature-verified bans compete for the one ranked slot per
@@ -2040,6 +2116,9 @@ fn pair_ranking_counts_only_verified_bans() {
     BansV1::enforce_user_ban_cap(
         &mut bans,
         2,
+        river_core::room_state::ban_evidence::evidence_depth_cap(
+            s.configuration.configuration.max_members,
+        ),
         &s.members,
         &s.ban_evidence,
         &s.member_info,
@@ -2115,11 +2194,12 @@ fn a_pruned_moderator_held_as_evidence_keeps_ban_authority() {
     );
 }
 
-/// The owner ranks above everything at the `max_user_bans` cap, and only one
-/// ban per (issuer, target) keeps its tier: a later duplicate of an effective
-/// ban is evicted before a different effective ban.
+/// Only one ban per (issuer, target) is judged live at the `max_user_bans`
+/// cap: the one the authority order reaches first (the newest within its
+/// level). A second ban for the pair can only fill a slot left at the end,
+/// so it never takes a slot from another pair's ban.
 #[test]
-fn cap_keeps_owner_bans_first_and_one_ban_per_pair() {
+fn a_duplicate_never_takes_another_pairs_slot() {
     let room = capped_room(20, 3);
     let (d, x, y, z) = (room.person(), room.person(), room.person(), room.person());
     let s = room.modded_state(&[&d, &x, &y, &z], &[&d], vec![]);
@@ -2138,31 +2218,387 @@ fn cap_keeps_owner_bans_first_and_one_ban_per_pair() {
     );
     let after = apply_checked(&s, bans_delta(vec![d_bans_y_again.clone()]), &room.params);
     assert!(has_ban(&after, &owner_bans_x));
-    assert!(has_ban(&after, &d_bans_y) && has_ban(&after, &d_bans_z));
+    assert!(has_ban(&after, &d_bans_z), "no other pair loses its ban");
+    // The pair keeps the ban the order reaches first; the cap is then full.
+    assert!(has_ban(&after, &d_bans_y_again) && !has_ban(&after, &d_bans_y));
+}
+
+/// freenet/river#796: with the ban list full of OWNER bans, a deputy's new ban
+/// used to rank lowest and be evicted the moment it arrived, so the deputy
+/// could ban nobody. Owner bans are guaranteed only half the cap, so the
+/// oldest owner ban beyond that half goes instead and the deputy's ban takes
+/// effect.
+#[test]
+fn a_full_list_of_owner_bans_does_not_evict_a_new_deputy_ban() {
+    let room = capped_room(20, 4);
+    let (d, x) = (room.person(), room.person());
+    let s = room.modded_state(&[&d, &x], &[&d], vec![]);
+    let gone: Vec<Person> = (0..4).map(|_| room.person()).collect();
+    let owner_bans: Vec<AuthorizedUserBan> = gone
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.owner_ban(p, 10 + i as u64))
+        .collect();
+    let s = apply_checked(&s, bans_delta(owner_bans.clone()), &room.params);
+    assert_eq!(s.bans.0.len(), 4, "the list is full of owner bans");
+
+    let d_bans_x = room.ban(&d, &x, 100);
+    let after = apply_checked(&s, bans_delta(vec![d_bans_x.clone()]), &room.params);
+    assert!(has_ban(&after, &d_bans_x), "the deputy's ban is kept");
     assert!(
-        !has_ban(&after, &d_bans_y_again),
-        "the duplicate goes first"
+        !member_ids(&after).contains(&x.id),
+        "the deputy's ban takes effect"
+    );
+    assert!(
+        !has_ban(&after, &owner_bans[0]),
+        "the oldest owner ban is evicted"
+    );
+    for ban in &owner_bans[1..] {
+        assert!(has_ban(&after, ban), "the newer owner bans are kept");
+    }
+}
+
+/// Owner bans are often rare, so their half of the cap is a floor, not an
+/// allocation: with no owner bans, the other pool uses the whole cap and
+/// evicts strictly by age.
+#[test]
+fn rare_owner_bans_leave_the_whole_cap_to_other_bans() {
+    let room = capped_room(20, 4);
+    let d = room.person();
+    let s = room.modded_state(&[&d], &[&d], vec![]);
+    let gone: Vec<Person> = (0..5).map(|_| room.person()).collect();
+    let d_bans: Vec<AuthorizedUserBan> = gone
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.ban(&d, p, 10 + i as u64))
+        .collect();
+    // A single delta may carry at most `max_user_bans` bans.
+    let s = apply_checked(&s, bans_delta(d_bans[..4].to_vec()), &room.params);
+    let after = apply_checked(&s, bans_delta(vec![d_bans[4].clone()]), &room.params);
+    assert_eq!(after.bans.0.len(), 4, "the whole cap is used");
+    assert!(!has_ban(&after, &d_bans[0]), "the oldest is evicted");
+    for ban in &d_bans[1..] {
+        assert!(has_ban(&after, ban));
+    }
+}
+
+/// The two pools trade unused slots by age: with one owner ban and a cap of 4,
+/// three other bans fit, and a newer owner ban evicts the oldest OTHER ban
+/// once the owner pool is within its share, because the other pool is then
+/// the one over its share.
+#[test]
+fn a_new_owner_ban_evicts_the_oldest_ban_of_the_pool_over_its_share() {
+    let room = capped_room(20, 4);
+    let d = room.person();
+    let s = room.modded_state(&[&d], &[&d], vec![]);
+    let gone: Vec<Person> = (0..5).map(|_| room.person()).collect();
+    let old_owner = room.owner_ban(&gone[0], 5);
+    let d_bans: Vec<AuthorizedUserBan> = gone[1..4]
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.ban(&d, p, 10 + i as u64))
+        .collect();
+    let mut first = vec![old_owner.clone()];
+    first.extend(d_bans.iter().cloned());
+    let s = apply_checked(&s, bans_delta(first), &room.params);
+    assert_eq!(s.bans.0.len(), 4);
+
+    let new_owner = room.owner_ban(&gone[4], 100);
+    let after = apply_checked(&s, bans_delta(vec![new_owner.clone()]), &room.params);
+    assert!(
+        has_ban(&after, &old_owner) && has_ban(&after, &new_owner),
+        "both owner bans fit the owner pool's share, so the older one is kept"
+    );
+    assert!(
+        !has_ban(&after, &d_bans[0]),
+        "the oldest other ban goes, its pool being over its share"
+    );
+    assert!(has_ban(&after, &d_bans[1]) && has_ban(&after, &d_bans[2]));
+}
+
+/// An odd cap's spare slot goes to the next ban in the authority order,
+/// whatever its age. Cap 3: each pool is guaranteed one slot, and the third
+/// goes to the older owner ban, as owner bans rank first.
+#[test]
+fn an_odd_caps_spare_slot_goes_to_the_next_ban_in_authority_order() {
+    for owner_older in [true, false] {
+        let room = capped_room(20, 3);
+        let d = room.person();
+        let s = room.modded_state(&[&d], &[&d], vec![]);
+        let gone: Vec<Person> = (0..4).map(|_| room.person()).collect();
+        let (o_at, d_at) = if owner_older { (10, 15) } else { (15, 10) };
+        let o1 = room.owner_ban(&gone[0], o_at);
+        let o2 = room.owner_ban(&gone[1], 20);
+        let d1 = room.ban(&d, &gone[2], d_at);
+        let d2 = room.ban(&d, &gone[3], 30);
+        let s = apply_checked(
+            &s,
+            bans_delta(vec![o1.clone(), o2.clone(), d1.clone()]),
+            &room.params,
+        );
+        let after = apply_checked(&s, bans_delta(vec![d2.clone()]), &room.params);
+        assert_eq!(after.bans.0.len(), 3);
+        assert!(has_ban(&after, &o2) && has_ban(&after, &d2));
+        assert!(has_ban(&after, &o1) && !has_ban(&after, &d1));
+    }
+}
+
+/// At cap 1 neither pool is guaranteed a slot, and the one slot goes to the
+/// first ban in the authority order: the owner's ban, newer or older.
+#[test]
+fn cap_one_keeps_the_owner_ban_over_a_newer_ban() {
+    for owner_newer in [true, false] {
+        let room = capped_room(20, 1);
+        let d = room.person();
+        let s = room.modded_state(&[&d], &[&d], vec![]);
+        let (x, y) = (room.person(), room.person());
+        let (o_at, d_at) = if owner_newer { (20, 10) } else { (10, 20) };
+        let o = room.owner_ban(&x, o_at);
+        let db = room.ban(&d, &y, d_at);
+        let s = apply_checked(&s, bans_delta(vec![o.clone()]), &room.params);
+        let after = apply_checked(&s, bans_delta(vec![db.clone()]), &room.params);
+        assert_eq!(after.bans.0.len(), 1);
+        assert!(has_ban(&after, &o) && !has_ban(&after, &db));
+    }
+}
+
+/// One cap pass over a duplicate pair AND a pool over its share: cap 4,
+/// three owner bans, a deputy's ban plus a later duplicate of it, and another
+/// deputy ban. Six bans, two to go: the owner pool keeps its newest two, and
+/// the deputy's pair keeps the ban the authority order reaches first (the
+/// newer one), so the older ban of the pair and the oldest owner ban go. The
+/// result does not depend on input order, and a second pass changes nothing.
+#[test]
+fn a_duplicate_pair_and_a_pool_eviction_in_one_pass() {
+    let room = capped_room(20, 4);
+    let (d, x, y) = (room.person(), room.person(), room.person());
+    let s = room.modded_state(&[&d, &x, &y], &[&d], vec![]);
+    let gone: Vec<Person> = (0..3).map(|_| room.person()).collect();
+    let owner_bans: Vec<AuthorizedUserBan> = gone
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.owner_ban(p, 10 + i as u64))
+        .collect();
+    let d_bans_x = room.ban(&d, &x, 20);
+    let d_bans_x_again = room.ban(&d, &x, 40);
+    let d_bans_y = room.ban(&d, &y, 21);
+    let mut input = owner_bans.clone();
+    input.extend([d_bans_x.clone(), d_bans_x_again.clone(), d_bans_y.clone()]);
+
+    let cap = |bans: &[AuthorizedUserBan]| {
+        let mut bans = bans.to_vec();
+        BansV1::enforce_user_ban_cap(
+            &mut bans,
+            4,
+            river_core::room_state::ban_evidence::evidence_depth_cap(
+                s.configuration.configuration.max_members,
+            ),
+            &s.members,
+            &s.ban_evidence,
+            &s.member_info,
+            &room.params,
+        );
+        bans
+    };
+    let out = cap(&input);
+    let ids: Vec<_> = out.iter().map(|b| b.id()).collect();
+    let want: Vec<_> = [&owner_bans[1], &owner_bans[2], &d_bans_y, &d_bans_x_again]
+        .iter()
+        .map(|b| b.id())
+        .collect();
+    assert_eq!(
+        ids, want,
+        "the pair's older ban and the oldest owner ban go, in stored order"
+    );
+
+    let mut reversed = input.clone();
+    reversed.reverse();
+    let mut rotated = input.clone();
+    rotated.rotate_left(2);
+    assert_eq!(cap(&reversed), out, "input order does not matter");
+    assert_eq!(cap(&rotated), out, "input order does not matter");
+    assert_eq!(cap(&out), out, "a second pass changes nothing");
+}
+
+/// More duplicates than the overflow: each (issuer, target) pair keeps the
+/// ban the authority order reaches first (the newest), no pair is left
+/// without a ban, and the remaining bans only fill the slots left, in the
+/// same order. Cap 5 with four bans, then three later bans on the deputy's
+/// two pairs: seven against cap 5.
+#[test]
+fn surplus_duplicates_only_fill_free_slots() {
+    let room = capped_room(20, 5);
+    let (d, x, y) = (room.person(), room.person(), room.person());
+    let s = room.modded_state(&[&d, &x, &y], &[&d], vec![]);
+    let gone: Vec<Person> = (0..2).map(|_| room.person()).collect();
+    let o1 = room.owner_ban(&gone[0], 10);
+    let o2 = room.owner_ban(&gone[1], 11);
+    let dx = room.ban(&d, &x, 12);
+    let dy = room.ban(&d, &y, 13);
+    let s = apply_checked(
+        &s,
+        bans_delta(vec![o1.clone(), o2.clone(), dx.clone(), dy.clone()]),
+        &room.params,
+    );
+    // Three later bans on the deputy's two pairs: 7 bans against cap 5.
+    let dup1 = room.ban(&d, &x, 20);
+    let dup2 = room.ban(&d, &y, 21);
+    let dup3 = room.ban(&d, &x, 22);
+    let after = apply_checked(
+        &s,
+        bans_delta(vec![dup1.clone(), dup2.clone(), dup3.clone()]),
+        &room.params,
+    );
+    assert!(
+        has_ban(&after, &o1) && has_ban(&after, &o2),
+        "owner bans stay"
+    );
+    // D->X keeps dup3, D->Y keeps dup2 (each pair's newest); the fifth slot
+    // goes to the next ban in order, dup1; the oldest bans of the pairs go.
+    assert!(has_ban(&after, &dup3) && has_ban(&after, &dup2));
+    assert!(has_ban(&after, &dup1), "a duplicate fills a free slot");
+    assert!(!has_ban(&after, &dx) && !has_ban(&after, &dy));
+}
+
+/// Both pools over their share with several evictions in one pass. Cap 4
+/// (share 2): owner bans at 10, 30, 40, 50 and deputy bans at 20, 60, 70.
+/// Seven live, three go: each pool keeps its newest two, its share. (The
+/// choice of a spare slot between pools is pinned by
+/// `an_odd_caps_spare_slot_goes_to_the_next_ban_in_authority_order`.)
+#[test]
+fn several_evictions_take_each_pools_oldest_beyond_its_share() {
+    let room = capped_room(20, 4);
+    let d = room.person();
+    let s = room.modded_state(&[&d], &[&d], vec![]);
+    let gone: Vec<Person> = (0..7).map(|_| room.person()).collect();
+    let o: Vec<AuthorizedUserBan> = [10, 30, 40, 50]
+        .iter()
+        .zip(&gone[..4])
+        .map(|(t, p)| room.owner_ban(p, *t))
+        .collect();
+    let db: Vec<AuthorizedUserBan> = [20, 60, 70]
+        .iter()
+        .zip(&gone[4..])
+        .map(|(t, p)| room.ban(&d, p, *t))
+        .collect();
+    let s = apply_checked(&s, bans_delta(o.clone()), &room.params);
+    let after = apply_checked(&s, bans_delta(db.clone()), &room.params);
+    assert_eq!(after.bans.0.len(), 4);
+    assert!(!has_ban(&after, &o[0]) && !has_ban(&after, &o[1]));
+    assert!(!has_ban(&after, &db[0]));
+    assert!(has_ban(&after, &o[2]) && has_ban(&after, &o[3]));
+    assert!(has_ban(&after, &db[1]) && has_ban(&after, &db[2]));
+}
+
+/// A ban that takes no effect is dead and goes before any live ban, however
+/// new: a plain member B bans D, whom B has no authority over (D is present,
+/// so the ban can be judged, and it is inert). It is the NEWEST ban, yet it is
+/// the one evicted at the cap.
+#[test]
+fn an_inert_ban_goes_before_older_live_bans() {
+    let room = capped_room(20, 3);
+    let (b, d, x) = (room.person(), room.person(), room.person());
+    let s = room.modded_state(&[&b, &d, &x], &[&d], vec![]);
+    let gone: Vec<Person> = (0..2).map(|_| room.person()).collect();
+    let o = room.owner_ban(&gone[0], 10);
+    let d_ban = room.ban(&d, &gone[1], 11);
+    let d_bans_x = room.ban(&d, &x, 12);
+    let s = apply_checked(
+        &s,
+        bans_delta(vec![o.clone(), d_ban.clone(), d_bans_x.clone()]),
+        &room.params,
+    );
+    let inert = room.ban(&b, &d, 100);
+    let after = apply_checked(&s, bans_delta(vec![inert.clone()]), &room.params);
+    assert!(!has_ban(&after, &inert), "the inert ban is evicted");
+    for live in [&o, &d_ban, &d_bans_x] {
+        assert!(has_ban(&after, live), "no live ban is evicted");
+    }
+}
+
+/// A ban on an id held nowhere by an issuer known nowhere is dead (its
+/// signature cannot be checked), and is evicted before older live bans.
+#[test]
+fn an_absent_target_ban_by_an_absent_issuer_is_dead() {
+    let room = capped_room(20, 2);
+    let d = room.person();
+    let s = room.modded_state(&[&d], &[&d], vec![]);
+    let gone: Vec<Person> = (0..2).map(|_| room.person()).collect();
+    let o = room.owner_ban(&gone[0], 10);
+    let d_ban = room.ban(&d, &gone[1], 11);
+    let stranger = room.person();
+    let by_stranger = room.ban(&stranger, &room.person(), 100);
+    let mut bans = vec![by_stranger.clone(), d_ban.clone(), o.clone()];
+    BansV1::enforce_user_ban_cap(
+        &mut bans,
+        2,
+        river_core::room_state::ban_evidence::evidence_depth_cap(
+            s.configuration.configuration.max_members,
+        ),
+        &s.members,
+        &s.ban_evidence,
+        &s.member_info,
+        &room.params,
+    );
+    let ids: Vec<_> = bans.iter().map(|b| b.id()).collect();
+    assert_eq!(ids, vec![o.id(), d_ban.id()]);
+}
+
+/// The widened residual of freenet/river#796, pinned so a future fix flips it
+/// deliberately: a plain member with no deputy grant and no invitees floods
+/// far-future bans against random ids whose record is held nowhere (each
+/// counts as live). With three owner bans at cap 4 the oldest owner ban is
+/// evicted; the newest two (the owner pool's share) survive.
+#[test]
+fn a_plain_members_random_target_flood_evicts_owner_bans_down_to_the_share() {
+    let room = capped_room(20, 4);
+    let m = room.person();
+    let s = room.modded_state(&[&m], &[], vec![]);
+    let gone: Vec<Person> = (0..3).map(|_| room.person()).collect();
+    let owner_bans: Vec<AuthorizedUserBan> = gone
+        .iter()
+        .enumerate()
+        .map(|(i, p)| room.owner_ban(p, 10 + i as u64))
+        .collect();
+    let s = apply_checked(&s, bans_delta(owner_bans.clone()), &room.params);
+    let far = 3_000_000_000;
+    let flood: Vec<AuthorizedUserBan> = (0..4)
+        .map(|i| room.ban(&m, &room.person(), far + i))
+        .collect();
+    let after = apply_checked(&s, bans_delta(flood.clone()), &room.params);
+    assert!(
+        !has_ban(&after, &owner_bans[0]),
+        "the oldest owner ban goes"
+    );
+    assert!(has_ban(&after, &owner_bans[1]) && has_ban(&after, &owner_bans[2]));
+    assert!(
+        has_ban(&after, &flood[2]) && has_ban(&after, &flood[3]),
+        "the newest flood bans fill the other pool"
     );
 }
 
-/// An evidence record whose inviter leaves `members` at the `max_members` trim
-/// (which runs before cleanup) no longer reaches the owner, so every reader
-/// leaves it out and cleanup drops it. The result verifies and cleanup is a
-/// fixpoint. (The issuer's own record is lost to the trim before it can
-/// become evidence, a documented residual, so its ban is swept.)
+/// The `max_members` cap runs in cleanup, after the pass has taken the
+/// records it knows at its start. A ban's issuer the cap removes therefore
+/// moves to ban evidence like any other member that leaves `members` while a
+/// stored ban references it (freenet/river#702), the ban stays, and the
+/// evidence record the issuer invited still reaches the owner through it. The
+/// result verifies and cleanup is a fixpoint. (Before the cap moved into
+/// cleanup, the issuer was trimmed before it could become evidence, so its
+/// ban was swept and its invitee's record dropped.)
 #[test]
-fn evidence_whose_inviter_is_trimmed_is_dropped() {
+fn a_ban_issuer_the_member_cap_removes_moves_to_evidence_with_its_invitee() {
     let room = Room::new();
     let mut people: Vec<Person> = (0..4).map(|_| room.person()).collect();
     people.sort_by_key(|p| p.id);
-    // The trim evicts the highest id among equal chain lengths.
+    // The cap evicts the highest id among equal chain lengths.
     let i = people.pop().unwrap();
     let e = room.person_invited_by(&i);
     let mut members: Vec<&Person> = people.iter().collect();
     members.push(&i);
     members.push(&e);
     let s = room.modded_state(&members, &[], vec![]);
-    let s = apply_checked(&s, bans_delta(vec![room.ban(&i, &e, 10)]), &room.params);
+    let ban = room.ban(&i, &e, 10);
+    let s = apply_checked(&s, bans_delta(vec![ban.clone()]), &room.params);
     assert!(evidence_ids(&s).contains(&e.id), "precondition");
 
     let lower = AuthorizedConfigurationV1::new(
@@ -2183,11 +2619,15 @@ fn evidence_whose_inviter_is_trimmed_is_dropped() {
     );
     assert!(
         !member_ids(&after).contains(&i.id),
-        "precondition: I is trimmed"
+        "precondition: I is removed by the cap"
     );
     assert!(
-        evidence_ids(&after).is_empty(),
-        "E no longer reaches the owner"
+        evidence_ids(&after).contains(&i.id) && evidence_ids(&after).contains(&e.id),
+        "I moves to evidence and E still reaches the owner through it"
+    );
+    assert!(
+        has_ban(&after, &ban),
+        "I's ban stays verifiable and is kept"
     );
 }
 
@@ -2457,14 +2897,12 @@ fn person_at_depth(room: &Room, depth: usize) -> (Person, Vec<Person>) {
 }
 
 /// Mutual bans between moderators deeper than `MAX_EVIDENCE_DEPTH` invites
-/// (intended under the depth cap; no real room has such a member, the
-/// deepest chain seen is 3). Two deep moderators who ban each other in one
-/// delta are both removed, and both bans lapse with their records, so both
-/// may return. Delivered one at a time, the first ban removes the other
-/// moderator and the second is swept with its issuer's record, so the outcome
-/// depends on delivery order; every pair of peers still converges.
+/// (no real room has such a member; the deepest chain seen is 3). A ban
+/// whose issuer sits deeper than the evidence depth cap takes no effect,
+/// present or not, so neither ban removes anyone and both are dropped, in
+/// every delivery order; every pair of peers converges.
 #[test]
-fn a_mutual_ban_between_deep_moderators_lapses_and_converges() {
+fn a_mutual_ban_between_deep_moderators_takes_no_effect_in_any_order() {
     use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
     let room = capped_room(40, 10);
     let (a, a_up) = person_at_depth(&room, MAX_EVIDENCE_DEPTH + 1);
@@ -2474,12 +2912,6 @@ fn a_mutual_ban_between_deep_moderators_lapses_and_converges() {
     let s = room.modded_state(&members, &[&a, &b], vec![]);
     let (ab, ba) = (room.ban(&a, &b, 10), room.ban(&b, &a, 11));
     let both = apply_checked(&s, bans_delta(vec![ab.clone(), ba.clone()]), &room.params);
-    let ids = member_ids(&both);
-    assert!(!ids.contains(&a.id) && !ids.contains(&b.id), "both removed");
-    assert!(
-        !has_ban(&both, &ab) && !has_ban(&both, &ba),
-        "both bans lapse"
-    );
     let a_first = apply_checked(
         &apply_checked(&s, bans_delta(vec![ab.clone()]), &room.params),
         bans_delta(vec![ba.clone()]),
@@ -2490,8 +2922,18 @@ fn a_mutual_ban_between_deep_moderators_lapses_and_converges() {
         bans_delta(vec![ab.clone()]),
         &room.params,
     );
-    assert!(member_ids(&a_first).contains(&a.id) && !member_ids(&a_first).contains(&b.id));
-    assert!(member_ids(&b_first).contains(&b.id) && !member_ids(&b_first).contains(&a.id));
+    for state in [&both, &a_first, &b_first] {
+        let ids = member_ids(state);
+        assert!(
+            ids.contains(&a.id) && ids.contains(&b.id),
+            "nobody is removed"
+        );
+        assert!(
+            !has_ban(state, &ab) && !has_ban(state, &ba),
+            "both bans are dropped"
+        );
+        assert_eq!(ser(state), ser(&both), "every delivery order ends the same");
+    }
     for (x, y) in [(&a_first, &b_first), (&both, &a_first), (&both, &b_first)] {
         let (p, q) = (
             merge(x, y, &room.params).unwrap(),
@@ -2502,13 +2944,12 @@ fn a_mutual_ban_between_deep_moderators_lapses_and_converges() {
     }
 }
 
-/// One moderator deeper than the cap, one shallow, banning each other. The
-/// deep one's ban lapses with its record; the shallow one's ban stands and
-/// keeps the deep one out. Whether the shallow one is removed depends on
-/// delivery order (removed when both bans arrive together, kept when its own
-/// ban arrives first); peers converge either way.
+/// One moderator deeper than the evidence depth cap, one shallow, banning
+/// each other. The deep one's ban takes no effect; the shallow one's ban
+/// removes the deep one and stays. The same in every delivery order, and
+/// peers converge.
 #[test]
-fn a_mutual_ban_with_one_deep_moderator_converges() {
+fn a_mutual_ban_with_one_deep_moderator_ends_the_same_in_any_order() {
     use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
     let room = capped_room(40, 10);
     let (a, a_up) = person_at_depth(&room, MAX_EVIDENCE_DEPTH + 1);
@@ -2528,14 +2969,14 @@ fn a_mutual_ban_with_one_deep_moderator_converges() {
         bans_delta(vec![ab.clone()]),
         &room.params,
     );
-    assert!(!member_ids(&both).contains(&b.id), "together: B is removed");
-    assert!(
-        member_ids(&b_first).contains(&b.id),
-        "B's ban first: B stays"
-    );
     for state in [&both, &a_first, &b_first] {
-        assert!(!member_ids(state).contains(&a.id));
+        assert!(
+            !member_ids(state).contains(&a.id),
+            "A is removed by B's ban"
+        );
+        assert!(member_ids(state).contains(&b.id), "A's ban takes no effect");
         assert!(has_ban(state, &ba) && !has_ban(state, &ab));
+        assert_eq!(ser(state), ser(&both), "every delivery order ends the same");
     }
     for (x, y) in [(&a_first, &b_first), (&both, &a_first), (&both, &b_first)] {
         let (agreed, _) = gossip_until_equal(x, y, &room.params, 4);
@@ -2694,14 +3135,15 @@ fn split_delivery_of_competing_evidence_records_converges() {
     assert!(peers[0].ban_evidence.members.contains(&lower));
 }
 
-/// Cleanup keeps `member_info` for every evidence strict ancestor of a ban's
-/// target, up to the first present ancestor. A target at depth 4 whose three
-/// ancestors are all absent keeps exactly those three records, and not the
-/// target's own. When the depth-2 ancestor posts, it and its inviter stay
-/// members and the walk stops there: of the absent members, only the depth-3
-/// ancestor keeps its `member_info`.
+/// Cleanup keeps `member_info` for every record held as ban evidence (and
+/// for no other absent member). A target at depth 4 whose three ancestors are
+/// all absent is held with them, and all four keep their records. When the
+/// depth-2 ancestor posts, it and its inviter stay members: of the absent
+/// members, the depth-3 ancestor and the target keep theirs. Until
+/// freenet/river#703's review only the ancestors a ban reads kept theirs, so
+/// a member who left `members` for evidence and came back lost it.
 #[test]
-fn evidence_member_info_is_kept_up_to_the_first_present_ancestor() {
+fn evidence_member_info_is_kept_for_every_evidence_record() {
     use river_core::room_state::ban_evidence::MAX_EVIDENCE_DEPTH;
     for depth2_posts in [false, true] {
         let room = Room::new();
@@ -2732,12 +3174,9 @@ fn evidence_member_info_is_kept_up_to_the_first_present_ancestor() {
             .collect();
         let expected: Vec<MemberId> = if depth2_posts {
             assert!(present.contains(&chain[0].id) && present.contains(&chain[1].id));
-            vec![chain[2].id]
+            vec![chain[2].id, t.id]
         } else {
-            chain[..MAX_EVIDENCE_DEPTH - 1]
-                .iter()
-                .map(|p| p.id)
-                .collect()
+            chain.iter().map(|p| p.id).collect()
         };
         let mut kept_sorted = kept.clone();
         kept_sorted.sort();
@@ -2754,4 +3193,130 @@ fn evidence_member_info_is_kept_up_to_the_first_present_ancestor() {
             );
         }
     }
+}
+
+// --- freenet/river#797: each ban record is judged by its own signature ---
+//
+// A `BanId` hashes the signature alone, and records that share an id but
+// differ in content are all stored. `enforce_user_ban_cap` must not credit a
+// record with the verdict `resolve_bans` reached for another record of the
+// same id: a record whose own signature does not verify against its claimed
+// issuer is dead. Each case is run in two input orders and compares whole
+// records, since the forged record and the genuine one share an id.
+type BanRecord = (MemberId, std::time::SystemTime, MemberId, MemberId);
+fn ban_record(b: &AuthorizedUserBan) -> BanRecord {
+    (
+        b.banned_by,
+        b.ban.banned_at,
+        b.ban.banned_user,
+        b.ban.owner_member_id,
+    )
+}
+fn copy_signature(
+    sig_of: &AuthorizedUserBan,
+    issuer: MemberId,
+    target: MemberId,
+    at: u64,
+    owner: MemberId,
+) -> AuthorizedUserBan {
+    AuthorizedUserBan::with_signature(
+        UserBan {
+            owner_member_id: owner,
+            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000 + at),
+            banned_user: target,
+        },
+        issuer,
+        sig_of.signature,
+    )
+}
+fn cap_both_orders(
+    room: &Room,
+    s: &ChatRoomStateV1,
+    bans: Vec<AuthorizedUserBan>,
+    cap: usize,
+) -> Vec<BanRecord> {
+    let mut out = Vec::new();
+    for rev in [false, true] {
+        let mut b = bans.clone();
+        if rev {
+            b.reverse();
+        }
+        BansV1::enforce_user_ban_cap(
+            &mut b,
+            cap,
+            river_core::room_state::ban_evidence::evidence_depth_cap(
+                s.configuration.configuration.max_members,
+            ),
+            &s.members,
+            &s.ban_evidence,
+            &s.member_info,
+            &room.params,
+        );
+        out.push(b.iter().map(ban_record).collect::<Vec<_>>());
+    }
+    assert_eq!(out[0], out[1], "input order changed the result");
+    out.pop().unwrap()
+}
+#[test]
+fn a_record_copying_an_owner_bans_signature_is_dead_at_the_cap() {
+    let room = capped_room(20, 2);
+    let s = room.modded_state(&[], &[], vec![]);
+    let (x, y, z) = (room.person(), room.person(), room.person());
+    let b1 = room.owner_ban(&x, 10);
+    let b2 = room.owner_ban(&y, 11);
+    let forged = copy_signature(&b1, room.owner_id, z.id, 99, room.owner_id);
+    let got = cap_both_orders(&room, &s, vec![b1.clone(), b2.clone(), forged], 2);
+    assert_eq!(got, vec![ban_record(&b1), ban_record(&b2)]);
+}
+#[test]
+fn a_record_copying_a_bans_signature_cannot_take_its_pair() {
+    // An older live ban H competes for the one slot, so the result depends on
+    // the first-of-pair filter alone: with it, the copy is dead and goes,
+    // then H (older than G) goes, leaving G. Without it, the copy takes G's
+    // pair, G and the copy both go as dead, and H is left.
+    let room = capped_room(20, 1);
+    let a = room.person();
+    let s = room.modded_state(&[&a], &[], vec![]);
+    let (t, t2) = (room.person(), room.person());
+    let g = room.ban(&a, &t, 20);
+    let h = room.ban(&a, &t2, 15);
+    let forged = copy_signature(&g, a.id, t.id, 10, room.owner_id);
+    let got = cap_both_orders(&room, &s, vec![g.clone(), h, forged], 1);
+    assert_eq!(got, vec![ban_record(&g)]);
+}
+
+/// A copy identical to a genuine ban in issuer, target and date, differing
+/// only in `owner_member_id`, matches the genuine ban's first-of-pair rank
+/// exactly. Only the per-record signature check in `live` makes it dead.
+#[test]
+fn a_record_differing_only_in_owner_member_id_is_dead_at_the_cap() {
+    let room = capped_room(20, 2);
+    let s = room.modded_state(&[], &[], vec![]);
+    let (x, y) = (room.person(), room.person());
+    let b1 = room.owner_ban(&x, 10);
+    let b2 = room.owner_ban(&y, 11);
+    let forged = AuthorizedUserBan::with_signature(
+        UserBan {
+            owner_member_id: room.person().id,
+            banned_at: b1.ban.banned_at,
+            banned_user: x.id,
+        },
+        room.owner_id,
+        b1.signature,
+    );
+    let got = cap_both_orders(&room, &s, vec![b1.clone(), b2.clone(), forged], 2);
+    assert_eq!(got, vec![ban_record(&b1), ban_record(&b2)]);
+}
+
+#[test]
+fn a_record_copying_a_bans_signature_is_not_live_on_an_unknown_target() {
+    let room = capped_room(20, 2);
+    let a = room.person();
+    let s = room.modded_state(&[&a], &[], vec![]);
+    let (t1, t2, t3) = (room.person(), room.person(), room.person());
+    let g1 = room.ban(&a, &t1, 10);
+    let g2 = room.ban(&a, &t2, 11);
+    let forged = copy_signature(&g1, a.id, t3.id, 99, room.owner_id);
+    let got = cap_both_orders(&room, &s, vec![g1.clone(), g2.clone(), forged], 2);
+    assert_eq!(got, vec![ban_record(&g1), ban_record(&g2)]);
 }

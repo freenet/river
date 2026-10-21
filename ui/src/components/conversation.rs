@@ -39,8 +39,8 @@ use self::emoji_picker::FREQUENT_EMOJIS;
 #[cfg(target_arch = "wasm32")]
 use self::history_scroll::{
     complete_scroll_request, correct_view_after_patch, follow_arrival_at_end,
-    install_scroll_settle_listener, land_at_end, note_newest_seen, observe_history_resize,
-    ROOM_HISTORY,
+    install_scroll_settle_listener, land_at_end, note_newest_seen, note_patch_while_hidden,
+    observe_history_resize, ROOM_HISTORY,
 };
 use self::history_scroll::{remember_reading_position, resolve_rendered_range, ReaderPosition};
 use self::history_window::{grown_window, BACKFILL_LEAD_PX, INITIAL_WINDOW_ITEMS};
@@ -1739,9 +1739,10 @@ pub fn Conversation() -> Element {
         });
     }
 
-    // After each render that can move rows: the patch corrections, which
-    // stand down while a request is pending, then the pending request, then
-    // the read rule against what the render left on screen.
+    // After each render that can move rows: a patch behind a hidden panel is
+    // noted for the reveal, then the patch corrections, which stand down
+    // while a request is pending, then the pending request, then the read
+    // rule against what the render left on screen.
     #[cfg(target_arch = "wasm32")]
     {
         let reader_position = reader_position.clone();
@@ -1750,6 +1751,7 @@ pub fn Conversation() -> Element {
             // and heads swap on content changes too.
             let _ = message_groups.read().is_some();
             let _ = window_items();
+            note_patch_while_hidden(&reader_position);
             correct_view_after_patch(&reader_position);
             complete_scroll_request(&reader_position, opening_snap_done);
             note_newest_seen(&reader_position);
@@ -2313,13 +2315,14 @@ pub fn Conversation() -> Element {
                                     version,
                                 )
                             } else {
-                                warn!("Room is private but no secret available, sending reply as public");
-                                RoomMessageBody::reply(
-                                    message_text.clone(),
-                                    reply.message_id,
-                                    reply.author_name,
-                                    reply.content_preview,
-                                )
+                                // The composer is not offered without the
+                                // secret (see `missing_room_secret`); this
+                                // is the backstop. A public body in a private
+                                // room is not admitted.
+                                error!(
+                                    "Cannot send: this private room's secret is not on this device"
+                                );
+                                return;
                             }
                         } else {
                             RoomMessageBody::reply(
@@ -2345,8 +2348,11 @@ pub fn Conversation() -> Element {
                                     version,
                                 )
                             } else {
-                                warn!("Room is private but no secret available, sending as public");
-                                RoomMessageBody::public(message_text.clone())
+                                // Backstop, as for a reply above.
+                                error!(
+                                    "Cannot send: this private room's secret is not on this device"
+                                );
+                                return;
                             }
                         } else {
                             RoomMessageBody::public(message_text.clone())
@@ -2395,9 +2401,16 @@ pub fn Conversation() -> Element {
                     // appear.
                     crate::util::debug_log("[send] signing message...");
                     let signature = crate::signing::sign_message_locally(&message_bytes, &self_sk);
+                    #[cfg(all(
+                        target_arch = "wasm32",
+                        feature = "example-data",
+                        feature = "no-sync"
+                    ))]
+                    let signature = crate::test_hooks::forge_if_requested(signature);
                     crate::util::debug_log("[send] signed OK");
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
+                    let sent_id = auth_message.id();
 
                     // Re-add ourselves if pruned for inactivity.
                     // Uses try_read() to avoid RefCell re-entrant borrow panics
@@ -2436,6 +2449,19 @@ pub fn Conversation() -> Element {
                                         e
                                     ));
                                     error!("Failed to apply message delta: {:?}", e);
+                                    false
+                                } else if !room_data
+                                    .room_state
+                                    .recent_messages
+                                    .messages
+                                    .iter()
+                                    .any(|m| m.id() == sent_id)
+                                {
+                                    // The room skips (does not reject) a
+                                    // message it does not admit, so a send
+                                    // that applied without error may still
+                                    // have added nothing.
+                                    error!("Failed to apply message delta: the room did not admit the message");
                                     false
                                 } else {
                                     crate::util::debug_log("[send] delta applied OK");
@@ -3184,6 +3210,16 @@ pub fn Conversation() -> Element {
                     },
                     Some(room_data) => {
                         match room_data.can_participate() {
+                            // Same shape as the notices below: a private room's
+                            // messages are encrypted with its secret, and a
+                            // message sent without it would not be admitted.
+                            Ok(()) if room_data.missing_room_secret() => rsx! {
+                                div {
+                                    "data-testid": "missing-room-secret-notice",
+                                    class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-red-700 dark:text-red-400 rounded-lg text-sm",
+                                    "This private room's key hasn't reached this device yet, so you can't send messages here until it does."
+                                }
+                            },
                             Ok(()) => {
                                 let max_msg_size = room_data.room_state.configuration.configuration.max_message_size;
                                 let room_is_private = room_data.is_private();
@@ -3217,7 +3253,7 @@ pub fn Conversation() -> Element {
                                 rsx! {
                                     MessageInput {
                                         handle_send_message: move |msg: (String, Option<ReplyContext>)| {
-                                            let mut handle = handle_send_message.clone();
+                                            let handle = handle_send_message.clone();
                                             handle(msg)
                                         },
                                         replying_to: replying_to,

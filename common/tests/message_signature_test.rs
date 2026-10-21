@@ -253,12 +253,15 @@ fn unsigned_messages_do_not_fail_a_private_room_delta() {
     );
     assert_eq!(ids(&after), HashSet::from([good.id()]));
 
+    // Validly signed but not admissible in a private room (an unknown
+    // secret version, a public body): skipped like the unsigned ones, never
+    // failing the delta (freenet/river#703).
     for signed_but_invalid in [
         private(&room.b, &room.b, 13, 7),
         room.message(&room.b, &room.b, 14),
     ] {
         let mut after = base.clone();
-        assert!(after
+        after
             .apply_delta(
                 &base,
                 &room.params,
@@ -267,6 +270,7 @@ fn unsigned_messages_do_not_fail_a_private_room_delta() {
                     ..Default::default()
                 }),
             )
-            .is_err());
+            .expect("an inadmissible message is skipped, not an error");
+        assert_eq!(ids(&after), HashSet::from([good.id()]));
     }
 }

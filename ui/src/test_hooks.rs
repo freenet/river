@@ -38,6 +38,26 @@ use river_core::room_state::{
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsValue;
 
+thread_local! {
+    static FORGE_NEXT_SEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The load worker `setRoomsLoadStateKeepingRooms("migrating")` holds open
+    /// (until the next call, or `releaseHeldLoadWorker`).
+    static HELD_LOAD_WORKER: std::cell::RefCell<
+        Option<crate::components::app::chat_delegate::LoadWorkerGuard>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// `signature` with one bit flipped if `forgeNextSendSignature` was called
+/// since the last send, else unchanged. Called by the composer's send path.
+pub fn forge_if_requested(signature: ed25519_dalek::Signature) -> ed25519_dalek::Signature {
+    if !FORGE_NEXT_SEND.with(|f| f.replace(false)) {
+        return signature;
+    }
+    let mut bytes = signature.to_bytes();
+    bytes[0] ^= 1;
+    ed25519_dalek::Signature::from_bytes(&bytes)
+}
+
 pub fn install_test_hooks() {
     let Some(window) = web_sys::window() else {
         return;
@@ -175,11 +195,9 @@ pub fn install_test_hooks() {
     );
 
     // Put the current room in the state of a private room whose secret this
-    // device does not hold. A send then falls back to a public body, which
-    // the send's own local `apply_delta` rejects ("Cannot send public messages
-    // in private room"), so the send fails AFTER the composer has handed it
-    // off: the failed-send case of the A06 specs. The rendered history does
-    // not change, since every example message body is public.
+    // device does not hold. The conversation then offers no composer and
+    // says why. The rendered history does not change, since every example
+    // message body is public.
     //
     // Only for a room self owns: the configuration is re-signed with the
     // owner's key, because a configuration that fails its signature check
@@ -212,6 +230,14 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Corrupt the signature of the next own message the composer sends, so
+    // the room does not admit it and the send fails AFTER the composer has
+    // handed it off: the failed-send case of the A06 specs.
+    set_hook(
+        "forgeNextSendSignature",
+        Closure::<dyn FnMut()>::new(move || FORGE_NEXT_SEND.with(|f| f.set(true))).into_js_value(),
+    );
+
     // Drive the no-room screen's load states (freenet/river#509), which the
     // example build, always seeded with rooms, never leaves. Clears ROOMS too:
     // `room_list_display_state` renders the list whenever there is anything to show.
@@ -225,6 +251,10 @@ pub fn install_test_hooks() {
                 "loaded" => RoomsLoadState::Loaded,
                 other => wasm_bindgen::throw_str(&format!("unknown rooms load state {other:?}")),
             };
+            // A worker `setRoomsLoadStateKeepingRooms("migrating")` holds is
+            // deliberately NOT released here: settling it over the emptied
+            // ROOMS would arm the idle resolution, which rewrites this state to
+            // `Loaded` 1.5 s later. Do not mix the two hooks on one page.
             crate::util::defer(move || {
                 ROOMS.with_mut(|rooms| {
                     rooms.map.clear();
@@ -234,6 +264,60 @@ pub fn install_test_hooks() {
                 *CURRENT_ROOM.write() = CurrentRoom { owner_key: None };
                 *ROOMS_LOAD_STATE.write() = parsed;
             });
+        })
+        .into_js_value(),
+    );
+
+    // Set the load state WITHOUT clearing ROOMS, for the rail's note under a
+    // partly restored list (freenet/river#802), which needs rooms showing.
+    set_hook(
+        "setRoomsLoadStateKeepingRooms",
+        Closure::<dyn FnMut(String)>::new(move |state: String| {
+            let parsed = match state.as_str() {
+                "loading" => RoomsLoadState::Loading,
+                "migrating" => RoomsLoadState::Migrating,
+                "failed" => RoomsLoadState::LoadFailed,
+                "loaded" => RoomsLoadState::Loaded,
+                other => wasm_bindgen::throw_str(&format!("unknown rooms load state {other:?}")),
+            };
+            // The rail shows `Migrating` under a list only while a load worker
+            // runs (a stale `Migrating` must not keep the note up), so
+            // "migrating" holds a real worker guard until the next call.
+            HELD_LOAD_WORKER.with(|held| {
+                *held.borrow_mut() = (parsed == RoomsLoadState::Migrating)
+                    .then(crate::components::app::chat_delegate::LoadWorkerGuard::new);
+            });
+            // Written only on a change, as production does
+            // (`set_rooms_load_state`), so a repeated "migrating" re-renders
+            // through the worker counter alone.
+            crate::util::defer(move || {
+                if *ROOMS_LOAD_STATE.peek() != parsed {
+                    *ROOMS_LOAD_STATE.write() = parsed;
+                }
+            });
+        })
+        .into_js_value(),
+    );
+
+    // The held load worker settles while the load state stays as it is: the
+    // stale-`Migrating` case, whose note must go (freenet/river#802 review).
+    set_hook(
+        "releaseHeldLoadWorker",
+        Closure::<dyn FnMut()>::new(move || {
+            // Dropped inside `defer`, like a real worker settling off a task.
+            let held = HELD_LOAD_WORKER.with(|held| held.borrow_mut().take());
+            crate::util::defer(move || drop(held));
+        })
+        .into_js_value(),
+    );
+
+    // A journaled walk that may still bring rooms back starts (`true`) or ends
+    // (`false`), through the same journal-session version counter a real walk
+    // bumps (freenet/river#802).
+    set_hook(
+        "setWalkRestoringRooms",
+        Closure::<dyn FnMut(bool)>::new(move |on: bool| {
+            crate::components::app::freenet_api::migration_journal::test_set_walk_restoring(on);
         })
         .into_js_value(),
     );
@@ -416,8 +500,8 @@ fn push_test_message(
 }
 
 /// What a real arrival does once the room is at `max_recent_messages`: drain
-/// the oldest. Mirrors `MessagesV1::apply_delta`
-/// (common/src/room_state/message.rs) — without this, the hooks grow the
+/// the oldest. Mirrors the room's `post_apply_cleanup` message cap
+/// (common/src/room_state.rs) — without this, the hooks grow the
 /// message list unboundedly and the at-cap index-shift path (#505)
 /// is unreachable from the browser suite.
 fn prune_to_cap(room: &mut RoomData) {

@@ -1,4 +1,5 @@
 use crate::room_state::member::MemberId;
+use crate::room_state::member_info::{outranks, sig_digest, SigDigest};
 use crate::room_state::privacy::{PrivacyMode, RoomDisplayMetadata};
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::truncated_base64;
@@ -15,9 +16,27 @@ pub struct AuthorizedConfigurationV1 {
     pub signature: Signature,
 }
 
+/// A configuration's place in the order every peer resolves collisions by:
+/// one that passes [`AuthorizedConfigurationV1::check_values`] outranks any
+/// that does not; then the higher `configuration_version` wins, and at an
+/// equal version the greater signature digest wins (freenet/river#703).
+/// Same [`outranks`] as `member_info`'s rank. Configurations that fail the
+/// value checks are ordered among themselves the same way, so two peers
+/// holding two different ones (only a full-state PUT carries one) tell them
+/// apart and settle on one, while any valid configuration replaces both.
+pub type ConfigurationRank = (bool, u32, SigDigest);
+
 impl ComposableState for AuthorizedConfigurationV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = u32;
+    /// The [`ConfigurationRank`], not just the version. Two owner devices can
+    /// each sign a DIFFERENT configuration at the SAME version; with only the
+    /// version in the summary, neither peer could tell the other held
+    /// something else, `delta` sent nothing, and the room stayed forked for
+    /// good. The digest lets anti-entropy see the difference and both peers
+    /// keep the higher-ranked one; the validity flag puts every valid
+    /// configuration above every invalid one. Changing this type re-keys the
+    /// contract.
+    type Summary = ConfigurationRank;
     type Delta = AuthorizedConfigurationV1;
     type Parameters = ChatRoomParametersV1;
 
@@ -30,27 +49,51 @@ impl ComposableState for AuthorizedConfigurationV1 {
             .map_err(|e| format!("Invalid signature: {}", e))
     }
 
+    /// A held configuration that fails [`Self::check_values`] (only a
+    /// full-state PUT can carry one: `verify` checks only the signature)
+    /// ranks below every valid one, so any valid configuration is offered to
+    /// the peer holding it (freenet/river#703).
     fn summarize(
         &self,
         _parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
+        parameters: &Self::Parameters,
     ) -> Self::Summary {
-        self.configuration.configuration_version
+        self.rank(parameters)
     }
 
     fn delta(
         &self,
         _parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
-        old_version: &Self::Summary,
+        parameters: &Self::Parameters,
+        old_rank: &Self::Summary,
     ) -> Option<Self::Delta> {
-        if self.configuration.configuration_version > *old_version {
+        // A configuration the room owner did not sign (an imported room's
+        // placeholder) is never offered: the receiver would refuse it as a
+        // forgery and fail the whole merge.
+        if outranks(self.rank(parameters), *old_rank)
+            && self.verify_signature(&parameters.owner).is_ok()
+        {
             Some(self.clone())
         } else {
             None
         }
     }
 
+    /// Adopt the delta's configuration if it OUTRANKS the held one.
+    ///
+    /// A delta that does not outrank (a re-delivery, an older version, or the
+    /// losing side of an equal-version tie) is a no-op, not an error: a delta
+    /// computed against a stale summary of this peer legitimately carries one,
+    /// and rejecting it rejected every other field of the same delta
+    /// (freenet/river#703 defect 2, `delta_idempotence`).
+    ///
+    /// An outranking configuration with a bad signature is a forgery and is
+    /// rejected. One that is owner-signed but fails [`Self::check_values`] (a
+    /// zero cap, an `owner_member_id` that is not the room owner's, oversized
+    /// or public display metadata in a private room) ranks below every valid
+    /// one (see [`ConfigurationRank`]), so it replaces only another invalid
+    /// configuration, never a valid one. `verify` only checks the signature,
+    /// so such a configuration can only arrive through a full-state PUT.
     fn apply_delta(
         &mut self,
         _parent_state: &Self::ParentState,
@@ -58,65 +101,19 @@ impl ComposableState for AuthorizedConfigurationV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(delta) = delta {
-            // Verify the delta's signature
+            // A held configuration that is not the owner's (an imported
+            // room's unsigned placeholder) does not compete: any valid
+            // configuration replaces it, whatever their ranks. Otherwise a
+            // placeholder could outrank the room's real configuration on the
+            // signature-digest tie-break and survive a merge with it.
+            //
+            let held_competes = self.verify_signature(&parameters.owner).is_ok();
+            if held_competes && !outranks(delta.rank(parameters), self.rank(parameters)) {
+                return Ok(());
+            }
             delta
                 .verify_signature(&parameters.owner)
                 .map_err(|e| format!("Invalid signature: {}", e))?;
-
-            // Check if the new version is greater than the current version
-            if delta.configuration.configuration_version <= self.configuration.configuration_version
-            {
-                return Err(
-                    "New configuration version must be greater than the current version"
-                        .to_string(),
-                );
-            }
-
-            // Verify that the owner_member_id hasn't changed
-            if delta.configuration.owner_member_id != self.configuration.owner_member_id {
-                return Err("Cannot change the owner_member_id".to_string());
-            }
-
-            // Verify that the new configuration is valid
-            if delta.configuration.max_recent_messages == 0
-                || delta.configuration.max_user_bans == 0
-                || delta.configuration.max_message_size == 0
-                || delta.configuration.max_nickname_size == 0
-                || delta.configuration.max_members == 0
-                || delta.configuration.max_room_name == 0
-                || delta.configuration.max_room_description == 0
-                || delta.configuration.max_direct_messages == Some(0)
-            {
-                return Err("Invalid configuration values".to_string());
-            }
-
-            // Validate display metadata declared lengths
-            if delta.configuration.display.name.declared_len() > delta.configuration.max_room_name {
-                return Err(format!(
-                    "Room name declared length {} exceeds max_room_name {}",
-                    delta.configuration.display.name.declared_len(),
-                    delta.configuration.max_room_name
-                ));
-            }
-
-            if let Some(desc) = &delta.configuration.display.description {
-                if desc.declared_len() > delta.configuration.max_room_description {
-                    return Err(format!(
-                        "Room description declared length {} exceeds max_room_description {}",
-                        desc.declared_len(),
-                        delta.configuration.max_room_description
-                    ));
-                }
-            }
-
-            // In private mode, ensure display metadata is encrypted
-            if delta.configuration.privacy_mode == PrivacyMode::Private
-                && delta.configuration.display.name.is_public()
-            {
-                return Err("Private room must have encrypted display metadata".to_string());
-            }
-
-            // If all checks pass, apply the delta
             self.configuration = delta.configuration.clone();
             self.signature = delta.signature;
         }
@@ -126,6 +123,29 @@ impl ComposableState for AuthorizedConfigurationV1 {
 }
 
 impl AuthorizedConfigurationV1 {
+    /// This configuration's [`ConfigurationRank`] in a room with
+    /// `parameters`.
+    pub fn rank(&self, parameters: &ChatRoomParametersV1) -> ConfigurationRank {
+        (
+            self.check_values(parameters).is_ok(),
+            self.configuration.configuration_version,
+            sig_digest(&self.signature),
+        )
+    }
+
+    /// The checks a configuration must pass to be adopted, other than its
+    /// signature and rank. `Err` names the first one it fails.
+    ///
+    /// Every check reads only this configuration and the room's parameters,
+    /// never the configuration a peer currently holds: an answer that
+    /// depended on the held configuration would differ between peers holding
+    /// different ones, and one bad held configuration would make every later
+    /// valid one fail (freenet/river#703). Clients run the same checks
+    /// before signing.
+    pub fn check_values(&self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
+        self.configuration.check_values(parameters)
+    }
+
     pub fn new(configuration: Configuration, owner_signing_key: &SigningKey) -> Self {
         let mut serialized_config = Vec::new();
         ciborium::ser::into_writer(&configuration, &mut serialized_config)
@@ -315,7 +335,112 @@ pub struct Configuration {
 /// it would have to be kept and ignored, not dropped.
 pub const DEFAULT_MAX_DIRECT_MESSAGES: usize = 300;
 
+/// Why a client must not create a room named `name` with the creator's
+/// nickname `nickname`, if it must not: the first configuration (the
+/// defaults, with that name) must pass [`Configuration::signing_refusal`],
+/// and the nickname must fit its `max_nickname_size`
+/// ([`crate::room_state::member_info::nickname_refusal`]). The one check the
+/// UI and riverctl run before creating a room (freenet/river#703).
+pub fn new_room_refusal(
+    parameters: &ChatRoomParametersV1,
+    name: &str,
+    nickname: &str,
+) -> Option<String> {
+    let config = Configuration {
+        owner_member_id: parameters.owner_id(),
+        display: RoomDisplayMetadata {
+            name: crate::room_state::privacy::SealedBytes::public(name.as_bytes().to_vec()),
+            description: None,
+        },
+        ..Configuration::default()
+    };
+    config
+        .signing_refusal(parameters)
+        .or_else(|| crate::room_state::member_info::nickname_refusal(nickname.len(), &config))
+}
+
 impl Configuration {
+    /// Correct, before signing, what an owner's edit to another field must
+    /// not be refused over, because the edit cannot fix it: the
+    /// `owner_member_id` is set to the room owner's (the only value the room
+    /// takes), and a `max_nickname_size` over the nickname ceiling that this
+    /// edit leaves as `held` had it is lowered to the ceiling (the room holds
+    /// nicknames to the ceiling whatever the configuration says, so this
+    /// changes nothing it enforces). A limit the edit itself sets over the
+    /// ceiling is left for [`Self::signing_refusal`] to refuse.
+    pub fn normalize_for_signing(
+        &mut self,
+        held: &Configuration,
+        parameters: &ChatRoomParametersV1,
+    ) {
+        self.owner_member_id = parameters.owner_id();
+        let ceiling = crate::room_state::member_info::NICKNAME_CEILING;
+        if self.max_nickname_size > ceiling && self.max_nickname_size == held.max_nickname_size {
+            self.max_nickname_size = ceiling;
+        }
+    }
+
+    /// Why a client must not sign this configuration as the owner's next
+    /// one, if it must not: it fails [`Self::check_values`] (the room would
+    /// skip it, so the edit would silently not take), or its
+    /// `max_nickname_size` is over the nickname ceiling the room enforces
+    /// whatever the configuration says. The one check the UI and riverctl
+    /// both run before signing a configuration edit (freenet/river#703).
+    pub fn signing_refusal(&self, parameters: &ChatRoomParametersV1) -> Option<String> {
+        if let Err(e) = self.check_values(parameters) {
+            return Some(e);
+        }
+        let ceiling = crate::room_state::member_info::NICKNAME_CEILING;
+        (self.max_nickname_size > ceiling)
+            .then(|| format!("Max nickname size can be at most {ceiling} bytes."))
+    }
+
+    /// The checks a configuration must pass to be adopted, other than its
+    /// signature and rank; see [`AuthorizedConfigurationV1::check_values`].
+    /// Clients run this before signing, because a configuration that fails it
+    /// is not adopted (it is skipped, not rejected), so nothing else would
+    /// tell the owner the edit did not take.
+    pub fn check_values(&self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
+        let c = self;
+        if c.owner_member_id != parameters.owner_id() {
+            return Err("owner_member_id is not the room owner's".to_string());
+        }
+        for (name, value) in [
+            ("max_recent_messages", c.max_recent_messages),
+            ("max_user_bans", c.max_user_bans),
+            ("max_message_size", c.max_message_size),
+            ("max_nickname_size", c.max_nickname_size),
+            ("max_members", c.max_members),
+            ("max_room_name", c.max_room_name),
+            ("max_room_description", c.max_room_description),
+            ("max_direct_messages", c.max_direct_messages.unwrap_or(1)),
+        ] {
+            if value == 0 {
+                return Err(format!("Invalid configuration values: {name} is 0"));
+            }
+        }
+        if c.display.name.declared_len() > c.max_room_name {
+            return Err(format!(
+                "Room name declared length {} exceeds max_room_name {}",
+                c.display.name.declared_len(),
+                c.max_room_name
+            ));
+        }
+        if let Some(desc) = &c.display.description {
+            if desc.declared_len() > c.max_room_description {
+                return Err(format!(
+                    "Room description declared length {} exceeds max_room_description {}",
+                    desc.declared_len(),
+                    c.max_room_description
+                ));
+            }
+        }
+        if c.privacy_mode == PrivacyMode::Private && c.display.name.is_public() {
+            return Err("Private room must have encrypted display metadata".to_string());
+        }
+        Ok(())
+    }
+
     /// The global DM cap in force for this room: the owner's explicit
     /// [`Self::max_direct_messages`], or [`DEFAULT_MAX_DIRECT_MESSAGES`] when
     /// unset. Every retention and horizon decision MUST read the cap through
@@ -324,6 +449,100 @@ impl Configuration {
     pub fn effective_max_direct_messages(&self) -> usize {
         self.max_direct_messages
             .unwrap_or(DEFAULT_MAX_DIRECT_MESSAGES)
+    }
+}
+
+#[cfg(test)]
+mod signing_refusal_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn params() -> (ChatRoomParametersV1, Configuration) {
+        let sk = SigningKey::from_bytes(&[5; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: sk.verifying_key(),
+        };
+        let config = Configuration {
+            owner_member_id: params.owner_id(),
+            ..Configuration::default()
+        };
+        (params, config)
+    }
+
+    /// A configuration passing the value checks, with a nickname limit up to
+    /// the ceiling, may be signed.
+    #[test]
+    fn a_valid_configuration_may_be_signed() {
+        let (params, mut c) = params();
+        assert_eq!(c.signing_refusal(&params), None);
+        c.max_nickname_size = crate::room_state::member_info::NICKNAME_CEILING;
+        assert_eq!(c.signing_refusal(&params), None);
+    }
+
+    /// An edit to another field is not refused over values the held
+    /// configuration already had that the edit cannot fix (another owner id,
+    /// a nickname limit over the ceiling); a limit the edit sets over the
+    /// ceiling still is (freenet/river#703).
+    #[test]
+    fn an_edit_is_not_refused_over_a_held_value_it_cannot_fix() {
+        let (params, c) = params();
+        let mut held = c.clone();
+        held.max_nickname_size = crate::room_state::member_info::NICKNAME_CEILING + 500;
+        held.owner_member_id = MemberId::from(&SigningKey::from_bytes(&[6; 32]).verifying_key());
+        let mut edit = held.clone();
+        edit.max_members = 99;
+        edit.normalize_for_signing(&held, &params);
+        assert_eq!(edit.signing_refusal(&params), None);
+        assert_eq!(
+            edit.max_nickname_size,
+            crate::room_state::member_info::NICKNAME_CEILING
+        );
+        assert_eq!(edit.owner_member_id, params.owner_id());
+
+        let mut raise = c.clone();
+        raise.max_nickname_size = crate::room_state::member_info::NICKNAME_CEILING + 1;
+        raise.normalize_for_signing(&c, &params);
+        assert!(raise.signing_refusal(&params).is_some());
+    }
+
+    /// A new room is refused for a name over the default room-name limit or
+    /// a creator nickname over the default nickname limit, and allowed at
+    /// both limits.
+    #[test]
+    fn a_new_room_is_refused_over_the_default_limits() {
+        let (params, c) = params();
+        let name = "n".repeat(c.max_room_name);
+        let nick = "k".repeat(c.max_nickname_size);
+        assert_eq!(new_room_refusal(&params, &name, &nick), None);
+        assert!(new_room_refusal(&params, &format!("{name}n"), &nick).is_some());
+        assert!(new_room_refusal(&params, &name, &format!("{nick}k")).is_some());
+    }
+
+    /// A zero limit is refused naming the field.
+    #[test]
+    fn a_zero_limit_is_refused_naming_the_field() {
+        let (params, mut c) = params();
+        c.max_user_bans = 0;
+        let refusal = c.signing_refusal(&params).unwrap();
+        assert!(refusal.contains("max_user_bans"), "{refusal}");
+    }
+
+    /// Failing the value checks, naming another owner, or a nickname limit
+    /// over the ceiling is refused, judged against the room's parameters and
+    /// not the configuration's own owner field.
+    #[test]
+    fn an_unadoptable_configuration_is_refused() {
+        let (params, c) = params();
+        let mut zero = c.clone();
+        zero.max_recent_messages = 0;
+        assert!(zero.signing_refusal(&params).is_some());
+        let mut other_owner = c.clone();
+        other_owner.owner_member_id =
+            MemberId::from(&SigningKey::from_bytes(&[6; 32]).verifying_key());
+        assert!(other_owner.signing_refusal(&params).is_some());
+        let mut over = c;
+        over.max_nickname_size = crate::room_state::member_info::NICKNAME_CEILING + 1;
+        assert!(over.signing_refusal(&params).is_some());
     }
 }
 
@@ -388,7 +607,10 @@ mod tests {
     fn test_summarize() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let configuration = Configuration::default();
+        let configuration = Configuration {
+            owner_member_id: owner_verifying_key.into(),
+            ..Configuration::default()
+        };
         let authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
@@ -402,7 +624,11 @@ mod tests {
 
         assert_eq!(
             authorized_configuration.summarize(&parent_state, &parameters),
-            configuration.configuration_version
+            (
+                true,
+                configuration.configuration_version,
+                sig_digest(&authorized_configuration.signature)
+            )
         );
     }
 
@@ -410,7 +636,10 @@ mod tests {
     fn test_delta_new_version() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let configuration = Configuration::default();
+        let configuration = Configuration {
+            owner_member_id: owner_verifying_key.into(),
+            ..Configuration::default()
+        };
         let authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
@@ -429,8 +658,9 @@ mod tests {
         let new_authorized_configuration =
             AuthorizedConfigurationV1::new(new_configuration.clone(), &owner_signing_key);
 
+        let old_rank = authorized_configuration.rank(&parameters);
         assert_eq!(
-            new_authorized_configuration.delta(&parent_state, &parameters, &1),
+            new_authorized_configuration.delta(&parent_state, &parameters, &old_rank),
             Some(new_authorized_configuration)
         );
     }
@@ -458,8 +688,19 @@ mod tests {
 
         // Test against a newer version (2)
         // The delta should return None since our configuration is older
+        let newer = AuthorizedConfigurationV1::new(
+            Configuration {
+                configuration_version: 2,
+                ..Configuration::default()
+            },
+            &owner_signing_key,
+        );
         assert_eq!(
-            old_authorized_configuration.delta(&parent_state, &parameters, &2),
+            old_authorized_configuration.delta(
+                &parent_state,
+                &parameters,
+                &newer.rank(&parameters)
+            ),
             None
         );
     }
@@ -468,7 +709,10 @@ mod tests {
     fn test_apply_delta_should_apply() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let configuration = Configuration::default();
+        let configuration = Configuration {
+            owner_member_id: owner_verifying_key.into(),
+            ..Configuration::default()
+        };
         let mut authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
@@ -523,17 +767,15 @@ mod tests {
         let new_authorized_configuration =
             AuthorizedConfigurationV1::new(new_configuration.clone(), &owner_signing_key);
 
-        let result = authorized_configuration.apply_delta(
-            &parent_state,
-            &parameters,
-            &Some(new_authorized_configuration),
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "New configuration version must be greater than the current version"
-        );
+        // An older configuration is a no-op, not an error: a delta computed
+        // against a stale summary carries one (freenet/river#703).
+        authorized_configuration
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(new_authorized_configuration),
+            )
+            .unwrap();
         assert_eq!(authorized_configuration, orig_authorized_configuration);
     }
 
@@ -541,8 +783,11 @@ mod tests {
     fn test_apply_delta_change_owner() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        // The held configuration is valid, so the invalid one below ranks
+        // under it (an invalid configuration replaces only another invalid
+        // one).
         let configuration = Configuration {
-            owner_member_id: MemberId(FastHash(1)),
+            owner_member_id: owner_verifying_key.into(),
             ..Configuration::default()
         };
         let mut authorized_configuration =
@@ -562,21 +807,30 @@ mod tests {
         let new_authorized_configuration =
             AuthorizedConfigurationV1::new(new_configuration, &owner_signing_key);
 
-        let result = authorized_configuration.apply_delta(
-            &parent_state,
-            &parameters,
-            &Some(new_authorized_configuration),
+        assert_eq!(
+            new_authorized_configuration.check_values(&parameters),
+            Err("owner_member_id is not the room owner's".to_string())
         );
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Cannot change the owner_member_id");
+        // Owner-signed, so skipped rather than rejected (freenet/river#703).
+        let before = authorized_configuration.clone();
+        authorized_configuration
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(new_authorized_configuration),
+            )
+            .unwrap();
+        assert_eq!(authorized_configuration, before);
     }
 
     #[test]
     fn test_apply_delta_invalid_values() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let configuration = Configuration::default();
+        let configuration = Configuration {
+            owner_member_id: owner_verifying_key.into(),
+            ..Configuration::default()
+        };
         let mut authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
@@ -594,13 +848,148 @@ mod tests {
         let new_authorized_configuration =
             AuthorizedConfigurationV1::new(new_configuration, &owner_signing_key);
 
-        let result = authorized_configuration.apply_delta(
-            &parent_state,
-            &parameters,
-            &Some(new_authorized_configuration),
+        assert_eq!(
+            new_authorized_configuration.check_values(&parameters),
+            Err("Invalid configuration values: max_recent_messages is 0".to_string())
+        );
+        // Owner-signed, so skipped rather than rejected (freenet/river#703).
+        let before = authorized_configuration.clone();
+        authorized_configuration
+            .apply_delta(
+                &parent_state,
+                &parameters,
+                &Some(new_authorized_configuration),
+            )
+            .unwrap();
+        assert_eq!(authorized_configuration, before);
+    }
+
+    /// freenet/river#703 defect 1: two owner devices sign different
+    /// configurations at the same version. Both summaries tell them apart,
+    /// the higher-ranked one is offered and adopted in both directions, and
+    /// re-delivering either afterwards changes nothing.
+    #[test]
+    fn equal_version_configurations_resolve_to_the_higher_rank() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_signing_key.verifying_key(),
+        };
+        let parent_state = ChatRoomStateV1::default();
+        let at_v2 = |max_members: usize| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    configuration_version: 2,
+                    owner_member_id: parameters.owner_id(),
+                    max_members,
+                    ..Configuration::default()
+                },
+                &owner_signing_key,
+            )
+        };
+        let (x, y) = (at_v2(7), at_v2(9));
+        let (hi, lo) = if outranks(x.rank(&parameters), y.rank(&parameters)) {
+            (x, y)
+        } else {
+            (y, x)
+        };
+        assert_ne!(
+            hi.summarize(&parent_state, &parameters),
+            lo.summarize(&parent_state, &parameters),
+            "equal-version configurations must summarize differently"
+        );
+        assert_eq!(
+            hi.delta(&parent_state, &parameters, &lo.rank(&parameters)),
+            Some(hi.clone())
+        );
+        assert_eq!(
+            lo.delta(&parent_state, &parameters, &hi.rank(&parameters)),
+            None
         );
 
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Invalid configuration values");
+        let mut on_lo = lo.clone();
+        on_lo
+            .apply_delta(&parent_state, &parameters, &Some(hi.clone()))
+            .unwrap();
+        assert_eq!(on_lo, hi);
+        let mut on_hi = hi.clone();
+        on_hi
+            .apply_delta(&parent_state, &parameters, &Some(lo.clone()))
+            .unwrap();
+        assert_eq!(on_hi, hi, "the lower-ranked one is a no-op");
+        on_hi
+            .apply_delta(&parent_state, &parameters, &Some(hi.clone()))
+            .unwrap();
+        assert_eq!(on_hi, hi, "re-delivery is a no-op");
+    }
+
+    /// A configuration's `owner_member_id` is checked against the room's
+    /// owner (the contract parameters), not against whatever configuration
+    /// the peer happens to hold: a held configuration naming the wrong owner
+    /// must not stop the correct one from being adopted, or the outcome
+    /// would depend on what each peer held (freenet/river#703).
+    #[test]
+    fn owner_member_id_is_checked_against_the_room_owner() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_signing_key.verifying_key(),
+        };
+        let mut held = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: MemberId(FastHash(1)),
+                ..Configuration::default()
+            },
+            &owner_signing_key,
+        );
+        let correct = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: parameters.owner_id(),
+                configuration_version: 2,
+                ..Configuration::default()
+            },
+            &owner_signing_key,
+        );
+        held.apply_delta(
+            &ChatRoomStateV1::default(),
+            &parameters,
+            &Some(correct.clone()),
+        )
+        .unwrap();
+        assert_eq!(held, correct, "the room owner's id is adopted");
+
+        let wrong = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: MemberId(FastHash(1)),
+                configuration_version: 3,
+                ..Configuration::default()
+            },
+            &owner_signing_key,
+        );
+        held.apply_delta(&ChatRoomStateV1::default(), &parameters, &Some(wrong))
+            .unwrap();
+        assert_eq!(
+            held, correct,
+            "a configuration naming another owner is skipped"
+        );
+    }
+
+    /// An outranking configuration whose signature does not verify is a
+    /// forgery and still rejects the delta.
+    #[test]
+    fn forged_outranking_configuration_is_rejected() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_signing_key.verifying_key(),
+        };
+        let mut held = AuthorizedConfigurationV1::new(Configuration::default(), &owner_signing_key);
+        let forged = AuthorizedConfigurationV1::new(
+            Configuration {
+                configuration_version: 9,
+                ..Configuration::default()
+            },
+            &SigningKey::generate(&mut OsRng),
+        );
+        assert!(held
+            .apply_delta(&ChatRoomStateV1::default(), &parameters, &Some(forged))
+            .is_err());
     }
 }

@@ -200,8 +200,8 @@ impl BanEvidenceV1 {
     /// Every record ban resolution may read: `members`, then each evidence
     /// record whose inviter is the owner or is itself in the map. A record
     /// whose chain no longer reaches the owner (an ancestor was lost, for
-    /// example to the `max_members` trim, which runs before cleanup) is left
-    /// out for every reader at once, and `post_apply_cleanup` drops it.
+    /// example to the `max_members` cap) is left out for every reader at
+    /// once, and `post_apply_cleanup` drops it.
     ///
     /// Linear in the records: a walk down from the owner and the members
     /// through the evidence records each one invited. Evidence holds at most
@@ -393,17 +393,43 @@ impl ComposableState for BanEvidenceV1 {
         if let Some(delta) = delta {
             // A bound on the work one delta can cause: no state this room's
             // configuration allows holds more evidence (see `verify`), so a
-            // delta derived from one carries no more. A peer still holding a
-            // larger set from before a configuration change is refused until
-            // it takes the new configuration, as `BansV1::apply_delta` refuses
-            // an over-cap ban delta.
+            // delta derived from one carries no more. Only records this peer
+            // does not already hold count, so a re-delivery is free, and the
+            // bound takes the bans floor (`MIN_BANS_DELTA_BOUND`), so a peer
+            // still on a higher `max_user_bans` is not refused once this one
+            // has applied a lowered cap (freenet/river#703 defect 2). A peer
+            // holding more than even the floor allows is refused until it
+            // takes the new configuration, as `BansV1::apply_delta` refuses
+            // its ban delta.
             let config = &parent_state.configuration.configuration;
-            let bound =
-                evidence_bound(config.max_user_bans, evidence_depth_cap(config.max_members));
-            if delta.len() > bound {
+            let bound = evidence_bound(
+                config
+                    .max_user_bans
+                    .max(crate::room_state::ban::MIN_BANS_DELTA_BOUND),
+                evidence_depth_cap(config.max_members),
+            );
+            // Refused before any record is hashed when it cannot be within
+            // the bound however many records it re-delivers.
+            if !crate::room_state::work_bounds::lifted()
+                && delta.len() > self.members.len().saturating_add(bound)
+            {
                 return Err(format!(
                     "Ban evidence delta of {} exceeds {bound}",
                     delta.len()
+                ));
+            }
+            let held_records: HashSet<(MemberId, EvidenceDigest)> = self
+                .members
+                .iter()
+                .map(|m| (m.member.id(), evidence_digest(m)))
+                .collect();
+            let new_records = delta
+                .iter()
+                .filter(|m| !held_records.contains(&(m.member.id(), evidence_digest(m))))
+                .count();
+            if !crate::room_state::work_bounds::lifted() && new_records > bound {
+                return Err(format!(
+                    "Ban evidence delta of {new_records} new records exceeds {bound}"
                 ));
             }
             // Only records a stored ban references can be kept (see `verify`;
@@ -435,17 +461,26 @@ impl ComposableState for BanEvidenceV1 {
                 for m in delta {
                     combined.entry(m.member.id()).or_insert(m);
                 }
+                // A held record competes only while its own chain still
+                // reaches the owner within the cap through the records known
+                // here; one that no longer does (its inviter was removed by
+                // this merge) is replaced by any incoming record that does,
+                // as cleanup would drop it anyway. Otherwise a peer holding
+                // the stale record and a peer holding the resolvable one
+                // ended a merge differently (freenet/river#703).
                 let held: HashMap<MemberId, EvidenceDigest> = self
                     .members
                     .iter()
+                    .filter(|m| within_depth(m, &combined, owner_id, depth_cap))
                     .map(|m| (m.member.id(), evidence_digest(m)))
                     .collect();
                 // Two valid records for one id resolve the same way on every
-                // peer, whatever order they arrive in: the lower digest wins.
-                // Per id only the lowest-digest record that passes the cheap
-                // checks is considered, and only if it would replace what is
-                // held, so an id costs at most one chain check. If it fails,
-                // a peer holding a valid record offers it on the next sync.
+                // peer, whatever order they arrive in: of those whose chains
+                // resolve, the lower digest wins. Per id only the
+                // lowest-digest record that passes the cheap checks is
+                // considered, and only if it would replace what is held, so an
+                // id costs at most one chain check. If it fails, a peer holding
+                // a valid record offers it on the next sync.
                 let mut best: BTreeMap<MemberId, (EvidenceDigest, &AuthorizedMember)> =
                     BTreeMap::new();
                 for m in delta {
@@ -559,10 +594,13 @@ pub(crate) mod tests {
             combined.entry(m.member.id()).or_insert(m);
         }
         // Per id, the lowest-digest eligible record, if it is lower than the
-        // held one; then a full walk of its chain.
+        // held one (a held record whose chain no longer resolves within the
+        // cap does not count); then a full walk of its chain.
+        let cap = evidence_depth_cap(parent_state.configuration.configuration.max_members);
         let held: HashMap<MemberId, EvidenceDigest> = evidence
             .members
             .iter()
+            .filter(|m| within_depth(m, &combined, owner_id, cap))
             .map(|m| (m.member.id(), evidence_digest(m)))
             .collect();
         let mut best: BTreeMap<MemberId, (EvidenceDigest, &AuthorizedMember)> = BTreeMap::new();
@@ -1204,8 +1242,9 @@ pub(crate) mod tests {
         state.ban_evidence.verify(&state, &parameters).unwrap();
     }
 
-    /// An evidence delta over `2 x max_user_bans x depth cap` records is
-    /// refused before any check.
+    /// An evidence delta over `2 x max(max_user_bans, MIN_BANS_DELTA_BOUND) x
+    /// depth cap` NEW records is refused before any check. Records already
+    /// held do not count (freenet/river#703).
     #[test]
     fn an_evidence_delta_over_the_bound_is_refused() {
         let owner_sk = SigningKey::generate(&mut OsRng);
@@ -1214,19 +1253,30 @@ pub(crate) mod tests {
             owner: owner_sk.verifying_key(),
         };
         let parent_state = state_with(&owner_sk, 10, Vec::new());
+        let bound = evidence_bound(crate::room_state::ban::MIN_BANS_DELTA_BOUND, 4);
+        assert_eq!(bound, 800, "premise: the floor, not max_user_bans = 10");
         let record = || AuthorizedMember::new(create_test_member(owner_id, owner_id).0, &owner_sk);
         let mut evidence = BanEvidenceV1::default();
-        let at_bound: Vec<AuthorizedMember> = (0..80).map(|_| record()).collect();
+        let at_bound: Vec<AuthorizedMember> = (0..bound).map(|_| record()).collect();
         evidence
             .apply_delta(&parent_state, &parameters, &Some(at_bound))
             .unwrap();
-        let over: Vec<AuthorizedMember> = (0..81).map(|_| record()).collect();
+        let over: Vec<AuthorizedMember> = (0..bound + 1).map(|_| record()).collect();
         let before = invite_signature_checks();
         let err = evidence
             .apply_delta(&parent_state, &parameters, &Some(over))
             .unwrap_err();
-        assert!(err.contains("exceeds 80"), "{err}");
+        assert!(err.contains(&format!("exceeds {bound}")), "{err}");
         assert_eq!(invite_signature_checks() - before, 0);
+
+        // Held records do not count toward the bound.
+        let mut held = BanEvidenceV1 {
+            members: (0..bound).map(|_| record()).collect(),
+        };
+        let mut redelivery = held.members.clone();
+        redelivery.push(record());
+        held.apply_delta(&parent_state, &parameters, &Some(redelivery))
+            .expect("re-delivered records must not count toward the bound");
     }
 
     /// Records whose chains all run through one record that fails are

@@ -939,17 +939,27 @@ fn issue_318_member_info_apply_delta_has_no_contract_privacy_guard() {
     let member_vk = member_sk.verifying_key();
     let member_id = MemberId::from(&member_vk);
 
+    // A configuration that passes the value checks (sealed display name),
+    // so the refused one below competes with a valid held configuration.
     let mut state = ChatRoomStateV1 {
         configuration: AuthorizedConfigurationV1::new(
             Configuration {
                 privacy_mode: PrivacyMode::Private,
                 owner_member_id: owner_id,
+                display: RoomDisplayMetadata {
+                    name: SealedBytes::private(vec![1; 8], [0; 12], 1, 8),
+                    description: None,
+                },
                 ..Default::default()
             },
             &owner_sk,
         ),
         ..Default::default()
     };
+    state
+        .configuration
+        .check_values(&params)
+        .expect("premise: the held configuration is valid");
     state.members.members.push(AuthorizedMember::new(
         Member {
             owner_member_id: owner_id,
@@ -996,8 +1006,11 @@ fn issue_318_member_info_apply_delta_has_no_contract_privacy_guard() {
     );
 
     // Part 2: the analogous Configuration write (public display metadata into
-    // a private room) IS rejected at the contract level. This is why the leak
+    // a private room) IS refused at the contract level. This is why the leak
     // only ever affected member_info, and is the guard the UI fix mirrors.
+    // Refused means not adopted: since freenet/river#703 an owner-signed
+    // configuration that fails a check is skipped rather than failing the
+    // whole delta, so the unrelated member delta still applies.
     let bad_config = Configuration {
         privacy_mode: PrivacyMode::Private,
         owner_member_id: owner_id,
@@ -1009,29 +1022,35 @@ fn issue_318_member_info_apply_delta_has_no_contract_privacy_guard() {
         configuration_version: state.configuration.configuration.configuration_version + 1,
         ..Default::default()
     };
+    let bad_config = AuthorizedConfigurationV1::new(bad_config, &owner_sk);
+    // Pin the SPECIFIC reason, not just "refused": the version bump,
+    // signature, and non-zero `max_*` all pass, so the privacy guard in
+    // `configuration.rs` is the only check that should refuse it. If some
+    // unrelated validation starts failing first, this stops passing rather
+    // than silently no longer testing the privacy guard.
+    let reason = bad_config
+        .check_values(&params)
+        .expect_err("Configuration MUST refuse public display metadata in a private room");
+    assert!(
+        reason.contains("encrypted display metadata"),
+        "expected the configuration privacy guard to refuse this configuration, but got \
+         a different reason ({reason:?}). The existing contract-level guard \
+         (#318's UI fix mirrors it) may have regressed or moved.",
+    );
     let config_delta = ChatRoomStateV1Delta {
-        configuration: Some(AuthorizedConfigurationV1::new(bad_config, &owner_sk)),
-        // include an unrelated member delta to prove it's the config that's rejected
+        configuration: Some(bad_config),
+        // include an unrelated member delta to prove only the config is refused
         members: Some(MembersDelta::new(vec![])),
         ..Default::default()
     };
     let mut state_for_config = state.clone();
     let old = state_for_config.clone();
-    let config_result = state_for_config.apply_delta(&old, &params, &Some(config_delta));
-    // Assert the SPECIFIC rejection reason, not just `is_err()`: the version
-    // bump, signature, and non-zero `max_*` all pass, so the privacy guard at
-    // `configuration.rs` is the only thing that should reject this delta. If
-    // some unrelated future validation starts erroring first, a bare
-    // `is_err()` would keep passing while silently no longer testing the
-    // privacy guard. Pinning the message keeps the test honest.
-    let config_err = config_result.expect_err(
-        "Configuration::apply_delta MUST reject public display metadata in a private room",
-    );
-    assert!(
-        config_err.contains("encrypted display metadata"),
-        "expected the configuration privacy guard to reject this delta, but got \
-         a different error ({config_err:?}). The existing contract-level guard \
-         (#318's UI fix mirrors it) may have regressed or moved.",
+    state_for_config
+        .apply_delta(&old, &params, &Some(config_delta))
+        .expect("an owner-signed configuration is skipped, not rejected");
+    assert_eq!(
+        state_for_config.configuration, old.configuration,
+        "public display metadata must never be adopted in a private room"
     );
 }
 
@@ -1171,9 +1190,10 @@ fn message_at_older_or_newer_known_secret_version_is_accepted() {
     );
 
     // Conversely, a message at a version that does NOT have a signed
-    // record must still be rejected (defense in depth: an attacker could
+    // record must still not be stored (defense in depth: an attacker could
     // not otherwise be ruled out from injecting ciphertext at a fabricated
-    // version).
+    // version). It is skipped rather than failing the delta
+    // (freenet/river#703).
     let msg_at_v99 = AuthorizedMessageV1::new(
         MessageV1 {
             room_owner: owner_id,
@@ -1183,17 +1203,17 @@ fn message_at_older_or_newer_known_secret_version_is_accepted() {
         },
         &owner_sk,
     );
-    let result =
-        state
+    state
+        .recent_messages
+        .apply_delta(&state.clone(), &params, &Some(vec![msg_at_v99.clone()]))
+        .expect("a message at an unknown version is skipped");
+    assert!(
+        !state
             .recent_messages
-            .apply_delta(&state.clone(), &params, &Some(vec![msg_at_v99.clone()]));
-    assert!(
-        result.is_err(),
-        "message at unknown secret_version 99 must be rejected"
-    );
-    assert!(
-        result.unwrap_err().contains("unknown secret version"),
-        "error should mention unknown secret version"
+            .messages
+            .iter()
+            .any(|m| m.id() == msg_at_v99.id()),
+        "message at unknown secret_version 99 must not be stored"
     );
 }
 
@@ -1347,11 +1367,14 @@ fn secrets_apply_delta_is_transactional_on_failure() {
     let mut secrets = RoomSecretsV1::default();
 
     // Build a delta where:
-    //   - new_versions: [v1]                            (passes)
-    //   - new_encrypted_secrets: [secret_for_owner_at_v99]  (FAILS: version 99 not in working.versions)
+    //   - new_versions: [v1]                    (passes)
+    //   - new_encrypted_secrets: [forged blob]  (FAILS: not signed by the owner)
     //
-    // Pre-fix: versions.push(v1) succeeds, then the v99 check returns
-    // Err — but `self.versions` is now `[v1]`, a partial mutation.
+    // Pre-fix: versions.push(v1) succeeds, then the blob check returns
+    // Err — but `self.versions` is now `[v1]`, a partial mutation. (This
+    // used a blob at an unknown version until freenet/river#703's review
+    // made that a skip rather than an error; a forged signature is still an
+    // error, so the transactional property is tested the same way.)
     let v1_record = SecretVersionRecordV1 {
         version: 1,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
@@ -1361,13 +1384,14 @@ fn secrets_apply_delta_is_transactional_on_failure() {
 
     let bad_secret = EncryptedSecretForMemberV1 {
         member_id: owner_id,
-        secret_version: 99, // version 99 not in `new_versions`
+        secret_version: 1,
         ciphertext: vec![1, 2, 3],
         nonce: [0u8; 12],
         sender_ephemeral_public_key: [0u8; 32],
         provider: owner_id,
     };
-    let auth_bad_secret = AuthorizedEncryptedSecretForMember::new(bad_secret, &owner_sk);
+    let auth_bad_secret =
+        AuthorizedEncryptedSecretForMember::new(bad_secret, &SigningKey::generate(&mut OsRng));
 
     let bad_delta = SecretsDelta {
         current_version: None,
@@ -1381,8 +1405,10 @@ fn secrets_apply_delta_is_transactional_on_failure() {
     let result = secrets.apply_delta(&state, &params, &Some(bad_delta));
     assert!(result.is_err(), "bad delta must fail");
     assert!(
-        result.unwrap_err().contains("non-existent version"),
-        "expected the v99 check to be the one that fires"
+        result
+            .unwrap_err()
+            .contains("Invalid encrypted secret signature"),
+        "expected the blob's signature check to be the one that fires"
     );
 
     // POST-FIX REQUIREMENT: `secrets` is unchanged. Pre-fix this would have

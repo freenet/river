@@ -251,3 +251,24 @@ description = "Last chat-delegate generation before the freenet/river#423 ban-re
 date = "2026-10-15"
 delegate_key = "e3c99e6897a1daef51370d0d00bc74132eec374d4267a0badf600e1a24cda5a4"
 code_hash = "cea989c88db1a0ebc3558f2c33f90ab491473388e3f80319d8a09450b13a5d81"
+
+[[entry]]
+version = "V35"
+description = "Last chat-delegate generation before the freenet/river#796 ban-cap eviction change, which the delegate links through river-core's room-state code; river-core 0.2.0 -> 0.2.1"
+date = "2026-10-16"
+delegate_key = "107923229a7cf8508968557478eda7c89c8252f36a4488619bfc6d8d5ce86892"
+code_hash = "49a3122b2de64a62d56a2254518277d6ed8247faf3abb5325e722587a03b2ee5"
+
+[[entry]]
+version = "V36"
+description = "Last chat-delegate generation before the freenet/river#703 merge-law fixes, which the delegate links through river-core's room-state code; river-core 0.2.1 -> 0.3.0"
+date = "2026-10-16"
+delegate_key = "67c126f562f4e77b9d3c851a25c34b33b417e0389b0c353a8cee6b53c5a704f4"
+code_hash = "eca06ace26857393b0c0ef283b560e06839b2c97b29d40d64b3909e9f9ead0aa"
+
+[[entry]]
+version = "V37"
+description = "Last chat-delegate generation before the cleanup merge-law change (ban cap order, caps decided after removals), which the delegate links through river-core's room-state code"
+date = "2026-10-19"
+delegate_key = "668ba4fddce481714db89bb113614bbb60c064a6047233bb291a15deec04e799"
+code_hash = "0fc3625e5ec0eee35d614938327e8d0dee9ce9ceacafaa3204a54673ba2a580d"

@@ -99,7 +99,7 @@ log = "0.4" # Add log crate
 tracing = { version = "0.1", default-features = false, features = ["std", "release_max_level_info"] }
 
 # Internal dependencies
-river-core = { workspace = true, features = ["ecies", "ecies-randomized", "migration", "mentions"] }
+river-core = { workspace = true, features = ["ecies", "ecies-randomized", "migration", "mentions", "own-purges"] }
 
 # Freenet dependencies
 freenet-scaffold.workspace = true
@@ -123,6 +123,9 @@ chrono = "0.4"
 # Parses ../legacy_delegates.toml, validates every hash + key derivation, and
 # generates the LEGACY_DELEGATES registry (freenet/river#398).
 freenet-migrate-build = "0.2"
+# Reads ../pointer-records.toml so the UI knows which pointer generation it was
+# built as (freenet/river#580). Already in the lockfile via common/.
+toml = "0.8"
 
 [dev-dependencies]
 # GrayImage only. Default image features pull AV1 and are unused by the QR test.

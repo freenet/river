@@ -281,19 +281,32 @@ pub(crate) fn pending_load_workers() -> u32 {
     PENDING_LOADS.load(Ordering::Relaxed)
 }
 
+/// Bumped when a load worker starts and when the last one of the current
+/// attempt settles, so a render that reads [`pending_load_workers`] (a plain
+/// atomic) re-renders when it changes between zero and non-zero. The rail's
+/// "Restoring more rooms…" note shows `Migrating` only while a worker is
+/// still running (freenet/river#802): with rooms present, a worker settling
+/// leaves `Migrating` as it is (`settle_terminal`, since the list renders
+/// anyway) until the hard-max backstop turns it into `LoadFailed`, so a stale
+/// one would otherwise keep the note up for up to that long, or for good when
+/// it is set after the backstop fired (the recovery path).
+pub static LOAD_WORKERS_CHANGED: GlobalSignal<u64> = Global::new(|| 0);
+
 // =============================================================================
 // DELEGATE-GENERATION AUTHORITY (freenet/river#527)
 // =============================================================================
 //
-// `fire_legacy_migration_request` probes EVERY legacy delegate generation at
-// once, and each one that still holds data hydrates independently. Their
-// responses race, so something has to decide which copy of a room is
-// authoritative when two generations disagree about the user's identity for it.
+// `fire_legacy_migration_request` probes EVERY legacy delegate generation (in
+// waves since freenet/river#809), and each one that still holds data hydrates
+// independently. Their responses race, so something has to decide which copy
+// of a room is authoritative when two generations disagree about the user's
+// identity for it.
 //
 // Before #527 nothing did: `Rooms::merge` kept whichever copy landed FIRST and
-// silently skipped the rest. Probes are dispatched oldest-generation-first (the
-// `LEGACY_DELEGATES` order), so the oldest surviving copy usually answered
-// first — rolling a long-time user back to an identity from months earlier.
+// silently skipped the rest. Probes were then dispatched oldest-generation-first
+// (the `LEGACY_DELEGATES` order; newest-first since #809), so the oldest
+// surviving copy usually answered first — rolling a long-time user back to an
+// identity from months earlier.
 //
 // The rank below is that missing order. `LEGACY_DELEGATES` is generated from
 // `legacy_delegates.toml` in age order (V1 oldest first), so an entry's INDEX
@@ -3178,6 +3191,83 @@ mod tests {
         }
     }
 
+    /// freenet/river#801: the save path must keep the read marker furthest
+    /// along in the merged buffer, whichever side holds it. A tab that loaded
+    /// a stale legacy marker must not write it over the delegate's later one,
+    /// and the delegate's stale one must not survive a later local one.
+    #[test]
+    fn reconcile_room_present_keeps_the_furthest_read_marker() {
+        let owner = SigningKey::from_bytes(&[3u8; 32]);
+        let me = SigningKey::from_bytes(&[1u8; 32]);
+        let vk = owner.verifying_key();
+        let (mut early, ids) = crate::room_data::test_room_with_messages(&owner, &me, 2, 4);
+        early.last_read_message_id = Some(ids[0].clone());
+        let (mut late, _) = crate::room_data::test_room_with_messages(&owner, &me, 4, 4);
+        late.last_read_message_id = Some(ids[2].clone());
+
+        let stored_marker = |local: &RoomData, remote: &RoomData| {
+            let out = reconcile_room_present(Some(&present_slot_bytes(remote)), &vk, local, false)
+                .unwrap()
+                .expect("a present slot merges and stores");
+            match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+                RoomSlot::Present(r) => r.last_read_message_id,
+                RoomSlot::Tombstone => panic!("expected Present"),
+            }
+        };
+        assert_eq!(
+            stored_marker(&early, &late),
+            Some(ids[2].clone()),
+            "a local stale marker must not overwrite the delegate's later one"
+        );
+        assert_eq!(
+            stored_marker(&late, &early),
+            Some(ids[2].clone()),
+            "the local later marker must replace the delegate's stale one"
+        );
+        // A side with no marker at all (a slot written before markers existed,
+        // or a fresh local copy) never erases the other side's.
+        let mut unmarked = late.clone();
+        unmarked.last_read_message_id = None;
+        assert_eq!(stored_marker(&unmarked, &late), Some(ids[2].clone()));
+        assert_eq!(stored_marker(&late, &unmarked), Some(ids[2].clone()));
+    }
+
+    /// A save whose stored copy of the room is on an older configuration (ban
+    /// cap 300, 150 bans, a message the local copy lacks) while the local
+    /// copy is on the owner's newer one (cap 10): the room's merge refuses
+    /// the stored copy once, and the save converges and stores rather than
+    /// failing (which would leave the local edits unsaved).
+    #[test]
+    fn reconcile_room_present_converges_past_a_lower_ranked_refusal() {
+        let owner = SigningKey::from_bytes(&[94u8; 32]);
+        let vk = owner.verifying_key();
+        let params = river_core::room_state::ChatRoomParametersV1 { owner: vk };
+        let mut local = crate::room_data::test_minimal_room_data(vk);
+        local.room_state = crate::room_data::test_generation_copy(&owner, 2, 10, &["m1"], 0);
+        let mut stored = local.clone();
+        stored.room_state =
+            crate::room_data::test_generation_copy(&owner, 1, 300, &["m1", "m2"], 150);
+        let refused = local
+            .room_state
+            .clone()
+            .merge_from(&params, &stored.room_state)
+            .unwrap_err();
+        assert!(
+            refused.contains(crate::room_data::LOWER_RANKED_REFUSAL),
+            "premise: {refused}"
+        );
+        let out = reconcile_room_present(Some(&present_slot_bytes(&stored)), &vk, &local, false)
+            .expect("the save converges")
+            .expect("a present slot merges and stores");
+        match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+            RoomSlot::Present(r) => {
+                assert_eq!(r.room_state.recent_messages.messages.len(), 2);
+                assert_eq!(r.room_state.bans.0.len(), 10);
+            }
+            RoomSlot::Tombstone => panic!("expected Present"),
+        }
+    }
+
     /// An unparseable current slot is a hard error (surfaced, not silently
     /// treated as absent — which could clobber a slot the delegate holds).
     #[test]
@@ -3351,6 +3441,32 @@ mod tests {
             merged.invitation_secrets.get(&2),
             Some(&[22u8; 32]),
             "remote-only version must be absorbed, not dropped"
+        );
+    }
+
+    /// The DM purges each tab recorded as its own are unioned by the save-side
+    /// merge, so one tab's save never drops a purge another tab recorded.
+    #[test]
+    fn reconcile_room_present_unions_own_purges() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let me = river_core::room_state::member::MemberId::from(
+            SigningKey::from_bytes(&[1u8; 32]).verifying_key(),
+        );
+        let mut local = crate::room_data::test_minimal_room_data(vk);
+        local.own_purges.record(me, [PurgeToken([1; 16])]);
+        let mut remote = crate::room_data::test_minimal_room_data(vk);
+        remote.own_purges.record(me, [PurgeToken([2; 16])]);
+        let out = reconcile_room_present(Some(&present_slot_bytes(&remote)), &vk, &local, false)
+            .unwrap()
+            .expect("matching-identity merge stores");
+        let merged = match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+            RoomSlot::Present(r) => r,
+            RoomSlot::Tombstone => panic!("expected Present"),
+        };
+        assert_eq!(
+            merged.own_purges.purged,
+            vec![(me, PurgeToken([1; 16])), (me, PurgeToken([2; 16]))]
         );
     }
 
@@ -3686,7 +3802,7 @@ mod tests {
         // This tab holds `mine` and `stale` (the latter at a current or chosen
         // rank, so no entry), not `theirs`.
         let represents = std::collections::HashSet::from([mine, stale]);
-        let out = reconcile_meta(Some(&rb), &local, &represents)
+        let out = reconcile_meta(Some(&rb), &local, &represents, &Default::default())
             .unwrap()
             .unwrap();
         let merged: RoomsMeta = ciborium::from_reader(out.as_slice()).unwrap();
@@ -3699,6 +3815,130 @@ mod tests {
             !merged.identity_sources.iter().any(|(v, _)| *v == stale),
             "for a room this tab holds, its own view wins"
         );
+    }
+
+    fn meta_bytes(meta: &RoomsMeta) -> Vec<u8> {
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(meta, &mut out).unwrap();
+        out
+    }
+
+    fn reconciled_order(
+        stored: Option<&RoomsMeta>,
+        local_order: Vec<VerifyingKey>,
+        left: &[VerifyingKey],
+    ) -> Vec<VerifyingKey> {
+        let stored = stored.map(meta_bytes);
+        let local = RoomsMeta {
+            room_order: local_order,
+            ..Default::default()
+        };
+        let left: std::collections::HashSet<VerifyingKey> = left.iter().copied().collect();
+        // The tab holds the rooms it places, plus the ones it left.
+        let represents: std::collections::HashSet<VerifyingKey> = local
+            .room_order
+            .iter()
+            .chain(left.iter())
+            .copied()
+            .collect();
+        let out = reconcile_meta(stored.as_deref(), &local, &represents, &left)
+            .unwrap()
+            .expect("stores merged meta");
+        ciborium::from_reader::<RoomsMeta, _>(out.as_slice())
+            .unwrap()
+            .room_order
+    }
+
+    /// freenet/river#802 cause 3: a tab whose order is empty (it has not
+    /// loaded or placed any rooms yet) must not wipe the stored order.
+    #[test]
+    fn reconcile_meta_does_not_let_an_empty_order_wipe_the_stored_one() {
+        let k: Vec<VerifyingKey> = (1..=3u8)
+            .map(|i| SigningKey::from_bytes(&[i; 32]).verifying_key())
+            .collect();
+        let stored = RoomsMeta {
+            room_order: vec![k[2], k[0], k[1]],
+            ..Default::default()
+        };
+        assert_eq!(
+            reconciled_order(Some(&stored), Vec::new(), &[]),
+            vec![k[2], k[0], k[1]]
+        );
+    }
+
+    /// freenet/river#802 cause 3: a tab holding only some of the rooms keeps
+    /// its own order for those, and the stored positions of the others.
+    #[test]
+    fn reconcile_meta_keeps_stored_positions_of_rooms_the_tab_lacks() {
+        let k: Vec<VerifyingKey> = (1..=4u8)
+            .map(|i| SigningKey::from_bytes(&[i; 32]).verifying_key())
+            .collect();
+        let stored = RoomsMeta {
+            room_order: vec![k[0], k[1], k[2], k[3]],
+            ..Default::default()
+        };
+        // The tab has k[1] and k[3] and placed k[3] first.
+        assert_eq!(
+            reconciled_order(Some(&stored), vec![k[3], k[1]], &[]),
+            vec![k[3], k[0], k[1], k[2]],
+            "the tab's own order wins for its rooms; the others keep their \
+             stored neighbours"
+        );
+    }
+
+    /// An entry this tab only carries for a room it never loaded (a ghost)
+    /// does not undo another tab's placement of that room; it is kept only
+    /// where the store lacks it.
+    #[test]
+    fn reconcile_meta_does_not_let_a_ghost_entry_undo_another_tabs_move() {
+        let k: Vec<VerifyingKey> = (1..=3u8)
+            .map(|i| SigningKey::from_bytes(&[i; 32]).verifying_key())
+            .collect();
+        // Another tab moved k[2] to the front.
+        let stored = meta_bytes(&RoomsMeta {
+            room_order: vec![k[2], k[0], k[1]],
+            ..Default::default()
+        });
+        // This tab holds k[0] and k[1]; k[2] is a ghost at its old position.
+        let local = RoomsMeta {
+            room_order: vec![k[0], k[1], k[2]],
+            ..Default::default()
+        };
+        let represents = std::collections::HashSet::from([k[0], k[1]]);
+        let out = reconcile_meta(Some(&stored), &local, &represents, &Default::default())
+            .unwrap()
+            .unwrap();
+        let merged: RoomsMeta = ciborium::from_reader(out.as_slice()).unwrap();
+        assert_eq!(merged.room_order, vec![k[2], k[0], k[1]]);
+        // With nothing stored, the ghost entry is kept where the tab had it.
+        let out = reconcile_meta(None, &local, &represents, &Default::default())
+            .unwrap()
+            .unwrap();
+        let merged: RoomsMeta = ciborium::from_reader(out.as_slice()).unwrap();
+        assert_eq!(merged.room_order, vec![k[0], k[1], k[2]]);
+    }
+
+    /// A room this tab left is dropped from the stored order, and a tab's own
+    /// complete order still replaces a stale stored one.
+    #[test]
+    fn reconcile_meta_drops_left_rooms_and_keeps_a_full_local_order() {
+        let k: Vec<VerifyingKey> = (1..=3u8)
+            .map(|i| SigningKey::from_bytes(&[i; 32]).verifying_key())
+            .collect();
+        let stored = RoomsMeta {
+            room_order: vec![k[0], k[1], k[2]],
+            ..Default::default()
+        };
+        assert_eq!(
+            reconciled_order(Some(&stored), vec![k[2], k[0]], &[k[1]]),
+            vec![k[2], k[0]]
+        );
+        assert_eq!(
+            reconciled_order(Some(&stored), vec![k[2], k[1], k[0]], &[]),
+            vec![k[2], k[1], k[0]]
+        );
+        // Nothing stored yet: the local order as is.
+        assert_eq!(reconciled_order(None, vec![k[1]], &[]), vec![k[1]]);
     }
 
     /// `reconcile_meta`: this tab's prefs win, but a remote notification-mode
@@ -3721,7 +3961,7 @@ mod tests {
         let mut rb = Vec::new();
         ciborium::ser::into_writer(&remote, &mut rb).unwrap();
 
-        let out = reconcile_meta(Some(&rb), &local, &Default::default())
+        let out = reconcile_meta(Some(&rb), &local, &Default::default(), &Default::default())
             .unwrap()
             .expect("stores merged meta");
         let merged: RoomsMeta = ciborium::from_reader(out.as_slice()).unwrap();
@@ -4288,7 +4528,7 @@ mod tests {
         }
         assert!(
             !body.contains("LEGACY_MIGRATION_ATTEMPTED"),
-            "begin_load_attempt must NOT touch LEGACY_MIGRATION_ATTEMPTED (retry-only; #253 gate)"
+            "begin_load_attempt must NOT touch LEGACY_MIGRATION_ATTEMPTED (a plain reconnect must not re-probe)"
         );
     }
 
@@ -4481,9 +4721,10 @@ mod tests {
     /// (all sends failed / connection down) the once-per-session
     /// `LEGACY_MIGRATION_ATTEMPTED` guard is reset so a reconnect re-probes. A send
     /// that SUCCEEDS sets `any_dispatched` and does NOT mark (the genuine new-user
-    /// case). Review 10 (P2#1): the probe captures the attempt and gates BOTH the
-    /// mark and the guard reset on still-current, so a stale probe (superseded by
-    /// a reconnect's begin_load_attempt) can't pollute the new attempt.
+    /// case). Review 10 (P2#1): the probe captures the attempt and gates the mark
+    /// on still-current, and the guard reset on being the latest sweep
+    /// (freenet/river#809), so a stale probe (superseded by a reconnect's
+    /// begin_load_attempt) can't pollute the new attempt.
     #[test]
     fn legacy_probe_transport_failure_marks_and_resets_guard() {
         // `fire_legacy_migration_request` is the last fn in the file, defined
@@ -4518,10 +4759,225 @@ mod tests {
             .expect("must reset the guard when no probe dispatched");
         let reset_block = &body[reset_pos..(reset_pos + 200).min(body.len())];
         assert!(
-            reset_block.contains("load_attempt_is_current(attempt)")
+            reset_block.contains("SWEEP_EPOCH.load(Ordering::Relaxed) == epoch")
                 && reset_block.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"),
-            "all-sends-failed (still current) must reset LEGACY_MIGRATION_ATTEMPTED so a reconnect re-probes"
+            "all-sends-failed (latest sweep) must reset LEGACY_MIGRATION_ATTEMPTED so a reconnect re-probes"
         );
+    }
+
+    /// freenet/river#809: the sweep asks the NEWEST legacy generation first, so
+    /// its answer is not queued on the node behind every older generation.
+    #[test]
+    fn legacy_sweep_asks_newest_first_in_bounded_waves() {
+        let src = include_str!("chat_delegate.rs");
+        let body = &src[src
+            .rfind("pub(crate) async fn fire_legacy_migration_request() -> bool {")
+            .expect("fire_legacy_migration_request must exist")..];
+        assert!(body.contains("sweep_wave_plan(LEGACY_DELEGATES.len())"));
+        assert!(
+            body[body.find("async fn send_sweep_generation(").unwrap()..]
+                .matches("expect_sweep_answer(wave, key_bytes);")
+                .count()
+                == 2,
+            "every sent request (the two GETs and the ListRequest) must be expected"
+        );
+        assert!(body.contains("await_sweep_wave(wave).await"));
+        // The caller writes the load state right after this returns, so no
+        // wave may be awaited before it does: otherwise that
+        // write lands after the first wave's merge and undoes its `Loaded`.
+        let spawn = body
+            .find("crate::util::safe_spawn_local(async move {")
+            .expect("later waves run from a background task");
+        assert!(!body[..spawn].contains("await_sweep_wave("));
+        // The worker is taken before returning, outside the task, so the idle
+        // timer cannot arm before the task first runs.
+        assert!(body[..spawn].contains("let worker = LoadWorkerGuard::new();"));
+        let task = &body[spawn..];
+        assert!(task.contains("sweep_continuation("));
+        // Every stop in the task goes through `stop_sweep` (latest-only,
+        // capped re-arm); nothing in it writes the guard or the marker
+        // directly. The task's end re-arms on an attempt change too.
+        assert!(task.contains("SweepNext::Superseded => return,"));
+        assert!(task.contains("stop_sweep(epoch, true);"));
+        assert!(task.contains("stop_sweep(epoch, !load_attempt_is_current(attempt));"));
+        assert!(body.contains("SweepStart::OverEarlier => take_sweep_rearm(),"));
+        let task_end = task.find("\n    });").expect("task end");
+        assert!(!task[..task_end].contains("LEGACY_MIGRATION_ATTEMPTED.store("));
+        assert!(!task[..task_end].contains("SWEEP_RUNNING_FOR.store("));
+    }
+
+    /// A pacing sweep stops for a newer sweep (leaving the guard alone) or a
+    /// new load attempt (clearing it), and a new attempt may start over a
+    /// sweep still pacing for an earlier one, but not over its own.
+    #[test]
+    fn a_pacing_sweep_yields_to_newer_sweeps_and_attempts() {
+        assert_eq!(sweep_continuation(true, true), SweepNext::Continue);
+        assert_eq!(sweep_continuation(false, true), SweepNext::Superseded);
+        assert_eq!(sweep_continuation(false, false), SweepNext::Superseded);
+        assert_eq!(sweep_continuation(true, false), SweepNext::Rearm);
+
+        assert_eq!(sweep_start(false, 0, 5), SweepStart::Fresh, "first sweep");
+        assert_eq!(
+            sweep_start(true, 0, 5),
+            SweepStart::Refuse,
+            "once per session"
+        );
+        assert_eq!(
+            sweep_start(true, 6, 5),
+            SweepStart::Refuse,
+            "own sweep pacing"
+        );
+        assert_eq!(
+            sweep_start(false, 6, 5),
+            SweepStart::Refuse,
+            "not even when a recovery or Retry cleared the guard"
+        );
+        assert_eq!(
+            sweep_start(true, 5, 5),
+            SweepStart::OverEarlier,
+            "an earlier attempt's sweep is pacing: a re-sweep, from the budget"
+        );
+
+        // Stopping: only the latest sweep touches the shared state, and only
+        // a re-arm of a guard still set tries to clear it.
+        assert_eq!(sweep_stop_effects(false, true, true), (false, false));
+        assert_eq!(sweep_stop_effects(true, false, true), (true, false));
+        assert_eq!(sweep_stop_effects(true, true, true), (true, true));
+        assert_eq!(
+            sweep_stop_effects(true, true, false),
+            (true, false),
+            "a Retry already cleared it: no re-arm spent"
+        );
+    }
+
+    /// Waves of overlapping sweeps are kept apart: an answer counts toward
+    /// every wave expecting its key, and disarming one leaves the other.
+    #[test]
+    fn sweep_waves_are_kept_per_sweep() {
+        let key = [42u8; 32];
+        let a = arm_sweep_wave();
+        let b = arm_sweep_wave();
+        expect_sweep_answer(a, &key);
+        expect_sweep_answer(b, &key);
+        let mut done_a = seal_sweep_wave(a).unwrap();
+        let mut done_b = seal_sweep_wave(b).unwrap();
+        disarm_sweep_wave(a);
+        note_sweep_answer(&key);
+        assert!(
+            done_a.try_recv().is_err(),
+            "a disarmed wave's waiter is dropped"
+        );
+        assert!(matches!(done_b.try_recv(), Ok(Some(()))));
+        disarm_sweep_wave(b);
+        expect_sweep_answer(b, &key);
+        assert!(seal_sweep_wave(b).is_none(), "a disarmed token is a no-op");
+    }
+
+    /// The plan: newest first, every generation exactly once, no wave larger
+    /// than `SWEEP_WAVE_GENERATIONS`.
+    #[test]
+    fn the_sweep_plan_is_newest_first_bounded_and_complete() {
+        for n in [0usize, 1, 3, 4, 5, 33, 64] {
+            let plan = sweep_wave_plan(n);
+            let flat: Vec<usize> = plan.iter().flatten().copied().collect();
+            assert_eq!(flat, (0..n).rev().collect::<Vec<_>>(), "n = {n}");
+            assert!(plan
+                .iter()
+                .all(|w| !w.is_empty() && w.len() <= SWEEP_WAVE_GENERATIONS));
+        }
+    }
+
+    /// Only the sweep's own requests pace it: a per-room slot or `rooms_meta`
+    /// reply from the same generation must not end its wave.
+    #[test]
+    fn only_sweep_replies_count_toward_a_wave() {
+        let get = |k: &[u8]| ChatDelegateResponseMsg::GetResponse {
+            key: ChatDelegateKey::new(k.to_vec()),
+            value: None,
+        };
+        assert!(is_sweep_reply(&get(ROOMS_STORAGE_KEY)));
+        assert!(is_sweep_reply(&get(OUTBOUND_DMS_STORAGE_KEY)));
+        assert!(is_sweep_reply(&ChatDelegateResponseMsg::ListResponse {
+            keys: vec![]
+        }));
+        assert!(!is_sweep_reply(&get(ROOMS_META_KEY)));
+        assert!(!is_sweep_reply(&get(&room_storage_key(
+            &SigningKey::from_bytes(&[3u8; 32]).verifying_key()
+        ))));
+    }
+
+    /// The node's real error texts name the delegate in the form the wave
+    /// matches: typed `Missing` as the synchronizer stringifies it.
+    #[test]
+    fn a_typed_missing_error_answers_its_sweep_request() {
+        use freenet_stdlib::client_api::{ClientError, DelegateError, ErrorKind, RequestError};
+        let key_bytes = [7u8; 32];
+        let key = DelegateKey::new(key_bytes, CodeHash::new([8u8; 32]));
+        let err: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+            DelegateError::Missing(key.clone()),
+        ))
+        .into();
+        let text =
+            crate::components::app::freenet_api::error::SynchronizerError::from_api_error(&err)
+                .to_string();
+        let mut wave = SweepWave::default();
+        wave.expect(&key_bytes);
+        wave.expect(&key_bytes);
+        let mut done = wave.seal().unwrap();
+        wave.errored(&text);
+        // The rate limiter's refusal of the next request to the same key, as
+        // freenet-core words it (`client_events/websocket.rs`).
+        let refused: ClientError =
+            ErrorKind::RequestError(RequestError::DelegateError(DelegateError::ExecutionError(
+                format!("delegate {key} is rate limited after repeated failures; retry in 80 ms")
+                    .into(),
+            )))
+            .into();
+        assert!(matches!(done.try_recv(), Ok(None)), "error text: {text}");
+        wave.errored(
+            &crate::components::app::freenet_api::error::SynchronizerError::from_api_error(
+                &refused,
+            )
+            .to_string(),
+        );
+        assert!(matches!(done.try_recv(), Ok(Some(()))));
+    }
+
+    /// A sweep wave completes once every request it sent is answered, by a
+    /// reply or by an error naming its delegate; an error naming no delegate
+    /// (the node's queue refusal) answers nothing, so the wave falls back to
+    /// its wait bound.
+    #[test]
+    fn a_sweep_wave_completes_when_every_request_is_answered() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let mut wave = SweepWave::default();
+        for _ in 0..3 {
+            wave.expect(&a);
+        }
+        wave.expect(&b);
+        let mut done = wave.seal().expect("requests are outstanding");
+        wave.answered(&a);
+        wave.errored(&format!(
+            "missing delegate {}",
+            bs58::encode(a).into_string()
+        ));
+        wave.errored("no response received from handler");
+        wave.answered(&[9u8; 32]);
+        assert!(
+            matches!(done.try_recv(), Ok(None)),
+            "a and b still outstanding"
+        );
+        wave.errored(&format!(
+            "delegate {} is rate limited after repeated failures; retry in 80 ms",
+            bs58::encode(a).into_string()
+        ));
+        assert!(matches!(done.try_recv(), Ok(None)), "b still outstanding");
+        wave.answered(&b);
+        assert!(matches!(done.try_recv(), Ok(Some(()))));
+
+        let mut empty = SweepWave::default();
+        assert!(empty.seal().is_none(), "nothing sent: nothing to wait for");
     }
 
     // ===== resolve_hidden_thread_hydration tests (#261 Codex P3) =====
@@ -6230,12 +6686,27 @@ mod tests {
     /// delegate links the room-state code that change rewrites, and the
     /// mandatory `river-core` 0.1.22 -> 0.2.0 bump would move it regardless.
     /// V34 (`cea989c8…`, from freenet/river#768) is the outgoing generation.
+    ///
+    /// Updated for V35 (freenet/river#796, PR #797): the delegate links the
+    /// room-state code that change touches, and the river-core 0.2.0 -> 0.2.1
+    /// bump moves it regardless. V35 (`49a3122b…`, from PR #702) is the
+    /// outgoing generation.
+    ///
+    /// Updated for V36 (the freenet/river#703 merge-law fixes): the delegate
+    /// links the room-state code they change, and the river-core 0.2.1 ->
+    /// 0.3.0 bump would move it regardless. V36 (`eca06ace…`, from PR #797)
+    /// is the outgoing generation.
+    ///
+    /// Updated for V37 (the cleanup merge-law change: the ban cap's order,
+    /// caps decided after removals): the delegate links the room-state code
+    /// it changes, and the river-core 0.3.0 -> 0.3.1 bump moves it
+    /// regardless. V37 (`0fc3625e…`) is the outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "49a3122b2de64a62d56a2254518277d6ed8247faf3abb5325e722587a03b2ee5",
+            "da47cbd9e5264828b80d229a292e23e05951737844cd289c8f53e99bf55e0848",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
@@ -8186,13 +8657,15 @@ pub(crate) fn reconcile_room_present(
                 local.clone()
             } else {
                 let mut m = local.clone();
-                m.room_state
-                    .merge(
-                        &local.room_state,
-                        &river_core::room_state::ChatRoomParametersV1 { owner: *owner_vk },
-                        &remote.room_state,
-                    )
-                    .map_err(|e| format!("room_state merge failed: {e}"))?;
+                // Converges when the room's merge refuses the stored copy
+                // once (its configuration does not outrank the local one's),
+                // as the other local merges do, so the save still stores.
+                crate::room_data::merge_converging(
+                    &mut m.room_state,
+                    &river_core::room_state::ChatRoomParametersV1 { owner: *owner_vk },
+                    &remote.room_state,
+                )
+                .map_err(|e| format!("room_state merge failed: {e}"))?;
                 // Union the invitation-carried secrets: a concurrent tab may hold
                 // a version this tab lacks, and these are persisted-only recovery
                 // state for a private-room invitee before the owner's contract
@@ -8202,6 +8675,18 @@ pub(crate) fn reconcile_room_present(
                 for (version, secret) in remote.invitation_secrets {
                     m.invitation_secrets.entry(version).or_insert(secret);
                 }
+                // The DM purges each tab signed: unioned, so a purge another
+                // tab recorded can still be re-published.
+                m.own_purges.union(&remote.own_purges);
+                // The read marker furthest along in the merged buffer wins, so
+                // a tab holding an older marker (a stale legacy copy won its
+                // merge, or another tab read further) never rolls the stored
+                // one back (freenet/river#801).
+                m.last_read_message_id = crate::room_data::furthest_read_marker(
+                    &m.room_state.recent_messages.messages,
+                    m.last_read_message_id.take(),
+                    remote.last_read_message_id,
+                );
                 m
             }
         }
@@ -8258,7 +8743,9 @@ fn reconcile_room_tombstone(current: Option<&[u8]>) -> Result<Option<Vec<u8>>, S
 
 /// Reconcile the `rooms_meta` save: this tab's view-prefs are authoritative;
 /// absorb notification prefs the delegate has for rooms we don't track so a
-/// concurrent tab's setting isn't lost.
+/// concurrent tab's setting isn't lost, and the stored order's entries for
+/// rooms this tab does not place (except rooms it `left`), at their stored
+/// position (freenet/river#802).
 ///
 /// Identity sources (#768 review B3) likewise: this tab speaks for the rooms
 /// it `represents` (present or tombstoned in its own `Rooms`); for any other
@@ -8269,10 +8756,39 @@ fn reconcile_meta(
     current: Option<&[u8]>,
     local: &RoomsMeta,
     represents: &std::collections::HashSet<VerifyingKey>,
+    left: &std::collections::HashSet<VerifyingKey>,
 ) -> Result<Option<Vec<u8>>, String> {
     let mut merged = local.clone();
     if let Some(bytes) = current {
         if let Ok(remote) = ciborium::from_reader::<RoomsMeta, _>(bytes) {
+            // Room order (freenet/river#802): this tab's order wins for the
+            // rooms it holds (`represents`), but it must not erase the stored
+            // position of a room it does not hold: an empty order from a tab
+            // that has not loaded yet, or one whose room set is incomplete (a
+            // migration still restoring, a slot that failed to read). Those
+            // keep their stored neighbours, and so does an entry this tab only
+            // carries for a room it never loaded, so another tab's move of that
+            // room is not undone. Then this tab's own such entries fill in
+            // whatever the store lacks (including a room another tab left that
+            // this tab has not seen the tombstone for: unrendered, and dropped
+            // by `apply_meta` once the tombstone loads). Only rooms this tab
+            // left go. A room
+            // this tab holds but never positioned takes its stored position,
+            // so the persisted order can differ from what this tab renders
+            // (key-byte tail) until it reloads: adopting a placement this
+            // device lacked, the same local-wins rule as `Rooms::merge`.
+            let local_order = std::mem::take(&mut merged.room_order);
+            merged.room_order = local_order
+                .iter()
+                .filter(|vk| represents.contains(vk))
+                .copied()
+                .collect();
+            crate::room_data::merge_room_order(&mut merged.room_order, &remote.room_order, |vk| {
+                left.contains(vk)
+            });
+            crate::room_data::merge_room_order(&mut merged.room_order, &local_order, |vk| {
+                left.contains(vk)
+            });
             for (vk, mode) in remote.notification_modes {
                 merged.notification_modes.entry(vk).or_insert(mode);
             }
@@ -8426,8 +8942,9 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
                     .chain(rooms.removed_rooms.iter())
                     .copied()
                     .collect();
+                let left = rooms.removed_rooms.clone();
                 match cas_write_delegate_key(ROOMS_META_KEY.to_vec(), move |current| {
-                    reconcile_meta(current, &meta, &represents)
+                    reconcile_meta(current, &meta, &represents, &left)
                 })
                 .await
                 {
@@ -10548,7 +11065,8 @@ pub(crate) static LOAD_ACTIVITY_GEN: AtomicU32 = AtomicU32::new(0);
 /// shell is already interactive at ~240 ms). It was 4_000 ms; recalibrated
 /// toward the actual legacy-probe response burst (~72 fire-and-forget probes over
 /// 24 delegate generations, measured ~130 ms spread, all in by ~490 ms on a fast
-/// link).
+/// link). Since freenet/river#809 the sweep sends in waves and holds a load
+/// worker while the later ones pace, so this timer arms only after the last.
 ///
 /// The FLOOR is set by the one cohort that can flash: a returning user whose
 /// CURRENT delegate is empty but a LEGACY delegate still has data (the first load
@@ -10592,6 +11110,13 @@ impl LoadWorkerGuard {
         let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
         PENDING_LOADS.fetch_add(1, Ordering::Relaxed);
         LOAD_ACTIVITY_GEN.fetch_add(1, Ordering::Relaxed);
+        // Re-render what reads `pending_load_workers` (freenet/river#802).
+        // Deferred: workers start inside tasks. Only in the browser: natively
+        // `defer` runs at once with no Dioxus runtime.
+        #[cfg(target_arch = "wasm32")]
+        crate::util::defer(|| {
+            *LOAD_WORKERS_CHANGED.write() += 1;
+        });
         LoadWorkerGuard { attempt }
     }
 
@@ -10764,6 +11289,12 @@ pub(crate) fn on_load_worker_settled() {
         if !load_attempt_is_current(armed_attempt) {
             return;
         }
+        // Only in the browser: natively `defer` runs at once with no Dioxus
+        // runtime, where a GlobalSignal write panics; nothing renders there.
+        #[cfg(target_arch = "wasm32")]
+        {
+            *LOAD_WORKERS_CHANGED.write() += 1;
+        }
         let room_count_zero = rooms_map_is_empty();
         let saw = SAW_FETCH_FAILURE.load(Ordering::Relaxed);
         match settle_terminal(room_count_zero, saw) {
@@ -10860,8 +11391,14 @@ pub(crate) fn room_set_complete_core(latch: u32, attempt: u32, current_attempt: 
 /// guard), so overlapping passes are harmless. It also zeroes the pending-worker
 /// count, clears `SAW_FETCH_FAILURE`, returns the rail to `Loading`, and arms a
 /// fresh gen-guarded hard-max backstop. Does NOT touch `LEGACY_MIGRATION_ATTEMPTED`
-/// — a plain reconnect must not force a legacy re-probe (preserves the #253 gate);
-/// only `retry_rooms_load` re-enables it.
+/// — a plain reconnect must not force a legacy re-probe (re-probe spam). The
+/// guard only limits repeat probes; #253 is enforced by the callers, which
+/// fire only over an empty current delegate, except the interrupted-migration
+/// recovery (#352), which fires only after a per-room load read every slot,
+/// and saves room by room through a CAS read-merge-write. Besides
+/// `retry_rooms_load` and that recovery, a sweep that a reconnect interrupts
+/// mid-pacing re-enables it, or the new attempt starts over it; the two
+/// share `MAX_SWEEP_REARMS` per session (freenet/river#809).
 pub(crate) fn begin_load_attempt() {
     LOAD_ATTEMPT_GEN.fetch_add(1, Ordering::Relaxed);
     PENDING_LOADS.store(0, Ordering::Relaxed);
@@ -10915,7 +11452,9 @@ fn schedule_rooms_load_backstop() {
 pub(crate) fn retry_rooms_load() {
     // Retry-only (deliberately NOT in `begin_load_attempt`): re-enable the legacy
     // probe so a legacy source that failed THIS session is retried (P1b). A plain
-    // reconnect must not force this (re-probe spam on every reconnect). Set
+    // reconnect must not force this (re-probe spam on every reconnect), except
+    // one that interrupts a pacing sweep (`stop_sweep`, or a new attempt
+    // starting over it; both capped by `MAX_SWEEP_REARMS`). Set
     // BEFORE the re-setup so `fire_legacy_migration_request` sees it cleared.
     LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     crate::util::safe_spawn_local(async {
@@ -10936,6 +11475,158 @@ pub(crate) fn retry_rooms_load() {
 /// success path. Without this guard, every WebSocket reconnect would re-fire every
 /// legacy delegate request, creating a tight error spam loop.
 static LEGACY_MIGRATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
+/// Legacy generations the startup sweep asks at once (freenet/river#809).
+///
+/// Every delegate request on a node, from every client and for every
+/// delegate, waits in ONE admission queue per priority tier, capped at 100
+/// (`MAX_QUEUED_PER_CONTRACT`, freenet-core `fair_queue.rs`), and one past the
+/// cap is refused with an error that names no delegate, so its waiter sits
+/// out its whole timeout. The sweep sends three requests per generation, so
+/// all 33 at once is 99: in the rehearsal that alone, plus the load's other
+/// requests, got the newest generation's room reads refused and held the room
+/// list for 26 s. Four generations is 12 requests a wave.
+pub(crate) const SWEEP_WAVE_GENERATIONS: usize = 4;
+const _: () = assert!(SWEEP_WAVE_GENERATIONS > 0);
+
+/// The longest a sweep wave waits for its answers before the next one goes
+/// out. A warm node answers a wave in one round trip; a cold one loads each
+/// delegate module first (about 0.4 s each in the rehearsal).
+const SWEEP_WAVE_WAIT_MS: u64 = 2_000;
+
+/// The requests of the sweep wave in flight that have no answer yet: per
+/// legacy delegate, how many were sent and not answered, with the key's
+/// base58 form (what the node's error texts name). The wave is complete once
+/// sealed with nothing outstanding.
+#[derive(Default)]
+pub(crate) struct SweepWave {
+    outstanding: HashMap<[u8; 32], (u32, String)>,
+    sealed: bool,
+    done: Option<oneshot::Sender<()>>,
+}
+
+impl SweepWave {
+    pub(crate) fn expect(&mut self, key: &[u8; 32]) {
+        self.outstanding
+            .entry(*key)
+            .or_insert_with(|| (0, bs58::encode(key).into_string()))
+            .0 += 1;
+    }
+
+    /// One request to `key` was answered: a reply, or an error naming it. A
+    /// key outside the wave (a late answer to an earlier wave, or another
+    /// path's request to the same generation) is ignored; one counted early
+    /// only lets the next wave go out sooner.
+    pub(crate) fn answered(&mut self, key: &[u8]) {
+        if let Ok(key) = <[u8; 32]>::try_from(key) {
+            if let Some((n, _)) = self.outstanding.get_mut(&key) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.outstanding.remove(&key);
+                }
+            }
+        }
+        self.finish_if_complete();
+    }
+
+    /// An error from the node: it answers the request to the wave key its
+    /// text names (typed `Missing`, the rate limiter's refusal, core's "not
+    /// found in store"). An error naming no key answers nothing.
+    pub(crate) fn errored(&mut self, text: &str) {
+        let named = self
+            .outstanding
+            .iter()
+            .find(|(_, (_, b58))| text.contains(b58.as_str()))
+            .map(|(k, _)| *k);
+        if let Some(key) = named {
+            self.answered(&key);
+        }
+    }
+
+    /// Every request is sent: from now on the wave completes when nothing is
+    /// outstanding. `None` when it already is.
+    pub(crate) fn seal(&mut self) -> Option<oneshot::Receiver<()>> {
+        self.sealed = true;
+        if self.outstanding.is_empty() {
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        self.done = Some(tx);
+        Some(rx)
+    }
+
+    fn finish_if_complete(&mut self) {
+        if self.sealed && self.outstanding.is_empty() {
+            if let Some(done) = self.done.take() {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+/// The sweep waves in flight, by token. Usually one; two when a recovery or a
+/// Retry starts a sweep while an earlier one is still pacing, and each then
+/// keeps its own wave. An answer counts toward every wave expecting its key.
+static SWEEP_WAVES: LazyLock<Mutex<HashMap<u64, SweepWave>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_SWEEP_WAVE: AtomicU64 = AtomicU64::new(0);
+
+fn arm_sweep_wave() -> u64 {
+    let wave = NEXT_SWEEP_WAVE.fetch_add(1, Ordering::Relaxed);
+    SWEEP_WAVES
+        .lock()
+        .unwrap()
+        .insert(wave, SweepWave::default());
+    wave
+}
+
+fn expect_sweep_answer(wave: u64, key: &[u8; 32]) {
+    if let Some(w) = SWEEP_WAVES.lock().unwrap().get_mut(&wave) {
+        w.expect(key);
+    }
+}
+
+fn seal_sweep_wave(wave: u64) -> Option<oneshot::Receiver<()>> {
+    SWEEP_WAVES
+        .lock()
+        .unwrap()
+        .get_mut(&wave)
+        .and_then(SweepWave::seal)
+}
+
+fn disarm_sweep_wave(wave: u64) {
+    SWEEP_WAVES.lock().unwrap().remove(&wave);
+}
+
+/// Whether a legacy delegate's reply answers a sweep request: the
+/// `rooms_data` or `outbound_dms` GET, or the `ListRequest`. A per-room slot
+/// or `rooms_meta` reply (the migration that follows a listing) is not one,
+/// and counting it would end a wave while its own requests are still queued.
+pub(crate) fn is_sweep_reply(response: &ChatDelegateResponseMsg) -> bool {
+    match response {
+        ChatDelegateResponseMsg::ListResponse { .. } => true,
+        ChatDelegateResponseMsg::GetResponse { key, .. } => {
+            key.as_bytes() == ROOMS_STORAGE_KEY || key.as_bytes() == OUTBOUND_DMS_STORAGE_KEY
+        }
+        _ => false,
+    }
+}
+
+/// A legacy delegate answered a sweep request (see [`is_sweep_reply`]), or
+/// replied with nothing at all (core 0.2.136 and earlier, for a delegate it
+/// does not have).
+pub(crate) fn note_sweep_answer(key: &[u8]) {
+    for wave in SWEEP_WAVES.lock().unwrap().values_mut() {
+        wave.answered(key);
+    }
+}
+
+/// The node answered some request with an error (called for every one).
+pub(crate) fn note_sweep_error(text: &str) {
+    for wave in SWEEP_WAVES.lock().unwrap().values_mut() {
+        wave.errored(text);
+    }
+}
 
 /// Per-session guard so interrupted-migration recovery re-fires the legacy
 /// probe at most ONCE per session. Without it, every WebSocket reconnect that
@@ -10963,8 +11654,11 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
     true
 }
 
-/// Fire requests to load rooms from all known legacy delegates (fire and forget).
-/// If any legacy delegate has room data, the response handler will migrate it.
+/// Fire requests to load rooms from all known legacy delegates, newest
+/// generation first, in waves (freenet/river#809). Only the first wave is sent
+/// before this returns; the rest follow from a background task, each once the
+/// one before is answered. The requests are fire-and-forget: if any legacy
+/// delegate has room data, the response handler will migrate it.
 ///
 /// **Must only be called once the current delegate has confirmed it has no
 /// rooms_data** (see freenet/river#253). Firing this while the current delegate
@@ -10980,11 +11674,31 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
 /// (nothing more is coming) — see [`load_state_after_probe_legacy`].
 pub(crate) async fn fire_legacy_migration_request() -> bool {
     // Only attempt migration once per session to avoid error spam on reconnect.
-    // If the legacy delegates aren't installed, retrying won't help.
-    if LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
+    // If the legacy delegates aren't installed, retrying won't help. The one
+    // exception: a sweep still pacing its waves for an EARLIER load attempt
+    // (freenet/river#809). It stops at its next wave, so this attempt starts a
+    // full sweep of its own rather than skip the generations it had not asked.
+    let already = LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed);
+    let start = match sweep_start(
+        already,
+        SWEEP_RUNNING_FOR.load(Ordering::Relaxed),
+        LOAD_ATTEMPT_GEN.load(Ordering::Relaxed),
+    ) {
+        // Over an earlier attempt's pacing sweep: a re-sweep, from the same
+        // per-session budget as a stopped sweep's re-arm.
+        SweepStart::OverEarlier => take_sweep_rearm(),
+        SweepStart::Fresh => true,
+        SweepStart::Refuse => false,
+    };
+    if !start {
         info!("Legacy migration already attempted this session, skipping");
         return false;
     }
+    let epoch = SWEEP_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    // Marked before the first send, so an attempt that begins meanwhile sees
+    // this sweep as an earlier attempt's and starts its own.
+    SWEEP_RUNNING_FOR.store(attempt.wrapping_add(1), Ordering::Relaxed);
 
     info!(
         "Attempting to migrate data from {} legacy delegate(s)",
@@ -11004,123 +11718,33 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // `begin_load_attempt` can advance the attempt mid-flight. Capture the attempt
     // and gate the global writes (`mark_fetch_failure`, the guard reset) on
     // still-current, so a STALE probe's late send-failure can't pollute the new
-    // attempt's `SAW_FETCH_FAILURE` into a false LoadFailed.
-    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    // attempt's `SAW_FETCH_FAILURE` into a false LoadFailed. (`attempt` is
+    // captured above, with the running marker.)
+    // Newest generation first, in waves (freenet/river#809). The node runs
+    // delegate requests one at a time, in arrival order, so oldest-first put
+    // the generation most likely to hold the user's rooms behind every older
+    // one. And all of them at once (three requests each, 99 for 33
+    // generations) nearly fills the ONE admission queue every delegate request
+    // on the node shares (see `SWEEP_WAVE_GENERATIONS`); a request the node
+    // turns away there comes back with no key, so its waiter sits out its
+    // whole timeout. Arrival order decides nothing else: every merge is ranked
+    // by source generation, never by arrival (freenet/river#527).
+    //
+    // Only the first wave is sent before returning, as the whole sweep used to
+    // be, so the caller's load-state write still lands before any reply. The
+    // rest go out from a background task holding a load worker, so the load
+    // stays `Loading` (not "No rooms yet") while older generations may still
+    // answer.
+    let mut waves = sweep_wave_plan(LEGACY_DELEGATES.len()).into_iter();
+    let Some(first) = waves.next() else {
+        stop_sweep(epoch, false);
+        return true;
+    };
+    let wave = arm_sweep_wave();
     let mut any_dispatched = false;
-
-    for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate() {
-        let legacy_code_hash = CodeHash::new(*code_hash_bytes);
-        let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
-
-        // Send a GetRequest for each storage key we want to migrate.
-        // rooms_data is the original and gates the migration; outbound_dms
-        // (#256) is mirrored so a delegate rebuild doesn't orphan the
-        // sender's own DM plaintext.
-        let storage_keys: [&[u8]; 2] = [ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY];
-        for storage_key in storage_keys {
-            let request = ChatDelegateRequestMsg::GetRequest {
-                key: ChatDelegateKey::new(storage_key.to_vec()),
-            };
-
-            let mut payload = Vec::new();
-            if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
-                error!(
-                    "Failed to serialize legacy migration request #{} for key {:?}: {}",
-                    i,
-                    String::from_utf8_lossy(storage_key),
-                    e
-                );
-                continue;
-            }
-
-            let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
-
-            let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
-                key: legacy_delegate_key.clone(),
-                params: Parameters::from(Vec::<u8>::new()),
-                inbound: vec![
-                    freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg),
-                ],
-            });
-
-            let api_result = {
-                let mut web_api = WEB_API.write();
-                if let Some(api) = web_api.as_mut() {
-                    api.send(delegate_request).await
-                } else {
-                    Err(freenet_stdlib::client_api::Error::ConnectionClosed)
-                }
-            };
-
-            match api_result {
-                Ok(_) => {
-                    any_dispatched = true;
-                    info!(
-                        "Legacy migration request #{} sent for key {:?}",
-                        i,
-                        String::from_utf8_lossy(storage_key)
-                    );
-                }
-                Err(e) => {
-                    // A send that RETURNS Err is a transport failure (connection
-                    // closed), NOT "delegate not present". Mark it (P1) — but only
-                    // for the current attempt (P2#1), so a stale probe can't
-                    // pollute a reconnect's fresh load.
-                    info!(
-                        "Legacy migration request #{} for key {:?} failed to send \
-                         (transport): {}",
-                        i,
-                        String::from_utf8_lossy(storage_key),
-                        e
-                    );
-                    mark_fetch_failure_if_current(attempt);
-                }
-            }
-        }
-
-        // Per-room keys (room:<vk>, rooms_meta) are DYNAMIC, so the fixed
-        // GetRequests above can't discover them. Probe the legacy delegate's key
-        // index with a ListRequest; the ListResponse (is_legacy) is routed in
-        // response_handler.rs to a per-room migration that reconstructs those
-        // slots from THIS legacy delegate and re-saves them to the current one
-        // (freenet/river#345 / #65). Without this, the NEXT delegate-WASM bump
-        // after per-room storage ships would strand every room under the old key.
-        // Fire-and-forget (not awaited): a ListResponse only arrives if the
-        // legacy delegate is present, so an absent delegate costs nothing rather
-        // than a 10s per-delegate timeout for fresh users.
-        let list_request = ChatDelegateRequestMsg::ListRequest;
-        let mut list_payload = Vec::new();
-        if let Err(e) = ciborium::ser::into_writer(&list_request, &mut list_payload) {
-            error!("Failed to serialize legacy ListRequest #{i}: {e}");
-            continue;
-        }
-        let list_app_msg = freenet_stdlib::prelude::ApplicationMessage::new(list_payload);
-        let list_delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
-            key: legacy_delegate_key.clone(),
-            params: Parameters::from(Vec::<u8>::new()),
-            inbound: vec![
-                freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(list_app_msg),
-            ],
-        });
-        let list_result = {
-            let mut web_api = WEB_API.write();
-            if let Some(api) = web_api.as_mut() {
-                api.send(list_delegate_request).await
-            } else {
-                Err(freenet_stdlib::client_api::Error::ConnectionClosed)
-            }
-        };
-        match list_result {
-            Ok(_) => {
-                any_dispatched = true;
-                info!("Legacy ListRequest #{i} sent for per-room key discovery");
-            }
-            Err(e) => {
-                // Transport failure on the ListRequest send → mark it (P1),
-                // current-attempt only (P2#1) via the uniform helper (review 11).
-                info!("Legacy ListRequest #{i} failed to send (transport): {e}");
-                mark_fetch_failure_if_current(attempt);
-            }
+    for &i in &first {
+        if send_sweep_generation(i, attempt, wave).await.dispatched {
+            any_dispatched = true;
         }
     }
 
@@ -11129,11 +11753,83 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // for a probe that never left. Reset it so a reconnect re-probes. Keep it set
     // when at least one probe dispatched (a genuine new user whose node has no
     // legacy delegate simply gets no response — do NOT re-probe-spam that case).
-    // Gated on still-current (P2#1): a stale probe must not reopen the guard for
-    // the new attempt (whose own probe already ran / set it).
-    if !any_dispatched && load_attempt_is_current(attempt) {
-        LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+    // A stale probe must not reopen the guard for a new attempt whose own probe
+    // already ran (P2#1): the reset is gated on this being the latest sweep,
+    // since a new attempt's probe starts a newer one (freenet/river#809). It
+    // costs no re-arm: the probe never went out, so this is not a re-probe.
+    if !any_dispatched {
+        if SWEEP_EPOCH.load(Ordering::Relaxed) == epoch {
+            LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+            SWEEP_RUNNING_FOR.store(0, Ordering::Relaxed);
+        }
+        disarm_sweep_wave(wave);
+        return true;
     }
+
+    let rest: Vec<Vec<usize>> = waves.collect();
+    if rest.is_empty() || !load_attempt_is_current(attempt) {
+        // Done; or a reconnect began a new attempt during the first wave, so
+        // that attempt sweeps instead (no task: its worker would hold the NEW
+        // attempt's load open).
+        disarm_sweep_wave(wave);
+        stop_sweep(epoch, !load_attempt_is_current(attempt));
+        return true;
+    }
+    // Taken here, before returning, so the load's idle timer cannot arm
+    // between this return and the task's first poll.
+    let worker = LoadWorkerGuard::new();
+    crate::util::safe_spawn_local(async move {
+        let _worker = worker;
+        let mut wave = wave;
+        for generations in rest {
+            await_sweep_wave(wave).await;
+            disarm_sweep_wave(wave);
+            match sweep_continuation(
+                SWEEP_EPOCH.load(Ordering::Relaxed) == epoch,
+                load_attempt_is_current(attempt),
+            ) {
+                SweepNext::Continue => {}
+                SweepNext::Superseded => return,
+                SweepNext::Rearm => {
+                    // A reconnect or Retry began a new load attempt. Its
+                    // requests go out on a new connection, and this sweep's
+                    // last wave may have gone down with the old one, so the
+                    // new attempt may sweep again if its load reaches the
+                    // sweep (the journaled walk asks the generations too).
+                    stop_sweep(epoch, true);
+                    return;
+                }
+            }
+            wave = arm_sweep_wave();
+            let mut failed = false;
+            for &i in &generations {
+                if sweep_continuation(
+                    SWEEP_EPOCH.load(Ordering::Relaxed) == epoch,
+                    load_attempt_is_current(attempt),
+                ) != SweepNext::Continue
+                {
+                    // Superseded, or the attempt changed, mid-wave: send no
+                    // more of it (the stop after the loop or at the next
+                    // wave decides the rest).
+                    break;
+                }
+                failed |= send_sweep_generation(i, attempt, wave).await.failed;
+            }
+            if failed {
+                // The connection dropped mid-sweep: let the next load attempt
+                // sweep again rather than skip the generations not yet asked.
+                disarm_sweep_wave(wave);
+                stop_sweep(epoch, true);
+                return;
+            }
+        }
+        // The last wave has no next wave to notice an attempt change, so it
+        // is awaited here too, and the end re-arms if the attempt changed
+        // while it was out (its replies may have gone down with the socket).
+        await_sweep_wave(wave).await;
+        disarm_sweep_wave(wave);
+        stop_sweep(epoch, !load_attempt_is_current(attempt));
+    });
 
     // The `freenet-migrate` walk is no longer armed from here: it runs on EVERY
     // load while the migration journal is incomplete
@@ -11141,4 +11837,267 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // (freenet/river#763). Every merge this sweep's responses make is gated by
     // the journal (`migration_journal::gate_sweep_import`).
     true
+}
+
+/// Bumped by every sweep that starts; a pacing sweep whose epoch is no longer
+/// the latest stops at its next wave (freenet/river#809).
+static SWEEP_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// `attempt + 1` of the load attempt whose sweep is still pacing its later
+/// waves; 0 when none is.
+static SWEEP_RUNNING_FOR: AtomicU32 = AtomicU32::new(0);
+
+/// Whether a sweep may start now. `already`: the once-per-session guard was
+/// set; `running_for`: [`SWEEP_RUNNING_FOR`]. A sweep still pacing for an
+/// earlier attempt does not count as this session's sweep: it stops at its
+/// next wave, and this attempt sweeps from the start. Pure.
+pub(crate) fn sweep_start(already: bool, running_for: u32, attempt: u32) -> SweepStart {
+    if running_for == attempt.wrapping_add(1) {
+        // This attempt's own sweep is pacing: it asks every generation, even
+        // if a recovery or Retry cleared the guard meanwhile.
+        SweepStart::Refuse
+    } else if !already {
+        SweepStart::Fresh
+    } else if running_for != 0 {
+        SweepStart::OverEarlier
+    } else {
+        SweepStart::Refuse
+    }
+}
+
+/// Whether a sweep may start, from [`sweep_start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepStart {
+    /// The guard was clear: the session's sweep, or one a Retry or recovery
+    /// allowed.
+    Fresh,
+    /// An earlier attempt's sweep is still pacing: it stops at its next
+    /// wave, and this one starts over, if a re-arm is left.
+    OverEarlier,
+    /// Already swept this session, or this attempt's own sweep is pacing.
+    Refuse,
+}
+
+/// Take one of this session's [`MAX_SWEEP_REARMS`]; false when none is left.
+fn take_sweep_rearm() -> bool {
+    SWEEP_REARMS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            (used < MAX_SWEEP_REARMS).then_some(used + 1)
+        })
+        .is_ok()
+}
+
+/// How many re-sweeps a session allows: a stopped sweep clearing the
+/// once-per-session guard, or a new attempt starting over an earlier
+/// attempt's pacing sweep, each take one. Bounds the re-probes a run of
+/// reconnects during the sweep's pacing (or a socket the sweep keeps
+/// dropping) could otherwise cause. A Retry and the interrupted-migration
+/// recovery clear the guard themselves and take none.
+const MAX_SWEEP_REARMS: u32 = 2;
+static SWEEP_REARMS: AtomicU32 = AtomicU32::new(0);
+
+/// What stopping a sweep does to the shared state: `(clear the running
+/// marker, try to clear the once-per-session guard)`. Only the latest sweep
+/// touches either, and only a re-arm of a guard that is still set tries
+/// (a Retry may have cleared it already; that must not spend a re-arm). Pure.
+pub(crate) fn sweep_stop_effects(latest: bool, rearm: bool, guard_set: bool) -> (bool, bool) {
+    if !latest {
+        return (false, false);
+    }
+    (true, rearm && guard_set)
+}
+
+/// Stop sweep `epoch`: apply [`sweep_stop_effects`], the guard clear only
+/// while a re-arm is left.
+fn stop_sweep(epoch: u64, rearm: bool) {
+    let latest = SWEEP_EPOCH.load(Ordering::Relaxed) == epoch;
+    let (clear_running, try_clear_guard) = sweep_stop_effects(
+        latest,
+        rearm,
+        LEGACY_MIGRATION_ATTEMPTED.load(Ordering::Relaxed),
+    );
+    if clear_running {
+        SWEEP_RUNNING_FOR.store(0, Ordering::Relaxed);
+    }
+    if try_clear_guard && take_sweep_rearm() {
+        LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+    }
+}
+
+/// What a pacing sweep does before its next wave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepNext {
+    /// Send it.
+    Continue,
+    /// A newer sweep started, and it asks every generation: stop, and leave
+    /// the once-per-session guard to it.
+    Superseded,
+    /// The load attempt changed and no newer sweep has started: stop, and
+    /// clear the guard so the new attempt sweeps.
+    Rearm,
+}
+
+/// Decide [`SweepNext`] from whether this sweep is still the latest and its
+/// load attempt still current. Pure.
+pub(crate) fn sweep_continuation(latest: bool, attempt_current: bool) -> SweepNext {
+    match (latest, attempt_current) {
+        (false, _) => SweepNext::Superseded,
+        (true, false) => SweepNext::Rearm,
+        (true, true) => SweepNext::Continue,
+    }
+}
+
+/// The sweep's waves: generation indexes, newest first, at most
+/// [`SWEEP_WAVE_GENERATIONS`] per wave, every generation exactly once. Pure.
+pub(crate) fn sweep_wave_plan(generations: usize) -> Vec<Vec<usize>> {
+    let newest_first: Vec<usize> = (0..generations).rev().collect();
+    newest_first
+        .chunks(SWEEP_WAVE_GENERATIONS)
+        .map(<[usize]>::to_vec)
+        .collect()
+}
+
+/// What sending one generation's sweep requests did.
+#[derive(Default, Clone, Copy)]
+struct SweepSent {
+    /// At least one request went out.
+    dispatched: bool,
+    /// At least one send failed in transport (the connection is down).
+    failed: bool,
+}
+
+/// Send legacy generation `i` its three sweep requests (the `rooms_data` and
+/// `outbound_dms` GETs and the `ListRequest`), each expected by sweep wave
+/// `wave`. Fire-and-forget: replies are routed by the response handler.
+async fn send_sweep_generation(i: usize, attempt: u32, wave: u64) -> SweepSent {
+    let mut sent = SweepSent::default();
+    let (key_bytes, code_hash_bytes) = &LEGACY_DELEGATES[i];
+    let legacy_code_hash = CodeHash::new(*code_hash_bytes);
+    let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
+
+    // Send a GetRequest for each storage key we want to migrate.
+    // rooms_data is the original and gates the migration; outbound_dms
+    // (#256) is mirrored so a delegate rebuild doesn't orphan the
+    // sender's own DM plaintext.
+    let storage_keys: [&[u8]; 2] = [ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY];
+    for storage_key in storage_keys {
+        let request = ChatDelegateRequestMsg::GetRequest {
+            key: ChatDelegateKey::new(storage_key.to_vec()),
+        };
+
+        let mut payload = Vec::new();
+        if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
+            error!(
+                "Failed to serialize legacy migration request #{} for key {:?}: {}",
+                i,
+                String::from_utf8_lossy(storage_key),
+                e
+            );
+            continue;
+        }
+
+        let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
+
+        let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+            key: legacy_delegate_key.clone(),
+            params: Parameters::from(Vec::<u8>::new()),
+            inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
+        });
+
+        let api_result = {
+            let mut web_api = WEB_API.write();
+            if let Some(api) = web_api.as_mut() {
+                api.send(delegate_request).await
+            } else {
+                Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+            }
+        };
+
+        match api_result {
+            Ok(_) => {
+                sent.dispatched = true;
+                expect_sweep_answer(wave, key_bytes);
+                info!(
+                    "Legacy migration request #{} sent for key {:?}",
+                    i,
+                    String::from_utf8_lossy(storage_key)
+                );
+            }
+            Err(e) => {
+                // A send that RETURNS Err is a transport failure (connection
+                // closed), NOT "delegate not present". Mark it (P1) — but only
+                // for the current attempt (P2#1), so a stale probe can't
+                // pollute a reconnect's fresh load.
+                info!(
+                    "Legacy migration request #{} for key {:?} failed to send \
+                 (transport): {}",
+                    i,
+                    String::from_utf8_lossy(storage_key),
+                    e
+                );
+                sent.failed = true;
+                mark_fetch_failure_if_current(attempt);
+            }
+        }
+    }
+
+    // Per-room keys (room:<vk>, rooms_meta) are DYNAMIC, so the fixed
+    // GetRequests above can't discover them. Probe the legacy delegate's key
+    // index with a ListRequest; the ListResponse (is_legacy) is routed in
+    // response_handler.rs to a per-room migration that reconstructs those
+    // slots from THIS legacy delegate and re-saves them to the current one
+    // (freenet/river#345 / #65). Without this, the NEXT delegate-WASM bump
+    // after per-room storage ships would strand every room under the old key.
+    // Fire-and-forget (no waiter): a ListResponse only arrives if the legacy
+    // delegate is present, so an absent delegate costs nothing rather than a
+    // 10s per-delegate timeout for fresh users. Its reply or error only paces
+    // the next sweep wave.
+    let list_request = ChatDelegateRequestMsg::ListRequest;
+    let mut list_payload = Vec::new();
+    if let Err(e) = ciborium::ser::into_writer(&list_request, &mut list_payload) {
+        error!("Failed to serialize legacy ListRequest #{i}: {e}");
+        return sent;
+    }
+    let list_app_msg = freenet_stdlib::prelude::ApplicationMessage::new(list_payload);
+    let list_delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+        key: legacy_delegate_key.clone(),
+        params: Parameters::from(Vec::<u8>::new()),
+        inbound: vec![
+            freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(list_app_msg),
+        ],
+    });
+    let list_result = {
+        let mut web_api = WEB_API.write();
+        if let Some(api) = web_api.as_mut() {
+            api.send(list_delegate_request).await
+        } else {
+            Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+        }
+    };
+    match list_result {
+        Ok(_) => {
+            sent.dispatched = true;
+            expect_sweep_answer(wave, key_bytes);
+            info!("Legacy ListRequest #{i} sent for per-room key discovery");
+        }
+        Err(e) => {
+            // Transport failure on the ListRequest send → mark it (P1),
+            // current-attempt only (P2#1) via the uniform helper (review 11).
+            info!("Legacy ListRequest #{i} failed to send (transport): {e}");
+            sent.failed = true;
+            mark_fetch_failure_if_current(attempt);
+        }
+    }
+    sent
+}
+
+/// Wait until sweep wave `wave` is answered, or [`SWEEP_WAVE_WAIT_MS`]. Silence
+/// concludes nothing here: the sweep never treated a missing answer as
+/// absence, and the journaled walk asks again.
+async fn await_sweep_wave(wave: u64) {
+    if let Some(answered) = seal_sweep_wave(wave) {
+        let timeout = Box::pin(crate::util::sleep(std::time::Duration::from_millis(
+            SWEEP_WAVE_WAIT_MS,
+        )));
+        let _ = select(answered, timeout).await;
+    }
 }

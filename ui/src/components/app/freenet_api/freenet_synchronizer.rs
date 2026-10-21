@@ -427,6 +427,12 @@ impl FreenetSynchronizer {
                                 // Clear the web API so is_connected() returns false
                                 WEB_API.write().take();
                                 *SYNC_STATUS.write() = SynchronizerStatus::Disconnected;
+                                // No generation reload until the reconnect has
+                                // caught up, and keep the update banner honest
+                                // about it (freenet/river#580). Only here, where
+                                // the connection is actually torn down: a
+                                // coalesced duplicate loss changes nothing.
+                                super::generation_watch::on_disconnected();
                                 warn!(
                                     "Connection lost (attempt {}), reconnecting in {}ms",
                                     reconnect.attempt(),
@@ -499,6 +505,7 @@ impl FreenetSynchronizer {
                             // First verify connection with ProcessRooms, then refresh all rooms to
                             // catch any updates that arrived while the page was hidden/PC was suspended.
                             info!("Connection appears active, refreshing all rooms to catch missed updates");
+                            super::generation_watch::on_page_visible();
                             if let Err(e) =
                                 message_tx.unbounded_send(SynchronizerMessage::RefreshAllRooms)
                             {
@@ -561,6 +568,19 @@ impl FreenetSynchronizer {
                         }
                     }
                     SynchronizerMessage::Connect => {
+                        // A generation reload is under way (freenet/river#580):
+                        // the shell is closing this document's sockets and
+                        // replacing it. A socket opened now would outlive the
+                        // page in the shell, under an id the next page reuses.
+                        if super::generation_watch::is_reloading() {
+                            info!("Reload under way; not reconnecting");
+                            // Still clear the latch: if the reload never
+                            // happens, the next loss must be able to arm a
+                            // reconnect (generation_watch also re-sends a
+                            // Connect when it gives up).
+                            reconnect.note_connect_attempt();
+                            continue;
+                        }
                         // A reconnect (or the first connect) is now being
                         // attempted; clear the pending latch so the next loss can
                         // arm a fresh reconnect. A redundant Connect — from
@@ -581,8 +601,16 @@ impl FreenetSynchronizer {
                         reconnect.note_connect_attempt();
                         if connection_manager.is_connected() && WEB_API.read().is_some() {
                             info!("Connect ignored — already connected");
+                            // The connect that made this connection has
+                            // finished (this loop handles one message at a
+                            // time), so the page is caught up (#580).
+                            super::generation_watch::mark_ready();
                             continue;
                         }
+                        // This replaces whatever socket there is and catches up
+                        // again, even with no loss before it (the status can
+                        // read Error on a live socket): not ready until done.
+                        super::generation_watch::on_disconnected();
                         info!("Connecting to Freenet");
                         match connection_manager
                             .initialize_connection(message_tx.clone())
@@ -721,12 +749,19 @@ impl FreenetSynchronizer {
                                     } else {
                                         info!("Successfully processed rooms after connection");
                                     }
+
+                                    // Watch River's pointer records so a re-key while
+                                    // this tab is open reloads it (freenet/river#580).
+                                    // A subscription does not survive a reconnect, so
+                                    // this re-subscribes every time.
+                                    super::generation_watch::on_connected();
                                 } else {
                                     error!("API not available after successful connection");
                                 }
                             }
                             Err(e) => {
                                 error!("Failed to initialize connection: {}", e);
+                                super::generation_watch::on_disconnected();
                                 let armed = reconnect.on_connect_failed();
                                 warn!(
                                     "Connection failed (attempt {}), reconnecting in {}ms",
@@ -825,6 +860,9 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
+                                crate::components::app::chat_delegate::note_sweep_error(
+                                    &e.to_string(),
+                                );
 
                                 let current = current_delegate_key();
                                 if let Some(key) = e.register_failed_key() {

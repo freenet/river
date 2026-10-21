@@ -6,6 +6,12 @@
 # freenet-core#5194 and the contract's README:
 # https://github.com/freenet/freenet-migrate/tree/main/contracts/pointer-contract
 #
+# River's own UI reads these too: an open tab watches both records and reloads
+# when one names a newer generation than the build it is running
+# (freenet/river#580). So an unpublished record strands our own users' open
+# tabs as well as third parties. The UI build also reads `version` and
+# `code_hash` from this file (ui/build.rs) to know which generation it is.
+#
 # This solves ADDRESSING ONLY. It says nothing about whether state or secrets
 # under the old key survived — see the note under [[record]] for the delegate.
 #
@@ -68,17 +74,17 @@ wasm_path = "ui/public/contracts/room_contract.wasm"
 # (author_verifying_key ‖ app_id); recorded here so a human can check it and
 # so the gate can catch a derivation that has drifted.
 pointer_key = "Ai4VLoC2jGdhpcB2UU8VPo3efUoxjm1Ju9VKXqRC63Az"
-version = 4
-code_hash = "eb2222c3f584231ee6f010b2802eae10d70f6bb0b6e48e2aa56be1cdef8b5396"
-state = "00000004eb2222c3f584231ee6f010b2802eae10d70f6bb0b6e48e2aa56be1cdef8b539643276b28bdb5617fe3c20ecfc901e1244b97140a66d823cb91c1d90442d9b81c929bdb939e1d3e14fab5fdfd3fe6cc78ae9bb1aff7f91bce86617b6963da5402"
+version = 7
+code_hash = "fa9e59e87532bc9681e8fef903f6d35a1207c25a0f0d8cca2c92e2f31761a4f9"
+state = "00000007fa9e59e87532bc9681e8fef903f6d35a1207c25a0f0d8cca2c92e2f31761a4f9b216297f9293599742ce10f8f408227d233183511b096448472155d0dbf6ae414a5ff844091a2d1d32769649a383d0ada6af3ce57c422829acdb826d601c3d05"
 
 [[record]]
 app_id = "river.chat-delegate"
 wasm_path = "ui/public/contracts/chat_delegate.wasm"
 pointer_key = "6qF2H5JRPBxbKC45UtPnzdDzyfsejYFW1UwDLGDU66mu"
-version = 5
-code_hash = "49a3122b2de64a62d56a2254518277d6ed8247faf3abb5325e722587a03b2ee5"
-state = "0000000549a3122b2de64a62d56a2254518277d6ed8247faf3abb5325e722587a03b2ee5285a94a7cd301e8d99d09fd671dcb5d255facfbc71c66f31c934ef488d5a23379d2b32596232da883fdba72972a4c515b648eb74e02e252c0d1eebcd3d32ce02"
+version = 8
+code_hash = "da47cbd9e5264828b80d229a292e23e05951737844cd289c8f53e99bf55e0848"
+state = "00000008da47cbd9e5264828b80d229a292e23e05951737844cd289c8f53e99bf55e0848d37f9d85ab1a724e42c7926de2609a35e9781e33d1c4ba12175e1015647978bd769a7f747872a4aca0783d0675e3b5f6aaf8000895e211953d8c49b570772b09"
 # SCOPE, and it matters most here. Resolving this pointer correctly tells you
 # the delegate's current key. It does NOT tell you that the user's secrets came
 # with it: delegate secrets only move when River's own UI has run on that user's

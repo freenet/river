@@ -5,11 +5,16 @@
 //! `ComposableState` convergence assumes `merge` is a join: state grows
 //! monotonically toward a least upper bound, so `delta` eventually returns
 //! `None` and the fan-out stops. Two collections in `ChatRoomStateV1` break
-//! that assumption by REMOVING entries during `apply_delta`:
+//! that assumption by REMOVING entries when a room delta is applied
+//! (`ChatRoomStateV1::post_apply_cleanup` applies the caps, after every field
+//! has been applied):
 //!
 //! * `MessagesV1` drops the oldest messages over `max_recent_messages`.
 //! * `DirectMessagesV1` caps each ordered `(sender, recipient)` pair at
 //!   `MAX_DM_MESSAGES_PER_PAIR`.
+//!
+//! The caps are ROOM rules, so the tests below that depend on them apply
+//! their deltas to a whole `ChatRoomStateV1`, never to the field alone.
 //!
 //! Before the fix, `delta` was a pure "everything you don't have"
 //! set-difference, so a peer whose retained window differed from its
@@ -38,7 +43,7 @@ use river_core::room_state::member::{AuthorizedMember, Member, MemberId, Members
 use river_core::room_state::message::{
     AuthorizedMessageV1, MessageV1, MessagesV1, RetentionHorizon, RoomMessageBody,
 };
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::time::{Duration, SystemTime};
 
 // ---------------------------------------------------------------------------
@@ -131,18 +136,66 @@ fn state_with_cap(r: &Room, cap: usize) -> ChatRoomStateV1 {
     }
 }
 
-/// `messages_holding`, but against an explicit parent state so the caller
-/// chooses which peer's cap normalises the result.
-fn messages_holding_under(
+/// Apply `delta` to `room` as a whole room delta: every field, then
+/// `post_apply_cleanup`, which is where the message and DM caps are applied.
+fn apply_room_delta(
+    room: &mut ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+    delta: ChatRoomStateV1Delta,
+) -> Result<(), String> {
+    // The macro's `apply_delta` ignores its outer parent (it re-reads `self`
+    // per field), so a cheap default stands in for it.
+    room.apply_delta(&ChatRoomStateV1::default(), params, &Some(delta))
+}
+
+/// The room `parent` holding the messages at the given offsets, normalised
+/// through a room-level apply (sorted, and truncated to `parent`'s
+/// `max_recent_messages` by cleanup) the way a real peer's stored state
+/// always is. The caller chooses which peer's cap normalises the result.
+fn room_holding_under(
     r: &Room,
     parent: &ChatRoomStateV1,
     offsets: impl IntoIterator<Item = u64>,
-) -> MessagesV1 {
-    let mut m = MessagesV1::default();
+) -> ChatRoomStateV1 {
+    let mut room = parent.clone();
     let delta: Vec<AuthorizedMessageV1> = offsets.into_iter().map(|s| msg_at(r, s)).collect();
-    m.apply_delta(parent, &r.params, &Some(delta))
-        .expect("fixture messages must apply");
-    m
+    apply_room_delta(
+        &mut room,
+        &r.params,
+        ChatRoomStateV1Delta {
+            recent_messages: Some(delta),
+            ..Default::default()
+        },
+    )
+    .expect("fixture messages must apply");
+    room
+}
+
+/// `room_holding_under` the fixture's own room.
+fn room_holding(r: &Room, offsets: impl IntoIterator<Item = u64>) -> ChatRoomStateV1 {
+    room_holding_under(r, &r.state, offsets)
+}
+
+/// `receiver` absorbs what `sender` offers on the messages field: the
+/// receiver's messages summary (read against its own room, so its own cap
+/// sets the horizon), the sender's messages delta against it, applied as a
+/// room delta so cleanup applies the cap. This is the field-level
+/// `ComposableState::merge` of `MessagesV1`, at room level.
+fn absorb_messages(
+    receiver: &mut ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+    sender: &ChatRoomStateV1,
+) -> Result<(), String> {
+    let summary = receiver.recent_messages.summarize(receiver, params);
+    let offered = sender.recent_messages.delta(sender, params, &summary);
+    apply_room_delta(
+        receiver,
+        params,
+        ChatRoomStateV1Delta {
+            recent_messages: offered,
+            ..Default::default()
+        },
+    )
 }
 
 /// A signed message at `BASE_SECS + secs`, with `secs` embedded in the body so
@@ -160,14 +213,10 @@ fn msg_at(r: &Room, secs: u64) -> AuthorizedMessageV1 {
 }
 
 /// `MessagesV1` holding exactly the messages at the given offsets, normalised
-/// through `apply_delta` (sorted and pruned) the way a real peer's stored state
-/// always is.
+/// through a room-level apply (sorted and pruned) the way a real peer's stored
+/// state always is.
 fn messages_holding(r: &Room, offsets: impl IntoIterator<Item = u64>) -> MessagesV1 {
-    let mut m = MessagesV1::default();
-    let delta: Vec<AuthorizedMessageV1> = offsets.into_iter().map(|s| msg_at(r, s)).collect();
-    m.apply_delta(&r.state, &r.params, &Some(delta))
-        .expect("fixture messages must apply");
-    m
+    room_holding(r, offsets).recent_messages
 }
 
 /// The offsets a `MessagesV1` currently retains, ascending.
@@ -251,16 +300,25 @@ fn sender_does_not_offer_messages_the_receiver_would_prune() {
 #[test]
 fn gossip_from_a_lagging_peer_terminates() {
     let r = room(10);
-    let mut a = messages_holding(&r, 10..20);
-    let b = messages_holding(&r, 5..15);
+    let mut a = room_holding(&r, 10..20);
+    let b = room_holding(&r, 5..15);
 
     for round in 0..10 {
-        let offered = b.delta(&r.state, &r.params, &a.summarize(&r.state, &r.params));
+        let offered =
+            b.recent_messages
+                .delta(&b, &r.params, &a.recent_messages.summarize(&a, &r.params));
         let Some(offered) = offered else {
             return;
         };
-        a.apply_delta(&r.state, &r.params, &Some(offered))
-            .unwrap_or_else(|e| panic!("round {round} apply failed: {e}"));
+        apply_room_delta(
+            &mut a,
+            &r.params,
+            ChatRoomStateV1Delta {
+                recent_messages: Some(offered),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("round {round} apply failed: {e}"));
     }
     panic!(
         "B was still offering payloads to A after 10 rounds — B never learns A \
@@ -279,19 +337,19 @@ fn gossip_from_a_lagging_peer_terminates() {
 #[test]
 fn offset_windows_converge_to_the_newest_messages() {
     let r = room(10);
-    let mut a = messages_holding(&r, 10..20);
-    let mut b = messages_holding(&r, 5..15);
+    let mut a = room_holding(&r, 10..20);
+    let mut b = room_holding(&r, 5..15);
 
-    a.merge(&r.state, &r.params, &b).expect("a.merge(b)");
-    b.merge(&r.state, &r.params, &a).expect("b.merge(a)");
+    absorb_messages(&mut a, &r.params, &b).expect("a absorbs b");
+    absorb_messages(&mut b, &r.params, &a).expect("b absorbs a");
 
     assert_eq!(
-        held(&a),
-        held(&b),
+        held(&a.recent_messages),
+        held(&b.recent_messages),
         "both peers must converge on the same window"
     );
     assert_eq!(
-        held(&a),
+        held(&a.recent_messages),
         (10..20).collect::<Vec<_>>(),
         "the converged window is the newest `max_recent_messages`"
     );
@@ -304,33 +362,44 @@ fn offset_windows_converge_to_the_newest_messages() {
 #[test]
 fn horizon_advances_when_an_accepted_message_displaces_the_oldest() {
     let r = room(5);
-    let a = messages_holding(&r, [10, 11, 12, 13, 14]);
+    let a = room_holding(&r, [10, 11, 12, 13, 14]);
     // B overlaps A but also holds one strictly older message (8) and, below,
     // gains one strictly newer (20).
-    let b = messages_holding(&r, [8, 10, 11, 12, 13]);
+    let b = room_holding(&r, [8, 10, 11, 12, 13]);
 
     let mut a_after = a.clone();
-    a_after.merge(&r.state, &r.params, &b).expect("a.merge(b)");
+    absorb_messages(&mut a_after, &r.params, &b).expect("a absorbs b");
     assert_eq!(
-        held(&a_after),
-        held(&a),
+        held(&a_after.recent_messages),
+        held(&a.recent_messages),
         "B's only unseen message (8) is below A's horizon, so nothing changes"
     );
 
     let mut b2 = b.clone();
-    b2.apply_delta(&r.state, &r.params, &Some(vec![msg_at(&r, 20)]))
-        .expect("b2 gains a newer message");
+    apply_room_delta(
+        &mut b2,
+        &r.params,
+        ChatRoomStateV1Delta {
+            recent_messages: Some(vec![msg_at(&r, 20)]),
+            ..Default::default()
+        },
+    )
+    .expect("b2 gains a newer message");
 
     let mut a2 = a.clone();
-    a2.merge(&r.state, &r.params, &b2).expect("a.merge(b2)");
+    absorb_messages(&mut a2, &r.params, &b2).expect("a absorbs b2");
     assert_eq!(
-        held(&a2),
+        held(&a2.recent_messages),
         vec![11, 12, 13, 14, 20],
         "A accepts the newer message and drops its own oldest"
     );
 
     assert_eq!(
-        b2.delta(&r.state, &r.params, &a2.summarize(&r.state, &r.params)),
+        b2.recent_messages.delta(
+            &b2,
+            &r.params,
+            &a2.recent_messages.summarize(&a2, &r.params)
+        ),
         None,
         "after displacing A's oldest, B must not re-offer the message A just dropped"
     );
@@ -342,21 +411,22 @@ fn horizon_advances_when_an_accepted_message_displaces_the_oldest() {
 #[test]
 fn a_peer_below_capacity_still_receives_older_messages() {
     let r = room(10);
-    let mut late_joiner = messages_holding(&r, [18, 19]);
-    let established = messages_holding(&r, 10..20);
+    let mut late_joiner = room_holding(&r, [18, 19]);
+    let established = room_holding(&r, 10..20);
 
     assert_eq!(
-        late_joiner.summarize(&r.state, &r.params).horizon,
+        late_joiner
+            .recent_messages
+            .summarize(&late_joiner, &r.params)
+            .horizon,
         RetentionHorizon::Open,
         "test premise: a peer holding 2 of 10 must advertise an open horizon"
     );
 
-    late_joiner
-        .merge(&r.state, &r.params, &established)
-        .expect("merge");
+    absorb_messages(&mut late_joiner, &r.params, &established).expect("merge");
 
     assert_eq!(
-        held(&late_joiner),
+        held(&late_joiner.recent_messages),
         (10..20).collect::<Vec<_>>(),
         "a peer with spare capacity must back-fill the full window"
     );
@@ -368,25 +438,25 @@ fn a_peer_below_capacity_still_receives_older_messages() {
 #[test]
 fn apply_delta_is_idempotent() {
     let r = room(5);
-    let mut m = messages_holding(&r, [10, 11, 12]);
-    let delta: Vec<AuthorizedMessageV1> =
-        [8, 9, 13, 14, 15].iter().map(|s| msg_at(&r, *s)).collect();
+    let mut m = room_holding(&r, [10, 11, 12]);
+    let delta = ChatRoomStateV1Delta {
+        recent_messages: Some([8, 9, 13, 14, 15].iter().map(|s| msg_at(&r, *s)).collect()),
+        ..Default::default()
+    };
 
-    m.apply_delta(&r.state, &r.params, &Some(delta.clone()))
-        .expect("first apply");
+    apply_room_delta(&mut m, &r.params, delta.clone()).expect("first apply");
     let once = m.clone();
-    m.apply_delta(&r.state, &r.params, &Some(delta))
-        .expect("second apply");
+    apply_room_delta(&mut m, &r.params, delta).expect("second apply");
 
     assert_eq!(
-        held(&m),
-        held(&once),
+        held(&m.recent_messages),
+        held(&once.recent_messages),
         "re-applying an identical delta must not change the retained window"
     );
 }
 
-/// `AuthorizedConfigurationV1::apply_delta` rejects a zero cap, but `verify`
-/// does not, so a zero can still reach a peer on the full-state path. It must
+/// A configuration with a zero cap ranks below every valid one, but `verify`
+/// accepts it, so a zero can still be held after a full-state PUT. It must
 /// suppress the delta rather than panic or loop.
 #[test]
 fn zero_cap_suppresses_the_delta_instead_of_looping() {
@@ -483,41 +553,41 @@ fn asymmetric_caps_terminate_in_both_directions() {
 
     // The small peer holds a newer slice; the large peer holds a wider, older
     // one. They overlap but neither contains the other.
-    let mut small = messages_holding_under(&r, &small_parent, 150..260);
-    let mut large = messages_holding_under(&r, &large_parent, 0..200);
+    // Each peer's room carries its own cap, so a room-level apply into it
+    // truncates to that cap.
+    let mut small = room_holding_under(&r, &small_parent, 150..260);
+    let mut large = room_holding_under(&r, &large_parent, 0..200);
 
     assert_eq!(
-        held(&small).len(),
+        held(&small.recent_messages).len(),
         50,
         "test premise: the 50-cap peer must be AT capacity"
     );
     assert_eq!(
-        held(&large).len(),
+        held(&large.recent_messages).len(),
         200,
         "test premise: the 200-cap peer must be AT capacity too"
     );
 
     // --- direction 1: large -> small (the small peer must not be flooded) ---
-    let before_small = held(&small);
-    small
-        .merge(&small_parent, &r.params, &large)
-        .expect("small.merge(large)");
+    let before_small = held(&small.recent_messages);
+    absorb_messages(&mut small, &r.params, &large).expect("small absorbs large");
     assert_eq!(
-        held(&small).len(),
+        held(&small.recent_messages).len(),
         50,
         "the 50-cap peer must still hold exactly 50 after merging a 200-message peer"
     );
     assert_eq!(
-        held(&small),
+        held(&small.recent_messages),
         before_small,
         "everything the 200-cap peer holds that the 50-cap peer lacks is OLDER \
          than its window, so nothing should have changed"
     );
     assert_eq!(
-        large.delta(
-            &small_parent,
+        large.recent_messages.delta(
+            &large,
             &r.params,
-            &small.summarize(&small_parent, &r.params)
+            &small.recent_messages.summarize(&small, &r.params)
         ),
         None,
         "the 200-cap peer still had a payload for the 50-cap peer — this is the \
@@ -525,9 +595,7 @@ fn asymmetric_caps_terminate_in_both_directions() {
     );
 
     // --- direction 2: small -> large (the large peer must back-fill) ---
-    large
-        .merge(&large_parent, &r.params, &small)
-        .expect("large.merge(small)");
+    absorb_messages(&mut large, &r.params, &small).expect("large absorbs small");
     // The union is 250 distinct messages, NOT a contiguous run: the large peer
     // holds 0..=199 and the small peer 210..=259, with nothing at 200..=209
     // (the small peer's own cap already pruned those away). So the newest 200
@@ -539,16 +607,16 @@ fn asymmetric_caps_terminate_in_both_directions() {
         "sanity: the oracle must be exactly the cap"
     );
     assert_eq!(
-        held(&large),
+        held(&large.recent_messages),
         expected,
         "the 200-cap peer must absorb the 50-cap peer's newer messages and keep \
          the newest 200 of the union"
     );
     assert_eq!(
-        small.delta(
-            &large_parent,
+        small.recent_messages.delta(
+            &small,
             &r.params,
-            &large.summarize(&large_parent, &r.params)
+            &large.recent_messages.summarize(&large, &r.params)
         ),
         None,
         "the 50-cap peer still had a payload for the 200-cap peer"
@@ -755,19 +823,48 @@ fn dm_at(r: &Room, timestamp: u64, tag: u8) -> AuthorizedDirectMessage {
     .expect("sign dm")
 }
 
-/// `DirectMessagesV1` holding the given DMs, normalised through `apply_delta`.
-fn dms_holding(r: &Room, msgs: Vec<AuthorizedDirectMessage>) -> DirectMessagesV1 {
-    let mut d = DirectMessagesV1::default();
-    d.apply_delta(
-        &r.state,
+/// The fixture's room holding the given DMs, normalised through a room-level
+/// apply (cleanup applies the per-pair cap).
+fn dm_room_holding(r: &Room, msgs: Vec<AuthorizedDirectMessage>) -> ChatRoomStateV1 {
+    let mut room = r.state.clone();
+    apply_room_delta(
+        &mut room,
         &r.params,
-        &Some(DirectMessagesDelta {
-            new_messages: msgs,
-            advanced_purges: vec![],
-        }),
+        ChatRoomStateV1Delta {
+            direct_messages: Some(DirectMessagesDelta {
+                new_messages: msgs,
+                advanced_purges: vec![],
+            }),
+            ..Default::default()
+        },
     )
     .expect("fixture dms must apply");
-    d
+    room
+}
+
+/// `receiver` absorbs what `sender` offers on the DM field, at room level:
+/// the DM counterpart of `absorb_messages`.
+fn absorb_dms(
+    receiver: &mut ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+    sender: &ChatRoomStateV1,
+) -> Result<(), String> {
+    let summary = receiver.direct_messages.summarize(receiver, params);
+    let offered = sender.direct_messages.delta(sender, params, &summary);
+    apply_room_delta(
+        receiver,
+        params,
+        ChatRoomStateV1Delta {
+            direct_messages: offered,
+            ..Default::default()
+        },
+    )
+}
+
+/// `DirectMessagesV1` holding the given DMs, normalised through a room-level
+/// apply.
+fn dms_holding(r: &Room, msgs: Vec<AuthorizedDirectMessage>) -> DirectMessagesV1 {
+    dm_room_holding(r, msgs).direct_messages
 }
 
 /// The DM analogue of the message loop. The per-pair cap used to be
@@ -820,7 +917,7 @@ fn sender_does_not_offer_dms_the_receiver_would_drop() {
 #[test]
 fn dm_pair_cap_keeps_the_newest_messages() {
     let r = room(100);
-    let mut d = dms_holding(
+    let mut room = dm_room_holding(
         &r,
         (0..MAX_DM_MESSAGES_PER_PAIR)
             .map(|i| dm_at(&r, 1_000 + i as u64, 1))
@@ -828,15 +925,19 @@ fn dm_pair_cap_keeps_the_newest_messages() {
     );
 
     let newcomer = dm_at(&r, 9_999, 2);
-    d.apply_delta(
-        &r.state,
+    apply_room_delta(
+        &mut room,
         &r.params,
-        &Some(DirectMessagesDelta {
-            new_messages: vec![newcomer.clone()],
-            advanced_purges: vec![],
-        }),
+        ChatRoomStateV1Delta {
+            direct_messages: Some(DirectMessagesDelta {
+                new_messages: vec![newcomer.clone()],
+                advanced_purges: vec![],
+            }),
+            ..Default::default()
+        },
     )
     .expect("apply");
+    let d = &room.direct_messages;
 
     assert_eq!(d.messages.len(), MAX_DM_MESSAGES_PER_PAIR);
     assert!(
@@ -856,13 +957,13 @@ fn dm_pair_cap_keeps_the_newest_messages() {
 #[test]
 fn dm_gossip_from_a_lagging_peer_terminates() {
     let r = room(100);
-    let mut a = dms_holding(
+    let mut a = dm_room_holding(
         &r,
         (0..MAX_DM_MESSAGES_PER_PAIR)
             .map(|i| dm_at(&r, 1_000 + i as u64, i as u8))
             .collect(),
     );
-    let b = dms_holding(
+    let b = dm_room_holding(
         &r,
         (0..MAX_DM_MESSAGES_PER_PAIR)
             .map(|i| dm_at(&r, 950 + i as u64, i as u8))
@@ -870,17 +971,22 @@ fn dm_gossip_from_a_lagging_peer_terminates() {
     );
 
     for round in 0..10 {
-        let offered = b.delta(&r.state, &r.params, &a.summarize(&r.state, &r.params));
+        let offered =
+            b.direct_messages
+                .delta(&b, &r.params, &a.direct_messages.summarize(&a, &r.params));
         let Some(offered) = offered else {
             return;
         };
-        a.apply_delta(
-            &r.state,
+        apply_room_delta(
+            &mut a,
             &r.params,
-            &Some(DirectMessagesDelta {
-                new_messages: offered.new_messages,
-                advanced_purges: offered.advanced_purges,
-            }),
+            ChatRoomStateV1Delta {
+                direct_messages: Some(DirectMessagesDelta {
+                    new_messages: offered.new_messages,
+                    advanced_purges: offered.advanced_purges,
+                }),
+                ..Default::default()
+            },
         )
         .unwrap_or_else(|e| panic!("round {round} apply failed: {e}"));
     }
@@ -894,17 +1000,17 @@ fn dm_gossip_from_a_lagging_peer_terminates() {
 #[test]
 fn dm_pair_below_cap_still_receives_older_messages() {
     let r = room(100);
-    let mut receiver = dms_holding(&r, vec![dm_at(&r, 5_000, 1)]);
-    let sender = dms_holding(
+    let mut receiver = dm_room_holding(&r, vec![dm_at(&r, 5_000, 1)]);
+    let sender = dm_room_holding(
         &r,
         (0..5)
             .map(|i| dm_at(&r, 1_000 + i as u64, i as u8))
             .collect(),
     );
 
-    receiver.merge(&r.state, &r.params, &sender).expect("merge");
+    absorb_dms(&mut receiver, &r.params, &sender).expect("merge");
     assert_eq!(
-        receiver.messages.len(),
+        receiver.direct_messages.messages.len(),
         6,
         "a pair with spare capacity must back-fill older DMs"
     );

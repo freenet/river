@@ -42,6 +42,9 @@ const TAIL_DROP_ZONE_KEY: &str = "room-reorder-tail-drop-zone";
 // the element across transitions.
 const ROOM_LIST_STATE_KEY: &str = "room-list-state";
 
+// Stable Dioxus key for the "Restoring more rooms…" note (freenet/river#802).
+const RESTORING_MORE_KEY: &str = "room-list-restoring-more";
+
 /// What the rooms rail shows in place of the room list (freenet/river#397).
 /// When the `ROOMS` map is empty during startup / migration, a bare `<ul>`
 /// rendered nothing, so a user with rooms still loading saw a blank list and
@@ -85,6 +88,62 @@ pub(crate) fn room_list_display_state(
             RoomsLoadState::LoadFailed => RoomListDisplay::LoadFailed,
         }
     }
+}
+
+/// Whether the rail shows a "Restoring more rooms…" note under a list that is
+/// already showing (freenet/river#802). Once one room has loaded the rail
+/// shows the list, so without it a partly restored list looked final while a
+/// migration was still bringing rooms back. `walk_restoring` is the journaled
+/// walk's answer ([`migration_journal::walk_may_restore_rooms`]). The sweep is
+/// `Migrating` while a load worker is still running (`workers_pending`):
+/// `Migrating` alone is not enough, because with rooms present a settling
+/// worker leaves it until the load backstop fires (or for good, when it was
+/// set after that), so a probe that set it and then found nothing would leave
+/// the note up. With no rooms the full-size
+/// `Migrating` state shows instead, so this is false there.
+///
+/// [`migration_journal::walk_may_restore_rooms`]:
+///     crate::components::app::freenet_api::migration_journal::walk_may_restore_rooms
+pub(crate) fn restoring_more_rooms(
+    load_state: RoomsLoadState,
+    workers_pending: bool,
+    room_count: usize,
+    walk_restoring: bool,
+) -> bool {
+    room_count > 0
+        && ((load_state == RoomsLoadState::Migrating && workers_pending) || walk_restoring)
+}
+
+/// [`restoring_more_rooms`] read from the live state. Reads are fallible per
+/// the signal-safety rules: anchored, and every failed read nudges, so a
+/// contended read cannot leave the rail unsubscribed and the note stuck. An
+/// unreadable signal shows no note this render (the nudge re-renders).
+fn current_restoring_more_rooms() -> bool {
+    use crate::components::app::chat_delegate::{pending_load_workers, LOAD_WORKERS_CHANGED};
+    use crate::components::app::freenet_api::migration_journal;
+    crate::util::signal_guard::anchor();
+    // The journal session and the worker count are not signals; these
+    // counters are, and are bumped when either changes.
+    if migration_journal::JOURNAL_GATE_VERSION.try_read().is_err() {
+        crate::util::signal_guard::schedule_nudge();
+    }
+    if LOAD_WORKERS_CHANGED.try_read().is_err() {
+        crate::util::signal_guard::schedule_nudge();
+    }
+    let Ok(load_state) = ROOMS_LOAD_STATE.try_read().map(|g| *g) else {
+        crate::util::signal_guard::schedule_nudge();
+        return false;
+    };
+    let Ok(room_count) = ROOMS.try_read().map(|rooms| rooms.map.len()) else {
+        crate::util::signal_guard::schedule_nudge();
+        return false;
+    };
+    restoring_more_rooms(
+        load_state,
+        pending_load_workers() > 0,
+        room_count,
+        migration_journal::current_walk_may_restore_rooms(),
+    )
 }
 
 /// Tooltip / accessible name for a room row's unread badge.
@@ -338,6 +397,7 @@ pub fn RoomList() -> Element {
     // into the rail and nowhere else, and below 768px the rail is
     // `display:none`, so mobile users saw none of them.
     let display = current_room_list_display();
+    let restoring_more = current_restoring_more_rooms();
 
     rsx! {
         aside {
@@ -419,6 +479,17 @@ pub fn RoomList() -> Element {
                         Icon { width: 14, height: 14, icon: FaPlus }
                     }
                 }
+            }
+
+            // Announces the "Restoring more rooms…" note to screen readers.
+            // Always mounted, with only its text toggled: a live region
+            // inserted together with its content is not reliably announced.
+            div {
+                class: "sr-only",
+                role: "status",
+                "aria-live": "polite",
+                "data-testid": "room-list-restoring-status",
+                if restoring_more { "Restoring more rooms…" }
             }
 
             // Room list
@@ -729,6 +800,21 @@ pub fn RoomList() -> Element {
                     }
                 }).collect::<Vec<_>>().into_iter()}
 
+                // A migration is still bringing rooms back under a list that is
+                // already showing (freenet/river#802).
+                if restoring_more {
+                    li {
+                        key: "{RESTORING_MORE_KEY}",
+                        "data-testid": "room-list-restoring-more",
+                        class: "flex items-center gap-2 px-3 py-2 text-xs text-text-muted",
+                        div {
+                            class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0",
+                            "aria-hidden": "true",
+                        }
+                        span { "Restoring more rooms…" }
+                    }
+                }
+
                 // Tail drop zone: only present mid-drag. Every row drop inserts
                 // the dragged room BEFORE its target, so the final slot would be
                 // unreachable without a dedicated end target. Shown only while a
@@ -907,6 +993,55 @@ mod tests {
                 "{state:?} with rooms must render the list"
             );
         }
+    }
+
+    /// freenet/river#802: a list that is showing while a migration still
+    /// restores rooms carries a "Restoring more rooms…" note; a settled list,
+    /// or an empty one (which shows the full Migrating state), does not.
+    #[test]
+    fn restoring_more_rooms_only_under_a_list_while_restoring() {
+        // The sweep: Migrating while a load worker runs.
+        assert!(restoring_more_rooms(
+            RoomsLoadState::Migrating,
+            true,
+            1,
+            false
+        ));
+        // A stale Migrating (every worker settled) shows nothing: with rooms
+        // present nothing resolves it, and the note must not stick.
+        assert!(!restoring_more_rooms(
+            RoomsLoadState::Migrating,
+            false,
+            1,
+            false
+        ));
+        // The walk, whatever the load state.
+        assert!(restoring_more_rooms(RoomsLoadState::Loaded, false, 3, true));
+        assert!(restoring_more_rooms(
+            RoomsLoadState::Loading,
+            false,
+            3,
+            true
+        ));
+        for state in [
+            RoomsLoadState::Loading,
+            RoomsLoadState::Loaded,
+            RoomsLoadState::LoadFailed,
+        ] {
+            for workers in [false, true] {
+                assert!(
+                    !restoring_more_rooms(state, workers, 3, false),
+                    "{state:?} workers={workers}"
+                );
+            }
+        }
+        // No rooms: the full-size Migrating state shows instead.
+        assert!(!restoring_more_rooms(
+            RoomsLoadState::Migrating,
+            true,
+            0,
+            true
+        ));
     }
 
     /// freenet/river#397 (#1 safety invariant): a genuinely-new user, once the

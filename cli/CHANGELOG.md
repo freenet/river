@@ -2,6 +2,52 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.23] - Unreleased
+
+### Changed
+- Built against river-core 0.3.0 and the new room contract (freenet/river#703).
+  Rooms migrate to the new contract automatically.
+- Room merges no longer depend on which side merges: two owner devices that
+  changed room settings at the same version now settle on one configuration,
+  and a merge that raises the message cap or bans a member keeps every message
+  the merged room has room for.
+- A room update that repeats records the room already holds, or is computed
+  against an out-of-date view of it, now applies instead of being rejected.
+- `room config` refuses a configuration the room would not take (for example
+  a zero limit, or a nickname limit over 1000 bytes) instead of reporting
+  success for an edit that does nothing.
+- `member set-nickname`, `invite accept` and `room create` refuse a nickname
+  (or room name) longer than the room's limit. The room no longer drops existing nicknames when
+  the owner lowers that limit.
+
+### Fixed
+- A DM purge made with `dm purge` is no longer lost when another device of the
+  same member purged a different DM at the same time: riverctl records its own
+  purges and, on the next read of the room, re-publishes any the room's purge
+  list is missing.
+- `debug bans` judges each ban record by its own signature. A record that
+  copies another ban's signature was reported with that ban's status
+  (freenet/river#797 follow-up). Display only: the contract already drops
+  such records.
+
+## [0.2.22] - 2026-10-16
+
+### Changed
+- Built against river-core 0.2.1 and the new room contract (freenet/river#796).
+  Rooms migrate to the new contract automatically.
+- When the ban list is over `max_user_bans`, bans that take no effect are
+  removed first, then the oldest. Owner bans and all other bans are each
+  guaranteed half the cap, rounded down (so nothing at a cap of 1), and either
+  can use slots the other leaves free.
+  Before, a list full of owner bans removed every new deputy ban as soon as it
+  was made. Now, while owner bans fill more than half the cap, each new ban
+  lifts the oldest owner ban, and the person it named can rejoin.
+- Known limit: a ban's date is set by whoever signs it, so a member who floods
+  the list with future-dated bans can still push out other members' bans, and
+  owner bans beyond the newest half of the cap. Banning that member makes their
+  bans dead, but bans already pushed out are not restored. To protect every
+  owner ban, set `max_user_bans` to at least twice the number of owner bans.
+
 ## [0.2.21] - 2026-10-15
 
 ### Changed

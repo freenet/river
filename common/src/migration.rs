@@ -123,8 +123,21 @@ mod tests {
         // converged state (freenet/river#423, PR #702): `BansV1::apply_delta`
         // rejected a WHOLE delta on the orphaned-ban rule judged against the
         // pre-update member set, which could fork a room permanently.
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 34);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "2ae50081f1b74c3a");
+        //
+        // V35 registers the generation before the `max_user_bans` cap
+        // evicted by age within owner and other pools (freenet/river#796):
+        // a list full of owner bans evicted every new deputy ban at once.
+        //
+        // V36 registers the generation before the merge-law fixes
+        // (freenet/river#703): its whole-state merge read retention horizons,
+        // its configuration summary carried only the version, and its
+        // apply_delta rejected re-delivered records.
+        //
+        // V37 registers the generation before the cleanup merge-law change:
+        // its ban cap evicted over the uncapped ban set, and its member,
+        // message and direct-message caps ran in the field applies.
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 37);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "a0133435bbd075cf");
     }
 
     #[test]

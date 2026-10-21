@@ -241,3 +241,21 @@ version = "V34"
 description = "Before bans were resolved from converged state (freenet/river#423, PR #702)"
 date = "2026-10-15"
 code_hash = "b98f49cf853c6dc09976197fa00d9f1e4d5a32c0e3d5b06e7e5969f9aa3c4acb"
+
+[[entry]]
+version = "V35"
+description = "Before the max_user_bans cap evicted by age within owner and other pools (freenet/river#796)"
+date = "2026-10-16"
+code_hash = "eb2222c3f584231ee6f010b2802eae10d70f6bb0b6e48e2aa56be1cdef8b5396"
+
+[[entry]]
+version = "V36"
+description = "Before the freenet/river#703 merge-law fixes: last generation whose whole-state merge read retention horizons, whose configuration summary carried only the version, and whose apply_delta rejected re-delivered records"
+date = "2026-10-16"
+code_hash = "057ec3ae165f54f043157e1c60fdf7a621ff86d526d80cf8e1a15f91bd271ad7"
+
+[[entry]]
+version = "V37"
+description = "Before the cleanup merge-law change: last generation whose ban cap evicted over the uncapped set and whose member, message and DM caps ran in the field applies"
+date = "2026-10-19"
+code_hash = "8bfd9bcd37db0a2b5961dfec711d47f84178a0e45bc558c234d826c698c36e05"

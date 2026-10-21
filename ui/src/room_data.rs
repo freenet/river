@@ -417,6 +417,15 @@ pub struct RoomData {
     /// queued again.
     #[serde(default)]
     pub rekey_merge: RekeyMerge,
+    /// The DM purges this device signed, per recipient id, and the winning
+    /// envelope version it last re-signed against: what
+    /// [`Self::heal_own_purges`] re-publishes when a concurrent envelope
+    /// from another device of the same member wins without them. Unioned
+    /// wherever two copies of the room merge. A tab on a build without the
+    /// field drops it on save (unknown fields are ignored), and the purges
+    /// recorded before that save are no longer re-published.
+    #[serde(default)]
+    pub own_purges: river_core::own_purges::OwnPurges,
     /// Room secrets recovered from the invitation artifact, by version.
     ///
     /// Populated once, when an invitation to a private room is accepted,
@@ -510,7 +519,126 @@ pub(crate) fn current_secret_from_state(
     Some((secret, version))
 }
 
+/// How the room's whole-state merge words its refusal of an incoming state
+/// whose configuration does not outrank the receiver's and that holds more
+/// than one delta may carry in the receiver's room (river-core's
+/// `refuse_beyond_receiver_bounds`). Pinned by the convergence tests.
+pub(crate) const LOWER_RANKED_REFUSAL: &str =
+    "under a configuration that does not outrank this room's";
+
+/// Merge `other` into `target` with the room's whole-state merge, and
+/// converge when that merge refuses `other` (its configuration does not
+/// outrank `target`'s and it holds more than one delta may carry in
+/// `target`'s room): `other` first takes `target`'s side (a copy of `other`
+/// merges `target`, adopting the outranking configuration and trimming),
+/// then that is merged in, which is where the two peers of such an exchange
+/// end. `target` is unchanged when the merge fails either way; the error is
+/// the first merge's.
+pub(crate) fn merge_converging(
+    target: &mut ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+    other: &ChatRoomStateV1,
+) -> Result<(), String> {
+    let mut merged = target.clone();
+    let first = match merged.merge_from(params, other) {
+        Ok(()) => {
+            *target = merged;
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    // Only the lower-ranked refusal converges this way; any other failure
+    // (a record no key verifies, ...) is the merge's answer.
+    if !first.contains(LOWER_RANKED_REFUSAL) {
+        return Err(first);
+    }
+    let mut other_side = other.clone();
+    other_side
+        .merge_from(params, target)
+        .map_err(|_| first.clone())?;
+    let mut merged = target.clone();
+    merged.merge_from(params, &other_side).map_err(|_| first)?;
+    *target = merged;
+    Ok(())
+}
+
 impl RoomData {
+    /// Apply this member's purge `envelope` (signed on this device, purging
+    /// `tokens`) to the room, and record the tokens as this device's own, so
+    /// a concurrent envelope from another device of the member cannot drop
+    /// them for good ([`Self::heal_own_purges`]).
+    pub fn apply_own_purge(
+        &mut self,
+        envelope: river_core::room_state::direct_messages::AuthorizedRecipientPurges,
+        tokens: Vec<river_core::room_state::direct_messages::PurgeToken>,
+    ) -> Result<(), String> {
+        let recipient = envelope.recipient_id;
+        let delta = river_core::room_state::ChatRoomStateV1Delta {
+            direct_messages: Some(
+                river_core::room_state::direct_messages::DirectMessagesDelta {
+                    new_messages: vec![],
+                    advanced_purges: vec![envelope],
+                },
+            ),
+            ..Default::default()
+        };
+        let parent = self.room_state.clone();
+        self.room_state.apply_delta(
+            &parent,
+            &ChatRoomParametersV1 {
+                owner: self.owner_vk,
+            },
+            &Some(delta),
+        )?;
+        // #310: preserve private edits/reactions across the optimistic
+        // apply_delta. No-op on public rooms.
+        self.rebuild_private_actions_state();
+        self.own_purges.record(recipient, tokens);
+        Ok(())
+    }
+
+    /// Re-sign a DM purge this device signed that the room's winning purge
+    /// envelope for this member omits (a concurrent envelope from another
+    /// device of the same member won), as `river_core::own_purges::OwnPurges::heal`
+    /// decides, and apply it to the local state. True when the room needs a
+    /// sync to publish it. Needs this room's signing key, as every
+    /// self-signed record does; the envelope carries no room secret.
+    pub fn heal_own_purges(&mut self) -> bool {
+        let Some(signing_key) = self.signing_key().cloned() else {
+            return false;
+        };
+        let owner = self.owner_vk;
+        // A recipient that left the room has its record dropped first.
+        self.own_purges.prune(&owner, &self.room_state);
+        let envelope = match self.own_purges.heal(&signing_key, &owner, &self.room_state) {
+            None => return false,
+            Some(Err(e)) => {
+                dioxus::logger::tracing::warn!("DM purge re-sign for {owner:?} not built: {e}");
+                return false;
+            }
+            Some(Ok(envelope)) => envelope,
+        };
+        let delta = river_core::room_state::ChatRoomStateV1Delta {
+            direct_messages: Some(
+                river_core::room_state::direct_messages::DirectMessagesDelta {
+                    new_messages: vec![],
+                    advanced_purges: vec![envelope],
+                },
+            ),
+            ..Default::default()
+        };
+        let parent = self.room_state.clone();
+        if let Err(e) =
+            self.room_state
+                .apply_delta(&parent, &ChatRoomParametersV1 { owner }, &Some(delta))
+        {
+            dioxus::logger::tracing::warn!("DM purge re-sign for {owner:?} not applied: {e}");
+            return false;
+        }
+        self.rebuild_private_actions_state();
+        true
+    }
+
     /// The local user's private signing key for this room, if this build still
     /// holds it locally.
     ///
@@ -906,8 +1034,8 @@ impl RoomData {
         // The assignment is unconditional and CAN move the pointer
         // backwards in the pathological case where local state holds a
         // newer decrypted version than the post-merge contract state.
-        // This relies on the `RoomSecretsV1` invariant
-        // (`common/src/room_state/secret.rs:166-174,192-213`) that
+        // This relies on the `RoomSecretsV1` invariant (its `apply_delta`)
+        // that
         // `current_version == max(versions)` and is monotonically
         // non-decreasing under merge — so the merge that immediately
         // precedes this call cannot move `current_version` backwards.
@@ -928,8 +1056,9 @@ impl RoomData {
     /// rotation asynchronously via ContractNotification when the UI isn't
     /// active. Both produce byte-identical secrets via
     /// [`river_core::key_derivation::derive_room_secret`], so concurrent
-    /// rotations converge via the contract's CRDT (duplicate-version dedup
-    /// at `secret.rs:140-145`).
+    /// rotations converge in the contract (`RoomSecretsV1::apply_delta` keeps
+    /// one record per version and one blob per member and version, by
+    /// signature digest).
     ///
     /// This helper is retained for any future caller that wants to ask
     /// "is this room overdue for rotation?", but no UI sync trigger calls
@@ -1092,6 +1221,13 @@ impl RoomData {
         }
 
         Err(SendMessageError::UserNotMember)
+    }
+
+    /// A private room whose current secret this device does not hold: a
+    /// message it sends could not be encrypted, and the room does not admit
+    /// a public body in a private room.
+    pub fn missing_room_secret(&self) -> bool {
+        self.is_private() && self.get_secret().is_none()
     }
 
     /// Check if the user can participate in the room (send messages, edit profile).
@@ -1650,11 +1786,10 @@ impl RoomData {
     /// produce **byte-identical** secrets because they both call
     /// [`river_core::key_derivation::derive_room_secret`] with the same
     /// `(signing_key_seed, owner_vk, new_version)` triple. Concurrent
-    /// rotation by both paths therefore converges via the contract's
-    /// duplicate-version dedup in `apply_delta` (`secret.rs:140-145`):
-    /// whichever record lands first wins, the other is rejected as a
-    /// duplicate, and both replicas end up with the same authoritative
-    /// state.
+    /// rotation by both paths therefore converges in
+    /// `RoomSecretsV1::apply_delta`: the blobs are byte-identical, and of the
+    /// two version records (the UI's and the delegate's `created_at` differ)
+    /// every replica keeps the one with the greater signature digest.
     pub fn rotate_secret(
         &mut self,
     ) -> Result<river_core::room_state::secret::SecretsDelta, String> {
@@ -1960,10 +2095,22 @@ pub struct Rooms {
     ///   this list are appended after the ordered ones in a deterministic
     ///   (key-byte) order — see [`Rooms::ordered_room_keys`]. So an absent
     ///   entry just means "not yet manually positioned", never "hidden".
-    /// * Entries are pruned to keys present in `map` on `merge` and on
-    ///   `leave_room`, so the list never grows without bound.
+    /// * An entry may name a room not (yet) in `map`, and is then ignored by
+    ///   [`Rooms::ordered_room_keys`]. It is kept on purpose: during a
+    ///   migration, or a load where one room's slot failed to read, the order
+    ///   arrives before (or without) some of its rooms, and pruning the entry
+    ///   sent that room to the bottom when it did arrive, after which the next
+    ///   save persisted the reshuffled order (freenet/river#802). Entries are
+    ///   dropped only for rooms this device knows the user left (`leave_room`,
+    ///   and any room in `removed_rooms` on `merge`/`apply_meta`). So an entry
+    ///   for a room that never arrives and is never tombstoned here (a slot
+    ///   that stays unreadable, a room lost to a refused predecessor) stays
+    ///   for good: never rendered, a few dozen bytes, and one extra slot probe
+    ///   when this delegate is later migrated from. That is the price of not
+    ///   guessing that a room which has not arrived yet never will.
     /// * On `merge`, this device's order is authoritative; keys seen only in
-    ///   the incoming order are appended (same local-wins rule as
+    ///   the incoming order are inserted next to their incoming neighbours
+    ///   ([`merge_room_order`]; same local-wins rule as
     ///   `notification_modes`). Cross-device consequence: reordering rooms on
     ///   one device does NOT reorder the rooms another device already has —
     ///   each device keeps its own arrangement and only adopts the *positions*
@@ -2127,13 +2274,81 @@ impl Rooms {
     }
 
     /// Apply a loaded [`RoomsMeta`] onto this in-memory `Rooms` (the per-room
-    /// slots populate `map`/`removed_rooms` separately). `room_order` is pruned
-    /// to rooms actually present.
+    /// slots populate `map`/`removed_rooms` separately). `room_order` drops
+    /// rooms the user left, but keeps rooms that are merely not loaded: a slot
+    /// that failed to read this time must keep its place (freenet/river#802).
     pub fn apply_meta(&mut self, meta: RoomsMeta) {
         self.current_room_key = meta.current_room_key;
         self.notification_modes = meta.notification_modes;
         self.room_order = meta.room_order;
-        self.room_order.retain(|vk| self.map.contains_key(vk));
+        self.room_order
+            .retain(|vk| !self.removed_rooms.contains(vk));
+    }
+}
+
+/// Merge the room order `other` into `base`, keeping `base`'s order for every
+/// room it already places (freenet/river#802).
+///
+/// Each room `other` names that `base` lacks (and `skip` does not reject) is
+/// inserted next to its neighbours in `other`: right after the nearest
+/// preceding room of `other` that `base` already places, else right before the
+/// nearest following one, else at the end. So a room keeps the position the
+/// user gave it relative to the rooms around it, wherever it comes from (a
+/// rooms_meta merged before its rooms, another tab's stored order, a reorder
+/// made while some rooms had not arrived yet). Never introduces a duplicate.
+pub(crate) fn merge_room_order(
+    base: &mut Vec<VerifyingKey>,
+    other: &[VerifyingKey],
+    skip: impl Fn(&VerifyingKey) -> bool,
+) {
+    for (i, vk) in other.iter().enumerate() {
+        if base.contains(vk) || skip(vk) {
+            continue;
+        }
+        let after = other[..i]
+            .iter()
+            .rev()
+            .find_map(|p| base.iter().position(|b| b == p).map(|at| at + 1));
+        let at = after.unwrap_or_else(|| {
+            other[i + 1..]
+                .iter()
+                .find_map(|n| base.iter().position(|b| b == n))
+                .unwrap_or(base.len())
+        });
+        base.insert(at, *vk);
+    }
+}
+
+/// Of two copies' read markers for one room, the one furthest along in
+/// `messages` — the room's MERGED `recent_messages`, which is in chronological
+/// order (freenet/river#801).
+///
+/// Read markers only ever move forward (`document_title::read_marker_update`),
+/// so the further one is the newer observation, whichever copy or delegate
+/// generation it came from. A marker not in the buffer (evicted, so it places
+/// nothing and the badge counts the whole buffer) loses to one that is. If
+/// neither is in it, `local` is kept, falling back to `incoming`.
+///
+/// Known limit: a marker can also leave the buffer by being NEWER than it
+/// places, e.g. pointing at a message a ban later purged. Such a marker loses
+/// to an older in-buffer one, which still counts no more unread than the
+/// dangling marker would (that counts the whole buffer). Telling the two apart
+/// would need the marker's timestamp persisted beside it.
+pub(crate) fn furthest_read_marker(
+    messages: &[river_core::room_state::message::AuthorizedMessageV1],
+    local: Option<MessageId>,
+    incoming: Option<MessageId>,
+) -> Option<MessageId> {
+    let position = |marker: &Option<MessageId>| {
+        marker
+            .as_ref()
+            .and_then(|id| messages.iter().position(|m| &m.id() == id))
+    };
+    match (position(&local), position(&incoming)) {
+        (Some(l), Some(i)) if i > l => incoming,
+        (Some(_), _) => local,
+        (None, Some(_)) => incoming,
+        (None, None) => local.or(incoming),
     }
 }
 
@@ -2165,8 +2380,131 @@ pub(crate) fn test_minimal_room_data(owner_vk: VerifyingKey) -> RoomData {
         self_nickname: None,
         previous_contract_key: None,
         rekey_merge: Default::default(),
+        own_purges: Default::default(),
         invitation_secrets: BTreeMap::new(),
     }
+}
+
+/// A copy of the room `owner_sk` owns, on configuration `version` with
+/// ban cap `cap`, holding `texts` as the owner's messages and `bans`
+/// owner-issued bans, normalized by a merge with itself.
+#[cfg(test)]
+pub(crate) fn test_generation_copy(
+    owner_sk: &SigningKey,
+    version: u32,
+    cap: usize,
+    texts: &[&str],
+    bans: u64,
+) -> ChatRoomStateV1 {
+    use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+    use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    let owner_id = river_core::room_state::member::MemberId::from(owner_sk.verifying_key());
+    let params = ChatRoomParametersV1 {
+        owner: owner_sk.verifying_key(),
+    };
+    let mut s = ChatRoomStateV1 {
+        configuration: river_core::room_state::configuration::AuthorizedConfigurationV1::new(
+            river_core::room_state::configuration::Configuration {
+                owner_member_id: owner_id,
+                configuration_version: version,
+                max_user_bans: cap,
+                ..Default::default()
+            },
+            owner_sk,
+        ),
+        bans: BansV1(
+            (0..bans)
+                .map(|i| {
+                    AuthorizedUserBan::new(
+                        UserBan {
+                            owner_member_id: owner_id,
+                            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(i),
+                            banned_user: river_core::room_state::member::MemberId::from(
+                                SigningKey::from_bytes(&{
+                                    let mut b = [4u8; 32];
+                                    b[..8].copy_from_slice(&i.to_le_bytes());
+                                    b
+                                })
+                                .verifying_key(),
+                            ),
+                        },
+                        owner_id,
+                        owner_sk,
+                    )
+                })
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    s.recent_messages.messages = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: owner_id,
+                    time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i as u64),
+                    content: RoomMessageBody::public(t.to_string()),
+                },
+                owner_sk,
+            )
+        })
+        .collect();
+    s.recent_messages.rebuild_actions_state();
+    let mut m = s.clone();
+    m.merge_from(&params, &s).unwrap();
+    m
+}
+
+/// A public room joined by `self_sk`, whose `recent_messages` holds the first
+/// `count` of a fixed sequence of owner-authored messages, one second apart.
+/// Returns the room and the ids of ALL `total` messages in that sequence, so
+/// two copies built with different `count`s (an older and a newer snapshot of
+/// one room) share a prefix and their read markers can be compared.
+#[cfg(test)]
+pub(crate) fn test_room_with_messages(
+    owner_sk: &SigningKey,
+    self_sk: &SigningKey,
+    count: usize,
+    total: usize,
+) -> (RoomData, Vec<MessageId>) {
+    use river_core::room_state::member::Member;
+    use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    let owner_vk = owner_sk.verifying_key();
+    let mut room = test_minimal_room_data(owner_vk);
+    room.self_sk = Some(self_sk.clone());
+    room.self_vk = Some(self_sk.verifying_key());
+    room.room_state.configuration =
+        AuthorizedConfigurationV1::new(Configuration::default(), owner_sk);
+    let member = AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_vk.into(),
+            invited_by: owner_vk.into(),
+            member_vk: self_sk.verifying_key(),
+        },
+        owner_sk,
+    );
+    room.room_state.members.members.push(member.clone());
+    room.self_authorized_member = Some(member);
+    // A fixed base, so two calls produce byte-identical messages.
+    let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let all: Vec<AuthorizedMessageV1> = (0..total)
+        .map(|i| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_vk.into(),
+                    author: owner_vk.into(),
+                    time: base + std::time::Duration::from_secs(i as u64),
+                    content: RoomMessageBody::public(format!("message {i}")),
+                },
+                owner_sk,
+            )
+        })
+        .collect();
+    let ids = all.iter().map(|m| m.id()).collect();
+    room.room_state.recent_messages.messages = all.into_iter().take(count).collect();
+    (room, ids)
 }
 
 impl Rooms {
@@ -2322,6 +2660,7 @@ impl Rooms {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -2408,8 +2747,9 @@ impl Rooms {
         // against the combined set, which lost that ordering entirely: an ancient
         // "you left this room" deleted a room you had since rejoined, and the
         // migration's re-save wrote the tombstone to the current delegate, taking
-        // `self_sk` with it. Probes dispatch oldest-first, so the oldest
-        // generation usually answers while the map is still empty — which is why
+        // `self_sk` with it. Probes dispatched oldest-first (until
+        // freenet/river#809), so the oldest generation usually answered while the
+        // map was still empty, and any generation still can — which is why
         // guarding only "is it in the map right now" is not enough.
         //
         // An `Authoritative` source (the current delegate, or a deliberate
@@ -2485,10 +2825,11 @@ impl Rooms {
         for (vk, mut room_data) in other.map {
             // Honour tombstones — never re-add a room the user has left — UNLESS
             // this observation comes from a strictly NEWER source than the one
-            // that tombstoned it (freenet/river#590). Probes are dispatched
-            // oldest-first, so without this a stale "you left" from the oldest
-            // generation suppresses the newest generation's `Present` and the
-            // re-save then tombstones the room on the current delegate.
+            // that tombstoned it (freenet/river#590). Generations answer in any
+            // order, so without this a stale "you left" from an older
+            // generation that answers first suppresses a newer generation's
+            // `Present` and the re-save then tombstones the room on the
+            // current delegate.
             if self.removed_rooms.contains(&vk) {
                 if !ranks.presence_survives_tombstone(&vk.to_bytes(), incoming_rank) {
                     continue;
@@ -2622,6 +2963,8 @@ impl Rooms {
                             e.room_state.clone(),
                             e.invitation_secrets.clone(),
                             e.self_nickname.clone(),
+                            e.last_read_message_id.clone(),
+                            e.own_purges.clone(),
                         )
                     })
                     .expect("AdoptIncoming implies the room is present");
@@ -2633,8 +2976,8 @@ impl Rooms {
                 // the next legacy generation's copy would be adopted unranked.
                 // Same shape as `do_save_rooms_to_delegate`, which accumulates
                 // per-key errors and keeps going for the same reason.
-                if let Err(e) = room_data.room_state.merge(
-                    &room_data.room_state.clone(),
+                if let Err(e) = merge_converging(
+                    &mut room_data.room_state,
                     &ChatRoomParametersV1 { owner: vk },
                     &existing_state.0,
                 ) {
@@ -2663,6 +3006,19 @@ impl Rooms {
                 if room_data.self_nickname.is_none() {
                     room_data.self_nickname = existing_state.2;
                 }
+                // Read state belongs to the device, not the identity: keep the
+                // marker furthest along in the folded buffer, so an older copy
+                // that had read further is not rolled back by the adopt
+                // (freenet/river#801).
+                room_data.last_read_message_id = furthest_read_marker(
+                    &room_data.room_state.recent_messages.messages,
+                    existing_state.3,
+                    room_data.last_read_message_id.take(),
+                );
+                // The DM purges this device signed are the device's record,
+                // not the identity's: unioned, so a purge either copy recorded
+                // can still be re-published (each is keyed by its recipient).
+                room_data.own_purges.union(&existing_state.4);
                 // The re-key merge marker stays the adopted copy's, as in the
                 // non-adopt branch below: it comes from the newer delegate
                 // generation, which knows the contract key the device last
@@ -2706,15 +3062,16 @@ impl Rooms {
                     // case was resolved above) — merge in the new state.
                     let self_room_data = self.map.get_mut(&vk).unwrap();
                     // freenet/river#591: per-room isolation, as above.
-                    if let Err(e) = self_room_data.room_state.merge(
-                        &self_room_data.room_state.clone(),
+                    if let Err(e) = merge_converging(
+                        &mut self_room_data.room_state,
                         &ChatRoomParametersV1 { owner: vk },
                         &room_data.room_state,
                     ) {
                         errors.push(format!("merge room {vk:?}: {e}"));
                         continue;
                     }
-                    // freenet/river#590: merging ONLY `room_state` made every other
+                    // freenet/river#590 (the read marker since #801, below):
+                    // merging ONLY `room_state` made every other
                     // field first-writer-wins regardless of rank — and probes are
                     // dispatched oldest-generation-first, so the systematic winner
                     // was the OLDEST copy. This is the most-travelled of the three
@@ -2732,6 +3089,9 @@ impl Rooms {
                     // for good. `repopulate_secrets_from_state` cannot recover it:
                     // it reads the contract blob, which is what is missing.
                     // Local wins collisions, matching both sibling paths.
+                    // The DM purges this device signed: unioned, as in the
+                    // adopt branch.
+                    self_room_data.own_purges.union(&room_data.own_purges);
                     for (version, secret) in room_data.invitation_secrets {
                         self_room_data
                             .invitation_secrets
@@ -2754,26 +3114,37 @@ impl Rooms {
                     if incoming_outranks {
                         self_room_data.rekey_merge = room_data.rekey_merge;
                     }
+                    // The read marker: furthest along in the merged buffer
+                    // wins, independent of arrival order and generation rank
+                    // (freenet/river#801). First-writer-wins made the OLDEST
+                    // generation's frozen marker stick, the re-save made it
+                    // permanent, and a marker that had left the buffer counted
+                    // the whole room as unread.
+                    self_room_data.last_read_message_id = furthest_read_marker(
+                        &self_room_data.room_state.recent_messages.messages,
+                        self_room_data.last_read_message_id.take(),
+                        room_data.last_read_message_id,
+                    );
                     // Deliberately NOT merged: `notification_modes` and
                     // `room_order` are handled outside this loop as local user
-                    // preferences ("this device wins"), and `last_read_message_id`
-                    // is cosmetic (the unread badge). Those are first-writer-wins
-                    // by design, not by omission.
+                    // preferences ("this device wins").
                     false
                 };
             record_identity_source(&mut ranks.identity, &vk, source_rank, was_vacant);
         }
 
         // Room display order: this device's order is authoritative (a local
-        // user setting, same rule as `notification_modes`). Adopt any keys the
-        // incoming order has that we don't, then prune to rooms actually in
-        // `map` so the list can't accumulate stale entries across merges.
-        for vk in other.room_order {
-            if !self.room_order.contains(&vk) {
-                self.room_order.push(vk);
-            }
-        }
-        self.room_order.retain(|vk| self.map.contains_key(vk));
+        // user setting, same rule as `notification_modes`). Adopt the keys the
+        // incoming order has that we don't, at their incoming position. An
+        // entry for a room not in `map` yet is KEPT: a migration can deliver
+        // the order before (or without) some of its rooms, and pruning it sent
+        // a late room to the bottom, after which the next save persisted that
+        // (freenet/river#802). Only rooms the user left are dropped.
+        let removed = &self.removed_rooms;
+        merge_room_order(&mut self.room_order, &other.room_order, |vk| {
+            removed.contains(vk)
+        });
+        self.room_order.retain(|vk| !removed.contains(vk));
 
         // Surface accumulated per-room failures as one aggregate: every OTHER
         // room has still been merged, but the caller must not be told this went
@@ -2825,6 +3196,15 @@ impl Rooms {
         result
     }
 
+    /// Persist a reordered list of the CURRENT rooms as the display order,
+    /// keeping the entries of ordered rooms not in `map` yet next to their old
+    /// neighbours, so reordering during a migration does not send the rooms
+    /// still to come to the bottom (freenet/river#802).
+    fn set_visible_order(&mut self, order: Vec<VerifyingKey>) {
+        let previous = std::mem::replace(&mut self.room_order, order);
+        merge_room_order(&mut self.room_order, &previous, |_| false);
+    }
+
     /// Move `dragged` so it sits immediately before `target` in the display
     /// order, persisting the resulting full order into `room_order`.
     ///
@@ -2834,7 +3214,8 @@ impl Rooms {
     /// current room or if the two keys are equal. If `target` is not a current
     /// room (unreachable from the UI, where the target is always a rendered
     /// row) the dragged room falls back to the end. After this call
-    /// `room_order` contains exactly the current `map` keys (no stale entries).
+    /// `room_order` holds every current `map` key, plus any entries for rooms
+    /// not in `map` yet, kept beside their old neighbours.
     pub fn move_room(&mut self, dragged: VerifyingKey, target: VerifyingKey) {
         if dragged == target {
             return;
@@ -2851,7 +3232,7 @@ impl Rooms {
             None => order.len(),
         };
         order.insert(insert_at, item);
-        self.room_order = order;
+        self.set_visible_order(order);
     }
 
     /// Move `dragged` to the very end of the display order, persisting the
@@ -2865,7 +3246,7 @@ impl Rooms {
         };
         let item = order.remove(from);
         order.push(item);
-        self.room_order = order;
+        self.set_visible_order(order);
     }
 
     /// Move `room` one position earlier in the display order, persisting the
@@ -2884,7 +3265,7 @@ impl Rooms {
             return;
         }
         order.swap(pos, pos - 1);
-        self.room_order = order;
+        self.set_visible_order(order);
     }
 
     /// Move `room` one position later in the display order, persisting the
@@ -2900,7 +3281,7 @@ impl Rooms {
             return;
         }
         order.swap(pos, pos + 1);
-        self.room_order = order;
+        self.set_visible_order(order);
     }
 }
 
@@ -2909,6 +3290,224 @@ mod tests {
     use super::*;
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::member::{AuthorizedMember, Member};
+
+    /// Two devices of one member, each holding the room, purge different
+    /// DMs at the same purge version. Each device's next ingestion of the
+    /// other's state keeps the winning envelope; the device whose purge lost
+    /// re-signs the union (`heal_own_purges`), and after one more exchange
+    /// both hold both tombstones and neither re-signs again.
+    #[test]
+    fn a_device_whose_purge_lost_re_signs_the_union() {
+        use river_core::room_state::direct_messages::{
+            advance_recipient_purges, DirectMessagesDelta, PurgeToken,
+        };
+        use river_core::room_state::ChatRoomStateV1Delta;
+        let owner_sk = SigningKey::from_bytes(&[31u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[32u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(owner_vk);
+        let bob_id = MemberId::from(bob_sk.verifying_key());
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let mut base = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        base.members.members = vec![AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: bob_sk.verifying_key(),
+            },
+            &owner_sk,
+        )];
+        let device = |token: PurgeToken| {
+            let mut rd = test_minimal_room_data(owner_vk);
+            rd.self_sk = Some(bob_sk.clone());
+            rd.room_state = base.clone();
+            // As the thread's "Delete their messages" does.
+            let env = advance_recipient_purges(&bob_sk, &owner_vk, None, [token]).unwrap();
+            let parent = rd.room_state.clone();
+            rd.room_state
+                .apply_delta(
+                    &parent,
+                    &params,
+                    &Some(ChatRoomStateV1Delta {
+                        direct_messages: Some(DirectMessagesDelta {
+                            new_messages: vec![],
+                            advanced_purges: vec![env],
+                        }),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            rd.own_purges.record(bob_id, [token]);
+            rd
+        };
+        let ingest = |rd: &mut RoomData, incoming: &ChatRoomStateV1| {
+            rd.room_state
+                .merge_through_summary(&params, incoming)
+                .unwrap();
+            rd.heal_own_purges()
+        };
+        let tombstones = |rd: &RoomData| {
+            rd.room_state
+                .direct_messages
+                .purges
+                .iter()
+                .find(|p| p.recipient_id == bob_id)
+                .map(|p| p.state.purged.clone())
+                .unwrap_or_default()
+        };
+        let (t1, t2) = (PurgeToken([1; 16]), PurgeToken([2; 16]));
+        let (mut x, mut y) = (device(t1), device(t2));
+        let (x_state, y_state) = (x.room_state.clone(), y.room_state.clone());
+        let x_healed = ingest(&mut x, &y_state);
+        let y_healed = ingest(&mut y, &x_state);
+        assert!(x_healed != y_healed, "exactly the losing device re-signs");
+        let (x_state, y_state) = (x.room_state.clone(), y.room_state.clone());
+        assert!(!ingest(&mut x, &y_state));
+        assert!(!ingest(&mut y, &x_state));
+        assert_eq!(tombstones(&x), vec![t1, t2]);
+        assert_eq!(tombstones(&y), vec![t1, t2]);
+        assert_eq!(x.room_state.direct_messages, y.room_state.direct_messages);
+    }
+
+    /// Deleting a peer's DMs applies the envelope and records its tokens as
+    /// this device's own, under the member's id.
+    #[test]
+    fn a_purge_is_applied_and_recorded_as_own() {
+        use river_core::room_state::direct_messages::{advance_recipient_purges, PurgeToken};
+        let owner_sk = SigningKey::from_bytes(&[35u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[36u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(owner_vk);
+        let mut rd = test_minimal_room_data(owner_vk);
+        rd.self_sk = Some(bob_sk.clone());
+        rd.room_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        rd.room_state.members.members = vec![AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: bob_sk.verifying_key(),
+            },
+            &owner_sk,
+        )];
+        let token = PurgeToken([3; 16]);
+        let env = advance_recipient_purges(&bob_sk, &owner_vk, None, [token]).unwrap();
+        rd.apply_own_purge(env, vec![token]).unwrap();
+        assert_eq!(
+            rd.room_state.direct_messages.purges[0].state.purged,
+            vec![token]
+        );
+        assert_eq!(
+            rd.own_purges.purged,
+            vec![(MemberId::from(bob_sk.verifying_key()), token)]
+        );
+    }
+
+    /// A re-sign first drops the record of a recipient that is no longer a
+    /// member: nothing is re-signed for it.
+    #[test]
+    fn a_purge_record_of_a_member_who_left_is_dropped_before_re_signing() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let owner_sk = SigningKey::from_bytes(&[37u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[38u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let mut rd = test_minimal_room_data(owner_vk);
+        rd.self_sk = Some(bob_sk.clone());
+        rd.room_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: MemberId::from(owner_vk),
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        rd.own_purges.record(
+            MemberId::from(bob_sk.verifying_key()),
+            [PurgeToken([1; 16])],
+        );
+        assert!(!rd.heal_own_purges());
+        assert!(rd.own_purges.purged.is_empty());
+    }
+
+    /// No loop: a device whose re-signed envelope has not landed does not
+    /// re-sign again against the same winning version.
+    #[test]
+    fn a_purge_re_sign_is_not_repeated_for_the_same_winning_version() {
+        use river_core::room_state::direct_messages::{
+            advance_recipient_purges, DirectMessagesDelta, PurgeToken,
+        };
+        use river_core::room_state::ChatRoomStateV1Delta;
+        let owner_sk = SigningKey::from_bytes(&[33u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[34u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(owner_vk);
+        let bob_id = MemberId::from(bob_sk.verifying_key());
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        state.members.members = vec![AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: bob_sk.verifying_key(),
+            },
+            &owner_sk,
+        )];
+        let winner =
+            advance_recipient_purges(&bob_sk, &owner_vk, None, [PurgeToken([2; 16])]).unwrap();
+        let parent = state.clone();
+        state
+            .apply_delta(
+                &parent,
+                &params,
+                &Some(ChatRoomStateV1Delta {
+                    direct_messages: Some(DirectMessagesDelta {
+                        new_messages: vec![],
+                        advanced_purges: vec![winner],
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let mut rd = test_minimal_room_data(owner_vk);
+        rd.self_sk = Some(bob_sk.clone());
+        rd.own_purges.record(bob_id, [PurgeToken([1; 16])]);
+        rd.room_state = state.clone();
+        assert!(rd.heal_own_purges(), "the recorded purge is missing");
+        // The re-signed envelope never lands: the network state comes back.
+        rd.room_state = state;
+        assert!(
+            !rd.heal_own_purges(),
+            "not again at the same winning version"
+        );
+    }
 
     #[test]
     fn notification_mode_defaults_to_all() {
@@ -3015,6 +3614,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -3091,6 +3691,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -3163,6 +3764,7 @@ mod tests {
                 self_nickname: None,
                 previous_contract_key: None,
                 rekey_merge: Default::default(),
+                own_purges: Default::default(),
                 invitation_secrets: BTreeMap::new(),
             }
         };
@@ -3234,6 +3836,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         }
     }
@@ -3369,10 +3972,11 @@ mod tests {
     // freenet/river#527 — identity conflicts resolve by DELEGATE GENERATION,
     // not by which probe answered first.
     //
-    // `fire_legacy_migration_request` probes every legacy generation at once
-    // and each hydrates independently, so for a long-time user whose rooms
-    // exist under many generations these merges arrive in a racy order —
-    // dispatched oldest-first, so the oldest copy usually lands first.
+    // `fire_legacy_migration_request` probes every legacy generation and each
+    // hydrates independently, so for a long-time user whose rooms exist under
+    // many generations these merges arrive in a racy order. (Dispatched
+    // oldest-first until freenet/river#809, newest-first in waves since; the
+    // ranking must hold for either order.)
     // =====================================================================
 
     fn empty_rooms_for_merge() -> Rooms {
@@ -3390,6 +3994,372 @@ mod tests {
         let mut rooms = empty_rooms_for_merge();
         rooms.map.insert(vk, room);
         rooms
+    }
+
+    /// Two copies of a room loaded from the delegate, one on the owner's
+    /// newer configuration (ban cap 10), the other on an older one holding
+    /// 150 bans and a message the first lacks: the merge converges rather
+    /// than keeping one copy (the room's merge refuses the older copy once).
+    #[test]
+    fn copies_from_two_generations_converge_past_a_lower_ranked_refusal() {
+        let owner_sk = SigningKey::from_bytes(&[91u8; 32]);
+        let vk = owner_sk.verifying_key();
+        let params = ChatRoomParametersV1 { owner: vk };
+        let state = |version: u32, cap: usize, texts: &[&str], bans: u64| {
+            test_generation_copy(&owner_sk, version, cap, texts, bans)
+        };
+        let refused = state(2, 10, &["m1"], 0)
+            .merge_from(&params, &state(1, 300, &["m1", "m2"], 150))
+            .unwrap_err();
+        assert!(refused.contains(LOWER_RANKED_REFUSAL), "premise: {refused}");
+        let mut lowered = test_minimal_room_data(vk);
+        lowered.self_sk = Some(owner_sk.clone());
+        lowered.room_state = state(2, 10, &["m1"], 0);
+        let mut stale = lowered.clone();
+        stale.room_state = state(1, 300, &["m1", "m2"], 150);
+        let mut local = rooms_holding(vk, lowered);
+        let mut ranks = MergeRanks::default();
+        local
+            .merge_from_source(
+                rooms_holding(vk, stale),
+                3,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
+            .expect("merges");
+        let room = &local.map[&vk];
+        assert_eq!(room.room_state.recent_messages.messages.len(), 2);
+        assert_eq!(room.room_state.bans.0.len(), 10);
+    }
+
+    /// Any other merge error is returned as it is, without the converging
+    /// steps: here the incoming copy holds 150 bans under its own cap of 100,
+    /// and the converging steps would succeed (the copy takes the target's
+    /// side and trims), yet the merge fails with the copy's own-limit error
+    /// and the target is unchanged.
+    #[test]
+    fn a_merge_error_other_than_the_refusal_is_returned_at_once() {
+        let owner_sk = SigningKey::from_bytes(&[95u8; 32]);
+        let vk = owner_sk.verifying_key();
+        let params = ChatRoomParametersV1 { owner: vk };
+        let lowered = test_generation_copy(&owner_sk, 2, 10, &["m1"], 0);
+        let mut over = test_generation_copy(&owner_sk, 1, 300, &["m1", "m2"], 150);
+        let mut c = over.configuration.configuration.clone();
+        c.max_user_bans = 100;
+        over.configuration = AuthorizedConfigurationV1::new(c, &owner_sk);
+        let mut other_side = over.clone();
+        other_side.merge_from(&params, &lowered).unwrap();
+        let mut converged = lowered.clone();
+        converged
+            .merge_from(&params, &other_side)
+            .expect("premise: the converging steps succeed here");
+        let mut target = lowered.clone();
+        let err = merge_converging(&mut target, &params, &over).unwrap_err();
+        assert!(err.contains("its own configuration's limit"), "{err}");
+        assert!(!err.contains(LOWER_RANKED_REFUSAL), "{err}");
+        assert_eq!(target, lowered);
+    }
+
+    /// When the converging merge fails past the lower-ranked refusal (the
+    /// refused copy also holds a member record the owner did not sign, with
+    /// a message by that member: the copy takes the target's side, and
+    /// merging that in fails on the record), the target is left exactly as
+    /// it was and the error is the refusal.
+    #[test]
+    fn a_failed_converging_merge_leaves_the_target_untouched() {
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let owner_sk = SigningKey::from_bytes(&[92u8; 32]);
+        let vk = owner_sk.verifying_key();
+        let params = ChatRoomParametersV1 { owner: vk };
+        let lowered = test_generation_copy(&owner_sk, 2, 10, &["m1"], 0);
+        let mut stale = test_generation_copy(&owner_sk, 1, 300, &["m1", "m2"], 150);
+        let member_sk = SigningKey::from_bytes(&[93u8; 32]);
+        stale
+            .members
+            .members
+            .push(river_core::room_state::member::AuthorizedMember {
+                member: river_core::room_state::member::Member {
+                    owner_member_id: vk.into(),
+                    invited_by: vk.into(),
+                    member_vk: member_sk.verifying_key(),
+                },
+                signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+            });
+        stale
+            .recent_messages
+            .messages
+            .push(AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: vk.into(),
+                    author: MemberId::from(member_sk.verifying_key()),
+                    time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000),
+                    content: RoomMessageBody::public("by the member".to_string()),
+                },
+                &member_sk,
+            ));
+        stale.recent_messages.rebuild_actions_state();
+        let refused = lowered.clone().merge_from(&params, &stale).unwrap_err();
+        assert!(refused.contains(LOWER_RANKED_REFUSAL), "premise: {refused}");
+        let mut target = lowered.clone();
+        let err = merge_converging(&mut target, &params, &stale).unwrap_err();
+        assert!(err.contains(LOWER_RANKED_REFUSAL), "{err}");
+        assert_eq!(target, lowered);
+    }
+
+    /// A private room is missing its secret until this device holds the
+    /// secret at the current version; a public room never is (D2 of the
+    /// freenet/river#703).
+    #[test]
+    fn missing_room_secret_is_private_and_without_the_current_secret() {
+        use river_core::room_state::privacy::PrivacyMode;
+        let owner_sk = SigningKey::from_bytes(&[1u8; 32]);
+        let mut room = test_minimal_room_data(owner_sk.verifying_key());
+        assert!(!room.missing_room_secret(), "a public room");
+        let mut config = room.room_state.configuration.configuration.clone();
+        config.privacy_mode = PrivacyMode::Private;
+        room.room_state.configuration =
+            river_core::room_state::configuration::AuthorizedConfigurationV1::new(
+                config, &owner_sk,
+            );
+        room.secrets.clear();
+        room.current_secret_version = None;
+        assert!(room.missing_room_secret());
+        room.secrets.insert(1, [7u8; 32]);
+        room.current_secret_version = Some(1);
+        assert!(!room.missing_room_secret());
+    }
+
+    // =====================================================================
+    // freenet/river#801: a room's read marker across a legacy migration.
+    //
+    // The fan-out delivers one copy per delegate generation, in any order,
+    // and an old generation's frozen snapshot carries a weeks-old marker. The
+    // merged room must keep the marker furthest along in the MERGED buffer,
+    // whichever copy arrived first and whichever generation it came from.
+    // =====================================================================
+
+    /// Merge two copies of one room, `first` then `second`, at the given
+    /// ranks, and return the merged marker.
+    fn merged_marker(
+        vk: VerifyingKey,
+        first: (RoomData, u32),
+        second: (RoomData, u32),
+    ) -> Option<MessageId> {
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+        for (room, rank) in [first, second] {
+            local
+                .merge_from_source(
+                    rooms_holding(vk, room),
+                    rank,
+                    MergeAuthority::OlderSnapshot,
+                    &mut ranks,
+                )
+                .expect("merge");
+        }
+        local.map[&vk].last_read_message_id.clone()
+    }
+
+    #[test]
+    fn furthest_read_marker_wins_the_merge_in_either_arrival_order() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let me = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+
+        // An old generation's frozen snapshot: two messages, read up to the first.
+        let (mut stale, ids) = test_room_with_messages(&owner, &me, 2, 4);
+        stale.last_read_message_id = Some(ids[0].clone());
+        // The newer generation: four messages, read up to the third.
+        let (mut fresh, _) = test_room_with_messages(&owner, &me, 4, 4);
+        fresh.last_read_message_id = Some(ids[2].clone());
+
+        assert_eq!(
+            merged_marker(vk, (stale.clone(), 3), (fresh.clone(), 20)),
+            Some(ids[2].clone()),
+            "oldest generation first (one possible order): its stale \
+             marker must not stick"
+        );
+        assert_eq!(
+            merged_marker(vk, (fresh, 20), (stale, 3)),
+            Some(ids[2].clone()),
+            "newest generation first: a later stale copy must not pull the \
+             marker back"
+        );
+    }
+
+    fn some_id(n: i64) -> Option<MessageId> {
+        Some(MessageId(freenet_scaffold::util::FastHash(n)))
+    }
+
+    /// The helper's whole decision table, directly.
+    #[test]
+    fn furthest_read_marker_decision_table() {
+        let owner = SigningKey::from_bytes(&[7u8; 32]);
+        let me = SigningKey::from_bytes(&[8u8; 32]);
+        let (room, ids) = test_room_with_messages(&owner, &me, 3, 3);
+        let buf = &room.room_state.recent_messages.messages;
+        let at = |i: usize| Some(ids[i].clone());
+        let gone_a = some_id(1);
+        let gone_b = some_id(2);
+
+        // Both in the buffer: the later one, either side; a tie keeps local.
+        assert_eq!(furthest_read_marker(buf, at(0), at(2)), at(2));
+        assert_eq!(furthest_read_marker(buf, at(2), at(0)), at(2));
+        assert_eq!(furthest_read_marker(buf, at(1), at(1)), at(1));
+        // One in the buffer: that one, whichever side and whatever the other.
+        assert_eq!(furthest_read_marker(buf, gone_a.clone(), at(0)), at(0));
+        assert_eq!(furthest_read_marker(buf, at(0), gone_a.clone()), at(0));
+        assert_eq!(furthest_read_marker(buf, None, at(1)), at(1));
+        assert_eq!(furthest_read_marker(buf, at(1), None), at(1));
+        // Neither in the buffer: local, else incoming.
+        assert_eq!(
+            furthest_read_marker(buf, gone_a.clone(), gone_b.clone()),
+            gone_a
+        );
+        assert_eq!(furthest_read_marker(buf, None, gone_b.clone()), gone_b);
+        assert_eq!(furthest_read_marker(buf, None, None), None);
+    }
+
+    /// The real #801 sequence on a per-room load: the oldest generation's
+    /// snapshot lands first, then the CURRENT delegate's authoritative copy.
+    #[test]
+    fn an_authoritative_copy_after_a_stale_snapshot_keeps_the_further_marker() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let me = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let (mut stale, ids) = test_room_with_messages(&owner, &me, 2, 4);
+        stale.last_read_message_id = Some(ids[0].clone());
+        let (mut current, _) = test_room_with_messages(&owner, &me, 4, 4);
+        current.last_read_message_id = Some(ids[3].clone());
+
+        for (first, second) in [
+            (
+                (stale.clone(), MergeAuthority::OlderSnapshot),
+                (current.clone(), MergeAuthority::Authoritative),
+            ),
+            (
+                (current, MergeAuthority::Authoritative),
+                (stale, MergeAuthority::OlderSnapshot),
+            ),
+        ] {
+            let mut local = empty_rooms_for_merge();
+            let mut ranks = MergeRanks::default();
+            for (room, authority) in [first, second] {
+                let rank = if authority == MergeAuthority::OlderSnapshot {
+                    3
+                } else {
+                    40
+                };
+                local
+                    .merge_from_source(rooms_holding(vk, room), rank, authority, &mut ranks)
+                    .expect("merge");
+            }
+            assert_eq!(local.map[&vk].last_read_message_id, Some(ids[3].clone()));
+        }
+    }
+
+    /// The adopt branch in the other direction: the ADOPTED (newer) copy holds
+    /// the further marker, so a regression to "always keep the local marker"
+    /// fails here.
+    #[test]
+    fn adopting_a_newer_identity_takes_its_further_read_marker() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let (mut older, ids) =
+            test_room_with_messages(&owner, &SigningKey::generate(&mut rng), 2, 4);
+        older.last_read_message_id = Some(ids[0].clone());
+        let new_identity = SigningKey::generate(&mut rng);
+        let (mut newer, _) = test_room_with_messages(&owner, &new_identity, 4, 4);
+        newer.last_read_message_id = Some(ids[3].clone());
+
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+        for (room, rank) in [(older, 3), (newer, 20)] {
+            local
+                .merge_from_source(
+                    rooms_holding(vk, room),
+                    rank,
+                    MergeAuthority::OlderSnapshot,
+                    &mut ranks,
+                )
+                .expect("merge");
+        }
+        let room = &local.map[&vk];
+        assert_eq!(
+            room.self_verifying_key(),
+            Some(new_identity.verifying_key())
+        );
+        assert_eq!(room.last_read_message_id, Some(ids[3].clone()));
+    }
+
+    /// A marker that has left the merged buffer (evicted) places nothing, so it
+    /// must not beat one that is still in it.
+    #[test]
+    fn a_read_marker_in_the_buffer_beats_one_that_is_not() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let me = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+
+        let (mut stale, ids) = test_room_with_messages(&owner, &me, 2, 4);
+        stale.last_read_message_id = Some(MessageId(freenet_scaffold::util::FastHash(42)));
+        let (mut fresh, _) = test_room_with_messages(&owner, &me, 4, 4);
+        fresh.last_read_message_id = Some(ids[1].clone());
+
+        assert_eq!(
+            merged_marker(vk, (stale.clone(), 3), (fresh.clone(), 20)),
+            Some(ids[1].clone())
+        );
+        assert_eq!(
+            merged_marker(vk, (fresh, 20), (stale, 3)),
+            Some(ids[1].clone())
+        );
+    }
+
+    /// The adopt branch (a newer generation carrying a different identity)
+    /// replaces the room with the incoming copy. Read state is per device, not
+    /// per identity, so the older copy's further marker must survive it.
+    #[test]
+    fn adopting_a_newer_identity_keeps_the_further_read_marker() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let old_identity = SigningKey::generate(&mut rng);
+        let new_identity = SigningKey::generate(&mut rng);
+
+        let (mut older, ids) = test_room_with_messages(&owner, &old_identity, 4, 4);
+        older.last_read_message_id = Some(ids[3].clone());
+        let (mut newer, _) = test_room_with_messages(&owner, &new_identity, 2, 4);
+        newer.last_read_message_id = Some(ids[0].clone());
+
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+        local
+            .merge_from_source(
+                rooms_holding(vk, older),
+                3,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
+            .expect("older merge");
+        local
+            .merge_from_source(
+                rooms_holding(vk, newer),
+                20,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
+            .expect("newer merge");
+        let room = &local.map[&vk];
+        assert_eq!(
+            room.self_verifying_key(),
+            Some(new_identity.verifying_key()),
+            "precondition: the adopt branch ran"
+        );
+        assert_eq!(room.last_read_message_id, Some(ids[3].clone()));
     }
 
     /// freenet/river#591 — one room's merge failure must not drop the others.
@@ -3413,13 +4383,20 @@ mod tests {
     fn a_failing_room_does_not_prevent_the_others_from_merging() {
         fn forged(owner: VerifyingKey, version: u32) -> RoomData {
             let mut room = test_minimal_room_data(owner);
-            let mut config = river_core::room_state::configuration::Configuration::default();
-            config.configuration_version = version;
-            room.room_state.configuration =
-                river_core::room_state::configuration::AuthorizedConfigurationV1::new(
-                    config,
-                    &SigningKey::from_bytes(&[99u8; 32]),
-                );
+            // A member record attributed to the owner's invitation that the
+            // owner did not sign: the merge fails on its signature. (A
+            // configuration the owner did not sign is no longer offered at
+            // all, freenet/river#703.)
+            room.room_state.members.members.push(
+                river_core::room_state::member::AuthorizedMember {
+                    member: river_core::room_state::member::Member {
+                        owner_member_id: owner.into(),
+                        invited_by: owner.into(),
+                        member_vk: SigningKey::from_bytes(&[version as u8; 32]).verifying_key(),
+                    },
+                    signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+                },
+            );
             room
         }
 
@@ -3720,9 +4697,10 @@ mod tests {
     /// freenet/river#590, PROBE-B — the interleaving that probe order makes the
     /// LIKELY one, and that a "is it in the map right now" guard cannot see.
     ///
-    /// `fire_legacy_migration_request` dispatches `LEGACY_DELEGATES.iter()` in
-    /// file order, oldest generation first, so the OLDEST generation usually
-    /// answers while the map is still empty. Its stale tombstone lands
+    /// `fire_legacy_migration_request` dispatched `LEGACY_DELEGATES.iter()` in
+    /// file order, oldest generation first, until freenet/river#809 (newest
+    /// first since), so the OLDEST generation usually answered while the map
+    /// was still empty. The interleaving stays possible on any order. Its stale tombstone lands
     /// unopposed; the newest generation's `Present` then arrives and is skipped
     /// by the tombstone check; and the re-save writes `room:R = Tombstone` to the
     /// current delegate, taking `self_sk` with it.
@@ -4214,6 +5192,89 @@ mod tests {
         );
     }
 
+    /// The DM purges a device signed are the device's record, not the
+    /// identity's: whichever copy's identity wins a room merge, the purges
+    /// either copy recorded survive it (the adopt branch and the same-identity
+    /// branch both union them).
+    #[test]
+    fn merging_rooms_unions_own_purges_in_both_branches() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let old_identity = SigningKey::generate(&mut rng);
+        let new_identity = SigningKey::generate(&mut rng);
+        let (me_old, me_new) = (
+            MemberId::from(old_identity.verifying_key()),
+            MemberId::from(new_identity.verifying_key()),
+        );
+
+        // Adopt branch: a newer identity replaces the older copy.
+        let mut old_room = make_rejoin_test_room(&owner, &old_identity, true);
+        old_room.own_purges.record(me_old, [PurgeToken([1; 16])]);
+        let mut new_room = make_rejoin_test_room(&owner, &new_identity, true);
+        new_room.own_purges.record(me_new, [PurgeToken([2; 16])]);
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+        local
+            .merge_from_source(
+                rooms_holding(vk, old_room),
+                3,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
+            .expect("old generation merge");
+        local
+            .merge_from_source(
+                rooms_holding(vk, new_room),
+                30,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
+            .expect("newer generation merge");
+        assert_eq!(
+            local.map.get(&vk).unwrap().own_purges.purged,
+            vec![(me_old, PurgeToken([1; 16])), (me_new, PurgeToken([2; 16]))]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "the adopt branch unions the purges of both copies"
+        );
+
+        // Same-identity branch: a third copy under the winning identity.
+        let mut third = make_rejoin_test_room(&owner, &new_identity, true);
+        third.own_purges.record(me_new, [PurgeToken([3; 16])]);
+        local
+            .merge_from_source(
+                rooms_holding(vk, third),
+                30,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
+            .expect("same-identity merge");
+        let tokens: std::collections::BTreeSet<_> = local
+            .map
+            .get(&vk)
+            .unwrap()
+            .own_purges
+            .purged
+            .iter()
+            .map(|(_, t)| *t)
+            .collect();
+        assert_eq!(
+            tokens,
+            [
+                PurgeToken([1; 16]),
+                PurgeToken([2; 16]),
+                PurgeToken([3; 16])
+            ]
+            .into_iter()
+            .collect(),
+            "the same-identity branch keeps what was recorded and adds the incoming copy's"
+        );
+    }
+
     /// Adopting a newer identity REPLACES the local `RoomData` wholesale, so
     /// every field not explicitly carried over is silently discarded. That is
     /// how the `invitation_secrets` loss got in — caught in review, not by a
@@ -4246,10 +5307,12 @@ mod tests {
 
             // --- Must be carried over from the local copy (identity-independent
             // state the older generation may hold and the newer may not).
-            // Both are handled in the adopt path.
+            // All are handled in the adopt path.
             room_state: _,         // CRDT-merged, so the older copy's messages survive
             invitation_secrets: _, // unioned; adopted copy wins on collision
             self_nickname: _,      // local kept when the adopted copy has none
+            last_read_message_id: _, // NOT carried over: furthest of local and adopted wins (#801)
+            own_purges: _,         // unioned
 
             // --- `#[serde(skip)]`: not persisted, so the local values are
             // runtime-only and are rebuilt after the merge —
@@ -4261,8 +5324,7 @@ mod tests {
             key_migrated_to_delegate: _,
 
             // --- Deliberately taken from the adopted copy; losing the local
-            // value is cosmetic or self-correcting.
-            last_read_message_id: _, // at worst some messages re-show as unread
+            // value is self-correcting.
             previous_contract_key: _, // re-derived by regenerate_contract_key
             rekey_merge: _, // re-key merge marker; the adopted (newer) copy knows it (#769)
         } = room;
@@ -4270,9 +5332,8 @@ mod tests {
 
     /// A FAILING fold must leave the room exactly as it was.
     ///
-    /// `ChatRoomStateV1::merge` is genuinely fallible — "Private message
-    /// references unknown secret version N", "Cannot send public messages in
-    /// private room", unresolvable invite chains. An earlier version of the
+    /// `ChatRoomStateV1::merge` is genuinely fallible — a record whose
+    /// signature does not verify, a work bound exceeded. An earlier version of the
     /// adopt path did `map.remove()` FIRST and merged second, so any such Err
     /// propagated out with the room already gone from the map: it vanished from
     /// the UI, every room later in the iteration was dropped from that pass,
@@ -4280,9 +5341,9 @@ mod tests {
     /// room was never written there and legacy is never probed again — a
     /// permanently stranded room, on the exact path this fix exists to protect.
     ///
-    /// Here the incoming copy is a PRIVATE room whose secrets do not carry the
-    /// version the older copy's message is sealed under, which is what makes
-    /// the fold fail.
+    /// Here the local copy carries a member record, attributed to the
+    /// owner's invitation, whose signature does not verify, which is what
+    /// makes the fold of the newer copy fail.
     #[test]
     fn a_failing_fold_leaves_the_existing_room_untouched() {
         let mut rng = rand::thread_rng();
@@ -4304,6 +5365,19 @@ mod tests {
             &owner,
         );
         old_room.room_state.recent_messages.messages.push(msg);
+        // A member record attributed to the owner's invitation but not
+        // signed by the owner.
+        let forged_member = SigningKey::generate(&mut rng);
+        old_room.room_state.members.members.push(
+            river_core::room_state::member::AuthorizedMember {
+                member: river_core::room_state::member::Member {
+                    owner_member_id: vk.into(),
+                    invited_by: vk.into(),
+                    member_vk: forged_member.verifying_key(),
+                },
+                signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+            },
+        );
 
         let mut local = empty_rooms_for_merge();
         let mut ranks = MergeRanks::default();
@@ -4317,23 +5391,15 @@ mod tests {
             .expect("seeding the local copy must succeed");
         assert!(local.map.contains_key(&vk), "precondition: room is present");
 
-        // The newer generation has flipped the room to PRIVATE. Folding the
-        // older copy's PUBLIC message into it hits
-        // "Cannot send public messages in private room"
-        // (common/src/room_state/message.rs), so the fold genuinely fails.
-        // An earlier version of this test used an ordinary public room, where
-        // the fold SUCCEEDS — and it therefore passed even with the map mutated
-        // before the merge, i.e. it was vacuous for the bug it exists to catch.
-        let mut newer = make_rejoin_test_room(&owner, &current_identity, true);
-        newer.room_state.configuration = AuthorizedConfigurationV1::new(
-            Configuration {
-                owner_member_id: vk.into(),
-                configuration_version: 2,
-                privacy_mode: PrivacyMode::Private,
-                ..Configuration::default()
-            },
-            &owner,
-        );
+        // Folding the newer copy merges the local copy's forged member record
+        // into it, and the record's signature check fails the fold. (Earlier
+        // fixtures used a public message in a room flipped to private, then a
+        // forged ban; since freenet/river#703 both are dropped rather than
+        // failing the merge.) An earlier version of this test used an
+        // ordinary public room, where the fold SUCCEEDS, and it therefore
+        // passed even with the map mutated before the merge, i.e. it was
+        // vacuous for the bug it exists to catch.
+        let newer = make_rejoin_test_room(&owner, &current_identity, true);
         let result = local.merge_from_source(
             rooms_holding(vk, newer),
             30,
@@ -5502,6 +6568,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         }
     }
@@ -5844,6 +6911,7 @@ mod tests {
                 self_nickname: None,
                 previous_contract_key: None,
                 rekey_merge: Default::default(),
+                own_purges: Default::default(),
                 invitation_secrets: BTreeMap::new(),
             }
         };
@@ -6084,10 +7152,184 @@ mod tests {
         assert_eq!(rooms.room_order, vec![keys[0], keys[2]]);
     }
 
-    /// Merge keeps this device's order authoritative, adopts incoming-only
-    /// keys, and prunes any order entry not backed by a live room.
+    /// A source carrying only list-level prefs (a `rooms_meta`), no rooms.
+    fn meta_only(order: Vec<VerifyingKey>) -> Rooms {
+        let mut rooms = rooms_with_keys(&[]);
+        rooms.room_order = order;
+        rooms
+    }
+
+    /// freenet/river#802 cause 1: a room whose order entry arrives before the
+    /// room itself (a migration delivering the order first, or a room from an
+    /// older generation arriving after the newer one's `rooms_meta`) keeps the
+    /// user's position. Before the fix `merge` pruned the entry, so the room
+    /// was appended in key-byte order when it arrived and the next save
+    /// persisted the reshuffled order.
     #[test]
-    fn merge_unions_and_prunes_room_order() {
+    fn merge_keeps_position_of_a_room_that_arrives_after_its_order() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        // The user's order is deliberately not the key-byte order.
+        let mut user_order = keys.clone();
+        user_order.sort_by(|a, b| b.as_bytes().cmp(a.as_bytes()));
+
+        let mut rooms = rooms_with_keys(&[]);
+        rooms
+            .merge(meta_only(user_order.clone()))
+            .expect("merge meta");
+        // Rooms then arrive one at a time, in key-byte order (the order a walk
+        // fetches them in). At every step the rail shows the user's order.
+        let mut arrival = keys.clone();
+        arrival.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for (i, vk) in arrival.iter().enumerate() {
+            rooms.merge(rooms_with_keys(&[*vk])).expect("merge room");
+            let expected: Vec<VerifyingKey> = user_order
+                .iter()
+                .filter(|k| arrival[..=i].contains(k))
+                .copied()
+                .collect();
+            assert_eq!(rooms.ordered_room_keys(), expected, "after room {i}");
+        }
+        assert_eq!(rooms.room_order, user_order);
+    }
+
+    /// freenet/river#802 cause 1, the lasting form: the order arrives with
+    /// only some of its rooms, and the rest arrive later.
+    #[test]
+    fn merge_keeps_position_of_a_late_room() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let mut user_order = keys.clone();
+        user_order.sort_by(|a, b| b.as_bytes().cmp(a.as_bytes()));
+        // The newest generation has two of the rooms and the full order...
+        let mut newer = rooms_with_keys(&[user_order[1], user_order[2]]);
+        newer.room_order = user_order.clone();
+        let mut rooms = rooms_with_keys(&[]);
+        rooms.merge(newer).expect("merge newer");
+        // ...and the first room only arrives later (an older generation).
+        rooms
+            .merge(rooms_with_keys(&[user_order[0]]))
+            .expect("merge late room");
+        assert_eq!(rooms.ordered_room_keys(), user_order);
+    }
+
+    /// The per-room load path: `apply_meta` over a map missing a room (its
+    /// slot failed to load this time) keeps that room's entry, so it is in its
+    /// place when it does load and a save in between does not drop it.
+    #[test]
+    fn apply_meta_keeps_entries_for_rooms_not_loaded() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&[keys[0], keys[1]]);
+        rooms.apply_meta(RoomsMeta {
+            room_order: vec![keys[2], keys[1], keys[0]],
+            ..Default::default()
+        });
+        assert_eq!(rooms.room_order, vec![keys[2], keys[1], keys[0]]);
+        assert_eq!(rooms.ordered_room_keys(), vec![keys[1], keys[0]]);
+        rooms
+            .merge(rooms_with_keys(&[keys[2]]))
+            .expect("merge late room");
+        assert_eq!(rooms.ordered_room_keys(), vec![keys[2], keys[1], keys[0]]);
+    }
+
+    /// A room the user left loses its order entry on every path, so the list
+    /// cannot accumulate entries for rooms that are gone.
+    #[test]
+    fn tombstoned_rooms_lose_their_order_entry() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        // apply_meta over a load that read the room as a tombstone.
+        let mut loaded = rooms_with_keys(&[keys[0], keys[2]]);
+        loaded.removed_rooms.insert(keys[1]);
+        loaded.apply_meta(RoomsMeta {
+            room_order: vec![keys[2], keys[1], keys[0]],
+            ..Default::default()
+        });
+        assert_eq!(loaded.room_order, vec![keys[2], keys[0]]);
+
+        // merge: an incoming order naming a room this device left.
+        let mut local = rooms_with_keys(&[keys[0]]);
+        local.leave_room(keys[1]);
+        local
+            .merge(meta_only(vec![keys[1], keys[0]]))
+            .expect("merge");
+        assert_eq!(local.room_order, vec![keys[0]]);
+
+        // merge: an incoming tombstone for a room this device had ordered.
+        let mut local = rooms_with_keys(&keys);
+        local.room_order = vec![keys[2], keys[1], keys[0]];
+        let mut incoming = rooms_with_keys(&[]);
+        incoming.removed_rooms.insert(keys[1]);
+        local
+            .merge_from_source(
+                incoming,
+                SOURCE_RANK_AUTHORITATIVE,
+                MergeAuthority::Authoritative,
+                &mut MergeRanks::default(),
+            )
+            .expect("merge tombstone");
+        assert!(
+            !local.map.contains_key(&keys[1]),
+            "premise: the leave applied"
+        );
+        assert_eq!(local.room_order, vec![keys[2], keys[0]]);
+    }
+
+    /// Reordering while some ordered rooms have not arrived yet keeps those
+    /// rooms' entries next to their old neighbours, so a drag during a
+    /// migration does not send the rooms still to come to the bottom.
+    #[test]
+    fn reordering_keeps_entries_for_rooms_not_yet_arrived() {
+        let keys: Vec<VerifyingKey> = (1..=4).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&[keys[0], keys[1], keys[3]]);
+        // keys[2] is ordered between keys[1] and keys[3] but not here yet.
+        rooms.room_order = vec![keys[0], keys[1], keys[2], keys[3]];
+        rooms.move_room(keys[3], keys[0]);
+        assert_eq!(rooms.ordered_room_keys(), vec![keys[3], keys[0], keys[1]]);
+        rooms
+            .merge(rooms_with_keys(&[keys[2]]))
+            .expect("merge late room");
+        assert_eq!(
+            rooms.ordered_room_keys(),
+            vec![keys[3], keys[0], keys[1], keys[2]]
+        );
+        // Every mover, on a room it really moves. keys[2] (absent) sits
+        // between keys[0] and keys[1], and stays right after keys[0].
+        type Mover = fn(&mut Rooms, VerifyingKey);
+        for (name, mv, room, expected) in [
+            (
+                "to_end",
+                Rooms::move_room_to_end as Mover,
+                keys[0],
+                vec![keys[1], keys[0], keys[2]],
+            ),
+            (
+                "up",
+                Rooms::move_room_up as Mover,
+                keys[1],
+                vec![keys[1], keys[0], keys[2]],
+            ),
+            (
+                "down",
+                Rooms::move_room_down as Mover,
+                keys[0],
+                vec![keys[1], keys[0], keys[2]],
+            ),
+        ] {
+            let mut rooms = rooms_with_keys(&[keys[0], keys[1]]);
+            rooms.room_order = vec![keys[0], keys[2], keys[1]];
+            mv(&mut rooms, room);
+            assert_eq!(rooms.ordered_room_keys(), vec![keys[1], keys[0]], "{name}");
+            assert_eq!(rooms.room_order, expected, "{name}");
+            rooms
+                .merge(rooms_with_keys(&[keys[2]]))
+                .expect("merge late room");
+            assert_eq!(rooms.ordered_room_keys(), expected, "{name}");
+        }
+    }
+
+    /// Merge keeps this device's order authoritative and adopts incoming-only
+    /// keys. An entry for a room not in `map` is kept (it may still arrive,
+    /// freenet/river#802) and is never rendered.
+    #[test]
+    fn merge_unions_room_order() {
         let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
         // Local has all three rooms, ordered [k3, k1] (k2 unpositioned).
         let mut local = rooms_with_keys(&keys);
@@ -6099,8 +7341,35 @@ mod tests {
         incoming.room_order = vec![keys[1], ghost];
 
         local.merge(incoming).expect("merge");
-        // k3,k1 from local; k2 adopted from incoming; ghost pruned.
-        assert_eq!(local.room_order, vec![keys[2], keys[0], keys[1]]);
+        // k3,k1 from local; k2 adopted from incoming; the ghost kept after it
+        // (its incoming neighbour) but not rendered.
+        assert_eq!(local.room_order, vec![keys[2], keys[0], keys[1], ghost]);
+        assert_eq!(local.ordered_room_keys(), vec![keys[2], keys[0], keys[1]]);
+    }
+
+    /// `merge_room_order` keeps the base order and places each missing entry
+    /// beside its neighbours in the other order.
+    #[test]
+    fn merge_room_order_places_missing_entries_by_their_neighbours() {
+        let k: Vec<VerifyingKey> = (1..=6).map(vk_from_seed).collect();
+        // Empty base adopts the other order verbatim.
+        let mut base = Vec::new();
+        merge_room_order(&mut base, &[k[2], k[0], k[1]], |_| false);
+        assert_eq!(base, vec![k[2], k[0], k[1]]);
+        // A missing entry with no placed predecessor goes before its placed
+        // successor; one with a placed predecessor goes right after it.
+        let mut base = vec![k[1], k[3]];
+        merge_room_order(&mut base, &[k[0], k[1], k[2], k[3], k[4]], |_| false);
+        assert_eq!(base, vec![k[0], k[1], k[2], k[3], k[4]]);
+        // Base order wins for the rooms it places, even against `other`.
+        let mut base = vec![k[3], k[1]];
+        merge_room_order(&mut base, &[k[1], k[2], k[3]], |_| false);
+        assert_eq!(base, vec![k[3], k[1], k[2]]);
+        // No anchor at all: appended. Skipped entries are not inserted, and
+        // duplicates in `other` are not duplicated.
+        let mut base = vec![k[5]];
+        merge_room_order(&mut base, &[k[0], k[4], k[0], k[1]], |vk| *vk == k[4]);
+        assert_eq!(base, vec![k[5], k[0], k[1]]);
     }
 
     /// The tail drop zone path: `move_room_to_end` puts a room last regardless
@@ -6170,11 +7439,11 @@ mod tests {
     }
 
     /// `to_meta` → ciborium → `apply_meta` round-trips the list-level view
-    /// preferences, and `apply_meta` prunes `room_order` to rooms present in the
-    /// reconstructed `map` (a stale entry for a no-longer-present room is
-    /// dropped, mirroring the per-room load where slots populate `map` first).
+    /// preferences. An order entry for a room the reconstructed `map` lacks is
+    /// kept (its slot may have failed to load, freenet/river#802) and is not
+    /// rendered.
     #[test]
-    fn rooms_meta_round_trips_and_apply_meta_prunes_order() {
+    fn rooms_meta_round_trips_through_apply_meta() {
         let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
         let ghost = vk_from_seed(88);
         let mut source = rooms_with_keys(&keys);
@@ -6199,8 +7468,10 @@ mod tests {
             reconstructed.notification_modes.get(&keys[0]),
             Some(&NotificationMode::Muted)
         );
-        // Ghost pruned; real order preserved.
-        assert_eq!(reconstructed.room_order, vec![keys[2], keys[0]]);
+        // Order preserved, ghost included but not rendered.
+        assert_eq!(reconstructed.room_order, vec![keys[2], keys[0], ghost]);
+        assert_eq!(&reconstructed.ordered_room_keys()[..2], &[keys[2], keys[0]]);
+        assert!(!reconstructed.ordered_room_keys().contains(&ghost));
     }
 
     /// Backward-compat: a `rooms_data` blob serialised before this PR
@@ -6295,6 +7566,7 @@ mod tests {
                 self_nickname: None,
                 previous_contract_key: None,
                 rekey_merge: Default::default(),
+                own_purges: Default::default(),
                 invitation_secrets: BTreeMap::new(),
             }
         };
@@ -6367,6 +7639,7 @@ mod tests {
                 self_nickname: None,
                 previous_contract_key: None,
                 rekey_merge: Default::default(),
+                own_purges: Default::default(),
                 invitation_secrets: BTreeMap::new(),
             }
         };
@@ -6460,7 +7733,7 @@ mod tests {
         // owner@0 is already in state — must NOT re-emit.
         assert!(
             !emitted.contains(&(owner_id, 0)),
-            "must not re-emit (owner, 0): contract would reject duplicate"
+            "must not re-emit (owner, 0): the room already holds it"
         );
         // The CRITICAL back-fill assertion: member gets v0 even though
         // we're rotating to v1.
@@ -6600,6 +7873,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -6937,6 +8211,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -7977,6 +9252,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         }
     }
@@ -8197,6 +9473,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -8417,6 +9694,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -8533,6 +9811,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -8651,6 +9930,7 @@ mod tests {
             self_nickname: None,
             previous_contract_key: None,
             rekey_merge: Default::default(),
+            own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
         };
 
@@ -8746,8 +10026,8 @@ mod tests {
         assert_eq!(owed_rekey_merge(&placeholder), None);
     }
 
-    /// The legacy fan-out after a delegate re-key answers oldest generation
-    /// first. The marker a room keeps must come from the NEWEST delegate
+    /// The legacy fan-out after a delegate re-key answers in any order. The
+    /// marker a room keeps must come from the NEWEST delegate
     /// generation's copy (it knows the key the device last saved under), not
     /// from whichever copy got there first (freenet/river#769).
     #[test]

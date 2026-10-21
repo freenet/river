@@ -81,6 +81,31 @@ pub fn bundled_room_code_hash() -> [u8; 32] {
     *blake3::hash(ROOM_CONTRACT_WASM).as_bytes()
 }
 
+/// Why `issuer` may not sign a ban in `room_state`, if it may not: the
+/// contract drops a ban whose issuer is deeper in the invite tree than the
+/// ban evidence depth cap (`min(max_members, 4)` invites below the owner).
+fn ban_depth_refusal(
+    room_state: &ChatRoomStateV1,
+    issuer: MemberId,
+    owner_id: MemberId,
+) -> Option<String> {
+    let max_members = room_state.configuration.configuration.max_members;
+    if river_core::room_state::ban::BansV1::issuer_within_depth_cap(
+        issuer,
+        &room_state.members,
+        owner_id,
+        max_members,
+    ) {
+        return None;
+    }
+    let cap = river_core::room_state::ban_evidence::evidence_depth_cap(max_members);
+    Some(format!(
+        "Bans only take effect from members at most {cap} invites below the room owner \
+         in this room, and you joined further down, so a ban from you would have no \
+         effect. Ask a moderator closer to the owner."
+    ))
+}
+
 /// [`PointerIo`] over riverctl's existing node connection.
 ///
 /// Deliberately not built on the crate's `ConservativeProbeIo` adapter: that
@@ -203,15 +228,17 @@ fn next_upgrade_hop(
 /// `next_state` INTO a clone of `base`, mirroring the UI (which merges a
 /// followed pointer's state into the authoritative current-key `RoomData`
 /// rather than replacing it), so a followed subset can never drop content
-/// already present on the base. On a merge failure the base is returned
-/// unchanged rather than losing it.
+/// already present on the base. The merge is [`merge_converging`], as for
+/// the other local merges, so a followed generation the room's merge refuses
+/// once (its configuration does not outrank the base's) is still folded in.
+/// On a merge failure the base is returned unchanged rather than losing it.
 fn fold_forward_upgrade_state(
     base: &ChatRoomStateV1,
     next_state: &ChatRoomStateV1,
     params: &ChatRoomParametersV1,
 ) -> ChatRoomStateV1 {
     let mut merged = base.clone();
-    match merged.merge(base, params, next_state) {
+    match merge_converging(&mut merged, params, next_state) {
         Ok(()) => {
             merged.recent_messages.rebuild_actions_state();
             merged
@@ -392,14 +419,15 @@ impl ProbeStateOps for RiverCliMigrationProbeOps {
         // The active-migration merge (unlike the read path's pass-through):
         // CRDT-merge the recovered network state with the local cache so
         // neither a fresher network state nor unsynced local edits are lost.
-        // Preserved exactly from the pre-driver `get_migration_state`:
-        //   let mut merged = net_state.clone();
-        //   merged.merge(&net_state, &params, local_state)  // Err => net_state
+        // The merge is `merge_converging`, as for the other local merges, so
+        // a local copy the room's merge refuses once (its configuration does
+        // not outrank the recovered state's) is still merged in. On any other
+        // failure the recovered network state is used alone, as before.
         let params = ChatRoomParametersV1 {
             owner: self.inner.owner_vk,
         };
         let mut merged = recovered.clone();
-        match merged.merge(&recovered, &params, local) {
+        match merge_converging(&mut merged, &params, local) {
             Ok(()) => merged,
             Err(e) => {
                 info!("Merge with local state failed ({e}); using network state alone");
@@ -2253,14 +2281,12 @@ fn classify_reaction(
 /// - a private room has no secret available, so sealing returns `None` (we must
 ///   never publish a plaintext nickname into a private room);
 /// - the stored nickname's byte length exceeds the room's current
-///   `max_nickname_size`. The contract's `MemberInfoV1::apply_delta` rejects the
-///   ENTIRE rejoin delta (members + member_info together) when
-///   `declared_len() > max_nickname_size`, so an over-long restored nickname
-///   would block the member from rejoining at all. `declared_len()` is the
-///   plaintext byte length for both public and sealed values, so comparing
-///   `nick.len()` here matches the contract check exactly. The 6-byte `"Member"`
-///   placeholder keeps the rejoin working (regression guard — Codex/skeptical
-///   review of PR #321).
+///   `max_nickname_size`. That limit is a client rule (riverctl and the UI do
+///   not sign a nickname over it; the room holds nicknames only to a fixed
+///   ceiling), checked by `nickname_refusal` on the plaintext byte length,
+///   which is what `declared_len()` reports for public and sealed values
+///   alike. The 6-byte `"Member"` placeholder is published instead, so the
+///   rejoin still carries a nickname (regression guard, PR #321).
 fn rejoin_preferred_nickname(
     room_state: &ChatRoomStateV1,
     signing_key: &SigningKey,
@@ -2279,6 +2305,198 @@ fn rejoin_preferred_nickname(
             )
         })
         .unwrap_or_else(|| SealedBytes::public("Member".to_string().into_bytes()))
+}
+
+/// How the room's whole-state merge words its refusal of an incoming state
+/// whose configuration does not outrank the receiver's and that holds more
+/// than one delta may carry in the receiver's room (river-core's
+/// `refuse_beyond_receiver_bounds`). Pinned by the convergence tests.
+const LOWER_RANKED_REFUSAL: &str = "under a configuration that does not outrank this room's";
+
+/// Merge `other` into `target` with the room's whole-state merge, and
+/// converge when that merge refuses `other` (its configuration does not
+/// outrank `target`'s and it holds more than one delta may carry in
+/// `target`'s room): `other` first takes `target`'s side, then that is
+/// merged in. The UI's `room_data::merge_converging` does the same. `target`
+/// is unchanged when the merge fails either way; the error is the first
+/// merge's.
+fn merge_converging(
+    target: &mut ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+    other: &ChatRoomStateV1,
+) -> std::result::Result<(), String> {
+    let mut merged = target.clone();
+    let first = match merged.merge_from(params, other) {
+        Ok(()) => {
+            *target = merged;
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    // Only the lower-ranked refusal converges this way; any other failure
+    // (a record no key verifies, ...) is the merge's answer.
+    if !first.contains(LOWER_RANKED_REFUSAL) {
+        return Err(first);
+    }
+    let mut other_side = other.clone();
+    other_side
+        .merge_from(params, target)
+        .map_err(|_| first.clone())?;
+    let mut merged = target.clone();
+    merged.merge_from(params, &other_side).map_err(|_| first)?;
+    *target = merged;
+    Ok(())
+}
+
+/// `state` with a DM purge this client signed, and the room's winning purge
+/// envelope omits, re-signed in (see `river_core::own_purges`), and the
+/// envelope to publish; `None` when nothing is re-signed. `own` records the
+/// winning version re-signed against, so the caller persists it either way.
+fn fold_own_purge_heal(
+    own: &mut river_core::own_purges::OwnPurges,
+    signing_key: &SigningKey,
+    room_owner_key: &VerifyingKey,
+    state: &ChatRoomStateV1,
+) -> Option<
+    Result<(
+        ChatRoomStateV1,
+        river_core::room_state::direct_messages::AuthorizedRecipientPurges,
+    )>,
+> {
+    let envelope = match own.heal(signing_key, room_owner_key, state)? {
+        Ok(envelope) => envelope,
+        Err(e) => return Some(Err(anyhow!("DM purge re-sign not built: {e}"))),
+    };
+    let delta = ChatRoomStateV1Delta {
+        direct_messages: Some(
+            river_core::room_state::direct_messages::DirectMessagesDelta {
+                new_messages: vec![],
+                advanced_purges: vec![envelope.clone()],
+            },
+        ),
+        ..Default::default()
+    };
+    let mut healed = state.clone();
+    Some(
+        healed
+            .apply_delta(
+                state,
+                &ChatRoomParametersV1 {
+                    owner: *room_owner_key,
+                },
+                &Some(delta),
+            )
+            .map(|()| (healed, envelope))
+            .map_err(|e| anyhow!("DM purge re-sign not applied: {e}")),
+    )
+}
+
+/// Re-publish a DM purge this client signed that `state`'s winning purge
+/// envelope for this member omits (`fold_own_purge_heal`), with `publish`
+/// sending the delta. Skipped under a signing-key override that is not the
+/// room's stored identity, whose purges these are not. The re-signed state
+/// is stored, and the record of the version re-signed against kept, only
+/// once `publish` succeeds, so an envelope that did not go out is signed and
+/// published again on the next read. Returns the state to operate on: the
+/// re-signed one when the envelope was published, else `state` unchanged.
+async fn heal_own_purges_in<F, Fut>(
+    storage: &crate::storage::Storage,
+    room_owner_key: &VerifyingKey,
+    state: ChatRoomStateV1,
+    publish: F,
+) -> ChatRoomStateV1
+where
+    F: FnOnce(ChatRoomStateV1Delta) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let Ok(rooms) = storage.load_rooms() else {
+        return state;
+    };
+    let key_str = bs58::encode(room_owner_key.as_bytes()).into_string();
+    let Some(info) = rooms.rooms.get(&key_str) else {
+        return state;
+    };
+    let signing_key = storage.resolve_signing_key(&info.signing_key_bytes);
+    if signing_key.to_bytes() != info.signing_key_bytes {
+        return state;
+    }
+    let mut own = info.own_purges.clone();
+    // A recipient that left the room has its record dropped first.
+    if own.prune(room_owner_key, &state) {
+        if let Err(e) = storage.update_own_purges(room_owner_key, |held| {
+            held.prune(room_owner_key, &state);
+        }) {
+            warn!("DM purge record: not pruned: {e}");
+        }
+    }
+    let Some(result) = fold_own_purge_heal(&mut own, &signing_key, room_owner_key, &state) else {
+        return state;
+    };
+    let (healed, envelope) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("{e}");
+            return state;
+        }
+    };
+    info!(
+        "Re-signing DM purges for room {key_str} at version {}: the room's winning \
+         envelope omits a purge this client signed",
+        envelope.state.version
+    );
+    let delta = ChatRoomStateV1Delta {
+        direct_messages: Some(
+            river_core::room_state::direct_messages::DirectMessagesDelta {
+                new_messages: vec![],
+                advanced_purges: vec![envelope],
+            },
+        ),
+        ..Default::default()
+    };
+    if let Err(e) = publish(delta).await {
+        warn!("DM purge re-sign: not published, signed again on the next read: {e}");
+        return state;
+    }
+    if let Err(e) = storage.update_own_purges(room_owner_key, |held| held.union(&own)) {
+        warn!("DM purge re-sign: record not saved: {e}");
+    }
+    if let Err(e) = storage.update_room_state(room_owner_key, healed.clone()) {
+        warn!("DM purge re-sign: local state not saved: {e}");
+    }
+    healed
+}
+
+/// The check riverctl runs before signing a nickname for `state`'s room
+/// (setting it, or joining with it): the room's `max_nickname_size` is a
+/// client rule, and the room holds nicknames to a fixed ceiling regardless.
+fn nickname_edit_refusal(state: &ChatRoomStateV1, nickname: &str) -> Result<()> {
+    match river_core::room_state::member_info::nickname_refusal(
+        nickname.len(),
+        &state.configuration.configuration,
+    ) {
+        Some(reason) => Err(anyhow!(reason)),
+        None => Ok(()),
+    }
+}
+
+/// `held` with `modify` applied as the owner's next configuration, ready to
+/// sign, or the reason it must not be signed: the same normalization and
+/// check the UI runs (`Configuration::normalize_for_signing`,
+/// `Configuration::signing_refusal`).
+fn prepare_config_edit(
+    held: &Configuration,
+    owner: &VerifyingKey,
+    modify: impl FnOnce(&mut Configuration),
+) -> Result<Configuration> {
+    let mut new_config = held.clone();
+    new_config.configuration_version += 1;
+    modify(&mut new_config);
+    let params = ChatRoomParametersV1 { owner: *owner };
+    new_config.normalize_for_signing(held, &params);
+    if let Some(reason) = new_config.signing_refusal(&params) {
+        return Err(anyhow!("Invalid configuration: {reason}"));
+    }
+    Ok(new_config)
 }
 
 /// Build the initial `ChatRoomStateV1` for a brand-new room: the owner-signed
@@ -2747,6 +2965,15 @@ impl ApiClient {
         let signing_key =
             SigningKey::from_bytes(&rand::Rng::gen::<[u8; 32]>(&mut rand::thread_rng()));
         let owner_vk = signing_key.verifying_key();
+        // The room's first configuration and the creator's nickname must
+        // pass the checks the room applies (freenet/river#703).
+        if let Some(reason) = river_core::room_state::configuration::new_room_refusal(
+            &ChatRoomParametersV1 { owner: owner_vk },
+            &name,
+            &nickname,
+        ) {
+            return Err(anyhow!("Cannot create the room: {reason}"));
+        }
 
         // Build the initial room state (owner config + member_info), plus the v0
         // secret for a private room. Extracted as a pure helper so the
@@ -3117,8 +3344,24 @@ impl ApiClient {
                 unhealed
             }
         };
+        // A DM purge this client signed that the room's winning envelope
+        // omits is re-signed and published (best-effort, like the heal above).
+        let room_state = self.heal_own_purges(room_owner_key, room_state).await;
 
         Ok(room_state)
+    }
+
+    /// Re-publish a DM purge this client signed that `state`'s winning purge
+    /// envelope omits ([`heal_own_purges_in`], publishing with `send_delta`).
+    async fn heal_own_purges(
+        &self,
+        room_owner_key: &VerifyingKey,
+        state: ChatRoomStateV1,
+    ) -> ChatRoomStateV1 {
+        heal_own_purges_in(&self.storage, room_owner_key, state, |delta| {
+            self.send_delta(room_owner_key, delta)
+        })
+        .await
     }
 
     /// Detect and remediate the "Unknown member" condition for the current
@@ -3917,6 +4160,10 @@ impl ApiClient {
         // see the UI's `build_member_info_heal` in
         // `ui/src/room_data.rs` for the eventual remediation
         // path (CLI counterpart filed as freenet/river#304).
+        // The room's nickname limit, checked before the invitee's
+        // member_info is signed (freenet/river#703).
+        nickname_edit_refusal(&room_state, nickname)
+            .map_err(|e| anyhow!("{e} Accept the invitation again with a shorter --nickname."))?;
         let sealed_nickname = crate::private_room::seal_invitee_nickname(
             &room_state,
             signing_key,
@@ -6028,6 +6275,10 @@ impl ApiClient {
 
         let my_member_id = signing_key.verifying_key().into();
 
+        // The room's `max_nickname_size` is a client rule, checked before
+        // signing (the contract holds nicknames only to a fixed ceiling).
+        nickname_edit_refusal(&room_state, &new_nickname)?;
+
         // Seal the nickname for the room's privacy mode. In a PRIVATE room the
         // nickname MUST be AES-256-GCM sealed under the room secret — sending
         // it as plaintext (the previous unconditional `SealedBytes::public`)
@@ -6255,11 +6506,12 @@ impl ApiClient {
             return Err(anyhow!("Cannot ban the room owner"));
         }
 
-        // Verify authorization using the SAME `is_ban_authorized` predicate the
-        // contract enforces (owner OR strict-ancestor-of-target OR
-        // owner-appointed global moderator OR deputy-of-an-ancestor), so
-        // client-side rejection stays in lockstep with
-        // on-contract enforcement (#410).
+        // Verify authorization using the SAME predicates the contract
+        // enforces: `is_ban_authorized` (owner OR strict-ancestor-of-target OR
+        // owner-appointed global moderator OR deputy-of-an-ancestor, #410) and
+        // `issuer_within_depth_cap` (cleanup drops a ban whose issuer is
+        // deeper in the invite tree than the ban evidence depth cap), so a ban
+        // the contract would ignore is refused here instead of being signed.
         if my_member_id != owner_member_id {
             let members_by_id = room_state.members.members_by_member_id();
             let authorized = river_core::room_state::member::MembersV1::is_ban_authorized(
@@ -6275,6 +6527,9 @@ impl ApiClient {
                      (directly or indirectly), or members within a subtree you have been \
                      deputized over."
                 ));
+            }
+            if let Some(reason) = ban_depth_refusal(&room_state, my_member_id, owner_member_id) {
+                return Err(anyhow!(reason));
             }
         }
 
@@ -6481,10 +6736,14 @@ impl ApiClient {
         // Fetch fresh room state from the network
         let room_state = self.get_room(room_owner_key, false).await?;
 
-        // Clone current config and apply modifications
-        let mut new_config = room_state.configuration.configuration.clone();
-        new_config.configuration_version += 1;
-        modify(&mut new_config);
+        // The same check the UI runs before signing: the room skips (does
+        // not reject) a configuration that fails it, so without this the edit
+        // would report success and do nothing.
+        let new_config = prepare_config_edit(
+            &room_state.configuration.configuration,
+            room_owner_key,
+            modify,
+        )?;
 
         // Sign the new configuration
         let authorized_config = AuthorizedConfigurationV1::new(new_config, &signing_key);
@@ -8984,6 +9243,552 @@ mod create_room_tests {
         );
     }
 
+    fn room_with_bob() -> (SigningKey, SigningKey, ChatRoomStateV1) {
+        use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+        let owner = SigningKey::from_bytes(&[41u8; 32]);
+        let bob = SigningKey::from_bytes(&[42u8; 32]);
+        let (mut state, _) = build_new_room_state(&owner, "Room", "Owner", false);
+        let owner_id = MemberId::from(&owner.verifying_key());
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: bob.verifying_key(),
+            },
+            &owner,
+        ));
+        (owner, bob, state)
+    }
+
+    fn with_purge(
+        state: &ChatRoomStateV1,
+        owner: &SigningKey,
+        env: river_core::room_state::direct_messages::AuthorizedRecipientPurges,
+    ) -> ChatRoomStateV1 {
+        let mut s = state.clone();
+        s.apply_delta(
+            state,
+            &ChatRoomParametersV1 {
+                owner: owner.verifying_key(),
+            },
+            &Some(ChatRoomStateV1Delta {
+                direct_messages: Some(
+                    river_core::room_state::direct_messages::DirectMessagesDelta {
+                        new_messages: vec![],
+                        advanced_purges: vec![env],
+                    },
+                ),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        s
+    }
+
+    /// Two riverctl installs of one member purge different DMs at the same
+    /// purge version; one envelope wins. The install whose purge lost
+    /// re-signs the union on its next read, and both converge with both
+    /// tombstones; neither re-signs again.
+    #[test]
+    fn a_purge_that_lost_is_re_signed_as_the_union() {
+        use river_core::own_purges::OwnPurges;
+        use river_core::room_state::direct_messages::{advance_recipient_purges, PurgeToken};
+        use river_core::room_state::member::MemberId;
+        let (owner, bob, base) = room_with_bob();
+        let owner_vk = owner.verifying_key();
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let bob_id = MemberId::from(&bob.verifying_key());
+        let (t1, t2) = (PurgeToken([1; 16]), PurgeToken([2; 16]));
+        let x = with_purge(
+            &base,
+            &owner,
+            advance_recipient_purges(&bob, &owner_vk, None, [t1]).unwrap(),
+        );
+        let y = with_purge(
+            &base,
+            &owner,
+            advance_recipient_purges(&bob, &owner_vk, None, [t2]).unwrap(),
+        );
+        let (mut own_x, mut own_y) = (OwnPurges::default(), OwnPurges::default());
+        own_x.record(bob_id, [t1]);
+        own_y.record(bob_id, [t2]);
+        let mut network = x.clone();
+        network.merge(&x, &params, &y).unwrap();
+        let heal_x = fold_own_purge_heal(&mut own_x, &bob, &owner_vk, &network);
+        let heal_y = fold_own_purge_heal(&mut own_y, &bob, &owner_vk, &network);
+        assert!(
+            heal_x.is_some() != heal_y.is_some(),
+            "exactly the losing install re-signs"
+        );
+        let (healed, envelope) = heal_x.or(heal_y).unwrap().unwrap();
+        assert_eq!(envelope.state.purged, vec![t1, t2]);
+        let mut converged = network.clone();
+        converged.merge(&network, &params, &healed).unwrap();
+        assert_eq!(converged.direct_messages, healed.direct_messages);
+        assert!(fold_own_purge_heal(&mut own_x, &bob, &owner_vk, &converged).is_none());
+        assert!(fold_own_purge_heal(&mut own_y, &bob, &owner_vk, &converged).is_none());
+        // No loop: against the same winning version, never twice.
+        let mut own = OwnPurges::default();
+        own.record(bob_id, [PurgeToken([9; 16])]);
+        assert!(fold_own_purge_heal(&mut own, &bob, &owner_vk, &network).is_some());
+        assert!(fold_own_purge_heal(&mut own, &bob, &owner_vk, &network).is_none());
+    }
+
+    /// A copy of the room `owner` owns, on configuration `version` with ban
+    /// cap `cap`, holding `n_msgs` owner messages and `n_bans` owner-issued
+    /// bans, normalized by a merge with itself.
+    fn generation_copy(
+        owner: &SigningKey,
+        version: u32,
+        cap: usize,
+        n_msgs: u64,
+        n_bans: u64,
+    ) -> ChatRoomStateV1 {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        use river_core::room_state::member::MemberId;
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let owner_id = MemberId::from(&owner.verifying_key());
+        let params = ChatRoomParametersV1 {
+            owner: owner.verifying_key(),
+        };
+        let (mut s, _) = build_new_room_state(owner, "Room", "Owner", false);
+        let mut c = s.configuration.configuration.clone();
+        c.configuration_version = version;
+        c.max_user_bans = cap;
+        s.configuration = AuthorizedConfigurationV1::new(c, owner);
+        s.recent_messages.messages = (0..n_msgs)
+            .map(|i| {
+                AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: owner_id,
+                        author: owner_id,
+                        time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i),
+                        content: RoomMessageBody::public(format!("m{i}")),
+                    },
+                    owner,
+                )
+            })
+            .collect();
+        s.recent_messages.rebuild_actions_state();
+        s.bans = BansV1(
+            (0..n_bans)
+                .map(|i| {
+                    AuthorizedUserBan::new(
+                        UserBan {
+                            owner_member_id: owner_id,
+                            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(i),
+                            banned_user: MemberId::from(
+                                &SigningKey::from_bytes(&{
+                                    let mut b = [6u8; 32];
+                                    b[..8].copy_from_slice(&i.to_le_bytes());
+                                    b
+                                })
+                                .verifying_key(),
+                            ),
+                        },
+                        owner_id,
+                        owner,
+                    )
+                })
+                .collect(),
+        );
+        let mut m = s.clone();
+        m.merge_from(&params, &s).unwrap();
+        m
+    }
+
+    /// A copy on the owner's newer configuration (ban cap 10) merging a copy
+    /// on an older one holding 150 bans and a message it lacks: the room's
+    /// merge refuses the older copy once, and the local merge converges
+    /// instead of keeping one side.
+    #[test]
+    fn a_local_merge_converges_past_a_lower_ranked_refusal() {
+        let owner = SigningKey::from_bytes(&[43u8; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: owner.verifying_key(),
+        };
+        let state = |version: u32, cap: usize, n_msgs: u64, n_bans: u64| {
+            generation_copy(&owner, version, cap, n_msgs, n_bans)
+        };
+        let lowered = state(2, 10, 1, 0);
+        let stale = state(1, 300, 2, 150);
+        let mut probe = lowered.clone();
+        let refused = probe.merge_from(&params, &stale).unwrap_err();
+        assert!(refused.contains(LOWER_RANKED_REFUSAL), "premise: {refused}");
+        let mut merged = lowered.clone();
+        merge_converging(&mut merged, &params, &stale).expect("converges");
+        assert_eq!(merged.recent_messages.messages.len(), 2);
+        assert_eq!(merged.bans.0.len(), 10);
+    }
+
+    /// Folding a followed generation the room's merge refuses once (its
+    /// configuration does not outrank the base's and it holds 150 bans
+    /// where the base's cap is 10) converges as the other local merges do:
+    /// the followed generation's message is kept and the base's cap holds.
+    #[test]
+    fn fold_forward_upgrade_state_converges_past_a_lower_ranked_refusal() {
+        let owner = SigningKey::from_bytes(&[44u8; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: owner.verifying_key(),
+        };
+        let base = generation_copy(&owner, 2, 10, 1, 0);
+        let followed = generation_copy(&owner, 1, 300, 2, 150);
+        let refused = base.clone().merge_from(&params, &followed).unwrap_err();
+        assert!(refused.contains(LOWER_RANKED_REFUSAL), "premise: {refused}");
+        let folded = fold_forward_upgrade_state(&base, &followed, &params);
+        assert_eq!(folded.recent_messages.messages.len(), 2);
+        assert_eq!(folded.bans.0.len(), 10);
+    }
+
+    /// Any other merge error is returned as it is, without the converging
+    /// steps: here the incoming copy holds 150 bans under its own cap of 100,
+    /// and the converging steps would succeed (the copy takes the target's
+    /// side and trims), yet the merge fails with the copy's own-limit error
+    /// and the target is unchanged.
+    #[test]
+    fn a_merge_error_other_than_the_refusal_is_returned_at_once() {
+        let owner = SigningKey::from_bytes(&[47u8; 32]);
+        let vk = owner.verifying_key();
+        let params = ChatRoomParametersV1 { owner: vk };
+        let lowered = generation_copy(&owner, 2, 10, 1, 0);
+        let mut over = generation_copy(&owner, 1, 300, 2, 150);
+        let mut c = over.configuration.configuration.clone();
+        c.max_user_bans = 100;
+        over.configuration = AuthorizedConfigurationV1::new(c, &owner);
+        let mut other_side = over.clone();
+        other_side.merge_from(&params, &lowered).unwrap();
+        let mut converged = lowered.clone();
+        converged
+            .merge_from(&params, &other_side)
+            .expect("premise: the converging steps succeed here");
+        let mut target = lowered.clone();
+        let err = merge_converging(&mut target, &params, &over).unwrap_err();
+        assert!(err.contains("its own configuration's limit"), "{err}");
+        assert!(!err.contains(LOWER_RANKED_REFUSAL), "{err}");
+        assert_eq!(target, lowered);
+    }
+
+    /// When the converging merge fails past the lower-ranked refusal (the
+    /// refused copy also holds a member record the owner did not sign, with
+    /// a message by that member: the copy takes the target's side, and
+    /// merging that in fails on the record), the target is left exactly as
+    /// it was and the error is the refusal.
+    #[test]
+    fn a_failed_converging_merge_leaves_the_target_untouched() {
+        use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let owner = SigningKey::from_bytes(&[45u8; 32]);
+        let owner_vk = owner.verifying_key();
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let lowered = generation_copy(&owner, 2, 10, 1, 0);
+        let mut stale = generation_copy(&owner, 1, 300, 2, 150);
+        let member = SigningKey::from_bytes(&[46u8; 32]);
+        stale.members.members.push(AuthorizedMember {
+            member: Member {
+                owner_member_id: MemberId::from(&owner_vk),
+                invited_by: MemberId::from(&owner_vk),
+                member_vk: member.verifying_key(),
+            },
+            signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+        });
+        stale
+            .recent_messages
+            .messages
+            .push(AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: MemberId::from(&owner_vk),
+                    author: MemberId::from(&member.verifying_key()),
+                    time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000),
+                    content: RoomMessageBody::public("by the member".to_string()),
+                },
+                &member,
+            ));
+        stale.recent_messages.rebuild_actions_state();
+        let refused = lowered.clone().merge_from(&params, &stale).unwrap_err();
+        assert!(refused.contains(LOWER_RANKED_REFUSAL), "premise: {refused}");
+        let mut target = lowered.clone();
+        let err = merge_converging(&mut target, &params, &stale).unwrap_err();
+        assert!(err.contains(LOWER_RANKED_REFUSAL), "{err}");
+        assert_eq!(target, lowered);
+    }
+
+    /// A storage holding the room `room_with_bob` builds, as bob, with bob
+    /// having recorded a purge of `token` that the network's winning
+    /// envelope (signed by bob's other install) omits; and that network state.
+    fn purge_heal_fixture(
+        token: river_core::room_state::direct_messages::PurgeToken,
+    ) -> (
+        crate::storage::Storage,
+        tempfile::TempDir,
+        SigningKey,
+        ChatRoomStateV1,
+    ) {
+        use river_core::room_state::direct_messages::{advance_recipient_purges, PurgeToken};
+        use river_core::room_state::member::MemberId;
+        let (owner, bob, base) = room_with_bob();
+        let owner_vk = owner.verifying_key();
+        let other_install =
+            advance_recipient_purges(&bob, &owner_vk, None, [PurgeToken([7; 16])]).unwrap();
+        let network = with_purge(&base, &owner, other_install);
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::storage::Storage::new(Some(dir.path().to_str().unwrap())).unwrap();
+        storage
+            .add_room(
+                &owner_vk,
+                &bob,
+                base.clone(),
+                // bundled-wasm-ok: a test fixture's stored key; no pointer is resolved.
+                &compute_contract_key(&owner_vk),
+            )
+            .unwrap();
+        storage
+            .update_own_purges(&owner_vk, |own| {
+                own.record(MemberId::from(&bob.verifying_key()), [token])
+            })
+            .unwrap();
+        (storage, dir, owner, network)
+    }
+
+    /// A re-signed envelope that is published stores the re-signed state and
+    /// records the version it was signed against, so the next read does not
+    /// sign again; the record kept is the union with what is stored.
+    #[tokio::test]
+    async fn a_published_purge_re_sign_is_recorded() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let token = PurgeToken([1; 16]);
+        let (storage, _dir, owner, network) = purge_heal_fixture(token);
+        let owner_vk = owner.verifying_key();
+        let sent = std::cell::Cell::new(0);
+        let healed = heal_own_purges_in(&storage, &owner_vk, network.clone(), |d| {
+            sent.set(sent.get() + 1);
+            assert_eq!(
+                d.direct_messages.unwrap().advanced_purges[0]
+                    .state
+                    .purged
+                    .len(),
+                2
+            );
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(sent.get(), 1);
+        let held = |s: &ChatRoomStateV1| s.direct_messages.purges[0].state.purged.clone();
+        assert_eq!(held(&healed), vec![token, PurgeToken([7; 16])]);
+        let (_, stored, _) = storage.get_room(&owner_vk).unwrap().unwrap();
+        assert_eq!(held(&stored), held(&healed));
+        heal_own_purges_in(&storage, &owner_vk, network, |_| {
+            sent.set(sent.get() + 1);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(sent.get(), 1, "not signed again against the same version");
+    }
+
+    /// A re-sign whose publish fails is not recorded: the next read signs and
+    /// publishes again.
+    #[tokio::test]
+    async fn a_purge_re_sign_that_was_not_published_is_retried() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let (storage, _dir, owner, network) = purge_heal_fixture(PurgeToken([1; 16]));
+        let owner_vk = owner.verifying_key();
+        let sent = std::cell::Cell::new(0);
+        let out = heal_own_purges_in(&storage, &owner_vk, network.clone(), |_| {
+            sent.set(sent.get() + 1);
+            async { Err(anyhow!("node unreachable")) }
+        })
+        .await;
+        assert_eq!(out, network, "nothing published, the state is unchanged");
+        let (_, stored, _) = storage.get_room(&owner_vk).unwrap().unwrap();
+        assert!(
+            stored.direct_messages.purges.is_empty(),
+            "nothing unpublished is stored"
+        );
+        heal_own_purges_in(&storage, &owner_vk, network, |_| {
+            sent.set(sent.get() + 1);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(sent.get(), 2);
+    }
+
+    /// A read of a room the recorded recipient has left drops its record
+    /// and publishes nothing.
+    #[tokio::test]
+    async fn a_purge_record_of_a_recipient_who_left_is_dropped() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let (storage, _dir, owner, mut network) = purge_heal_fixture(PurgeToken([1; 16]));
+        let owner_vk = owner.verifying_key();
+        network.members.members.clear();
+        network.direct_messages.purges.clear();
+        heal_own_purges_in(&storage, &owner_vk, network, |_| async {
+            panic!("must not publish")
+        })
+        .await;
+        let key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        assert!(storage.load_rooms().unwrap().rooms[&key_str]
+            .own_purges
+            .purged
+            .is_empty());
+    }
+
+    /// Under a signing-key override that is not the room's stored identity,
+    /// nothing is re-signed: the recorded purges are not that identity's.
+    #[tokio::test]
+    async fn a_purge_re_sign_is_skipped_under_another_identity() {
+        use river_core::room_state::direct_messages::PurgeToken;
+        let (_, dir, owner, network) = purge_heal_fixture(PurgeToken([1; 16]));
+        let other = crate::storage::Storage::new_with_override(
+            Some(dir.path().to_str().unwrap()),
+            Some(SigningKey::from_bytes(&[99u8; 32])),
+        )
+        .unwrap();
+        let out = heal_own_purges_in(&other, &owner.verifying_key(), network.clone(), |_| async {
+            panic!("must not publish")
+        })
+        .await;
+        assert_eq!(out, network);
+    }
+
+    /// The nickname and room checks run before anything is signed, in each
+    /// command that signs: `invite accept` before the invitee's member info
+    /// is sealed, `member set-nickname` before the nickname is sealed, `room
+    /// create` before its first state is built, and `room config` through
+    /// `prepare_config_edit` before signing.
+    #[test]
+    fn the_refusals_run_before_signing_in_each_command() {
+        // The first occurrence of each signature is the definition; the
+        // test modules come after the `impl ApiClient` block.
+        let code = include_str!("api.rs");
+        let body = |sig: &str| {
+            let start = code.find(sig).unwrap_or_else(|| panic!("{sig}"));
+            let rest = &code[start..];
+            rest[..rest.find("\n    }\n").expect("method end")]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        };
+        let before = |b: &str, check: &str, then: &str| {
+            let c = b.find(check).unwrap_or_else(|| panic!("{check} missing"));
+            let t = b.find(then).unwrap_or_else(|| panic!("{then} missing"));
+            assert!(c < t, "{check} must come before {then}");
+        };
+        let accept = body("pub async fn accept_invitation_struct(");
+        before(
+            &accept,
+            "nickname_edit_refusal(&room_state,nickname)",
+            "seal_invitee_nickname(",
+        );
+        let set = body("pub async fn set_nickname(");
+        before(
+            &set,
+            "nickname_edit_refusal(&room_state,&new_nickname)?;",
+            "AuthorizedMemberInfo",
+        );
+        let create = body("pub async fn create_room(");
+        before(
+            &create,
+            "configuration::new_room_refusal(",
+            "build_new_room_state(",
+        );
+        let config = body("pub async fn update_config(");
+        before(
+            &config,
+            "prepare_config_edit(",
+            "AuthorizedConfigurationV1::new(",
+        );
+    }
+
+    /// `rooms.json` stores the purge record as JSON and reads it back; an
+    /// older file without it reads as empty.
+    #[test]
+    fn the_purge_record_round_trips_through_rooms_json() {
+        use river_core::own_purges::OwnPurges;
+        use river_core::room_state::direct_messages::PurgeToken;
+        use river_core::room_state::member::MemberId;
+        let (_, bob, state) = room_with_bob();
+        let mut own = OwnPurges::default();
+        own.record(MemberId::from(&bob.verifying_key()), [PurgeToken([5; 16])]);
+        let info = crate::storage::StoredRoomInfo {
+            signing_key_bytes: bob.to_bytes(),
+            state,
+            contract_key: "k".into(),
+            self_authorized_member: None,
+            invite_chain: vec![],
+            previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
+            self_nickname: None,
+            own_purges: own.clone(),
+        };
+        let mut value = serde_json::to_value(&info).unwrap();
+        let back: crate::storage::StoredRoomInfo = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(back.own_purges, own);
+        value.as_object_mut().unwrap().remove("own_purges");
+        let old: crate::storage::StoredRoomInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(old.own_purges, OwnPurges::default());
+    }
+
+    /// Every read re-signs a lost purge (`get_room` calls the heal), and
+    /// `dm purge` records what it purged.
+    #[test]
+    fn the_purge_heal_is_wired_in() {
+        let api: String = include_str!("api.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(api.contains(&format!(
+            "{}{}",
+            "letroom_state=self.heal_own_purges(", "room_owner_key,room_state).await;"
+        )));
+        let dm: String = include_str!("commands/dm.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(dm.contains(&format!(
+            "{}{}",
+            "record_sent_purge(||{api.storage().record_own_purges(&room_owner_key,",
+            "&signing_key,[resolved_token])})"
+        )));
+    }
+
+    /// `member set-nickname` and `invite accept` refuse a nickname over the
+    /// room's limit before signing; one at the limit is allowed.
+    #[test]
+    fn a_nickname_over_the_room_limit_is_refused_before_signing() {
+        let owner = SigningKey::from_bytes(&[3u8; 32]);
+        let (state, _) = build_new_room_state(&owner, "Room", "Owner", false);
+        let limit = state.configuration.configuration.max_nickname_size;
+        assert!(nickname_edit_refusal(&state, &"n".repeat(limit)).is_ok());
+        let err = nickname_edit_refusal(&state, &"n".repeat(limit + 1)).unwrap_err();
+        assert!(err.to_string().contains(&limit.to_string()), "{err}");
+    }
+
+    /// `room config` signs only a configuration the room takes: a zero limit
+    /// or a nickname limit over the ceiling is refused, an unrelated edit is
+    /// not refused over a held value it cannot fix, and the owner id is the
+    /// room owner's.
+    #[test]
+    fn a_config_edit_is_checked_before_signing() {
+        let owner = SigningKey::from_bytes(&[3u8; 32]);
+        let owner_vk = owner.verifying_key();
+        let (state, _) = build_new_room_state(&owner, "Room", "Owner", false);
+        let held = state.configuration.configuration.clone();
+        let edit = prepare_config_edit(&held, &owner_vk, |c| c.max_members = 7).unwrap();
+        assert_eq!(edit.max_members, 7);
+        assert_eq!(edit.configuration_version, held.configuration_version + 1);
+        assert!(prepare_config_edit(&held, &owner_vk, |c| c.max_user_bans = 0).is_err());
+        assert!(prepare_config_edit(&held, &owner_vk, |c| {
+            c.max_nickname_size = river_core::room_state::member_info::NICKNAME_CEILING + 1
+        })
+        .is_err());
+        let mut odd = held.clone();
+        odd.max_nickname_size = river_core::room_state::member_info::NICKNAME_CEILING + 9;
+        let edit = prepare_config_edit(&odd, &owner_vk, |c| c.max_members = 7).unwrap();
+        assert_eq!(
+            edit.max_nickname_size,
+            river_core::room_state::member_info::NICKNAME_CEILING
+        );
+    }
+
     /// Creating a PUBLIC room is unchanged: no secret, public metadata.
     #[test]
     fn build_new_room_state_public_has_no_secret_and_public_metadata() {
@@ -9401,10 +10206,9 @@ mod rejoin_nickname_tests {
         assert_eq!(out.to_string_lossy(), "Member");
     }
 
-    /// A nickname longer than the room's current `max_nickname_size` must NOT
-    /// be published (the contract would reject the whole rejoin delta) — fall
-    /// back to "Member" so the member can still rejoin. Regression guard for the
-    /// PR #321 Codex/skeptical finding.
+    /// A nickname longer than the room's current `max_nickname_size` is not
+    /// published (riverctl does not sign a nickname over the room's limit):
+    /// the rejoin falls back to "Member". Regression guard for PR #321.
     #[test]
     fn over_long_nickname_falls_back_to_member() {
         // max 8: "Member" (6) fits, but the stored nickname (20) does not.
@@ -13727,5 +14531,74 @@ mod await_response_tests {
             .expect("an UpdateResponse for the new contract answers a re-PUT");
         assert_eq!(conn.reads, 2);
         assert_eq!(stored_key(&storage, &owner_vk), key().id().to_string());
+    }
+}
+
+#[cfg(test)]
+mod ban_depth_refusal_tests {
+    use super::ban_depth_refusal;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersV1};
+    use river_core::room_state::ChatRoomStateV1;
+
+    /// `riverctl` refuses to sign a ban whose issuer sits deeper in the
+    /// invite tree than the ban evidence depth cap, which the contract would
+    /// drop: four invites down is allowed, five is refused with a reason, a
+    /// member limit below 4 lowers the cap, and the owner always may.
+    #[test]
+    fn a_ban_from_deeper_than_the_depth_cap_is_refused() {
+        let owner = SigningKey::from_bytes(&[1; 32]);
+        let owner_id: MemberId = owner.verifying_key().into();
+        let chain: Vec<SigningKey> = (2..8u8).map(|b| SigningKey::from_bytes(&[b; 32])).collect();
+        let mut members = Vec::new();
+        let mut inviter = &owner;
+        for sk in &chain {
+            members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: inviter.verifying_key().into(),
+                    member_vk: sk.verifying_key(),
+                },
+                inviter,
+            ));
+            inviter = sk;
+        }
+        let mut state = ChatRoomStateV1 {
+            members: MembersV1 { members },
+            ..Default::default()
+        };
+        state.configuration.configuration.max_members = 200;
+        let id = |i: usize| -> MemberId { chain[i].verifying_key().into() };
+        assert_eq!(ban_depth_refusal(&state, id(3), owner_id), None);
+        let reason = ban_depth_refusal(&state, id(4), owner_id).expect("refused");
+        assert!(reason.contains("at most 4 invites"), "{reason}");
+        assert_eq!(ban_depth_refusal(&state, owner_id, owner_id), None);
+        state.configuration.configuration.max_members = 3;
+        assert!(ban_depth_refusal(&state, id(3), owner_id).is_some());
+    }
+    /// The ban command asks `ban_depth_refusal` before it signs the ban, and
+    /// returns its reason as the error, so a member deeper than the cap is
+    /// refused rather than handed a ban the contract drops.
+    #[test]
+    fn the_ban_command_checks_the_depth_cap_before_signing() {
+        let src = include_str!("api.rs");
+        let start = src
+            .find("pub async fn ban_member_with_safety(")
+            .expect("the ban command exists");
+        let sign_at = start
+            + src[start..]
+                .find("AuthorizedUserBan::new(")
+                .expect("the ban command signs a ban");
+        let body: String = src[start..sign_at]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains(
+                "if let Some(reason) = ban_depth_refusal(&room_state, my_member_id, owner_member_id)"
+            ) && body.contains("return Err(anyhow!(reason));"),
+            "the ban command must refuse with ban_depth_refusal's reason before signing"
+        );
     }
 }

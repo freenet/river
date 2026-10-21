@@ -5,7 +5,6 @@
 
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::util::FastHash;
-use freenet_scaffold::ComposableState;
 use rand::rngs::OsRng;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
@@ -22,8 +21,15 @@ fn test_default_state_has_placeholder_owner() {
     );
 }
 
+/// A configuration is checked against the room's owner, not against the
+/// configuration the peer holds (freenet/river#703). The placeholder
+/// configuration of an imported room names no owner, so merging the real
+/// network state into it adopts the network's configuration rather than
+/// failing (as it did before #703) or keeping the placeholder. The UI still
+/// replaces such a state wholesale; this pins that a merge cannot leave a
+/// placeholder configuration behind either.
 #[test]
-fn test_merge_fails_when_owner_member_id_differs() {
+fn test_merge_into_placeholder_adopts_the_network_configuration() {
     let owner_sk = SigningKey::generate(&mut OsRng);
     let owner_vk = owner_sk.verifying_key();
     let params = ChatRoomParametersV1 { owner: owner_vk };
@@ -40,20 +46,19 @@ fn test_merge_fails_when_owner_member_id_differs() {
     };
     let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
     let network_state = ChatRoomStateV1 {
-        configuration: auth_config,
+        configuration: auth_config.clone(),
         ..Default::default()
     };
 
-    // Merge should fail because owner_member_id differs
-    let result = local_state.merge(&current, &params, &network_state);
-    assert!(
-        result.is_err(),
-        "Merge should fail due to owner_member_id mismatch"
-    );
-    assert!(
-        result.unwrap_err().contains("owner_member_id"),
-        "Error should mention owner_member_id"
-    );
+    assert_eq!(auth_config.check_values(&params), Ok(()));
+    local_state
+        .merge(&current, &params, &network_state)
+        .expect("the merge succeeds");
+    assert_eq!(local_state.configuration, auth_config);
+    assert!(local_state
+        .configuration
+        .verify_signature(&owner_vk)
+        .is_ok());
 }
 
 #[test]
@@ -97,4 +102,35 @@ fn test_wholesale_replacement_works_for_imported_rooms() {
         local_state.configuration.configuration.owner_member_id,
         MemberId::from(owner_vk),
     );
+}
+
+/// The placeholder's configuration is at version 1, as is a room whose owner
+/// never edited its settings, so the two tie on version. The real
+/// configuration must still replace the placeholder, whichever wins the
+/// signature-digest tie-break: the placeholder is not signed by the owner.
+#[test]
+fn test_placeholder_configuration_never_outranks_the_owners() {
+    for seed in 0..16u8 {
+        let owner_sk = SigningKey::from_bytes(&[seed.wrapping_add(40); 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let mut local_state = ChatRoomStateV1::default();
+        let current = local_state.clone();
+        let auth_config = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: owner_vk.into(),
+                configuration_version: current.configuration.configuration.configuration_version,
+                ..Default::default()
+            },
+            &owner_sk,
+        );
+        let network_state = ChatRoomStateV1 {
+            configuration: auth_config.clone(),
+            ..Default::default()
+        };
+        local_state
+            .merge(&current, &params, &network_state)
+            .unwrap();
+        assert_eq!(local_state.configuration, auth_config, "seed {seed}");
+    }
 }

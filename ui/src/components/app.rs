@@ -4,6 +4,7 @@ pub mod freenet_api;
 pub mod notifications;
 pub mod receive_times;
 pub mod sync_info;
+pub mod update_banner;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::document_title::DocumentTitleUpdater;
@@ -81,6 +82,9 @@ pub static NEEDS_SYNC: GlobalSignal<std::collections::HashSet<VerifyingKey>> =
 /// when polling tasks. setTimeout(0) breaks out of the WASM call stack entirely,
 /// ensuring the write happens in a completely clean execution context.
 pub fn mark_needs_sync(room_key: ed25519_dalek::VerifyingKey) {
+    // A user action is leaving: hold off any generation reload until it has
+    // (freenet/river#580).
+    freenet_api::generation_watch::note_sync_queued();
     crate::util::defer(move || {
         NEEDS_SYNC.write().insert(room_key);
     });
@@ -588,6 +592,7 @@ pub fn App() -> Element {
             invitation: receive_invitation
         }
         DocumentTitleUpdater {}
+        update_banner::UpdateBanner {}
     }
 }
 
