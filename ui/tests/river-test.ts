@@ -8,6 +8,8 @@ type RiverTestHooks = {
   insertMessageBeforeLast(text: string): void;
   appendMessages(count: number): void;
   removeMessages(containing: string): void;
+  // Each emoji as a reaction on the newest message, all held by one test author.
+  addReactionsToNewest(emojis: string[]): void;
   makeRoomPrivateWithoutSecret(): void;
   forgeNextSendSignature(): void;
   setRoomsLoadState(state: RoomsLoadState): void;

@@ -9,7 +9,7 @@ import { readerLeavesTheEnd } from "./history-geometry";
 //
 // Assumes the example-data build is served on `baseURL`, which includes a
 // reply message added in ui/src/example_data.rs specifically so these tests
-// can exercise the reply bubble layout.
+// can exercise the reply strip layout.
 
 // #205: on a narrow viewport, clicking edit on an own message must not produce
 // an edit container wider than the available chat area.
@@ -39,67 +39,26 @@ test.describe("Edit box width (#205)", () => {
   });
 });
 
-// #206 and #207: at a narrow viewport, a reply message bubble should not be
-// wider than a sibling non-reply bubble, and hovering the reply strip should
-// not change the bubble's width.
-test.describe("Reply bubble layout (#206, #207)", () => {
+// #207: hovering a reply strip expands its preview in place. The strip must
+// stay inside the content column and show its whole preview, and the history
+// must not scroll sideways. The self reply to the long URL is the worst case:
+// its unbreakable preview is wider than the column at 480px.
+test.describe("Reply strip layout (#207)", () => {
   test.use({ viewport: { width: 480, height: 900 } });
 
-  test("reply bubbles are not wider than non-reply bubbles", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-
-    const replyStrip = page.locator(".reply-strip").first();
-    await expect(replyStrip).toBeVisible({ timeout: 10_000 });
-
-    // Find the bubble containing the reply strip and a sibling non-reply bubble.
-    const replyBubble = replyStrip.locator(
-      "xpath=ancestor::*[@data-testid='message-bubble'][1]"
-    );
-    const allBubbles = page.getByTestId("message-bubble");
-    const bubbleCount = await allBubbles.count();
-    let maxNonReplyWidth = 0;
-    for (let i = 0; i < bubbleCount; i++) {
-      const bubble = allBubbles.nth(i);
-      const hasReplyStrip = await bubble
-        .locator(".reply-strip")
-        .count();
-      if (hasReplyStrip === 0) {
-        const w = await bubble.evaluate(
-          (el) => el.getBoundingClientRect().width
-        );
-        if (w > maxNonReplyWidth) maxNonReplyWidth = w;
-      }
-    }
-
-    const replyWidth = await replyBubble.evaluate(
-      (el) => el.getBoundingClientRect().width
-    );
-
-    // Reply bubble width should be determined by its body content (same as
-    // non-reply siblings), not by the strip's nowrap text. Allow a small
-    // margin because different content lengths mean widths won't be exactly
-    // equal — the regression was a visible 100-200px gap.
-    //
-    // Before the fix: reply bubbles were dramatically wider because the
-    // reply-strip's nowrap text forced the shrink-to-fit width up to
-    // max-w-prose. After the fix: bubble is sized by the body, strip
-    // ellipsizes within it.
-    expect(replyWidth).toBeLessThanOrEqual(maxNonReplyWidth + 40);
-  });
-
-  test("hovering the reply strip does not change the bubble width", async ({
+  test("a hovered reply strip expands inside the content column", async ({
     page,
   }, testInfo) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    const replyStrip = page.locator(".reply-strip").first();
+    const replyStrip = page
+      .locator(".reply-strip")
+      .filter({ hasText: "longlongurl" })
+      .first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
+    await replyStrip.scrollIntoViewIfNeeded();
 
     // The hover-expand CSS is gated behind
     // `@media (hover: hover) and (pointer: fine)`, which evaluates false
@@ -117,32 +76,36 @@ test.describe("Reply bubble layout (#206, #207)", () => {
       `(hover: hover) and (pointer: fine) is false in this browser (project: ${testInfo.project.name}); the hover-expand CSS is suppressed and there is nothing to exercise`
     );
 
-    const replyBubble = replyStrip.locator(
-      "xpath=ancestor::*[@data-testid='message-bubble'][1]"
-    );
+    const measure = () =>
+      replyStrip.evaluate((el) => {
+        const strip = el.getBoundingClientRect();
+        const column = el.closest(".msg-content")!.getBoundingClientRect();
+        const scroller = document.getElementById("chat-scroll-container")!;
+        return {
+          strip: [strip.left, strip.right],
+          column: [column.left, column.right],
+          height: strip.height,
+          // The expanded preview shows all of its text: none of it is clipped
+          // or spills past the strip (the content column's own scrollWidth
+          // would count the hover bar in the gutter).
+          stripSpill: el.scrollWidth - el.clientWidth,
+          sideways: scroller.scrollWidth - scroller.clientWidth,
+        };
+      });
 
-    const widthBefore = await replyBubble.evaluate(
-      (el) => el.getBoundingClientRect().width
-    );
-
-    // Move mouse to the origin first to ensure no prior hover state
-    // affects the measurement, then hover the reply strip.
     await page.mouse.move(0, 0);
+    const before = await measure();
     await replyStrip.hover();
-    // Poll until the computed `white-space` flips to `normal`, which
-    // proves the hover CSS actually engaged.
+    // The expansion engaged: the preview wraps onto more lines.
     await expect
-      .poll(async () =>
-        replyStrip.evaluate((el) => getComputedStyle(el).whiteSpace)
-      )
-      .toMatch(/normal/);
+      .poll(async () => (await measure()).height)
+      .toBeGreaterThan(before.height);
+    const after = await measure();
 
-    const widthAfter = await replyBubble.evaluate(
-      (el) => el.getBoundingClientRect().width
-    );
-
-    // Width must not change when the reply strip expands on hover.
-    expect(Math.abs(widthAfter - widthBefore)).toBeLessThanOrEqual(0.5);
+    expect(after.strip[0]).toBeGreaterThanOrEqual(after.column[0] - 0.5);
+    expect(after.strip[1]).toBeLessThanOrEqual(after.column[1] + 0.5);
+    expect(after.stripSpill, "the whole preview fits the strip").toBeLessThanOrEqual(0);
+    expect(after.sideways).toBeLessThanOrEqual(0);
   });
 });
 
@@ -248,70 +211,6 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
         page.locator("[id^='msg-'].reply-highlight").count()
       )
       .toBeGreaterThan(0);
-  });
-});
-
-// #212: a message containing an unbreakable long string (e.g. a long URL)
-// must wrap inside the bubble without overflowing. `overflow-wrap: break-word`
-// (the `break-words` utility) inserts soft breaks when content would
-// otherwise overflow, but does NOT lower min-content sizing — so an ancestor
-// `min-w-0` flex parent still gets stretched by the long token. Switching to
-// `overflow-wrap: anywhere` also lowers min-content, which is what lets the
-// bubble actually shrink to fit.
-test.describe("Long unbreakable content (#212)", () => {
-  test.use({ viewport: { width: 1024, height: 900 } });
-
-  test("bubble with long URL wraps and does not cause horizontal overflow", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-
-    const longTokenBubble = page
-      .getByTestId("message-bubble")
-      .filter({ hasText: "longlongurlpath" })
-      .first();
-    await expect(longTokenBubble).toBeVisible({ timeout: 10_000 });
-    await longTokenBubble.scrollIntoViewIfNeeded();
-
-    // Core assertion: the inner prose body must not overflow its own box —
-    // i.e. the long URL must actually wrap. If `overflow-wrap` fails to
-    // apply, the <a> element's min-content exceeds the parent width and
-    // scrollWidth > clientWidth.
-    const proseOverflow = await longTokenBubble.evaluate((el) => {
-      const prose = el.querySelector(".max-w-none") as HTMLElement | null;
-      if (!prose) return { ok: false, reason: "no prose div" };
-      const a = prose.querySelector("a") as HTMLElement | null;
-      const aRect = a?.getBoundingClientRect();
-      const pRect = prose.getBoundingClientRect();
-      return {
-        ok: true,
-        proseScroll: prose.scrollWidth,
-        proseClient: prose.clientWidth,
-        aWidth: aRect?.width ?? 0,
-        proseWidth: pRect.width,
-      };
-    });
-    expect(proseOverflow.ok).toBe(true);
-    // The prose content must not overflow its own container.
-    expect(proseOverflow.proseScroll).toBeLessThanOrEqual(
-      proseOverflow.proseClient + 1
-    );
-    // And the rendered <a> must fit inside the prose box (i.e. the URL
-    // wrapped rather than forcing the link to be wider than its parent).
-    expect(proseOverflow.aWidth).toBeLessThanOrEqual(
-      proseOverflow.proseWidth + 1
-    );
-
-    // Defense in depth: no horizontal overflow on the document. The
-    // original regression screenshot showed the long-URL bubble pushing
-    // the chat column wider than its sibling bubbles.
-    const docOverflow = await page.evaluate(() => ({
-      scroll: document.documentElement.scrollWidth,
-      client: document.documentElement.clientWidth,
-    }));
-    expect(docOverflow.scroll).toBeLessThanOrEqual(docOverflow.client + 1);
   });
 });
 
@@ -558,8 +457,6 @@ test.describe("Composer grows with the draft, up to half the viewport", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("grows as you type, and an 80-line draft never scrolls the app shell", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
     await openRoomWithComposer(page);
     const ta = page.getByTestId("message-input");
     const metrics = () =>
@@ -660,67 +557,6 @@ test.describe("Auto-scroll to bottom on refresh", () => {
   });
 });
 
-// Mobile self-message overflow: a SELF (right-aligned) bubble must stay fully
-// within a narrow viewport. Regression: a self reply whose reply-strip preview
-// held a long unbreakable URL rendered nowrap, driving the bubble to its full
-// `max-w-prose` (65ch) width. As a non-stretched flex item under the self
-// bubbles wrapper's `items-end`, that wrapper sized to the bubble's content and
-// escaped the `max-w-[75%]` column, so the bubble spilled off BOTH edges of a
-// 375px screen (clipped, message text cut off left and right), exactly the
-// "text going off the edge" report. Received (left-aligned) bubbles were fine
-// because their wrapper is a plain block that already fills the column. Fixed
-// by `min-w-0 max-w-full` on the per-message wrapper (conversation.rs). The
-// example data carries a self reply to the long-URL message so this reproduces.
-test.describe("Self message bubble mobile overflow", () => {
-  test.use({ viewport: { width: 375, height: 667 } });
-
-  test("no message bubble overflows either edge of a 375px viewport", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-
-    // The specific reproducer must be present: a reply strip quoting the long
-    // URL. (Its textContent keeps the full preview even though CSS ellipsizes
-    // it, so this also proves the strip rendered rather than being absent.)
-    const longReplyStrip = page
-      .locator(".reply-strip")
-      .filter({ hasText: "longlongurl" })
-      .first();
-    await expect(longReplyStrip).toBeVisible({ timeout: 10_000 });
-
-    // Horizontal position is independent of vertical scroll, so every rendered
-    // bubble can be checked at once: each must lie within [0, viewportWidth].
-    // Before the fix the self reply bubble sat at left ≈ -169 / right ≈ 359 in
-    // a 375px viewport (width 528). After the fix it is clamped to the column.
-    const overflow = await page.evaluate(() => {
-      const vw = window.innerWidth;
-      const bad: Array<{ left: number; right: number; width: number; text: string }> = [];
-      for (const b of Array.from(document.querySelectorAll('[data-testid="message-bubble"]'))) {
-        const r = b.getBoundingClientRect();
-        if (r.width === 0) continue;
-        if (r.left < -1 || r.right > vw + 1) {
-          bad.push({
-            left: Math.round(r.left),
-            right: Math.round(r.right),
-            width: Math.round(r.width),
-            text: (b.textContent || "").trim().replace(/\s+/g, " ").slice(0, 40),
-          });
-        }
-      }
-      return { vw, bad };
-    });
-
-    expect(
-      overflow.bad,
-      `message bubbles overflowing the ${overflow.vw}px viewport: ${JSON.stringify(
-        overflow.bad
-      )}`
-    ).toEqual([]);
-  });
-});
-
 // A reply whose quoted message can no longer be read from room state must show
 // a neutral placeholder instead of the replier-authored snapshot. This is what
 // a reply to a BANNED member's message renders as: banning purges the target,
@@ -763,10 +599,10 @@ test.describe("Unavailable reply quote", () => {
       page.locator('[data-testid="reply-strip"]')
     ).not.toHaveCount(0);
 
-    // Mutually exclusive with the quote strip: no bubble carries both.
-    const bubbles = page.getByTestId("message-bubble");
-    expect(await bubbles.count()).toBeGreaterThan(0);
-    const bothInOneBubble = await bubbles.evaluateAll(
+    // Mutually exclusive with the quote strip: no message carries both.
+    const rows = page.getByTestId("message-row");
+    expect(await rows.count()).toBeGreaterThan(0);
+    const bothInOneRow = await rows.evaluateAll(
       (els) =>
         els.filter(
           (b) =>
@@ -774,7 +610,7 @@ test.describe("Unavailable reply quote", () => {
             b.querySelector('[data-testid="reply-strip-unavailable"]')
         ).length
     );
-    expect(bothInOneBubble).toBe(0);
+    expect(bothInOneRow).toBe(0);
   });
 });
 
@@ -783,8 +619,6 @@ test.describe("Unavailable reply quote", () => {
 // conversation's scroll policy. Run at each project's own device viewport.
 test.describe("Editing the last message keeps its controls reachable (A08)", () => {
   test("Save and Cancel are inside the visible history and hit-testable", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
     await openRoomWithComposer(page);
     const input = page.getByTestId("message-input");
     await input.fill("edit me, I am the last message");

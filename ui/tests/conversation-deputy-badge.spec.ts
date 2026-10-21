@@ -22,10 +22,8 @@ import { waitForApp, selectRoom } from "./example-room";
 // The member-list side of the spoof check lives in member-info-deputy-tag.spec.ts.
 
 const BADGE = '[data-testid="message-author-deputy-badge"]';
-// The author-name span in a message header. Scoped to the chat container so it
-// cannot pick up the @mention autocomplete's disambiguator, which uses the
-// same title prefix.
-const AUTHOR_NAME = '#chat-scroll-container span[title^="Member ID"]';
+// The author-name button in a message header.
+const AUTHOR_NAME = '#chat-scroll-container [data-testid="message-author-name"]';
 // Every glyph River uses as a badge somewhere in the UI. None may appear in a
 // rendered author NAME.
 const BADGE_GLYPHS = ["🛡", "👑", "⭐", "🔑", "🎪"];
@@ -61,7 +59,7 @@ test.describe("Deputy badge on message authors", { tag: "@chromium-only" }, () =
     const badgedNames = await page.locator(BADGE).evaluateAll((badges) =>
       badges.map((b) => {
         const name = b.parentElement?.querySelector(
-          'span[title^="Member ID"]',
+          '[data-testid="message-author-name"]',
         );
         return (name?.textContent || "").trim();
       }),

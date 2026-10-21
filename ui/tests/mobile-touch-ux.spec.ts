@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp, selectRoom } from "./example-room";
+import { touchOnly, waitForApp, selectRoom } from "./example-room";
 import { AT_BOTTOM_EPSILON_PX } from "./history-geometry";
 
 // Coverage for freenet/river#402 — mobile / touch UX improvements:
@@ -9,11 +9,6 @@ import { AT_BOTTOM_EPSILON_PX } from "./history-geometry";
 //   3. A scroll-to-latest button shown whenever the newest message's bottom
 //      is off screen, plus a jump to the newest message on room switch.
 
-// Whether this browser context has no hover pointer (i.e. a touch device).
-// The kebab is shown only in that case; the hover action bar only otherwise.
-async function isTouchOnly(page: Page): Promise<boolean> {
-  return page.evaluate(() => window.matchMedia("(hover: none)").matches);
-}
 
 // The app scrolls to the bottom asynchronously on room entry. Wait for that to
 // settle before a test scrolls up, otherwise the pending async scroll races the
@@ -81,7 +76,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     // pure-CSS decision keyed on `@media (hover: none)`.
     await expect(kebab).toHaveCount(1);
 
-    if (await isTouchOnly(page)) {
+    if (await touchOnly(page)) {
       await expect(kebab).toBeVisible();
     } else {
       // On a device with a hover pointer the kebab stays display:none — the
@@ -99,13 +94,13 @@ test.describe("Message action kebab menu (#402.1)", () => {
 
     // This flow only applies where the kebab is actually usable (touch).
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
-    // A self (right-aligned, accent-coloured) message bubble. Its row carries
-    // the kebab that must expose Edit + Delete as well as Reply.
-    const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
+    // An own message. Its row carries the kebab that must expose Edit +
+    // Delete as well as Reply.
+    const ownRow = page.locator('[id^="msg-"][data-message-self="true"]').first();
     await expect(ownRow).toBeVisible();
     const ownKebab = ownRow.locator('[data-testid="message-kebab"]');
     await ownKebab.click();
@@ -133,7 +128,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
@@ -156,7 +151,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
@@ -193,16 +188,16 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
     const vp = page.viewportSize();
-    // Both a self (accent bubble) and a received (surface bubble) message: the
-    // menu opens on opposite sides, so both must stay within the viewport.
+    // Both an own (4-row menu) and a received (2-row menu) message: both
+    // menus must stay within the viewport.
     for (const sel of [
-      '[id^="msg-"]:has(.bg-accent)',
-      '[id^="msg-"]:has(.bg-surface)',
+      '[id^="msg-"][data-message-self="true"]',
+      '[id^="msg-"][data-message-self="false"]',
     ]) {
       const row = page.locator(sel).first();
       if ((await row.count()) === 0) continue;
@@ -248,7 +243,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
@@ -256,7 +251,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     // capped to the available space (and scroll internally) rather than extend
     // past the scroll container with actions unreachable.
     await page
-      .locator('[id^="msg-"]:has(.bg-accent)')
+      .locator('[id^="msg-"][data-message-self="true"]')
       .first()
       .locator('[data-testid="message-kebab"]')
       .click();
@@ -280,7 +275,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     test.skip(
-      !(await isTouchOnly(page)),
+      !(await touchOnly(page)),
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 

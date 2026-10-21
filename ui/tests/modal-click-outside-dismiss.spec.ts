@@ -9,8 +9,6 @@ async function clickOutsideCard(page: Page) {
 }
 
 test("clicking outside the Invite Member card dismisses it", async ({ page }) => {
-  await page.goto("/");
-  await waitForApp(page);
   await openRoomWithComposer(page);
   await page.getByTestId("invite-member-button").click();
   const modal = page.getByTestId("invite-member-modal");
