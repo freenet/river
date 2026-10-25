@@ -419,6 +419,33 @@ test.describe("Avatars", () => {
   });
 });
 
+// React has one way in per pointer: the hover bar's React with a mouse, the
+// kebab menu's React on touch. A faint "+" after a message's reaction chips
+// was a second way; Ian found two controls for one action untidy
+// (2026-10-25), so it was removed. Its element stays only as the inert
+// anchor the picker opens from, so it must never show or take a tap.
+test.describe("Reaction row", () => {
+  test("a message with reactions shows no add-reaction control after its chips", async ({ page }) => {
+    const { own } = await openRoomWithPairs(page);
+    const row = own.getByTestId("message-row").last();
+    await reactTo(page, row);
+    if (!(await coarsePointer(page))) await row.hover({ position: { x: 4, y: 4 } });
+
+    const anchor = row.getByTestId("add-reaction-button");
+    await expect(anchor).toBeAttached();
+    await expect(anchor).toBeHidden();
+    const m = await anchor.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      return { w: r.width, h: r.height, events: getComputedStyle(el.parentElement!).pointerEvents, text: el.textContent };
+    });
+    expect(m).toEqual({ w: 0, h: 0, events: "none", text: "" });
+    // The reaction line holds the chips and nothing else a reader can press.
+    const reactionRow = row.getByTestId("message-reaction-row");
+    await expect(reactionRow.getByTestId("reaction-chip")).toHaveCount(1);
+    await expect(reactionRow.locator('button:not([data-testid="reaction-chip"]):visible')).toHaveCount(0);
+  });
+});
+
 test.describe("Join notices and date separators", () => {
   test("joins fold into one quiet line in the gutter; separators are not items", async ({ page }) => {
     await openRoomWithComposer(page);
@@ -446,6 +473,33 @@ test.describe("Join notices and date separators", () => {
     }));
     expect(rule.before).toBe("1px");
     expect(rule.bg).toBe("rgba(0, 0, 0, 0)");
+  });
+
+  // Ivvor: "8 people joined" should say who, to tell new members from
+  // established ones. Hover shows the names; a tap or click lists them.
+  test("a count of joins names who on hover and when opened", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await callRiverTest(page, "appendJoinEvents", 3);
+    const notice = page.getByTestId("join-notice").last();
+    const toggle = notice.getByTestId("join-notice-toggle");
+    const list = notice.getByTestId("join-notice-names");
+    const who = /^Test Sender [AB], Test Sender [AB], Test Sender [AB]$/;
+    await expect(toggle).toContainText(/^3 people joined · \d{1,2}:\d{2}/);
+    await expect(toggle).toHaveAttribute("title", who);
+    await expect(list).toBeHidden();
+
+    await toggle.click();
+    await expect(list).toBeVisible();
+    await expect(list).toHaveText(who);
+
+    // A re-render (another join folding in) keeps it open and adds the name.
+    await callRiverTest(page, "appendJoinEvents", 1);
+    await expect(toggle).toContainText(/^4 people joined/);
+    await expect(list).toBeVisible();
+    await expect(list).toHaveText(/^(Test Sender [AB], ){3}Test Sender [AB]$/);
+
+    await toggle.click();
+    await expect(list).toBeHidden();
   });
 });
 

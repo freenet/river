@@ -102,17 +102,13 @@ async function removeOwnReaction(page: Page, chip: Locator) {
     await owners.getByTestId("reaction-remove").click();
     await expect(owners).toHaveCount(0);
     await expect(chip).toHaveCount(0);
-    // The chip that opened the list is gone, so focus goes to the nearest
-    // control left on that message rather than nowhere: its "+" while other
-    // chips remain, else its React action (the kebab on touch, the hover
-    // bar's React otherwise), since a message with no reactions has no "+".
+    // The chip that opened the list is gone, so focus goes to that
+    // message's React action rather than nowhere: the kebab on touch, the
+    // hover bar's React otherwise.
     const message = page.locator(`[id="${messageId}"]`);
-    const nearest =
-      (await message.getByTestId("reaction-chip").count()) > 0
-        ? message.getByTestId("add-reaction-button")
-        : (await touchOnly(page))
-          ? message.getByTestId("message-kebab")
-          : message.getByTestId("message-hover-actions").getByRole("button", { name: "React" });
+    const nearest = (await touchOnly(page))
+      ? message.getByTestId("message-kebab")
+      : message.getByTestId("message-hover-actions").getByRole("button", { name: "React" });
     await expect(nearest).toBeFocused();
   } else {
     await expect(owners).toHaveCount(0);

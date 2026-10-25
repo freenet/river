@@ -787,6 +787,11 @@ fn event_summary_parts(names: &[String]) -> (Vec<String>, String) {
     }
 }
 
+/// Who a folded join notice stands for, in join order: "Alice, Bob, Carol".
+fn join_names_list(names: &[String]) -> String {
+    names.join(", ")
+}
+
 /// The message body's readable text, or `None` when the body is private and
 /// cannot be read at all — either its secret version is missing, or the
 /// secret we hold for that version does not decrypt it.
@@ -3099,14 +3104,36 @@ pub fn Conversation() -> Element {
                                                                 class: "msg-event",
                                                                 span { class: "msg-gutter", {line_icon(JOIN_ICON_PATH, 14)} }
                                                                 span { class: "min-w-0 [overflow-wrap:anywhere]",
-                                                                    if let Some(first) = names.first() {
-                                                                        span { class: "font-bold text-text-secondary", "{first}" }
+                                                                    if names.is_empty() {
+                                                                        // "N people joined" names them on
+                                                                        // hover (`title`) and on a tap or
+                                                                        // click, which opens the list
+                                                                        // below. A native `details` keeps
+                                                                        // the open state in the DOM, so a
+                                                                        // re-render does not close it.
+                                                                        details { class: "join-names",
+                                                                            summary {
+                                                                                "data-testid": "join-notice-toggle",
+                                                                                title: "{join_names_list(&summary.names)}",
+                                                                                span { class: "join-names-count", "{rest}" }
+                                                                                " · {time}"
+                                                                            }
+                                                                            div {
+                                                                                "data-testid": "join-notice-names",
+                                                                                class: "join-names-list",
+                                                                                "{join_names_list(&summary.names)}"
+                                                                            }
+                                                                        }
+                                                                    } else {
+                                                                        if let Some(first) = names.first() {
+                                                                            span { class: "font-bold text-text-secondary", "{first}" }
+                                                                        }
+                                                                        if let Some(second) = names.get(1) {
+                                                                            " and "
+                                                                            span { class: "font-bold text-text-secondary", "{second}" }
+                                                                        }
+                                                                        "{rest} · {time}"
                                                                     }
-                                                                    if let Some(second) = names.get(1) {
-                                                                        " and "
-                                                                        span { class: "font-bold text-text-secondary", "{second}" }
-                                                                    }
-                                                                    "{rest} · {time}"
                                                                 }
                                                             }
                                                         }
@@ -3691,7 +3718,7 @@ fn reaction_owners_popover_at(
     }
 }
 
-/// Where the inline emoji picker opens from its "+", set when it opens (#402).
+/// Where the inline emoji picker opens from its anchor, set when it opens (#402).
 #[derive(Clone, Copy, Default, PartialEq)]
 struct PickerPlacement {
     above: bool,
@@ -3856,9 +3883,9 @@ fn chat_scrollport_bounds() -> (f64, f64) {
         .unwrap_or((60.0, 600.0))
 }
 
-/// Where `msg-{msg_id}`'s inline picker opens, measured from its "+" wrapper,
+/// Where `msg-{msg_id}`'s inline picker opens, measured from its anchor's wrapper,
 /// never from a click: a key press reports no position, and the kebab's React
-/// is tapped nowhere near "+".
+/// is tapped nowhere near the anchor.
 ///
 /// - Leftward (`right-0`) when the wrapper sits right of the chat scroller's
 ///   centre, so the picker opens toward the roomier side.
@@ -3986,7 +4013,7 @@ fn MessageGroupComponent(
 ) -> Element {
     let mut open_action_menu = open_action_menu;
     // Per-group: at most one picker per group, and while a picker is open its
-    // raised (z-[60]) backdrop covers every other group's kebabs and "+"
+    // raised (z-[60]) backdrop covers every other group's kebabs and React
     // buttons, so tapping one dismisses the picker rather than stacking a
     // second popover — the single-popover guarantee comes from the z-order, not
     // a shared signal (#402).
@@ -4025,9 +4052,9 @@ fn MessageGroupComponent(
     let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
 
     let mut picker_placement: Signal<PickerPlacement> = use_signal(PickerPlacement::default);
-    // Measures the "+" now, then places and opens the picker in one deferred
-    // step (.claude/rules/dioxus-signal-safety.md). Every open path (the "+",
-    // the hover bar's React, the kebab's React) comes through here.
+    // Measures the anchor now, then places and opens the picker in one deferred
+    // step (.claude/rules/dioxus-signal-safety.md). Every open path
+    // (the hover bar's React, the kebab's React) comes through here.
     let open_inline_picker = move |msg_id: &str| {
         request_reveal(format!("emoji-picker-{msg_id}"));
         let placement = inline_picker_placement(msg_id);
@@ -4113,18 +4140,15 @@ fn MessageGroupComponent(
                         return;
                     }
                     // The chip is gone: Remove took the only reaction with that
-                    // emoji. The nearest control left on the message takes
-                    // focus: its "+" while other chips remain, else its React
-                    // action, which is the kebab on touch and the hover bar's
-                    // React otherwise (a message with no reactions has no
-                    // visible "+"). Each is tried until one actually holds
-                    // focus, since a hidden one refuses it. If the message is
+                    // emoji. The message's React action takes focus: the
+                    // kebab on touch, the hover bar's React otherwise. Each
+                    // is tried until one actually holds focus, since a
+                    // hidden one refuses it. If the message is
                     // gone too, focus stays where the browser put it.
                     let Some(row) = document.get_element_by_id(&format!("msg-{message_id}")) else {
                         return;
                     };
                     for selector in [
-                        "[data-testid=\"add-reaction-button\"].has-reactions",
                         "[data-testid=\"message-kebab\"]",
                         "[data-testid=\"message-hover-actions\"] button",
                     ] {
@@ -4818,7 +4842,7 @@ fn MessageGroupComponent(
                                                         button {
                                                             class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
                                                             onclick: move |_| {
-                                                                // Placed from this message's "+", like every
+                                                                // Placed from this message's anchor, like every
                                                                 // other open path (#402).
                                                                 open_inline_picker(&msg_id_menu_react);
                                                             },
@@ -4882,11 +4906,10 @@ fn MessageGroupComponent(
                                         rsx! {
                                             div {
                                                 "data-testid": "message-reaction-row",
-                                                // A message with no reactions has no reaction line:
-                                                // its "+" stays in the DOM, collapsed and inert, only
-                                                // as the anchor the picker opens from (the hover
-                                                // bar's React, the kebab's React). With reactions,
-                                                // the chips and a visible "+" form the line.
+                                                // A message with no reactions has no reaction line.
+                                                // Either way the picker's anchor sits at its end,
+                                                // collapsed and inert; the picker is opened by the
+                                                // hover bar's React or the kebab's React.
                                                 class: if has_reactions { "flex flex-wrap items-center gap-[5px] mt-[5px] mb-0.5" } else { "flex h-0" },
                                                 // Existing reactions (clickable to toggle if user has reacted)
                                                 {
@@ -5132,19 +5155,18 @@ fn MessageGroupComponent(
                                                         }
                                                     })
                                                 }
-                                                // Inline add reaction button (same line height as reactions)
+                                                // The inline picker's anchor, after the chips.
                                                 div {
                                                     // Raise the whole picker (grid + z-40 backdrop) above the
                                                     // closed z-20 kebabs and hover bars while it's open, so a
                                                     // nearby one can't paint over the emoji grid and steal a tap
                                                     // (mirrors the action menu's z-[60] behaviour). (#402)
-                                                    // Collapsed (no reactions), it takes no hits, so it
-                                                    // never sits over the next row; the backdrop and the
-                                                    // picker take them back.
+                                                    // Collapsed, it takes no hits, so it never sits over
+                                                    // the next row; the backdrop and the picker take
+                                                    // them back.
                                                     class: format!(
-                                                        "relative group/react inline-flex items-center {} {}",
+                                                        "relative group/react inline-flex items-center h-0 pointer-events-none {}",
                                                         if is_inline_picker_open { "z-[60]" } else { "" },
-                                                        if has_reactions { "" } else { "h-0 pointer-events-none" },
                                                     ),
                                                     // Invisible backdrop when picker is open
                                                     if is_inline_picker_open {
@@ -5153,33 +5175,20 @@ fn MessageGroupComponent(
                                                             onclick: move |_| crate::util::defer(move || open_emoji_picker.set(None)),
                                                         }
                                                     }
-                                                    button {
+                                                    // Where the picker opens from. Not a control:
+                                                    // React is the hover bar's button, or the kebab
+                                                    // menu's on touch, so a message has one way in.
+                                                    span {
                                                         "data-testid": "add-reaction-button",
-                                                        class: format!(
-                                                            "add-reaction-btn inline-flex items-center justify-center text-xl leading-none hover:scale-110 {}",
-                                                            if has_reactions { "has-reactions" } else { "invisible h-0 overflow-hidden" }
-                                                        ),
-                                                        title: "Add reaction",
-                                                        onclick: {
-                                                            let picker_id = format!("inline-{}", msg_id_for_inline);
-                                                            let msg_id = msg_id_for_inline.clone();
-                                                            move |e: MouseEvent| {
-                                                                e.stop_propagation();
-                                                                if open_emoji_picker.peek().as_ref() == Some(&picker_id) {
-                                                                    crate::util::defer(move || open_emoji_picker.set(None));
-                                                                } else {
-                                                                    open_inline_picker(&msg_id);
-                                                                }
-                                                            }
-                                                        },
-                                                        "+"
+                                                        "aria-hidden": "true",
+                                                        class: "invisible inline-block h-0 w-0 overflow-hidden",
                                                     }
                                                     // Inline emoji picker; placed by `open_inline_picker`.
                                                     if is_inline_picker_open {
                                                         div {
                                                             "data-testid": "emoji-picker",
                                                             id: "emoji-picker-{msg_id_for_inline}",
-                                                            // It hangs off the "+" at the message's foot.
+                                                            // It hangs off the anchor at the message's foot.
                                                             // Opened from the hover bar's React at the top
                                                             // of a message taller than the view, that is
                                                             // below the fold: bring it into view, only as
@@ -5314,6 +5323,7 @@ mod tests {
             event_summary_parts(&names(3)),
             (vec![], "3 people joined".to_string())
         );
+        assert_eq!(join_names_list(&names(3)), "M0, M1, M2");
     }
 
     /// The @mention pickers and name lookup offer the owner and present
