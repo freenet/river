@@ -131,13 +131,14 @@ test.describe("Member panel on desktop", () => {
   // The panel changes the chat column's width, so every row rewraps. At
   // 820px the column is narrower than the 76ch measure whether the panel is
   // open or not, so every body rewraps (wider, the text sits at its measure
-  // and only the odd long line changes).
+  // and only the odd long line changes). At 820 the panel starts hidden
+  // (automatic below 1024px), so the first toggle shows it.
   test("a reader at the end stays at the end through a toggle", async ({ page }) => {
     await page.setViewportSize({ width: 820, height: 768 });
     await openRoomAtBottom(page, "Your Private Room");
     await fillHistory(page);
     const toggle = page.getByTestId("members-panel-toggle");
-    for (const step of ["hide", "show"]) {
+    for (const step of ["show", "hide"]) {
       const height = (await scrollMetrics(page)).height;
       await toggle.click();
       await expect.poll(async () => (await scrollMetrics(page)).height, { message: `premise: ${step} rewraps the rows` }).not.toBe(height);
@@ -156,7 +157,7 @@ test.describe("Member panel on desktop", () => {
     await settle(page);
     await expectParkedAwayFromEnd(page);
     const toggle = page.getByTestId("members-panel-toggle");
-    for (const step of ["hide", "show"]) {
+    for (const step of ["show", "hide"]) {
       const row = (await anchorRow(page))!;
       expect(row, "premise: a row starts in view").not.toBeNull();
       const height = (await scrollMetrics(page)).height;
@@ -218,13 +219,15 @@ test.describe("Member panel on desktop", () => {
   test("a double toggle keeps the reading row and leaves no stale correction", async ({ page }) => {
     const row = await parkMidHistory(page);
     // Two clicks before either renders: two deferred writes, each rendered
-    // on its own (closed, then open again), so the rows rewrap twice.
+    // on its own (open, then closed again: at 820 it starts hidden), so the
+    // rows rewrap twice.
+    await expect(page.getByTestId("members-rail"), "premise: hidden at 820").toBeHidden();
     await page.getByTestId("members-panel-toggle").evaluate((el) => {
       (el as HTMLElement).click();
       (el as HTMLElement).click();
     });
     await settle(page);
-    await expect(page.getByTestId("members-rail")).toBeVisible();
+    await expect(page.getByTestId("members-rail")).toBeHidden();
     const after = await anchorRow(page, row.key);
     expect(Math.abs(after!.top - row.top), "the reading row stays put").toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
     await expectNoStaleRestore(page, "a later resize did not apply the double toggle's capture");
@@ -312,6 +315,68 @@ test.describe("Member panel on desktop", () => {
     expect((await resolveColor(page, bg))[3], "transparent at rest").toBe(0);
     expect(parseFloat(await invite.evaluate((el) => getComputedStyle(el).borderTopWidth)), "outlined").toBeGreaterThanOrEqual(1);
     await expect(page.getByTestId("export-id-button")).toBeVisible();
+  });
+});
+
+// Automatic until the reader chooses (MEMBERS_PANEL_OPEN = None): shown on a
+// window at least 1024px wide, hidden on a tablet-width one (768-1023px), by
+// CSS, so rotating or resizing across 1024 just works. The toggle stores the
+// opposite of what is shown, which then holds at any width for the session.
+// Its pressed state and title follow what is shown, across the breakpoint.
+test.describe("Member panel by width", () => {
+  async function open(page: import("@playwright/test").Page, width: number, height = 900) {
+    await page.setViewportSize({ width, height });
+    await openRoomWithComposer(page);
+  }
+  const panel = (page: import("@playwright/test").Page) => page.getByTestId("members-rail");
+  const toggle = (page: import("@playwright/test").Page) => page.getByTestId("members-panel-toggle");
+  async function expectShown(page: import("@playwright/test").Page, shown: boolean, why: string) {
+    if (shown) await expect(panel(page), why).toBeVisible();
+    else await expect(panel(page), why).toBeHidden();
+    await expect(toggle(page), `${why}: pressed`).toHaveAttribute("aria-pressed", shown ? "true" : "false");
+    await expect(toggle(page), `${why}: title`).toHaveAttribute("title", shown ? "Hide members" : "Show members");
+  }
+
+  test("an iPad in portrait (820px) loads it hidden, and the toggle shows it", async ({ page }) => {
+    await open(page, 820, 1180);
+    await expectShown(page, false, "auto at 820");
+    await expect(page.getByTestId("rooms-rail")).toBeVisible();
+    await toggle(page).click();
+    await expectShown(page, true, "after the toggle");
+  });
+
+  test("a 1280px window loads it shown", async ({ page }) => {
+    await open(page, 1280);
+    await expectShown(page, true, "auto at 1280");
+  });
+
+  test("automatic at 820, it shows once the window is 1180 wide (an iPad turned to landscape)", async ({ page }) => {
+    await open(page, 820, 1180);
+    await expectShown(page, false, "auto at 820");
+    await page.setViewportSize({ width: 1180, height: 820 });
+    await expectShown(page, true, "auto at 1180");
+    await page.setViewportSize({ width: 820, height: 1180 });
+    await expectShown(page, false, "auto back at 820");
+  });
+
+  test("closed by the reader at 1280, it stays closed at 1400 and at 900", async ({ page }) => {
+    await open(page, 1280);
+    await toggle(page).click();
+    await expectShown(page, false, "closed at 1280");
+    for (const width of [1400, 900]) {
+      await page.setViewportSize({ width, height: 900 });
+      await expectShown(page, false, `still closed at ${width}`);
+    }
+  });
+
+  test("opened by the reader at 900, it stays open at 1400 and at 820", async ({ page }) => {
+    await open(page, 900);
+    await expectShown(page, false, "auto at 900");
+    await toggle(page).click();
+    for (const width of [1400, 820]) {
+      await page.setViewportSize({ width, height: 900 });
+      await expectShown(page, true, `still open at ${width}`);
+    }
   });
 });
 

@@ -2536,7 +2536,11 @@ pub fn Conversation() -> Element {
                     // Members in the room: the owner plus every member record,
                     // the same set the member panel lists.
                     let member_count = header_room.room_state.members.members.len() + 1;
-                    let members_open = *MEMBERS_PANEL_OPEN.read();
+                    // What is shown: the stored choice, else automatic by width.
+                    let members_open = crate::components::app::members_panel_shown(
+                        *MEMBERS_PANEL_OPEN.read(),
+                        *crate::components::app::WIDE_VIEWPORT.read(),
+                    );
                     let description_expanded = expanded_description_room.read().as_ref()
                         == room_key.as_ref()
                         && room_key.is_some();
@@ -2794,8 +2798,9 @@ pub fn Conversation() -> Element {
                                         }
                                             }
                                         }
-                                    // Desktop: show or hide the member panel, for this
-                                    // session (`MEMBERS_PANEL_OPEN`, no localStorage).
+                                    // 768px and wider: show or hide the member panel, for
+                                    // this session (`MEMBERS_PANEL_OPEN`, no localStorage):
+                                    // the opposite of what is shown now, held at any width.
                                     button {
                                         "data-testid": "members-panel-toggle",
                                         class: "hidden md:inline-flex items-center gap-1 h-8 px-2 rounded-lg text-text-muted hover:text-text hover:bg-surface aria-pressed:bg-surface aria-pressed:text-text transition-colors flex-shrink-0",
@@ -2812,8 +2817,11 @@ pub fn Conversation() -> Element {
                                                 let reader_position = reader_position.clone();
                                                 crate::util::defer(move || {
                                                     reader_position.note_panel_toggle_written();
-                                                    let open = *MEMBERS_PANEL_OPEN.peek();
-                                                    *MEMBERS_PANEL_OPEN.write() = !open;
+                                                    let shown = crate::components::app::members_panel_shown(
+                                                        *MEMBERS_PANEL_OPEN.peek(),
+                                                        *crate::components::app::WIDE_VIEWPORT.peek(),
+                                                    );
+                                                    *MEMBERS_PANEL_OPEN.write() = Some(!shown);
                                                 });
                                             }
                                         },
