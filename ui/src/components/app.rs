@@ -103,8 +103,9 @@ pub static MOBILE_VIEW: GlobalSignal<MobileView> = Global::new(|| MobileView::Ch
 /// iframe. Phones ignore it; there `MOBILE_VIEW` picks the panel.
 pub static MEMBERS_PANEL_OPEN: GlobalSignal<Option<bool>> = Global::new(|| None);
 
-/// Whether the window is at least `lg` wide (1024px), the automatic member
-/// panel's breakpoint, kept current by a `matchMedia` change listener
+/// Whether the window is at least `lg` wide (64rem, 1024px at the default
+/// font size), the automatic member panel's breakpoint, kept current by a
+/// `matchMedia` change listener
 /// (`install_wide_viewport_listener`). Read for the toggle's pressed state;
 /// the panel itself is shown or hidden by CSS.
 pub static WIDE_VIEWPORT: GlobalSignal<bool> = Global::new(wide_viewport_now);
@@ -133,7 +134,7 @@ fn wide_viewport_now() -> bool {
     }
 }
 
-/// Keep [`WIDE_VIEWPORT`] current as the window crosses 1024px (a rotation,
+/// Keep [`WIDE_VIEWPORT`] current as the window crosses 64rem (a rotation,
 /// a resize). The write is deferred (dioxus-signal-safety.md). Installs once.
 fn install_wide_viewport_listener() {
     #[cfg(target_arch = "wasm32")]

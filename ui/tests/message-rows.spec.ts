@@ -416,12 +416,15 @@ test.describe("Avatars", () => {
     expect(first).not.toBe("");
 
     // A read seed colours the disc before its salt is stored: render
-    // computes the salt from the seed (`salt_for_render`). The hue is the
-    // one the stored salt would give, so it differs from salt 2's.
+    // computes the salt from the seed (`salt_for_render`). No salt is stored
+    // (cleared first, and the hook stores none), so the colour can only come
+    // from that fallback. (Not compared with a hue: the example room's key
+    // is random per load, so the seed's hue is too.)
+    await callRiverTest(page, "setAvatarSalt", null);
+    await expect.poll(isGrey, { message: "cleared: neutral" }).toBe(true);
     await callRiverTest(page, "setSeedReadUnstored", 3);
     await expect(avatar).toHaveAttribute("style", /--avatar-hue/);
-    expect(await isGrey(), "a read seed colours the disc").toBe(false);
-    await expect.poll(hueOf).not.toBe("288");
+    await expect.poll(isGrey, { message: "a read seed colours the disc" }).toBe(false);
 
     // Your own avatar carries the accent ring.
     const ring = await own.getByTestId("message-author-avatar").evaluate((el) => getComputedStyle(el).outlineStyle);
@@ -463,6 +466,39 @@ test.describe("Reaction row", () => {
     const c = (await reactionRow.getByTestId("reaction-chip").boundingBox())!;
     const clear = p.y >= c.y + c.height - 0.5 || p.y + p.height <= c.y + 0.5;
     expect(clear, `picker ${p.y}..${p.y + p.height} vs chips ${c.y}..${c.y + c.height}`).toBe(true);
+  });
+});
+
+// Chips that wrap onto several lines: the anchor shares only the last one,
+// and a picker opening upward must clear the lines above it too.
+test.describe("Reaction row that wraps, at 320px", () => {
+  test.use({ viewport: { width: 320, height: 700 } });
+
+  test("the picker covers no chip on any line", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await callRiverTest(page, "appendMessage", "wrap target");
+    const row = page.getByTestId("message-row").filter({ hasText: "wrap target" });
+    await expect(row).toBeVisible();
+    await callRiverTest(page, "addReactionsToNewest", ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"]);
+    const chips = row.getByTestId("reaction-chip");
+    await expect(chips).toHaveCount(10);
+    await row.evaluate((el) => el.scrollIntoView({ block: "end" }));
+    const lines = new Set((await chips.evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().top)))));
+    expect(lines.size, "premise: the chips wrap").toBeGreaterThan(1);
+
+    await openInlinePicker(page, row);
+    const picker = page.getByTestId("emoji-picker");
+    await expect(picker).toBeVisible();
+    const p = (await picker.boundingBox())!;
+    const overlaps = await chips.evaluateAll(
+      (els, p) =>
+        els.filter((e) => {
+          const r = e.getBoundingClientRect();
+          return r.left < p.x + p.width && r.right > p.x && r.top < p.y + p.height - 0.5 && r.bottom > p.y + 0.5;
+        }).length,
+      p,
+    );
+    expect(overlaps, "chips under the picker").toBe(0);
   });
 });
 
@@ -511,6 +547,8 @@ test.describe("Join notices and date separators", () => {
     await toggle.click();
     await expect(list).toBeVisible();
     await expect(list).toHaveText(who);
+    // One element per name, so a nickname holding ", " reads as one person.
+    await expect(list.locator(".join-name")).toHaveCount(3);
 
     // A re-render (another join folding in) keeps it open and adds the name.
     await callRiverTest(page, "appendJoinEvents", 1);

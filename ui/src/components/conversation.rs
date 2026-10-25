@@ -3729,6 +3729,10 @@ struct PickerPlacement {
     above: bool,
     /// Leftward (`right-0`).
     align_right: bool,
+    /// How far the anchor's line sits below the reaction row's first line,
+    /// in px: opening above, the picker rises by this much more, so it clears
+    /// every chip line, not only the last one the anchor shares.
+    rise_px: f64,
 }
 
 /// The centre of the element with this id, in client coordinates.
@@ -3895,26 +3899,31 @@ fn chat_scrollport_bounds() -> (f64, f64) {
 /// - Leftward (`right-0`) when the wrapper sits right of the chat scroller's
 ///   centre, so the picker opens toward the roomier side.
 /// - Above when it does not fit below the wrapper inside the scroller and
-///   there is more room above ([`vertical_placement_from`]).
+///   there is more room above the reaction row ([`vertical_placement_from`]),
+///   rising past every chip line (`rise_px`).
 ///
 /// Unmeasurable, it opens below and rightward.
 fn inline_picker_placement(msg_id: &str) -> PickerPlacement {
     let measure = || {
         let document = web_sys::window()?.document()?;
-        let plus = document
+        let wrapper = document
             .get_element_by_id(&format!("msg-{msg_id}"))?
             .query_selector("[data-testid=\"reaction-picker-anchor\"]")
             .ok()??
-            .parent_element()?
-            .get_bounding_client_rect();
+            .parent_element()?;
+        let plus = wrapper.get_bounding_client_rect();
+        // The chips can wrap; the wrapper shares only the last line.
+        let line_top = wrapper
+            .parent_element()
+            .map_or(plus.top(), |row| row.get_bounding_client_rect().top());
         let scroller = document
             .get_element_by_id("chat-scroll-container")?
             .get_bounding_client_rect();
-        let (above, _) =
-            vertical_placement_from(plus.top(), plus.bottom(), INLINE_PICKER_HEIGHT_PX);
+        let (above, _) = vertical_placement_from(line_top, plus.bottom(), INLINE_PICKER_HEIGHT_PX);
         Some(PickerPlacement {
             above,
             align_right: plus.left() + plus.right() > scroller.left() + scroller.right(),
+            rise_px: (plus.top() - line_top).max(0.0),
         })
     };
     measure().unwrap_or_default()
@@ -5211,10 +5220,17 @@ fn MessageGroupComponent(
                                                             },
                                                             class: format!(
                                                                 "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid pointer-events-auto {} {}",
-                                                                if picker_placement.read().above { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                                if picker_placement.read().above { "bottom-full" } else { "top-full mt-1" },
                                                                 if picker_placement.read().align_right { "right-0" } else { "left-0" },
                                                             ),
-                                                            style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
+                                                            style: format!(
+                                                                "grid-template-columns: repeat(4, 1fr); gap: 2px;{}",
+                                                                if picker_placement.read().above {
+                                                                    format!(" margin-bottom: {}px;", 4.0 + picker_placement.read().rise_px)
+                                                                } else {
+                                                                    String::new()
+                                                                },
+                                                            ),
                                                             onclick: move |e: MouseEvent| e.stop_propagation(),
                                                             {FREQUENT_EMOJIS.iter().map(|emoji| {
                                                                 let emoji_str = emoji.to_string();
