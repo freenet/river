@@ -55,3 +55,5 @@ pub(crate) const GLOBE_ICON_PATH: &str =
     "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 3a14 14 0 0 0 0 18 14 14 0 0 0 0-18M3 12h18";
 pub(crate) const LINK_ICON_PATH: &str = "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71";
 pub(crate) const REORDER_ICON_PATH: &str = "M7 4v16M3 8l4-4 4 4M17 20V4M13 16l4 4 4-4";
+pub(crate) const COPY_ICON_PATH: &str =
+    "M10 8h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2zM16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3";

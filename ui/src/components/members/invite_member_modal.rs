@@ -1,8 +1,9 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
+use crate::components::icons::{line_icon, COPY_ICON_PATH};
 use crate::components::members::Invitation;
 use crate::room_data::RoomData;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaArrowsRotate, FaCopy, FaQrcode, FaXmark};
+use dioxus_free_icons::icons::fa_solid_icons::{FaArrowsRotate, FaQrcode, FaXmark};
 use dioxus_free_icons::Icon;
 
 /// Fallback URL for non-browser environments or when `window.location` is
@@ -302,7 +303,7 @@ fn InvitationContent(
                     "data-testid": "invite-copy-link-button",
                     class: "px-3 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] rounded-lg transition-colors flex items-center gap-2",
                     onclick: copy_link_to_clipboard,
-                    Icon { icon: FaCopy, width: 14, height: 14 }
+                    {line_icon(COPY_ICON_PATH, 15)}
                     span { "{copy_link_text}" }
                 }
             }
@@ -335,7 +336,7 @@ fn InvitationContent(
                     "data-testid": "invite-copy-code-button",
                     class: "px-3 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] rounded-lg transition-colors flex items-center gap-2",
                     onclick: copy_code_to_clipboard,
-                    Icon { icon: FaCopy, width: 14, height: 14 }
+                    {line_icon(COPY_ICON_PATH, 15)}
                     span { "{copy_code_text}" }
                 }
             }
@@ -388,7 +389,7 @@ fn InvitationContent(
                 "data-testid": "invite-copy-message-button",
                 class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] font-medium rounded-lg transition-colors flex items-center gap-2",
                 onclick: copy_message_to_clipboard,
-                Icon { icon: FaCopy, width: 14, height: 14 }
+                {line_icon(COPY_ICON_PATH, 15)}
                 span { "{copy_msg_text}" }
             }
             button {
