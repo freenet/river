@@ -2,13 +2,13 @@ import { test, expect } from "@playwright/test";
 import { waitForApp, selectRoom } from "./example-room";
 
 // freenet/river#493. The member rows were already clickable. The missing
-// piece is a name filter, opened from the Active Members heading so the
+// piece is a name filter, opened from the Members heading so the
 // rail stays quiet until someone asks for it.
 
 test.describe("Member search on a phone", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 390, height: 844 } });
 
-  test("the lens sits beside Active Members and the field stays on screen", async ({
+  test("the lens sits beside Members and the field stays on screen", async ({
     page,
   }) => {
     await page.goto("/");
@@ -18,8 +18,9 @@ test.describe("Member search on a phone", { tag: "@chromium-only" }, () => {
 
     const toggle = page.getByTestId("member-search-toggle");
     await expect(toggle).toBeVisible();
-    await expect(toggle).toContainText("Active Members");
-    const lens = toggle.locator("svg").nth(1);
+    await expect(toggle).toContainText(/^Members\s*\d+$/);
+    // The heading's only icon is the lens, at its right.
+    const lens = toggle.locator("svg");
     await expect(lens).toBeVisible();
     const toggleBox = await toggle.boundingBox();
     const lensBox = await lens.boundingBox();
@@ -41,7 +42,7 @@ test.describe("Member search on a phone", { tag: "@chromium-only" }, () => {
 test.describe("Member search", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("clicking Active Members filters the list and a row still opens info", async ({
+  test("clicking Members filters the list and a row still opens info", async ({
     page,
   }) => {
     await page.goto("/");
@@ -57,7 +58,7 @@ test.describe("Member search", { tag: "@chromium-only" }, () => {
     await expect(page.getByTestId("member-search-input")).toHaveCount(0);
     const toggle = page.getByTestId("member-search-toggle");
     // Still a heading, with the toggle inside it.
-    await expect(page.getByRole("heading", { name: "Active Members" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /^Members\s*\d+$/ })).toBeVisible();
     await expect(toggle).toHaveAttribute("aria-controls", "member-search-input");
     await expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect((await toggle.boundingBox())!.height).toBeGreaterThanOrEqual(24);
@@ -69,7 +70,7 @@ test.describe("Member search", { tag: "@chromium-only" }, () => {
     await expect(page.getByRole("searchbox", { name: "Search members by name" })).toBeVisible();
 
     const nickname = (
-      await rows.nth(1).locator("span").first().innerText()
+      await rows.nth(1).getByTestId("member-name").innerText()
     ).trim();
     await input.fill(nickname);
     await expect(rows).toHaveCount(1);

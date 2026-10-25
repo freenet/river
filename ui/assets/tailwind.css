@@ -292,7 +292,7 @@ button, a, input, textarea, select, [role="button"] {
   /* Shrink sidebar widths on narrow desktop/tablet viewports.
      Scoped to .app-root to avoid affecting unrelated elements. */
   .app-root .md\:w-64 { width: clamp(140px, 18vw, 256px) !important; }
-  .app-root .md\:w-56 { width: clamp(120px, 15vw, 224px) !important; }
+  .app-root .md\:w-62 { width: clamp(120px, 15vw, 248px) !important; }
 }
 
 /* ── Mobile: ensure full-width panels and readable text ── */

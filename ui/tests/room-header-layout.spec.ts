@@ -21,13 +21,17 @@ const right = (b: { x: number; width: number }) => b.x + b.width;
 // Not @chromium-only: flex geometry differs across engines, and this replaced
 // the #402.2 hamburger-spacing test, which ran on every project.
 test.describe("Room header layout", () => {
-  test("at 1280px (i) and the bell sit at the right edge", async ({ page }) => {
+  test("at 1280px (i), the bell and the members toggle sit at the right edge, in that order", async ({ page }) => {
     await openRoomAt(page, { width: 1280, height: 800 });
     const row = await box(page.getByTestId("room-header-row"));
     const info = await box(page.getByTestId("room-info-button"));
     const bell = await box(page.getByTestId("notification-bell-button"));
+    const members = await box(page.getByTestId("members-panel-toggle"));
+    await expect(page.getByTestId("header-members-button")).toBeHidden();
     expect(info.x).toBeGreaterThan(row.x + row.width / 2);
-    expect(Math.abs(right(bell) - right(row))).toBeLessThanOrEqual(EPS);
+    expect(bell.x).toBeGreaterThanOrEqual(right(info));
+    expect(members.x).toBeGreaterThanOrEqual(right(bell));
+    expect(Math.abs(right(members) - right(row))).toBeLessThanOrEqual(EPS);
   });
 
   test("at 320px the icons sit beside the members button, clear of the hamburger", async ({ page }) => {
@@ -37,6 +41,7 @@ test.describe("Room header layout", () => {
     const title = await box(page.getByTestId("room-title-button"));
     const bell = await box(page.getByTestId("notification-bell-button"));
     const members = await box(page.getByTestId("header-members-button"));
+    await expect(page.getByTestId("members-panel-toggle")).toBeHidden();
     expect(Math.abs(right(members) - right(row))).toBeLessThanOrEqual(EPS);
     expect(members.x - right(bell)).toBeGreaterThanOrEqual(4);
     // #402: reaching for the room list must not open room details.

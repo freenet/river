@@ -115,7 +115,7 @@ test.describe("Impersonation warning (#489)", { tag: "@chromium-only" }, () => {
     const deputyName = (
       (await rowsWithShield(page)
         .first()
-        .locator("span:not(.member-icon)")
+        .getByTestId("member-name")
         .first()
         .textContent()) || ""
     ).trim();
@@ -168,7 +168,7 @@ test.describe("Impersonation warning survives a narrow viewport (#489)", () => {
 
     // Now switch to the members panel, which is a separate view at this width.
     await page.getByTestId("header-members-button").click();
-    await expect(page.locator("aside").filter({ hasText: "Active Members" })).toBeVisible({
+    await expect(page.getByTestId("members-rail")).toBeVisible({
       timeout: 15_000,
     });
 
@@ -205,7 +205,7 @@ test.describe("Impersonation warning survives a narrow viewport (#489)", () => {
     // comes from the same layout pass.
     const m = await flagged.evaluate((el) => {
       const btn = el as HTMLElement;
-      const name = btn.querySelector("span:not(.member-icon)") as HTMLElement;
+      const name = btn.querySelector('[data-testid="member-name"]') as HTMLElement;
       const icon = btn.querySelector(
         '[data-testid="member-list-impersonation-warning"]',
       ) as HTMLElement | null;

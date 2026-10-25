@@ -6,10 +6,11 @@ use crate::components::app::receive_times::{
 };
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{
-    MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NOTIFICATION_MODAL,
-    ROOMS,
+    MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBERS_PANEL_OPEN, MEMBER_INFO_MODAL, MOBILE_VIEW,
+    NOTIFICATION_MODAL, ROOMS,
 };
 use crate::components::back_to_chat::CountBadge;
+use crate::components::icons::*;
 use crate::components::members::{
     deputy_badges_for_viewer, impersonation_checker_for_viewer, impersonation_warning_for_display,
     privilege_in_view, DeputyBadge,
@@ -27,7 +28,7 @@ use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
     get_current_system_time, local_message_date, local_today,
 };
-mod avatar;
+pub(crate) mod avatar;
 mod emoji_picker;
 mod history_scroll;
 mod history_window;
@@ -56,8 +57,7 @@ use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaBell, FaBellSlash, FaChevronDown, FaChevronUp, FaCircleInfo, FaEllipsisVertical,
-    FaFaceSmile, FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
+    FaEllipsisVertical, FaFaceSmile, FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -2505,7 +2505,7 @@ pub fn Conversation() -> Element {
         div { class: "flex-1 flex flex-col min-w-0 bg-panel",
             // Room header
             {
-                current_room_data.as_ref().map(|_room_data| {
+                current_room_data.as_ref().map(|header_room| {
                     let open_room_details = move || {
                         crate::util::defer(move || {
                             if let Some(current_room) = CURRENT_ROOM.read().owner_key {
@@ -2516,6 +2516,10 @@ pub fn Conversation() -> Element {
                         });
                     };
                     let room_key = CURRENT_ROOM.read().owner_key;
+                    // Members in the room: the owner plus every member record,
+                    // the same set the member panel lists.
+                    let member_count = header_room.room_state.members.members.len() + 1;
+                    let members_open = *MEMBERS_PANEL_OPEN.read();
                     let description_expanded = expanded_description_room.read().as_ref()
                         == room_key.as_ref()
                         && room_key.is_some();
@@ -2551,7 +2555,7 @@ pub fn Conversation() -> Element {
                                 // modal by mistake when reaching for the room list (#402).
                                 button {
                                     // `relative` anchors the unread badge overlay.
-                                    class: "relative md:hidden flex-shrink-0 mr-1 p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                    class: "relative md:hidden flex-shrink-0 mr-1 p-2 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
                                     "data-testid": "hamburger-rooms-button",
                                     // The button's aria-label overrides descendant text in
                                     // accessible-name computation, so the unread count must
@@ -2568,7 +2572,7 @@ pub fn Conversation() -> Element {
                                             crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms)
                                         }
                                     },
-                                    Icon { icon: FaBars, width: 18, height: 18 }
+                                    {line_icon(MENU_ICON_PATH, 20)}
                                     // Unread-elsewhere badge: new messages in OTHER rooms
                                     // (and DMs) are invisible on mobile while a room fills
                                     // the screen — surface them on the room-list button.
@@ -2587,85 +2591,12 @@ pub fn Conversation() -> Element {
                                             // desktop (no adjacent hamburger there). On mobile
                                             // the negative margin is dropped so this room-details
                                             // target stays clear of the hamburger (#402).
-                                            class: "flex items-center px-3 py-1.5 md:-ml-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0",
+                                            class: "flex items-center px-3 py-0.5 md:-ml-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0",
                                             title: "Room details",
                                             "data-testid": "room-title-button",
                                             onclick: move |_| open_room_details(),
-                                            h2 { class: "text-lg font-semibold text-text truncate",
+                                            h2 { class: "text-[16px] leading-6 font-semibold text-text truncate",
                                                 "{current_room_label}"
-                                            }
-                                        }
-                                        button {
-                                            "data-testid": "room-info-button",
-                                            class: "ml-auto flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                                            title: "Room details",
-                                            "aria-label": "Room details",
-                                            onclick: move |_| open_room_details(),
-                                            Icon { icon: FaCircleInfo, width: 16, height: 16 }
-                                        }
-                                        // Per-room notification preference. Icon reflects state:
-                                        // bell = notifying, bell-slash = muted; the tooltip names
-                                        // the exact mode. Opens the compact NotificationModal.
-                                        // Sized to 16px to pair with the adjacent (i) icon.
-                                        {
-                                            let mode = *current_notification_mode.read();
-                                            let mode_title = match mode {
-                                                NotificationMode::All => "Notifications: All messages",
-                                                NotificationMode::MentionsAndReplies => "Notifications: Mentions & replies only",
-                                                NotificationMode::Muted => "Notifications: Muted",
-                                            };
-                                            // The browser may be refusing to deliver, which makes
-                                            // every mode above inert (freenet/river#510).
-                                            let blocked = crate::components::app::notifications::delivery_is_blocked(
-                                                mode,
-                                                crate::components::app::notifications::current_notification_status(),
-                                            );
-                                            rsx! {
-                                        button {
-                                            "data-testid": "notification-bell-button",
-                                            class: "relative flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                                            // `title` stays the MODE alone. The blocked state rides
-                                            // on `aria-label` and the dot instead, so the tooltip
-                                            // keeps naming exactly one thing.
-                                            title: mode_title,
-                                            "aria-label": if blocked {
-                                                format!("{mode_title} (your browser is not delivering notifications)")
-                                            } else {
-                                                mode_title.to_string()
-                                            },
-                                            onclick: move |_| {
-                                                crate::util::defer(move || {
-                                                    if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                                        NOTIFICATION_MODAL.with_mut(|modal| {
-                                                            modal.room = Some(current_room);
-                                                        });
-                                                    }
-                                                });
-                                            },
-                                            if mode == NotificationMode::Muted {
-                                                Icon { icon: FaBellSlash, width: 16, height: 16 }
-                                            } else {
-                                                Icon { icon: FaBell, width: 16, height: 16 }
-                                            }
-                                            if blocked {
-                                                // Decorative: `aria-hidden` keeps it out of the
-                                                // button's accessible name, which the `aria-label`
-                                                // above already carries in full. A badge that
-                                                // announced itself separately would append to the
-                                                // button's name instead of replacing it.
-                                                span {
-                                                    "data-testid": "notification-blocked-badge",
-                                                    "aria-hidden": "true",
-                                                    // `ring-panel` needs the hand-written
-                                                    // `@utility` in tailwind.css: `--color-panel` is
-                                                    // declared on `:root`, outside `@theme`, so
-                                                    // Tailwind v4 generates no colour utility for it
-                                                    // and `ring-1` would fall back to `currentColor`
-                                                    // — a grey ring that turns blue on hover.
-                                                    class: "absolute top-0.5 right-0.5 h-2 w-2 rounded-full bg-red-500 ring-1 ring-panel",
-                                                }
-                                            }
-                                        }
                                             }
                                         }
                                     }
@@ -2760,27 +2691,126 @@ pub fn Conversation() -> Element {
                                                         move |_| toggle_description()
                                                     },
                                                     if description_expanded {
-                                                        Icon { icon: FaChevronUp, width: 14, height: 14 }
+                                                        {line_icon(CHEVRON_UP_ICON_PATH, 14)}
                                                     } else {
-                                                        Icon { icon: FaChevronDown, width: 14, height: 14 }
+                                                        {line_icon(CHEVRON_DOWN_ICON_PATH, 14)}
                                                     }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                // Mobile: button to open members panel
-                                button {
-                                    "data-testid": "header-members-button",
-                                    class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors flex-shrink-0",
-                                    onclick: {
-                                        let reader_position = reader_position.clone();
-                                        move |_| {
-                                            remember_reading_position(&reader_position);
-                                            crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Members)
+                                // The room's actions, right-aligned: details, notifications,
+                                // and the members button (a toggle on desktop, the
+                                // Members view on a phone).
+                                div { class: "flex items-center gap-1 flex-shrink-0",
+                                        button {
+                                            "data-testid": "room-info-button",
+                                            class: "flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
+                                            title: "Room details",
+                                            "aria-label": "Room details",
+                                            onclick: move |_| open_room_details(),
+                                            {line_icon(INFO_ICON_PATH, 19)}
                                         }
-                                    },
-                                    Icon { icon: FaUsers, width: 18, height: 18 }
+                                        // Per-room notification preference. Icon reflects state:
+                                        // bell = notifying, bell-slash = muted; the tooltip names
+                                        // the exact mode. Opens the compact NotificationModal.
+                                        // Sized to 16px to pair with the adjacent (i) icon.
+                                        {
+                                            let mode = *current_notification_mode.read();
+                                            let mode_title = match mode {
+                                                NotificationMode::All => "Notifications: All messages",
+                                                NotificationMode::MentionsAndReplies => "Notifications: Mentions & replies only",
+                                                NotificationMode::Muted => "Notifications: Muted",
+                                            };
+                                            // The browser may be refusing to deliver, which makes
+                                            // every mode above inert (freenet/river#510).
+                                            let blocked = crate::components::app::notifications::delivery_is_blocked(
+                                                mode,
+                                                crate::components::app::notifications::current_notification_status(),
+                                            );
+                                            rsx! {
+                                        button {
+                                            "data-testid": "notification-bell-button",
+                                            class: "relative flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
+                                            // `title` stays the MODE alone. The blocked state rides
+                                            // on `aria-label` and the dot instead, so the tooltip
+                                            // keeps naming exactly one thing.
+                                            title: mode_title,
+                                            "aria-label": if blocked {
+                                                format!("{mode_title} (your browser is not delivering notifications)")
+                                            } else {
+                                                mode_title.to_string()
+                                            },
+                                            onclick: move |_| {
+                                                crate::util::defer(move || {
+                                                    if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                                        NOTIFICATION_MODAL.with_mut(|modal| {
+                                                            modal.room = Some(current_room);
+                                                        });
+                                                    }
+                                                });
+                                            },
+                                            if mode == NotificationMode::Muted {
+                                                {line_icon(BELL_OFF_ICON_PATH, 19)}
+                                            } else {
+                                                {line_icon(BELL_ICON_PATH, 19)}
+                                            }
+                                            if blocked {
+                                                // Decorative: `aria-hidden` keeps it out of the
+                                                // button's accessible name, which the `aria-label`
+                                                // above already carries in full. A badge that
+                                                // announced itself separately would append to the
+                                                // button's name instead of replacing it.
+                                                span {
+                                                    "data-testid": "notification-blocked-badge",
+                                                    "aria-hidden": "true",
+                                                    // `ring-panel` needs the hand-written
+                                                    // `@utility` in tailwind.css: `--color-panel` is
+                                                    // declared on `:root`, outside `@theme`, so
+                                                    // Tailwind v4 generates no colour utility for it
+                                                    // and `ring-1` would fall back to `currentColor`
+                                                    // — a grey ring that turns blue on hover.
+                                                    class: "absolute top-0.5 right-0.5 h-2 w-2 rounded-full bg-red-500 ring-1 ring-panel",
+                                                }
+                                            }
+                                        }
+                                            }
+                                        }
+                                    // Desktop: show or hide the member panel, for this
+                                    // session (`MEMBERS_PANEL_OPEN`, no localStorage).
+                                    button {
+                                        "data-testid": "members-panel-toggle",
+                                        class: "hidden md:inline-flex items-center gap-1 h-8 px-2 rounded-lg text-text-muted hover:text-text hover:bg-surface aria-pressed:bg-surface aria-pressed:text-text transition-colors flex-shrink-0",
+                                        title: if members_open { "Hide members" } else { "Show members" },
+                                        "aria-label": "Members, {member_count}",
+                                        "aria-pressed": if members_open { "true" } else { "false" },
+                                        "aria-controls": "members-rail",
+                                        onclick: move |_| {
+                                            crate::util::defer(move || {
+                                                let open = *MEMBERS_PANEL_OPEN.peek();
+                                                *MEMBERS_PANEL_OPEN.write() = !open;
+                                            });
+                                        },
+                                        {line_icon(PEOPLE_ICON_PATH, 19)}
+                                        span { class: "text-[12.5px] font-bold tabular-nums", "{member_count}" }
+                                    }
+                                    // Phone: open the Members view.
+                                    button {
+                                        "data-testid": "header-members-button",
+                                        class: "md:hidden inline-flex items-center gap-1 h-9 px-2 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors flex-shrink-0",
+                                        title: "Members",
+                                        "aria-label": "Members, {member_count}",
+                                        onclick: {
+                                            let reader_position = reader_position.clone();
+                                            move |_| {
+                                                remember_reading_position(&reader_position);
+                                                crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Members)
+                                            }
+                                        },
+                                        {line_icon(PEOPLE_ICON_PATH, 19)}
+                                        span { class: "text-[12.5px] font-bold tabular-nums", "{member_count}" }
+                                    }
                                 }
                             }
                         }
@@ -3364,7 +3394,7 @@ pub fn Conversation() -> Element {
                                     "Open room list".to_string()
                                 },
                                 onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
-                                Icon { icon: FaBars, width: 18, height: 18 }
+                                {line_icon(MENU_ICON_PATH, 20)}
                                 // Same unread-elsewhere badge as the room-header
                                 // hamburger; with no room selected every room's
                                 // unread (plus DMs) counts.
@@ -3759,34 +3789,6 @@ fn name_tag(
         }
     }
 }
-
-/// A 24-unit line icon (stroke, no fill) at `size` px, decorative.
-fn line_icon(icon_d: &'static str, size: u32) -> Element {
-    rsx! {
-        svg {
-            "aria-hidden": "true",
-            width: "{size}",
-            height: "{size}",
-            view_box: "0 0 24 24",
-            fill: "none",
-            stroke: "currentColor",
-            stroke_width: "1.8",
-            stroke_linecap: "round",
-            stroke_linejoin: "round",
-            class: "flex-none",
-            path { d: icon_d }
-        }
-    }
-}
-
-/// Line-icon paths (24-unit, stroked), as in the design mockup.
-const SHIELD_ICON_PATH: &str = "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10";
-const JOIN_ICON_PATH: &str = "M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3";
-const REPLY_ICON_PATH: &str = "M9 14 4 9l5-5M20 20v-7a4 4 0 0 0-4-4H4";
-const REACT_ICON_PATH: &str =
-    "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01";
-const EDIT_ICON_PATH: &str = "M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z";
-const DELETE_ICON_PATH: &str = "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6";
 
 /// ⚠ and 🛡 for one reactor. `reactor_id` is the member whose name is shown.
 fn reaction_owner_marks(

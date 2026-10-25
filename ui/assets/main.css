@@ -286,6 +286,21 @@
     }
 }
 
+/* The same disc in the member panel (28px) and the DM rail (22px). Not
+ * clickable on its own: the row around it is the control. */
+.msg-avatar.member-avatar {
+    --avatar-size: 28px;
+    margin-top: 0;
+    cursor: inherit;
+}
+
+.msg-avatar.dm-avatar {
+    --avatar-size: 22px;
+    margin-top: 0;
+    font-size: 9.5px;
+    cursor: inherit;
+}
+
 /* Touch: the kebab sits in a narrow right gutter, and there is no hover time
  * or hover bar. */
 @media (hover: none) {

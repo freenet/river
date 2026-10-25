@@ -380,7 +380,7 @@ export async function expectRowHeld(
 /// Below the 768px breakpoint, open the members panel, which replaces the chat.
 export async function hideChatBehindMembers(page: Page) {
   await page.getByTestId("header-members-button").click();
-  await expect(page.locator("aside").filter({ hasText: "Active Members" })).toBeVisible();
+  await expect(page.getByTestId("members-rail")).toBeVisible();
   await expect(page.locator("#chat-scroll-container"), "premise: the chat panel is hidden").toBeHidden();
 }
 
