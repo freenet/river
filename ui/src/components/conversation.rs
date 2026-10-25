@@ -4328,17 +4328,17 @@ fn MessageGroupComponent(
                                                             div { class: "flex justify-end gap-3 mt-3",
                                                                 style: "overflow: visible;",
                                                                 button {
-                                                                    class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border",
+                                                                    "data-testid": "edit-cancel-button",
+                                                                    class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                                                                     onclick: move |_| crate::util::defer(move || editing_message.set(None)),
                                                                     "Cancel (Esc)"
                                                                 }
+                                                                // The dialogs' primary: raised neutral with a
+                                                                // hairline, never a solid accent fill (white on
+                                                                // the dark accent is 2.15:1).
                                                                 button {
-                                                                    class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg font-medium hover:opacity-90",
-                                                                    style: if over_limit {
-                                                                        "background-color: #9ca3af; color: white; cursor: not-allowed; opacity: 0.6;"
-                                                                    } else {
-                                                                        "background-color: var(--color-accent); color: white;"
-                                                                    },
+                                                                    "data-testid": "edit-save-button",
+                                                                    class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg font-semibold bg-panel hover:bg-surface-hover border border-border-hover text-text transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                                                                     disabled: over_limit,
                                                                     title: if over_limit {
                                                                         format!("Edited message exceeds the {} byte limit", max_message_size)

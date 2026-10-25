@@ -1026,6 +1026,36 @@ mod accent_token_audit {
         found
     }
 
+    /// Solid accent fills: the accent as a background, other than the soft
+    /// fill (`-soft`) or a translucent tint (`/N`). White text on the dark
+    /// theme's accent is 2.15:1, and the design keeps the accent for text,
+    /// lines and faint tints.
+    fn solid_accent_fills(src: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for (at, _) in src.match_indices("bg-accent") {
+            let after = &src[at + "bg-accent".len()..];
+            let (token, rest) = match after.strip_prefix("-hover") {
+                Some(rest) => ("bg-accent-hover", rest),
+                None => ("bg-accent", after),
+            };
+            if rest.is_empty() || rest.starts_with([' ', '"', '}', ',']) {
+                found.push(token.to_string());
+            }
+        }
+        for needle in [
+            "background-color: var(--color-accent",
+            "background: var(--color-accent",
+            "bg-[var(--color-accent",
+        ] {
+            for (at, _) in src.match_indices(needle) {
+                if !src[at + needle.len()..].starts_with("-soft") {
+                    found.push(needle.to_string());
+                }
+            }
+        }
+        found
+    }
+
     const OLD_ACCENTS: [&str; 7] = [
         "#0265e7",
         "#0255c7",
@@ -1046,11 +1076,19 @@ mod accent_token_audit {
         let mut bad = Vec::new();
         for path in &paths {
             let src = std::fs::read_to_string(path).expect("read source");
-            // This file names the patterns it forbids.
+            // This file names the patterns it forbids, and test modules
+            // name them in assertions: scan production code only.
             let src = match src.find("mod accent_token_audit") {
                 Some(cut) => &src[..cut],
                 None => &src[..],
             };
+            let src = match src.find("#[cfg(test)]\nmod tests") {
+                Some(cut) => &src[..cut],
+                None => src,
+            };
+            for hit in solid_accent_fills(src) {
+                bad.push(format!("{}: solid accent fill `{hit}`", path.display()));
+            }
             for hit in palette_blues(src) {
                 bad.push(format!("{}: {hit}", path.display()));
             }
@@ -1066,6 +1104,32 @@ mod accent_token_audit {
             "accent colours outside the tokens:\n  {}",
             bad.join("\n  ")
         );
+    }
+
+    #[test]
+    fn the_scan_sees_a_solid_accent_fill() {
+        assert_eq!(
+            solid_accent_fills(r#"class: "px-3 bg-accent text-white""#),
+            vec!["bg-accent"]
+        );
+        assert_eq!(
+            solid_accent_fills(r#"class: "hover:bg-accent-hover text-white""#),
+            vec!["bg-accent-hover"]
+        );
+        assert_eq!(
+            solid_accent_fills(r#"style: "background-color: var(--color-accent); color: white;""#),
+            vec!["background-color: var(--color-accent"]
+        );
+        assert_eq!(
+            solid_accent_fills("x bg-[var(--color-accent)] y"),
+            vec!["bg-[var(--color-accent"]
+        );
+        // The soft fill and translucent tints are allowed.
+        assert!(
+            solid_accent_fills(r#"class: "bg-accent-soft bg-accent/20 hover:bg-accent/10""#)
+                .is_empty()
+        );
+        assert!(solid_accent_fills("background-color: var(--color-accent-soft);").is_empty());
     }
 
     #[test]
