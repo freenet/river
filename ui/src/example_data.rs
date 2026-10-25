@@ -201,6 +201,19 @@ pub fn create_example_rooms() -> Rooms {
         }
     }
 
+    // A room with members and no messages: the history renders no rows,
+    // so nothing there asks for the avatar salt and the member panel must.
+    if fixture_requested("empty-room") {
+        let mut room = create_room(
+            &"Quiet Room".to_string(),
+            SelfIs::Member,
+            None,
+            HistoryDepth::Standard,
+        );
+        room.room_data.room_state.recent_messages.messages.clear();
+        map.insert(room.owner_vk, room.room_data);
+    }
+
     if fixture_requested("uneven-history") {
         for (name, depth) in [
             ("Tall Head Room", HistoryDepth::TallHead),
@@ -742,7 +755,7 @@ fn add_example_messages(
     }
 
     // Add a reply to the first message so example data exercises the reply
-    // bubble layout (needed for Playwright coverage of #205/#206/#207).
+    // strip layout (needed for Playwright coverage of #205/#206/#207).
     if !messages.messages.is_empty() {
         let target = &messages.messages[0];
         let target_id = target.id();
@@ -820,7 +833,7 @@ fn add_example_messages(
         messages.messages.push(orphan_reply);
     }
 
-    // Add a message containing an unbreakable long URL so the bubble width
+    // Add a message containing an unbreakable long URL so the row width
     // regression for #212 is exercised by Playwright.
     {
         let (long_url_author_id, long_url_signing_key) = authors[0];
@@ -841,12 +854,12 @@ fn add_example_messages(
 
     // A SELF (owner-authored) reply whose quoted preview is the long URL above.
     // The reply strip renders its preview with `white-space: nowrap`, so an
-    // unbreakable long URL in the preview drives the bubble to its full
-    // `max-w-prose` width. On a self (right-aligned) message that used to
-    // overflow the viewport on narrow mobile screens, clipping the bubble off
-    // both edges. Kept in example data so the mobile-overflow Playwright
-    // regression test has a self bubble that WOULD overflow without the
-    // per-message width clamp.
+    // unbreakable long URL in the preview is as wide as text gets. When
+    // messages were bubbles, a self (right-aligned) one with this preview
+    // overflowed the viewport on narrow mobile screens, clipping it off both
+    // edges. Kept in example data so the mobile-overflow Playwright
+    // regression test has a self row whose strip WOULD overflow without the
+    // width clamp (the strip truncates inside the row).
     if let Some(long_url_msg) = messages.messages.last().cloned() {
         let target_id = long_url_msg.id();
         let target_author_id = long_url_msg.message.author;

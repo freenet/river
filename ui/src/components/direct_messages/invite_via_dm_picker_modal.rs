@@ -182,14 +182,21 @@ pub fn InviteViaDmPickerModal() -> Element {
         nickname.unwrap_or_else(|| target_peer.to_string().chars().take(8).collect())
     };
     // The invitee's avatar for the header, by the conversation's colouring
-    // rule (the current room's salt). Neutral when anything is unreadable.
+    // rule (the current room's salt). Neutral while a read is contended; the
+    // nudge renders the picker again (dioxus-signal-safety.md, #555).
+    crate::avatar_salt::ensure_avatar_salt(current_room.to_bytes());
+    crate::util::signal_guard::anchor();
     let peer_hue: Option<u16> = (|| {
-        let salt = crate::avatar_salt::AVATAR_SALTS
-            .try_read()
-            .ok()?
-            .get(&current_room.to_bytes())
-            .copied()?;
-        let rooms = ROOMS.try_read().ok()?;
+        let Ok(salts) = crate::avatar_salt::AVATAR_SALTS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return None;
+        };
+        let salt = salts.get(&current_room.to_bytes()).copied()?;
+        drop(salts);
+        let Ok(rooms) = ROOMS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return None;
+        };
         let room_data = rooms.map.get(&current_room)?;
         crate::components::conversation::avatar::member_vk_bytes(
             &room_data.room_state,

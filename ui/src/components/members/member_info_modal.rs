@@ -445,6 +445,9 @@ pub fn MemberInfoModal() -> Element {
         // The avatar's hue under this viewer's salt for the room (a fallible
         // read: contended, the disc is neutral and the nudge re-renders).
         let avatar_hue = owner_key_signal().and_then(|owner_vk| {
+            crate::avatar_salt::ensure_avatar_salt(owner_vk.to_bytes());
+            // A dependency the nudge can wake (#555).
+            crate::util::signal_guard::anchor();
             let salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
                 Ok(salts) => salts.get(&owner_vk.to_bytes()).copied()?,
                 Err(_) => {

@@ -292,8 +292,12 @@ impl MemberTag {
 /// A member-row marker, drawn from its glyph (the tag's meaning): the ⚠ stays
 /// its glyph, in the warning colour; "you" is a muted word; every other mark
 /// is a monochrome line icon. Its span carries the tooltip and label.
-fn member_marker(glyph: &str) -> Element {
-    let icon = match glyph {
+/// The line icon a relationship glyph is drawn as. `None` for the self
+/// marker (drawn as "you") and the impersonation warning (drawn as itself, in
+/// the warning colour); `member_tag_glyphs_all_have_a_drawing` pins that
+/// nothing else falls through.
+fn marker_icon(glyph: &str) -> Option<&'static str> {
+    match glyph {
         "👑" => Some(CROWN_ICON_PATH),
         "🛡" => Some(SHIELD_ICON_PATH),
         "🔑" => Some(KEY_ICON_PATH),
@@ -301,7 +305,11 @@ fn member_marker(glyph: &str) -> Element {
         "🎪" => Some(JOIN_ICON_PATH),
         "🔭" => Some(LINK_ICON_PATH),
         _ => None,
-    };
+    }
+}
+
+fn member_marker(glyph: &str) -> Element {
+    let icon = marker_icon(glyph);
     match (glyph, icon) {
         ("⭐", _) => rsx! { span { class: "text-[12.5px] text-text-muted", "you" } },
         (_, Some(path)) => {
@@ -1506,7 +1514,9 @@ pub fn MemberList() -> Element {
         let room_state = room_data.room_state.clone();
         // The avatar salt, a second fallible read: on contention the list
         // still renders, with neutral avatars, and the nudge re-runs the memo
-        // (dioxus-signal-safety.md).
+        // (dioxus-signal-safety.md). Asked for here too, not only by the
+        // history: a room with no messages renders no history rows.
+        crate::avatar_salt::ensure_avatar_salt(room_owner.to_bytes());
         let avatar_salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
             Ok(salts) => salts.get(&room_owner.to_bytes()).copied(),
             Err(_) => {
@@ -1873,7 +1883,7 @@ pub fn MemberList() -> Element {
                 // your own name, links and counts.
                 button {
                     "data-testid": "invite-member-button",
-                    class: "w-full h-[38px] flex items-center justify-center gap-2 px-3 bg-panel hover:bg-surface text-text text-[14px] font-medium rounded-xl border border-border-hover transition-colors",
+                    class: "w-full h-[38px] flex items-center justify-center gap-2 px-3 bg-transparent hover:bg-surface text-text text-[14px] font-medium rounded-xl border border-border-hover transition-colors",
                     onclick: move |_| invite_modal_active.set(true),
                     {line_icon(INVITE_ICON_PATH, 18)}
                     span { "Invite someone" }
@@ -2992,6 +3002,44 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every glyph a `MemberTag` is built with is drawn as a line icon, as
+    /// "you", or (only the impersonation warning) as itself in the warning
+    /// colour. A new tag glyph without an icon would otherwise render as a
+    /// bare emoji in the warning colour, reading as a warning.
+    #[test]
+    fn member_tag_glyphs_all_have_a_drawing() {
+        let raw = include_str!("members.rs");
+        let src = &raw[..raw.find("mod tests {").expect("a test module")];
+        let mut glyphs = Vec::new();
+        for (at, _) in src.match_indices("MemberTag::new(") {
+            let rest = src[at + "MemberTag::new(".len()..].trim_start();
+            if let Some(lit) = rest.strip_prefix('"') {
+                glyphs.push(lit[..lit.find('"').expect("a closed literal")].to_string());
+            } else {
+                // The only non-literal glyph is the shared warning glyph.
+                assert!(
+                    rest.starts_with("crate::util::confusable::WARNING_GLYPH"),
+                    "a MemberTag built from an unexpected glyph: {}",
+                    &rest[..rest.len().min(60)]
+                );
+            }
+        }
+        assert!(
+            glyphs.len() >= 7,
+            "premise: the scan found the tags: {glyphs:?}"
+        );
+        for glyph in &glyphs {
+            assert!(
+                glyph == "⭐" || super::marker_icon(glyph).is_some(),
+                "MemberTag glyph {glyph:?} has no line icon in `marker_icon`"
+            );
+        }
+        assert_eq!(
+            super::marker_icon(crate::util::confusable::WARNING_GLYPH),
+            None
+        );
+    }
     use super::*;
     use river_core::room_state::member::Member;
 

@@ -1,6 +1,46 @@
 import { test, expect } from "@playwright/test";
-import { memberRows, openRoomWithComposer, resolveColor, selectRoom, waitForApp } from "./example-room";
+import { memberRows, openRoomWithComposer, resolveColor, selectRoom, settle, waitForApp } from "./example-room";
+import {
+  READING_ROW_BUDGET_PX,
+  expectParkedAwayFromEnd,
+  expectSettledAtBottom,
+  fillHistory,
+  openRoomAtBottom,
+  readerScrollsWithoutGesture,
+  scrollMetrics,
+} from "./history-geometry";
 import { callRiverTest } from "./river-test";
+
+/// The reading row as the app defines it (history-scrolling.md): the first
+/// message or event row whose top lies inside the view, with that top.
+function anchorRow(page: import("@playwright/test").Page, key?: string): Promise<{ key: string; top: number } | null> {
+  return page.evaluate((wanted) => {
+    const c = document.getElementById("chat-scroll-container")!;
+    const view = c.getBoundingClientRect();
+    for (const el of Array.from(c.querySelectorAll<HTMLElement>("[data-anchor-key]"))) {
+      const r = el.getBoundingClientRect();
+      const k = el.getAttribute("data-anchor-key")!;
+      if (wanted ? k === wanted : r.top >= view.top - 0.5 && r.top < view.bottom) return { key: k, top: r.top - view.top };
+    }
+    return null;
+  }, key ?? null);
+}
+
+/// Every localStorage key and value (the gateway iframe may throw on access).
+function localStorageSnapshot(page: import("@playwright/test").Page): Promise<Record<string, string> | null> {
+  return page.evaluate(() => {
+    try {
+      const out: Record<string, string> = {};
+      for (let i = 0; i < window.localStorage.length; i++) {
+        const k = window.localStorage.key(i)!;
+        out[k] = window.localStorage.getItem(k)!;
+      }
+      return out;
+    } catch {
+      return null;
+    }
+  });
+}
 
 // The member panel: collapsible on desktop from the header's members toggle
 // (open by default, for the session only), and its rows show an avatar, the
@@ -53,6 +93,95 @@ test.describe("Member panel on desktop", () => {
     }), "no member-panel state in localStorage").toEqual([]);
   });
 
+  test("toggling writes nothing to localStorage", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await settle(page);
+    const before = await localStorageSnapshot(page);
+    const toggle = page.getByTestId("members-panel-toggle");
+    await toggle.click();
+    await expect(page.getByTestId("members-rail")).toBeHidden();
+    await settle(page);
+    expect(await localStorageSnapshot(page), "after hiding").toEqual(before);
+    await toggle.click();
+    await expect(page.getByTestId("members-rail")).toBeVisible();
+    await settle(page);
+    expect(await localStorageSnapshot(page), "after showing").toEqual(before);
+  });
+
+  test("hidden on desktop, the phone's Members view still works, and it stays hidden back on desktop", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await page.getByTestId("members-panel-toggle").click();
+    await expect(page.getByTestId("members-rail")).toBeHidden();
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.getByTestId("header-members-button").click();
+    await expect(page.getByTestId("members-rail")).toBeVisible();
+    await expect(memberRows(page).first()).toBeVisible();
+    await page.getByTestId("members-back-to-chat-button").click();
+    await expect(page.getByTestId("message-composer")).toBeVisible();
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await expect(page.getByTestId("members-panel-toggle")).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("members-rail")).toBeHidden();
+  });
+
+  // The panel changes the chat column's width, so every row rewraps. At
+  // 820px the column is narrower than the 76ch measure whether the panel is
+  // open or not, so every body rewraps (wider, the text sits at its measure
+  // and only the odd long line changes).
+  test("a reader at the end stays at the end through a toggle", async ({ page }) => {
+    await page.setViewportSize({ width: 820, height: 768 });
+    await openRoomAtBottom(page, "Your Private Room");
+    await fillHistory(page);
+    const toggle = page.getByTestId("members-panel-toggle");
+    for (const step of ["hide", "show"]) {
+      const height = (await scrollMetrics(page)).height;
+      await toggle.click();
+      await expect.poll(async () => (await scrollMetrics(page)).height, { message: `premise: ${step} rewraps the rows` }).not.toBe(height);
+      await settle(page);
+      await expectSettledAtBottom(page, `after ${step}`);
+    }
+  });
+
+  test("a parked reader keeps their row through a toggle", async ({ page }) => {
+    await page.setViewportSize({ width: 820, height: 768 });
+    await openRoomAtBottom(page, "Your Private Room");
+    await fillHistory(page);
+    // Park mid-history: well away from both ends.
+    const m = await scrollMetrics(page);
+    await readerScrollsWithoutGesture(page, Math.round(m.max / 2));
+    await settle(page);
+    await expectParkedAwayFromEnd(page);
+    const toggle = page.getByTestId("members-panel-toggle");
+    for (const step of ["hide", "show"]) {
+      const row = (await anchorRow(page))!;
+      expect(row, "premise: a row starts in view").not.toBeNull();
+      const height = (await scrollMetrics(page)).height;
+      await toggle.click();
+      await expect.poll(async () => (await scrollMetrics(page)).height, { message: `premise: ${step} rewraps the rows` }).not.toBe(height);
+      await settle(page);
+      const after = await anchorRow(page, row.key);
+      expect(after, `after ${step}: the reading row is still rendered`).not.toBeNull();
+      expect(Math.abs(after!.top - row.top), `after ${step}: the reading row stays put`).toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
+    }
+  });
+
+  test("an empty room's member avatars are coloured", async ({ page }) => {
+    // Only the empty room is opened, so nothing in a history ever asked for
+    // its salt: the member panel has to.
+    await page.goto("/?empty-room=1");
+    await waitForApp(page);
+    await selectRoom(page, "Quiet Room");
+    await expect(page.getByTestId("message-row")).toHaveCount(0);
+    const avatars = page.getByTestId("members-rail").locator(".member-avatar");
+    await expect(avatars.first()).toBeVisible();
+    await expect
+      .poll(() => avatars.evaluateAll((els) => els.map((e) => (e as HTMLElement).style.getPropertyValue("--avatar-hue"))), {
+        message: "every member's disc has a hue",
+      })
+      .toEqual(expect.not.arrayContaining([""]));
+  });
+
   test("a row is an avatar, the name and quiet markers; an ordinary name fits", async ({ page }) => {
     await openRoomWithComposer(page);
     // A fixed test member with an ordinary-length name.
@@ -98,6 +227,8 @@ test.describe("Member panel on desktop", () => {
       resolveColor(page, "var(--color-accent)"),
     ]);
     expect(await resolveColor(page, bg)).not.toEqual(accent);
+    expect((await resolveColor(page, bg))[3], "transparent at rest").toBe(0);
+    expect(parseFloat(await invite.evaluate((el) => getComputedStyle(el).borderTopWidth)), "outlined").toBeGreaterThanOrEqual(1);
     await expect(page.getByTestId("export-id-button")).toBeVisible();
   });
 });
