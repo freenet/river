@@ -26,11 +26,11 @@
 //! The seed is per device: identity export does not carry it. It normally
 //! survives a chat-delegate re-key: the migration walk only finds it (earliest
 //! seed winning), and the walk driver carries it after the walk's journal
-//! status is recorded and the journal lock released, in a detached task with
-//! a 15 s budget (`delegate_migration::carry_found_seed_with`, [`import_seed`]).
-//! So it never holds up the migration of real data, the identity-import gate
-//! or the sweep's journal gate; a failed or timed-out carry changes the
-//! palette once.
+//! status is recorded and the journal lock released, in a detached task
+//! bounded by its requests' 10 s timeouts
+//! (`delegate_migration::carry_found_seed_with`, [`import_seed`]). So it never
+//! holds up the migration of real data, the identity-import gate or the
+//! sweep's journal gate; a failed carry changes the palette once.
 
 use crate::components::app::freenet_api::delegate_migration::RiverDelegateChannel;
 // Never `{:?}` a reply here: a seed-bearing reply would print the seed.
@@ -139,7 +139,7 @@ const SEED_CAS_ATTEMPTS: u32 = 3;
 /// waiter, or the replies cross and each acts on the other's answer.
 ///
 /// Residual this does not close: a reply that arrives AFTER its request's
-/// 10 s timeout (or after a carry gave up at its budget) finds the slot empty
+/// 10 s timeout finds the slot empty
 /// or, if the next seed request has registered by then, fills that request's
 /// waiter. The reply's key is checked and matches; the protocol carries no
 /// request id for these operations and the generation alone cannot tell two
@@ -148,6 +148,19 @@ const SEED_CAS_ATTEMPTS: u32 = 3;
 /// palette changes once (the CAS still refuses any write against a stale
 /// generation, so no seed is overwritten blindly).
 static SEED_IO: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
+
+/// Serialises every test that takes [`SEED_IO`] (in this module and in the
+/// migration, journal and registry tests). `SEED_IO` is process-wide, so under
+/// a parallel `cargo test` one test holding it (the hanging-carry test holds it
+/// until it ends) reorders another's turns or stalls it. Take this FIRST, before
+/// any other test guard, so the lock order is the same everywhere.
+#[cfg(test)]
+pub(crate) fn seed_io_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SEED_IO_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SEED_IO_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn seed_key() -> ChatDelegateKey {
     ChatDelegateKey::new(AVATAR_SEED_STORAGE_KEY.to_vec())
@@ -669,6 +682,7 @@ mod tests {
 
     #[test]
     fn a_seed_is_created_once_and_read_back() {
+        let _seed_io = seed_io_test_guard();
         let channel = channel_with(None);
         let created = block_on(load_or_create_seed(
             &channel,
@@ -693,6 +707,7 @@ mod tests {
     /// adopts the first's, so the device has one palette.
     #[test]
     fn a_tab_that_loses_the_create_race_adopts_the_stored_seed() {
+        let _seed_io = seed_io_test_guard();
         let channel = channel_with(None);
         channel
             .delegates
@@ -712,6 +727,7 @@ mod tests {
 
     #[test]
     fn an_undecodable_stored_seed_is_replaced() {
+        let _seed_io = seed_io_test_guard();
         let mut sim = DelegateSim::default();
         sim.store
             .insert(AVATAR_SEED_STORAGE_KEY.to_vec(), vec![0xFF, 0x00]);
@@ -729,6 +745,7 @@ mod tests {
 
     #[test]
     fn a_silent_delegate_is_an_error_not_a_new_seed() {
+        let _seed_io = seed_io_test_guard();
         let channel = channel_with(None);
         channel.silence(&successor_key(), true);
         assert!(block_on(load_or_create_seed(
@@ -805,6 +822,7 @@ mod tests {
 
     #[test]
     fn a_valid_seed_in_the_last_conflict_is_adopted() {
+        let _seed_io = seed_io_test_guard();
         let channel = Scripted::new(three_conflicts(record(3, 9).encode()));
         let got = block_on(load_or_create_seed(
             &channel,
@@ -821,6 +839,7 @@ mod tests {
 
     #[test]
     fn conflicts_that_never_settle_are_an_error() {
+        let _seed_io = seed_io_test_guard();
         let channel = Scripted::new(three_conflicts(vec![0xFF]));
         assert!(block_on(load_or_create_seed(
             &channel,
@@ -837,6 +856,7 @@ mod tests {
 
     #[test]
     fn a_refused_store_is_an_error() {
+        let _seed_io = seed_io_test_guard();
         let refused = || {
             vec![
                 versioned(None, 0),
@@ -856,6 +876,7 @@ mod tests {
 
     #[test]
     fn importing_keeps_the_earliest_seed() {
+        let _seed_io = seed_io_test_guard();
         // Absent: the incoming seed lands.
         let channel = channel_with(None);
         assert_eq!(

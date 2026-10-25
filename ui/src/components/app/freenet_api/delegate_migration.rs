@@ -2446,42 +2446,29 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     (report, seam, found_seed)
 }
 
-/// Overall budget for [`carry_found_seed_with`]: the wait for the seed lock
-/// (a session read can hold it for a few round trips) plus the import itself.
-pub(crate) const SEED_CARRY_BUDGET_MS: u64 = 15_000;
-
 /// Carry `record`, the earliest seed a walk found ([`walk_with`]'s third
-/// value), onto the successor: BEST-EFFORT and within
-/// [`SEED_CARRY_BUDGET_MS`]. The caller runs it only after the walk's journal
-/// status is recorded and the journal lock is released, detached from the walk
-/// driver (`migration_journal::run_work_with`), so it never holds the
-/// identity-import gate Pending and never blocks the sweep's journal gate.
-/// `on_replaced` is told when the seed was written (the UI recolours). A
-/// failure or timeout is only logged: the worst case is that this device's
-/// palette changes once. The predecessors are resolved by then, so a seed
-/// whose carry failed is not tried again.
+/// value), onto the successor, BEST-EFFORT. The caller runs it only after the
+/// walk's journal status is recorded and the journal lock is released, detached
+/// from the walk driver (`migration_journal::run_work_with`), so it never holds
+/// the identity-import gate Pending and never blocks the sweep's journal gate.
+/// It has no overall deadline of its own: each of its requests is bounded by
+/// the registry's 10 s response timeout, which bounds the task. (An overall
+/// budget would cancel it mid-request and free the seed lock while a reply is
+/// still in flight, letting that reply complete the session's own seed request
+/// on the same correlation key.) `on_replaced` is told when the seed was
+/// written (the UI recolours). A failure is only logged: the worst case is that
+/// this device's palette changes once. The predecessors are resolved by then,
+/// so a seed whose carry failed is not tried again.
 pub(crate) async fn carry_found_seed_with<C: RiverDelegateChannel>(
     channel: &C,
     successor: &DelegateKey,
     record: crate::avatar_salt::AvatarSeedRecord,
     on_replaced: impl FnOnce(crate::avatar_salt::AvatarSeedRecord),
 ) {
-    let import = std::pin::pin!(crate::avatar_salt::import_seed(channel, successor, record));
-    let budget = std::pin::pin!(crate::util::sleep(crate::util::millis(
-        SEED_CARRY_BUDGET_MS
-    )));
-    match futures::future::select(import, budget).await {
-        futures::future::Either::Left((Ok(crate::avatar_salt::SeedImport::Replaced), _)) => {
-            on_replaced(record)
-        }
-        futures::future::Either::Left((Ok(crate::avatar_salt::SeedImport::Kept), _)) => {}
-        futures::future::Either::Left((Err(e), _)) => {
-            warn!("avatar seed not carried to the successor (palette may change): {e}")
-        }
-        futures::future::Either::Right(_) => warn!(
-            "avatar seed not carried to the successor within {SEED_CARRY_BUDGET_MS} ms \
-             (palette may change)"
-        ),
+    match crate::avatar_salt::import_seed(channel, successor, record).await {
+        Ok(crate::avatar_salt::SeedImport::Replaced) => on_replaced(record),
+        Ok(crate::avatar_salt::SeedImport::Kept) => {}
+        Err(e) => warn!("avatar seed not carried to the successor (palette may change): {e}"),
     }
 }
 
@@ -3324,6 +3311,7 @@ mod tests {
         MemorySeam,
         Vec<crate::avatar_salt::AvatarSeedRecord>,
     ) {
+        let _seed_io = crate::avatar_salt::seed_io_test_guard();
         let (journaled, seam, found) = block_on(walk_with(
             channel,
             MemorySeam::new(),

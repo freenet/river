@@ -225,8 +225,9 @@ on an unmodified tree.
 `river_avatar_colour_seed_v1` (the per-device avatar colour seed) is carried
 from a predecessor by the journaled walk only: the walk finds it (earliest
 seed wins, undecodable skipped), and the walk driver carries it best-effort
-after recording the walk and releasing the journal lock, so it never delays
-real data or the identity-import gate. It has no fixed probe and did not raise
+after recording the walk and releasing the journal lock, in a detached task
+bounded only by its requests' 10 s timeouts, so it never delays real data or
+the identity-import gate. It has no fixed probe and did not raise
 `RIVER_IMPORT_REVISION`; see "Adding new storage keys" in
 `.claude/rules/river-publish.md` for why. It is stored by the UI in the
 existing KV store, so it needs no delegate change and no migration entry.

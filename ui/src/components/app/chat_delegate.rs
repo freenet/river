@@ -7253,12 +7253,19 @@ mod tests {
         /// second registration displaces the first (`Cancelled`) or their
         /// replies cross. `avatar_salt`'s one seed mutex makes them take turns:
         /// both complete, and the earlier seed is what the delegate ends with.
+        ///
+        /// Deterministic: the seed test guard keeps every other `SEED_IO` user
+        /// out, so the turns follow poll order (the session's read is polled
+        /// first and takes the lock first), and the two are driven to
+        /// completion, failing only when nothing can make progress (not after a
+        /// count of idle yields).
         #[test]
         fn the_seed_read_and_the_seed_import_take_turns_in_the_registry() {
             use crate::avatar_salt::{
-                import_seed, load_or_create_seed, AvatarSeedRecord, SeedImport,
+                import_seed, load_or_create_seed, seed_io_test_guard, AvatarSeedRecord, SeedImport,
                 AVATAR_SEED_STORAGE_KEY,
             };
+            let _seed_io = seed_io_test_guard();
             let _guard = registry_guard();
             let current = current_delegate_key();
             let node = TestNode::default();
@@ -7283,22 +7290,46 @@ mod tests {
                 live.set(live.get() - 1);
                 out
             };
-            let (read, import, ()) =
-                block_on(futures::future::join3(session, walk, pump(&node, &live)));
+            // Answer the node until both are done. A round in which the node
+            // had nothing to answer and neither finished is only a stall if
+            // the NEXT round makes no progress either: a lock released in one
+            // round wakes its waiter for the following one.
+            let drive = async {
+                let mut quiet_rounds = 0;
+                let mut last_live = live.get();
+                loop {
+                    if node.step() {
+                        quiet_rounds = 0;
+                        continue;
+                    }
+                    if live.get() == 0 {
+                        return;
+                    }
+                    if live.get() != last_live {
+                        last_live = live.get();
+                        quiet_rounds = 0;
+                    }
+                    quiet_rounds += 1;
+                    assert!(
+                        quiet_rounds <= 2,
+                        "stalled: {} seed operation(s) waiting on nothing the node can answer",
+                        live.get()
+                    );
+                    yield_now().await;
+                }
+            };
+            let (read, import, ()) = block_on(futures::future::join3(session, walk, drive));
 
             let read = read.expect("the session's read must not be displaced");
             let import = import.expect("the walk's import must not be displaced");
-            // Whichever went first, the delegate ends with the earlier seed.
+            // The session went first and stored its (later) seed; the import
+            // replaced it with the earlier one.
+            assert_eq!(read, later);
+            assert_eq!(import, SeedImport::Replaced);
             let stored = node
                 .stored(&current, AVATAR_SEED_STORAGE_KEY)
                 .and_then(|v| AvatarSeedRecord::decode(&v));
             assert_eq!(stored, Some(earlier));
-            match import {
-                // The session created its seed first; the import replaced it.
-                SeedImport::Replaced => assert_eq!(read, later),
-                // The import landed first; the session adopted it.
-                SeedImport::Kept => assert_eq!(read, earlier),
-            }
             assert!(
                 node.completed_for(&current, AVATAR_SEED_STORAGE_KEY)
                     .iter()

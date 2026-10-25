@@ -361,8 +361,11 @@ ONLY, and best-effort:
   answers `AlreadyAuthoritative`) and `walk_with` returns it. The walk driver
   (`migration_journal::run_work_with`) records the walk's journal status,
   RELEASES the journal lock, and only then starts the carry
-  (`carry_found_seed_with`) as a detached task with a 15 s overall budget,
-  ignoring failure. So a seed never keeps a predecessor open, never interrupts
+  (`carry_found_seed_with`) as a detached task, ignoring failure. It has no
+  overall deadline: each request is bounded by the registry's 10 s timeout. A
+  deadline would cancel it mid-request and free `SEED_IO` with a reply still in
+  flight, which could then complete the session's own seed request (same
+  correlation key), leaving the tab on a palette the delegate does not hold. So a seed never keeps a predecessor open, never interrupts
   the journal, never holds the identity-import gate `Pending`, and never
   blocks the sweep's journal gate (`JOURNAL_OPS`); pinned by
   `a_slow_seed_import_holds_neither_the_gate_nor_the_journal_lock`. The worst

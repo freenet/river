@@ -2121,6 +2121,9 @@ mod tests {
         use super::super::delegate_migration::tests_support::{
             successor_key, DelegateSim, MockChannel,
         };
+        // Before `fresh_load`: the seed guard is always taken first. The
+        // hanging import below holds `SEED_IO` until this test drops it.
+        let _seed_io = crate::avatar_salt::seed_io_test_guard();
         let _g = fresh_load();
         let lineage = river_delegate_lineage(&[([10u8; 32], [110u8; 32])]);
         let pred = DelegateKey::new(
