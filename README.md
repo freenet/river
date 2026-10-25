@@ -143,8 +143,9 @@ and run the UI locally:
    # Note: system packages (e.g. `apt-get install npm`) may ship outdated
    # versions that don't work. Install from the official site instead.
 
-   # Install build tools
-   cargo install dioxus-cli
+   # Install build tools. dx must be the exact dioxus version Cargo.lock
+   # resolves (`cargo make check-dx-version` checks it; every build runs it).
+   cargo install --locked dioxus-cli@0.7.10
    cargo install --locked cargo-make
    ```
 

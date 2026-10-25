@@ -96,12 +96,13 @@ the wrong thing, all hit in one session (2026-07-25):
   test is not vacuous. Prefer the static-server flow above; if you must use
   `dx serve`, read a marker out of the DOM (a row's `class` attribute is
   enough) to confirm which build is loaded before believing a pass OR a fail.
-- **A stale `dx` earlier on PATH.** `/opt/rust/bin/dx` was 0.7.3 against the
-  crate's dioxus 0.7.9. It refuses to build and serves a 404 "dx is not serving
-  a web app" page that reads exactly like a broken change; `~/.cargo/bin/dx`
-  was correct. Check `dx --version` against the RESOLVED dioxus version —
-  `cargo tree -p dioxus` or `Cargo.lock`, NOT `ui/Cargo.toml`, which declares
-  `0.7.3` and would have confirmed the stale binary as correct.
+- **A stale `dx` earlier on PATH.** `/opt/rust/bin/dx` was once 0.7.3 against
+  the crate's dioxus 0.7.9. `dx serve` then serves a 404 "dx is not serving a
+  web app" page that reads exactly like a broken change, and `dx build` prints
+  "incompatible" and builds anyway. Every dx task now depends on
+  `check-dx-version`, which fails unless `dx --version` equals the dioxus
+  version `Cargo.lock` resolves; run `cargo make check-dx-version` to check by
+  hand. Compare against `Cargo.lock`, not the requirement in `ui/Cargo.toml`.
 - **Port 8082 is shared.** It is the suite's default `baseURL`, so if another
   worktree already has a server on it, `npx playwright test` silently tests
   THAT build. Use a free port and set `PLAYWRIGHT_BASE_URL`.
