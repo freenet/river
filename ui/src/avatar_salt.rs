@@ -231,7 +231,21 @@ pub fn signing_key_written(room_key: RoomKey) {
 }
 
 /// Ask the chat delegate for this viewer's avatar salt for `room_key`.
+#[cfg(not(all(feature = "example-data", feature = "no-sync")))]
 pub async fn fetch_avatar_salt(room_key: RoomKey) -> Result<[u8; 32], String> {
+    fetch_avatar_salt_from_delegate(room_key).await
+}
+
+/// The offline example build has no delegate to ask, so it stands one in:
+/// a salt derived from the room key, so example avatars are coloured as a
+/// real viewer's would be. Tests clear it with `__riverTest.setAvatarSalt`.
+#[cfg(all(feature = "example-data", feature = "no-sync"))]
+pub async fn fetch_avatar_salt(room_key: RoomKey) -> Result<[u8; 32], String> {
+    Ok(*blake3::keyed_hash(b"river example-data avatar salt!!", &room_key).as_bytes())
+}
+
+#[cfg_attr(all(feature = "example-data", feature = "no-sync"), allow(dead_code))]
+async fn fetch_avatar_salt_from_delegate(room_key: RoomKey) -> Result<[u8; 32], String> {
     let request = ChatDelegateRequestMsg::GetAvatarSalt {
         room_key,
         request_id: generate_request_id(),

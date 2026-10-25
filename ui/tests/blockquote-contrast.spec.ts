@@ -1,5 +1,5 @@
-import { test, expect, Locator } from "@playwright/test";
-import { colourOf, contrast, over, resolveColor, waitForApp } from "./example-room";
+import { test, expect } from "@playwright/test";
+import { colourOf, contrast, effectiveBackground, over, waitForApp } from "./example-room";
 import { openMemberInfoForFirstNonSelf } from "./invite-picker";
 
 // Quoted text (`> …` Markdown) on the tinted outgoing DM bubble, the app's
@@ -8,19 +8,6 @@ import { openMemberInfoForFirstNonSelf } from "./invite-picker";
 // message-contrast.spec.ts covers quotes in room messages.
 
 const AA_TEXT = 4.5;
-
-/// The opaque colour behind `el`: every ancestor's background, composited
-/// from the page down, since the bubble itself is translucent (`bg-accent/20`).
-async function effectiveBackground(el: Locator): Promise<number[]> {
-  const layers = await el.evaluate((e) => {
-    const out: string[] = [];
-    for (let n: Element | null = e; n; n = n.parentElement) out.push(getComputedStyle(n).backgroundColor);
-    return out.reverse();
-  });
-  let base = [255, 255, 255, 1];
-  for (const css of layers) base = over(await resolveColor(el.page(), css), base);
-  return base;
-}
 
 for (const colorScheme of ["dark", "light"] as const) {
   test.describe(`Blockquote contrast (${colorScheme} mode)`, () => {

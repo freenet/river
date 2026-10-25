@@ -79,7 +79,7 @@ test.describe("Reply strip layout (#207)", () => {
     const measure = () =>
       replyStrip.evaluate((el) => {
         const strip = el.getBoundingClientRect();
-        const column = el.closest(".msg-content")!.getBoundingClientRect();
+        const column = el.closest('[data-testid="message-content"]')!.getBoundingClientRect();
         const scroller = document.getElementById("chat-scroll-container")!;
         return {
           strip: [strip.left, strip.right],

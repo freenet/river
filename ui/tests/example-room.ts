@@ -167,6 +167,19 @@ export function over(fg: number[], bg: number[]): number[] {
   return [0, 1, 2].map((i) => fg[i] * a + bg[i] * (1 - a)).concat(1);
 }
 
+/// The opaque colour painted behind `el`: every ancestor's background (and its
+/// own), composited from the page down, since some surfaces are translucent.
+export async function effectiveBackground(el: Locator): Promise<number[]> {
+  const layers = await el.evaluate((e) => {
+    const out: string[] = [];
+    for (let n: Element | null = e; n; n = n.parentElement) out.push(getComputedStyle(n).backgroundColor);
+    return out.reverse();
+  });
+  let base = [255, 255, 255, 1];
+  for (const css of layers) base = over(await resolveColor(el.page(), css), base);
+  return base;
+}
+
 /// The element's computed text colour, as `resolveColor` returns it.
 export async function colourOf(locator: Locator): Promise<number[]> {
   return resolveColor(locator.page(), await locator.evaluate((el) => getComputedStyle(el).color));
@@ -182,11 +195,23 @@ export function coarsePointer(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none), (any-pointer: coarse)").matches);
 }
 
-/// Open `row`'s inline reaction picker from its "+": hover the row unless a
-/// finger is the pointer, then click "+".
+/// Open `row`'s inline reaction picker. A row with reactions shows a "+"
+/// after its chips: hover the row unless a finger is the pointer, then click
+/// it. A row without any has no "+" to click, so take its React action: the
+/// hover bar's on a hover pointer, the kebab menu's on touch.
 export async function openInlinePicker(page: Page, row: Locator) {
-  if (!(await coarsePointer(page))) await row.hover();
-  await row.getByTestId("add-reaction-button").click();
+  if ((await row.getByTestId("reaction-chip").count()) > 0) {
+    if (!(await coarsePointer(page))) await row.hover();
+    await row.getByTestId("add-reaction-button").click();
+  } else if (await touchOnly(page)) {
+    await row.getByTestId("message-kebab").click();
+    await page.getByTestId("message-action-menu").getByRole("button", { name: "React" }).click();
+  } else {
+    // From the row's top left: the next row's hover bar floats over this
+    // row's last line.
+    await row.hover({ position: { x: 4, y: 4 } });
+    await row.getByTestId("message-hover-actions").getByRole("button", { name: "React" }).click();
+  }
 }
 
 /// React to `row` with the picker's first emoji. Expects the row to end with

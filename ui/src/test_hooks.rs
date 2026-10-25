@@ -182,6 +182,54 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Replace the current room's avatar salt with 32 copies of `fill`, or
+    // remove it with `null`, so a spec can see both the neutral disc and two
+    // different salts colouring one member differently.
+    set_hook(
+        "setAvatarSalt",
+        Closure::<dyn FnMut(JsValue)>::new(move |fill: JsValue| {
+            let fill = fill.as_f64().map(|f| f as u8);
+            crate::util::defer(move || {
+                let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+                    return;
+                };
+                let key = room_key.to_bytes();
+                crate::avatar_salt::AVATAR_SALTS.with_mut(|salts| match fill {
+                    Some(b) => {
+                        salts.insert(key, [b; 32]);
+                    }
+                    None => {
+                        salts.remove(&key);
+                    }
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
+    // Append `count` join events in ONE mutation, from the alternating
+    // appended identities ("Test Sender A" / "Test Sender B"), so two fold into
+    // one "A and B joined" notice.
+    set_hook(
+        "appendJoinEvents",
+        Closure::<dyn FnMut(u32)>::new(move |count: u32| {
+            crate::util::defer(move || {
+                with_current_room_mut(|room, room_key| {
+                    for _ in 0..count {
+                        push_test_body(
+                            room,
+                            room_key,
+                            RoomMessageBody::join_event(),
+                            Delivery::Append,
+                        );
+                    }
+                    prune_to_cap(room);
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
     // Remove every message in the current room whose text contains the given
     // substring, in ONE mutation — the shape of a ban purge or a retention
     // drain, which take messages out of the list rather than adding a delete
@@ -476,6 +524,17 @@ fn push_test_message(
     text: String,
     delivery: Delivery,
 ) {
+    push_test_body(room, room_key, RoomMessageBody::public(text), delivery);
+}
+
+/// Insert `content` into `room` where `delivery` says, as that delivery's
+/// test identity.
+fn push_test_body(
+    room: &mut RoomData,
+    room_key: &VerifyingKey,
+    content: RoomMessageBody,
+    delivery: Delivery,
+) {
     let (sk, nickname) = test_author(delivery);
     let author = MemberId::from(&sk.verifying_key());
     admit_with_nickname(room, room_key, &sk, nickname);
@@ -485,7 +544,7 @@ fn push_test_message(
         MessageV1 {
             room_owner: MemberId::from(room_key),
             author,
-            content: RoomMessageBody::public(text),
+            content,
             time,
         },
         &sk,

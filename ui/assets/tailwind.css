@@ -48,6 +48,23 @@
   /* Message-row hover band. Derived from the surface token, so the dark
      value follows the dark --color-surface below. */
   --color-row-hover: color-mix(in srgb, var(--color-surface) 40%, transparent);
+  /* The side rails sit darker than the conversation, which is the lifted
+     --color-panel surface. */
+  --color-rail: #f4f4f6;
+  /* Secondary text (names in a join notice, a reply strip's author, tags). */
+  --color-text-secondary: #484850;
+  /* The similar-name warning's text; 4.5:1 on every row surface. */
+  --color-warning-text: #8a5800;
+  /* Your own rows: a faint tint of the link colour over the conversation
+     surface, stronger under the pointer. Opaque, so the hover band (which is
+     translucent) never has to be layered over it. */
+  --color-row-self: color-mix(in srgb, var(--color-link) 6%, var(--color-panel));
+  --color-row-self-hover: color-mix(in srgb, var(--color-link) 10%, var(--color-panel));
+  /* Avatar discs: oklch(L C hue). The hue is per member (`--avatar-hue`, set
+     inline); a disc without one is the neutral grey. */
+  --avatar-l: 0.90;
+  --avatar-c: 0.05;
+  --avatar-text-l: 0.37;
 }
 
 /* Dark mode colors */
@@ -69,6 +86,12 @@
     --color-warning-bg: #422006;
     --color-error-bg: #450a0a;
     --color-accent-soft: oklch(from #0265e7 l c h / 20%);
+    --color-rail: #0f0f11;
+    --color-text-secondary: #b4b4bb;
+    --color-warning-text: #e3a845;
+    --avatar-l: 0.42;
+    --avatar-c: 0.07;
+    --avatar-text-l: 0.93;
   }
 }
 
@@ -78,6 +101,7 @@
 @utility bg-surface { background-color: var(--color-surface); }
 @utility bg-surface-hover { background-color: var(--color-surface-hover); }
 @utility bg-accent-soft { background-color: var(--color-accent-soft); }
+@utility bg-rail { background-color: var(--color-rail); }
 @utility bg-success-bg { background-color: var(--color-success-bg); }
 @utility bg-warning-bg { background-color: var(--color-warning-bg); }
 @utility bg-error-bg { background-color: var(--color-error-bg); }
@@ -85,6 +109,8 @@
 @utility text-text { color: var(--color-text); }
 @utility text-text-muted { color: var(--color-text-muted); }
 @utility text-text-quote { color: var(--color-text-quote); }
+@utility text-text-secondary { color: var(--color-text-secondary); }
+@utility text-warning-text { color: var(--color-warning-text); }
 @utility text-link { color: var(--color-link); }
 @utility text-link-hover { color: var(--color-link-hover); }
 @utility text-text-inverse { color: var(--color-text-inverse); }

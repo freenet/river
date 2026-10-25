@@ -55,33 +55,252 @@
     }
 }
 
-/* Message rows: the content, then a 72px right gutter for the hover bar and
- * kebab. Rows bleed 8px so the hover band has room; the history's -my-2
- * cancels the group-edge padding so the bottom sentinel sits at the newest
- * message's bottom. No opacity, transform, filter, isolation or z-index on a
- * row: it would trap its menus beneath later rows. */
+/* Message history. A row is a grid: the avatar gutter, then the content
+ * column. The content is indented past the gutter, so nothing a message body
+ * renders can sit where a group header's name does. Rows span the column; the
+ * body text keeps its own measure (`max-w-[76ch]`).
+ *
+ * No opacity, transform, filter, isolation or z-index on a row: it would trap
+ * its menus beneath later rows. */
+.msg-history {
+    /* The newest row's 2px bottom padding, so the bottom sentinel right below
+     * the history sits at the newest message's bottom (history-scrolling.md). */
+    margin-bottom: -2px;
+}
+
+.msg-history > :first-child {
+    margin-top: 0;
+}
+
+.msg-group {
+    margin-top: 14px;
+}
+
 .msg-row {
-    margin-inline: -0.5rem;
-    padding: 0.125rem 72px 0.125rem 0.5rem;
-    border-radius: 0.5rem;
+    --msg-gutter: 60px;
+    display: grid;
+    grid-template-columns: var(--msg-gutter) minmax(0, 1fr);
+    /* No right gutter on a hover pointer: the hover bar floats over the row. */
+    padding: 2px 24px 2px 0;
     transition: background-color 0.15s;
 }
 
 .msg-row:first-child {
-    padding-top: 0.5rem;
+    padding-top: 5px;
 }
 
-.msg-row:last-child {
-    padding-bottom: 0.5rem;
+/* Your own rows carry a faint tint (`--color-row-self`), on every row of the
+ * group. The hover rules below raise it to `--color-row-self-hover`, so the
+ * band and the tint never fight: a row has exactly one background. */
+.msg-row[data-message-self="true"] {
+    background-color: var(--color-row-self);
+}
+
+.msg-gutter {
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    min-width: 0;
+}
+
+/* The author's avatar: initials on a disc. Neutral grey until the room's
+ * avatar salt is known; `.msg-avatar-hued` colours it from `--avatar-hue`. */
+.msg-avatar {
+    --avatar-size: 36px;
+    width: var(--avatar-size);
+    height: var(--avatar-size);
+    flex: none;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 1px;
+    background-color: oklch(var(--avatar-l) 0 0);
+    color: oklch(var(--avatar-text-l) 0 0);
+    font-size: calc(var(--avatar-size) * 0.38);
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    line-height: 1;
+    user-select: none;
+    cursor: pointer;
+}
+
+.msg-avatar-hued {
+    background-color: oklch(var(--avatar-l) var(--avatar-c) var(--avatar-hue));
+    color: oklch(var(--avatar-text-l) 0.045 var(--avatar-hue));
+}
+
+/* Your own avatar: an accent ring, with the row's own background in the gap. */
+.msg-avatar-self {
+    outline: 1.5px solid var(--color-link);
+    outline-offset: 2px;
+}
+
+/* A continuation row's time, in the gutter, shown under a hover pointer. */
+.msg-gutter-time {
+    font-size: 11px;
+    line-height: 22px;
+    color: var(--color-text-muted);
+    font-variant-numeric: tabular-nums;
+    opacity: 0;
+    white-space: nowrap;
+}
+
+/* Others' names underline on hover; the accent colour belongs to your own. */
+.msg-author-name:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+/* The floating hover bar: at the row's top right, over the row above it,
+ * so no gutter is reserved for it. Idle, it is invisible AND takes no hits,
+ * so it never covers Latest (z-30); it rests at z-20, under Latest and the
+ * z-40 dismiss backdrops. Keyboard focus inside the row reveals it too. */
+.hover-actions {
+    position: absolute;
+    right: 0;
+    top: -1.125rem;
+    z-index: 20;
+    display: flex;
+    gap: 2px;
+    padding: 3px;
+    background-color: var(--color-panel);
+    border: 1px solid var(--color-border-hover);
+    border-radius: 0.5rem;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.1s;
+}
+
+.hover-actions button {
+    width: 30px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 0.375rem;
+    color: var(--color-text-muted);
+}
+
+.hover-actions button:hover,
+.hover-actions button:focus-visible {
+    background-color: var(--color-surface);
+    color: var(--color-text);
+}
+
+@media (hover: hover) {
+    .msg-row:hover .hover-actions {
+        opacity: 1;
+        pointer-events: auto;
+    }
+}
+
+/* A separate rule: a browser that does not know `:focus-within` drops only
+ * this one. */
+@media (hover: hover) {
+    .msg-row:focus-within .hover-actions {
+        opacity: 1;
+        pointer-events: auto;
+    }
 }
 
 /* Fine pointers only: a touchscreen laptop would otherwise keep a sticky
- * band. The band also stays while a reaction chip's reactor list is open
- * (the chip reports itself expanded). */
+ * band. */
 @media (hover: hover) and (not (any-pointer: coarse)) {
-    .msg-row:hover,
+    .msg-row:hover {
+        background-color: var(--color-row-hover);
+    }
+
+    .msg-row[data-message-self="true"]:hover {
+        background-color: var(--color-row-self-hover);
+    }
+
+    .msg-row:hover .msg-gutter-time {
+        opacity: 1;
+    }
+}
+
+/* The band also stays while a control the row opened is expanded (a reaction
+ * chip's reactor list). Its own rule, NOT a selector list with `:hover`
+ * above: a browser without `:has()` drops the whole rule it appears in, and
+ * must keep the plain hover band. */
+@media (hover: hover) and (not (any-pointer: coarse)) {
     .msg-row:has([aria-expanded="true"]) {
         background-color: var(--color-row-hover);
+    }
+
+    .msg-row[data-message-self="true"]:has([aria-expanded="true"]) {
+        background-color: var(--color-row-self-hover);
+    }
+}
+
+/* Join notices: one quiet line, the icon in the avatar gutter. */
+.msg-event {
+    display: grid;
+    grid-template-columns: var(--msg-gutter, 60px) minmax(0, 1fr);
+    align-items: center;
+    margin-top: 12px;
+    padding: 3px 24px 3px 0;
+    font-size: 13px;
+    line-height: 20px;
+    color: var(--color-text-muted);
+}
+
+.msg-event .msg-gutter {
+    align-items: center;
+}
+
+/* Date separators: a hairline with a centred label. */
+.msg-day {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin: 26px 24px 4px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--color-text-muted);
+}
+
+.msg-day::before,
+.msg-day::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background-color: var(--color-border);
+}
+
+@media (max-width: 767px) {
+    .msg-row,
+    .msg-event {
+        --msg-gutter: 52px;
+        padding-right: 14px;
+    }
+
+    .msg-avatar {
+        --avatar-size: 32px;
+    }
+
+    .msg-day {
+        margin-inline: 14px;
+    }
+}
+
+/* Touch: the kebab sits in a narrow right gutter, and there is no hover time
+ * or hover bar. */
+@media (hover: none) {
+    .msg-row {
+        padding-right: 40px;
+    }
+
+    .hover-actions {
+        display: none;
+    }
+}
+
+@media (hover: none), (any-pointer: coarse) {
+    .msg-gutter-time {
+        display: none;
     }
 }
 
@@ -162,11 +381,11 @@
 
 /* Touch-only message action affordance (freenet/river#402).
  *
- * The per-message hover action bar (reply / edit / delete) is built with
- * Tailwind `group-hover:` utilities, which Tailwind v4 automatically wraps in
- * `@media (hover: hover)`. On a touch device (phone, tablet) there is no hover
- * pointer, so that bar can NEVER become visible and touch users have no way to
- * reach reply / edit / delete / react.
+ * The per-message hover action bar (`.hover-actions` above) reveals only
+ * under `@media (hover: hover)` and is `display: none` under `(hover: none)`.
+ * On a touch device (phone, tablet) there is no hover pointer, so that bar
+ * can NEVER appear and touch users would have no way to reach reply / edit /
+ * delete / react.
  *
  * `.touch-actions` is the exact complement: hidden by default (so mouse users
  * keep the clean hover-reveal desktop UI) and shown only where `hover: none`

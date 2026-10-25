@@ -407,7 +407,7 @@ pub fn RoomList() -> Element {
             // tests anchor on this testid instead of the brittle visible
             // text "Rooms".
             "data-testid": "rooms-rail",
-            class: "w-full md:w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
+            class: "w-full md:w-64 flex-shrink-0 bg-rail border-r border-border flex flex-col overflow-y-auto",
             // Mobile back button (hidden on desktop)
             div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
                 BackToChatButton {

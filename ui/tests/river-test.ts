@@ -7,9 +7,13 @@ type RiverTestHooks = {
   appendMessage(text: string): void;
   insertMessageBeforeLast(text: string): void;
   appendMessages(count: number): void;
+  // `count` join events from Test Sender A and B, alternating (two fold into one notice).
+  appendJoinEvents(count: number): void;
   removeMessages(containing: string): void;
   // Each emoji as a reaction on the newest message, all held by one test author.
   addReactionsToNewest(emojis: string[]): void;
+  // The current room's avatar salt: 32 bytes of `fill`, or none (neutral avatars).
+  setAvatarSalt(fill: number | null): void;
   makeRoomPrivateWithoutSecret(): void;
   forgeNextSendSignature(): void;
   setRoomsLoadState(state: RoomsLoadState): void;

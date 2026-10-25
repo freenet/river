@@ -1,5 +1,5 @@
 import { expect, Locator, Page, test } from "@playwright/test";
-import { coarsePointer, selectRoom, settle, waitForApp } from "./example-room";
+import { coarsePointer, openInlinePicker, selectRoom, settle, touchOnly, waitForApp } from "./example-room";
 
 // Regression coverage for freenet/river#714.
 //
@@ -65,10 +65,7 @@ async function addOwnReaction(page: Page): Promise<Locator> {
   const id = await row.getAttribute("id");
   const pinned = page.locator(`[id="${id}"]`);
   await pinned.scrollIntoViewIfNeeded();
-  if (!(await coarsePointer(page))) {
-    await pinned.hover();
-  }
-  await pinned.getByTestId("add-reaction-button").click();
+  await openInlinePicker(page, pinned);
   await page.getByTestId("emoji-picker").getByRole("button").first().click();
   const chip = pinned.locator('[data-testid="reaction-chip"][title*="click to remove"]');
   await expect(chip).toHaveCount(1);
@@ -105,10 +102,17 @@ async function removeOwnReaction(page: Page, chip: Locator) {
     await expect(owners).toHaveCount(0);
     await expect(chip).toHaveCount(0);
     // The chip that opened the list is gone, so focus goes to the nearest
-    // control left on that message rather than nowhere.
-    await expect(
-      page.locator(`[id="${messageId}"]`).getByTestId("add-reaction-button")
-    ).toBeFocused();
+    // control left on that message rather than nowhere: its "+" while other
+    // chips remain, else its React action (the kebab on touch, the hover
+    // bar's React otherwise), since a message with no reactions has no "+".
+    const message = page.locator(`[id="${messageId}"]`);
+    const nearest =
+      (await message.getByTestId("reaction-chip").count()) > 0
+        ? message.getByTestId("add-reaction-button")
+        : (await touchOnly(page))
+          ? message.getByTestId("message-kebab")
+          : message.getByTestId("message-hover-actions").getByRole("button", { name: "React" });
+    await expect(nearest).toBeFocused();
   } else {
     await expect(owners).toHaveCount(0);
   }

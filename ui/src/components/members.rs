@@ -1659,7 +1659,7 @@ pub fn MemberList() -> Element {
             // carries no indicator, anchoring on the testid instead of the
             // brittle visible text "Active Members".
             "data-testid": "members-rail",
-            class: "w-full md:w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col",
+            class: "w-full md:w-56 flex-shrink-0 bg-rail border-l border-border flex flex-col",
             // Header
             div { class: "px-4 py-3 border-b border-border flex-shrink-0",
                 div { class: "flex items-center gap-2",
@@ -7480,7 +7480,7 @@ mod tests {
         let group_fn = between(
             conversation,
             "fn group_messages(",
-            "\n/// Format an event summary",
+            "\n/// A join notice's names",
             "group_messages",
         );
         assert!(
@@ -7509,7 +7509,18 @@ mod tests {
             conversation.contains("impersonation_checker_for_viewer("),
             "the conversation no longer builds an impersonation checker"
         );
-        // The rendered element and its glyph: impersonation-warning.spec.ts.
+        // The rendered element, anchored on its call, and the glyph it renders
+        // (the browser side is impersonation-warning.spec.ts).
+        let author_warning = between(
+            conversation,
+            "name_mark(\"message-author-impersonation-warning\"",
+            "\n",
+            "author-line warning element",
+        );
+        assert!(
+            author_warning.contains("WARNING_GLYPH"),
+            "the message author line no longer renders the warning glyph"
+        );
 
         // --- Member-info modal -------------------------------------------
         //

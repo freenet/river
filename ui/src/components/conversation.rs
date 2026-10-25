@@ -27,6 +27,7 @@ use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
     get_current_system_time, local_message_date, local_today,
 };
+mod avatar;
 mod emoji_picker;
 mod history_scroll;
 mod history_window;
@@ -406,7 +407,7 @@ fn resolve_reply_strip(
         // `edited_content` BEFORE any content-type decode. So without this a
         // member could post a join event, edit it to arbitrary text, and quote
         // it — surfacing text that is rendered nowhere else in the app, since
-        // events render through `format_event_summary`. Do NOT drop this filter.
+        // events render through `event_summary_parts`. Do NOT drop this filter.
         // Quoting an action or event would also aim scroll-to-original at a
         // `msg-{id}` element that never exists.
         .filter(|target_msg| {
@@ -776,12 +777,12 @@ fn group_messages(
     items
 }
 
-/// Format an event summary like "Alice joined the room" or "3 people joined the room"
-fn format_event_summary(names: &[String]) -> String {
+/// A join notice's names (shown in the secondary colour) and the text after
+/// them: "Alice joined", "Alice and Bob joined", "3 people joined".
+fn event_summary_parts(names: &[String]) -> (Vec<String>, String) {
     match names.len() {
-        1 => format!("{} joined the room", names[0]),
-        2 => format!("{} and {} joined the room", names[0], names[1]),
-        n => format!("{} people joined the room", n),
+        1 | 2 => (names.to_vec(), " joined".to_string()),
+        n => (Vec::new(), format!("{n} people joined")),
     }
 }
 
@@ -2501,7 +2502,7 @@ pub fn Conversation() -> Element {
     };
 
     rsx! {
-        div { class: "flex-1 flex flex-col min-w-0 bg-bg",
+        div { class: "flex-1 flex flex-col min-w-0 bg-panel",
             // Room header
             {
                 current_room_data.as_ref().map(|_room_data| {
@@ -2809,7 +2810,9 @@ pub fn Conversation() -> Element {
                     style: "overflow-anchor:none;",
                     id: "chat-scroll-container",
                     "data-testid": "chat-scroll-container",
-                    div { class: "max-w-4xl mx-auto px-4 py-4", id: "chat-content",
+                    // Full width: rows and their hover band span the column, and
+                    // the body text keeps its own 76ch measure.
+                    div { class: "py-4", id: "chat-content",
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
@@ -2869,6 +2872,43 @@ pub fn Conversation() -> Element {
                                     let member_names = member_names.clone();
                                     let impersonation = impersonation.clone();
                                     let deputy_badges = deputy_badges.clone();
+                                    // This viewer's avatar hue for each author in the
+                                    // rendered range, under the room's salt. No salt
+                                    // (not fetched yet, or the delegate has no key for
+                                    // the room) leaves every avatar neutral; there is
+                                    // deliberately no other source (`avatar_salt.rs`).
+                                    let author_hues: HashMap<MemberId, u16> = {
+                                        let owner_vk = CURRENT_ROOM.peek().owner_key;
+                                        let salt = owner_vk.and_then(|vk| {
+                                            crate::avatar_salt::ensure_avatar_salt(vk.to_bytes());
+                                            match crate::avatar_salt::AVATAR_SALTS.try_read() {
+                                                Ok(salts) => salts.get(&vk.to_bytes()).copied(),
+                                                Err(_) => {
+                                                    // No subscription this render; the
+                                                    // nudge renders it again (#555).
+                                                    crate::util::signal_guard::anchor();
+                                                    crate::util::signal_guard::schedule_nudge();
+                                                    None
+                                                }
+                                            }
+                                        });
+                                        match (salt, owner_vk, current_room_data.as_ref()) {
+                                            (Some(salt), Some(owner_vk), Some(rd)) => groups
+                                                .iter()
+                                                .filter_map(|item| match item {
+                                                    DisplayItem::Messages(g) => Some(g.author_id),
+                                                    DisplayItem::Event(_) => None,
+                                                })
+                                                .collect::<HashSet<MemberId>>()
+                                                .into_iter()
+                                                .filter_map(|author| {
+                                                    avatar::member_vk_bytes(&rd.room_state, &owner_vk, author)
+                                                        .map(|vk| (author, crate::avatar_salt::avatar_hue(&salt, &vk)))
+                                                })
+                                                .collect(),
+                                            _ => HashMap::new(),
+                                        }
+                                    };
                                     // Room limits for the in-place edit form's
                                     // encoded-size gate (same measure the
                                     // contract enforces on the edit action).
@@ -2953,9 +2993,9 @@ pub fn Conversation() -> Element {
                                             }
                                         }
                                         div {
-                                            // -my-2 cancels the first and last rows' 8px band padding;
-                                            // separators and events pad to match.
-                                            class: "-my-2",
+                                            // `.msg-history` (main.css) spaces the items and
+                                            // cancels the newest row's bottom padding.
+                                            class: "msg-history",
                                             // Stable automation hook for the
                                             // history rows (AGENTS.md test-id
                                             // rule); additive markup only.
@@ -2968,6 +3008,7 @@ pub fn Conversation() -> Element {
                                                 let member_names = member_names.clone();
                                                 let impersonation = impersonation.clone();
                                                 let deputy_badges = deputy_badges.clone();
+                                                let author_hues = author_hues.clone();
                                                 move |row| {
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let handle_edit_message = handle_edit_message.clone();
@@ -2976,17 +3017,17 @@ pub fn Conversation() -> Element {
                                                 let deputy_badges = deputy_badges.clone();
                                                 match row {
                                                     DisplayRow::DateSeparator { key, label } => rsx! {
+                                                        // A hairline with the label (`.msg-day`).
                                                         div {
                                                             key: "{key}",
-                                                            class: "flex justify-center py-4",
-                                                            span {
-                                                                class: "text-xs font-medium text-text-muted bg-surface px-3 py-1 rounded-full",
-                                                                "{label}"
-                                                            }
+                                                            "data-testid": "date-separator",
+                                                            class: "msg-day",
+                                                            "{label}"
                                                         }
                                                     },
                                                     DisplayRow::Item(DisplayItem::Event(summary)) => {
-                                                        let text = format_event_summary(&summary.names);
+                                                        let (names, rest) = event_summary_parts(&summary.names);
+                                                        let time = format_utc_as_local_time(summary.last_time.timestamp_millis());
                                                         let key = summary.id.clone();
                                                         rsx! {
                                                             div {
@@ -2994,16 +3035,25 @@ pub fn Conversation() -> Element {
                                                                 "data-item-key": "{key}",
                                                                 // For `capture_reading_anchor`.
                                                                 "data-anchor-key": "{key}",
-                                                                class: "flex justify-center py-3",
-                                                                span {
-                                                                    class: "text-xs text-text-muted italic",
-                                                                    "{text}"
+                                                                "data-testid": "join-notice",
+                                                                class: "msg-event",
+                                                                span { class: "msg-gutter", {line_icon(JOIN_ICON_PATH, 14)} }
+                                                                span { class: "min-w-0 [overflow-wrap:anywhere]",
+                                                                    if let Some(first) = names.first() {
+                                                                        span { class: "font-bold text-text-secondary", "{first}" }
+                                                                    }
+                                                                    if let Some(second) = names.get(1) {
+                                                                        " and "
+                                                                        span { class: "font-bold text-text-secondary", "{second}" }
+                                                                    }
+                                                                    "{rest} · {time}"
                                                                 }
                                                             }
                                                         }
                                                     }
                                                     DisplayRow::Item(DisplayItem::Messages(group)) => {
                                                         let key = group.messages[0].id.clone();
+                                                        let author_hue = author_hues.get(&group.author_id).copied();
                                                         rsx! {
                                                             // The wrapper exists to carry
                                                             // `data-item-key`, which marks the
@@ -3016,6 +3066,7 @@ pub fn Conversation() -> Element {
                                                             div {
                                                                 key: "{key}",
                                                                 "data-item-key": "{key}",
+                                                                class: "msg-group",
                                                                 MessageGroupComponent {
                                                                 group: group,
                                                                 self_member_id: self_member_id,
@@ -3048,6 +3099,7 @@ pub fn Conversation() -> Element {
                                                                     }
                                                                 },
                                                                 open_action_menu: open_action_menu,
+                                                                author_hue: author_hue,
                                                                 }
                                                             }
                                                         }
@@ -3414,7 +3466,7 @@ pub fn Conversation() -> Element {
             if pending_delete.read().is_some() {
                 div {
                     class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
-                    onclick: move |_| pending_delete.set(None),
+                    onclick: move |_| crate::util::defer(move || pending_delete.set(None)),
                     div {
                         class: "bg-panel rounded-lg shadow-xl p-6 max-w-sm mx-4",
                         onclick: move |e| e.stop_propagation(),
@@ -3427,17 +3479,17 @@ pub fn Conversation() -> Element {
                         div { class: "flex gap-3 justify-end",
                             button {
                                 class: "px-4 py-2 rounded-lg bg-surface hover:bg-surface/80 text-text transition-colors",
-                                onclick: move |_| pending_delete.set(None),
+                                onclick: move |_| crate::util::defer(move || pending_delete.set(None)),
                                 "Cancel"
                             }
                             button {
                                 class: "px-4 py-2 rounded-lg bg-red-500 hover:bg-red-600 text-white transition-colors",
                                 onclick: move |_| {
-                                    let msg_id_opt = pending_delete.read().clone();
+                                    let msg_id_opt = pending_delete.peek().clone();
                                     if let Some(msg_id) = msg_id_opt {
                                         handle_delete_message(msg_id);
                                     }
-                                    pending_delete.set(None);
+                                    crate::util::defer(move || pending_delete.set(None));
                                 },
                                 "Delete"
                             }
@@ -3613,12 +3665,21 @@ fn focus_without_scrolling(element: &web_sys::Element) -> bool {
 /// scrollport), and its max height: the space on that side less the 8px gap
 /// each way, so an `overflow-y-auto` popover scrolls instead of clipping (#402).
 fn vertical_placement(y: f64, height: f64) -> (bool, f64) {
-    let (top, bottom) = chat_scrollport_bounds();
-    let (below, above_space) = (bottom - y, y - top);
+    vertical_placement_from(y, y, height)
+}
+
+/// [`vertical_placement`] for a popover hung off an element spanning viewport
+/// `top..bottom`: it opens below from `bottom`, or above from `top`.
+fn vertical_placement_from(top: f64, bottom: f64, height: f64) -> (bool, f64) {
+    let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
+    let (below, above_space) = (scroll_bottom - bottom, top - scroll_top);
     let above = below < height && above_space > below;
     let max_h = ((if above { above_space } else { below }) - 16.0).max(1.0);
     (above, max_h)
 }
+
+/// The inline picker's height: 16 emoji in four rows of four, plus padding.
+const INLINE_PICKER_HEIGHT_PX: f64 = 140.0;
 
 fn chat_scrollport_bounds() -> (f64, f64) {
     web_sys::window()
@@ -3631,10 +3692,17 @@ fn chat_scrollport_bounds() -> (f64, f64) {
         .unwrap_or((60.0, 600.0))
 }
 
-/// Whether `msg-{msg_id}`'s inline picker opens leftward (`right-0`): when
-/// its "+" wrapper sits right of the chat scroller's centre, so the picker
-/// opens toward the roomier side; rightward when unmeasurable.
-fn inline_picker_align_right(msg_id: &str) -> bool {
+/// Where `msg-{msg_id}`'s inline picker opens, measured from its "+" wrapper,
+/// never from a click: a key press reports no position, and the kebab's React
+/// is tapped nowhere near "+".
+///
+/// - Leftward (`right-0`) when the wrapper sits right of the chat scroller's
+///   centre, so the picker opens toward the roomier side.
+/// - Above when it does not fit below the wrapper inside the scroller and
+///   there is more room above ([`vertical_placement_from`]).
+///
+/// Unmeasurable, it opens below and rightward.
+fn inline_picker_placement(msg_id: &str) -> PickerPlacement {
     let measure = || {
         let document = web_sys::window()?.document()?;
         let plus = document
@@ -3646,9 +3714,14 @@ fn inline_picker_align_right(msg_id: &str) -> bool {
         let scroller = document
             .get_element_by_id("chat-scroll-container")?
             .get_bounding_client_rect();
-        Some(plus.left() + plus.right() > scroller.left() + scroller.right())
+        let (above, _) =
+            vertical_placement_from(plus.top(), plus.bottom(), INLINE_PICKER_HEIGHT_PX);
+        Some(PickerPlacement {
+            above,
+            align_right: plus.left() + plus.right() > scroller.left() + scroller.right(),
+        })
     };
-    measure().unwrap_or(false)
+    measure().unwrap_or_default()
 }
 
 /// A ⚠ or 🛡 beside a name, its tooltip also its accessible label.
@@ -3662,6 +3735,56 @@ fn name_mark(
         span { "data-testid": testid, class, title: "{tooltip}", "aria-label": "{tooltip}", {glyph} }
     }
 }
+
+/// A role tag after an author's name ("OWNER", "DEPUTY"): small outlined
+/// caps, an optional line icon, its tooltip also its accessible label.
+fn name_tag(
+    testid: &'static str,
+    tooltip: String,
+    icon_path: Option<&'static str>,
+    label: &'static str,
+) -> Element {
+    rsx! {
+        span {
+            "data-testid": testid,
+            class: "self-center inline-flex items-center gap-[3px] px-[5px] leading-4 text-[10.5px] font-bold uppercase tracking-[0.03em] text-text-secondary border border-border-hover rounded cursor-default",
+            title: "{tooltip}",
+            "aria-label": "{tooltip}",
+            if let Some(path) = icon_path {
+                {line_icon(path, 11)}
+            }
+            {label}
+        }
+    }
+}
+
+/// A 24-unit line icon (stroke, no fill) at `size` px, decorative.
+fn line_icon(icon_d: &'static str, size: u32) -> Element {
+    rsx! {
+        svg {
+            "aria-hidden": "true",
+            width: "{size}",
+            height: "{size}",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.8",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            class: "flex-none",
+            path { d: icon_d }
+        }
+    }
+}
+
+/// Line-icon paths (24-unit, stroked), as in the design mockup.
+const SHIELD_ICON_PATH: &str = "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10";
+const JOIN_ICON_PATH: &str = "M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3";
+const REPLY_ICON_PATH: &str = "M9 14 4 9l5-5M20 20v-7a4 4 0 0 0-4-4H4";
+const REACT_ICON_PATH: &str =
+    "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01";
+const EDIT_ICON_PATH: &str = "M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z";
+const DELETE_ICON_PATH: &str = "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6";
 
 /// ⚠ and 🛡 for one reactor. `reactor_id` is the member whose name is shown.
 fn reaction_owner_marks(
@@ -3706,6 +3829,10 @@ fn MessageGroupComponent(
     on_reply: EventHandler<ReplyContext>,
     // Shared across all groups so only one action menu is open at a time (#402).
     open_action_menu: Signal<Option<String>>,
+    /// The author's avatar hue under this viewer's salt for the room, or
+    /// `None` for the neutral disc (no salt yet, or an author the room no
+    /// longer lists).
+    author_hue: Option<u16>,
 ) -> Element {
     let mut open_action_menu = open_action_menu;
     // Per-group: at most one picker per group, and while a picker is open its
@@ -3749,12 +3876,13 @@ fn MessageGroupComponent(
 
     let mut picker_placement: Signal<PickerPlacement> = use_signal(PickerPlacement::default);
     // Measures the "+" now, then places and opens the picker in one deferred
-    // step (.claude/rules/dioxus-signal-safety.md).
-    let open_inline_picker = move |msg_id: &str, above: bool| {
-        let align_right = inline_picker_align_right(msg_id);
+    // step (.claude/rules/dioxus-signal-safety.md). Every open path (the "+",
+    // the hover bar's React, the kebab's React) comes through here.
+    let open_inline_picker = move |msg_id: &str| {
+        let placement = inline_picker_placement(msg_id);
         let picker_id = format!("inline-{msg_id}");
         crate::util::defer(move || {
-            picker_placement.set(PickerPlacement { above, align_right });
+            picker_placement.set(placement);
             open_emoji_picker.set(Some(picker_id));
             open_action_menu.set(None);
         });
@@ -3834,18 +3962,29 @@ fn MessageGroupComponent(
                         return;
                     }
                     // The chip is gone: Remove took the only reaction with that
-                    // emoji. The message's add-reaction button is the nearest
-                    // control. If the message is gone too, focus stays where the
-                    // browser put it.
-                    if let Some(add) = document
-                        .get_element_by_id(&format!("msg-{message_id}"))
-                        .and_then(|row| {
-                            row.query_selector("[data-testid=\"add-reaction-button\"]")
-                                .ok()
-                                .flatten()
-                        })
-                    {
-                        focus_without_scrolling(&add);
+                    // emoji. The nearest control left on the message takes
+                    // focus: its "+" while other chips remain, else its React
+                    // action, which is the kebab on touch and the hover bar's
+                    // React otherwise (a message with no reactions has no
+                    // visible "+"). Each is tried until one actually holds
+                    // focus, since a hidden one refuses it. If the message is
+                    // gone too, focus stays where the browser put it.
+                    let Some(row) = document.get_element_by_id(&format!("msg-{message_id}")) else {
+                        return;
+                    };
+                    for selector in [
+                        "[data-testid=\"add-reaction-button\"].has-reactions",
+                        "[data-testid=\"message-kebab\"]",
+                        "[data-testid=\"message-hover-actions\"] button",
+                    ] {
+                        let Some(control) = row.query_selector(selector).ok().flatten() else {
+                            continue;
+                        };
+                        if focus_without_scrolling(&control)
+                            && document.active_element().as_ref() == Some(&control)
+                        {
+                            return;
+                        }
                     }
                 });
             }
@@ -3892,11 +4031,22 @@ fn MessageGroupComponent(
         }
     });
 
-    let name_colour = if is_self {
-        "text-link hover:text-link-hover"
-    } else {
-        "text-text hover:text-link"
-    };
+    // Your own name is the link colour; others' names underline on hover
+    // (`.msg-author-name` in main.css) and keep the text colour, so a name
+    // under the pointer never reads as yours.
+    let name_colour = if is_self { "text-link" } else { "text-text" };
+    let author_initials = avatar::initials(&group.author_name);
+    let avatar_class = format!(
+        "msg-avatar{}{}",
+        if author_hue.is_some() {
+            " msg-avatar-hued"
+        } else {
+            ""
+        },
+        if is_self { " msg-avatar-self" } else { "" },
+    );
+    let avatar_style = avatar::avatar_style(author_hue);
+    let author_is_owner = group.author_id == owner_id;
     let author_id = group.author_id;
     let open_author_info = move |_: MouseEvent| {
         crate::util::defer(move || {
@@ -3911,9 +4061,11 @@ fn MessageGroupComponent(
                         let is_first = idx == 0;
                         let has_reactions = !msg.reactions.is_empty();
                         let reply_strip_val = msg.reply_strip.clone();
+                        let row_time_ms = msg.time.timestamp_millis();
 
                         rsx! {
-                            // One row per message (`.msg-row` in main.css).
+                            // One row per message (`.msg-row` in main.css): the
+                            // avatar gutter, then the content column.
                             div {
                                 key: "{msg.id}",
                                 id: "msg-{msg.id}",
@@ -3924,32 +4076,73 @@ fn MessageGroupComponent(
                                 "data-message-self": "{is_self}",
                                 class: "msg-row group",
                                 div {
-                                    // `relative` anchors the hover bar and the
-                                    // kebab, which sit just past its right edge.
-                                    class: "msg-content relative",
+                                    class: "msg-gutter",
+                                    if is_first {
+                                        // Decorative for assistive tech: the name
+                                        // button beside it is the accessible
+                                        // control, so this is no tab stop either.
+                                        div {
+                                            "data-testid": "message-author-avatar",
+                                            "aria-hidden": "true",
+                                            class: "{avatar_class}",
+                                            style: avatar_style.clone(),
+                                            onclick: open_author_info,
+                                            "{author_initials}"
+                                        }
+                                    } else {
+                                        span {
+                                            "data-testid": "message-gutter-time",
+                                            class: "msg-gutter-time",
+                                            title: format_utc_as_full_datetime(row_time_ms),
+                                            {format_utc_as_local_time(row_time_ms)}
+                                        }
+                                    }
+                                }
+                                div {
+                                    "data-testid": "message-content",
+                                    // `relative` anchors the hover bar (over its
+                                    // top right) and the kebab (just past its
+                                    // right edge, in the touch gutter).
+                                    class: "msg-content relative min-w-0",
                                     if is_first {
                                         div {
                                             "data-testid": "message-group-header",
-                                            class: "flex flex-wrap items-baseline gap-x-2 mb-0.5",
+                                            class: "flex flex-wrap items-baseline gap-x-2 mb-0.5 leading-5",
                                             // A native button: Enter and Space fire
                                             // its click, so no key handler.
                                             button {
                                                 r#type: "button",
                                                 "data-testid": "message-author-name",
-                                                class: "text-sm font-medium text-left min-w-0 [overflow-wrap:anywhere] cursor-pointer rounded-sm transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent {name_colour}",
+                                                class: "msg-author-name text-[15px] font-bold text-left min-w-0 [overflow-wrap:anywhere] cursor-pointer rounded-sm focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent {name_colour}",
                                                 title: "Member ID: {author_id}",
                                                 onclick: open_author_info,
                                                 "{group.author_name}"
                                             }
-                                            // Impersonation warning. Sits immediately after the
-                                            // name, before the shield slot. The two are NOT
-                                            // mutually exclusive — two deputies whose names collide
-                                            // each carry a shield AND a warning — so these really
-                                            // are two badge positions and both can be filled at
-                                            // once. Do not collapse them into one slot, and do not
-                                            // suppress the warning when a shield is present: a
-                                            // deputised sockpuppet carries a genuine shield, and
-                                            // suppressing on it is the exact immunity
+                                            // Role tags. The owner tag reads the room's
+                                            // owner id, the same fact as the member
+                                            // list's crown and its tooltip.
+                                            if author_is_owner {
+                                                {name_tag("message-author-owner-tag", "Room Owner".to_string(), None, "Owner")}
+                                            }
+                                            // Deputy tag. Same visibility rule and the
+                                            // same tooltip as the member-list row and the
+                                            // member-info modal chip, so the three read
+                                            // as one badge. The nickname above cannot
+                                            // forge it: it is styled markup, and
+                                            // nicknames are stripped of emoji by
+                                            // `crate::util::display_name`.
+                                            {group.author_badge.as_ref().map(|badge| name_tag("message-author-deputy-badge", badge.tooltip(), Some(SHIELD_ICON_PATH), "Deputy"))}
+                                            // Impersonation warning, after the tags.
+                                            // The tag and the warning are NOT mutually
+                                            // exclusive — two deputies whose names
+                                            // collide each carry a tag AND a warning —
+                                            // so these really are two positions and
+                                            // both can be filled at once. Do not
+                                            // collapse them into one slot, and do not
+                                            // suppress the warning when a tag is
+                                            // present: a deputised sockpuppet carries a
+                                            // genuine tag, and suppressing on it is the
+                                            // exact immunity
                                             // `a_deputised_sockpuppet_cannot_suppress_its_own_warning`
                                             // denies.
                                             //
@@ -3957,16 +4150,17 @@ fn MessageGroupComponent(
                                             // inside the range `display_name::is_display_hidden`
                                             // strips, so it can never survive into a rendered
                                             // nickname. `the_warning_glyph_cannot_appear_in_a_nickname`
-                                            // pins that.
-                                            {group.author_impersonation.as_ref().map(|warning| name_mark("message-author-impersonation-warning", "text-sm cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
-                                            // Deputy shield. Same glyph, same visibility rule and
-                                            // the same tooltip as the member-list row and the
-                                            // member-info modal chip, so the three read as one
-                                            // badge. The nickname above cannot forge it: nicknames
-                                            // are stripped of emoji by `crate::util::display_name`.
-                                            {group.author_badge.as_ref().map(|badge| name_mark("message-author-deputy-badge", "text-sm cursor-default", badge.tooltip(), "🛡"))}
+                                            // pins that. The label after it is decorative
+                                            // for assistive tech: the glyph's own label
+                                            // is the full tooltip.
+                                            if let Some(warning) = group.author_impersonation.as_ref() {
+                                                span { class: "self-center inline-flex items-center gap-1 text-xs font-medium text-warning-text",
+                                                    {name_mark("message-author-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH)}
+                                                    span { "aria-hidden": "true", class: "cursor-default", title: warning.tooltip(), "Similar name" }
+                                                }
+                                            }
                                             span {
-                                                class: "text-xs text-text-muted cursor-default",
+                                                class: "text-xs text-text-muted cursor-default tabular-nums",
                                                 class: if time_clamped { "italic opacity-70" },
                                                 title: "{full_time_str}",
                                                 if time_clamped { "~{time_str}" } else { "{time_str}" }
@@ -4018,7 +4212,7 @@ fn MessageGroupComponent(
                                                         let original = original_text.clone();
                                                         move |e: KeyboardEvent| {
                                                             if e.key() == Key::Escape {
-                                                                editing_message.set(None);
+                                                                crate::util::defer(move || editing_message.set(None));
                                                             } else if e.key() == Key::Enter && !e.modifiers().shift() {
                                                                 e.prevent_default();
                                                                 let new_text = edit_text.read().clone();
@@ -4032,10 +4226,14 @@ fn MessageGroupComponent(
                                                                 {
                                                                     return;
                                                                 }
-                                                                if !new_text.is_empty() && new_text != original {
-                                                                    on_edit.call((msg_id.clone(), new_text));
-                                                                }
-                                                                editing_message.set(None);
+                                                                let msg_id = msg_id.clone();
+                                                                let changed = !new_text.is_empty() && new_text != original;
+                                                                crate::util::defer(move || {
+                                                                    if changed {
+                                                                        on_edit.call((msg_id, new_text));
+                                                                    }
+                                                                    editing_message.set(None);
+                                                                });
                                                             }
                                                         }
                                                     },
@@ -4127,7 +4325,7 @@ fn MessageGroupComponent(
                                                                 style: "overflow: visible;",
                                                                 button {
                                                                     class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border",
-                                                                    onclick: move |_| editing_message.set(None),
+                                                                    onclick: move |_| crate::util::defer(move || editing_message.set(None)),
                                                                     "Cancel (Esc)"
                                                                 }
                                                                 button {
@@ -4158,10 +4356,14 @@ fn MessageGroupComponent(
                                                                         {
                                                                             return;
                                                                         }
-                                                                        if !new_text.is_empty() && new_text != save_original {
-                                                                            on_edit.call((save_msg_id.clone(), new_text));
-                                                                        }
-                                                                        editing_message.set(None);
+                                                                        let msg_id = save_msg_id.clone();
+                                                                        let changed = !new_text.is_empty() && new_text != save_original;
+                                                                        crate::util::defer(move || {
+                                                                            if changed {
+                                                                                on_edit.call((msg_id, new_text));
+                                                                            }
+                                                                            editing_message.set(None);
+                                                                        });
                                                                     },
                                                                     "Save (Enter)"
                                                                 }
@@ -4194,7 +4396,7 @@ fn MessageGroupComponent(
                                                             ReplyStrip::Unavailable => rsx! {
                                                                 div {
                                                                     "data-testid": "reply-strip-unavailable",
-                                                                    class: "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 py-1.5 mb-0.5 rounded-md italic bg-surface text-text-quote",
+                                                                    class: "reply-strip-unavailable min-w-0 w-full max-w-[76ch] text-[13px] leading-[18px] mb-[3px] italic text-text-quote",
                                                                     // The arrow is decorative; the sentence
                                                                     // after it is what a screen reader needs.
                                                                     span { "aria-hidden": "true", "\u{21a9} " }
@@ -4209,7 +4411,7 @@ fn MessageGroupComponent(
                                                                 rsx! {
                                                                     div {
                                                                         "data-testid": "reply-strip",
-                                                                        class: "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 py-1.5 mb-0.5 rounded-md cursor-pointer bg-surface text-text-quote",
+                                                                        class: "reply-strip min-w-0 w-full max-w-[76ch] text-[13px] leading-[18px] mb-[3px] rounded-sm cursor-pointer text-text-quote",
                                                                         title: "Scroll to original message (Enter or Space to activate)",
                                                                         role: "button",
                                                                         tabindex: "0",
@@ -4240,7 +4442,8 @@ fn MessageGroupComponent(
                                                                                 }
                                                                             }
                                                                         },
-                                                                        span { class: "font-medium", "\u{21a9} @{author}: " }
+                                                                        span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5", {line_icon(REPLY_ICON_PATH, 13)} }
+                                                                        span { class: "font-bold text-text-secondary mr-1.5", "{author}" }
                                                                         span { "{preview}" }
                                                                     }
                                                                 }
@@ -4251,7 +4454,7 @@ fn MessageGroupComponent(
                                                 // breaks a long URL only where it would overflow the column.
                                                 div {
                                                     "data-testid": "message-body",
-                                                    class: "text-sm text-text",
+                                                    class: "text-[15px] leading-[22px] text-text max-w-[76ch]",
                                                     div {
                                                         class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
                                                         dangerous_inner_html: "{msg.content_html}"
@@ -4263,68 +4466,91 @@ fn MessageGroupComponent(
                                             }
                                         }
                                     }
-                                    // Hover action bar (reply for all, edit/delete for own)
-                                    {
-                                        let msg_id_str_for_edit = msg.id.clone();
-                                        let msg_id_for_delete = msg.message_id.clone();
-                                        let msg_id_for_reply = msg.message_id.clone();
-                                        let current_text = msg.content_text.clone();
-                                        // Clean the snapshot (mentions -> @name, markdown stripped)
-                                        // BEFORE truncating, so the stored preview is plain text and
-                                        // no consumer (UI, CLI, old client) ever sees a raw token —
-                                        // even one that would have crossed the truncation boundary.
-                                        let reply_text_preview = clean_reply_preview(&msg.content_text, &member_names)
-                                            .chars()
-                                            .take(100)
-                                            .collect::<String>();
-                                        let reply_author_name = group.author_name.clone();
-                                        rsx! {
-                                            div {
-                                                // Right gutter. Opacity-0 still takes clicks, so it takes none
-                                                // until its row is hovered: a touch tap can't fire an invisible
-                                                // action (#402) and an idle bar never covers Latest. It and the
-                                                // closed kebab are z-20, under Latest (z-30) and backdrops (z-40).
-                                                class: "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-20 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto right-0 translate-x-full",
-                                                // Reply button - available for all messages
-                                                button {
-                                                    class: "text-xs text-text-muted hover:text-accent transition-colors",
-                                                    title: "Reply",
-                                                    onclick: move |_| {
-                                                        on_reply.call(ReplyContext {
-                                                            message_id: msg_id_for_reply.clone(),
-                                                            author_name: reply_author_name.clone(),
-                                                            content_preview: reply_text_preview.clone(),
-                                                        });
-                                                    },
-                                                    "reply"
-                                                }
-                                                // Edit/Delete buttons - only for own messages
-                                                if is_self {
+                                    // Hover action bar: React and Reply for all, Edit and
+                                    // Delete for own (`.hover-actions` in main.css). Not
+                                    // rendered while the row is being edited.
+                                    if editing_message.read().as_ref() != Some(&msg.id) {
+                                        {
+                                            let msg_id_str_for_edit = msg.id.clone();
+                                            let msg_id_for_react = msg.id.clone();
+                                            let msg_id_for_delete = msg.message_id.clone();
+                                            let msg_id_for_reply = msg.message_id.clone();
+                                            let current_text = msg.content_text.clone();
+                                            // Clean the snapshot (mentions -> @name, markdown stripped)
+                                            // BEFORE truncating, so the stored preview is plain text and
+                                            // no consumer (UI, CLI, old client) ever sees a raw token —
+                                            // even one that would have crossed the truncation boundary.
+                                            let reply_text_preview = clean_reply_preview(&msg.content_text, &member_names)
+                                                .chars()
+                                                .take(100)
+                                                .collect::<String>();
+                                            let reply_author_name = group.author_name.clone();
+                                            rsx! {
+                                                div {
+                                                    // Hidden and hit-transparent until its row is hovered
+                                                    // or holds focus: a touch tap can't fire an invisible
+                                                    // action (#402) and an idle bar never covers Latest.
+                                                    // It and the closed kebab are z-20, under Latest (z-30)
+                                                    // and backdrops (z-40).
+                                                    "data-testid": "message-hover-actions",
+                                                    class: "hover-actions",
                                                     button {
-                                                        class: "text-xs text-text-muted hover:text-text transition-colors",
-                                                        title: "Edit message",
-                                                        onclick: move |_| {
-                                                            edit_text.set(current_text.clone());
-                                                            editing_message.set(Some(msg_id_str_for_edit.clone()));
+                                                        r#type: "button",
+                                                        title: "React",
+                                                        "aria-label": "React",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            open_inline_picker(&msg_id_for_react);
                                                         },
-                                                        "edit"
+                                                        {line_icon(REACT_ICON_PATH, 18)}
                                                     }
                                                     button {
-                                                        class: "text-xs text-text-muted hover:text-red-500 transition-colors",
-                                                        title: "Delete message",
+                                                        r#type: "button",
+                                                        title: "Reply",
+                                                        "aria-label": "Reply",
                                                         onclick: move |_| {
-                                                            on_request_delete.call(msg_id_for_delete.clone());
+                                                            let ctx = ReplyContext {
+                                                                message_id: msg_id_for_reply.clone(),
+                                                                author_name: reply_author_name.clone(),
+                                                                content_preview: reply_text_preview.clone(),
+                                                            };
+                                                            crate::util::defer(move || on_reply.call(ctx));
                                                         },
-                                                        "delete"
+                                                        {line_icon(REPLY_ICON_PATH, 18)}
+                                                    }
+                                                    if is_self {
+                                                        button {
+                                                            r#type: "button",
+                                                            title: "Edit message",
+                                                            "aria-label": "Edit message",
+                                                            onclick: move |_| {
+                                                                let (t, id) = (current_text.clone(), msg_id_str_for_edit.clone());
+                                                                crate::util::defer(move || {
+                                                                    edit_text.set(t);
+                                                                    editing_message.set(Some(id));
+                                                                });
+                                                            },
+                                                            {line_icon(EDIT_ICON_PATH, 17)}
+                                                        }
+                                                        button {
+                                                            r#type: "button",
+                                                            title: "Delete message",
+                                                            "aria-label": "Delete message",
+                                                            onclick: move |_| {
+                                                                let id = msg_id_for_delete.clone();
+                                                                crate::util::defer(move || on_request_delete.call(id));
+                                                            },
+                                                            {line_icon(DELETE_ICON_PATH, 17)}
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
                                     // Touch-only kebab action menu (#402). The hover
-                                    // action bar above is wrapped by Tailwind in
-                                    // `@media (hover:hover)`, so it can never appear on a
-                                    // touch device. `.touch-actions` (main.css) reveals
+                                    // action bar above is `display: none` where there is
+                                    // no hover pointer (main.css), so it can never appear
+                                    // on a touch device. `.touch-actions` (main.css) reveals
                                     // this kebab only where there is no hover pointer;
                                     // tapping it opens a menu with the same Reply / React /
                                     // Edit / Delete actions.
@@ -4362,7 +4588,9 @@ fn MessageGroupComponent(
                                                 ),
                                                 // Kebab toggle button
                                                 button {
-                                                    class: "flex items-center justify-center w-8 h-8 rounded-full bg-panel shadow-md border border-border text-text-muted",
+                                                    // Bare in its own gutter, so it does not compete with
+                                                    // the message; the press shows the surface.
+                                                    class: "flex items-center justify-center w-8 h-8 rounded-full text-text-muted active:bg-surface aria-expanded:bg-surface",
                                                     "aria-label": "Message actions",
                                                     "aria-haspopup": "menu",
                                                     "aria-expanded": "{menu_open}",
@@ -4433,10 +4661,9 @@ fn MessageGroupComponent(
                                                         button {
                                                             class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
                                                             onclick: move |_| {
-                                                                // Inherit the kebab's flip direction so the picker
-                                                                // for a bottom message also opens upward, not
-                                                                // clipped by the composer (#402).
-                                                                open_inline_picker(&msg_id_menu_react, *menu_show_above.peek());
+                                                                // Placed from this message's "+", like every
+                                                                // other open path (#402).
+                                                                open_inline_picker(&msg_id_menu_react);
                                                             },
                                                             Icon { icon: FaFaceSmile, width: 14, height: 14 }
                                                             "React"
@@ -4497,7 +4724,12 @@ fn MessageGroupComponent(
                                         rsx! {
                                             div {
                                                 "data-testid": "message-reaction-row",
-                                                class: "flex flex-wrap items-center gap-1 mt-0.5",
+                                                // A message with no reactions has no reaction line:
+                                                // its "+" stays in the DOM, collapsed and inert, only
+                                                // as the anchor the picker opens from (the hover
+                                                // bar's React, the kebab's React). With reactions,
+                                                // the chips and a visible "+" form the line.
+                                                class: if has_reactions { "flex flex-wrap items-center gap-[5px] mt-[5px] mb-0.5" } else { "flex h-0" },
                                                 // Existing reactions (clickable to toggle if user has reacted)
                                                 {
                                                     let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
@@ -4647,12 +4879,14 @@ fn MessageGroupComponent(
                                                                     tabindex: "0",
                                                                     "aria-expanded": if owners_open { "true" } else { "false" },
                                                                     "aria-haspopup": "dialog",
+                                                                    // A pill; your own reaction is the link
+                                                                    // colour on the soft accent, like a mention.
                                                                     class: format!(
-                                                                        "inline-flex items-center gap-0.5 text-base transition-transform {}",
+                                                                        "inline-flex items-center gap-1 h-6 px-2 rounded-full border text-[13px] font-bold {}",
                                                                         if is_user_reaction {
-                                                                            "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
+                                                                            "cursor-pointer border-[color-mix(in_srgb,var(--color-link)_50%,transparent)] bg-accent-soft text-link"
                                                                         } else {
-                                                                            "cursor-default hover:scale-110"
+                                                                            "cursor-default border-border bg-rail text-text-secondary"
                                                                         }
                                                                     ),
                                                                     title: "{tooltip}",
@@ -4733,10 +4967,8 @@ fn MessageGroupComponent(
                                                                             open_reaction_owners.set(Some(popover));
                                                                         });
                                                                     },
-                                                                    "{emoji}"
-                                                                    if count > 1 {
-                                                                        span { class: "text-xs text-text-muted", "{count}" }
-                                                                    }
+                                                                    span { class: "text-[15px] leading-none", "{emoji}" }
+                                                                    span { class: "tabular-nums", "{count}" }
                                                                 }
                                                             }
                                                         }
@@ -4748,22 +4980,26 @@ fn MessageGroupComponent(
                                                     // closed z-20 kebabs and hover bars while it's open, so a
                                                     // nearby one can't paint over the emoji grid and steal a tap
                                                     // (mirrors the action menu's z-[60] behaviour). (#402)
+                                                    // Collapsed (no reactions), it takes no hits, so it
+                                                    // never sits over the next row; the backdrop and the
+                                                    // picker take them back.
                                                     class: format!(
-                                                        "relative group/react inline-flex items-center {}",
-                                                        if is_inline_picker_open { "z-[60]" } else { "" }
+                                                        "relative group/react inline-flex items-center {} {}",
+                                                        if is_inline_picker_open { "z-[60]" } else { "" },
+                                                        if has_reactions { "" } else { "h-0 pointer-events-none" },
                                                     ),
                                                     // Invisible backdrop when picker is open
                                                     if is_inline_picker_open {
                                                         div {
-                                                            class: "fixed inset-0 z-40",
-                                                            onclick: move |_| open_emoji_picker.set(None),
+                                                            class: "fixed inset-0 z-40 pointer-events-auto",
+                                                            onclick: move |_| crate::util::defer(move || open_emoji_picker.set(None)),
                                                         }
                                                     }
                                                     button {
                                                         "data-testid": "add-reaction-button",
                                                         class: format!(
                                                             "add-reaction-btn inline-flex items-center justify-center text-xl leading-none hover:scale-110 {}",
-                                                            if has_reactions || is_inline_picker_open { "has-reactions" } else { "" }
+                                                            if has_reactions { "has-reactions" } else { "invisible h-0 overflow-hidden" }
                                                         ),
                                                         title: "Add reaction",
                                                         onclick: {
@@ -4774,16 +5010,7 @@ fn MessageGroupComponent(
                                                                 if open_emoji_picker.peek().as_ref() == Some(&picker_id) {
                                                                     crate::util::defer(move || open_emoji_picker.set(None));
                                                                 } else {
-                                                                    // Determine if picker should appear above or below based on click position
-                                                                    // If click is in bottom 40% of viewport, show picker above
-                                                                    let click_y = e.client_coordinates().y;
-                                                                    let viewport_height = web_sys::window()
-                                                                        .and_then(|w| w.inner_height().ok())
-                                                                        .and_then(|h| h.as_f64())
-                                                                        .unwrap_or(800.0);
-                                                                    // The side comes from the "+" itself, not the click:
-                                                                    // a key press reports no position.
-                                                                    open_inline_picker(&msg_id, click_y > viewport_height * 0.6);
+                                                                    open_inline_picker(&msg_id);
                                                                 }
                                                             }
                                                         },
@@ -4794,7 +5021,7 @@ fn MessageGroupComponent(
                                                         div {
                                                             "data-testid": "emoji-picker",
                                                             class: format!(
-                                                                "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid {} {}",
+                                                                "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid pointer-events-auto {} {}",
                                                                 if picker_placement.read().above { "bottom-full mb-1" } else { "top-full mt-1" },
                                                                 if picker_placement.read().align_right { "right-0" } else { "left-0" },
                                                             ),
@@ -4817,8 +5044,11 @@ fn MessageGroupComponent(
                                                                             format!("React with {}", emoji)
                                                                         },
                                                                         onclick: move |_| {
-                                                                            on_react.call((msg_id.clone(), emoji_str.clone()));
-                                                                            open_emoji_picker.set(None);
+                                                                            let (id, emoji) = (msg_id.clone(), emoji_str.clone());
+                                                                            crate::util::defer(move || {
+                                                                                on_react.call((id, emoji));
+                                                                                open_emoji_picker.set(None);
+                                                                            });
                                                                         },
                                                                         "{emoji}"
                                                                     }
@@ -4842,6 +5072,23 @@ fn MessageGroupComponent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_join_notice_names_at_most_two_members() {
+        let names = |n: usize| (0..n).map(|i| format!("M{i}")).collect::<Vec<_>>();
+        assert_eq!(
+            event_summary_parts(&names(1)),
+            (names(1), " joined".to_string())
+        );
+        assert_eq!(
+            event_summary_parts(&names(2)),
+            (names(2), " joined".to_string())
+        );
+        assert_eq!(
+            event_summary_parts(&names(3)),
+            (vec![], "3 people joined".to_string())
+        );
+    }
 
     /// The @mention pickers and name lookup offer the owner and present
     /// members, not identities held only as ban evidence.

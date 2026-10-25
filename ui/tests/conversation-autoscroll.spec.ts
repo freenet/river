@@ -681,8 +681,10 @@ const INITIAL_RENDERED_ITEMS = 60;
 const ARRIVAL_CEILING_ITEMS = INITIAL_RENDERED_ITEMS * 4;
 /// How far above the end the newer-history trigger reaches (BACKFILL_LEAD_PX).
 const NEWER_TRIGGER_REACH_PX = 800;
-/// The trim above the reader in #747's last review round (~6,000px; measured 6,120-6,200).
-const NEWER_PAGE_SHIFT_FLOOR_PX = 4_500;
+/// The trim above the reader: ~6,000px in #747's last review round (measured
+/// 6,120-6,200), 4,205 once a message without reactions stopped carrying an
+/// empty reaction line. The floor keeps the shift far larger than any view.
+const NEWER_PAGE_SHIFT_FLOOR_PX = 3_500;
 /// Tall rows at the head of "Tall Head Room" (at its message cap).
 const TALL_HEAD_TALL_ROWS = 8;
 /// Tall rows at the head of "Uneven Tail Room", numbered 00 up.
