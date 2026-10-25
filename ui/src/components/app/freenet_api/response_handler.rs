@@ -2979,6 +2979,48 @@ mod tests {
         assert!(!receive.contains("{:?}\", resp"));
     }
 
+    /// The two logs of an unhandled outbound delegate message (one a
+    /// release-build `warn!`) print its variant name, never its `Debug`,
+    /// which carries the payload or a whole `DelegateContext`.
+    #[test]
+    fn the_outbound_message_logs_print_only_the_kind() {
+        let statement = |src: &str, needle: &str| {
+            let src = crate::util::strip_comments(src);
+            let start = src.find(needle).expect(needle);
+            let rest = &src[start..];
+            rest[..rest.find(");").expect("statement end")].to_string()
+        };
+        for (src, needle) in [
+            (
+                include_str!("response_handler.rs"),
+                "\"Unhandled delegate response",
+            ),
+            (
+                include_str!("freenet_synchronizer.rs"),
+                "\"Value #{} is: {}\"",
+            ),
+        ] {
+            let log = statement(src, needle);
+            assert!(log.contains("outbound_delegate_msg_kind(v)"), "{log}");
+            assert!(!log.contains("{:?}"), "{log}");
+        }
+    }
+
+    #[test]
+    fn outbound_delegate_msg_kind_names_the_variant_only() {
+        let payload = vec![0xC3u8; 16];
+        let msg = OutboundDelegateMsg::ApplicationMessage(
+            freenet_stdlib::prelude::ApplicationMessage::new(payload),
+        );
+        let kind = super::outbound_delegate_msg_kind(&msg);
+        assert_eq!(kind, "ApplicationMessage");
+        // The derived Debug does print the payload; the kind does not.
+        assert!(format!("{msg:?}").contains("195"));
+        for r in ["195", "c3", "C3"] {
+            assert!(!kind.contains(r));
+        }
+    }
+
     // --- startup console volume (freenet/river#569) ---
 
     /// A `ListResponse` summary must name its keys and stay small. Its `Debug`
