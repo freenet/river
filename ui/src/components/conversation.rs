@@ -2523,6 +2523,34 @@ pub fn Conversation() -> Element {
         }
     };
 
+    // The message groups' handlers, created once. An `EventHandler` compares
+    // by pointer, so a closure written in the row loop is a new handler on
+    // every render: no group's props ever compared equal, and every group
+    // re-rendered whenever the conversation did, three or four times on
+    // opening a room. `use_callback` keeps one `Callback` and replaces its
+    // body each render, so a group whose data is unchanged is skipped.
+    let on_group_react = use_callback(move |(msg_id, emoji): (MessageId, String)| {
+        handle_toggle_reaction(msg_id, emoji);
+    });
+    let on_group_request_delete = use_callback(move |msg_id: MessageId| {
+        pending_delete.set(Some(msg_id));
+    });
+    let on_group_edit = use_callback(move |(msg_id, new_text): (MessageId, String)| {
+        handle_edit_message(msg_id, new_text);
+    });
+    let on_group_reply = use_callback(move |ctx: ReplyContext| {
+        replying_to.set(Some(ctx));
+        if let Some(window) = web_sys::window() {
+            if let Some(doc) = window.document() {
+                if let Some(el) = doc.get_element_by_id("message-input") {
+                    if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
+                        let _ = el.focus();
+                    }
+                }
+            }
+        }
+    });
+
     rsx! {
         div { class: "flex-1 flex flex-col min-w-0 bg-panel",
             // Room header
@@ -3068,14 +3096,11 @@ pub fn Conversation() -> Element {
                                             // reader, for tests (additive markup).
                                             "data-newer-withheld": "{withheld_newer}",
                                             {rows.into_iter().map({
-                                                let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
                                                 let impersonation = impersonation.clone();
                                                 let deputy_badges = deputy_badges.clone();
                                                 let author_hues = author_hues.clone();
                                                 move |row| {
-                                                let handle_toggle_reaction = handle_toggle_reaction.clone();
-                                                let handle_edit_message = handle_edit_message.clone();
                                                 let member_names = member_names.clone();
                                                 let impersonation = impersonation.clone();
                                                 let deputy_badges = deputy_badges.clone();
@@ -3169,27 +3194,10 @@ pub fn Conversation() -> Element {
                                                                 max_message_size: edit_max_size,
                                                                 is_private: edit_is_private,
                                                                 edit_trigger: edit_trigger,
-                                                                on_react: move |(msg_id, emoji)| {
-                                                                    handle_toggle_reaction(msg_id, emoji);
-                                                                },
-                                                                on_request_delete: move |msg_id| {
-                                                                    pending_delete.set(Some(msg_id));
-                                                                },
-                                                                on_edit: move |(msg_id, new_text)| {
-                                                                    handle_edit_message(msg_id, new_text);
-                                                                },
-                                                                on_reply: move |ctx: ReplyContext| {
-                                                                    replying_to.set(Some(ctx));
-                                                                    if let Some(window) = web_sys::window() {
-                                                                        if let Some(doc) = window.document() {
-                                                                            if let Some(el) = doc.get_element_by_id("message-input") {
-                                                                                if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                                                                                    let _ = el.focus();
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                },
+                                                                on_react: on_group_react,
+                                                                on_request_delete: on_group_request_delete,
+                                                                on_edit: on_group_edit,
+                                                                on_reply: on_group_reply,
                                                                 open_action_menu: open_action_menu,
                                                                 author_hue: author_hue,
                                                                 }
@@ -3996,6 +4004,17 @@ fn reaction_owner_marks(
     )
 }
 
+/// A reply's snapshot of the message it answers. Cleaned (mentions -> @name,
+/// markdown stripped) BEFORE truncating, so the stored preview is plain text
+/// and no consumer (UI, CLI, old client) ever sees a raw token, even one that
+/// would have crossed the truncation boundary.
+fn reply_preview(text: &str, member_names: &HashMap<MemberId, String>) -> String {
+    clean_reply_preview(text, member_names)
+        .chars()
+        .take(100)
+        .collect()
+}
+
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -4026,6 +4045,8 @@ fn MessageGroupComponent(
     author_hue: Option<u16>,
 ) -> Element {
     let mut open_action_menu = open_action_menu;
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    crate::test_hooks::note_message_group_render();
     // Per-group: at most one picker per group, and while a picker is open its
     // raised (z-[60]) backdrop covers every other group's kebabs and React
     // buttons, so tapping one dismisses the picker rather than stacking a
@@ -4193,7 +4214,12 @@ fn MessageGroupComponent(
     // Mentionable members for the edit form's @ autocomplete: every member with
     // a (decrypted) nickname except self, sorted by name — the same shape the
     // composer receives, derived from `member_names` so no extra prop plumbing.
-    let edit_mention_members: Vec<(MemberId, String)> = {
+    // Built only while one of this group's messages is being edited: sorting
+    // every member's name per group per render was a large share of opening a
+    // big room.
+    let edit_mention_members: Vec<(MemberId, String)> = if editing_message.read().is_none() {
+        Vec::new()
+    } else {
         let mut v: Vec<(MemberId, String)> = member_names
             .iter()
             // With no known identity there is no "yourself" to exclude, so the
@@ -4208,6 +4234,9 @@ fn MessageGroupComponent(
         v.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
         v
     };
+
+    // Shared by every row's reply buttons, which build their preview on click.
+    let preview_names = Rc::new(member_names.clone());
 
     // Watch for external edit requests (e.g. up-arrow in empty input)
     let message_ids: Vec<String> = group.messages.iter().map(|m| m.id.clone()).collect();
@@ -4672,14 +4701,10 @@ fn MessageGroupComponent(
                                             let msg_id_for_delete = msg.message_id.clone();
                                             let msg_id_for_reply = msg.message_id.clone();
                                             let current_text = msg.content_text.clone();
-                                            // Clean the snapshot (mentions -> @name, markdown stripped)
-                                            // BEFORE truncating, so the stored preview is plain text and
-                                            // no consumer (UI, CLI, old client) ever sees a raw token —
-                                            // even one that would have crossed the truncation boundary.
-                                            let reply_text_preview = clean_reply_preview(&msg.content_text, &member_names)
-                                                .chars()
-                                                .take(100)
-                                                .collect::<String>();
+                                            // Built on click, not per render: it parses the
+                                            // message's markdown.
+                                            let reply_preview_source = msg.content_text.clone();
+                                            let reply_preview_names = preview_names.clone();
                                             let reply_author_name = group.author_name.clone();
                                             rsx! {
                                                 div {
@@ -4708,7 +4733,10 @@ fn MessageGroupComponent(
                                                             let ctx = ReplyContext {
                                                                 message_id: msg_id_for_reply.clone(),
                                                                 author_name: reply_author_name.clone(),
-                                                                content_preview: reply_text_preview.clone(),
+                                                                content_preview: reply_preview(
+                                                                    &reply_preview_source,
+                                                                    &reply_preview_names,
+                                                                ),
                                                             };
                                                             crate::util::defer(move || on_reply.call(ctx));
                                                         },
@@ -4760,10 +4788,8 @@ fn MessageGroupComponent(
                                         let msg_id_menu_react = msg.id.clone();
                                         let edit_text_kebab = msg.content_text.clone();
                                         let reply_author_kebab = group.author_name.clone();
-                                        let reply_preview_kebab = clean_reply_preview(&msg.content_text, &member_names)
-                                            .chars()
-                                            .take(100)
-                                            .collect::<String>();
+                                        let reply_preview_source_kebab = msg.content_text.clone();
+                                        let reply_preview_names_kebab = preview_names.clone();
                                         let menu_open = open_action_menu.read().as_deref()
                                             == Some(msg_id_kebab.as_str());
                                         rsx! {
@@ -4842,7 +4868,10 @@ fn MessageGroupComponent(
                                                             onclick: move |_| {
                                                                 let id = msg_id_menu_reply.clone();
                                                                 let author = reply_author_kebab.clone();
-                                                                let preview = reply_preview_kebab.clone();
+                                                                let preview = reply_preview(
+                                                                    &reply_preview_source_kebab,
+                                                                    &reply_preview_names_kebab,
+                                                                );
                                                                 crate::util::defer(move || {
                                                                     on_reply.call(ReplyContext {
                                                                         message_id: id,

@@ -1,7 +1,7 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
 //! INBOUND messages, remove messages, drive the no-room screen's load states,
-//! complete an own DM while another thread is open, and put reactions on the
-//! newest message.
+//! complete an own DM while another thread is open, put reactions on the
+//! newest message, and count message group renders.
 //!
 //! The composer is not a substitute: an own send is an explicit request to go
 //! to the newest message, so a message sent through the UI
@@ -39,6 +39,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsValue;
 
 thread_local! {
+    /// Message group renders since `takeMessageGroupRenders` last read them.
+    static MESSAGE_GROUP_RENDERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static FORGE_NEXT_SEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The load worker `setRoomsLoadStateKeepingRooms("migrating")` holds open
     /// (until the next call, or `releaseHeldLoadWorker`).
@@ -58,6 +60,13 @@ pub fn forge_if_requested(signature: ed25519_dalek::Signature) -> ed25519_dalek:
     ed25519_dalek::Signature::from_bytes(&bytes)
 }
 
+/// Counts one render of a message group, for `takeMessageGroupRenders`: a
+/// group whose props are unchanged must not render again when the
+/// conversation does.
+pub fn note_message_group_render() {
+    MESSAGE_GROUP_RENDERS.with(|n| n.set(n.get() + 1));
+}
+
 pub fn install_test_hooks() {
     let Some(window) = web_sys::window() else {
         return;
@@ -71,6 +80,12 @@ pub fn install_test_hooks() {
     let set_hook = |name: &str, hook: JsValue| {
         let _ = js_sys::Reflect::set(&hooks, &JsValue::from_str(name), &hook);
     };
+
+    set_hook(
+        "takeMessageGroupRenders",
+        Closure::<dyn FnMut() -> u32>::new(move || MESSAGE_GROUP_RENDERS.with(|n| n.replace(0)))
+            .into_js_value(),
+    );
 
     set_hook(
         "appendMessage",

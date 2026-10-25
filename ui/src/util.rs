@@ -104,13 +104,20 @@ pub fn capture_runtime() {
 export function get_current_time() {
     return Date.now();
 }
+// One formatter each, built on first use. `toLocaleTimeString` and
+// `toLocaleString` with options build a new `Intl.DateTimeFormat` on every
+// call, and a room's history formats several times per message per render:
+// that was a large share of opening a busy room. The output is the same, since
+// both methods format through such a formatter with these options. A formatter
+// keeps the time zone it was built in, so a zone change shows after a reload.
+let time_format = null;
+let full_datetime_format = null;
 export function format_time_local(timestamp_ms) {
-    const date = new Date(timestamp_ms);
-    return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
+    time_format ??= new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
+    return time_format.format(new Date(timestamp_ms));
 }
 export function format_full_datetime_local(timestamp_ms) {
-    const date = new Date(timestamp_ms);
-    return date.toLocaleString(undefined, {
+    full_datetime_format ??= new Intl.DateTimeFormat(undefined, {
         weekday: 'short',
         year: 'numeric',
         month: 'short',
@@ -120,6 +127,7 @@ export function format_full_datetime_local(timestamp_ms) {
         second: '2-digit',
         hour12: false
     });
+    return full_datetime_format.format(new Date(timestamp_ms));
 }
 export function local_date_key(timestamp_ms) {
     // Local calendar date (viewer's timezone) as a zero-padded YYYY-MM-DD
