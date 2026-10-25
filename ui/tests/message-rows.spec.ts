@@ -265,7 +265,11 @@ test.describe("Message headers", () => {
     const ownerNames = await history.getByTestId("message-author-owner-tag").evaluateAll((tags) =>
       tags.map((t) => t.parentElement!.querySelector('[data-testid="message-author-name"]')!.textContent),
     );
-    expect(ownerNames.every((n) => n!.includes("(Owner)")), ownerNames.join(" | ")).toBe(true);
+    // The owner is the member the panel marks with the crown.
+    const owner = (await page.getByTestId("member-list").locator('[data-testid^="member-item-"] button')
+      .filter({ has: page.getByTestId("member-list-owner") }).getByTestId("member-name").textContent())!.trim();
+    expect(ownerNames.length).toBeGreaterThan(0);
+    expect(ownerNames.every((n) => n!.trim() === owner), `${ownerNames.join(" | ")} vs ${owner}`).toBe(true);
 
     const deputy = history.getByTestId("message-author-deputy-badge").first();
     await expect(deputy).toHaveText(/deputy/i);

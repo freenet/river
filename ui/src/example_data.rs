@@ -294,6 +294,13 @@ fn create_room(
 ) -> CreatedRoom {
     let mut csprng = OsRng;
 
+    // Plain names, as people choose them: no " (You)" / " (Owner)" /
+    // " (Member)" suffixes, which the app never adds and the redesign shows
+    // otherwise (the own-row tint, OWNER/DEPUTY tags, the "you" marker).
+    // Pairwise distinct under the confusable fold, so the only ⚠ in a room
+    // is the deliberate impostor's (see `confusable_variant`).
+    let [owner_name, self_name, deputy_nickname] = distinct_full_names();
+
     // Create self - the user actually using the app
     let self_sk = SigningKey::generate(&mut csprng);
     let self_vk = self_sk.verifying_key();
@@ -360,7 +367,8 @@ fn create_room(
                 member_id: owner_id,
                 version: 0,
                 // The trailing 🛡👑 is a deliberate BADGE-SPOOF attempt baked
-                // into example data: the owner's stored nickname claims the
+                // into example data (kept for the specs below; the name has
+                // no role text): the owner's stored nickname claims the
                 // deputy shield and the owner crown. `display_nickname` strips
                 // both at render time, so the member list must still show
                 // exactly ONE shield (the real deputy's) and the conversation
@@ -369,7 +377,7 @@ fn create_room(
                 // `toHaveCount(1)` and `conversation-deputy-badge.spec.ts`
                 // both fail.
                 preferred_nickname: SealedBytes::public(
-                    (random_full_name() + " (Owner) \u{1F6E1}\u{1F451}").into_bytes(),
+                    (owner_name + " \u{1F6E1}\u{1F451}").into_bytes(),
                 ),
                 deputies: vec![other_member_id],
             },
@@ -396,9 +404,7 @@ fn create_room(
                 MemberInfo {
                     member_id: self_id,
                     version: 0,
-                    preferred_nickname: SealedBytes::public(
-                        (random_full_name() + " (You)").into_bytes(),
-                    ),
+                    preferred_nickname: SealedBytes::public(self_name.into_bytes()),
                     deputies: Vec::new(),
                 },
                 &self_sk,
@@ -429,10 +435,9 @@ fn create_room(
         inviter_sk,
     ));
 
-    // The deputy's nickname, captured rather than inlined: the impostor added
+    // The deputy's nickname (`deputy_nickname`, above): the impostor added
     // below is DERIVED from it (see `confusable_variant`), because these names
     // are re-rolled on every run.
-    let deputy_nickname = random_full_name() + " (Member)";
 
     member_info
         .member_info
@@ -966,23 +971,14 @@ fn add_example_messages(
 /// exhaustively over the real pools (46 x 23 = 1,058 handles): `I`->`l` covers
 /// 6.5%, `l`->`I` covers 42.1%, and the remaining 51.4% used to fall through to
 /// uppercasing. That meant more than half of `cargo make dev-example` runs
-/// showed `BOB SMITH (MEMBER)` flagged as impersonating `Bob Smith (Member)` —
+/// showed `BOB SMITH` flagged as impersonating `Bob Smith` —
 /// a correct tier-1 match (the case-insensitive fold is exactly that), but one
 /// a developer reasonably reads as a FALSE POSITIVE. A fixture that teaches the
 /// reader to distrust the badge inverts its own purpose, and is the same
 /// "trains people to ignore the warning" harm the tier-1-only decision exists
 /// to avoid. The digit swap is tried BEFORE the uppercase fallback for that
 /// reason: all 544 of those handles contain at least one of `o/e/s/a/t`, so it
-/// covers the remainder completely and `B0b Smith (Member)` is what the demo
-/// shows.
-///
-/// The digit swap searches only the NAME, never the `" (Member)"` / `" (Owner)"`
-/// role suffix. The suffix contains an `e`, so an unconstrained search would
-/// always find a target there and quietly hide a name the pools cannot spoof —
-/// producing `Quinn Zhu (M3mber)`, which reads as a broken label rather than a
-/// spoofed name. `the_example_impostor_always_collides_with_the_deputy` pins
-/// that the swap lands inside the name for every handle the generator can
-/// produce.
+/// covers the remainder completely and `B0b Smith` is what the demo shows.
 ///
 /// Uppercasing stays as a last resort for inputs outside the generator's pools.
 ///
@@ -1005,12 +1001,7 @@ fn confusable_variant(real: &str) -> String {
     }
     // Both cases: the visual fold lowercases, so `O` and `o` both end up at
     // `o`, which is where the table sends `0`.
-    //
-    // Searched over the NAME only — everything before the role suffix — so a
-    // name with none of `o/e/s/a/t` falls through to the fallback instead of
-    // silently mangling `" (Member)"` into `" (M3mber)"`.
-    let name_len = real.find(" (").unwrap_or(real.len());
-    for (i, c) in real[..name_len].char_indices() {
+    for (i, c) in real.char_indices() {
         if let Some((_, digit)) = DIGIT_FOR
             .iter()
             .find(|(letter, _)| c.eq_ignore_ascii_case(letter))
@@ -1019,6 +1010,20 @@ fn confusable_variant(real: &str) -> String {
         }
     }
     real.to_uppercase()
+}
+
+/// Three random full names, no two folding together (nor equal), for a
+/// room's owner, self and deputy.
+fn distinct_full_names() -> [String; 3] {
+    use crate::util::confusable::folds_together;
+    let mut names: Vec<String> = Vec::with_capacity(3);
+    while names.len() < 3 {
+        let name = random_full_name();
+        if names.iter().all(|n| !folds_together(n, &name)) {
+            names.push(name);
+        }
+    }
+    names.try_into().expect("three names")
 }
 
 fn get_time_from_millis(ms: u64) -> SystemTime {
@@ -1197,9 +1202,9 @@ mod tests {
         // One name per branch of `confusable_variant`, so a future edit that
         // breaks a branch fails here rather than in a browser.
         for (real, why) in [
-            ("Ian Clarke (Member)", "capital I -> lowercase l"),
-            ("Alice Golden (Member)", "no capital I; lowercase l -> I"),
-            ("Bob Smith (Member)", "neither I nor l; letter -> digit"),
+            ("Ian Clarke", "capital I -> lowercase l"),
+            ("Alice Golden", "no capital I; lowercase l -> I"),
+            ("Bob Smith", "neither I nor l; letter -> digit"),
             ("Zyx Wvu", "no I, no l, no o/e/s/a/t; uppercased"),
         ] {
             let variant = confusable_variant(real);
@@ -1220,7 +1225,7 @@ mod tests {
         // measure the whole pool too.
         let mut checked = 0usize;
         for name in crate::util::all_full_names() {
-            let real = name + " (Member)";
+            let real = name;
             let variant = confusable_variant(&real);
 
             assert_ne!(variant, real, "{real:?} produced no variant at all");
@@ -1232,7 +1237,7 @@ mod tests {
             // The demo-QUALITY property, pinned rather than left to a comment:
             // the uppercase fallback must be unreachable for every handle the
             // generator can actually produce. It used to catch 51.4% of them,
-            // and `BOB SMITH (MEMBER)` beside `Bob Smith (Member)` reads as a
+            // and `BOB SMITH` beside `Bob Smith` reads as a
             // false positive to anyone looking at the dev build — which teaches
             // exactly the distrust of the badge this feature cannot afford.
             assert_ne!(
@@ -1242,16 +1247,6 @@ mod tests {
                  shows a shouted name, which reads as a false positive"
             );
 
-            // …and the substitution must land in the NAME, never in the
-            // `" (Member)"` role suffix. `Quinn Zhu (M3mber)` would satisfy
-            // every assertion above while showing the reader a broken label
-            // rather than a spoofed name.
-            let suffix_at = real.find(" (").expect("the fixture appends a role");
-            assert_eq!(
-                &variant[suffix_at..],
-                &real[suffix_at..],
-                "{variant:?} mangled the role suffix instead of the name"
-            );
             checked += 1;
         }
         assert!(

@@ -6,8 +6,8 @@ import { waitForApp, memberRows, selectRoom } from "./example-room";
 // list, under the SAME viewer-relevant condition as the list row.
 //
 // Example data (ui/src/example_data.rs) has the "Team Chat Room" owner
-// deputize the "(Member)" member, so that member is a global moderator and
-// shows the shield in every view. The owner and the local "(You)" member are
+// deputize one member, so that member is a global moderator and
+// shows the shield in every view. The owner and the local member are
 // not deputies, so their modals must NOT show the chip.
 //
 // Rust unit tests pin the decision logic (`relevant_deputizer_names`) and that
@@ -35,12 +35,12 @@ test.describe("Member-info modal deputy shield legend (#451)", { tag: "@chromium
     await openTeamChatMembers(page);
 
     // The deputy is the one member whose row carries the shield glyph. Exactly
-    // one member (the owner-appointed "(Member)") is a deputy in example data.
+    // one member (the owner-appointed deputy) is a deputy in example data.
     //
     // The badge is a line icon now, so the 🛡 GLYPH in a row's text can only
     // come from a nickname. That makes the second count the member-list
     // regression gate for nickname emoji stripping: example_data.rs
-    // deliberately gives the OWNER the stored nickname "… (Owner) 🛡👑", so if
+    // deliberately gives the OWNER a stored nickname ending "🛡👑", so if
     // `crate::util::display_name` ever stops stripping it, a row shows it.
     const deputyRow = memberRows(page).filter({ has: page.getByTestId("member-list-deputy") });
     await expect(deputyRow).toHaveCount(1);

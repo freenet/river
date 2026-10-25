@@ -37,12 +37,11 @@ async function openDmThreadModal(page: Page) {
   // app load, so we can't rely on a fixed index for anyone but the local
   // user — who is pinned to index 0 since freenet/river#584, though this
   // scan deliberately does not depend on that. Pick the first member
-  // whose text doesn't include "(You)".
+  // whose row is not marked as the local user (`member-list-self`).
   const count = await memberButtons.count();
   let clicked = false;
   for (let i = 0; i < count; i++) {
-    const text = (await memberButtons.nth(i).textContent()) || "";
-    if (!/\(You\)/i.test(text)) {
+    if ((await memberButtons.nth(i).getByTestId("member-list-self").count()) === 0) {
       await memberButtons.nth(i).click();
       clicked = true;
       break;
