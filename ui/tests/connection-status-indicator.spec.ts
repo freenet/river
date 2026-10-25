@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { selectRoom } from "./example-room";
+import { resolveColor, selectRoom } from "./example-room";
 
 // Regression tests for Bug #5 (Ivvor, Matrix 2026-05-17): the WebSocket
 // connection indicator must remain visible when the user has no rooms —
@@ -46,15 +46,16 @@ async function waitForApp(page: Page) {
 // A genuinely-rendered pill ALWAYS matches one of these rows; a stuck or
 // blank pill (e.g. a regression that replaces the reactive `try_read()`
 // with a non-subscribing `peek()` and renders no real state) would not.
-// The dots use the theme's status tokens (no raw palette shades; the
-// accent audit in components.rs forbids them).
+// The dots use the theme's status tokens; the spec checks the class AND the
+// painted colour, which must be the token's (status-contrast.spec.ts pins
+// the tokens themselves).
 const STATUS_STATES = [
-  { dot: "bg-success", label: "Connected" },
-  { dot: "bg-warning", label: "Connecting..." },
-  { dot: "bg-error", label: "Disconnected" },
+  { dot: "bg-success", token: "--color-success", label: "Connected" },
+  { dot: "bg-warning", token: "--color-warning", label: "Connecting..." },
+  { dot: "bg-error", token: "--color-error", label: "Disconnected" },
   // SynchronizerStatus::Error renders "Error: <msg>" with the error dot; the
   // label is matched with a prefix below rather than an exact string.
-  { dot: "bg-error", label: "Error:" },
+  { dot: "bg-error", token: "--color-error", label: "Error:" },
 ];
 
 // Assert the visible pill renders a coherent connection state: its dot
@@ -87,6 +88,14 @@ async function expectCoherentState(visiblePill: Locator) {
   ).toHaveLength(1);
 
   const colour = present[0];
+  // The class must paint the token's colour, not merely be present.
+  const token = STATUS_STATES.find((s) => s.dot === colour)!.token;
+  const page = dot.page();
+  const [painted, expected] = await Promise.all([
+    dot.evaluate((el) => getComputedStyle(el).backgroundColor).then((c) => resolveColor(page, c)),
+    resolveColor(page, `var(${token})`),
+  ]);
+  expect(painted, `the ${colour} dot is painted var(${token})`).toEqual(expected);
   const expectedLabels = STATUS_STATES.filter((s) => s.dot === colour).map(
     (s) => s.label
   );

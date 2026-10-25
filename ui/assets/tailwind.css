@@ -67,10 +67,11 @@
   /* The similar-name warning's text; 4.5:1 on every row surface and on
      --color-warning-bg. */
   --color-warning-text: #8a5800;
-  /* Status, all through tokens (no raw palette classes; the accent audit
-     checks): a destructive action's fill (white text 4.5:1 and more in both
-     themes) and its hover; error and success TEXT, 4.5:1 on the panel and
-     on their own *-bg callout. A callout's colour is carried by a left rule
+  /* Status, all through tokens (no raw palette classes): a destructive
+     action's fill (white text 4.5:1 and more in both themes) and its hover;
+     error and success TEXT, 4.5:1 on the panel and on their own *-bg
+     callout. Pinned in both themes by status-contrast.spec.ts (the rendered
+     surfaces and the token pairs). A callout's colour is carried by a left rule
      (`border-warning` / `border-danger`); its body text stays --color-text. */
   --color-danger: #b42318;
   --color-danger-hover: #912018;

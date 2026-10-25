@@ -799,9 +799,11 @@ mod volatile_value_binding_audit {
     /// `util::lex` scan. Lifetimes in the module must not be taken for literals.
     #[test]
     fn cfg_test_cull_skips_brace_char_literals() {
-        // Each fixture holds an UNBALANCED brace literal: a lexer that counted
-        // it would end the cull early (`'}'`) or late (`'{'`). Lifetimes and
-        // escaped literals sit beside them.
+        // `'}'` and `'{'` are UNBALANCED brace literals: a lexer that counted
+        // them would end the cull early or late. `'\u{7D}'` is balanced in
+        // the text (its `{7D}`), so it cannot move the cut; it checks that an
+        // escape inside a char literal is read as part of the literal.
+        // Lifetimes and escaped quotes sit beside them.
         for literal in ["'}'", "'{'", "'\\u{7D}'"] {
             let src = format!(
                 "fn before() {{}}\n#[cfg(test)]\nmod tests {{\n    fn t<'a>(s: &'a str) -> Option<usize> {{ s.find({literal}) }}\n    fn u() {{ let _ = ['\\'', '\\\\']; let _ = input {{ value: \"{{leaked}}\" }}; }}\n}}\nfn keep_me() {{ textarea {{ value: \"{{v}}\" }} }}\n"

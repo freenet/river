@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { colourOf, contrast, effectiveBackground, over, selectRoom, waitForApp } from "./example-room";
+import { colourOf, contrast, effectiveBackground, over, resolveColor, selectRoom, waitForApp } from "./example-room";
 import { callRiverTest } from "./river-test";
 import { DM_PEER } from "./dm-thread";
 
@@ -36,6 +36,44 @@ async function openMemberInfo(page: Page, which: Locator) {
 }
 
 const rows = (page: Page) => page.getByTestId("member-list").locator('[data-testid^="member-item-"] button');
+
+/// The status tokens against the surfaces they are drawn on, resolved in
+/// the page so each theme's overrides are what is measured: text tokens on
+/// the panel, the raised surface and their own callout fill, and body text
+/// on the callout fills. Composited, since a token may be translucent.
+const TOKEN_PAIRS: [string, string][] = [
+  ...["--color-danger-text", "--color-warning-text", "--color-success-text"].flatMap((fg): [string, string][] => [
+    [fg, "--color-panel"],
+    [fg, "--color-surface"],
+  ]),
+  ["--color-danger-text", "--color-error-bg"],
+  ["--color-warning-text", "--color-warning-bg"],
+  ["--color-success-text", "--color-success-bg"],
+  ["--color-text", "--color-warning-bg"],
+  ["--color-text", "--color-error-bg"],
+];
+
+for (const scheme of ["light", "dark"] as const) {
+  test(`${scheme}: status tokens clear 4.5:1 on the surfaces they sit on`, { tag: "@chromium-only" }, async ({ page }) => {
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.goto("/");
+    await waitForApp(page);
+    const panel = await resolveColor(page, "var(--color-panel)");
+    for (const [fg, bg] of TOKEN_PAIRS) {
+      // The background over the panel (a callout fill may be translucent),
+      // then the text over that.
+      const behind = over(await resolveColor(page, `var(${bg})`), panel);
+      const ratio = contrast(over(await resolveColor(page, `var(${fg})`), behind), behind);
+      expect(ratio, `${fg} on ${bg}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+    }
+    // White on the destructive fill and its hover.
+    for (const fill of ["--color-danger", "--color-danger-hover"]) {
+      const behind = over(await resolveColor(page, `var(${fill})`), panel);
+      const ratio = contrast([255, 255, 255, 1], behind);
+      expect(ratio, `white on ${fill}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+}
 
 for (const scheme of ["light", "dark"] as const) {
   test.describe(`Warning and destructive surfaces, ${scheme}`, { tag: "@chromium-only" }, () => {
