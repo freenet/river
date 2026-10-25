@@ -792,6 +792,40 @@ mod volatile_value_binding_audit {
         }
     }
 
+    /// Brace char literals (and escaped ones) inside a test module are not
+    /// braces: counted as code they would end the cull early (leaking the rest
+    /// of the module) or late (eating the production code after it), which is
+    /// how a `'}'` cut `chat_delegate.rs`'s test module short under the plain
+    /// `util::lex` scan. Lifetimes in the module must not be taken for literals.
+    #[test]
+    fn cfg_test_cull_skips_brace_char_literals() {
+        // Each fixture holds an UNBALANCED brace literal: a lexer that counted
+        // it would end the cull early (`'}'`) or late (`'{'`). Lifetimes and
+        // escaped literals sit beside them.
+        for literal in ["'}'", "'{'", "'\\u{7D}'"] {
+            let src = format!(
+                "fn before() {{}}\n#[cfg(test)]\nmod tests {{\n    fn t<'a>(s: &'a str) -> Option<usize> {{ s.find({literal}) }}\n    fn u() {{ let _ = ['\\'', '\\\\']; let _ = input {{ value: \"{{leaked}}\" }}; }}\n}}\nfn keep_me() {{ textarea {{ value: \"{{v}}\" }} }}\n"
+            );
+            let out = strip_cfg_test_items(&src);
+            assert!(
+                out.contains("keep_me"),
+                "{literal}: production code after must survive: {out}"
+            );
+            assert!(
+                !out.contains("leaked"),
+                "{literal}: the rest of the test module must go: {out}"
+            );
+            assert!(
+                !out.contains("fn t<"),
+                "{literal}: the test module must go: {out}"
+            );
+            assert!(
+                scan_elements(&out).iter().any(|e| e.name == "textarea"),
+                "{literal}"
+            );
+        }
+    }
+
     /// A `;` inside a type like `[u8; 4]` must not end the item early and leak
     /// test-only rsx into the audited source.
     #[test]

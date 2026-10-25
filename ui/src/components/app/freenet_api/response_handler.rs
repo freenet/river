@@ -2999,13 +2999,7 @@ mod tests {
             let mut depth = 0i32;
             let mut end = src.len();
             for (i, c) in src[open..].char_indices() {
-                let at = open + i;
-                // `util::lex` knows only the `'"'` char literal; a `'{'` or
-                // `'}'` (one sits in this file's tests) is not a brace either.
-                let char_literal = at > 0
-                    && src.as_bytes()[at - 1] == b'\''
-                    && src.as_bytes().get(at + 1) == Some(&b'\'');
-                if kinds[at] != crate::util::Lexeme::Code || char_literal {
+                if kinds[open + i] != crate::util::Lexeme::Code {
                     continue;
                 }
                 match c {

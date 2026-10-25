@@ -593,11 +593,8 @@ pub(crate) fn lex(src: &str) -> Vec<Lexeme> {
             (Lexeme::Comment, len)
         } else if rest.starts_with(b"/*") {
             (Lexeme::Comment, block_comment_len(rest))
-        } else if let Some(lit) = [&b"'\"'"[..], &b"'\\\"'"[..]]
-            .into_iter()
-            .find(|lit| rest.starts_with(lit))
-        {
-            (Lexeme::Literal, lit.len())
+        } else if let Some(len) = char_literal_len(rest) {
+            (Lexeme::Literal, len)
         } else if let Some(len) = raw_string_len(b, i) {
             (Lexeme::Literal, len)
         } else if b[i] == b'"' {
@@ -609,6 +606,43 @@ pub(crate) fn lex(src: &str) -> Vec<Lexeme> {
         i += len;
     }
     kinds
+}
+
+/// Length of the char literal `rest` starts with (`'x'`, `'é'`, `'{'`, or an
+/// escape: `'\''`, `'\\'`, `'\n'`, `'\x41'`, `'\u{1F600}'`), or `None` when the
+/// `'` opens a lifetime or a loop label (`'a`, `'static`, `'outer:`), which
+/// are code. A `'{'` or `'}'` read as code would shift every brace count after
+/// it. A byte literal `b'x'` lexes as the code `b` and this literal.
+#[cfg(test)]
+fn char_literal_len(rest: &[u8]) -> Option<usize> {
+    if rest.first() != Some(&b'\'') {
+        return None;
+    }
+    let body = if rest.get(1) == Some(&b'\\') {
+        match rest.get(2)? {
+            b'u' => {
+                if rest.get(3) != Some(&b'{') {
+                    return None;
+                }
+                rest[3..].iter().position(|&c| c == b'}')? + 4
+            }
+            b'x' => 5,
+            _ => 3,
+        }
+    } else {
+        let lead = *rest.get(1)?;
+        if lead == b'\'' || lead == b'\n' {
+            return None;
+        }
+        // The UTF-8 width of the char, from its leading byte.
+        1 + match lead {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            _ => 4,
+        }
+    };
+    (rest.get(body) == Some(&b'\'')).then_some(body + 1)
 }
 
 /// Length of the (nested) block comment `rest` starts with, or all of `rest`
@@ -685,6 +719,50 @@ fn raw_string_len(b: &[u8], i: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    /// The kind `lex` gives the byte at the first occurrence of `needle`.
+    fn kind_at(src: &str, needle: &str) -> Lexeme {
+        lex(src)[src.find(needle).expect(needle)]
+    }
+
+    /// Char literals are literals, braces and quotes inside them included, so
+    /// a brace count over `lex` is not shifted by `'{'` or `'}'`.
+    #[test]
+    fn lex_reads_char_literals() {
+        for (src, inner) in [
+            ("let c = '{'; x();", "{'"),
+            ("let c = '}'; x();", "}'"),
+            ("let c = '\"'; x();", "\"'"),
+            (r"let c = '\''; x();", r"\''"),
+            (r"let c = '\\'; x();", r"\\'"),
+            (r"let c = '\n'; x();", r"\n'"),
+            (r"let c = '\x7B'; x();", r"\x7B'"),
+            (r"let c = '\u{1F600}'; x();", r"\u{1F600}'"),
+            ("let c = 'é'; x();", "é'"),
+            ("let c = b'{'; x();", "{'"),
+        ] {
+            assert_eq!(kind_at(src, inner), Lexeme::Literal, "{src}");
+            assert_eq!(kind_at(src, "x();"), Lexeme::Code, "{src}: code after it");
+        }
+    }
+
+    /// A lifetime or a loop label is code, and does not swallow what follows.
+    #[test]
+    fn lex_does_not_take_lifetimes_or_labels_for_char_literals() {
+        for (src, code) in [
+            ("fn f<'a>(x: &'a str) -> &'a str { x }", "x }"),
+            ("const S: &'static str = \"s\"; fn g() {}", "fn g"),
+            ("'outer: loop { break 'outer; } h();", "h();"),
+            ("fn f<'a, 'b>(x: &'a u8, y: &'b u8) { y; }", "y; }"),
+            ("impl<'de> Visitor<'de> for V { fn k() {} }", "fn k"),
+        ] {
+            assert_eq!(kind_at(src, code), Lexeme::Code, "{src}");
+            assert_eq!(kind_at(src, "'"), Lexeme::Code, "{src}: the quote itself");
+        }
+        // A brace right after a lifetime stays a brace.
+        let src = "impl<'a> T for S<'a> { fn f() {} }";
+        assert_eq!(kind_at(src, "{ fn"), Lexeme::Code);
+    }
 
     /// freenet/river#716: a raw string ending in a backslash used to leave the
     /// scanner inside a string, so a later `"/*"` literal opened a phantom
