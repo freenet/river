@@ -277,6 +277,26 @@ pub enum ChatDelegateRequestMsg {
         request_id: RequestId,
         contract_id: [u8; 32],
     },
+
+    /// Ask for this viewer's avatar colour salt for a room.
+    ///
+    /// The UI colours each message author's avatar as
+    /// `H(salt || member_verifying_key)`, where the salt is secret to the
+    /// viewer. Because nobody else knows it, an impersonator cannot grind a
+    /// key whose avatar colour matches someone else's: they cannot compute
+    /// any viewer's colour mapping at all.
+    ///
+    /// The delegate derives the salt from the viewer's stored member signing
+    /// key for `room_key`, so the private key never reaches the UI's display
+    /// code. The salt is a one-way derivation under a dedicated context
+    /// string: it reveals only this viewer's colour mapping for the room,
+    /// never the key it came from.
+    ///
+    /// Appended to the enum (never reordered), like the variants above.
+    GetAvatarSalt {
+        room_key: RoomKey,
+        request_id: RequestId,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -366,6 +386,19 @@ pub enum ChatDelegateResponseMsg {
         room_owner_vk: RoomKey,
         request_id: RequestId,
         result: Result<(), String>,
+    },
+
+    /// Response to [`ChatDelegateRequestMsg::GetAvatarSalt`].
+    ///
+    /// `salt` is the viewer's 32-byte avatar colour salt for `room_key`,
+    /// derived one-way from the stored member signing key (see the request
+    /// variant). It exposes only this viewer's colour mapping, never the key.
+    /// `Err` when the delegate holds no signing key for the room. `request_id`
+    /// is echoed from the request for correlation.
+    AvatarSaltResponse {
+        room_key: RoomKey,
+        request_id: RequestId,
+        salt: Result<[u8; 32], String>,
     },
 }
 

@@ -610,6 +610,7 @@ dependencies = [
 name = "chat-delegate"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bs58",
  "ciborium",
  "ed25519-dalek",

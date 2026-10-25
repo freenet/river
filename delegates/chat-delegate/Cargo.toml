@@ -14,6 +14,8 @@ bs58 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 river-core = { workspace = true, features = ["ecies"] }
 ed25519-dalek = { workspace = true }
+# Deterministic (no randomness): derives the avatar colour salt.
+blake3.workspace = true
 # NOTE: Do NOT add a `getrandom` or `rand` dep here. The freenet-core
 # delegate runtime on wasm32-unknown-unknown has no `getrandom` backend, so
 # any path that pulls those crates in causes wasm-bindgen placeholder

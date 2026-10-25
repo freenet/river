@@ -197,6 +197,16 @@ pub(crate) fn handle_application_message(
                 contract_id,
             )
         }
+
+        ChatDelegateRequestMsg::GetAvatarSalt {
+            room_key,
+            request_id,
+        } => {
+            logging::info(
+                format!("Delegate received GetAvatarSalt for room: {room_key:?}").as_str(),
+            );
+            handle_get_avatar_salt(&*ctx, origin, room_key, request_id)
+        }
     }
 }
 
@@ -675,6 +685,52 @@ fn handle_get_public_key(
     let response = ChatDelegateResponseMsg::GetPublicKeyResponse {
         room_key,
         public_key,
+    };
+
+    Ok(vec![create_app_response(&response)?])
+}
+
+/// BLAKE3 `derive_key` context for the avatar colour salt. Changing it
+/// changes every viewer's avatar colours.
+const AVATAR_SALT_CONTEXT: &str = "freenet river avatar colour salt v1";
+
+/// The viewer's avatar colour salt, derived one-way from their member signing
+/// key for a room. The UI keys its avatar colour hash with it; it reveals that
+/// viewer's colour mapping and nothing about the key.
+fn derive_avatar_salt(signing_key_bytes: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(AVATAR_SALT_CONTEXT, signing_key_bytes)
+}
+
+/// Handle a get avatar salt request. The signing key is loaded exactly as
+/// `handle_get_public_key` loads it.
+fn handle_get_avatar_salt(
+    ctx: &impl SecretStore,
+    origin: &Origin,
+    room_key: RoomKey,
+    request_id: RequestId,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    let secret_key = create_signing_key_secret_key(origin, &room_key);
+
+    let salt = match ctx.get_secret(&secret_key) {
+        Some(sk_bytes) => match <[u8; 32]>::try_from(sk_bytes.as_slice()) {
+            Ok(sk_array) => Ok(derive_avatar_salt(&sk_array)),
+            Err(_) => Err(format!(
+                "Invalid signing key length: expected 32, got {}",
+                sk_bytes.len()
+            )),
+        },
+        None => Err("Signing key not found for this room".to_string()),
+    };
+
+    logging::info(&format!(
+        "Avatar salt request for room, salt derived: {}",
+        salt.is_ok()
+    ));
+
+    let response = ChatDelegateResponseMsg::AvatarSaltResponse {
+        room_key,
+        request_id,
+        salt,
     };
 
     Ok(vec![create_app_response(&response)?])
@@ -1870,5 +1926,126 @@ mod tests {
             }
         }
         assert!(cases > 0, "no crash-during-recovery case ran");
+    }
+
+    // ---------------------------------------------------------------------
+    // GetAvatarSalt
+    // ---------------------------------------------------------------------
+
+    /// A store holding `signing_key` as the room's signing key, where
+    /// `GetPublicKey` and the Sign* handlers would find it.
+    fn store_with_signing_key(room_key: &RoomKey, signing_key: &[u8]) -> FakeSecrets {
+        let mut f = FakeSecrets::default();
+        f.map.insert(
+            create_signing_key_secret_key(&origin(), room_key),
+            signing_key.to_vec(),
+        );
+        f
+    }
+
+    fn avatar_salt_reply(
+        f: &FakeSecrets,
+        room_key: RoomKey,
+        request_id: RequestId,
+    ) -> Result<[u8; 32], String> {
+        let reply = handle_get_avatar_salt(f, &origin(), room_key, request_id).unwrap();
+        match extract_response(reply).unwrap() {
+            ChatDelegateResponseMsg::AvatarSaltResponse {
+                room_key: resp_room_key,
+                request_id: resp_request_id,
+                salt,
+            } => {
+                assert_eq!(resp_room_key, room_key);
+                assert_eq!(resp_request_id, request_id);
+                salt
+            }
+            other => panic!("Expected AvatarSaltResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn avatar_salt_is_deterministic_for_one_key() {
+        let room_key = [11u8; 32];
+        let f = store_with_signing_key(&room_key, &[8u8; 32]);
+        let first = avatar_salt_reply(&f, room_key, 1).unwrap();
+        let second = avatar_salt_reply(&f, room_key, 2).unwrap();
+        assert_eq!(first, second);
+    }
+
+    /// Pins the derivation (function, context string, input): a change here
+    /// changes every viewer's avatar colours. Expected value from
+    /// `b3sum --derive-key "freenet river avatar colour salt v1"` over 32
+    /// bytes of 0x08.
+    #[test]
+    fn avatar_salt_golden_vector() {
+        let room_key = [11u8; 32];
+        let f = store_with_signing_key(&room_key, &[8u8; 32]);
+        let salt = avatar_salt_reply(&f, room_key, 1).unwrap();
+        let hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "e59218354e8c957715a1c15310aed67502698b4174330e86634362e348e89b5d"
+        );
+    }
+
+    #[test]
+    fn avatar_salt_differs_for_different_keys() {
+        let room_key = [11u8; 32];
+        let a = avatar_salt_reply(&store_with_signing_key(&room_key, &[8u8; 32]), room_key, 1);
+        let b = avatar_salt_reply(&store_with_signing_key(&room_key, &[9u8; 32]), room_key, 1);
+        assert_ne!(a.unwrap(), b.unwrap());
+    }
+
+    #[test]
+    fn avatar_salt_is_neither_the_key_nor_its_public_key() {
+        let room_key = [11u8; 32];
+        let sk = [8u8; 32];
+        let salt = avatar_salt_reply(&store_with_signing_key(&room_key, &sk), room_key, 1).unwrap();
+        assert_ne!(salt, sk);
+        assert_ne!(salt, SigningKey::from_bytes(&sk).verifying_key().to_bytes());
+    }
+
+    #[test]
+    fn avatar_salt_is_an_error_without_a_stored_key() {
+        let room_key = [11u8; 32];
+        // A key stored for another room is not this room's key.
+        let f = store_with_signing_key(&[12u8; 32], &[8u8; 32]);
+        let salt = avatar_salt_reply(&f, room_key, 77);
+        assert!(salt.unwrap_err().contains("not found"));
+
+        // Through the full dispatch too, where the native context stores nothing.
+        let request = ChatDelegateRequestMsg::GetAvatarSalt {
+            room_key,
+            request_id: 4242,
+        };
+        let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
+            create_test_parameters(),
+            get_test_origin(),
+            InboundDelegateMsg::ApplicationMessage(create_app_message(request)),
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        match extract_response(result).unwrap() {
+            ChatDelegateResponseMsg::AvatarSaltResponse {
+                room_key: resp_room_key,
+                request_id,
+                salt,
+            } => {
+                assert_eq!(resp_room_key, room_key);
+                assert_eq!(request_id, 4242);
+                assert!(salt.is_err());
+            }
+            other => panic!("Expected AvatarSaltResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn avatar_salt_is_an_error_for_a_malformed_key() {
+        let room_key = [11u8; 32];
+        let f = store_with_signing_key(&room_key, &[8u8; 31]);
+        assert!(avatar_salt_reply(&f, room_key, 1)
+            .unwrap_err()
+            .contains("Invalid signing key length"));
     }
 }
