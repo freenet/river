@@ -147,7 +147,9 @@ test.describe("Message rows", () => {
   });
 
   test.describe("at a desktop width", () => {
-    test.use({ viewport: { width: 1280, height: 800 } });
+    // Wide enough that the column exceeds the measure with both side panels
+    // and the touch gutter (at 1280 a touch project's column is just under it).
+    test.use({ viewport: { width: 1440, height: 900 } });
 
     // #791 review: nothing caught a width cap (65ch, max-w-prose, max-w-4xl)
     // coming back. Rows span the column and a long body fills the 76ch measure.
