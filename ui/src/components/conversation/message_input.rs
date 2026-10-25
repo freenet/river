@@ -384,7 +384,7 @@ pub fn MessageInput(
                             if encoded_bytes > threshold {
                                 if over_limit {
                                     rsx! {
-                                        div { class: "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium",
+                                        div { class: "text-xs text-right mt-1 pr-1 text-danger font-medium",
                                             "Message too long \u{2014} {encoded_bytes}/{max_message_size} bytes"
                                         }
                                     }

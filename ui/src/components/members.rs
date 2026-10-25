@@ -70,24 +70,12 @@ pub fn ConnectionStatusIndicator() -> Element {
         .unwrap_or(SynchronizerStatus::Connecting);
 
     let (pill_classes, dot_classes, label) = match &status {
-        SynchronizerStatus::Connected => {
-            ("text-text-muted", "bg-green-500", "Connected".to_string())
+        SynchronizerStatus::Connected => ("text-text-muted", "bg-success", "Connected".to_string()),
+        SynchronizerStatus::Connecting => {
+            ("text-text-muted", "bg-warning", "Connecting...".to_string())
         }
-        SynchronizerStatus::Connecting => (
-            "text-text-muted",
-            "bg-yellow-500",
-            "Connecting...".to_string(),
-        ),
-        SynchronizerStatus::Disconnected => (
-            "text-red-700 dark:text-red-400",
-            "bg-red-500",
-            "Disconnected".to_string(),
-        ),
-        SynchronizerStatus::Error(msg) => (
-            "text-red-700 dark:text-red-400",
-            "bg-red-500",
-            format!("Error: {}", msg),
-        ),
+        SynchronizerStatus::Disconnected => ("text-danger", "bg-error", "Disconnected".to_string()),
+        SynchronizerStatus::Error(msg) => ("text-danger", "bg-error", format!("Error: {}", msg)),
     };
 
     rsx! {
@@ -2092,7 +2080,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                 p { class: "text-[13px] text-text-muted mb-3",
                     "Copy this token and import it in another River client (UI or riverctl) to use the same identity."
                 }
-                p { class: "text-[13px] text-yellow-500 font-medium mb-3",
+                p { class: "text-[13px] text-text font-medium mb-3 px-3 py-2 rounded-lg bg-warning-bg border-l-[3px] border-warning",
                     "⚠ This token contains your private key. Treat it like a password — do not share it publicly."
                 }
                 textarea {
@@ -2856,12 +2844,12 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     },
                 }
                 if let Some(err) = &*error_msg.read() {
-                    div { class: "mt-2 text-sm text-red-400",
+                    div { class: "mt-2 text-sm text-danger",
                         "{err}"
                     }
                 }
                 if let Some(msg) = &*success_msg.read() {
-                    div { class: "mt-2 text-sm text-green-400",
+                    div { class: "mt-2 text-sm text-success",
                         "{msg}"
                     }
                 }
@@ -2869,7 +2857,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     // A room identity already exists — warn before replacing it.
                     div {
                         "data-testid": "import-identity-replace-warning",
-                        class: "mt-3 text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3",
+                        class: "mt-3 text-sm text-text bg-warning-bg border-l-[3px] border-warning rounded-lg p-3",
                         "This room already has an identity. Importing will REPLACE it \u{2014} you'll lose access to your current identity for this room unless you've exported it first."
                     }
                     // Multi-tab reversal caveat (freenet/river#420): another
@@ -2877,7 +2865,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     // the switch on next load, so tell the user to close them first.
                     div {
                         "data-testid": "import-identity-replace-multitab-warning",
-                        class: "mt-2 text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3",
+                        class: "mt-2 text-sm text-text bg-warning-bg border-l-[3px] border-warning rounded-lg p-3",
                         "Close any other tabs or devices open to this room first. A session still using the old identity can write it back and undo the switch."
                     }
                     div { class: "flex justify-end gap-3 mt-4",
@@ -2889,7 +2877,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                         }
                         button {
                             "data-testid": "import-identity-replace-confirm",
-                            class: "px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors",
+                            class: "px-4 py-2 bg-danger hover:bg-danger-hover text-white text-sm font-medium rounded-lg transition-colors",
                             onclick: handle_replace_confirm,
                             "Replace identity"
                         }
@@ -2909,7 +2897,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                             // the missing rooms hydrate (freenet/river#414 round-10 P2).
                             div {
                                 "data-testid": "import-identity-load-failed",
-                                class: "mt-3 text-sm text-amber-400",
+                                class: "mt-3 text-sm text-warning-text",
                                 "Some rooms didn't finish loading, so importing is paused to avoid overwriting one. Retry loading your rooms to continue."
                             }
                             div { class: "flex justify-end mt-2",
@@ -2936,7 +2924,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                             // entry is freenet-migrate#39).
                             div {
                                 "data-testid": "import-identity-migration-incomplete",
-                                class: "mt-3 text-sm text-amber-400",
+                                class: "mt-3 text-sm text-warning-text",
                                 "Some rooms from an earlier version of River may not have finished moving over. Importing now could overwrite one of them. River keeps trying on each load; import anyway only if you know the room is not one of them."
                             }
                             div { class: "flex justify-end mt-2",
@@ -2959,7 +2947,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                             // user may go ahead knowingly (#768).
                             div {
                                 "data-testid": "import-identity-migration-unresolved",
-                                class: "mt-3 text-sm text-amber-400",
+                                class: "mt-3 text-sm text-warning-text",
                                 "Rooms from an earlier version of River on this node haven't answered yet. Importing now could replace the identity one of them brings back. River keeps checking on each load; import anyway only if you know the room is not one of them."
                             }
                             div { class: "flex justify-end mt-2",

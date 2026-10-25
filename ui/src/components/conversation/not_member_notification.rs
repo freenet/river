@@ -16,7 +16,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     };
 
     rsx! {
-        div { class: "mx-4 mb-4 p-4 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
+        div { class: "mx-4 mb-4 p-4 bg-warning-bg border-l-4 border-warning rounded-r-lg",
             p { class: "mb-3 text-sm text-text",
                 "You're not a member of this room yet. To join, go back to where you received your invite link and request a new one."
             }

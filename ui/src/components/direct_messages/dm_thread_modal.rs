@@ -1077,10 +1077,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 // Footer with composer + actions
                 div { class: "border-t border-border px-5 py-3 space-y-2",
                     if let Some(err) = send_error.read().as_ref() {
-                        div { class: "text-xs text-red-400", "{err}" }
+                        div { class: "text-xs text-danger", "{err}" }
                     }
                     if !peer_still_member {
-                        div { class: "text-xs text-yellow-400",
+                        div { class: "text-xs text-warning-text",
                             "This member is not currently in the room — outbound DMs will be rejected by the contract."
                         }
                     }
@@ -1093,7 +1093,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     if !can_send {
                         div {
                             "data-testid": "dm-thread-no-key-notice",
-                            class: "text-xs text-yellow-400",
+                            class: "text-xs text-warning-text",
                             "This device doesn't hold your key for this room, so you can't send DMs here."
                         }
                     }
@@ -1227,7 +1227,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // Destructive, so it keeps the far right of the row
                         // and the red hover, away from the invite link.
                         button {
-                            class: "text-xs text-text-muted hover:text-red-400 transition-colors",
+                            class: "text-xs text-text-muted hover:text-danger transition-colors",
                             onclick: move |_| confirm_delete_open.set(true),
                             title: "Removes messages they sent you from the network. Your own sent messages stay. Cannot be undone.",
                             "Delete their messages"
@@ -1307,7 +1307,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                 "Cancel"
                             }
                             button {
-                                class: "px-3 py-1.5 text-sm rounded-lg bg-red-600 hover:bg-red-500 text-white transition-colors",
+                                class: "px-3 py-1.5 text-sm rounded-lg bg-danger hover:bg-danger-hover text-white transition-colors",
                                 onclick: purge_thread,
                                 "Delete"
                             }
@@ -1754,7 +1754,7 @@ fn DmInviteCard(card: InviteCardData) -> Element {
             // mirrors the AlreadyMember styling so the affordance is
             // identical (the button doesn't act); the red tint
             // communicates the failure mode.
-            "px-3 py-1.5 text-sm rounded-lg bg-red-500/20 text-red-300 border border-red-500/40 cursor-not-allowed"
+            "px-3 py-1.5 text-sm rounded-lg bg-error-bg text-danger border border-danger cursor-not-allowed"
         }
         InviteCardState::Joinable => {
             "px-3 py-1.5 text-sm rounded-lg bg-surface hover:bg-surface-hover border border-border-hover text-text transition-colors"
@@ -1805,7 +1805,7 @@ fn DmInviteCard(card: InviteCardData) -> Element {
                 }
             }
             if let Some(err) = accept_error.read().as_ref() {
-                div { class: "text-xs text-red-400", "{err}" }
+                div { class: "text-xs text-danger", "{err}" }
             }
             div { class: "flex justify-end pt-1",
                 button {
@@ -2231,7 +2231,7 @@ mod tests {
         // but not comments, so a `split_once` on the label silently cut at
         // line 2 and made the assertion unreachable.
         assert!(
-            src.contains("class:\"text-xstext-text-mutedhover:text-red-400transition-colors\""),
+            src.contains("class:\"text-xstext-text-mutedhover:text-dangertransition-colors\""),
             "the delete control stopped being the recessive muted-until-hover one"
         );
         assert!(

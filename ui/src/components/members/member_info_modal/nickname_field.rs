@@ -330,7 +330,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 class: "relative",
                 input {
                     class: if invalid {
-                        "w-full px-3 py-2 bg-surface border border-red-500 rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent"
+                        "w-full px-3 py-2 bg-surface border border-danger rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-danger focus:border-transparent"
                     } else {
                         "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:border-text-muted"
                     },
@@ -352,7 +352,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             if has_emoji {
                 p {
                     "data-testid": "nickname-emoji-error",
-                    class: "mt-1 text-xs text-red-400",
+                    class: "mt-1 text-xs text-danger",
                     role: "alert",
                     "{EMOJI_REJECTION_MESSAGE}"
                 }
@@ -360,7 +360,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             if let Some(reason) = too_long {
                 p {
                     "data-testid": "nickname-length-error",
-                    class: "mt-1 text-xs text-red-400",
+                    class: "mt-1 text-xs text-danger",
                     role: "alert",
                     "{reason}"
                 }

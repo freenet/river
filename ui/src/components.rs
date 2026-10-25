@@ -1176,6 +1176,33 @@ mod accent_token_audit {
         found
     }
 
+    /// Raw palette status colours (`text-red-400`, `bg-yellow-500/10`,
+    /// `dark:text-amber-200`, …): every status colour goes through a token
+    /// (`text-danger`, `bg-danger`, `bg-warning-bg`, `border-warning`,
+    /// `text-warning-text`, `text-success`, the `bg-success`/`bg-warning`/
+    /// `bg-error` dots), which are checked for contrast in both themes. Raw
+    /// shades were picked for one theme and failed the other (light yellow on
+    /// light yellow in the leave-room confirmation).
+    fn raw_status_colours(src: &str) -> Vec<String> {
+        const HUES: [&str; 9] = [
+            "red", "yellow", "amber", "orange", "green", "emerald", "lime", "rose", "pink",
+        ];
+        let mut found = Vec::new();
+        for raw in src.split(|c: char| !(c.is_ascii_alphanumeric() || "-_:/[]!".contains(c))) {
+            // The utility after any variant (`hover:`, `dark:`, `focus:`).
+            let utility = raw.rsplit(':').next().unwrap_or(raw).trim_matches('!');
+            let mut parts = utility.splitn(3, '-');
+            let (Some(_prop), Some(hue), Some(shade)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if HUES.contains(&hue) && shade.starts_with(|c: char| c.is_ascii_digit()) {
+                found.push(raw.to_string());
+            }
+        }
+        found
+    }
+
     /// Solid fills reviewed and kept, as (file suffix, what the scan
     /// reports, exactly how many times, why). The count is exact, so a new
     /// fill of the same kind in the same file is not hidden by the entry.
@@ -1227,6 +1254,12 @@ mod accent_token_audit {
             // assertions: scan production code only.
             let src = without_test_modules(&src);
             let src = src.as_str();
+            for hit in raw_status_colours(src) {
+                bad.push(format!(
+                    "{}: raw palette status colour `{hit}`",
+                    path.display()
+                ));
+            }
             let hits = solid_accent_fills(src);
             for (file, fill, count, _) in ALLOWED_FILLS {
                 if path.ends_with(file) {
@@ -1351,6 +1384,37 @@ mod accent_token_audit {
         // A `#[cfg(test)]` in a doc comment is text, not an attribute.
         let doc = "/// Not code: #[cfg(test)] mod x { }\nfn kept() {}\n";
         assert!(without_test_modules(doc).contains("fn kept()"));
+    }
+
+    #[test]
+    fn the_scan_sees_a_raw_status_colour() {
+        for src in [
+            r#"class: "text-yellow-400 mb-3""#,
+            r#"class: "bg-yellow-500/10 border border-yellow-500/20""#,
+            r#"class: "text-red-700 dark:text-red-400""#,
+            r#"class: "hover:bg-red-600 bg-red-500""#,
+            r#"class: "focus:ring-red-500/50""#,
+            r#"class: "text-amber-200""#,
+            r#"class: "text-emerald-400""#,
+            r#"class: "bg-green-500""#,
+            "x !text-orange-300 y",
+        ] {
+            assert!(
+                !raw_status_colours(src).is_empty(),
+                "the scan should see: {src}"
+            );
+        }
+        for src in [
+            r#"class: "text-danger bg-danger hover:bg-danger-hover border-danger""#,
+            r#"class: "bg-warning-bg border-l-[3px] border-warning text-warning-text""#,
+            r#"class: "text-success bg-success bg-error bg-warning""#,
+            r#"class: "text-text-muted bg-red-ish""#,
+        ] {
+            assert!(
+                raw_status_colours(src).is_empty(),
+                "the scan should allow: {src}"
+            );
+        }
     }
 
     /// Production code after a test module is still scanned, and every test

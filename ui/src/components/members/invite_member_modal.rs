@@ -221,7 +221,7 @@ fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> El
         Some(Err(err)) => {
             rsx! {
                 div { class: "text-center py-8",
-                    p { class: "text-red-500 mb-4", "{err}" }
+                    p { class: "text-danger mb-4", "{err}" }
                     button {
                         class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
                         onclick: move |_| {
@@ -366,7 +366,7 @@ fn InvitationContent(
                 Err(err) => rsx! {
                     p {
                         "data-testid": "invite-qr-error",
-                        class: "text-sm text-red-500",
+                        class: "text-sm text-danger",
                         "{err}"
                     }
                 },

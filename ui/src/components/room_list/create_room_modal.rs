@@ -199,7 +199,7 @@ pub fn CreateRoomModal() -> Element {
                         input {
                             "data-testid": "create-room-nickname-input",
                             class: if nickname_has_emoji {
-                                "w-full px-3 py-2 bg-surface border border-red-500 rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-red-500/50 focus:border-red-500"
+                                "w-full px-3 py-2 bg-surface border border-danger rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-danger focus:border-danger"
                             } else {
                                 "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:border-text-muted"
                             },
@@ -216,7 +216,7 @@ pub fn CreateRoomModal() -> Element {
                         if nickname_has_emoji {
                             p {
                                 "data-testid": "create-room-nickname-emoji-error",
-                                class: "mt-1 text-xs text-red-400",
+                                class: "mt-1 text-xs text-danger",
                                 role: "alert",
                                 "{EMOJI_REJECTION_MESSAGE}"
                             }
@@ -224,7 +224,7 @@ pub fn CreateRoomModal() -> Element {
                         if let Some(reason) = limit_refusal {
                             p {
                                 "data-testid": "create-room-limit-error",
-                                class: "mt-1 text-xs text-red-400",
+                                class: "mt-1 text-xs text-danger",
                                 role: "alert",
                                 "{reason}"
                             }

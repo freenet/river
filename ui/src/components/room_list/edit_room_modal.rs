@@ -146,7 +146,7 @@ pub fn EditRoomModal() -> Element {
                         if *user_is_owner.read() && !*user_can_edit.read() {
                             p {
                                 "data-testid": "edit-room-no-key-notice",
-                                class: "mb-4 px-3 py-2 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-yellow-400 text-sm",
+                                class: "mb-4 px-3 py-2 rounded-lg bg-warning-bg border-l-[3px] border-warning text-text text-sm",
                                 "This device doesn't hold your key for this room, so you can't change its settings here."
                             }
                         }
@@ -386,9 +386,9 @@ pub fn EditRoomModal() -> Element {
                         // Leave Room Section
                         if *show_leave_confirmation.read() {
                             div {
-                                class: "bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4 mt-4",
+                                class: "bg-warning-bg border-l-[3px] border-warning rounded-lg p-4 mt-4",
                                 p {
-                                    class: "text-yellow-400 mb-3",
+                                    class: "text-[15px] text-text mb-3",
                                     if *user_is_owner.read() {
                                         "Warning: You are the owner of this room. Leaving will permanently delete it for you. Other members might retain access if they have the contract key, but coordination will be lost."
                                     } else {
@@ -398,7 +398,7 @@ pub fn EditRoomModal() -> Element {
                                 div {
                                     class: "flex gap-3",
                                     button {
-                                        class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors",
+                                        class: "px-4 py-2 bg-danger hover:bg-danger-hover text-white font-medium rounded-lg transition-colors",
                                         onclick: move |_| {
                                             // Read the room_vk first and drop the read borrow
                                             let room_vk_to_remove = EDIT_ROOM_MODAL.read().room;
@@ -456,7 +456,7 @@ pub fn EditRoomModal() -> Element {
                                 class: "mt-4",
                                 button {
                                     "data-testid": "edit-room-leave-button",
-                                    class: "px-4 py-2 border border-red-500 text-red-500 hover:bg-red-500/10 rounded-lg transition-colors",
+                                    class: "px-4 py-2 border border-danger text-danger hover:bg-error-bg rounded-lg transition-colors",
                                     onclick: move |_| show_leave_confirmation.set(true),
                                     "Leave Room"
                                 }
@@ -809,7 +809,7 @@ fn MaxMembersField(
                 "Members ({member_count}/{max_members})"
             }
             if is_full {
-                p { class: "text-xs text-red-400 mb-1",
+                p { class: "text-xs text-danger mb-1",
                     "Room is full — new members will be rejected."
                 }
             }
@@ -939,7 +939,7 @@ pub(super) fn sign_and_apply_configuration(
 pub(super) fn ConfigError(error: Option<String>) -> Element {
     rsx! {
         if let Some(e) = error {
-            p { "data-testid": "config-error", class: "text-xs text-red-400 mt-1", "{e}" }
+            p { "data-testid": "config-error", class: "text-xs text-danger mt-1", "{e}" }
         }
     }
 }

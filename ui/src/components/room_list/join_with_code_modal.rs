@@ -325,7 +325,7 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                 if let Some(err) = scan_error.read().as_ref() {
                     div {
                         "data-testid": "join-with-code-scan-error",
-                        class: "mb-3 text-sm text-red-400",
+                        class: "mb-3 text-sm text-danger",
                         "{err}"
                     }
                 }
@@ -341,7 +341,7 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                     },
                 }
                 if let Some(err) = &*error_msg.read() {
-                    div { class: "mt-2 text-sm text-red-400",
+                    div { class: "mt-2 text-sm text-danger",
                         "{err}"
                     }
                 }

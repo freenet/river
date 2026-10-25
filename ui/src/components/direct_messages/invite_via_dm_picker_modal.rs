@@ -504,10 +504,10 @@ pub fn InviteViaDmPickerModal() -> Element {
                         }
                     }
                     if let Some(err) = send_error_value.as_ref() {
-                        div { class: "text-xs text-red-400", "{err}" }
+                        div { class: "text-xs text-danger", "{err}" }
                     }
                     if let Some(label) = last_success_label_value.as_ref() {
-                        div { class: "text-xs text-emerald-400",
+                        div { class: "text-xs text-success",
                             "Invitation to \""
                             span { class: "font-medium", "{label}" }
                             "\" sent."

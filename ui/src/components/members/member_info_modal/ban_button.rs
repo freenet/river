@@ -205,7 +205,7 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
         rsx! {
             div {
                 button {
-                    class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors whitespace-nowrap",
+                    class: "px-4 py-2 bg-danger hover:bg-danger-hover text-white font-medium rounded-lg transition-colors whitespace-nowrap",
                     onclick: move |_| show_confirmation.set(true),
                     "Ban User"
                 }
@@ -254,7 +254,7 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
                                     "Cancel"
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors",
+                                    class: "px-4 py-2 bg-danger hover:bg-danger-hover text-white font-medium rounded-lg transition-colors",
                                     onclick: execute_ban,
                                     "Yes, Ban User"
                                 }

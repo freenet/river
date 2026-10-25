@@ -267,7 +267,7 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
                     class: "dm-archive-btn absolute right-1 top-1/2 -translate-y-1/2 p-1 rounded text-text-muted \
                             flex items-center justify-center opacity-0 \
                             group-hover:opacity-100 group-focus-within:opacity-100 \
-                            hover:text-red-400 hover:bg-surface focus:opacity-100 \
+                            hover:text-danger hover:bg-surface focus:opacity-100 \
                             transition-opacity transition-colors",
                     title: "{archive_title}",
                     "aria-label": "{archive_title}",

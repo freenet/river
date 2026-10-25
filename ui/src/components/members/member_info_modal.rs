@@ -165,7 +165,7 @@ pub fn MemberInfoModal() -> Element {
                 error!("Member info not found for member {member_id}");
                 return rsx! {
                     div {
-                        class: "p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400",
+                        class: "p-4 bg-error-bg border-l-[3px] border-danger rounded-lg text-text",
                         "Member information is missing or corrupted"
                     }
                 };
@@ -185,7 +185,7 @@ pub fn MemberInfoModal() -> Element {
             error!("Member {member_id} not found in members list and is not owner");
             return rsx! {
                 div {
-                    class: "p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400",
+                    class: "p-4 bg-error-bg border-l-[3px] border-danger rounded-lg text-text",
                     "Member not found in room members list"
                 }
             };
@@ -622,7 +622,7 @@ pub fn MemberInfoModal() -> Element {
                         if let Some(warning) = impersonation.as_ref() {
                             div {
                                 "data-testid": "member-info-impersonation-explanation",
-                                class: "mb-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-sm text-amber-200",
+                                class: "mb-4 p-3 rounded-lg bg-warning-bg border-l-[3px] border-warning text-sm text-text",
                                 p { class: "mb-1", "{impersonation_tooltip}" }
                                 div {
                                     span { class: "mr-1 text-text-muted", "Resembles:" }

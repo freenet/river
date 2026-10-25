@@ -735,7 +735,7 @@ pub fn RoomList() -> Element {
                                         // failed GET/PUT send. Show a warning marker (tooltip = the
                                         // stored error message) instead of a perpetual spinner.
                                         span {
-                                            class: "flex-shrink-0 text-red-600 dark:text-red-400",
+                                            class: "flex-shrink-0 text-danger",
                                             title: "{err_msg}",
                                             "aria-label": "Room sync failed",
                                             Icon { width: 12, height: 12, icon: FaTriangleExclamation }

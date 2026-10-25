@@ -2788,7 +2788,7 @@ pub fn Conversation() -> Element {
                                                     // Tailwind v4 generates no colour utility for it
                                                     // and `ring-1` would fall back to `currentColor`
                                                     // — a grey ring that turns blue on hover.
-                                                    class: "absolute top-0.5 right-0.5 h-2 w-2 rounded-full bg-red-500 ring-1 ring-panel",
+                                                    class: "absolute top-0.5 right-0.5 h-2 w-2 rounded-full bg-error ring-1 ring-panel",
                                                 }
                                             }
                                         }
@@ -3303,7 +3303,7 @@ pub fn Conversation() -> Element {
                     Some(_) if initial_sync_error_msg.is_some() => {
                         let msg = initial_sync_error_msg.unwrap_or_default();
                         rsx! {
-                            div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg rounded-lg text-sm text-red-700 dark:text-red-400 flex items-center gap-3",
+                            div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg rounded-lg text-sm text-danger flex items-center gap-3",
                                 Icon { width: 16, height: 16, icon: FaTriangleExclamation }
                                 span { "{msg}" }
                             }
@@ -3325,7 +3325,7 @@ pub fn Conversation() -> Element {
                             Ok(()) if room_data.missing_room_secret() => rsx! {
                                 div {
                                     "data-testid": "missing-room-secret-notice",
-                                    class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-red-700 dark:text-red-400 rounded-lg text-sm",
+                                    class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
                                     "This private room's key hasn't reached this device yet, so you can't send messages here until it does."
                                 }
                             },
@@ -3389,7 +3389,7 @@ pub fn Conversation() -> Element {
                                 }
                             },
                             Err(SendMessageError::UserBanned) => rsx! {
-                                div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-red-700 dark:text-red-400 rounded-lg text-sm",
+                                div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
                                     "You have been banned from sending messages in this room."
                                 }
                             },
@@ -3398,7 +3398,7 @@ pub fn Conversation() -> Element {
                             // `NotMemberNotification` cannot be used here — it
                             // needs the verifying key, which is what is missing.
                             Err(SendMessageError::IdentityUnavailable) => rsx! {
-                                div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-red-700 dark:text-red-400 rounded-lg text-sm",
+                                div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
                                     "This device doesn't hold your key for this room, so you can't send messages here."
                                 }
                             },
@@ -3540,7 +3540,7 @@ pub fn Conversation() -> Element {
                                 "Cancel"
                             }
                             button {
-                                class: "px-4 py-2 rounded-lg bg-red-500 hover:bg-red-600 text-white transition-colors",
+                                class: "px-4 py-2 rounded-lg bg-danger hover:bg-danger-hover text-white transition-colors",
                                 onclick: move |_| {
                                     let msg_id_opt = pending_delete.peek().clone();
                                     if let Some(msg_id) = msg_id_opt {
@@ -3885,6 +3885,20 @@ fn name_mark(
 ) -> Element {
     rsx! {
         span { "data-testid": testid, class, title: "{tooltip}", "aria-label": "{tooltip}", {glyph} }
+    }
+}
+
+/// A role mark beside a name drawn as a line icon (the deputy's shield, as
+/// in the member list), its tooltip also its accessible label.
+fn name_icon_mark(testid: &'static str, tooltip: String, icon_path: &'static str) -> Element {
+    rsx! {
+        span {
+            "data-testid": testid,
+            class: "inline-flex self-center text-text-muted cursor-default",
+            title: "{tooltip}",
+            "aria-label": "{tooltip}",
+            {line_icon(icon_path, 13)}
+        }
     }
 }
 
@@ -4440,7 +4454,7 @@ fn MessageGroupComponent(
                                                             if near_limit {
                                                                 div {
                                                                     class: if over_limit {
-                                                                        "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium"
+                                                                        "text-xs text-right mt-1 pr-1 text-danger font-medium"
                                                                     } else {
                                                                         "text-xs text-right mt-1 pr-1 text-text-muted"
                                                                     },
@@ -4816,7 +4830,7 @@ fn MessageGroupComponent(
                                                                 "Edit"
                                                             }
                                                             button {
-                                                                class: "flex items-center gap-2 px-3 py-2 text-sm text-red-500 hover:bg-error-bg text-left",
+                                                                class: "flex items-center gap-2 px-3 py-2 text-sm text-danger hover:bg-error-bg text-left",
                                                                 onclick: move |_| {
                                                                     let id = msg_id_menu_delete.clone();
                                                                     crate::util::defer(move || {
@@ -4975,7 +4989,7 @@ fn MessageGroupComponent(
                                                                         if is_user_reaction {
                                                                             button {
                                                                                 "data-testid": "reaction-remove",
-                                                                                class: "px-3 py-2 text-sm text-left text-red-500 hover:bg-error-bg",
+                                                                                class: "px-3 py-2 text-sm text-left text-danger hover:bg-error-bg",
                                                                                 onclick: move |_| {
                                                                                     let id = msg_id_for_remove.clone();
                                                                                     let emoji = emoji_for_remove.clone();
@@ -4998,7 +5012,7 @@ fn MessageGroupComponent(
                                                                                         "{name}"
                                                                                     }
                                                                                     {warning.as_ref().map(|warning| name_mark("reaction-owner-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
-                                                                                    {badge.as_ref().map(|badge| name_mark("reaction-owner-deputy-badge", "cursor-default", badge.tooltip(), "🛡"))}
+                                                                                    {badge.as_ref().map(|badge| name_icon_mark("reaction-owner-deputy-badge", badge.tooltip(), SHIELD_ICON_PATH))}
                                                                                 }
                                                                             }
                                                                         })}

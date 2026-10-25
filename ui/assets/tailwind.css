@@ -64,8 +64,18 @@
   --color-rail: #f4f4f6;
   /* Secondary text (names in a join notice, a reply strip's author, tags). */
   --color-text-secondary: #484850;
-  /* The similar-name warning's text; 4.5:1 on every row surface. */
+  /* The similar-name warning's text; 4.5:1 on every row surface and on
+     --color-warning-bg. */
   --color-warning-text: #8a5800;
+  /* Status, all through tokens (no raw palette classes; the accent audit
+     checks): a destructive action's fill (white text 4.5:1 and more in both
+     themes) and its hover; error and success TEXT, 4.5:1 on the panel and
+     on their own *-bg callout. A callout's colour is carried by a left rule
+     (`border-warning` / `border-danger`); its body text stays --color-text. */
+  --color-danger: #b42318;
+  --color-danger-hover: #912018;
+  --color-danger-text: #b42318;
+  --color-success-text: #067647;
   /* Your own rows: a faint tint of the link colour over the conversation
      surface, stronger under the pointer. Opaque, so the hover band (which is
      translucent) never has to be layered over it. */
@@ -102,6 +112,10 @@
     --color-rail: #0f0f11;
     --color-text-secondary: #b4b4bb;
     --color-warning-text: #e3a845;
+    --color-danger: #b42318;
+    --color-danger-hover: #c8331f;
+    --color-danger-text: #f97066;
+    --color-success-text: #47cd89;
     --avatar-l: 0.42;
     --avatar-c: 0.07;
     --avatar-text-l: 0.93;
@@ -124,6 +138,12 @@
 @utility text-text-quote { color: var(--color-text-quote); }
 @utility text-text-secondary { color: var(--color-text-secondary); }
 @utility text-warning-text { color: var(--color-warning-text); }
+@utility text-danger { color: var(--color-danger-text); }
+@utility text-success { color: var(--color-success-text); }
+@utility bg-danger { background-color: var(--color-danger); }
+@utility bg-danger-hover { background-color: var(--color-danger-hover); }
+@utility border-danger { border-color: var(--color-danger-text); }
+@utility ring-danger { --tw-ring-color: var(--color-danger-text); }
 @utility text-link { color: var(--color-link); }
 @utility text-link-hover { color: var(--color-link-hover); }
 @utility text-text-inverse { color: var(--color-text-inverse); }
