@@ -116,10 +116,14 @@
     margin-top: 1px;
     background-color: oklch(var(--avatar-l) 0 0);
     color: oklch(var(--avatar-text-l) 0 0);
-    font-size: calc(var(--avatar-size) * 0.38);
+    /* Capped, and clipped to the disc: initials() bounds the text to two
+     * glyphs, and nothing a nickname holds may spill past the circle. */
+    font-size: min(calc(var(--avatar-size) * 0.38), 15px);
     font-weight: 700;
     letter-spacing: 0.01em;
     line-height: 1;
+    white-space: nowrap;
+    overflow: hidden;
     user-select: none;
     cursor: pointer;
 }

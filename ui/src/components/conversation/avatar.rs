@@ -8,110 +8,97 @@
 use river_core::room_state::member::MemberId;
 use river_core::room_state::ChatRoomStateV1;
 
-/// The disc's text: the first letter of each of the first two words of the
-/// display nickname, upper-cased; the first character if the name is one
-/// word; "?" if it has none. At most two visible glyphs: an upper-casing that
-/// expands (`ß` to `SS`) counts each letter.
+/// The disc's text: the initial of each of the first words of the display
+/// nickname that have one, at most two glyphs, upper-cased; for a name with
+/// no letter or digit, its first emoji; else "?".
 ///
-/// A word's "letter" is its first alphanumeric character, so the `(Owner)`
-/// in `Kara (Owner)` gives `O`, not `(`. A character keeps what a reader sees
-/// as part of it (combining marks, an Indic vowel sign or conjunct, an emoji's
-/// skin tone, variation selector or ZWJ sequence; see [`first_glyphs`]), and
-/// a mark with no letter before it is never shown alone.
+/// Built on UAX #29 extended grapheme clusters, because a nickname is
+/// untrusted text: it must not be able to put arbitrary text in the disc.
+/// - A word's initial is its first cluster holding a letter or digit, so the
+///   `(Owner)` in `Kara (Owner)` gives `O`. Leading format and bidi controls
+///   and lone combining marks are skipped.
+/// - The initial is that letter (upper-cased; `ß` gives `SS`, two glyphs)
+///   and at most two more characters of its own cluster (combining marks, an
+///   Indic vowel sign or conjunct), never a format character: a ZWJ or a
+///   pile of marks cannot drag more text in.
+/// - At most two glyphs in all: `ßa ßb` gives `SS`.
 pub(crate) fn initials(name: &str) -> String {
-    let words: Vec<&str> = name.split_whitespace().collect();
-    if words.len() >= 2 {
-        let letters: String = words
-            .iter()
-            .flat_map(|w| first_glyphs(w, true))
-            .take(2)
-            .collect();
-        if !letters.is_empty() {
-            return letters;
-        }
-    }
-    let one: String = words
-        .first()
-        .map(|w| first_glyphs(w, false))
-        .unwrap_or_default()
-        .into_iter()
-        .take(2)
-        .collect();
-    if one.is_empty() {
-        "?".to_string()
-    } else {
-        one
-    }
-}
-
-/// The word's first character, upper-cased, as the glyphs it shows: the base
-/// character's upper case (one glyph per letter, `ß` gives two) with what
-/// extends it attached to the last. `alphanumeric` skips to the first
-/// alphanumeric base; otherwise any base will do. Leading marks are skipped,
-/// so a lone mark is never the result.
-///
-/// A close approximation of an extended grapheme cluster, without a
-/// segmentation table: extenders are combining marks, variation selectors
-/// and emoji modifiers ([`extends_glyph`]); a ZWJ or an Indic virama also
-/// takes the character after it.
-fn first_glyphs(word: &str, alphanumeric: bool) -> Vec<String> {
-    let mut chars = word.chars().peekable();
-    let base = loop {
-        let c = chars.next();
-        match c {
-            None => return Vec::new(),
-            Some(c) if extends_glyph(c) || c == ZWJ => continue,
-            Some(c) if alphanumeric && !c.is_alphanumeric() => continue,
-            Some(c) => break c,
-        }
-    };
-    let mut glyphs: Vec<String> = base.to_uppercase().map(String::from).collect();
-    let last = glyphs.last_mut().expect("upper case is never empty");
-    while let Some(&c) = chars.peek() {
-        if c == ZWJ || is_virama(c) {
-            last.push(c);
-            chars.next();
-            if let Some(joined) = chars.next() {
-                last.push(joined);
-            }
-        } else if extends_glyph(c) {
-            last.push(c);
-            chars.next();
-        } else {
+    let mut glyphs: Vec<String> = Vec::new();
+    for word in name.split_whitespace() {
+        if glyphs.len() >= 2 {
             break;
         }
+        glyphs.extend(word_initial(word));
     }
-    glyphs
+    glyphs.truncate(2);
+    if !glyphs.is_empty() {
+        return glyphs.concat();
+    }
+    pictograph(name).unwrap_or_else(|| "?".to_string())
 }
 
-const ZWJ: char = '\u{200D}';
+/// Characters an initial keeps after its letter, from the letter's cluster.
+const MAX_MARKS: usize = 2;
+/// The longest emoji cluster shown (a ZWJ family is seven characters).
+const MAX_PICTOGRAPH_CHARS: usize = 8;
 
-/// Characters drawn as part of the character before them: combining marks
-/// (Latin, Greek, Cyrillic, symbols), variation selectors, emoji skin-tone
-/// modifiers, and the Indic blocks' dependent signs (vowel signs, nukta,
-/// candrabindu, anusvara, visarga), which sit at the same offsets in every
-/// block from Devanagari to Sinhala.
-fn extends_glyph(c: char) -> bool {
-    if matches!(c, '\u{0300}'..='\u{036F}' | '\u{0483}'..='\u{0489}' | '\u{1AB0}'..='\u{1AFF}' | '\u{1DC0}'..='\u{1DFF}' | '\u{20D0}'..='\u{20FF}' | '\u{FE20}'..='\u{FE2F}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}' | '\u{1F3FB}'..='\u{1F3FF}')
-    {
-        return true;
+/// The word's initial as the glyphs it draws (see [`initials`]): one per
+/// letter of the upper-cased base, the marks on the last. Empty when the
+/// word holds no letter or digit.
+fn word_initial(word: &str) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    for cluster in word.graphemes(true) {
+        let mut chars = cluster.chars();
+        // A cluster's base is its first letter or digit that is not itself
+        // a mark (a lone mark forms a cluster of its own).
+        let Some(base) = chars
+            .by_ref()
+            .find(|c| c.is_alphanumeric() && !extends_cluster(*c))
+        else {
+            continue;
+        };
+        let mut glyphs: Vec<String> = base.to_uppercase().map(String::from).collect();
+        let last = glyphs.last_mut().expect("upper case is never empty");
+        last.extend(chars.filter(|c| !is_format(*c)).take(MAX_MARKS));
+        return glyphs;
     }
-    match indic_offset(c) {
-        Some(o) => matches!(o, 0x00..=0x03 | 0x3A..=0x3C | 0x3E..=0x4F | 0x51..=0x57 | 0x62..=0x63),
-        None => false,
-    }
+    Vec::new()
 }
 
-/// An Indic virama, which joins the next consonant into a conjunct.
-fn is_virama(c: char) -> bool {
-    indic_offset(c) == Some(0x4D)
+/// A name with no letter or digit: its first emoji cluster (a flag, a ZWJ
+/// sequence, a skin tone), if it starts with one.
+fn pictograph(name: &str) -> Option<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let cluster = name.graphemes(true).find(|g| {
+        g.chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && !is_format(c) && !extends_cluster(c))
+    })?;
+    let first = cluster.chars().next()?;
+    is_pictographic(first).then(|| cluster.chars().take(MAX_PICTOGRAPH_CHARS).collect())
 }
 
-/// `c`'s offset in its Indic block (Devanagari U+0900 to Sinhala U+0DFF, 128
-/// code points each), if it is in one.
-fn indic_offset(c: char) -> Option<u32> {
-    let c = c as u32;
-    (0x0900..=0x0DFF).contains(&c).then_some(c & 0x7F)
+/// Whether `c` attaches to the character before it in a grapheme cluster
+/// (UAX #29 Extend, ZWJ or SpacingMark: combining marks, Indic vowel signs,
+/// viramas, variation selectors, skin tones), asked of the segmenter itself
+/// so no property table is duplicated here.
+fn extends_cluster(c: char) -> bool {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut probe = String::from("a");
+    probe.push(c);
+    probe.graphemes(true).count() == 1
+}
+
+/// Invisible format characters a disc never shows: zero-width spaces and
+/// joiners, bidi marks, embeddings, overrides and isolates, the word joiner
+/// family, variation selectors, the BOM and the soft hyphen.
+fn is_format(c: char) -> bool {
+    matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
+/// Emoji and pictographic symbols, regional indicators (flags) included.
+fn is_pictographic(c: char) -> bool {
+    matches!(c, '\u{2190}'..='\u{2BFF}' | '\u{3297}' | '\u{3299}' | '\u{1F000}'..='\u{1FAFF}')
 }
 
 /// The verifying-key bytes of `member`, the input the hue is keyed on: the
@@ -180,6 +167,10 @@ mod tests {
         assert_eq!(initials("\u{1F44D}\u{1F3FD}"), "\u{1F44D}\u{1F3FD}");
         // A variation selector stays with its symbol.
         assert_eq!(initials("\u{2764}\u{FE0F}"), "\u{2764}\u{FE0F}");
+        // A flag is one cluster of two regional indicators.
+        assert_eq!(initials("\u{1F1FA}\u{1F1F8}"), "\u{1F1FA}\u{1F1F8}");
+        // A letter wins over an emoji.
+        assert_eq!(initials("\u{1F1FA}\u{1F1F8} Sam"), "S");
         // Devanagari: a vowel sign, and a conjunct through the virama.
         assert_eq!(
             initials("\u{0915}\u{093F}\u{0930}\u{0923}"),
@@ -193,16 +184,63 @@ mod tests {
             initials("\u{0930}\u{093E}\u{091C} \u{0915}\u{0941}\u{092E}\u{093E}\u{0930}"),
             "\u{0930}\u{093E}\u{0915}\u{0941}"
         );
-        // Tamil (a different block, the same offsets).
+        // Tamil's virama does not form conjuncts: "ச்" alone.
+        assert_eq!(
+            initials("\u{0B9A}\u{0BCD}\u{0B9A}\u{0BC6}\u{0BB2}\u{0BCD}\u{0BB5}\u{0BAE}\u{0BCD}"),
+            "\u{0B9A}\u{0BCD}"
+        );
         assert_eq!(initials("\u{0B95}\u{0BBF}"), "\u{0B95}\u{0BBF}");
+        // Sinhala letters are letters (සමන් gives ස; two words, two glyphs).
+        assert_eq!(initials("\u{0DC3}\u{0DB8}\u{0DB1}\u{0DCA}"), "\u{0DC3}");
+        assert_eq!(
+            initials("\u{0DC3}\u{0DB8}\u{0DB1}\u{0DCA} \u{0D9A}\u{0DD4}\u{0DB8}\u{0DCF}\u{0DBB}"),
+            "\u{0DC3}\u{0D9A}\u{0DD4}"
+        );
+        assert_eq!(
+            initials("\u{0DC3}\u{0DD4}\u{0DB1}\u{0DD2}\u{0DBD}\u{0DCA}"),
+            "\u{0DC3}\u{0DD4}"
+        );
+        // Hebrew points and Thai marks stay on their letter.
+        assert_eq!(
+            initials("\u{05E9}\u{05C1}\u{05B8}\u{05DC}\u{05D5}\u{05B9}\u{05DD}"),
+            "\u{05E9}\u{05C1}\u{05B8}"
+        );
+        assert_eq!(
+            initials("\u{0E19}\u{0E49}\u{0E33}"),
+            "\u{0E19}\u{0E49}\u{0E33}"
+        );
+    }
+
+    /// A nickname cannot write text into the disc: a ZWJ joins only emoji,
+    /// a virama only same-script consonants, and marks are capped.
+    #[test]
+    fn a_name_cannot_smuggle_text_into_the_disc() {
+        assert_eq!(initials("O\u{200D}W\u{200D}N\u{200D}E\u{200D}R"), "O");
+        assert_eq!(initials("A\u{200D}d\u{200D}m\u{200D}i\u{200D}n x"), "AX");
+        // A Devanagari virama does not join Latin letters.
+        assert_eq!(initials("\u{0915}\u{094D}abc"), "\u{0915}\u{094D}");
+        assert_eq!(initials("x\u{094D}yz"), "X\u{094D}");
+        // Eight combining marks: the letter keeps two.
+        let zalgo = format!("a{}", "\u{0301}".repeat(8));
+        assert_eq!(initials(&zalgo), "A\u{0301}\u{0301}");
+        // Format characters never reach the disc.
+        assert_eq!(initials("a\u{200B}\u{0301}"), "A");
     }
 
     #[test]
-    fn a_lone_mark_is_never_shown() {
+    fn a_lone_mark_or_control_is_never_shown() {
         assert_eq!(initials("\u{0301}abc"), "A");
         assert_eq!(initials("\u{0301}\u{0302}"), "?");
         assert_eq!(initials("\u{093F}\u{0915}"), "\u{0915}");
         assert_eq!(initials("\u{200D}x"), "X");
+        // Arabic harakat before the first letter.
+        assert_eq!(initials("\u{064E}\u{0639}\u{0644}\u{064A}"), "\u{0639}");
+        // Leading RLO, ZWSP, LRM.
+        assert_eq!(initials("\u{202E}abc"), "A");
+        assert_eq!(initials("\u{200B}bob"), "B");
+        assert_eq!(initials("\u{200E}cat dog"), "CD");
+        // Nothing but format characters.
+        assert_eq!(initials("\u{200B}\u{200E}\u{202E}\u{2066}"), "?");
     }
 
     #[test]
@@ -211,6 +249,8 @@ mod tests {
         assert_eq!(initials("ßa ßb"), "SS");
         assert_eq!(initials("anna ßb"), "AS");
         assert_eq!(initials("Kara Martinez Lopez"), "KM");
+        // ŉ upper-cases to an apostrophe and N.
+        assert_eq!(initials("\u{0149}"), "\u{02BC}N");
     }
 
     #[test]

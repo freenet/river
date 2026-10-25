@@ -85,6 +85,8 @@ lipsum = { version = "0.9.1", optional = true }
 
 # Utilities
 blake3.workspace = true
+# Grapheme clusters (UAX #29) for avatar initials.
+unicode-segmentation = "1.13.2"
 chrono.workspace = true
 markdown = "1.0.0-alpha.21"
 ciborium = "0.2.2"
