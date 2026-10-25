@@ -147,7 +147,14 @@ Known limitations:
 - Outside that hold, a size change gets no correction: when the composer
   grows or the phone keyboard opens, the browser keeps the view's top edge,
   so the bottom of the view is covered. Paging and panel reveals retain their
-  reading-position corrections. A hide is noticed from the container's size
+  reading-position corrections, and so does the desktop member panel's
+  toggle: opening or closing it changes the chat column's width and rewraps
+  every row, so a reader at the end keeps the end hold (the resize takes the
+  view back to the end), and anyone else has their reading row measured at
+  the click and put back by the first resize at a new width
+  (`capture_before_reflow`; a capture no resize uses within a second is
+  dropped, so it cannot move the view at some later resize). A window resize
+  gets no such correction. A hide is noticed from the container's size
   or from a patch landing while it has no layout (`note_patch_while_hidden`,
   which also re-observes the container), so a reveal restores the reader even
   when the ResizeObserver never reported the hide: a hide and reveal with no
@@ -204,7 +211,7 @@ to go to the end, in render, and that render queues an effect
 the DOM, like the room's `complete_scroll_request`. Dioxus drops a removed
 scope's queued effects, so no placement can outlive its thread. An own send's
 plaintext is cached in the same `defer` block that adds it to `ROOMS`
-(`save_outbound_dm_now`), so the jump lands on the sent bubble's final
+(`save_outbound_dm_now`), so the jump lands on the sent row's final
 height. The placement and the read witness find the thread through the
 global `dm-scroll-container` and `dm-bottom-sentinel` ids, and every caller
 of the witness runs while its thread is mounted: its effects (whose queued

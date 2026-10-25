@@ -24,7 +24,7 @@ use crate::room_data::CurrentRoom;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
-    icons::fa_solid_icons::{FaArrowsUpDown, FaChevronDown, FaChevronUp, FaTriangleExclamation},
+    icons::fa_solid_icons::{FaChevronDown, FaChevronUp, FaTriangleExclamation},
     Icon,
 };
 use ed25519_dalek::VerifyingKey;

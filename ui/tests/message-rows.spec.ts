@@ -316,6 +316,15 @@ test.describe("Avatars", () => {
     await expect.poll(isGrey, { message: "no salt: a neutral disc" }).toBe(true);
     await expect(avatar).not.toHaveAttribute("style", /--avatar-hue/);
 
+    // Exact hues for the fixed-key sender (Test Sender Insert) under two
+    // salts, pinned natively by `the_fixed_test_senders_hues_are_pinned`:
+    // the same member, two viewers, two different colours.
+    const hueOf = () => avatar.evaluate((el) => (el as HTMLElement).style.getPropertyValue("--avatar-hue").trim());
+    await callRiverTest(page, "setAvatarSalt", 1);
+    await expect.poll(hueOf).toBe("108");
+    await callRiverTest(page, "setAvatarSalt", 2);
+    await expect.poll(hueOf).toBe("288");
+
     await callRiverTest(page, "setAvatarSalt", 1);
     await expect.poll(isGrey, { message: "a salt colours the disc" }).toBe(false);
     const first = await disc();
@@ -746,12 +755,98 @@ test.describe("Hover bar", () => {
 
     await page.mouse.move(0, 0);
     await expect.poll(state).toEqual({ opacity: "0", events: "none", hit: false });
-    // Focus the bar's first button, where Tab lands from the row's content.
-    await bar.getByRole("button", { name: "React" }).focus();
+    // Focus the bar's first button, where Tab lands from the row's content,
+    // as a keyboard user does.
+    await keyboardFocus(page, bar.getByRole("button", { name: "React" }));
     await expect.poll(state, { message: "focus within the row" }).toMatchObject({ opacity: "1", events: "auto" });
     expect(await bar.getByRole("button", { name: "React" }).evaluate((el) => el === document.activeElement)).toBe(true);
   });
+  test("a mouse click inside the row does not keep the bar after the pointer leaves", async ({ page }) => {
+    test.skip(await touchOnly(page), "no hover bar on touch");
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    const row = page.getByTestId("message-row").filter({ has: page.getByTestId("reply-strip") }).first();
+    await row.scrollIntoViewIfNeeded();
+    const bar = row.getByTestId("message-hover-actions");
+    const strip = row.getByTestId("reply-strip");
+    const state = () =>
+      bar.evaluate(async (el) => {
+        await Promise.all(el.getAnimations().map((a) => a.finished));
+        return { opacity: getComputedStyle(el).opacity, events: getComputedStyle(el).pointerEvents };
+      });
+    // A mouse click focuses the strip (it is a tabindex="0" button).
+    await strip.click();
+    await expect.poll(() => strip.evaluate((el) => el === document.activeElement), { message: "premise: the click focused the strip" }).toBe(true);
+    await page.mouse.move(0, 0);
+    await expect.poll(state, { message: "pointer gone, focus from a mouse click" }).toEqual({ opacity: "0", events: "none" });
+    // The same focus from the keyboard does reveal it.
+    await strip.evaluate((el) => (el as HTMLElement).blur());
+    await keyboardFocus(page, strip);
+    await expect.poll(() => strip.evaluate((el) => el.matches(":focus-visible")), { message: "premise: keyboard focus" }).toBe(true);
+    await expect.poll(state, { message: "keyboard focus in the row" }).toEqual({ opacity: "1", events: "auto" });
+  });
 });
+
+// React on a message taller than the view: the picker hangs off the "+" at
+// the message's foot, below the fold when React is taken from the top of the
+// message. Opening brings it into view, and the next click is the reader's
+// pick, not swallowed by the invisible backdrop.
+test.describe("React on a tall message", () => {
+  test("the picker opens in view and takes the next click", async ({ page }) => {
+    await openRoomWithComposer(page);
+    // Tall but well under the room's message-size limit (an over-size
+    // message is dropped at the next send, the reaction's).
+    const text = Array.from({ length: 40 }, (_, i) => `tall ${i}`).join("\n\n") + "\n\ntall paragraph 59";
+    await callRiverTest(page, "appendMessage", text);
+    const row = page.getByTestId("message-row").filter({ hasText: "tall paragraph 59" });
+    await expect(row).toHaveCount(1);
+    // Read from the message's top: its foot is far below the view.
+    await row.evaluate((el) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.scrollTop += el.getBoundingClientRect().top - c.getBoundingClientRect().top - 40;
+    });
+    const geometry = () =>
+      page.evaluate(() => {
+        const c = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+        const p = document.querySelector('[data-testid="emoji-picker"]')?.getBoundingClientRect();
+        const plus = Array.from(document.querySelectorAll('[data-testid="message-row"]'))
+          .find((r) => r.textContent!.includes("tall paragraph 59"))!
+          .querySelector('[data-testid="add-reaction-button"]')!
+          .parentElement!.getBoundingClientRect();
+        return { view: [c.top, c.bottom], picker: p ? [p.top, p.bottom] : null, plusTop: plus.top };
+      });
+    expect((await geometry()).plusTop, "premise: the message's foot is below the view").toBeGreaterThan((await geometry()).view[1]);
+
+    await openInlinePicker(page, row);
+    const picker = page.getByTestId("emoji-picker");
+    await expect(picker).toBeVisible();
+    await expect
+      .poll(async () => {
+        const g = await geometry();
+        return !!g.picker && g.picker[0] >= g.view[0] - 1 && g.picker[1] <= g.view[1] + 1;
+      }, { message: "the picker is wholly inside the history's view" })
+      .toBe(true);
+    await picker.getByRole("button").first().click();
+    await expect(picker).toHaveCount(0);
+    await expect(row.getByTestId("reaction-chip"), "the click reacted").toHaveCount(1);
+  });
+});
+
+/// Focus `target` as a keyboard user would, so it is `:focus-visible`. A key
+/// press then a scripted focus does it in Chromium and WebKit (which does not
+/// Tab to every control); Firefox needs a real Tab, so step off and back.
+async function keyboardFocus(page: Page, target: Locator) {
+  await page.keyboard.press("Escape");
+  await target.focus();
+  if (!(await target.evaluate((el) => el.matches(":focus-visible")))) {
+    await page.keyboard.press("Shift+Tab");
+    await page.keyboard.press("Tab");
+  }
+  await expect.poll(() => target.evaluate((el) => el === document.activeElement && el.matches(":focus-visible")), {
+    message: "premise: keyboard focus",
+  }).toBe(true);
+}
 
 // A row's resting controls (the hover bar on a hover pointer, the kebab on
 // touch) can share Latest's corner. They paint under Latest, so a row at the

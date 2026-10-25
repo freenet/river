@@ -2786,11 +2786,17 @@ pub fn Conversation() -> Element {
                                         "aria-label": "Members, {member_count}",
                                         "aria-pressed": if members_open { "true" } else { "false" },
                                         "aria-controls": "members-rail",
-                                        onclick: move |_| {
-                                            crate::util::defer(move || {
-                                                let open = *MEMBERS_PANEL_OPEN.peek();
-                                                *MEMBERS_PANEL_OPEN.write() = !open;
-                                            });
+                                        onclick: {
+                                            let reader_position = reader_position.clone();
+                                            move |_| {
+                                                // The chat column changes width and every row
+                                                // rewraps: keep the reader on their row.
+                                                reader_position.capture_before_reflow();
+                                                crate::util::defer(move || {
+                                                    let open = *MEMBERS_PANEL_OPEN.peek();
+                                                    *MEMBERS_PANEL_OPEN.write() = !open;
+                                                });
+                                            }
                                         },
                                         {line_icon(PEOPLE_ICON_PATH, 19)}
                                         span { class: "text-[12.5px] font-bold tabular-nums", "{member_count}" }
@@ -3704,6 +3710,18 @@ fn vertical_placement(y: f64, height: f64) -> (bool, f64) {
 /// `top..bottom`: it opens below from `bottom`, or above from `top`.
 fn vertical_placement_from(top: f64, bottom: f64, height: f64) -> (bool, f64) {
     let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
+    placement_within(scroll_top, scroll_bottom, top, bottom, height)
+}
+
+/// [`vertical_placement_from`] inside a scrollport spanning
+/// `scroll_top..scroll_bottom`, pure for native tests.
+fn placement_within(
+    scroll_top: f64,
+    scroll_bottom: f64,
+    top: f64,
+    bottom: f64,
+    height: f64,
+) -> (bool, f64) {
     let (below, above_space) = (scroll_bottom - bottom, top - scroll_top);
     let above = below < height && above_space > below;
     let max_h = ((if above { above_space } else { below }) - 16.0).max(1.0);
@@ -5024,6 +5042,25 @@ fn MessageGroupComponent(
                                                     if is_inline_picker_open {
                                                         div {
                                                             "data-testid": "emoji-picker",
+                                                            // It hangs off the "+" at the message's foot.
+                                                            // Opened from the hover bar's React at the top
+                                                            // of a message taller than the view, that is
+                                                            // below the fold: bring it into view, only as
+                                                            // far as needed, or the reader sees nothing
+                                                            // open and the invisible backdrop takes their
+                                                            // next click. Instant, like the edit form.
+                                                            onmounted: move |cx| {
+                                                                let el = cx.data();
+                                                                wasm_bindgen_futures::spawn_local(async move {
+                                                                    let _ = el
+                                                                        .scroll_to_with_options(dioxus::html::ScrollToOptions {
+                                                                            behavior: ScrollBehavior::Instant,
+                                                                            vertical: dioxus::html::ScrollLogicalPosition::Nearest,
+                                                                            horizontal: dioxus::html::ScrollLogicalPosition::Nearest,
+                                                                        })
+                                                                        .await;
+                                                                });
+                                                            },
                                                             class: format!(
                                                                 "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid pointer-events-auto {} {}",
                                                                 if picker_placement.read().above { "bottom-full mb-1" } else { "top-full mt-1" },
@@ -5076,6 +5113,35 @@ fn MessageGroupComponent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The popover side rule at its edges: a scrollport from 100 to 700,
+    /// a 140px popover.
+    #[test]
+    fn popover_placement_edges() {
+        let place = |top: f64, bottom: f64| placement_within(100.0, 700.0, top, bottom, 140.0);
+        // Fits below: below, whatever the room above.
+        assert_eq!(place(500.0, 520.0), (false, 164.0));
+        // Exactly fits below (140px to the scrollport's foot): below.
+        assert_eq!(place(540.0, 560.0), (false, 124.0));
+        // One pixel short of fitting below, more room above: above.
+        assert_eq!(place(541.0, 561.0), (true, 425.0));
+        // Fits neither side: the roomier one, its max height the space less 16.
+        let short = |top: f64, bottom: f64| placement_within(100.0, 300.0, top, bottom, 140.0);
+        assert_eq!(short(180.0, 200.0), (false, 84.0));
+        assert_eq!(short(230.0, 250.0), (true, 114.0));
+        // Equal room either side, neither enough: below.
+        assert_eq!(short(190.0, 210.0), (false, 74.0));
+        // The anchor below the scrollport (a tall message's foot): above,
+        // with the whole view to use.
+        assert_eq!(place(900.0, 920.0), (true, 784.0));
+        // Above it: below.
+        assert_eq!(place(20.0, 40.0), (false, 644.0));
+        // No room at all: the max height never drops below 1px.
+        assert_eq!(
+            placement_within(100.0, 100.0, 100.0, 100.0, 140.0),
+            (false, 1.0)
+        );
+    }
 
     #[test]
     fn a_join_notice_names_at_most_two_members() {

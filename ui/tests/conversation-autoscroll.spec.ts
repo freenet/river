@@ -681,10 +681,12 @@ const INITIAL_RENDERED_ITEMS = 60;
 const ARRIVAL_CEILING_ITEMS = INITIAL_RENDERED_ITEMS * 4;
 /// How far above the end the newer-history trigger reaches (BACKFILL_LEAD_PX).
 const NEWER_TRIGGER_REACH_PX = 800;
-/// The trim above the reader: ~6,000px in #747's last review round (measured
-/// 6,120-6,200), 4,205 once a message without reactions stopped carrying an
-/// empty reaction line. The floor keeps the shift far larger than any view.
-const NEWER_PAGE_SHIFT_FLOOR_PX = 3_500;
+/// The trim above the reader must be far larger than the view, or a broken
+/// correction could hide inside it: at least this many view heights. Derived
+/// from the view rather than fixed in pixels, so a row-height change does not
+/// need the number re-tuned (it was ~6,000px in #747's last review round and
+/// 4,205px once rows got shorter, against a 593px view).
+const NEWER_PAGE_SHIFT_FLOOR_VIEWS = 3;
 /// Tall rows at the head of "Tall Head Room" (at its message cap).
 const TALL_HEAD_TALL_ROWS = 8;
 /// Tall rows at the head of "Uneven Tail Room", numbered 00 up.
@@ -931,7 +933,7 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
         const rect = r.getBoundingClientRect();
         if (rect.height > 0 && rect.top >= cTop && rect.bottom <= cTop + c.clientHeight) {
           const top = rect.top - cTop;
-          return { key: r.getAttribute("data-item-key")!, top, contentTop: top + c.scrollTop };
+          return { key: r.getAttribute("data-item-key")!, top, contentTop: top + c.scrollTop, view: c.clientHeight };
         }
       }
       return null;
@@ -947,8 +949,8 @@ test.describe("Render ceiling and trimming (A04, A05)", () => {
     expect(contentTopAfter, "premise: the reader's row is still rendered").not.toBeNull();
     expect(
       row!.contentTop - contentTopAfter!,
-      `premise: the newer page should trim at least ${NEWER_PAGE_SHIFT_FLOOR_PX}px above the reader`,
-    ).toBeGreaterThanOrEqual(NEWER_PAGE_SHIFT_FLOOR_PX);
+      `premise: the newer page should trim at least ${NEWER_PAGE_SHIFT_FLOOR_VIEWS} views (${row!.view}px each) above the reader`,
+    ).toBeGreaterThanOrEqual(NEWER_PAGE_SHIFT_FLOOR_VIEWS * row!.view);
     await expectRowHeld(page, row!.key, row!.top, "a newer page moved the reader's row");
 
     const paged = await withheld(page);
