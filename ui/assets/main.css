@@ -290,6 +290,18 @@
     }
 }
 
+/* A DM thread's rows: the room's row, without the kebab gutter (a DM has no
+ * per-message actions). */
+.msg-row.dm-row {
+    padding-right: 20px;
+}
+
+@media (max-width: 767px) {
+    .msg-row.dm-row {
+        padding-right: 14px;
+    }
+}
+
 /* The same disc in the member panel (28px) and the DM rail (22px). Not
  * clickable on its own: the row around it is the control. */
 .msg-avatar.member-avatar {

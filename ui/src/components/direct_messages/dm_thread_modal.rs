@@ -402,7 +402,31 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             }
             rendered.sort_by_key(|d| d.timestamp);
 
+            // The avatar salt for the DM's ROOM, a further fallible read: on
+            // contention both discs render neutral and the nudge re-runs this.
+            let salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
+                Ok(salts) => salts.get(&room.to_bytes()).copied(),
+                Err(_) => {
+                    crate::util::signal_guard::schedule_nudge();
+                    None
+                }
+            };
+            let hue_of = |member: MemberId| {
+                let salt = salt?;
+                crate::components::conversation::avatar::member_vk_bytes(
+                    &room_data.room_state,
+                    &room,
+                    member,
+                )
+                .map(|vk| crate::components::conversation::avatar::display_hue(&salt, &vk))
+            };
+            let self_nickname = self_id
+                .and_then(|id| nicknames.get(&id).cloned())
+                .unwrap_or_else(|| "You".to_string());
             let view = ViewData {
+                self_hue: self_id.and_then(hue_of),
+                peer_hue: hue_of(peer),
+                self_nickname,
                 peer_nickname,
                 peer_still_member,
                 messages: rendered,
@@ -536,6 +560,8 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     }
     #[cfg(not(target_arch = "wasm32"))]
     let _ = arrival;
+    // The avatars' colour salt for the DM's room (safe from render).
+    crate::avatar_salt::ensure_avatar_salt(room.to_bytes());
     let peer_label = view_data.peer_nickname.clone();
     let peer_still_member = view_data.peer_still_member;
     let identity_known = view_data.identity_known;
@@ -935,11 +961,15 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     // tree.
                     div {
                         id: "dm-scroll-container",
-                        class: "flex-1 min-h-0 overflow-y-auto px-5 py-4",
+                        // No side padding: rows and their tint span the thread.
+                        class: "flex-1 min-h-0 overflow-y-auto py-4",
                         // The spacing lives on this inner list, not on the
                         // container, so the sentinel below gets no gap: its top
                         // edge is the newest DM's bottom.
-                        div { class: "space-y-2",
+                        // `.msg-history` (main.css): grouped rows like the
+                        // room's, and the newest row's bottom padding cancelled
+                        // so the sentinel below sits at the newest DM's bottom.
+                        div { class: "msg-history",
                             if view_data.messages.is_empty() && !identity_known {
                                 // NOT "No messages yet". With no local identity every
                                 // DM in this thread was skipped rather than shown (see
@@ -957,8 +987,18 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                     "No messages yet. Say hello!"
                                 }
                             } else {
-                                for (idx, m) in view_data.messages.iter().enumerate() {
-                                    DmBubble { key: "{idx}_{m.timestamp}", message: m.clone() }
+                                for (group_idx, group) in dm_groups(&view_data.messages).into_iter().enumerate() {
+                                    div { key: "{group_idx}_{group[0].timestamp}", class: "msg-group",
+                                        for (idx, m) in group.iter().enumerate() {
+                                            DmRow {
+                                                key: "{idx}_{m.timestamp}",
+                                                message: m.clone(),
+                                                first: idx == 0,
+                                                author: if m.outgoing { view_data.self_nickname.clone() } else { view_data.peer_nickname.clone() },
+                                                hue: if m.outgoing { view_data.self_hue } else { view_data.peer_hue },
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1255,6 +1295,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 #[derive(Clone, PartialEq)]
 struct ViewData {
     peer_nickname: String,
+    /// The local user's nickname in this room, for the own rows' header.
+    self_nickname: String,
+    /// Avatar hues under this viewer's salt for the DM's room, or `None`
+    /// for the neutral disc (the conversation's rule).
+    self_hue: Option<u16>,
+    peer_hue: Option<u16>,
     peer_still_member: bool,
     messages: Vec<RenderedDm>,
     latest_inbound_ts: u64,
@@ -1426,26 +1472,47 @@ fn note_newest_dm(recorded: &std::cell::Cell<Option<DmKey>>, now: Option<DmKey>)
     is_arrival(previous.as_ref(), now.as_ref(), true)
 }
 
+/// Consecutive DMs from one side, at most five minutes apart, as one group:
+/// the same rule the room history groups by.
+fn dm_groups(messages: &[RenderedDm]) -> Vec<Vec<RenderedDm>> {
+    const GROUP_WINDOW_SECS: u64 = 5 * 60;
+    let mut groups: Vec<Vec<RenderedDm>> = Vec::new();
+    for m in messages {
+        let joins = groups.last().and_then(|g| g.last()).is_some_and(|last| {
+            last.outgoing == m.outgoing
+                && m.timestamp.saturating_sub(last.timestamp) < GROUP_WINDOW_SECS
+        });
+        if joins {
+            groups
+                .last_mut()
+                .expect("joins implies a group")
+                .push(m.clone());
+        } else {
+            groups.push(vec![m.clone()]);
+        }
+    }
+    groups
+}
+
+/// One DM as a row of the thread, laid out like a room message
+/// (`.msg-row`): the avatar and a name + time header on a group's first row,
+/// the time in the gutter on hover after that, and your own rows tinted.
 #[component]
-fn DmBubble(message: RenderedDm) -> Element {
+fn DmRow(message: RenderedDm, first: bool, author: String, hue: Option<u16>) -> Element {
     let ts_label = format_local_time(message.timestamp);
-    let align_class = if message.outgoing {
-        "self-end bg-accent/20 text-text"
-    } else {
-        "self-start bg-surface text-text"
-    };
-    let bubble_body = match message.kind {
+    let body = match message.kind {
         BodyKind::Plaintext => {
             // Reuse the room-message linkify path so pasted URLs (notably
             // invite links shared via DM — see #252) render as clickable
             // anchors, and Freenet web-contract URLs get host-stripped to
             // a same-origin path the recipient's gateway can serve. The
-            // `prose prose-sm` wrapper matches `conversation.rs:2061` so
+            // `prose` wrapper matches the room's message body so
             // multi-paragraph bodies don't collapse to a single block.
             let body_html = crate::components::conversation::message_to_html(&message.body);
             rsx! {
                 div {
-                    class: "prose prose-sm max-w-[80%] px-3 py-2 rounded-lg text-sm break-words {align_class}",
+                    "data-testid": "dm-body",
+                    class: "prose prose-sm max-w-[76ch] text-[15px] leading-[22px] text-text break-words",
                     dangerous_inner_html: "{body_html}",
                 }
             }
@@ -1453,17 +1520,17 @@ fn DmBubble(message: RenderedDm) -> Element {
         BodyKind::Placeholder => {
             rsx! {
                 div {
-                    class: "max-w-[80%] px-3 py-2 rounded-lg text-xs italic text-text-muted {align_class}",
+                    "data-testid": "dm-body",
+                    class: "max-w-[76ch] text-[13px] italic text-text-muted",
                     "{message.body}"
                 }
             }
         }
         BodyKind::Invite(card) => {
-            // Inset card rendered inside the bubble column. The Accept
-            // button decodes the CBOR-encoded `Invitation` payload and
-            // hands off to `present_invitation`, which is the same entry
-            // point the URL-bar accept flow uses. Already-member rooms
-            // disable the button and relabel it to reduce confusion.
+            // Inset card. The Accept button decodes the CBOR-encoded
+            // `Invitation` payload and hands off to `present_invitation`,
+            // which is the same entry point the URL-bar accept flow uses.
+            // Already-member rooms disable the button and relabel it.
             //
             // Deref the box at the boundary so `DmInviteCard`'s prop
             // type stays the unboxed `InviteCardData` — the box exists
@@ -1481,12 +1548,50 @@ fn DmBubble(message: RenderedDm) -> Element {
             }
         }
     };
+    let initials = crate::components::conversation::avatar::initials(&author);
+    let avatar_class = format!(
+        "msg-avatar{}{}",
+        if hue.is_some() {
+            " msg-avatar-hued"
+        } else {
+            ""
+        },
+        if message.outgoing {
+            " msg-avatar-self"
+        } else {
+            ""
+        },
+    );
+    let name_class = if message.outgoing {
+        "text-link"
+    } else {
+        "text-text"
+    };
     rsx! {
-        div { class: "flex flex-col",
-            {bubble_body}
-            span {
-                class: if message.outgoing { "self-end text-[10px] text-text-muted mt-0.5" } else { "self-start text-[10px] text-text-muted mt-0.5" },
-                "{ts_label}"
+        div {
+            "data-testid": "dm-row",
+            "data-message-self": "{message.outgoing}",
+            class: "msg-row dm-row",
+            div { class: "msg-gutter",
+                if first {
+                    div {
+                        "aria-hidden": "true",
+                        class: "{avatar_class}",
+                        style: crate::components::conversation::avatar::avatar_style(hue),
+                        "{initials}"
+                    }
+                } else {
+                    span { class: "msg-gutter-time", "{ts_label}" }
+                }
+            }
+            div { class: "min-w-0",
+                if first {
+                    div { "data-testid": "dm-group-header", class: "flex flex-wrap items-baseline gap-x-2 mb-0.5 leading-5",
+                        span { class: "text-[15px] font-bold [overflow-wrap:anywhere] {name_class}", "{author}" }
+                        span { class: "text-xs text-text-muted tabular-nums", "{ts_label}" }
+                    }
+                }
+                {body}
             }
         }
     }
