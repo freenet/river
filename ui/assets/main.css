@@ -160,9 +160,15 @@
  * so it never covers Latest (z-30); it rests at z-20, under Latest and the
  * z-40 dismiss backdrops. Keyboard focus inside the row reveals it too
  * (below). */
+/* Pinned to the right edge of the text column, not the row: rows span the
+ * panel but text stops at the body's 76ch measure, so on a wide window a bar
+ * at the row's edge sat far from the message. `ch` is font-relative, so the
+ * bar takes the body's 15px size (its buttons are fixed-size icons). Where
+ * the column is narrower than the measure, the bar sits at its edge. */
 .hover-actions {
     position: absolute;
-    right: 0;
+    font-size: 15px;
+    right: max(0px, calc(100% - 76ch));
     top: -1.125rem;
     z-index: 20;
     display: flex;

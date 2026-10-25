@@ -82,3 +82,25 @@ test.describe("DM thread rows", () => {
     expect(style).toEqual({ size: "12px", weight: "600", rule: "1px" });
   });
 });
+
+// The thread is as wide as a room's rows need (their 76ch measure plus the
+// avatar gutter), not a narrow dialog, and still fits a phone.
+for (const [width, min, max] of [
+  [1280, 720, 768],
+  [1920, 720, 768],
+  [375, 300, 375],
+] as const) {
+  test(`the DM thread panel is ${min}-${max}px wide in a ${width}px window`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+    await callRiverTest(page, "appendDmsForPeer", DM_PEER.index, 3);
+    await openThread(page, DM_PEER, "dm history 02");
+    const box = (await page.getByTestId("dm-thread-panel").boundingBox())!;
+    expect(box.width, `panel width at ${width}px`).toBeGreaterThanOrEqual(min);
+    expect(box.width, `panel width at ${width}px`).toBeLessThanOrEqual(max);
+    expect(box.x, "panel starts on screen").toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width, "panel ends on screen").toBeLessThanOrEqual(width);
+  });
+}

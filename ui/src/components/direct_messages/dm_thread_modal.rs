@@ -933,9 +933,11 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 class: "absolute inset-0 bg-black/50",
                 onclick: close,
             }
-            // Modal body
+            // Modal body. As wide as a room's rows need for their 76ch text
+            // measure plus the avatar gutter, so a DM reads like the room.
             div {
-                class: "relative z-10 w-full max-w-lg mx-4 bg-panel rounded-xl shadow-xl border border-border flex flex-col max-h-[80vh]",
+                "data-testid": "dm-thread-panel",
+                class: "relative z-10 w-full max-w-3xl mx-4 bg-panel rounded-xl shadow-xl border border-border flex flex-col max-h-[85vh]",
                 // Header. After #266 the Hide/Archive affordance moved
                 // out of this header onto the per-row rollover ✕ in
                 // `DmRailSection`, so the header is just the title and

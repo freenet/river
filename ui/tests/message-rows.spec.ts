@@ -957,3 +957,25 @@ test.describe("Latest over row controls", () => {
     await expect(latest).toBeHidden();
   });
 });
+
+// On a wide window rows span the panel while text stops at the body's 76ch
+// measure; the hover bar ends at that measure, not at the row's far edge, so
+// it stays next to the message it acts on.
+test("the hover bar ends at the text column, not the row's edge, on a wide window", async ({ page }) => {
+  test.skip(await touchOnly(page), "touch has no hover bar");
+  await page.setViewportSize({ width: 1920, height: 900 });
+  const { received } = await openRoomWithPairs(page);
+  const row = received.getByTestId("message-row").last();
+  await row.hover();
+  const bar = (await row.getByTestId("message-hover-actions").boundingBox())!;
+  const m = await row.evaluate((el) => {
+    const body = el.querySelector('[data-testid="message-body"]')!;
+    const content = el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect();
+    return {
+      measureRight: body.getBoundingClientRect().left + parseFloat(getComputedStyle(body).maxWidth),
+      contentRight: content.right,
+    };
+  });
+  expect(m.contentRight - m.measureRight, "premise: the column is wider than the text measure").toBeGreaterThan(100);
+  expect(Math.abs(bar.x + bar.width - m.measureRight), "bar's right edge at the measure").toBeLessThanOrEqual(1);
+});
