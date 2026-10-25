@@ -371,10 +371,10 @@ impl ImpersonationWarning {
     /// as VISIBLE TEXT, so the collision surface is wider than accessible
     /// names: `getByText`, `filter({ hasText })` and `toContainText` can now
     /// match it too, which they could not when it lived only in `title` and
-    /// `aria-label`. The deputy wording contains 🛡, and
-    /// `member-info-deputy-tag.spec.ts` filters rows on `hasText: "🛡"` — safe
-    /// today only because that locator is scoped to `button[title^="Member
-    /// ID"]`, not because the glyph is unique on the page.
+    /// `aria-label`. The wording names what is rendered ("a crown icon", "an
+    /// OWNER tag", "a shield icon", "a DEPUTY tag"), not emoji: the redesign
+    /// draws line icons and tags, and a sentence pointing at 👑 or 🛡 sent the
+    /// reader looking for something that is not on screen.
     ///
     /// If you reword this, grep the Playwright specs for `getByRole`,
     /// `getByText`, `hasText` and `toContainText` and check each against the
@@ -400,12 +400,12 @@ impl ImpersonationWarning {
         }
         match self.impersonated.role {
             ProtectedRole::Owner => "Impersonation warning: this member is NOT the room owner, \
-                 but their name closely resembles the owner's. The real owner is marked \
-                 \u{1f451} in the member list."
+                 but their name closely resembles the owner's. The real owner has a crown \
+                 icon in the member list and an OWNER tag on their messages."
                 .to_string(),
             ProtectedRole::Deputy => "Impersonation warning: this member is NOT a moderator, \
-                 but their name closely resembles one. A real moderator shows a \u{1f6e1} \
-                 shield next to their name."
+                 but their name closely resembles one. A real moderator has a shield icon \
+                 next to their name and a DEPUTY tag on their messages."
                 .to_string(),
         }
     }
@@ -3136,9 +3136,12 @@ mod tests {
         }
         .tooltip();
         assert!(deputy.contains("is NOT a moderator"), "{deputy}");
+        // The remedy names what is rendered: a shield line icon and a DEPUTY
+        // tag. No emoji: the redesign draws none, so pointing at one would
+        // send the reader looking for something that is not there.
         assert!(
-            deputy.contains('\u{1f6e1}'),
-            "must point at the shield: {deputy}"
+            deputy.contains("shield icon") && deputy.contains("DEPUTY tag"),
+            "must point at the shield icon and the DEPUTY tag: {deputy}"
         );
 
         let owner = ImpersonationWarning {
@@ -3149,13 +3152,19 @@ mod tests {
         .tooltip();
         assert!(owner.contains("is NOT the room owner"), "{owner}");
         assert!(
-            owner.contains('\u{1f451}'),
-            "the owner is marked with a crown, not a shield: {owner}"
+            owner.contains("crown icon") && owner.contains("OWNER tag"),
+            "the owner is marked with a crown and an OWNER tag: {owner}"
         );
         // The shield is NOT the remedy for an owner collision: the owner never
         // carries a deputy shield, so telling the reader to look for one would
         // send them hunting for something that is correctly absent.
-        assert!(!owner.contains('\u{1f6e1}'), "{owner}");
+        assert!(!owner.contains("shield"), "{owner}");
+        for glyph in ['\u{1f451}', '\u{1f6e1}'] {
+            assert!(
+                !deputy.contains(glyph) && !owner.contains(glyph),
+                "no emoji the UI no longer draws"
+            );
+        }
     }
 
     /// **The tooltip-injection guard.** A protected name is attacker-choosable
