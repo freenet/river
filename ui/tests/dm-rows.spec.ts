@@ -57,12 +57,9 @@ test.describe("DM thread rows", () => {
     await callRiverTest(page, "appendDmsAcrossDaysForPeer", DM_PEER.index, 6);
     await openThread(page, DM_PEER, "dm history 05");
     const seps = page.getByTestId("dm-date-separator");
-    // Yesterday's half and today's (a third label only when the run crosses
-    // midnight as the test runs).
-    await expect.poll(() => seps.count()).toBeGreaterThanOrEqual(2);
-    const labels = await seps.allTextContents();
-    expect(new Set(labels).size, "one break per day").toBe(labels.length);
-    expect(labels[labels.length - 1]).toBe("Today");
+    // Yesterday's half and today's, stamped from local midnight, so this
+    // holds at any time of day (it used to fail just after midnight).
+    await expect.poll(() => seps.allTextContents()).toEqual(["Yesterday", "Today"]);
     // The break sits between the days: above the first of today's DMs, below
     // the last of the earlier day's.
     const order = await page.evaluate(() => {

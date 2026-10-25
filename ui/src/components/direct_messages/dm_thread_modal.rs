@@ -993,7 +993,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                 // taken at render so "Today" stays fresh.
                                 for row in dm_thread_rows(&view_data.messages, |ts| {
                                     crate::util::local_message_date((ts as i64).saturating_mul(1000))
-                                }, crate::util::local_today()) {
+                                }, crate::util::local_today(), unix_now_secs()) {
                                     match row {
                                         DmThreadRow::Day { key, label } => rsx! {
                                             div {
@@ -1511,17 +1511,43 @@ enum DmThreadRow {
     },
 }
 
+/// How far a DM's sender-supplied timestamp may run ahead of this client's
+/// clock before it is clamped for grouping, day breaks and the shown time:
+/// the room's tolerance (`CLOCK_SKEW_TOLERANCE_SECS` in conversation.rs).
+const DM_CLOCK_SKEW_TOLERANCE_SECS: u64 = 60;
+
+/// A DM's timestamp as the thread presents it: the sender's, but no later
+/// than `now_secs` plus the tolerance, so a skewed or hostile clock (up to
+/// `u64::MAX`, which as an `i64` would read as 1970) cannot date or group a
+/// DM in the future. Ordering still uses the sender's value.
+fn shown_dm_secs(timestamp: u64, now_secs: u64) -> u64 {
+    timestamp.min(now_secs.saturating_add(DM_CLOCK_SKEW_TOLERANCE_SECS))
+}
+
+/// Seconds since the epoch, by this client's clock.
+fn unix_now_secs() -> u64 {
+    crate::util::get_current_system_time()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// The thread's groups ([`dm_groups`]) with a day break above each local
 /// calendar day's first group, labelled like the room's
 /// ([`crate::util::date_separator_labels`]). `day_of` maps a DM's timestamp
-/// (seconds) to its local date; injected so the rule is testable natively.
+/// (seconds) to its local date; injected, with `today` and `now_secs`, so the
+/// rule is testable natively. Times are clamped ([`shown_dm_secs`]).
 fn dm_thread_rows(
     messages: &[RenderedDm],
     day_of: impl Fn(u64) -> chrono::NaiveDate,
     today: chrono::NaiveDate,
+    now_secs: u64,
 ) -> Vec<DmThreadRow> {
-    let groups = dm_groups(messages, &day_of);
-    let days: Vec<chrono::NaiveDate> = groups.iter().map(|g| day_of(g[0].timestamp)).collect();
+    let groups = dm_groups(messages, &day_of, now_secs);
+    let days: Vec<chrono::NaiveDate> = groups
+        .iter()
+        .map(|g| day_of(shown_dm_secs(g[0].timestamp, now_secs)))
+        .collect();
     let labels = crate::util::date_separator_labels(&days, today);
     let mut rows = Vec::with_capacity(groups.len() * 2);
     for (idx, (group, label)) in groups.into_iter().zip(labels).enumerate() {
@@ -1543,19 +1569,23 @@ fn dm_thread_rows(
 /// Consecutive DMs from one side, at most five minutes apart and on one
 /// local day (`day_of`), as one group: the same rule the room history groups
 /// by. The thread is in timestamp order; a DM older than the one before it
-/// starts a group rather than joining on a negative gap.
+/// starts a group rather than joining on a negative gap. Times are clamped
+/// ([`shown_dm_secs`]).
 fn dm_groups(
     messages: &[RenderedDm],
     day_of: impl Fn(u64) -> chrono::NaiveDate,
+    now_secs: u64,
 ) -> Vec<Vec<RenderedDm>> {
     const GROUP_WINDOW_SECS: u64 = 5 * 60;
+    let shown = |m: &RenderedDm| shown_dm_secs(m.timestamp, now_secs);
     let mut groups: Vec<Vec<RenderedDm>> = Vec::new();
     for m in messages {
         let joins = groups.last().and_then(|g| g.last()).is_some_and(|last| {
+            let (at, before) = (shown(m), shown(last));
             last.outgoing == m.outgoing
-                && m.timestamp >= last.timestamp
-                && m.timestamp - last.timestamp < GROUP_WINDOW_SECS
-                && day_of(m.timestamp) == day_of(last.timestamp)
+                && at >= before
+                && at - before < GROUP_WINDOW_SECS
+                && day_of(at) == day_of(before)
         });
         if joins {
             groups
@@ -1575,9 +1605,10 @@ fn dm_groups(
 #[component]
 fn DmRow(message: RenderedDm, first: bool, author: String, hue: Option<u16>) -> Element {
     // The full stamp on hover; the row shows the time of day, as a room does.
-    let ts_full = format_local_time(message.timestamp);
-    let ts_label =
-        crate::util::format_utc_as_local_time((message.timestamp as i64).saturating_mul(1000));
+    // Both clamped like the grouping, so a far-future stamp never shows.
+    let shown = shown_dm_secs(message.timestamp, unix_now_secs());
+    let ts_full = format_local_time(shown);
+    let ts_label = crate::util::format_utc_as_local_time((shown as i64).saturating_mul(1000));
     let body = match message.kind {
         BodyKind::Plaintext => {
             // Reuse the room-message linkify path so pasted URLs (notably
@@ -1995,6 +2026,9 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 10, 1).unwrap() + chrono::Days::new(ts / 100_000)
         }
 
+        /// A clock far past every test stamp, so nothing is clamped.
+        const NOW: u64 = 10_000_000;
+
         fn shape(groups: &[Vec<RenderedDm>]) -> Vec<Vec<u64>> {
             groups
                 .iter()
@@ -2006,7 +2040,7 @@ mod tests {
         fn the_five_minute_window_is_exclusive() {
             let base = 1_000;
             for (gap, joins) in [(299, true), (300, false), (301, false)] {
-                let groups = dm_groups(&[dm(false, base), dm(false, base + gap)], day);
+                let groups = dm_groups(&[dm(false, base), dm(false, base + gap)], day, NOW);
                 assert_eq!(groups.len(), if joins { 1 } else { 2 }, "a {gap} s gap");
             }
         }
@@ -2016,26 +2050,57 @@ mod tests {
             let groups = dm_groups(
                 &[dm(false, 10), dm(true, 20), dm(true, 30), dm(false, 40)],
                 day,
+                NOW,
             );
             assert_eq!(shape(&groups), vec![vec![10], vec![20, 30], vec![40]]);
         }
 
         #[test]
         fn an_out_of_order_dm_starts_a_group() {
-            let groups = dm_groups(&[dm(false, 500), dm(false, 400)], day);
+            let groups = dm_groups(&[dm(false, 500), dm(false, 400)], day, NOW);
             assert_eq!(shape(&groups), vec![vec![500], vec![400]]);
         }
 
         #[test]
         fn no_dms_no_groups() {
-            assert!(dm_groups(&[], day).is_empty());
-            assert!(dm_thread_rows(&[], day, day(0)).is_empty());
+            assert!(dm_groups(&[], day, NOW).is_empty());
+            assert!(dm_thread_rows(&[], day, day(0), NOW).is_empty());
         }
 
         #[test]
         fn a_group_never_spans_midnight() {
-            let groups = dm_groups(&[dm(false, 99_990), dm(false, 100_010)], day);
+            let groups = dm_groups(&[dm(false, 99_990), dm(false, 100_010)], day, NOW);
             assert_eq!(groups.len(), 2);
+        }
+
+        /// A sender's clock running ahead is clamped to now plus the
+        /// tolerance, for grouping and the day break, as in a room.
+        #[test]
+        fn a_future_stamp_is_clamped() {
+            let now = 100_010;
+            // An hour ahead joins the DM sent a moment ago, under today.
+            let dms = [dm(false, now - 5), dm(false, now + 3_600)];
+            let rows = dm_thread_rows(&dms, day, day(now), now);
+            assert_eq!(rows.len(), 2, "one break, one group");
+            assert!(matches!(&rows[0], DmThreadRow::Day { label, .. } if label == "Today"));
+            assert!(matches!(&rows[1], DmThreadRow::Group { messages, .. } if messages.len() == 2));
+            // Within the tolerance it is left alone.
+            assert_eq!(shown_dm_secs(now + 60, now), now + 60);
+            assert_eq!(shown_dm_secs(now + 61, now), now + 60);
+        }
+
+        /// A stamp at or past 2^63 is not read as a negative time (1970).
+        #[test]
+        fn a_huge_stamp_is_dated_today() {
+            let now = 100_010;
+            for stamp in [1u64 << 63, u64::MAX] {
+                let rows = dm_thread_rows(&[dm(true, stamp)], day, day(now), now);
+                assert!(
+                    matches!(&rows[0], DmThreadRow::Day { label, .. } if label == "Today"),
+                    "{stamp}"
+                );
+                assert_eq!(shown_dm_secs(stamp, now), now + 60);
+            }
         }
 
         #[test]
@@ -2046,7 +2111,7 @@ mod tests {
                 dm(false, 100_010),
                 dm(false, 100_020),
             ];
-            let rows = dm_thread_rows(&dms, day, day(100_000));
+            let rows = dm_thread_rows(&dms, day, day(100_000), NOW);
             let labels: Vec<String> = rows
                 .iter()
                 .map(|r| match r {

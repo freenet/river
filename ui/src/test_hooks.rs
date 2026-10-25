@@ -94,8 +94,8 @@ pub fn install_test_hooks() {
     );
 
     // `count` DMs from test peer `peer`, labelled like `appendDmsForPeer`'s,
-    // across two days: the first half a minute apart a day ago, the rest a
-    // minute apart ending a minute ago. The thread shows a day break between.
+    // across exactly two local days, yesterday and today, whatever the time
+    // (`two_day_stamp`). The thread shows a day break between.
     set_hook(
         "appendDmsAcrossDaysForPeer",
         Closure::<dyn FnMut(u32, u32)>::new(move |peer: u32, count: u32| {
@@ -443,7 +443,7 @@ enum Delivery {
     Append,
     /// One position from the end — the mid-list insert that grows the history
     /// WITHOUT remounting its last row, which is the case the old
-    /// `onmounted`-on-the-last-bubble scroll trigger could not see.
+    /// `onmounted`-on-the-last-message scroll trigger could not see.
     BeforeLast,
 }
 
@@ -716,12 +716,44 @@ fn append_dm_history(peer: &DmPeer, count: u32) {
 enum DmStamp {
     /// A minute apart, the last one a minute ago.
     History,
-    /// `History`, with the first half a further day earlier.
+    /// The second half between local midnight and now (a minute apart when
+    /// there is room, closer just after midnight), the first half the same
+    /// times a day earlier: today and yesterday at any time of day.
     TwoDays,
     /// Now, or one second after the thread's newest DM if that is later, so
     /// the delivery sorts last even within one second of the previous one
     /// (the thread orders same-second DMs by signature).
     Newest,
+}
+
+/// The `i`th of `count` `DmStamp::TwoDays` timestamps: the second half's
+/// slots fall between local midnight and `now`, and the first half reuses
+/// the same slots a day earlier, so the thread spans exactly yesterday and
+/// today whatever the time (a spec stamped "now less a few minutes" failed
+/// just after midnight).
+fn two_day_stamp(i: u64, count: u64, now: u64) -> u64 {
+    // Local midnight today and yesterday, by the calendar (a DST change
+    // makes a day other than 86,400 s).
+    let midnight_days_ago = |days: u32| {
+        let d = js_sys::Date::new_0();
+        d.set_hours(0);
+        d.set_minutes(0);
+        d.set_seconds(0);
+        d.set_milliseconds(0);
+        d.set_date(d.get_date() - days);
+        (d.get_time() / 1000.0) as u64
+    };
+    let (midnight, yesterday) = (midnight_days_ago(0), midnight_days_ago(1));
+    let half = count / 2;
+    let today = count - half;
+    let slot = if i < half { i } else { i - half };
+    let spacing = (now.saturating_sub(midnight) / (today + 1)).min(60);
+    let at = now.saturating_sub((today - slot) * spacing);
+    if i < half {
+        yesterday + (at - midnight)
+    } else {
+        at
+    }
 }
 
 /// Deliver `texts` from `peer` to self in the current room, in ONE `ROOMS`
@@ -764,10 +796,10 @@ fn deliver_dms(peer: &DmPeer, texts: Vec<String>, stamp: DmStamp) {
             .into_iter()
             .zip(0..)
             .filter_map(|(text, i)| {
-                let mut ts = first + i * step;
-                if matches!(stamp, DmStamp::TwoDays) && i < count / 2 {
-                    ts = ts.saturating_sub(86_400);
-                }
+                let ts = match stamp {
+                    DmStamp::TwoDays => two_day_stamp(i, count, now),
+                    _ => first + i * step,
+                };
                 compose_direct_message(&peer_sk, &self_vk, &room_key, ts, now, text.as_bytes())
                     .inspect_err(|e| {
                         web_sys::console::error_1(&format!("__riverTest DM compose: {e}").into())
