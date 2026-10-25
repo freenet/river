@@ -2,6 +2,9 @@
 
 use dioxus::prelude::*;
 
+// Consumed by the avatar UI of the room redesign; nothing calls it yet.
+#[allow(dead_code)]
+mod avatar_salt;
 mod components;
 mod constants;
 #[cfg(feature = "example-data")]

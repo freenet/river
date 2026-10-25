@@ -370,6 +370,9 @@ const SIGN_PREFIX: &[u8] = b"__sign:";
 /// Must match the bytes built in `get_request_key()` so `send_delegate_request`
 /// and the response router agree on the lookup key.
 const ROOM_SUBSCRIPTION_PREFIX: &[u8] = b"__room_subscription:";
+/// Tracking-key prefix for an in-flight `GetAvatarSalt` request, followed by
+/// the room key and `request_id` (built in `get_request_key()`).
+const AVATAR_SALT_PREFIX: &[u8] = b"__avatar_salt:";
 
 /// Atomic counter for generating unique request IDs
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -448,6 +451,19 @@ pub fn complete_pending_room_subscription_request(
 ) -> bool {
     let mut key_bytes = ROOM_SUBSCRIPTION_PREFIX.to_vec();
     key_bytes.extend_from_slice(room_owner_vk);
+    key_bytes.extend_from_slice(&request_id.to_le_bytes());
+    complete_pending_request_bytes(&key_bytes, response)
+}
+
+/// Complete a pending `GetAvatarSalt` request, correlated on
+/// `(room_key, request_id)` like the signing requests.
+pub fn complete_pending_avatar_salt_request(
+    room_key: &RoomKey,
+    request_id: RequestId,
+    response: ChatDelegateResponseMsg,
+) -> bool {
+    let mut key_bytes = AVATAR_SALT_PREFIX.to_vec();
+    key_bytes.extend_from_slice(room_key);
     key_bytes.extend_from_slice(&request_id.to_le_bytes());
     complete_pending_request_bytes(&key_bytes, response)
 }
@@ -6384,6 +6400,46 @@ mod tests {
         );
     }
 
+    /// The `GetAvatarSalt` waiter must register under the key the response
+    /// handler completes, and two requests for one room must not share a slot.
+    #[test]
+    fn avatar_salt_pending_key_round_trips() {
+        let room_key = sk(13).verifying_key().to_bytes();
+        let request_id: RequestId = 0x0fed_cba9_8765_4321;
+        let key_bytes = get_request_key(&ChatDelegateRequestMsg::GetAvatarSalt {
+            room_key,
+            request_id,
+        });
+        let response = ChatDelegateResponseMsg::AvatarSaltResponse {
+            room_key,
+            request_id,
+            salt: Ok([5u8; 32]),
+        };
+        assert_eq!(response_correlation_base(&response), None);
+
+        let (sender, mut receiver) = oneshot::channel();
+        PENDING_REQUESTS
+            .lock()
+            .unwrap()
+            .insert(key_bytes.clone(), sender);
+        assert!(
+            complete_pending_avatar_salt_request(&room_key, request_id, response),
+            "the response must complete the waiter its request registered"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Some(ChatDelegateResponseMsg::AvatarSaltResponse { .. }))
+        ));
+
+        assert_ne!(
+            key_bytes,
+            get_request_key(&ChatDelegateRequestMsg::GetAvatarSalt {
+                room_key,
+                request_id: request_id + 1,
+            })
+        );
+    }
+
     /// Two concurrent `EnsureRoomSubscription` calls for the same
     /// `room_owner_vk` MUST produce distinct pending-request keys —
     /// otherwise the second caller would clobber the first's sender slot,
@@ -10431,12 +10487,13 @@ pub(crate) fn response_correlation_base(response: &ChatDelegateResponseMsg) -> O
         // re-open exactly the class of bug B1 was: a newly added storage
         // variant would silently correlate to nothing (`completed` stays
         // false, the waiter never fires) instead of failing to compile. These
-        // four correlate through their own registries and never touch
+        // five correlate through their own registries and never touch
         // `PENDING_REQUESTS`.
         ChatDelegateResponseMsg::StoreSigningKeyResponse { .. }
         | ChatDelegateResponseMsg::GetPublicKeyResponse { .. }
         | ChatDelegateResponseMsg::SignResponse { .. }
-        | ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse { .. } => None,
+        | ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse { .. }
+        | ChatDelegateResponseMsg::AvatarSaltResponse { .. } => None,
     }
 }
 
@@ -10526,6 +10583,17 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
         } => {
             let mut key = ROOM_SUBSCRIPTION_PREFIX.to_vec();
             key.extend_from_slice(room_owner_vk);
+            key.extend_from_slice(&request_id.to_le_bytes());
+            key
+        }
+
+        // Routed via `complete_pending_avatar_salt_request`.
+        ChatDelegateRequestMsg::GetAvatarSalt {
+            room_key,
+            request_id,
+        } => {
+            let mut key = AVATAR_SALT_PREFIX.to_vec();
+            key.extend_from_slice(room_key);
             key.extend_from_slice(&request_id.to_le_bytes());
             key
         }
