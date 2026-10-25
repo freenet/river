@@ -2491,19 +2491,20 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
 /// the registry's 10 s response timeout, which bounds the task. (An overall
 /// budget would cancel it mid-request and free the seed lock while a reply is
 /// still in flight, letting that reply complete the session's own seed request
-/// on the same correlation key.) `on_replaced` is told when the seed was
-/// written (the UI recolours). A failure is only logged: the worst case is that
+/// on the same correlation key.) `on_held` is told the seed the successor
+/// holds afterwards: the one written, or the earlier one it already held,
+/// which may be another tab's that this tab has never seen; the UI recolours
+/// if it is not the session's seed. A failure is only logged: the worst case is that
 /// this device's palette changes once. The predecessors are resolved by then,
 /// so a seed whose carry failed is not tried again.
 pub(crate) async fn carry_found_seed_with<C: RiverDelegateChannel>(
     channel: &C,
     successor: &DelegateKey,
     record: crate::avatar_salt::AvatarSeedRecord,
-    on_replaced: impl FnOnce(crate::avatar_salt::AvatarSeedRecord),
+    on_held: impl FnOnce(crate::avatar_salt::AvatarSeedRecord),
 ) {
     match crate::avatar_salt::import_seed(channel, successor, record).await {
-        Ok(crate::avatar_salt::SeedImport::Replaced) => on_replaced(record),
-        Ok(crate::avatar_salt::SeedImport::Kept) => {}
+        Ok(outcome) => on_held(outcome.held(record)),
         Err(e) => warn!("avatar seed not carried to the successor (palette may change): {e}"),
     }
 }
@@ -3339,7 +3340,8 @@ mod tests {
     }
 
     /// One walk, then the seed carry the driver runs after it: the walk's
-    /// report and every seed the carry reported writing.
+    /// report and the seed the carry reported the successor holding (empty if
+    /// the walk found no seed, or the carry failed).
     fn walk_and_carry(
         channel: &impl RiverDelegateChannel,
     ) -> (
@@ -3354,16 +3356,16 @@ mod tests {
             successor_key(),
             &lineage3(),
         ));
-        let mut replaced = Vec::new();
+        let mut held = Vec::new();
         if let Some(record) = found {
             block_on(carry_found_seed_with(
                 channel,
                 &successor_key(),
                 record,
-                |r| replaced.push(r),
+                |r| held.push(r),
             ));
         }
-        (journaled, seam, replaced)
+        (journaled, seam, held)
     }
 
     // ---------------- marker keys ----------------
@@ -4420,9 +4422,13 @@ mod tests {
     #[test]
     fn a_successor_seed_that_is_earlier_stands() {
         let channel = channel_with_seeds(seed(9, 2).encode(), Some(seed(5, 1)));
-        let (_, _, replaced) = walk_and_carry(&channel);
+        let (_, _, held) = walk_and_carry(&channel);
         assert_eq!(stored_seed(&channel), Some(seed(5, 1)));
-        assert!(replaced.is_empty());
+        assert_eq!(
+            held,
+            vec![seed(5, 1)],
+            "the UI is told the seed that stands, which may be one it never saw"
+        );
     }
 
     /// A corrupt seed is skipped: losing a palette must not count as a

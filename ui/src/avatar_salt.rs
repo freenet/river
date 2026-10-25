@@ -264,8 +264,19 @@ pub(crate) async fn load_or_create_seed<C: RiverDelegateChannel>(
 pub(crate) enum SeedImport {
     /// The incoming seed now stands on the successor.
     Replaced,
-    /// The successor's seed precedes (or is) the incoming one, and stands.
-    Kept,
+    /// The successor's seed precedes (or is) the incoming one, and stands. It
+    /// can be one ANOTHER tab stored, which this tab has never seen.
+    Kept(AvatarSeedRecord),
+}
+
+impl SeedImport {
+    /// The seed the successor holds after the import.
+    pub(crate) fn held(&self, incoming: AvatarSeedRecord) -> AvatarSeedRecord {
+        match self {
+            SeedImport::Replaced => incoming,
+            SeedImport::Kept(held) => *held,
+        }
+    }
 }
 
 /// Carry a predecessor's seed onto `successor`: written unless the successor
@@ -277,15 +288,16 @@ pub(crate) async fn import_seed<C: RiverDelegateChannel>(
 ) -> Result<SeedImport, String> {
     let _io = SEED_IO.lock().await;
     let (mut value, mut generation) = read_seed_versioned(channel, successor).await?;
-    let stands = |value: &Option<Vec<u8>>| {
+    // The held seed, if it decodes and the incoming one does not precede it.
+    let standing = |value: &Option<Vec<u8>>| {
         value
             .as_deref()
             .and_then(AvatarSeedRecord::decode)
-            .is_some_and(|held| !incoming.precedes(&held))
+            .filter(|held| !incoming.precedes(held))
     };
     for _ in 0..SEED_CAS_ATTEMPTS {
-        if stands(&value) {
-            return Ok(SeedImport::Kept);
+        if let Some(held) = standing(&value) {
+            return Ok(SeedImport::Kept(held));
         }
         match cas_seed(channel, successor, &incoming, generation).await? {
             CasStoreResult::Stored { .. } => return Ok(SeedImport::Replaced),
@@ -300,8 +312,8 @@ pub(crate) async fn import_seed<C: RiverDelegateChannel>(
         }
     }
     // The last conflict may have stored a seed at least as early: it stands.
-    if stands(&value) {
-        return Ok(SeedImport::Kept);
+    if let Some(held) = standing(&value) {
+        return Ok(SeedImport::Kept(held));
     }
     Err("seed import kept conflicting".to_string())
 }
@@ -428,6 +440,10 @@ impl SeedSession {
     /// The migration walk replaced the stored seed: every room asked for so
     /// far is recoloured under the new one, and a read still running is stale.
     fn replace_seed(&mut self, seed: [u8; 32]) -> Salts {
+        if self.fetch == (SeedFetch::Ready { seed }) {
+            // Already this session's seed: nothing to recolour.
+            return Vec::new();
+        }
         self.fetch = SeedFetch::Ready { seed };
         self.filled.extend(self.wanted.iter().copied());
         Self::salts(&seed, self.filled.iter().copied())
@@ -491,8 +507,10 @@ pub(crate) fn current_delegate_present() {
     }
 }
 
-/// The migration walk stored a predecessor's earlier seed over this
-/// session's: recolour every room under it.
+/// The delegate holds `record` after a migration seed carry: the walk stored
+/// a predecessor's earlier seed, or the delegate already held one (possibly
+/// another tab's) that precedes it. If it is not this session's seed, recolour
+/// every room under it, so the tab shows the palette the delegate holds.
 pub(crate) fn seed_replaced(record: AvatarSeedRecord) {
     store_salts(with_session(|s| s.replace_seed(record.seed)));
 }
@@ -834,7 +852,7 @@ mod tests {
         // The importer: the last conflict holds an earlier seed, which stands.
         let channel = Scripted::new(three_conflicts(record(3, 9).encode()));
         let got = block_on(import_seed(&channel, &successor_key(), record(5, 1)));
-        assert_eq!(got, Ok(SeedImport::Kept));
+        assert_eq!(got, Ok(SeedImport::Kept(record(3, 9))));
     }
 
     #[test]
@@ -898,10 +916,56 @@ mod tests {
             let channel = channel_with(Some(held));
             assert_eq!(
                 block_on(import_seed(&channel, &successor_key(), record(5, 1))),
-                Ok(SeedImport::Kept)
+                Ok(SeedImport::Kept(held))
             );
             assert_eq!(stored(&channel), Some(held));
         }
+    }
+
+    /// Another tab stored an EARLIER seed than the one this tab's session
+    /// created; the walk's carry finds the delegate already holding it (the
+    /// import is `Kept`). This tab must switch to it, or it keeps rendering a
+    /// palette the delegate does not hold until it is reloaded.
+    #[test]
+    fn a_carry_that_finds_another_tabs_earlier_seed_recolours_the_session() {
+        use crate::components::app::freenet_api::delegate_migration::carry_found_seed_with;
+        let _seed_io = seed_io_test_guard();
+        let (s_old, s_found, s_new) = (record(3, 9), record(6, 4), record(8, 2));
+        let room = [0x5A; 32];
+        let mut session = SeedSession::default();
+        assert!(session.want(room, 1) == Want::Fetch(1));
+        assert!(matches!(
+            session.after_attempt(1, 1, Some(s_new.seed)),
+            AfterAttempt::Fill(_)
+        ));
+
+        // The delegate holds the other tab's S_old; the walk found a later one.
+        let channel = channel_with(Some(s_old));
+        let mut salts = None;
+        block_on(carry_found_seed_with(
+            &channel,
+            &successor_key(),
+            s_found,
+            |held| salts = Some(session.replace_seed(held.seed)),
+        ));
+
+        assert_eq!(stored(&channel), Some(s_old), "the earlier seed stands");
+        assert!(session.fetch == SeedFetch::Ready { seed: s_old.seed });
+        assert_eq!(salts, Some(vec![(room, room_salt(&s_old.seed, &room))]));
+    }
+
+    /// A carry that finds the session's own seed changes nothing on screen.
+    #[test]
+    fn a_carry_that_confirms_the_session_seed_recolours_nothing() {
+        let mut session = SeedSession::default();
+        session.replace_seed([4; 32]);
+        assert!(matches!(session.want([1; 32], 1), Want::Fill(_)));
+        assert!(session.replace_seed([4; 32]).is_empty());
+        assert_eq!(
+            session.replace_seed([5; 32]).len(),
+            1,
+            "a different seed recolours"
+        );
     }
 
     #[test]

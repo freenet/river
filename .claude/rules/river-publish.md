@@ -371,7 +371,12 @@ ONLY, and best-effort:
   `a_slow_seed_import_holds_neither_the_gate_nor_the_journal_lock`. The worst
   case is a palette that changes once;
 - earliest `created_at_ms` wins (ties by seed bytes), so the seed the UI
-  creates on the first load after a re-key gives way to the user's original;
+  creates on the first load after a re-key gives way to the user's original.
+  The carry reports the seed the delegate holds AFTERWARDS, whether it wrote
+  one or kept an earlier one (which can be another tab's that this tab has
+  never seen; `SeedImport::Kept` carries it), and the tab recolours if that is
+  not its session's seed, so a tab never keeps a palette the delegate does
+  not hold;
 - an undecodable seed is skipped (`Unrecognized`), never rejected;
 - `RIVER_IMPORT_REVISION` was NOT raised for it: before this change the key
   classified `Unrecognized` (skipped, not rejected), and no shipped generation

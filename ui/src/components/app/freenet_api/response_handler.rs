@@ -772,13 +772,17 @@ impl ResponseHandler {
                             }
                         }
                         _ => {
-                            warn!("Unhandled delegate response: {:?}", v);
+                            warn!(
+                                "Unhandled delegate response: {}",
+                                outbound_delegate_msg_kind(v)
+                            );
                         }
                     }
                 }
             }
             _ => {
-                warn!("Unhandled API response: {:?}", response);
+                // `Display`: the kind and contract key, never the state.
+                warn!("Unhandled API response: {}", response);
             }
         }
         Ok(flags)
@@ -2530,7 +2534,14 @@ fn delegate_storage_key_str(key: &ChatDelegateKey) -> String {
             if s.len() <= MAX {
                 s.to_string()
             } else {
-                format!("{}...({} chars)", &s[..MAX], s.len())
+                // Cut on a char boundary at or below MAX bytes: slicing a
+                // multi-byte char in half panics, and this runs on every
+                // request in a debug build.
+                let mut cut = MAX;
+                while !s.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}...({} bytes)", &s[..cut], s.len())
             }
         }
         _ => format!("<{} bytes>", key.as_bytes().len()),
@@ -2765,6 +2776,23 @@ pub(crate) fn describe_delegate_request(r: &ChatDelegateRequestMsg) -> String {
     }
 }
 
+/// The variant name of an outbound delegate message, for logs. Its `Debug`
+/// prints the payload: an application message's bytes, or a delegate's whole
+/// `DelegateContext` (`ContextUpdated`). Exhaustive, so a new variant is a
+/// compile error here rather than a fallback to `Debug`.
+pub(crate) fn outbound_delegate_msg_kind(m: &OutboundDelegateMsg) -> &'static str {
+    match m {
+        OutboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
+        OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput",
+        OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated",
+        OutboundDelegateMsg::GetContractRequest(_) => "GetContractRequest",
+        OutboundDelegateMsg::PutContractRequest(_) => "PutContractRequest",
+        OutboundDelegateMsg::UpdateContractRequest(_) => "UpdateContractRequest",
+        OutboundDelegateMsg::SubscribeContractRequest(_) => "SubscribeContractRequest",
+        OutboundDelegateMsg::SendDelegateMessage(_) => "SendDelegateMessage",
+    }
+}
+
 /// Short fingerprint of a room key (a 32-byte verifying key) for logs.
 fn room_key_fp(room_key: &river_core::chat_delegate::RoomKey) -> String {
     let head: String = room_key
@@ -2909,6 +2937,243 @@ mod tests {
                 assert!(!line.contains(&r), "{line:?} leaks {r}");
             }
         }
+    }
+
+    /// A key over the 128-byte cap with a multi-byte char straddling the cut
+    /// must not panic (a byte slice there splits the char), and is cut on a
+    /// char boundary at or below the cap.
+    #[test]
+    fn a_long_non_ascii_key_is_cut_on_a_char_boundary() {
+        // 127 ASCII bytes, then 2-byte chars: byte 128 falls inside one.
+        let text = format!("{}{}", "k".repeat(127), "é".repeat(20));
+        assert!(!text.is_char_boundary(128));
+        let line =
+            super::delegate_storage_key_str(&ChatDelegateKey::new(text.clone().into_bytes()));
+        assert!(line.starts_with(&"k".repeat(127)), "{line}");
+        assert!(
+            line.ends_with(&format!("...({} bytes)", text.len())),
+            "{line}"
+        );
+        // And through the request summary, which runs on every request.
+        let request = river_core::chat_delegate::ChatDelegateRequestMsg::GetRequest {
+            key: ChatDelegateKey::new(text.into_bytes()),
+        };
+        assert!(super::describe_delegate_request(&request).starts_with("GetRequest"));
+    }
+
+    // --- no Debug of a delegate message anywhere in production code ---
+
+    /// Names production code binds delegate messages to. The scan below keys on
+    /// them because a text scan cannot see types.
+    const MESSAGE_BINDINGS: [&str; 12] = [
+        "request", "req", "response", "resp", "reply", "other", "v", "msg", "outbound", "app_msg",
+        "value", "values",
+    ];
+
+    /// Debug-printed message bindings that are NOT delegate messages, each
+    /// with the reason, as `(file suffix, binding, a snippet of the macro)`.
+    const NOT_DELEGATE_MESSAGES: [(&str, &str, &str); 2] = [
+        // A `JournalAnswer` from the migration journal: an enum of outcomes.
+        ("delegate_migration.rs", "other", "unknown journal answer"),
+        // A rooms-load state name passed in from a browser test.
+        ("test_hooks.rs", "other", "unknown rooms load state"),
+    ];
+
+    /// `src` with every `#[cfg(test)] mod … { … }` block and every comment
+    /// removed (braces counted in code only, via `util::lex`).
+    fn production_code(src: &str) -> String {
+        let kinds = crate::util::lex(src);
+        let mut keep = vec![true; src.len()];
+        let mut from = 0;
+        while let Some(at) = src[from..].find("#[cfg(test)]").map(|i| from + i) {
+            from = at + 1;
+            if kinds[at] != crate::util::Lexeme::Code {
+                continue;
+            }
+            let Some(open) = src[at..].find('{').map(|i| at + i) else {
+                break;
+            };
+            if !src[at..open].contains("mod ") {
+                continue;
+            }
+            let mut depth = 0i32;
+            let mut end = src.len();
+            for (i, c) in src[open..].char_indices() {
+                let at = open + i;
+                // `util::lex` knows only the `'"'` char literal; a `'{'` or
+                // `'}'` (one sits in this file's tests) is not a brace either.
+                let char_literal = at > 0
+                    && src.as_bytes()[at - 1] == b'\''
+                    && src.as_bytes().get(at + 1) == Some(&b'\'');
+                if kinds[at] != crate::util::Lexeme::Code || char_literal {
+                    continue;
+                }
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            keep[at..end].iter_mut().for_each(|k| *k = false);
+            from = end;
+        }
+        let kept: String = src
+            .char_indices()
+            .filter(|(i, _)| keep[*i])
+            .map(|(_, c)| c)
+            .collect();
+        crate::util::strip_comments(&kept)
+    }
+
+    /// The top-level, comma-separated arguments of a macro call whose `(` has
+    /// just been consumed, ending at its matching `)`.
+    fn macro_args(rest: &str) -> Vec<String> {
+        let (mut args, mut cur, mut depth, mut in_str) = (Vec::new(), String::new(), 0i32, false);
+        let mut chars = rest.chars();
+        while let Some(c) = chars.next() {
+            if in_str {
+                cur.push(c);
+                if c == '\\' {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                    }
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_str = true;
+                    cur.push(c);
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    cur.push(c);
+                }
+                ')' | ']' | '}' if depth == 0 => break,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    cur.push(c);
+                }
+                ',' if depth == 0 => args.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            }
+        }
+        args.push(cur);
+        args.into_iter().map(|a| a.trim().to_string()).collect()
+    }
+
+    /// Every Debug placeholder in `code` whose argument is a bare
+    /// [`MESSAGE_BINDINGS`] name, as `(binding, snippet)`.
+    fn debug_printed_bindings(code: &str) -> Vec<(String, String)> {
+        const MACROS: [&str; 10] = [
+            "debug!(",
+            "info!(",
+            "warn!(",
+            "error!(",
+            "trace!(",
+            "format!(",
+            "panic!(",
+            "write!(",
+            "writeln!(",
+            "println!(",
+        ];
+        let mut found = Vec::new();
+        for m in MACROS {
+            let mut from = 0;
+            while let Some(at) = code[from..].find(m).map(|i| from + i) {
+                from = at + m.len();
+                let args = macro_args(&code[from..]);
+                let Some(fmt_at) = args.iter().position(|a| a.starts_with('"')) else {
+                    continue;
+                };
+                let fmt = args[fmt_at].replace("{{", "").replace("}}", "");
+                let rest = &args[fmt_at + 1..];
+                let mut positional = 0;
+                let mut cursor = fmt.as_str();
+                while let Some(open) = cursor.find('{') {
+                    let Some(close) = cursor[open..].find('}') else {
+                        break;
+                    };
+                    let spec = &cursor[open + 1..open + close];
+                    cursor = &cursor[open + close + 1..];
+                    let (name, format) = spec.split_once(':').unwrap_or((spec, ""));
+                    let arg = if name.is_empty() {
+                        positional += 1;
+                        rest.get(positional - 1).cloned().unwrap_or_default()
+                    } else if let Ok(n) = name.parse::<usize>() {
+                        rest.get(n).cloned().unwrap_or_default()
+                    } else {
+                        name.to_string()
+                    };
+                    let bare = arg.trim_start_matches('&').trim();
+                    if format.contains('?') && MESSAGE_BINDINGS.contains(&bare) {
+                        let snippet: String = code[at..].chars().take(100).collect();
+                        found.push((bare.to_string(), snippet));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// No delegate message (`ChatDelegateRequestMsg`, `ChatDelegateResponseMsg`,
+    /// `OutboundDelegateMsg`) is Debug-printed in production code: their `Debug`
+    /// prints stored values, signing keys, the avatar seed and delegate
+    /// contexts. Use `describe_delegate_request`, `describe_delegate_response`
+    /// or `outbound_delegate_msg_kind`. A text scan cannot see types, so this
+    /// keys on the names such values are bound to; a Debug print of one of
+    /// those names that is NOT a delegate message goes in
+    /// `NOT_DELEGATE_MESSAGES` with its reason.
+    #[test]
+    fn no_delegate_message_is_debug_printed() {
+        use crate::util::source_scan::rust_files;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offending = Vec::new();
+        let mut files = 0;
+        for path in rust_files(&root) {
+            let name = path.display().to_string();
+            let code = production_code(&std::fs::read_to_string(&path).unwrap());
+            files += 1;
+            for (binding, snippet) in debug_printed_bindings(&code) {
+                let allowed = NOT_DELEGATE_MESSAGES.iter().any(|(file, b, s)| {
+                    name.ends_with(file) && *b == binding && snippet.contains(s)
+                });
+                if !allowed {
+                    offending.push(format!("{name}: {binding} in `{snippet}`"));
+                }
+            }
+        }
+        assert!(files > 50, "scanned only {files} files");
+        assert!(offending.is_empty(), "{offending:#?}");
+    }
+
+    /// The scan is not vacuous: the two prints this replaced, restored in a
+    /// copy, are caught, and a test module's are not.
+    #[test]
+    fn the_debug_print_scan_catches_the_old_prints() {
+        let real = production_code(include_str!("response_handler.rs"));
+        assert!(debug_printed_bindings(&real).is_empty());
+        let old_warn = real.replacen("outbound_delegate_msg_kind(v)", "format!(\"{:?}\", v)", 1);
+        assert_ne!(old_warn, real, "the fixture call moved");
+        assert_eq!(debug_printed_bindings(&old_warn).len(), 1);
+        let inline = "fn f() { debug!(\"Value #{} is: {:?}\", i, v); }";
+        assert_eq!(debug_printed_bindings(inline).len(), 1);
+        let in_tests = "#[cfg(test)]\nmod tests { fn f() { s.find('}'); debug!(\"{:?}\", v); } }";
+        assert!(debug_printed_bindings(&production_code(in_tests)).is_empty());
+        let after_tests = format!("{in_tests}\nfn g() {{ warn!(\"{{:?}}\", resp); }}");
+        assert_eq!(
+            debug_printed_bindings(&production_code(&after_tests)).len(),
+            1,
+            "production code after a test module is still scanned"
+        );
     }
 
     /// The two lines that log EVERY delegate request and response in a dev
