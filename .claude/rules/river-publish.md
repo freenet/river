@@ -350,6 +350,31 @@ Missing any of these leaves the new key orphaned across delegate rebuilds —
 exactly the bug the per-room `ListRequest` legacy probe (freenet/river#345) was
 added to prevent.
 
+**The deliberate exception: `river_avatar_colour_seed_v1`** (the per-device
+avatar colour seed, `ui/src/avatar_salt.rs`). It is carried by the crate walk
+ONLY, and best-effort:
+- no fixed probe in either importer: a probe is one more GET per pending
+  generation on every walk, against the node's shared 100-request delegate
+  admission queue (freenet/river#809), for a key no shipped generation before
+  this change holds. A predecessor whose index reads corrupt loses its seed;
+- the walk only remembers the earliest seed it sees (`RecoveredItem::AvatarSeed`
+  answers `AlreadyAuthoritative`) and `walk_with` writes it once, AFTER every
+  predecessor's real data, ignoring failure. A seed can never keep a
+  predecessor open, interrupt the journal, or block the identity-import gate;
+  the worst case is a palette that changes once;
+- earliest `created_at_ms` wins (ties by seed bytes), so the seed the UI
+  creates on the first load after a re-key gives way to the user's original;
+- an undecodable seed is skipped (`Unrecognized`), never rejected;
+- `RIVER_IMPORT_REVISION` was NOT raised for it: before this change the key
+  classified `Unrecognized` (skipped, not rejected), and no shipped generation
+  holds one, so a bump would only force re-walks;
+- the sweep and the post-resolve top-up do not carry it, and identity export
+  does not either: the seed, and so the palette, is per device.
+
+All seed requests in a tab go through one mutex (`SEED_IO`): the session's read
+and the walk's import ask the same delegate for the same key, which is one slot
+in the single-waiter `PENDING_REQUESTS` registry.
+
 ## The crate walk and the completeness journal (freenet-migrate 0.7)
 
 There are **two** importers running side by side, and since freenet/river#763

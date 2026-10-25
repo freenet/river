@@ -220,6 +220,15 @@ Note the measurement must use the co-build: building `-p room-contract` alone
 resolves river-core with different features and gives a different hash even
 on an unmodified tree.
 
+## Keys the migration carries that are not room data
+
+`river_avatar_colour_seed_v1` (the per-device avatar colour seed) is carried
+from a predecessor by the journaled walk only, last and best-effort, earliest
+seed wins, undecodable skipped. It has no fixed probe and did not raise
+`RIVER_IMPORT_REVISION`; see "Adding new storage keys" in
+`.claude/rules/river-publish.md` for why. It is stored by the UI in the
+existing KV store, so it needs no delegate change and no migration entry.
+
 ## Technical Details
 
 - **Delegate key formula**: `BLAKE3(BLAKE3(wasm) || params)` — both steps use BLAKE3
