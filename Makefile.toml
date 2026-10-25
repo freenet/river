@@ -147,10 +147,31 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-to
 [tasks.build-ui]
 description = "Build the Dioxus UI"
 # build-chat-delegate is required because UI includes delegate WASM via include_bytes!
-dependencies = ["build-chat-delegate", "build-tailwind", "uncomment-base-path"]
+dependencies = ["check-dx-version", "build-chat-delegate", "build-tailwind", "uncomment-base-path"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
+
+[tasks.check-dx-version]
+description = "Fail unless dx is the dioxus version Cargo.lock resolves"
+# dx must match the dioxus crate exactly. A mismatched dx prints "dx and dioxus
+# versions are incompatible" and then builds anyway, so a mismatched build can
+# be published or tested without anything failing (River was published from a
+# dx 0.7.3 build against dioxus 0.7.9 on 2026-09-29). On nova a stale
+# /opt/rust/bin/dx sits ahead of ~/.cargo/bin on PATH.
+script = '''
+locked=$(awk '/^name = "dioxus"$/ { getline; gsub(/version = |"/, ""); print }' Cargo.lock)
+if [ "$(printf '%s\n' "$locked" | grep -c .)" != 1 ]; then
+    echo "error: expected exactly one dioxus entry in Cargo.lock, found: ${locked:-none}" >&2
+    exit 1
+fi
+installed=$(dx --version 2>/dev/null | awk '{ print $2 }')
+if [ "$installed" != "$locked" ]; then
+    echo "error: dx is ${installed:-missing} ($(command -v dx)) but Cargo.lock resolves dioxus $locked." >&2
+    echo "Install the matching CLI with 'cargo binstall -y dioxus-cli@$locked' and put it first on PATH." >&2
+    exit 1
+fi
+'''
 
 [tasks.uncomment-base-path]
 private = true
@@ -264,7 +285,7 @@ env = { UI_FEATURES = "example-data" }
 # build product). Without it `dx build` fails on a clean tree with
 # "Asset at /assets/styles.css doesn't exist" — CI only gets away with omitting
 # it here because build.yml runs `npm run build:css` as an explicit step.
-dependencies = ["build-chat-delegate", "build-tailwind"]
+dependencies = ["check-dx-version", "build-chat-delegate", "build-tailwind"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -274,7 +295,7 @@ description = "Build the Dioxus UI without Freenet sync"
 env = { UI_FEATURES = "no-sync" }
 # build-chat-delegate is required because UI includes delegate WASM via include_bytes!
 # build-tailwind is required — see the note on build-ui-example.
-dependencies = ["build-chat-delegate", "build-tailwind"]
+dependencies = ["check-dx-version", "build-chat-delegate", "build-tailwind"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -297,7 +318,7 @@ env = { UI_FEATURES = "example-data,no-sync" }
 # is the established trigger (see compress-webapp-test) that makes dx rebuild
 # rather than trust its incremental decision. Pinned by
 # scripts/tests/playwright-bundle-provenance-test.sh.
-dependencies = ["build-chat-delegate", "build-tailwind", "clean-ui-example-output", "touch-ui-files"]
+dependencies = ["check-dx-version", "build-chat-delegate", "build-tailwind", "clean-ui-example-output", "touch-ui-files"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -907,7 +928,7 @@ dependencies = ["build-ui-with-cleanup", "build-web-container"]
 description = "Development build with example data"
 env = { UI_FEATURES = "example-data", BUILD_PROFILE = "dev" }
 # build-chat-delegate is required because UI includes delegate WASM via include_bytes!
-dependencies = ["build-chat-delegate", "build-tailwind"]
+dependencies = ["check-dx-version", "build-chat-delegate", "build-tailwind"]
 command = "dx"
 args = ["serve", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -927,7 +948,7 @@ env = { UI_FEATURES = "" }
 # build-chat-delegate is required because UI includes delegate WASM via include_bytes!
 # build-tailwind is required — see the note on build-ui-example. (dev-example
 # already had it; this task was the odd one out.)
-dependencies = ["build-chat-delegate", "build-tailwind"]
+dependencies = ["check-dx-version", "build-chat-delegate", "build-tailwind"]
 command = "dx"
 args = ["serve"]
 cwd = "./ui"
