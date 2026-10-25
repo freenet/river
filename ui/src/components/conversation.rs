@@ -2539,10 +2539,12 @@ pub fn Conversation() -> Element {
                         }
                     };
                     rsx! {
-                        div { class: "flex-shrink-0 px-3 md:px-6 py-3 border-b border-border bg-panel",
+                        // Full width, left-aligned like the rows below it: no
+                        // centred column leaving a void either side.
+                        div { class: "flex-shrink-0 px-3 md:pl-5 md:pr-3 py-3 border-b border-border bg-panel",
                             div {
                                 "data-testid": "room-header-row",
-                                class: "flex items-center justify-between gap-2 md:gap-3 max-w-4xl mx-auto",
+                                class: "flex items-center justify-between gap-2 md:gap-3",
                                 // Mobile: hamburger to open rooms panel. `mr-1` plus the row
                                 // `gap-2` keep this switch-rooms button clear of the room-name
                                 // tap target so a touch user does not open the room-details

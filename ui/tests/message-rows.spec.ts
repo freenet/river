@@ -183,6 +183,51 @@ test.describe("Message rows", () => {
   });
 });
 
+// The design critique's first complaint: a narrow column centred in a broad
+// empty panel. On a wide window nothing centres: rows start at the panel's
+// edge and span it, the header and composer share one left edge near it, and
+// only the message text keeps its measure.
+test.describe("at 1920px", () => {
+  test.use({ viewport: { width: 1920, height: 1080 } });
+
+  test("the conversation fills its panel, left-aligned, and text keeps its measure", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await deliver(page, "A wide-window line that keeps going ".repeat(12) + "to the wide end");
+    const row = page.getByTestId("message-row").filter({ hasText: "to the wide end" });
+    const m = await row.evaluate((el) => {
+      const scroller = document.getElementById("chat-scroll-container")!;
+      const s = scroller.getBoundingClientRect();
+      const body = el.querySelector('[data-testid="message-body"]')!;
+      const probe = document.createElement("div");
+      probe.style.width = "76ch";
+      body.appendChild(probe);
+      const measure = probe.getBoundingClientRect().width;
+      probe.remove();
+      const left = (sel: string) => document.querySelector(sel)!.getBoundingClientRect().left;
+      return {
+        rowLeft: el.getBoundingClientRect().left - s.left,
+        rowWidth: el.getBoundingClientRect().width,
+        scrollerInner: scroller.clientWidth,
+        bodyWidth: body.getBoundingClientRect().width,
+        contentWidth: el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect().width,
+        measure,
+        header: left('[data-testid="room-header-row"]') - s.left,
+        // The composer's content edge: its padded inner wrapper.
+        composer: (() => {
+          const inner = document.querySelector('[data-testid="message-composer"] > div')!;
+          return inner.getBoundingClientRect().left + parseFloat(getComputedStyle(inner).paddingLeft) - s.left;
+        })(),
+      };
+    });
+    expect(m.rowLeft, "the row starts at the panel's edge: no centring gutter").toBeCloseTo(0, 0);
+    expect(m.rowWidth, "the row spans the panel").toBeCloseTo(m.scrollerInner, 0);
+    expect(m.contentWidth, "premise: the column is far wider than the measure").toBeGreaterThan(m.measure + 200);
+    expect(m.bodyWidth, "the text keeps its 76ch measure").toBeCloseTo(m.measure, 0);
+    expect(m.header, "the header sits at the panel's left padding").toBeLessThanOrEqual(24);
+    expect(m.composer, "the composer shares the header's left edge").toBeCloseTo(m.header, 0);
+  });
+});
+
 test.describe("Message headers", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
