@@ -1217,25 +1217,51 @@ mod accent_token_audit {
     /// `bg-error` dots), which are checked for contrast in both themes. Raw
     /// shades were picked for one theme and failed the other (light yellow on
     /// light yellow in the leave-room confirmation).
+    ///
+    /// Any `<hue>-<shade>` pair of hyphen segments counts, wherever it sits,
+    /// so multi-part utilities (`border-l-yellow-500`, `ring-offset-red-500`),
+    /// v4 variable forms (`bg-(--color-red-500)`, `bg-[var(--color-red-500)]`)
+    /// and CSS `var(--color-red-500)` are all caught; and the status hexes
+    /// in [`OLD_STATUS_HEX`], outside the token definitions themselves.
     fn raw_status_colours(src: &str) -> Vec<String> {
         const HUES: [&str; 9] = [
             "red", "yellow", "amber", "orange", "green", "emerald", "lime", "rose", "pink",
         ];
         let mut found = Vec::new();
         for raw in src.split(|c: char| !(c.is_ascii_alphanumeric() || "-_:/[]!".contains(c))) {
-            // The utility after any variant (`hover:`, `dark:`, `focus:`).
-            let utility = raw.rsplit(':').next().unwrap_or(raw).trim_matches('!');
-            let mut parts = utility.splitn(3, '-');
-            let (Some(_prop), Some(hue), Some(shade)) = (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            if HUES.contains(&hue) && shade.starts_with(|c: char| c.is_ascii_digit()) {
+            let segments: Vec<&str> = raw.split(['-', ':', '[', ']', '/', '!']).collect();
+            let named = segments.windows(2).any(|pair| {
+                HUES.contains(&pair[0]) && pair[1].starts_with(|c: char| c.is_ascii_digit())
+            });
+            if named {
                 found.push(raw.to_string());
+            }
+        }
+        // Raw status hexes, other than a token's own definition.
+        for line in src.lines() {
+            if line.trim_start().starts_with("--color-") {
+                continue;
+            }
+            let lower = line.to_lowercase();
+            for hex in OLD_STATUS_HEX {
+                for (at, _) in lower.match_indices(hex) {
+                    let next = lower[at + hex.len()..].chars().next();
+                    if !next.is_some_and(|c| c.is_ascii_hexdigit()) {
+                        found.push(hex.to_string());
+                    }
+                }
             }
         }
         found
     }
+
+    /// Tailwind's red, yellow, amber, orange, green and emerald shades as
+    /// hexes: a status colour written by value instead of by token.
+    const OLD_STATUS_HEX: [&str; 21] = [
+        "#fca5a5", "#f87171", "#ef4444", "#dc2626", "#b91c1c", "#fde047", "#facc15", "#eab308",
+        "#ca8a04", "#fbbf24", "#f59e0b", "#d97706", "#fb923c", "#f97316", "#86efac", "#4ade80",
+        "#22c55e", "#16a34a", "#34d399", "#10b981", "#059669",
+    ];
 
     /// Solid fills reviewed and kept, as (file suffix, what the scan
     /// reports, exactly how many times, why). The count is exact, so a new
@@ -1432,6 +1458,18 @@ mod accent_token_audit {
             r#"class: "text-emerald-400""#,
             r#"class: "bg-green-500""#,
             "x !text-orange-300 y",
+            // Multi-part utilities.
+            r#"class: "border-l-yellow-500""#,
+            r#"class: "border-t-red-500""#,
+            r#"class: "ring-offset-red-500""#,
+            // v4 variable forms, and CSS custom properties.
+            "x bg-(--color-red-500) y",
+            "x bg-[var(--color-red-500)] y",
+            "color: var(--color-amber-400);",
+            // Raw status hexes, in a class or a style.
+            "x text-[#ef4444] y",
+            r#"style: "color:#dc2626""#,
+            ".x { background: #F59E0B; }",
         ] {
             assert!(
                 !raw_status_colours(src).is_empty(),
@@ -1443,6 +1481,9 @@ mod accent_token_audit {
             r#"class: "bg-warning-bg border-l-[3px] border-warning text-warning-text""#,
             r#"class: "text-success bg-success bg-error bg-warning""#,
             r#"class: "text-text-muted bg-red-ish""#,
+            // A token's own definition, and a longer hex that merely starts alike.
+            "  --color-error: #ef4444;",
+            "x text-[#ef44441a] y",
         ] {
             assert!(
                 raw_status_colours(src).is_empty(),
