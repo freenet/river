@@ -169,6 +169,18 @@ Known limitations:
   through a partial range does not advance it. Every mark-read path is
   bounded by the message published in `NEWEST_SEEN`.
 
+The app root's width is the viewport's (`.app-root { width: 100vw }` in
+`tailwind.css`), not just `position: fixed; inset: 0`. Narrowing the window,
+Chromium lays the page out once with the new media queries and `vw` units but
+the old width for the fixed root's `inset: 0`, so the chat column is briefly
+wider. Full-width rows rewrap to it, the history gets shorter for that one
+layout, the max-scroll clamp lowers `scrollTop` by 20-80px, and the end hold
+reads that as the reader scrolling up and releases (#791; it reproduces with
+a real window resize, not only in Playwright). `100vw` equals the viewport
+only because nothing outside the root scrolls, which is why `html, body` are
+`overflow: hidden`: a page scrollbar would make `100vw` wider than the root's
+box. Do not drop either rule in a layout edit.
+
 Browser scroll anchoring is disabled on the room scroller, and a browser test
 asserts the computed `overflow-anchor: none`. Custom position corrections
 remain in place. Known limitation: late images and bulk removal above a parked

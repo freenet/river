@@ -130,9 +130,13 @@
 }
 
 /* Base styles */
+/* `overflow: hidden`: the fixed `.app-root` is the whole page and nothing
+   outside it scrolls, which is what its `width: 100vw` relies on (see
+   .claude/rules/history-scrolling.md). */
 html, body {
   height: 100%;
   margin: 0;
+  overflow: hidden;
   font-family: var(--font-sans);
   background-color: var(--color-bg);
   color: var(--color-text);
