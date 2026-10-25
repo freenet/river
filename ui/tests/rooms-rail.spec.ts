@@ -75,3 +75,18 @@ test.describe("Rooms rail", () => {
     await expect(page.getByRole("heading", { name: "Direct messages", exact: true })).toBeVisible();
   });
 });
+
+test.describe("Rooms rail on a phone", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  test("the back header shows the brand, and 'Rooms' only as the section heading", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).first().click();
+    const rail = page.getByTestId("rooms-rail");
+    await expect(rail.getByTestId("rail-brand-mobile")).toContainText("River");
+    await expect(rail.getByTestId("rail-brand-mobile").locator("img")).toBeVisible();
+    await expect(rail.getByRole("heading", { name: "Rooms", exact: true })).toBeVisible();
+    await expect(rail.getByText("Rooms", { exact: true })).toHaveCount(1);
+  });
+});

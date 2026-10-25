@@ -15,7 +15,7 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::components::back_to_chat::BackToChatButton;
 use crate::components::icons::{
-    line_icon, IMPORT_ICON_PATH, JOIN_ICON_PATH, LOCK_ICON_PATH, PLUS_ICON_PATH,
+    line_icon, IMPORT_ICON_PATH, JOIN_ICON_PATH, LOCK_ICON_PATH, PLUS_ICON_PATH, REORDER_ICON_PATH,
 };
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
@@ -415,7 +415,16 @@ pub fn RoomList() -> Element {
                     icon_size: 16,
                     testid: "rooms-back-to-chat-button",
                 }
-                span { class: "ml-2 text-sm font-semibold text-text", "Rooms" }
+                // The brand, as the desktop rail shows it; the section
+                // heading below already says "Rooms".
+                div { "data-testid": "rail-brand-mobile", class: "ml-2 flex items-center gap-2.5",
+                    img {
+                        class: "w-[30px] h-[30px]",
+                        src: asset!("/assets/river_logo.svg"),
+                        alt: ""
+                    }
+                    span { class: "text-[18px] font-bold tracking-[-0.01em] text-text", "River" }
+                }
             }
             // Brand row (desktop): the dolphin and the wordmark.
             div {
@@ -464,7 +473,7 @@ pub fn RoomList() -> Element {
                                     reorder_mode.set(next);
                                 });
                             },
-                            Icon { width: 14, height: 14, icon: FaArrowsUpDown }
+                            {line_icon(REORDER_ICON_PATH, 15)}
                         }
                     }
                     button {

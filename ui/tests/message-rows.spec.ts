@@ -227,6 +227,23 @@ test.describe("at 1920px", () => {
     expect(m.bodyWidth, "the text keeps its 76ch measure").toBeCloseTo(m.measure, 0);
     expect(m.header, "the header sits at the panel's left padding").toBeLessThanOrEqual(24);
     expect(m.composer, "the composer shares the header's left edge").toBeCloseTo(m.header, 0);
+
+    // A date separator is centred over the text column (gutter + measure),
+    // not the whole panel, so its label stays near the text.
+    await callRiverTest(page, "appendJoinEvents", 1);
+    const sep = page.getByTestId("date-separator").last();
+    await expect(sep).toBeAttached();
+    const d = await sep.evaluate((el, measure) => {
+      const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+      const r = el.getBoundingClientRect();
+      // The label is the text node between the two rules.
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const label = range.getBoundingClientRect();
+      return { right: r.right - s.left, labelCentre: (label.left + label.right) / 2 - s.left, textEnd: 60 + (measure as number) };
+    }, m.measure);
+    expect(d.right, "the separator ends near the text's measure").toBeLessThanOrEqual(d.textEnd + 2);
+    expect(d.labelCentre, "its label sits over the text column").toBeLessThan(d.textEnd);
   });
 });
 

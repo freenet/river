@@ -251,12 +251,16 @@
     align-items: center;
 }
 
-/* Date separators: a hairline with a centred label. */
+/* Date separators: a hairline with a label, centred over the text column
+ * (the avatar gutter plus the body's 76ch measure), not over the whole panel,
+ * so on a wide window the label stays near the text. 76ch of 15px body text
+ * is 95ch at this 12px size. */
 .msg-day {
     display: flex;
     align-items: center;
     gap: 14px;
     margin: 26px 24px 4px;
+    max-width: calc(var(--msg-gutter, 60px) - 24px + 95ch);
     font-size: 12px;
     font-weight: 700;
     color: var(--color-text-muted);
