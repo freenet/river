@@ -1187,7 +1187,8 @@ test.describe("Message group renders", () => {
     await selectRoom(page, "Team Chat Room");
     await nextFrames(page);
     await page.waitForTimeout(300);
-    // Counted after the take, so a group mounted in between is not missed.
+    // The wait above lets the opening settle, so no group mounts or unmounts
+    // between these two reads.
     const renders = await callRiverTest(page, "takeMessageGroupRenders");
     const groups = await groupCount(page);
     expect(groups, "premise: the room has enough groups to tell one render from several").toBeGreaterThanOrEqual(5);
@@ -1221,9 +1222,10 @@ test.describe("Message group renders", () => {
     expect(renders).toBeLessThanOrEqual(2);
   });
 
-  // A group skipped by a render still holds the handlers from its last
-  // render. They are `use_callback`s, so they run the latest body: a reaction
-  // on an older message after an arrival still lands.
+  // Reacting still works on an older group after an arrival the groups above
+  // it were skipped for. (A skipped child's handlers are re-pointed by Dioxus,
+  // and `handle_toggle_reaction` reads the room when called, so this checks
+  // the behaviour, not which mechanism keeps the handler current.)
   test("a group skipped by a render still reacts", async ({ page }) => {
     await openRoomWithComposer(page);
     for (const text of ["skip probe A", "skip probe B", "skip probe C"]) {

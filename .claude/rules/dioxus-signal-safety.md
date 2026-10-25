@@ -349,7 +349,8 @@ most of the delay on clicking a busy room (freenet/river#830).
 
 Create the handler once in the parent with `use_callback`, which keeps one
 `Callback` and replaces its body on each render, and pass that. A skipped child
-still calls the latest body. `message-rows.spec.ts`'s "Message group renders"
+still calls the latest body (the derived `memoize` also re-points a skipped
+child's handlers at the new ones). `message-rows.spec.ts`'s "Message group renders"
 tests count renders through the `takeMessageGroupRenders` test hook, and fail
 on all five projects if one handler goes back to an inline closure.
 
