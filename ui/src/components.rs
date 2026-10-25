@@ -335,7 +335,7 @@ mod volatile_value_binding_audit {
     /// Removing each annotated item individually is exact, and keeps production
     /// rsx that follows a test module. It also removes THIS module, so the
     /// fixtures below cannot satisfy the audit's own needles.
-    fn strip_cfg_test_items(src: &str) -> String {
+    pub(super) fn strip_cfg_test_items(src: &str) -> String {
         const NEEDLE: &str = "#[cfg(test)]";
         let lx = Lexed::new(src);
         let n = lx.chars.len();
@@ -1177,58 +1177,30 @@ mod accent_token_audit {
     }
 
     /// Solid fills reviewed and kept, as (file suffix, what the scan
-    /// reports, why).
-    const ALLOWED_FILLS: [(&str, &str, &str); 2] = [
+    /// reports, exactly how many times, why). The count is exact, so a new
+    /// fill of the same kind in the same file is not hidden by the entry.
+    const ALLOWED_FILLS: [(&str, &str, usize, &str); 2] = [
         (
             "components/back_to_chat.rs",
             "bg-[var(--color-link)]",
+            1,
             "the hamburger's unread count: a small badge, panel-coloured text on the link colour, clearing contrast in both themes",
         ),
         (
             "components/room_list/receive_invitation_modal.rs",
             "bg-[var(--color-link)]",
-            "the subscribe progress bars: an 8px indicator with no text on it",
+            2,
+            "the two subscribe progress bars: an 8px indicator with no text on it",
         ),
     ];
 
-    /// `src` without its `#[cfg(test)]` modules (their assertions name the
+    /// `src` without its `#[cfg(test)]` items (their assertions name the
     /// patterns the scan forbids), however many there are and wherever they
-    /// sit, so production code after one is still scanned.
+    /// sit, so production code after one is still scanned. Lexer-aware (the
+    /// volatile-binding audit's stripper): braces in strings and comments,
+    /// and a `#[cfg(test)]` written in a doc comment, do not move the cut.
     fn without_test_modules(src: &str) -> String {
-        let mut out = String::with_capacity(src.len());
-        let mut rest = src;
-        while let Some(at) = rest.find("#[cfg(test)]") {
-            out.push_str(&rest[..at]);
-            let after = &rest[at..];
-            // The attributed item: up to its block's closing brace, or the
-            // end of a one-line item.
-            let Some(open) = after.find(['{', ';']) else {
-                rest = "";
-                break;
-            };
-            if after.as_bytes()[open] == b';' {
-                rest = &after[open + 1..];
-                continue;
-            }
-            let mut depth = 0usize;
-            let mut close = after.len();
-            for (i, c) in after[open..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            close = open + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            rest = &after[close..];
-        }
-        out.push_str(rest);
-        out
+        super::volatile_value_binding_audit::strip_cfg_test_items(src)
     }
 
     const OLD_ACCENTS: [&str; 7] = [
@@ -1255,10 +1227,22 @@ mod accent_token_audit {
             // assertions: scan production code only.
             let src = without_test_modules(&src);
             let src = src.as_str();
-            for hit in solid_accent_fills(src) {
+            let hits = solid_accent_fills(src);
+            for (file, fill, count, _) in ALLOWED_FILLS {
+                if path.ends_with(file) {
+                    let seen = hits.iter().filter(|h| h.as_str() == fill).count();
+                    if seen != count {
+                        bad.push(format!(
+                            "{}: `{fill}` appears {seen} times, the allowlist says {count}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+            for hit in hits {
                 let allowed = ALLOWED_FILLS
                     .iter()
-                    .any(|(file, fill, _)| path.ends_with(file) && hit == *fill);
+                    .any(|(file, fill, _, _)| path.ends_with(file) && hit == *fill);
                 if !allowed {
                     bad.push(format!("{}: solid accent fill `{hit}`", path.display()));
                 }
@@ -1335,6 +1319,38 @@ mod accent_token_audit {
                 solid_accent_fills(src)
             );
         }
+    }
+
+    /// A real file that interleaves test modules with production code:
+    /// chat_delegate.rs has a test module from about line 1,300, full of
+    /// braces in strings, and production code thousands of lines after it.
+    /// A brace counter that ignored strings cut from there to the end of the
+    /// file, so none of that code was scanned.
+    #[test]
+    fn production_code_after_a_real_test_module_is_scanned() {
+        let src = include_str!("components/app/chat_delegate.rs");
+        let first_test = src
+            .find("#[cfg(test)]\nmod ")
+            .expect("premise: a mid-file test module");
+        let marker = "async fn fire_list_rooms_request()";
+        assert!(
+            src.find(marker).expect("premise: the marker exists") > first_test,
+            "premise: the marker sits after a test module"
+        );
+        let kept = without_test_modules(src);
+        assert!(
+            kept.contains(marker),
+            "production code after a test module was cut"
+        );
+        assert!(
+            kept.len() < src.len() / 2 && kept.len() > src.len() / 10,
+            "the test modules, and only they, were cut ({} of {} bytes kept)",
+            kept.len(),
+            src.len()
+        );
+        // A `#[cfg(test)]` in a doc comment is text, not an attribute.
+        let doc = "/// Not code: #[cfg(test)] mod x { }\nfn kept() {}\n";
+        assert!(without_test_modules(doc).contains("fn kept()"));
     }
 
     /// Production code after a test module is still scanned, and every test
