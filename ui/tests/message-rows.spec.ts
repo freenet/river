@@ -499,6 +499,9 @@ test.describe("Reaction row that wraps, at 320px", () => {
       p,
     );
     expect(overlaps, "chips under the picker").toBe(0);
+    // Premise: it opened upward, past the first line, so the rise mattered.
+    expect(p.y + p.height, "the picker sits above the first chip line").toBeLessThanOrEqual(Math.min(...lines) + 0.5);
+    expectEveryEmojiTappable(await measurePicker(page));
   });
 });
 
