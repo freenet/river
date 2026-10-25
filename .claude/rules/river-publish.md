@@ -350,6 +350,46 @@ Missing any of these leaves the new key orphaned across delegate rebuilds —
 exactly the bug the per-room `ListRequest` legacy probe (freenet/river#345) was
 added to prevent.
 
+**The deliberate exception: `river_avatar_colour_seed_v1`** (the per-device
+avatar colour seed, `ui/src/avatar_salt.rs`). It is carried by the crate walk
+ONLY, and best-effort:
+- no fixed probe in either importer: a probe is one more GET per pending
+  generation on every walk, against the node's shared 100-request delegate
+  admission queue (freenet/river#809), for a key no shipped generation before
+  this change holds. A predecessor whose index reads corrupt loses its seed;
+- the walk only remembers the earliest seed it sees (`RecoveredItem::AvatarSeed`
+  answers `AlreadyAuthoritative`) and `walk_with` returns it. The walk driver
+  (`migration_journal::run_work_with`) records the walk's journal status,
+  RELEASES the journal lock, and only then starts the carry
+  (`carry_found_seed_with`) as a detached task, ignoring failure. It has no
+  overall deadline: each request is bounded by the registry's 10 s timeout. A
+  deadline would cancel it mid-request and free `SEED_IO` with a reply still in
+  flight, which could then complete the session's own seed request (same
+  correlation key), leaving the tab on a palette the delegate does not hold. So a seed never keeps a predecessor open, never interrupts
+  the journal, never holds the identity-import gate `Pending`, and never
+  blocks the sweep's journal gate (`JOURNAL_OPS`); pinned by
+  `a_slow_seed_import_holds_neither_the_gate_nor_the_journal_lock`. The worst
+  case is a palette that changes once;
+- earliest `created_at_ms` wins (ties by seed bytes), so the seed the UI
+  creates on the first load after a re-key gives way to the user's original.
+  The carry reports the seed the delegate holds AFTERWARDS, whether it wrote
+  one or kept an earlier one (which can be another tab's that this tab has
+  never seen; `SeedImport::Kept` carries it), and the tab recolours if that is
+  not its session's seed, so a tab never keeps a palette the delegate does
+  not hold;
+- an undecodable seed is skipped (`Unrecognized`), never rejected;
+- `RIVER_IMPORT_REVISION` was NOT raised for it: before this change the key
+  classified `Unrecognized` (skipped, not rejected), and no shipped generation
+  holds one, so a bump would only force re-walks;
+- the sweep and the post-resolve top-up do not carry it, and identity export
+  does not either: the seed, and so the palette, is per device.
+
+All seed requests in a tab go through one mutex (`SEED_IO`): the session's read
+and the walk's import ask the same delegate for the same key, which is one slot
+in the single-waiter `PENDING_REQUESTS` registry. Residual: a reply arriving
+after its request timed out can fill the NEXT seed request's waiter (no request
+id in the protocol, so no cheap guard); the worst case is one palette change.
+
 ## The crate walk and the completeness journal (freenet-migrate 0.7)
 
 There are **two** importers running side by side, and since freenet/river#763

@@ -202,7 +202,11 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
 
     rsx! {
         div {
-            class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
+            // z-[60], over the composer's z-50: this modal mounts inside the
+            // rooms rail, which comes BEFORE the conversation in the DOM, so
+            // at an equal z-index the composer painted over the backdrop.
+            "data-testid": "join-with-code-backdrop",
+            class: "fixed inset-0 bg-black/50 flex items-center justify-center z-[60]",
             onclick: {
                 let reset_and_close = reset_and_close.clone();
                 move |_| reset_and_close()
@@ -211,10 +215,10 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                 "data-testid": "join-with-code-modal",
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto",
                 onclick: move |e| e.stop_propagation(),
-                h3 { class: "text-lg font-semibold text-text mb-4",
+                h3 { class: "text-[16px] font-semibold text-text mb-4",
                     "Enter Invite Code"
                 }
-                p { class: "text-sm text-text-muted mb-3",
+                p { class: "text-[13px] text-text-muted mb-3",
                     // Only mention scanning where the Scan button is shown.
                     if can_scan {
                         "Paste a portable invite code someone shared with you, or scan their QR code. It works on any host or peer, so you don't need to open a special link."
@@ -231,12 +235,12 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                         muted: true,
                         playsinline: true,
                     }
-                    p { class: "text-xs text-text-muted mt-2",
+                    p { class: "text-[13px] text-text-muted mt-2",
                         "Point the camera at the invitation QR code."
                     }
                     button {
                         "data-testid": "join-with-code-scan-stop-button",
-                        class: "mt-3 w-full px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                        class: "mt-3 w-full px-4 py-2 bg-surface hover:bg-surface-hover text-text text-[15px] rounded-lg transition-colors border border-border",
                         onclick: stop_scan,
                         "Stop scanning"
                     }
@@ -246,13 +250,13 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                     // only. A Scan button there can only report that scanning
                     // is unavailable (freenet/river#741 review).
                     if invite_qr_scan::camera_prompt_unavailable() {
-                        p { class: "text-xs text-text-muted mb-3",
+                        p { class: "text-[13px] text-text-muted mb-3",
                             "Take or choose a photo of the QR code."
                         }
                     }
                     button {
                         "data-testid": "join-with-code-scan-button",
-                        class: "w-full mb-3 px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border flex items-center justify-center gap-2",
+                        class: "w-full mb-3 px-4 py-2 bg-surface hover:bg-surface-hover text-text text-[15px] rounded-lg transition-colors border border-border flex items-center justify-center gap-2",
                         onclick: start_scan,
                         Icon { icon: FaCamera, width: 14, height: 14 }
                         span { "Scan QR code" }
@@ -321,13 +325,13 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                 if let Some(err) = scan_error.read().as_ref() {
                     div {
                         "data-testid": "join-with-code-scan-error",
-                        class: "mb-3 text-sm text-red-400",
+                        class: "mb-3 text-sm text-danger",
                         "{err}"
                     }
                 }
                 textarea {
                     "data-testid": "join-with-code-input",
-                    class: "w-full h-32 bg-surface border border-border rounded-lg p-3 text-xs font-mono text-text resize-none",
+                    class: "w-full h-32 bg-surface border border-border rounded-xl p-3 text-xs font-mono text-text resize-none",
                     placeholder: "Paste invite code here",
                     value: "{code_input}",
                     oninput: move |e| {
@@ -337,19 +341,19 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                     },
                 }
                 if let Some(err) = &*error_msg.read() {
-                    div { class: "mt-2 text-sm text-red-400",
+                    div { class: "mt-2 text-sm text-danger",
                         "{err}"
                     }
                 }
                 div { class: "flex justify-end gap-3 mt-4",
                     button {
-                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                        class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                         onclick: move |_| reset_and_close(),
                         "Cancel"
                     }
                     button {
                         "data-testid": "join-with-code-submit-button",
-                        class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
+                        class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] font-medium rounded-lg transition-colors",
                         onclick: handle_join,
                         "Join"
                     }

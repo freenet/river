@@ -5,6 +5,9 @@ mod nickname_field;
 
 use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::components::direct_messages::{open_dm_thread, open_invite_via_dm_picker};
+use crate::components::icons::{
+    line_icon, CROWN_ICON_PATH, JOIN_ICON_PATH, KEY_ICON_PATH, SHIELD_ICON_PATH,
+};
 use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::deputy_button::DeputyButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
@@ -40,9 +43,17 @@ impl PartialEq<MemberId> for SelfMemberId {
     }
 }
 
-/// Shape shared by every member-info chip; each chip adds its own colours.
+/// Shape shared by every member-info chip: outlined and quiet, a muted line
+/// icon then the label, as the member panel draws the same markers.
 const TAG_CHIP_CLASS: &str =
-    "inline-flex items-center px-3 py-[5px] rounded-full text-sm font-medium";
+    "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-border-hover text-[13px] font-medium";
+
+/// A member-info chip's icon, in the muted colour.
+fn chip_icon(path: &'static str) -> Element {
+    rsx! {
+        span { class: "inline-flex text-text-muted", {line_icon(path, 14)} }
+    }
+}
 
 #[component]
 pub fn MemberInfoModal() -> Element {
@@ -154,7 +165,7 @@ pub fn MemberInfoModal() -> Element {
                 error!("Member info not found for member {member_id}");
                 return rsx! {
                     div {
-                        class: "p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400",
+                        class: "p-4 bg-error-bg border-l-[3px] border-danger rounded-lg text-text",
                         "Member information is missing or corrupted"
                     }
                 };
@@ -174,7 +185,7 @@ pub fn MemberInfoModal() -> Element {
             error!("Member {member_id} not found in members list and is not owner");
             return rsx! {
                 div {
-                    class: "p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400",
+                    class: "p-4 bg-error-bg border-l-[3px] border-danger rounded-lg text-text",
                     "Member not found in room members list"
                 }
             };
@@ -431,6 +442,30 @@ pub fn MemberInfoModal() -> Element {
             .unwrap_or_default()
             .to_string();
 
+        // The avatar's hue under this viewer's salt for the room (a fallible
+        // read: contended, the disc is neutral and the nudge re-renders).
+        let avatar_hue = owner_key_signal().and_then(|owner_vk| {
+            crate::avatar_salt::ensure_avatar_salt(owner_vk.to_bytes());
+            // A dependency the nudge can wake (#555).
+            crate::util::signal_guard::anchor();
+            let salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
+                Ok(salts) => salts.get(&owner_vk.to_bytes()).copied()?,
+                Err(_) => {
+                    crate::util::signal_guard::schedule_nudge();
+                    return None;
+                }
+            };
+            let vk = if is_owner {
+                owner_vk
+            } else {
+                member?.member.member_vk
+            };
+            Some(crate::components::conversation::avatar::display_hue(
+                &salt,
+                vk.as_bytes(),
+            ))
+        });
+
         // Get the member ID string to display
         let member_id_str = member_id.to_string();
 
@@ -478,7 +513,22 @@ pub fn MemberInfoModal() -> Element {
                     class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
                     div {
                         class: "p-6",
-                        h1 { class: "text-xl font-semibold text-text mb-4", "Member Info" }
+                        // The member's avatar beside the title, by the
+                        // conversation's colouring rule. Decorative.
+                        div { class: "flex items-center gap-3 mb-4",
+                            div {
+                                "aria-hidden": "true",
+                                "data-testid": "member-info-avatar",
+                                class: format!(
+                                    "msg-avatar{}{}",
+                                    if avatar_hue.is_some() { " msg-avatar-hued" } else { "" },
+                                    if member_id == self_member_id { " msg-avatar-self" } else { "" },
+                                ),
+                                style: crate::components::conversation::avatar::avatar_style(avatar_hue),
+                                {crate::components::conversation::avatar::initials(&target_nickname)}
+                            }
+                            h1 { class: "text-[16px] font-semibold text-text", "Member Info" }
+                        }
 
                         // Show tags for owner, self, and relationships
                         div {
@@ -487,22 +537,24 @@ pub fn MemberInfoModal() -> Element {
                             if is_owner {
                                 span {
                                     "data-testid": "member-info-owner-tag",
-                                    class: "{TAG_CHIP_CLASS} bg-blue-500/20 text-text",
-                                    "👑 Room Owner"
+                                    class: "{TAG_CHIP_CLASS} text-text",
+                                    {chip_icon(CROWN_ICON_PATH)}
+                                    "Room Owner"
                                 }
                             }
                             if member_id == self_member_id {
                                 span {
                                     "data-testid": "member-info-self-tag",
-                                    class: "{TAG_CHIP_CLASS} bg-cyan-500/20 text-text",
-                                    "⭐ You"
+                                    class: "{TAG_CHIP_CLASS} text-text",
+                                    "You"
                                 }
                             }
                             if is_downstream {
                                 span {
                                     "data-testid": "member-info-invited-by-you-tag",
-                                    class: "{TAG_CHIP_CLASS} bg-green-500/20 text-text",
-                                    "🔑 Invited by You"
+                                    class: "{TAG_CHIP_CLASS} text-text",
+                                    {chip_icon(KEY_ICON_PATH)}
+                                    "Invited by You"
                                 }
                             }
                             // Check if this member invited the current user
@@ -510,8 +562,9 @@ pub fn MemberInfoModal() -> Element {
                                 if self_member.member.invited_by == member_id {
                                     span {
                                         "data-testid": "member-info-invited-you-tag",
-                                        class: "{TAG_CHIP_CLASS} bg-yellow-500/20 text-text",
-                                        "🎪 Invited You"
+                                        class: "{TAG_CHIP_CLASS} text-text",
+                                        {chip_icon(JOIN_ICON_PATH)}
+                                        "Invited You"
                                     }
                                 }
                             }
@@ -524,10 +577,11 @@ pub fn MemberInfoModal() -> Element {
                             if deputy_badge.is_some() {
                                 span {
                                     "data-testid": "member-info-deputy-tag",
-                                    class: "{TAG_CHIP_CLASS} bg-purple-500/20 text-text",
+                                    class: "{TAG_CHIP_CLASS} text-text",
                                     title: "{deputy_tooltip}",
                                     "aria-label": "{deputy_tooltip}",
-                                    "🛡 Deputy"
+                                    {chip_icon(SHIELD_ICON_PATH)}
+                                    "Deputy"
                                 }
                             }
                             // The ⚠ impersonation warning (#489). Deliberately
@@ -542,7 +596,7 @@ pub fn MemberInfoModal() -> Element {
                                 span {
                                     "data-testid": "member-info-impersonation-tag",
                                     // Amber, not `text-text`: the colour is the warning.
-                                    class: "{TAG_CHIP_CLASS} bg-amber-500/20 text-amber-400",
+                                    class: "{TAG_CHIP_CLASS} border-[color-mix(in_srgb,var(--color-warning-text)_45%,transparent)] text-warning-text",
                                     title: "{impersonation_tooltip}",
                                     "aria-label": "{impersonation_tooltip}",
                                     "{crate::util::confusable::WARNING_GLYPH} {impersonation_label}"
@@ -568,7 +622,7 @@ pub fn MemberInfoModal() -> Element {
                         if let Some(warning) = impersonation.as_ref() {
                             div {
                                 "data-testid": "member-info-impersonation-explanation",
-                                class: "mb-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-sm text-amber-200",
+                                class: "mb-4 p-3 rounded-lg bg-warning-bg border-l-[3px] border-warning text-sm text-text",
                                 p { class: "mb-1", "{impersonation_tooltip}" }
                                 div {
                                     span { class: "mr-1 text-text-muted", "Resembles:" }
@@ -602,7 +656,7 @@ pub fn MemberInfoModal() -> Element {
                         if let Some(badge) = deputy_badge.as_ref() {
                             div {
                                 "data-testid": "member-info-deputy-appointers",
-                                class: "mb-4 text-sm text-text-muted",
+                                class: "mb-4 text-[13px] text-text-muted",
                                 span { class: "mr-1", "Deputized by:" }
                                 for name in badge.appointer_names() {
                                     span {
@@ -622,7 +676,7 @@ pub fn MemberInfoModal() -> Element {
                             label { class: "block text-sm font-medium text-text-muted mb-2", "Member ID" }
                             input {
                                 "data-testid": "member-info-id-input",
-                                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text font-mono text-sm",
+                                class: "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text font-mono text-sm",
                                 value: "{member_id_str}",
                                 readonly: true
                             }
@@ -641,7 +695,7 @@ pub fn MemberInfoModal() -> Element {
                                 }
                                 input {
                                     "data-testid": "member-info-verifying-key-input",
-                                    class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text font-mono text-sm",
+                                    class: "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text font-mono text-sm",
                                     value: "{vk_str}",
                                     readonly: true
                                 }
@@ -673,7 +727,7 @@ pub fn MemberInfoModal() -> Element {
                                     div { class: "mb-4 flex gap-2",
                                         button {
                                             "data-testid": "member-info-dm-button",
-                                            class: "flex-1 px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-sm font-medium rounded-lg transition-colors border border-border",
+                                            class: "flex-1 px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-[15px] font-medium rounded-lg transition-colors border border-border",
                                             "aria-label": "Send direct message",
                                             onclick: move |_| {
                                                 crate::util::defer(move || {
@@ -753,7 +807,7 @@ pub fn MemberInfoModal() -> Element {
                                 if let Some(reason) = ban_refusal {
                                     div {
                                         "data-testid": "ban-withheld-reason",
-                                        class: "mt-4 px-3 py-2 text-sm text-text-muted bg-surface border border-border rounded-lg",
+                                        class: "mt-4 px-3 py-2 text-[13px] text-text-muted bg-surface border border-border rounded-lg",
                                         "{reason}"
                                     }
                                 }
@@ -952,9 +1006,16 @@ mod ban_gate_tests {
             .find("#[cfg(test)]")
             .expect("member_info_modal.rs should have a #[cfg(test)] block")];
 
+        let chip = prod
+            .split_once("\"data-testid\": \"member-info-deputy-tag\"")
+            .expect("the member-info modal must render the deputy legend chip (#451)")
+            .1;
+        let chip = &chip[..chip
+            .find("\"Deputy\"")
+            .expect("the deputy chip keeps its label")];
         assert!(
-            prod.contains("🛡 Deputy"),
-            "the member-info modal must render the 🛡 deputy legend chip (#451)"
+            chip.contains("SHIELD_ICON_PATH"),
+            "the deputy chip must carry the shield, as the member list's does (#451)"
         );
         assert!(
             prod.contains("deputy_badge_for_viewer"),

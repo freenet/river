@@ -205,7 +205,7 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
         rsx! {
             div {
                 button {
-                    class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors whitespace-nowrap",
+                    class: "px-4 py-2 bg-danger hover:bg-danger-hover text-white font-medium rounded-lg transition-colors whitespace-nowrap",
                     onclick: move |_| show_confirmation.set(true),
                     "Ban User"
                 }
@@ -225,7 +225,7 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
                             // Header
                             div {
                                 class: "px-6 py-4 border-b border-border flex items-center justify-between",
-                                h2 { class: "text-lg font-semibold text-text", "Confirm Ban" }
+                                h2 { class: "text-[16px] font-semibold text-text", "Confirm Ban" }
                                 button {
                                     class: "p-1 text-text-muted hover:text-text transition-colors",
                                     onclick: move |_| show_confirmation.set(false),
@@ -236,7 +236,7 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
                             // Body
                             div {
                                 class: "px-6 py-4",
-                                p { class: "text-text",
+                                p { class: "text-[15px] text-text",
                                     "Are you sure you want to ban "
                                     span { class: "font-semibold", "{nickname}" }
                                     " (ID: "
@@ -249,12 +249,12 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
                             div {
                                 class: "px-6 py-4 border-t border-border flex justify-end gap-3",
                                 button {
-                                    class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                                    class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                                     onclick: move |_| show_confirmation.set(false),
                                     "Cancel"
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors",
+                                    class: "px-4 py-2 bg-danger hover:bg-danger-hover text-white font-medium rounded-lg transition-colors",
                                     onclick: execute_ban,
                                     "Yes, Ban User"
                                 }

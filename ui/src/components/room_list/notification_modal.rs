@@ -101,7 +101,7 @@ pub fn NotificationModal() -> Element {
                 class: "relative z-10 w-full max-w-sm mx-4 bg-panel rounded-xl shadow-xl border border-border",
                 div { class: "p-5",
                     div { class: "flex items-center justify-between mb-4",
-                        h1 { class: "text-lg font-semibold text-text", "Notifications" }
+                        h1 { class: "text-[16px] font-semibold text-text", "Notifications" }
                         button {
                             "data-testid": "notification-modal-close",
                             class: "p-1.5 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
@@ -145,7 +145,7 @@ pub fn NotificationModal() -> Element {
                                         }
                                         div { class: "min-w-0 flex-1",
                                             div { class: "text-sm font-medium text-text", "{label}" }
-                                            div { class: "text-xs text-text-muted", "{description}" }
+                                            div { class: "text-[13px] text-text-muted", "{description}" }
                                         }
                                         if is_selected {
                                             span { class: "text-accent flex-shrink-0 mt-0.5",
@@ -157,7 +157,7 @@ pub fn NotificationModal() -> Element {
                             }
                         }
                     }
-                    p { class: "text-xs text-text-muted mt-4",
+                    p { class: "text-[13px] text-text-muted mt-4",
                         "Applies to this room and syncs across your devices."
                     }
                     // Browser-level permission. The modes above only decide
@@ -171,13 +171,13 @@ pub fn NotificationModal() -> Element {
                                 div { class: "text-xs font-medium text-text mb-1", "Browser permission" }
                                 p {
                                     "data-testid": "notification-permission-message",
-                                    class: "text-xs text-text-muted",
+                                    class: "text-[13px] text-text-muted",
                                     "{notice.message}"
                                 }
                                 if notice.offer_enable {
                                     button {
                                         "data-testid": "notification-enable-button",
-                                        class: "mt-2 px-3 py-1.5 rounded-lg bg-accent text-white text-xs font-medium hover:opacity-90 transition-opacity",
+                                        class: "mt-2 px-3 py-1.5 rounded-lg bg-surface hover:bg-surface-hover border border-border-hover text-text text-xs font-medium hover:opacity-90 transition-opacity",
                                         // NOT deferred, and that is load-bearing:
                                         // the browser only honours a permission
                                         // request made inside the click's transient

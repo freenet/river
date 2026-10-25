@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp } from "./example-room";
+import { resolveColor, waitForApp } from "./example-room";
 
 // Smoke tests for the DM thread modal Phase 3 changes
 // (#243 structured invite-DM variant + auto-scroll):
@@ -37,12 +37,11 @@ async function openDmThreadModal(page: Page) {
   // app load, so we can't rely on a fixed index for anyone but the local
   // user — who is pinned to index 0 since freenet/river#584, though this
   // scan deliberately does not depend on that. Pick the first member
-  // whose text doesn't include "(You)".
+  // whose row is not marked as the local user (`member-list-self`).
   const count = await memberButtons.count();
   let clicked = false;
   for (let i = 0; i < count; i++) {
-    const text = (await memberButtons.nth(i).textContent()) || "";
-    if (!/\(You\)/i.test(text)) {
+    if ((await memberButtons.nth(i).getByTestId("member-list-self").count()) === 0) {
       await memberButtons.nth(i).click();
       clicked = true;
       break;
@@ -73,11 +72,9 @@ test.describe("DM thread modal (Phase 3 structure)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    const opened = await openDmThreadModal(page);
-    if (!opened) {
-      test.skip(true, "no DM entry point available in example data");
-      return;
-    }
+    // A missing entry point is a failure, not a skip: example data always
+    // lists other members, and Member Info always offers a DM.
+    expect(await openDmThreadModal(page), "premise: the DM thread opened from Member Info").toBe(true);
 
     // The auto-scroll effect targets this id; if it gets renamed
     // every scroll behaviour regresses to "no scroll happens."
@@ -89,11 +86,9 @@ test.describe("DM thread modal (Phase 3 structure)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    const opened = await openDmThreadModal(page);
-    if (!opened) {
-      test.skip(true, "no DM entry point available in example data");
-      return;
-    }
+    // A missing entry point is a failure, not a skip: example data always
+    // lists other members, and Member Info always offers a DM.
+    expect(await openDmThreadModal(page), "premise: the DM thread opened from Member Info").toBe(true);
 
     // Example-data has no DMs, so the empty-state prompt is the only
     // thing inside #dm-scroll-container on first open.
@@ -106,11 +101,9 @@ test.describe("DM thread modal (Phase 3 structure)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    const opened = await openDmThreadModal(page);
-    if (!opened) {
-      test.skip(true, "no DM entry point available in example data");
-      return;
-    }
+    // A missing entry point is a failure, not a skip: example data always
+    // lists other members, and Member Info always offers a DM.
+    expect(await openDmThreadModal(page), "premise: the DM thread opened from Member Info").toBe(true);
 
     const composer = page.locator(
       'textarea[placeholder="Type a direct message..."]',
@@ -136,11 +129,9 @@ test.describe("DM thread modal (Phase 3 structure)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    const opened = await openDmThreadModal(page);
-    if (!opened) {
-      test.skip(true, "no DM entry point available in example data");
-      return;
-    }
+    // A missing entry point is a failure, not a skip: example data always
+    // lists other members, and Member Info always offers a DM.
+    expect(await openDmThreadModal(page), "premise: the DM thread opened from Member Info").toBe(true);
 
     const shareInvite = page.getByTestId("dm-thread-share-invite-button");
     await expect(shareInvite).toBeVisible({ timeout: 5_000 });
@@ -166,19 +157,17 @@ test.describe("DM thread modal (Phase 3 structure)", () => {
     await expect(page.getByText(/invite .+ to another room/i)).toBeVisible();
   });
 
-  // Sending is the modal's primary purpose, so Send keeps the only filled
-  // accent treatment and the invite control sits on the secondary tier.
+  // Sending is the modal's primary purpose, so Send is the composer box's
+  // accent icon and the invite control sits on the secondary tier.
   // Asserted on the rendered DOM rather than on the source, so it survives
   // a class list being moved or recomputed.
   test("share-invite is styled below Send", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
 
-    const opened = await openDmThreadModal(page);
-    if (!opened) {
-      test.skip(true, "no DM entry point available in example data");
-      return;
-    }
+    // A missing entry point is a failure, not a skip: example data always
+    // lists other members, and Member Info always offers a DM.
+    expect(await openDmThreadModal(page), "premise: the DM thread opened from Member Info").toBe(true);
 
     const shareInvite = page.getByTestId("dm-thread-share-invite-button");
     await expect(shareInvite).toBeVisible({ timeout: 5_000 });
@@ -187,9 +176,24 @@ test.describe("DM thread modal (Phase 3 structure)", () => {
     const inviteClass = (await shareInvite.getAttribute("class")) || "";
     const sendClass = (await send.getAttribute("class")) || "";
 
-    // Send keeps the filled accent treatment; the invite link carries no
+    // Send is the composer box's accent icon; the invite link carries no
     // background at all.
-    expect(sendClass).toContain("bg-accent");
+    await expect(send).toHaveAttribute("data-testid", "dm-send-button");
+    expect(sendClass).toContain("text-link");
+    // Measured too: the link colour on no fill at all, once a draft enables
+    // it (disabled, it is muted).
+    await page.locator('textarea[placeholder="Type a direct message..."]').fill("a draft");
+    await expect(send).toBeEnabled();
+    await page.mouse.move(0, 0);
+    // After the enable transition (`transition-colors`) settles.
+    const sendPaint = () =>
+      send.evaluate(async (el) => {
+        await Promise.all(el.getAnimations().map((a) => a.finished));
+        return { color: getComputedStyle(el).color, bg: getComputedStyle(el).backgroundColor };
+      });
+    const link = await resolveColor(page, "var(--color-link)");
+    await expect.poll(async () => resolveColor(page, (await sendPaint()).color), { message: "Send is the link colour" }).toEqual(link);
+    expect((await resolveColor(page, (await sendPaint()).bg))[3], "Send has no fill").toBe(0);
     expect(inviteClass).not.toContain("bg-accent");
     expect(inviteClass).not.toContain("bg-surface");
 

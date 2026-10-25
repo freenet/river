@@ -3,6 +3,7 @@ pub mod back_to_chat;
 pub mod conversation;
 pub mod direct_messages;
 pub mod foreground;
+pub(crate) mod icons;
 pub mod invite_click_interceptor;
 pub mod members;
 pub mod mention_click_interceptor;
@@ -791,6 +792,42 @@ mod volatile_value_binding_audit {
         }
     }
 
+    /// Brace char literals (and escaped ones) inside a test module are not
+    /// braces: counted as code they would end the cull early (leaking the rest
+    /// of the module) or late (eating the production code after it), which is
+    /// how a `'}'` cut `chat_delegate.rs`'s test module short under the plain
+    /// `util::lex` scan. Lifetimes in the module must not be taken for literals.
+    #[test]
+    fn cfg_test_cull_skips_brace_char_literals() {
+        // `'}'` and `'{'` are UNBALANCED brace literals: a lexer that counted
+        // them would end the cull early or late. `'\u{7D}'` is balanced in
+        // the text (its `{7D}`), so it cannot move the cut; it checks that an
+        // escape inside a char literal is read as part of the literal.
+        // Lifetimes and escaped quotes sit beside them.
+        for literal in ["'}'", "'{'", "'\\u{7D}'"] {
+            let src = format!(
+                "fn before() {{}}\n#[cfg(test)]\nmod tests {{\n    fn t<'a>(s: &'a str) -> Option<usize> {{ s.find({literal}) }}\n    fn u() {{ let _ = ['\\'', '\\\\']; let _ = input {{ value: \"{{leaked}}\" }}; }}\n}}\nfn keep_me() {{ textarea {{ value: \"{{v}}\" }} }}\n"
+            );
+            let out = strip_cfg_test_items(&src);
+            assert!(
+                out.contains("keep_me"),
+                "{literal}: production code after must survive: {out}"
+            );
+            assert!(
+                !out.contains("leaked"),
+                "{literal}: the rest of the test module must go: {out}"
+            );
+            assert!(
+                !out.contains("fn t<"),
+                "{literal}: the test module must go: {out}"
+            );
+            assert!(
+                scan_elements(&out).iter().any(|e| e.name == "textarea"),
+                "{literal}"
+            );
+        }
+    }
+
     /// A `;` inside a type like `[u8; 4]` must not end the item early and leak
     /// test-only rsx into the audited source.
     #[test]
@@ -988,5 +1025,33 @@ mod volatile_value_binding_audit {
         assert!(is_display_only(
             &scan_elements(r#"input { readonly: true, value: "{n}" }"#)[0]
         ));
+    }
+}
+
+/// The accent is one token set in `assets/tailwind.css` (`--color-accent`,
+/// `--color-accent-hover`, `--color-link`, `--color-link-hover`,
+/// `--color-accent-soft`), each defined for both themes. Whether anything
+/// paints it as a solid fill, and whether status surfaces are readable, is
+/// checked where it shows: dialogs.spec, shell-contrast, edit-form-contrast
+/// and status-contrast, in both themes.
+#[cfg(test)]
+mod accent_token_audit {
+    #[test]
+    fn each_accent_token_is_defined_once_per_theme() {
+        let css = include_str!("../assets/tailwind.css");
+        let definitions = |token: &str| {
+            css.lines()
+                .filter(|l| l.trim_start().starts_with(token))
+                .count()
+        };
+        for token in [
+            "--color-accent:",
+            "--color-accent-hover:",
+            "--color-link:",
+            "--color-link-hover:",
+            "--color-accent-soft:",
+        ] {
+            assert_eq!(definitions(token), 2, "{token}: light and dark");
+        }
     }
 }

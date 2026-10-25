@@ -40,10 +40,7 @@ use crate::components::direct_messages::{
     is_thread_hidden_for, open_dm_thread, DM_LAST_SEEN, HIDDEN_DM_THREADS,
 };
 use dioxus::prelude::*;
-use dioxus_free_icons::{
-    icons::fa_solid_icons::{FaEnvelope, FaXmark},
-    Icon,
-};
+use dioxus_free_icons::{icons::fa_solid_icons::FaXmark, Icon};
 use ed25519_dalek::VerifyingKey;
 use river_core::chat_delegate::HiddenDmThreadEntry;
 use river_core::room_state::member::MemberId;
@@ -141,14 +138,13 @@ pub fn DmRailSection() -> Element {
     let panel_is_open = *archived_panel_open.read();
 
     rsx! {
-        div { class: "px-4 py-2 flex items-center justify-between border-t border-border mt-2",
-            h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",
-                Icon { width: 14, height: 14, icon: FaEnvelope }
-                span { "Direct Messages" }
+        div { class: "pl-[18px] pr-3 pt-3.5 pb-1.5 flex items-center justify-between",
+            h2 { class: "text-xs font-semibold text-text-muted",
+                "Direct messages"
             }
         }
         if !threads_value.is_empty() {
-            ul { class: "px-2 py-1 space-y-0.5",
+            ul { class: "px-2.5 py-0.5 space-y-0.5",
                 for entry in threads_value.iter() {
                     DmRailRow { key: "{entry.room:?}_{entry.peer}", entry: entry.clone() }
                 }
@@ -207,6 +203,29 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
     let archive_title =
         "Archive this conversation. It will return if either of you sends a new DM.";
 
+    // The avatar: the room's salt (derived locally from this viewer's seed,
+    // read once per session) and the peer's key. Both reads are fallible; a contended one renders the neutral disc
+    // and the nudge renders the row again (dioxus-signal-safety.md).
+    let initials = crate::components::conversation::avatar::initials(&entry.peer_nickname);
+    crate::avatar_salt::ensure_avatar_salt(room.to_bytes());
+    crate::util::signal_guard::anchor();
+    let salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
+        Ok(salts) => salts.get(&room.to_bytes()).copied(),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            None
+        }
+    };
+    let avatar_hue = salt.and_then(|salt| {
+        let Ok(rooms) = crate::components::app::ROOMS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return None;
+        };
+        let room_data = rooms.map.get(&room)?;
+        crate::components::conversation::avatar::member_vk_bytes(&room_data.room_state, &room, peer)
+            .map(|vk| crate::components::conversation::avatar::display_hue(&salt, &vk))
+    });
+
     rsx! {
         li {
             div { class: "group relative w-full",
@@ -214,8 +233,17 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
                     // `dm-rail-row-btn`: main.css widens the right padding on
                     // touch devices so the enlarged always-visible archive ✕
                     // (below) doesn't overlap the nickname / unread badge (#462).
-                    class: "dm-rail-row-btn w-full text-left pl-3 pr-9 py-1.5 rounded-lg text-sm transition-colors text-text hover:bg-surface flex items-center gap-2",
+                    class: "dm-rail-row-btn w-full text-left pl-2.5 pr-9 py-1 rounded-lg text-[14.5px] transition-colors text-text-secondary hover:text-text hover:bg-surface/60 flex items-center gap-2.5",
                     onclick: click,
+                    // The peer's avatar, by the conversation's colouring rule
+                    // for the DM's room. Decorative: the name follows.
+                    span {
+                        "aria-hidden": "true",
+                        "data-testid": "dm-rail-avatar",
+                        class: if avatar_hue.is_some() { "msg-avatar dm-avatar msg-avatar-hued" } else { "msg-avatar dm-avatar" },
+                        style: crate::components::conversation::avatar::avatar_style(avatar_hue),
+                        "{initials}"
+                    }
                     div { class: "flex-1 min-w-0",
                         div { class: "truncate text-sm",
                             "{entry.peer_nickname}"
@@ -227,7 +255,7 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
                     if entry.unread > 0 {
                         span {
                             "data-testid": "dm-rail-unread-badge",
-                            class: "ml-2 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
+                            class: "ml-2 inline-flex items-center justify-center min-w-5 h-[18px] px-1.5 rounded-full text-[11.5px] font-bold tabular-nums bg-accent-soft text-link",
                             "{entry.unread}"
                         }
                     }
@@ -239,7 +267,7 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
                     class: "dm-archive-btn absolute right-1 top-1/2 -translate-y-1/2 p-1 rounded text-text-muted \
                             flex items-center justify-center opacity-0 \
                             group-hover:opacity-100 group-focus-within:opacity-100 \
-                            hover:text-red-400 hover:bg-surface focus:opacity-100 \
+                            hover:text-danger hover:bg-surface focus:opacity-100 \
                             transition-opacity transition-colors",
                     title: "{archive_title}",
                     "aria-label": "{archive_title}",

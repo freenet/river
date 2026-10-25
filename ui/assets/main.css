@@ -21,30 +21,26 @@
     opacity: 0.4;
 }
 
-/* Touch reveal for the inline add-reaction "+" button (same failure mode as
- * #402/#462 above): `.add-reaction-btn` reveals via `.group:hover`, a real
- * CSS `:hover`, which touch devices can't reliably trigger — so on a phone
- * the button was invisible (opacity: 0) yet still tappable, unless the
- * message already had reactions (`.has-reactions` gives it opacity: 0.2 at
- * rest regardless of hover), which is why the bug only showed on
- * reaction-less messages.
+/* The inline add-reaction "+" on touch. The "+" is a visible control only
+ * on a message that already has reactions, after its chips (`.has-reactions`;
+ * 0.2 at rest on a hover pointer, brighter on hover). On a message with none
+ * it is collapsed and invisible (`invisible h-0`, its wrapper
+ * `pointer-events-none`), kept only as the anchor the picker opens from;
+ * React there comes from the hover bar on a hover pointer and from the kebab
+ * menu on touch (`conversation.rs`, `.touch-actions`).
  *
- * Gate on pointer CAPABILITY, not viewport width — see the #462 comment
- * above for why `(hover: none), (any-pointer: coarse)` is the correct query
- * (`any-pointer: coarse` also catches a touchscreen laptop, which reports
- * `hover: hover` while a finger is on the glass).
+ * Touch cannot trigger the `.group:hover` reveal, so where there is a "+" to
+ * see it rests at 0.4. Gate on pointer CAPABILITY, not viewport width — see
+ * the #462 comment above for why `(hover: none), (any-pointer: coarse)` is
+ * the correct query (`any-pointer: coarse` also catches a touchscreen laptop,
+ * which reports `hover: hover` while a finger is on the glass).
  *
  * Deliberately does NOT widen the tap target the way #462 did: a min-size
  * here (tried in #605, reverted after user feedback) grows the reaction
- * row's line height on every message, even ones without reactions yet,
- * which reads as "the composer now takes up more room" — a real visible
- * regression, not just a WCAG nice-to-have. This button is also a
- * lower-stakes target than the DM-archive ✕ (a mis-tap just opens the
- * emoji picker, not a destructive action) and touch users have a second
- * path to the same action via the message kebab menu's "React" entry
- * (`conversation.rs`, `.touch-actions`) — a full menu row, comfortably
- * above the WCAG 2.5.8 AA 24px floor though still short of the 44px AAA
- * target itself. So: fix visibility only, leave sizing alone. */
+ * row's line height on every message with reactions, which reads as "the
+ * composer now takes up more room". A mis-tap only opens the emoji picker,
+ * and the kebab's React is a full menu row, above the WCAG 2.5.8 AA 24px
+ * floor though short of the 44px AAA target. So: visibility only. */
 @media (hover: none), (any-pointer: coarse) {
     .add-reaction-btn {
         opacity: 0.4;
@@ -55,33 +51,301 @@
     }
 }
 
-/* Message rows: the content, then a 72px right gutter for the hover bar and
- * kebab. Rows bleed 8px so the hover band has room; the history's -my-2
- * cancels the group-edge padding so the bottom sentinel sits at the newest
- * message's bottom. No opacity, transform, filter, isolation or z-index on a
- * row: it would trap its menus beneath later rows. */
+/* Message history. A row is a grid: the avatar gutter, then the content
+ * column. A body's text starts at the same edge as a header's name, so what
+ * tells a real header from a body that imitates one (`**Name** 🛡`) is the
+ * gutter: a group's first row has the author's avatar there, which markdown
+ * cannot produce, and a continuation row's gutter is empty (its time shows
+ * only on hover). Rows span the column; the body text keeps its own measure
+ * (`max-w-[76ch]`).
+ *
+ * No opacity, transform, filter, isolation or z-index on a row: it would trap
+ * its menus beneath later rows. */
+.msg-history {
+    /* The newest row's 2px bottom padding, so the bottom sentinel right below
+     * the history sits at the newest message's bottom (history-scrolling.md). */
+    margin-bottom: -2px;
+}
+
+.msg-history > :first-child {
+    margin-top: 0;
+}
+
+.msg-group {
+    margin-top: 14px;
+}
+
 .msg-row {
-    margin-inline: -0.5rem;
-    padding: 0.125rem 72px 0.125rem 0.5rem;
-    border-radius: 0.5rem;
+    --msg-gutter: 60px;
+    display: grid;
+    grid-template-columns: var(--msg-gutter) minmax(0, 1fr);
+    /* No right gutter on a hover pointer: the hover bar floats over the row. */
+    padding: 2px 24px 2px 0;
     transition: background-color 0.15s;
 }
 
 .msg-row:first-child {
-    padding-top: 0.5rem;
+    padding-top: 5px;
 }
 
-.msg-row:last-child {
-    padding-bottom: 0.5rem;
+/* Your own rows carry a faint tint (`--color-row-self`), on every row of the
+ * group. The hover rules below raise it to `--color-row-self-hover`, so the
+ * band and the tint never fight: a row has exactly one background. */
+.msg-row[data-message-self="true"] {
+    background-color: var(--color-row-self);
+}
+
+.msg-gutter {
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    min-width: 0;
+}
+
+/* The author's avatar: initials on a disc. Neutral grey until the room's
+ * avatar salt is known; `.msg-avatar-hued` colours it from `--avatar-hue`. */
+.msg-avatar {
+    --avatar-size: 36px;
+    width: var(--avatar-size);
+    height: var(--avatar-size);
+    flex: none;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 1px;
+    background-color: oklch(var(--avatar-l) 0 0);
+    color: oklch(var(--avatar-text-l) 0 0);
+    /* Capped, and clipped to the disc: initials() bounds the text to two
+     * glyphs, and nothing a nickname holds may spill past the circle. */
+    font-size: min(calc(var(--avatar-size) * 0.38), 15px);
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    line-height: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    user-select: none;
+    cursor: pointer;
+}
+
+.msg-avatar-hued {
+    background-color: oklch(var(--avatar-l) var(--avatar-c) var(--avatar-hue));
+    color: oklch(var(--avatar-text-l) 0.045 var(--avatar-hue));
+}
+
+/* Your own avatar: an accent ring, with the row's own background in the gap. */
+.msg-avatar-self {
+    outline: 1.5px solid var(--color-link);
+    outline-offset: 2px;
+}
+
+/* A continuation row's time, in the gutter, shown under a hover pointer. */
+.msg-gutter-time {
+    font-size: 11px;
+    line-height: 22px;
+    color: var(--color-text-muted);
+    font-variant-numeric: tabular-nums;
+    opacity: 0;
+    white-space: nowrap;
+}
+
+/* Others' names underline on hover; the accent colour belongs to your own. */
+.msg-author-name:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+/* The floating hover bar: at the row's top right, over the row above it,
+ * so no gutter is reserved for it. Idle, it is invisible AND takes no hits,
+ * so it never covers Latest (z-30); it rests at z-20, under Latest and the
+ * z-40 dismiss backdrops. Keyboard focus inside the row reveals it too
+ * (below). */
+.hover-actions {
+    position: absolute;
+    right: 0;
+    top: -1.125rem;
+    z-index: 20;
+    display: flex;
+    gap: 2px;
+    padding: 3px;
+    background-color: var(--color-panel);
+    border: 1px solid var(--color-border-hover);
+    border-radius: 0.5rem;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.1s;
+}
+
+.hover-actions button {
+    width: 30px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 0.375rem;
+    color: var(--color-text-muted);
+}
+
+.hover-actions button:hover,
+.hover-actions button:focus-visible {
+    background-color: var(--color-surface);
+    color: var(--color-text);
+}
+
+@media (hover: hover) {
+    .msg-row:hover .hover-actions {
+        opacity: 1;
+        pointer-events: auto;
+    }
+}
+
+/* Keyboard focus inside the row reveals the bar too. `:focus-visible`, not
+ * `:focus-within`: a mouse click on a chip or a reply strip focuses it, and
+ * `:focus-within` would keep the bar shown and clickable over the row above
+ * after the pointer had left. A separate rule, so a browser that does not
+ * know `:has()` drops only this one and keeps the hover reveal; such a
+ * browser has no keyboard-only reveal (an accepted trade-off). */
+@media (hover: hover) {
+    .msg-row:has(:focus-visible) .hover-actions {
+        opacity: 1;
+        pointer-events: auto;
+    }
 }
 
 /* Fine pointers only: a touchscreen laptop would otherwise keep a sticky
- * band. The band also stays while a reaction chip's reactor list is open
- * (the chip reports itself expanded). */
+ * band. */
 @media (hover: hover) and (not (any-pointer: coarse)) {
-    .msg-row:hover,
+    .msg-row:hover {
+        background-color: var(--color-row-hover);
+    }
+
+    .msg-row[data-message-self="true"]:hover {
+        background-color: var(--color-row-self-hover);
+    }
+
+    .msg-row:hover .msg-gutter-time {
+        opacity: 1;
+    }
+}
+
+/* The band also stays while a control the row opened is expanded (a reaction
+ * chip's reactor list). Its own rule, NOT a selector list with `:hover`
+ * above: a browser without `:has()` drops the whole rule it appears in, and
+ * must keep the plain hover band. */
+@media (hover: hover) and (not (any-pointer: coarse)) {
     .msg-row:has([aria-expanded="true"]) {
         background-color: var(--color-row-hover);
+    }
+
+    .msg-row[data-message-self="true"]:has([aria-expanded="true"]) {
+        background-color: var(--color-row-self-hover);
+    }
+}
+
+/* Join notices: one quiet line, the icon in the avatar gutter. */
+.msg-event {
+    display: grid;
+    grid-template-columns: var(--msg-gutter, 60px) minmax(0, 1fr);
+    align-items: center;
+    margin-top: 12px;
+    padding: 3px 24px 3px 0;
+    font-size: 13px;
+    line-height: 20px;
+    color: var(--color-text-muted);
+}
+
+.msg-event .msg-gutter {
+    align-items: center;
+}
+
+/* Date separators: a hairline with a label, centred over the text column
+ * (the avatar gutter plus the body's 76ch measure), not over the whole panel,
+ * so on a wide window the label stays near the text. 76ch of 15px body text
+ * is 95ch at this 12px size. */
+.msg-day {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin: 26px 24px 4px;
+    max-width: calc(var(--msg-gutter, 60px) - 24px + 95ch);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-text-muted);
+}
+
+.msg-day::before,
+.msg-day::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background-color: var(--color-border);
+}
+
+@media (max-width: 767px) {
+    .msg-row,
+    .msg-event {
+        --msg-gutter: 52px;
+        padding-right: 14px;
+    }
+
+    .msg-avatar {
+        --avatar-size: 32px;
+    }
+
+    .msg-day {
+        margin-inline: 14px;
+    }
+}
+
+/* A DM thread's rows: the room's row, without the kebab gutter (a DM has no
+ * per-message actions). */
+.msg-row.dm-row {
+    padding-right: 20px;
+}
+
+/* A DM's avatar opens nothing (the thread is already with that person), so
+ * it does not look clickable. */
+.msg-row.dm-row .msg-avatar {
+    cursor: default;
+}
+
+@media (max-width: 767px) {
+    .msg-row.dm-row {
+        padding-right: 14px;
+    }
+}
+
+/* The same disc in the member panel (28px) and the DM rail (22px). Not
+ * clickable on its own: the row around it is the control. */
+.msg-avatar.member-avatar {
+    --avatar-size: 28px;
+    margin-top: 0;
+    cursor: inherit;
+}
+
+.msg-avatar.dm-avatar {
+    --avatar-size: 22px;
+    margin-top: 0;
+    font-size: 9.5px;
+    cursor: inherit;
+}
+
+/* Touch: the kebab sits in a narrow right gutter, and there is no hover time
+ * or hover bar. */
+@media (hover: none) {
+    .msg-row {
+        padding-right: 40px;
+    }
+
+    .hover-actions {
+        display: none;
+    }
+}
+
+@media (hover: none), (any-pointer: coarse) {
+    .msg-gutter-time {
+        display: none;
     }
 }
 
@@ -111,12 +375,15 @@
     text-decoration: underline;
 }
 
+/* A mention of you: the same fill plus a ring, not a stronger fill. A
+ * stronger fill would take the chip's text under 4.5:1 on your own rows'
+ * tint. */
 .river-mention-self {
-    background-color: rgba(2, 101, 231, 0.28);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-link) 55%, transparent);
 }
 
 .river-mention:focus-visible {
-    outline: 2px solid var(--color-accent, #0265e7);
+    outline: 2px solid var(--color-link);
     outline-offset: 1px;
 }
 
@@ -126,7 +393,7 @@
 }
 
 @keyframes replyHighlight {
-    0% { background-color: rgba(59, 130, 246, 0.2); }
+    0% { background-color: color-mix(in srgb, var(--color-link) 20%, transparent); }
     100% { background-color: transparent; }
 }
 
@@ -162,11 +429,11 @@
 
 /* Touch-only message action affordance (freenet/river#402).
  *
- * The per-message hover action bar (reply / edit / delete) is built with
- * Tailwind `group-hover:` utilities, which Tailwind v4 automatically wraps in
- * `@media (hover: hover)`. On a touch device (phone, tablet) there is no hover
- * pointer, so that bar can NEVER become visible and touch users have no way to
- * reach reply / edit / delete / react.
+ * The per-message hover action bar (`.hover-actions` above) reveals only
+ * under `@media (hover: hover)` and is `display: none` under `(hover: none)`.
+ * On a touch device (phone, tablet) there is no hover pointer, so that bar
+ * can NEVER appear and touch users would have no way to reach reply / edit /
+ * delete / react.
  *
  * `.touch-actions` is the exact complement: hidden by default (so mouse users
  * keep the clean hover-reveal desktop UI) and shown only where `hover: none`

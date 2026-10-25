@@ -16,7 +16,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     };
 
     rsx! {
-        div { class: "mx-4 mb-4 p-4 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
+        div { class: "mx-4 mb-4 p-4 bg-warning-bg border-l-4 border-warning rounded-r-lg",
             p { class: "mb-3 text-sm text-text",
                 "You're not a member of this room yet. To join, go back to where you received your invite link and request a new one."
             }
@@ -31,7 +31,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
                     readonly: "true"
                 }
                 button {
-                    class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2",
+                    class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-sm font-medium rounded-lg transition-colors flex items-center gap-2",
                     onclick: copy_to_clipboard,
                     Icon { icon: FaCopy, width: 14, height: 14 }
                     span { "{button_text}" }

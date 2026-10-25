@@ -14,6 +14,9 @@ use crate::components::app::document_title::count_unread_in_room_data_with_mode;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::components::back_to_chat::BackToChatButton;
+use crate::components::icons::{
+    line_icon, IMPORT_ICON_PATH, JOIN_ICON_PATH, LOCK_ICON_PATH, PLUS_ICON_PATH, REORDER_ICON_PATH,
+};
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
 use crate::components::room_list::join_with_code_modal::JoinWithCodeModal;
@@ -21,10 +24,7 @@ use crate::room_data::CurrentRoom;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
-    icons::fa_solid_icons::{
-        FaArrowsUpDown, FaChevronDown, FaChevronUp, FaComments, FaFileImport, FaLock, FaPlus,
-        FaRightToBracket, FaTriangleExclamation,
-    },
+    icons::fa_solid_icons::{FaChevronDown, FaChevronUp, FaTriangleExclamation},
     Icon,
 };
 use ed25519_dalek::VerifyingKey;
@@ -407,7 +407,7 @@ pub fn RoomList() -> Element {
             // tests anchor on this testid instead of the brittle visible
             // text "Rooms".
             "data-testid": "rooms-rail",
-            class: "w-full md:w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
+            class: "w-full md:w-64 flex-shrink-0 bg-rail border-r border-border flex flex-col overflow-y-auto",
             // Mobile back button (hidden on desktop)
             div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
                 BackToChatButton {
@@ -415,21 +415,33 @@ pub fn RoomList() -> Element {
                     icon_size: 16,
                     testid: "rooms-back-to-chat-button",
                 }
-                span { class: "ml-2 text-sm font-semibold text-text", "Rooms" }
-            }
-            div { class: "p-4 hidden md:flex justify-center",
-                img {
-                    class: "w-24 h-24",
-                    src: asset!("/assets/river_logo.svg"),
-                    alt: "River Logo"
+                // The brand, as the desktop rail shows it; the section
+                // heading below already says "Rooms".
+                div { "data-testid": "rail-brand-mobile", class: "ml-2 flex items-center gap-2.5",
+                    img {
+                        class: "w-[30px] h-[30px]",
+                        src: asset!("/assets/river_logo.svg"),
+                        alt: ""
+                    }
+                    span { class: "text-[18px] font-bold tracking-[-0.01em] text-text", "River" }
                 }
+            }
+            // Brand row (desktop): the dolphin and the wordmark.
+            div {
+                "data-testid": "rail-brand",
+                class: "hidden md:flex items-center gap-2.5 h-[60px] px-[18px] flex-shrink-0",
+                img {
+                    class: "w-[30px] h-[30px]",
+                    src: asset!("/assets/river_logo.svg"),
+                    alt: ""
+                }
+                span { class: "text-[18px] font-bold tracking-[-0.01em] text-text", "River" }
             }
 
             // Rooms header with create button
-            div { class: "px-4 py-2 flex items-center justify-between",
-                h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",
-                    Icon { width: 16, height: 16, icon: FaComments }
-                    span { "Rooms" }
+            div { class: "pl-[18px] pr-3 pt-3.5 pb-1.5 flex items-center justify-between",
+                h2 { class: "text-xs font-semibold text-text-muted",
+                    "Rooms"
                 }
                 div { class: "flex items-center gap-1",
                     // Reorder-mode toggle — the touch-friendly path to room
@@ -443,9 +455,9 @@ pub fn RoomList() -> Element {
                             class: format!(
                                 "p-1.5 rounded-md transition-colors {}",
                                 if reorder_now {
-                                    "text-accent bg-accent/10"
+                                    "text-link bg-accent-soft"
                                 } else {
-                                    "text-text-muted hover:text-accent hover:bg-surface"
+                                    "text-text-muted hover:text-text hover:bg-surface"
                                 },
                             ),
                             title: if reorder_now { "Done reordering" } else { "Reorder rooms" },
@@ -461,12 +473,12 @@ pub fn RoomList() -> Element {
                                     reorder_mode.set(next);
                                 });
                             },
-                            Icon { width: 14, height: 14, icon: FaArrowsUpDown }
+                            {line_icon(REORDER_ICON_PATH, 15)}
                         }
                     }
                     button {
                         "data-testid": "create-room-button",
-                        class: "p-1.5 rounded-md text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                        class: "p-1 rounded-md text-text-muted hover:text-text hover:bg-surface transition-colors",
                         title: "Create Room",
                         // Signal mutation from an event handler must be deferred
                         // (dioxus-signal-safety: direct writes here are the
@@ -476,7 +488,7 @@ pub fn RoomList() -> Element {
                                 CREATE_ROOM_MODAL.write().show = true;
                             });
                         },
-                        Icon { width: 14, height: 14, icon: FaPlus }
+                        {line_icon(PLUS_ICON_PATH, 15)}
                     }
                 }
             }
@@ -495,7 +507,7 @@ pub fn RoomList() -> Element {
             // Room list
             ul {
                 "data-testid": "room-list",
-                class: "flex-1 px-2 py-1 space-y-0.5",
+                class: "flex-1 px-2.5 py-0.5 space-y-0.5",
 
                 // Non-room states (freenet/river#397). Shown only when there are
                 // no rooms to render — the room-item map and tail drop zone below
@@ -652,11 +664,15 @@ pub fn RoomList() -> Element {
                             div { class: "flex items-center",
                             button {
                                 class: format!(
-                                    "flex-1 min-w-0 text-left px-3 py-2 rounded-lg text-sm transition-colors {}",
+                                    "flex-1 min-w-0 text-left px-2.5 h-[34px] rounded-lg text-[14.5px] transition-colors {}",
+                                    // The open room is raised and semibold, not
+                                    // blue: the accent is for counts and your name.
                                     if is_current {
-                                        "bg-accent/10 text-accent font-medium"
+                                        "bg-surface text-text font-semibold"
+                                    } else if unread > 0 {
+                                        "text-text font-semibold hover:bg-surface/60"
                                     } else {
-                                        "text-text hover:bg-surface"
+                                        "text-text-secondary hover:text-text hover:bg-surface/60"
                                     }
                                 ),
                                 onclick: move |_| {
@@ -684,7 +700,7 @@ pub fn RoomList() -> Element {
                                             class: "flex-shrink-0 text-text-muted",
                                             title: "Private room (members-only, end-to-end encrypted)",
                                             "aria-label": "Private room",
-                                            Icon { width: 12, height: 12, icon: FaLock }
+                                            {line_icon(LOCK_ICON_PATH, 14)}
                                         }
                                     }
                                     // Unread badge, absent for Muted rooms
@@ -701,9 +717,9 @@ pub fn RoomList() -> Element {
                                     if unread > 0 {
                                         span {
                                             class: if is_current {
-                                                "ml-2 flex-shrink-0 inline-flex md:hidden items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white"
+                                                "ml-2 flex-shrink-0 inline-flex md:hidden items-center justify-center min-w-5 h-[18px] px-1.5 rounded-full text-[11.5px] font-bold tabular-nums bg-accent-soft text-link"
                                             } else {
-                                                "ml-2 flex-shrink-0 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white"
+                                                "ml-2 flex-shrink-0 inline-flex items-center justify-center min-w-5 h-[18px] px-1.5 rounded-full text-[11.5px] font-bold tabular-nums bg-accent-soft text-link"
                                             },
                                             "data-testid": "room-unread-badge",
                                             title: "{badge_title}",
@@ -719,7 +735,7 @@ pub fn RoomList() -> Element {
                                         // failed GET/PUT send. Show a warning marker (tooltip = the
                                         // stored error message) instead of a perpetual spinner.
                                         span {
-                                            class: "flex-shrink-0 text-red-600 dark:text-red-400",
+                                            class: "flex-shrink-0 text-danger",
                                             title: "{err_msg}",
                                             "aria-label": "Room sync failed",
                                             Icon { width: 12, height: 12, icon: FaTriangleExclamation }
@@ -869,22 +885,24 @@ pub fn RoomList() -> Element {
             // first-load experience.
             DmRailSection {}
 
-            // Bottom actions
-            div { class: "p-3 border-t border-border space-y-2",
+            // Bottom actions: visible, quiet and outlined, since they are how
+            // a newcomer joins a room or restores an identity.
+            div { class: "px-3 pt-2.5 pb-2.5 space-y-1.5 flex-shrink-0",
                 // Enter a portable invite code (freenet/river#381). Lets a user
                 // join a room from a bare code — no host-baked link needed —
                 // which is the only practical path on hosts like try.freenet.org.
                 button {
                     "data-testid": "join-with-code-button",
-                    class: "w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
+                    class: "{RAIL_ACTION_CLASS}",
                     onclick: move |_| join_code_modal_active.set(true),
-                    Icon { width: 14, height: 14, icon: FaRightToBracket }
-                    span { "Enter Invite Code" }
+                    {line_icon(JOIN_ICON_PATH, 15)}
+                    span { "Enter invite code" }
                 }
                 button {
-                    class: "w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
+                    "data-testid": "import-id-button",
+                    class: "{RAIL_ACTION_CLASS}",
                     onclick: move |_| import_modal_active.set(true),
-                    Icon { width: 14, height: 14, icon: FaFileImport }
+                    {line_icon(IMPORT_ICON_PATH, 15)}
                     span { "Import ID" }
                 }
             }
@@ -894,11 +912,13 @@ pub fn RoomList() -> Element {
             // (Bug #5, Ivvor on Matrix 2026-05-17). Previously lived in the
             // right-hand member panel, which is hidden when no room is
             // selected.
-            ConnectionStatusIndicator {}
-
-            // Build info (local time)
-            div { class: "px-3 py-2 text-xs text-text-muted text-center",
-                {"Built: "} {format_build_time_local()}
+            // Footer: the connection state and the build.
+            div { "data-testid": "rail-footer", class: "border-t border-border pt-2.5 pb-3 flex-shrink-0",
+                ConnectionStatusIndicator {}
+                // Build info (local time)
+                div { class: "px-4 pt-1 text-[11.5px] text-text-muted",
+                    {"Built: "} {format_build_time_local()}
+                }
             }
         }
         ImportIdentityModal {
@@ -909,6 +929,9 @@ pub fn RoomList() -> Element {
         }
     }
 }
+
+/// The rail's bottom actions: quiet outlined buttons, not filled ones.
+const RAIL_ACTION_CLASS: &str = "w-full flex items-center gap-2 h-[34px] px-2.5 rounded-lg border border-border-hover text-[13.5px] font-medium text-text-secondary hover:text-text hover:bg-surface transition-colors";
 
 #[cfg(test)]
 mod tests {

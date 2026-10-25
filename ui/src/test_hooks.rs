@@ -93,6 +93,26 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // `count` DMs from test peer `peer`, labelled like `appendDmsForPeer`'s,
+    // across exactly two local days, yesterday and today, whatever the time
+    // (`two_day_stamp`). The thread shows a day break between.
+    set_hook(
+        "appendDmsAcrossDaysForPeer",
+        Closure::<dyn FnMut(u32, u32)>::new(move |peer: u32, count: u32| {
+            let peer = dm_peer(peer);
+            crate::util::defer(move || {
+                deliver_dms(
+                    peer,
+                    (0..count)
+                        .map(|i| format!("{} {i:02}", peer.history_label))
+                        .collect(),
+                    DmStamp::TwoDays,
+                )
+            });
+        })
+        .into_js_value(),
+    );
+
     // One inbound DM from test peer `peer`, stamped after every DM in the
     // thread so it renders as the newest.
     set_hook(
@@ -178,6 +198,54 @@ pub fn install_test_hooks() {
         Closure::<dyn FnMut(js_sys::Array)>::new(move |emojis: js_sys::Array| {
             let emojis: Vec<String> = emojis.iter().filter_map(|e| e.as_string()).collect();
             crate::util::defer(move || add_reactions_to_newest(emojis));
+        })
+        .into_js_value(),
+    );
+
+    // Replace the current room's avatar salt with 32 copies of `fill`, or
+    // remove it with `null`, so a spec can see both the neutral disc and two
+    // different salts colouring one member differently.
+    set_hook(
+        "setAvatarSalt",
+        Closure::<dyn FnMut(JsValue)>::new(move |fill: JsValue| {
+            let fill = fill.as_f64().map(|f| f as u8);
+            crate::util::defer(move || {
+                let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+                    return;
+                };
+                let key = room_key.to_bytes();
+                crate::avatar_salt::AVATAR_SALTS.with_mut(|salts| match fill {
+                    Some(b) => {
+                        salts.insert(key, [b; 32]);
+                    }
+                    None => {
+                        salts.remove(&key);
+                    }
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
+    // Append `count` join events in ONE mutation, from the alternating
+    // appended identities ("Test Sender A" / "Test Sender B"), so two fold into
+    // one "A and B joined" notice.
+    set_hook(
+        "appendJoinEvents",
+        Closure::<dyn FnMut(u32)>::new(move |count: u32| {
+            crate::util::defer(move || {
+                with_current_room_mut(|room, room_key| {
+                    for _ in 0..count {
+                        push_test_body(
+                            room,
+                            room_key,
+                            RoomMessageBody::join_event(),
+                            Delivery::Append,
+                        );
+                    }
+                    prune_to_cap(room);
+                });
+            });
         })
         .into_js_value(),
     );
@@ -375,7 +443,7 @@ enum Delivery {
     Append,
     /// One position from the end — the mid-list insert that grows the history
     /// WITHOUT remounting its last row, which is the case the old
-    /// `onmounted`-on-the-last-bubble scroll trigger could not see.
+    /// `onmounted`-on-the-last-message scroll trigger could not see.
     BeforeLast,
 }
 
@@ -476,6 +544,17 @@ fn push_test_message(
     text: String,
     delivery: Delivery,
 ) {
+    push_test_body(room, room_key, RoomMessageBody::public(text), delivery);
+}
+
+/// Insert `content` into `room` where `delivery` says, as that delivery's
+/// test identity.
+fn push_test_body(
+    room: &mut RoomData,
+    room_key: &VerifyingKey,
+    content: RoomMessageBody,
+    delivery: Delivery,
+) {
     let (sk, nickname) = test_author(delivery);
     let author = MemberId::from(&sk.verifying_key());
     admit_with_nickname(room, room_key, &sk, nickname);
@@ -485,7 +564,7 @@ fn push_test_message(
         MessageV1 {
             room_owner: MemberId::from(room_key),
             author,
-            content: RoomMessageBody::public(text),
+            content,
             time,
         },
         &sk,
@@ -637,10 +716,45 @@ fn append_dm_history(peer: &DmPeer, count: u32) {
 enum DmStamp {
     /// A minute apart, the last one a minute ago.
     History,
+    /// The second half between local midnight and now (a minute apart when
+    /// there is room, closer just after midnight), the first half the same
+    /// times a day earlier: today and yesterday at any time of day.
+    TwoDays,
     /// Now, or one second after the thread's newest DM if that is later, so
     /// the delivery sorts last even within one second of the previous one
     /// (the thread orders same-second DMs by signature).
     Newest,
+}
+
+/// The `i`th of `count` `DmStamp::TwoDays` timestamps: the second half's
+/// slots fall between local midnight and `now`, and the first half reuses
+/// the same slots a day earlier, so the thread spans exactly yesterday and
+/// today whatever the time (a spec stamped "now less a few minutes" failed
+/// just after midnight).
+fn two_day_stamp(i: u64, count: u64, now: u64) -> u64 {
+    let midnight = {
+        let d = js_sys::Date::new_0();
+        d.set_hours(0);
+        d.set_minutes(0);
+        d.set_seconds(0);
+        d.set_milliseconds(0);
+        (d.get_time() / 1000.0) as u64
+    };
+    let half = count / 2;
+    let today = count - half;
+    let slot = if i < half { i } else { i - half };
+    let spacing = (now.saturating_sub(midnight) / (today + 1)).min(60);
+    let at = now.saturating_sub((today - slot) * spacing);
+    if i < half {
+        // The same wall-clock time on the previous calendar day: the day
+        // after a DST change, yesterday was not 86,400 s (nor midnight plus
+        // today's offset) long.
+        let d = js_sys::Date::new(&JsValue::from_f64(at as f64 * 1000.0));
+        d.set_date(d.get_date() - 1);
+        (d.get_time() / 1000.0) as u64
+    } else {
+        at
+    }
 }
 
 /// Deliver `texts` from `peer` to self in the current room, in ONE `ROOMS`
@@ -664,7 +778,7 @@ fn deliver_dms(peer: &DmPeer, texts: Vec<String>, stamp: DmStamp) {
             .unwrap_or(0);
         let count = texts.len() as u64;
         let (first, step) = match stamp {
-            DmStamp::History => (now.saturating_sub(count * 60), 60),
+            DmStamp::History | DmStamp::TwoDays => (now.saturating_sub(count * 60), 60),
             DmStamp::Newest => (
                 room.room_state
                     .direct_messages
@@ -683,7 +797,10 @@ fn deliver_dms(peer: &DmPeer, texts: Vec<String>, stamp: DmStamp) {
             .into_iter()
             .zip(0..)
             .filter_map(|(text, i)| {
-                let ts = first + i * step;
+                let ts = match stamp {
+                    DmStamp::TwoDays => two_day_stamp(i, count, now),
+                    _ => first + i * step,
+                };
                 compose_direct_message(&peer_sk, &self_vk, &room_key, ts, now, text.as_bytes())
                     .inspect_err(|e| {
                         web_sys::console::error_1(&format!("__riverTest DM compose: {e}").into())

@@ -772,13 +772,17 @@ impl ResponseHandler {
                             }
                         }
                         _ => {
-                            warn!("Unhandled delegate response: {:?}", v);
+                            warn!(
+                                "Unhandled delegate response: {}",
+                                outbound_delegate_msg_kind(v)
+                            );
                         }
                     }
                 }
             }
             _ => {
-                warn!("Unhandled API response: {:?}", response);
+                // `Display`: the kind and contract key, never the state.
+                warn!("Unhandled API response: {}", response);
             }
         }
         Ok(flags)
@@ -1006,7 +1010,11 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                         worker.mark_fetch_failure();
                     }
                     Ok(other) => {
-                        error!("Unexpected response loading room {:?}: {:?}", vk, other);
+                        error!(
+                            "Unexpected response loading room {:?}: {}",
+                            vk,
+                            describe_delegate_response(&other)
+                        );
                         had_fetch_error = true;
                         worker.mark_fetch_failure();
                     }
@@ -1528,10 +1536,8 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
                 // mirror the current-delegate per-room path (review 10 P2#2), or a
                 // listed room silently fails to materialize and the idle resolver
                 // shows a false Empty.
-                error!(
-                    "Unexpected response loading legacy room {:?}: {:?}",
-                    vk, other
-                );
+                let reply = describe_delegate_response(&other);
+                error!("Unexpected response loading legacy room {vk:?}: {reply}");
                 worker.mark_fetch_failure();
             }
             Err(e) => {
@@ -2528,7 +2534,14 @@ fn delegate_storage_key_str(key: &ChatDelegateKey) -> String {
             if s.len() <= MAX {
                 s.to_string()
             } else {
-                format!("{}...({} chars)", &s[..MAX], s.len())
+                // Cut on a char boundary at or below MAX bytes: slicing a
+                // multi-byte char in half panics, and this runs on every
+                // request in a debug build.
+                let mut cut = MAX;
+                while !s.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}...({} bytes)", &s[..cut], s.len())
             }
         }
         _ => format!("<{} bytes>", key.as_bytes().len()),
@@ -2542,7 +2555,7 @@ fn delegate_storage_key_str(key: &ChatDelegateKey) -> String {
 /// console bytes River emits during startup** (freenet/river#569), and the
 /// per-key bytes were never what anyone read. This keeps the variant, the key
 /// names and the sizes -- everything the logs were actually used for.
-fn describe_delegate_response(r: &ChatDelegateResponseMsg) -> String {
+pub(crate) fn describe_delegate_response(r: &ChatDelegateResponseMsg) -> String {
     use ChatDelegateResponseMsg as R;
     match r {
         R::GetResponse { key, value } => format!(
@@ -2662,6 +2675,124 @@ fn describe_delegate_response(r: &ChatDelegateResponseMsg) -> String {
     }
 }
 
+/// One-line summary of a delegate REQUEST, replacing its full `Debug`: the
+/// variant, the storage key (as text, or its byte count), room fingerprints,
+/// request ids and payload LENGTHS. Never a stored value, a signing key or a
+/// payload to be signed: a `CasStoreRequest` can carry the viewer-only avatar
+/// seed, `StoreSigningKey` a member's private key, and a stored value a room's
+/// whole slot with its signing key, all of which the derived `Debug` prints.
+/// Exhaustive, no catch-all, so a new variant cannot fall through to `Debug`.
+pub(crate) fn describe_delegate_request(r: &ChatDelegateRequestMsg) -> String {
+    use ChatDelegateRequestMsg as Q;
+    let signed = |name: &str,
+                  room_key: &river_core::chat_delegate::RoomKey,
+                  request_id: &u64,
+                  payload: &[u8]| {
+        format!(
+            "{name} {{ room: {}, request_id: {request_id}, payload: {} bytes }}",
+            room_key_fp(room_key),
+            payload.len()
+        )
+    };
+    match r {
+        Q::StoreRequest { key, value } => format!(
+            "StoreRequest {{ key: {}, value: {} bytes }}",
+            delegate_storage_key_str(key),
+            value.len()
+        ),
+        Q::GetRequest { key } => format!("GetRequest {{ key: {} }}", delegate_storage_key_str(key)),
+        Q::DeleteRequest { key } => {
+            format!("DeleteRequest {{ key: {} }}", delegate_storage_key_str(key))
+        }
+        Q::ListRequest => "ListRequest".to_string(),
+        Q::GetVersionedRequest { key } => format!(
+            "GetVersionedRequest {{ key: {} }}",
+            delegate_storage_key_str(key)
+        ),
+        Q::CasStoreRequest {
+            key,
+            value,
+            expected_generation,
+        } => format!(
+            "CasStoreRequest {{ key: {}, value: {} bytes, expected_generation: {expected_generation} }}",
+            delegate_storage_key_str(key),
+            value.len()
+        ),
+        Q::StoreSigningKey {
+            room_key,
+            signing_key_bytes: _,
+        } => format!("StoreSigningKey {{ room: {} }}", room_key_fp(room_key)),
+        Q::GetPublicKey { room_key } => {
+            format!("GetPublicKey {{ room: {} }}", room_key_fp(room_key))
+        }
+        Q::SignMessage {
+            room_key,
+            request_id,
+            message_bytes,
+        } => signed("SignMessage", room_key, request_id, message_bytes),
+        Q::SignMember {
+            room_key,
+            request_id,
+            member_bytes,
+        } => signed("SignMember", room_key, request_id, member_bytes),
+        Q::SignBan {
+            room_key,
+            request_id,
+            ban_bytes,
+        } => signed("SignBan", room_key, request_id, ban_bytes),
+        Q::SignConfig {
+            room_key,
+            request_id,
+            config_bytes,
+        } => signed("SignConfig", room_key, request_id, config_bytes),
+        Q::SignMemberInfo {
+            room_key,
+            request_id,
+            member_info_bytes,
+        } => signed("SignMemberInfo", room_key, request_id, member_info_bytes),
+        Q::SignSecretVersion {
+            room_key,
+            request_id,
+            record_bytes,
+        } => signed("SignSecretVersion", room_key, request_id, record_bytes),
+        Q::SignEncryptedSecret {
+            room_key,
+            request_id,
+            secret_bytes,
+        } => signed("SignEncryptedSecret", room_key, request_id, secret_bytes),
+        Q::SignUpgrade {
+            room_key,
+            request_id,
+            upgrade_bytes,
+        } => signed("SignUpgrade", room_key, request_id, upgrade_bytes),
+        Q::EnsureRoomSubscription {
+            room_owner_vk,
+            request_id,
+            contract_id: _,
+        } => format!(
+            "EnsureRoomSubscription {{ room: {}, request_id: {request_id} }}",
+            room_key_fp(room_owner_vk)
+        ),
+    }
+}
+
+/// The variant name of an outbound delegate message, for logs. Its `Debug`
+/// prints the payload: an application message's bytes, or a delegate's whole
+/// `DelegateContext` (`ContextUpdated`). Exhaustive, so a new variant is a
+/// compile error here rather than a fallback to `Debug`.
+pub(crate) fn outbound_delegate_msg_kind(m: &OutboundDelegateMsg) -> &'static str {
+    match m {
+        OutboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
+        OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput",
+        OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated",
+        OutboundDelegateMsg::GetContractRequest(_) => "GetContractRequest",
+        OutboundDelegateMsg::PutContractRequest(_) => "PutContractRequest",
+        OutboundDelegateMsg::UpdateContractRequest(_) => "UpdateContractRequest",
+        OutboundDelegateMsg::SubscribeContractRequest(_) => "SubscribeContractRequest",
+        OutboundDelegateMsg::SendDelegateMessage(_) => "SendDelegateMessage",
+    }
+}
+
 /// Short fingerprint of a room key (a 32-byte verifying key) for logs.
 fn room_key_fp(room_key: &river_core::chat_delegate::RoomKey) -> String {
     let head: String = room_key
@@ -2674,6 +2805,222 @@ fn room_key_fp(room_key: &river_core::chat_delegate::RoomKey) -> String {
 
 #[cfg(test)]
 mod tests {
+    // --- secrets never reach the console (Codex, PR #823) ---
+
+    /// Every rendering a byte could take in a log line: decimal (`Debug` of a
+    /// `Vec<u8>` or array) and hex, either case.
+    fn renderings(byte: u8) -> [String; 3] {
+        [
+            byte.to_string(),
+            format!("{byte:02x}"),
+            format!("{byte:02X}"),
+        ]
+    }
+
+    /// The request summary names the variant, the key and the LENGTH of
+    /// anything secret, and never the bytes of a stored value (a CAS of the
+    /// viewer-only avatar seed), a signing key, or a payload to be signed.
+    #[test]
+    fn a_request_summary_never_contains_a_value_or_a_key() {
+        use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg as Q};
+        // 0xC3 = 195: a byte no key, room fingerprint or count below contains.
+        const SECRET: u8 = 0xC3;
+        let room = [0x11u8; 32];
+        let seed = crate::avatar_salt::AvatarSeedRecord {
+            created_at_ms: 7,
+            seed: [SECRET; 32],
+        };
+        let seed_cas = Q::CasStoreRequest {
+            key: ChatDelegateKey::new(crate::avatar_salt::AVATAR_SEED_STORAGE_KEY.to_vec()),
+            value: seed.encode(),
+            expected_generation: 4,
+        };
+        let requests = vec![
+            seed_cas.clone(),
+            Q::StoreRequest {
+                key: ChatDelegateKey::new(b"room:abc".to_vec()),
+                value: vec![SECRET; 40],
+            },
+            Q::StoreSigningKey {
+                room_key: room,
+                signing_key_bytes: [SECRET; 32],
+            },
+            Q::SignMessage {
+                room_key: room,
+                request_id: 9,
+                message_bytes: vec![SECRET; 12],
+            },
+            Q::SignMember {
+                room_key: room,
+                request_id: 9,
+                member_bytes: vec![SECRET; 12],
+            },
+            Q::SignBan {
+                room_key: room,
+                request_id: 9,
+                ban_bytes: vec![SECRET; 12],
+            },
+            Q::SignConfig {
+                room_key: room,
+                request_id: 9,
+                config_bytes: vec![SECRET; 12],
+            },
+            Q::SignMemberInfo {
+                room_key: room,
+                request_id: 9,
+                member_info_bytes: vec![SECRET; 12],
+            },
+            Q::SignSecretVersion {
+                room_key: room,
+                request_id: 9,
+                record_bytes: vec![SECRET; 12],
+            },
+            Q::SignEncryptedSecret {
+                room_key: room,
+                request_id: 9,
+                secret_bytes: vec![SECRET; 12],
+            },
+            Q::SignUpgrade {
+                room_key: room,
+                request_id: 9,
+                upgrade_bytes: vec![SECRET; 12],
+            },
+        ];
+        for request in &requests {
+            let line = super::describe_delegate_request(request);
+            for r in renderings(SECRET) {
+                assert!(!line.contains(&r), "{line:?} leaks {r}");
+            }
+            // The check is not vacuous: the derived Debug does leak.
+            let debug = format!("{request:?}");
+            assert!(renderings(SECRET).iter().any(|r| debug.contains(r)));
+        }
+        let seed_line = super::describe_delegate_request(&seed_cas);
+        assert!(seed_line.contains("CasStoreRequest"), "{seed_line}");
+        assert!(
+            seed_line.contains("river_avatar_colour_seed_v1"),
+            "{seed_line}"
+        );
+        assert!(
+            seed_line.contains(&format!("value: {} bytes", seed.encode().len())),
+            "{seed_line}"
+        );
+    }
+
+    /// The replies that can carry a secret (a stored value, the seed) are
+    /// summarised by length too.
+    #[test]
+    fn a_response_summary_never_contains_a_value() {
+        use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateResponseMsg as R};
+        const SECRET: u8 = 0xC3;
+        let key = ChatDelegateKey::new(crate::avatar_salt::AVATAR_SEED_STORAGE_KEY.to_vec());
+        for response in [
+            R::GetResponse {
+                key: key.clone(),
+                value: Some(vec![SECRET; 40]),
+            },
+            R::GetVersionedResponse {
+                key: key.clone(),
+                value: Some(vec![SECRET; 40]),
+                generation: 2,
+            },
+            R::CasStoreResponse {
+                key,
+                result: river_core::chat_delegate::CasStoreResult::Conflict {
+                    current_generation: 2,
+                    current_value: Some(vec![SECRET; 40]),
+                },
+            },
+        ] {
+            let line = super::describe_delegate_response(&response);
+            for r in renderings(SECRET) {
+                assert!(!line.contains(&r), "{line:?} leaks {r}");
+            }
+        }
+    }
+
+    /// A key over the 128-byte cap with a multi-byte char straddling the cut
+    /// must not panic (a byte slice there splits the char), and is cut on a
+    /// char boundary at or below the cap.
+    #[test]
+    fn a_long_non_ascii_key_is_cut_on_a_char_boundary() {
+        // 127 ASCII bytes, then 2-byte chars: byte 128 falls inside one.
+        let text = format!("{}{}", "k".repeat(127), "é".repeat(20));
+        assert!(!text.is_char_boundary(128));
+        let line =
+            super::delegate_storage_key_str(&ChatDelegateKey::new(text.clone().into_bytes()));
+        assert!(line.starts_with(&"k".repeat(127)), "{line}");
+        assert!(
+            line.ends_with(&format!("...({} bytes)", text.len())),
+            "{line}"
+        );
+        // And through the request summary, which runs on every request.
+        let request = river_core::chat_delegate::ChatDelegateRequestMsg::GetRequest {
+            key: ChatDelegateKey::new(text.into_bytes()),
+        };
+        assert!(super::describe_delegate_request(&request).starts_with("GetRequest"));
+    }
+
+    /// The two lines that log EVERY delegate request and response in a dev
+    /// build go through the summaries, not `Debug`.
+    #[test]
+    fn the_send_and_receive_logs_use_the_summaries() {
+        let src = crate::util::strip_comments(include_str!("../chat_delegate.rs"));
+        let body = |sig: &str| {
+            let start = src.find(sig).expect(sig);
+            let rest = &src[start..];
+            rest[..rest.find("\n}\n").expect("function end")].to_string()
+        };
+        let send = body("\nasync fn enqueue_delegate_request_inner(");
+        assert!(send.contains("describe_delegate_request(&request)"));
+        assert!(!send.contains("{:?}\", request"));
+        let receive = body("\npub(crate) async fn await_delegate_response_outcome(");
+        assert!(receive.contains("describe_delegate_response(&resp)"));
+        assert!(!receive.contains("{:?}\", resp"));
+    }
+
+    /// The two logs of an unhandled outbound delegate message (one a
+    /// release-build `warn!`) print its variant name, never its `Debug`,
+    /// which carries the payload or a whole `DelegateContext`.
+    #[test]
+    fn the_outbound_message_logs_print_only_the_kind() {
+        let statement = |src: &str, needle: &str| {
+            let src = crate::util::strip_comments(src);
+            let start = src.find(needle).expect(needle);
+            let rest = &src[start..];
+            rest[..rest.find(");").expect("statement end")].to_string()
+        };
+        for (src, needle) in [
+            (
+                include_str!("response_handler.rs"),
+                "\"Unhandled delegate response",
+            ),
+            (
+                include_str!("freenet_synchronizer.rs"),
+                "\"Value #{} is: {}\"",
+            ),
+        ] {
+            let log = statement(src, needle);
+            assert!(log.contains("outbound_delegate_msg_kind(v)"), "{log}");
+            assert!(!log.contains("{:?}"), "{log}");
+        }
+    }
+
+    #[test]
+    fn outbound_delegate_msg_kind_names_the_variant_only() {
+        let payload = vec![0xC3u8; 16];
+        let msg = OutboundDelegateMsg::ApplicationMessage(
+            freenet_stdlib::prelude::ApplicationMessage::new(payload),
+        );
+        let kind = super::outbound_delegate_msg_kind(&msg);
+        assert_eq!(kind, "ApplicationMessage");
+        // The derived Debug does print the payload; the kind does not.
+        assert!(format!("{msg:?}").contains("195"));
+        for r in ["195", "c3", "C3"] {
+            assert!(!kind.contains(r));
+        }
+    }
+
     // --- startup console volume (freenet/river#569) ---
 
     /// A `ListResponse` summary must name its keys and stay small. Its `Debug`

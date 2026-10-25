@@ -7,10 +7,20 @@
 
 /* Design tokens for River chat UI */
 @theme {
-  /* Brand accent - dolphin blue */
-  --color-accent: #0265e7;
-  --color-accent-hover: #0255c7;
-  --color-accent-soft: oklch(from #0265e7 l c h / 12%);
+  /* The accent, a muted blue used thinly. Every accent colour in the app is
+     one of the tokens here and in the two `:root` blocks below; nothing else
+     names an accent hex, so a new accent is a change to these lines.
+     - --color-accent: the accent itself (rings, borders, the faint
+       `bg-accent/N` tints). Lighter in the dark theme. Nothing in the app
+       is a solid accent fill carrying white text any more, so it no longer
+       has to stay dark there.
+     - --color-link (`:root`): accent TEXT and lines — your own name, links,
+       mentions, focus rings, your avatar's ring, your rows' tint. Lighter in
+       the dark theme, so it clears 4.5:1 on the dark panel.
+     - --color-accent-soft (`:root`): the faint fill under accent text
+       (mention chips, your reactions). */
+  --color-accent: oklch(0.50 0.11 262);
+  --color-accent-hover: oklch(0.44 0.11 262);
 
   /* Status colors */
   --color-success: #22c55e;
@@ -21,8 +31,9 @@
   --spacing-message-gap: 0.25rem;
   --spacing-block-gap: 1rem;
 
-  /* Font settings */
-  --font-family-sans: 'Lato', system-ui, sans-serif;
+  /* Lato is bundled (ui/src/fonts.rs). `--font-sans` is the token Tailwind's
+     `font-sans` utility reads, and the body rule below uses it too. */
+  --font-sans: 'Lato', system-ui, sans-serif;
 }
 
 /* Light mode colors (default) */
@@ -37,16 +48,45 @@
   --color-text-muted: #6b6b6b;
   --color-text-quote: #5c5c5c;
   --color-text-inverse: #ffffff;
-  /* Text links and mentions: 4.5:1 on the row, its hover band and a mention chip. */
-  --color-link: #024cb0;
-  --color-link-hover: #013b8a;
+  /* Accent text (see @theme): 4.5:1 on the row, its hover band, your rows'
+     tint and a mention chip, in both themes (message-contrast.spec.ts). */
+  --color-link: var(--color-accent);
+  --color-link-hover: oklch(0.42 0.11 262);
   --color-success-bg: #f0fdf4;
   --color-warning-bg: #fefce8;
   --color-error-bg: #fef2f2;
-  --color-accent-soft: oklch(from #0265e7 l c h / 12%);
+  --color-accent-soft: color-mix(in srgb, var(--color-link) 9%, transparent);
   /* Message-row hover band. Derived from the surface token, so the dark
      value follows the dark --color-surface below. */
   --color-row-hover: color-mix(in srgb, var(--color-surface) 40%, transparent);
+  /* The side rails sit darker than the conversation, which is the lifted
+     --color-panel surface. */
+  --color-rail: #f4f4f6;
+  /* Secondary text (names in a join notice, a reply strip's author, tags). */
+  --color-text-secondary: #484850;
+  /* The similar-name warning's text; 4.5:1 on every row surface and on
+     --color-warning-bg. */
+  --color-warning-text: #8a5800;
+  /* Status, all through tokens (no raw palette classes): a destructive
+     action's fill (white text 4.5:1 and more in both themes) and its hover;
+     error and success TEXT, 4.5:1 on the panel and on their own *-bg
+     callout. Pinned in both themes by status-contrast.spec.ts (the rendered
+     surfaces and the token pairs). A callout's colour is carried by a left rule
+     (`border-warning` / `border-danger`); its body text stays --color-text. */
+  --color-danger: #b42318;
+  --color-danger-hover: #912018;
+  --color-danger-text: #b42318;
+  --color-success-text: #067647;
+  /* Your own rows: a faint tint of the link colour over the conversation
+     surface, stronger under the pointer. Opaque, so the hover band (which is
+     translucent) never has to be layered over it. */
+  --color-row-self: color-mix(in srgb, var(--color-link) 6%, var(--color-panel));
+  --color-row-self-hover: color-mix(in srgb, var(--color-link) 10%, var(--color-panel));
+  /* Avatar discs: oklch(L C hue). The hue is per member (`--avatar-hue`, set
+     inline); a disc without one is the neutral grey. */
+  --avatar-l: 0.90;
+  --avatar-c: 0.05;
+  --avatar-text-l: 0.37;
 }
 
 /* Dark mode colors */
@@ -62,12 +102,24 @@
     --color-text-muted: #9a9a9e;
     --color-text-quote: #b4b4b9;
     --color-text-inverse: #1a1a1a;
-    --color-link: #5c9dff;
-    --color-link-hover: #7db2ff;
+    --color-accent: oklch(0.76 0.075 262);
+    --color-accent-hover: oklch(0.84 0.075 262);
+    --color-link: var(--color-accent);
+    --color-link-hover: var(--color-accent-hover);
     --color-success-bg: #052e16;
     --color-warning-bg: #422006;
     --color-error-bg: #450a0a;
-    --color-accent-soft: oklch(from #0265e7 l c h / 20%);
+    --color-accent-soft: color-mix(in srgb, var(--color-link) 15%, transparent);
+    --color-rail: #0f0f11;
+    --color-text-secondary: #b4b4bb;
+    --color-warning-text: #e3a845;
+    --color-danger: #b42318;
+    --color-danger-hover: #c8331f;
+    --color-danger-text: #f97066;
+    --color-success-text: #47cd89;
+    --avatar-l: 0.42;
+    --avatar-c: 0.07;
+    --avatar-text-l: 0.93;
   }
 }
 
@@ -77,6 +129,7 @@
 @utility bg-surface { background-color: var(--color-surface); }
 @utility bg-surface-hover { background-color: var(--color-surface-hover); }
 @utility bg-accent-soft { background-color: var(--color-accent-soft); }
+@utility bg-rail { background-color: var(--color-rail); }
 @utility bg-success-bg { background-color: var(--color-success-bg); }
 @utility bg-warning-bg { background-color: var(--color-warning-bg); }
 @utility bg-error-bg { background-color: var(--color-error-bg); }
@@ -84,6 +137,14 @@
 @utility text-text { color: var(--color-text); }
 @utility text-text-muted { color: var(--color-text-muted); }
 @utility text-text-quote { color: var(--color-text-quote); }
+@utility text-text-secondary { color: var(--color-text-secondary); }
+@utility text-warning-text { color: var(--color-warning-text); }
+@utility text-danger { color: var(--color-danger-text); }
+@utility text-success { color: var(--color-success-text); }
+@utility bg-danger { background-color: var(--color-danger); }
+@utility bg-danger-hover { background-color: var(--color-danger-hover); }
+@utility border-danger { border-color: var(--color-danger-text); }
+@utility ring-danger { --tw-ring-color: var(--color-danger-text); }
 @utility text-link { color: var(--color-link); }
 @utility text-link-hover { color: var(--color-link-hover); }
 @utility text-text-inverse { color: var(--color-text-inverse); }
@@ -103,10 +164,14 @@
 }
 
 /* Base styles */
+/* `overflow: hidden`: the fixed `.app-root` is the whole page and nothing
+   outside it scrolls, which is what its `width: 100vw` relies on (see
+   .claude/rules/history-scrolling.md). */
 html, body {
   height: 100%;
   margin: 0;
-  font-family: var(--font-family-sans);
+  overflow: hidden;
+  font-family: var(--font-sans);
   background-color: var(--color-bg);
   color: var(--color-text);
 }
@@ -186,7 +251,7 @@ html, body {
  * Measure a translucent surface where it renders (the DM bubble over the
  * modal panel, not `--color-bg`). */
 .prose blockquote {
-  border-left: 3px solid var(--color-accent);
+  border-left: 3px solid var(--color-link);
   padding-left: 1rem;
   margin-left: 0;
   color: var(--color-text-quote);
@@ -251,7 +316,7 @@ button, a, input, textarea, select, [role="button"] {
   /* Shrink sidebar widths on narrow desktop/tablet viewports.
      Scoped to .app-root to avoid affecting unrelated elements. */
   .app-root .md\:w-64 { width: clamp(140px, 18vw, 256px) !important; }
-  .app-root .md\:w-56 { width: clamp(120px, 15vw, 224px) !important; }
+  .app-root .md\:w-62 { width: clamp(120px, 15vw, 248px) !important; }
 }
 
 /* ── Mobile: ensure full-width panels and readable text ── */

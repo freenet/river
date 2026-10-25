@@ -99,7 +99,7 @@ pub fn DeputyButton(
                     onclick: move |_| apply_change(false),
                     "Revoke deputy"
                 }
-                p { class: "mt-1 text-xs text-text-muted",
+                p { class: "mt-1 text-[13px] text-text-muted",
                     "{nickname} can currently help moderate people you invited."
                 }
             }
@@ -113,7 +113,7 @@ pub fn DeputyButton(
                     onclick: move |_| apply_change(true),
                     "Deputize"
                 }
-                p { class: "mt-1 text-xs text-text-muted",
+                p { class: "mt-1 text-[13px] text-text-muted",
                     "Let {nickname} help moderate people you invited."
                 }
             }

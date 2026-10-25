@@ -7041,7 +7041,10 @@ mod tests {
                             result,
                         }
                     }
-                    other => panic!("test node: unsupported request {other:?}"),
+                    other => panic!(
+                        "test node: unsupported request {}",
+                        crate::components::app::freenet_api::response_handler::describe_delegate_request(other)
+                    ),
                 }
             }
 
@@ -7247,6 +7250,97 @@ mod tests {
 
         // ---------------- the tests ----------------
 
+        /// The session's avatar-seed read and the migration walk's seed import
+        /// ask the CURRENT delegate for the same key, so they share one slot in
+        /// the single-waiter registry. Run together without serialising, the
+        /// second registration displaces the first (`Cancelled`) or their
+        /// replies cross. `avatar_salt`'s one seed mutex makes them take turns:
+        /// both complete, and the earlier seed is what the delegate ends with.
+        ///
+        /// Deterministic: the seed test guard keeps every other `SEED_IO` user
+        /// out, so the turns follow poll order (the session's read is polled
+        /// first and takes the lock first), and the two are driven to
+        /// completion, failing only when nothing can make progress (not after a
+        /// count of idle yields).
+        #[test]
+        fn the_seed_read_and_the_seed_import_take_turns_in_the_registry() {
+            use crate::avatar_salt::{
+                import_seed, load_or_create_seed, seed_io_test_guard, AvatarSeedRecord, SeedImport,
+                AVATAR_SEED_STORAGE_KEY,
+            };
+            let _seed_io = seed_io_test_guard();
+            let _guard = registry_guard();
+            let current = current_delegate_key();
+            let node = TestNode::default();
+            let channel = RegistryChannel { node: &node };
+            let live = Cell::new(2usize);
+            let later = AvatarSeedRecord {
+                created_at_ms: 9,
+                seed: [2; 32],
+            };
+            let earlier = AvatarSeedRecord {
+                created_at_ms: 5,
+                seed: [1; 32],
+            };
+
+            let session = async {
+                let out = load_or_create_seed(&channel, &current, later).await;
+                live.set(live.get() - 1);
+                out
+            };
+            let walk = async {
+                let out = import_seed(&channel, &current, earlier).await;
+                live.set(live.get() - 1);
+                out
+            };
+            // Answer the node until both are done. A round in which the node
+            // had nothing to answer and neither finished is only a stall if
+            // the NEXT round makes no progress either: a lock released in one
+            // round wakes its waiter for the following one.
+            let drive = async {
+                let mut quiet_rounds = 0;
+                let mut last_live = live.get();
+                loop {
+                    if node.step() {
+                        quiet_rounds = 0;
+                        continue;
+                    }
+                    if live.get() == 0 {
+                        return;
+                    }
+                    if live.get() != last_live {
+                        last_live = live.get();
+                        quiet_rounds = 0;
+                    }
+                    quiet_rounds += 1;
+                    assert!(
+                        quiet_rounds <= 2,
+                        "stalled: {} seed operation(s) waiting on nothing the node can answer",
+                        live.get()
+                    );
+                    yield_now().await;
+                }
+            };
+            let (read, import, ()) = block_on(futures::future::join3(session, walk, drive));
+
+            let read = read.expect("the session's read must not be displaced");
+            let import = import.expect("the walk's import must not be displaced");
+            // The session went first and stored its (later) seed; the import
+            // replaced it with the earlier one.
+            assert_eq!(read, later);
+            assert_eq!(import, SeedImport::Replaced);
+            let stored = node
+                .stored(&current, AVATAR_SEED_STORAGE_KEY)
+                .and_then(|v| AvatarSeedRecord::decode(&v));
+            assert_eq!(stored, Some(earlier));
+            assert!(
+                node.completed_for(&current, AVATAR_SEED_STORAGE_KEY)
+                    .iter()
+                    .all(|c| *c),
+                "every seed reply reached a waiter"
+            );
+        }
+
         /// **The property B1 broke.** A legacy delegate's reply must complete
         /// the waiter the legacy read registered, and must NOT complete a
         /// concurrently-outstanding CURRENT-delegate waiter for the same
@@ -7306,7 +7400,7 @@ mod tests {
                 )
                 .await;
                 live.set(live.get() - 1);
-                out
+                (out.0, out.1)
             };
 
             let (sweep_outcome, (report, seam), ()) =
@@ -7474,7 +7568,7 @@ mod tests {
                 )
                 .await;
                 live.set(live.get() - 1);
-                out
+                (out.0, out.1)
             };
 
             let (sweep_outcome, (report, seam), ()) =
@@ -7835,7 +7929,10 @@ pub(crate) async fn ensure_room_subscription_once(
         other => {
             clear_ensure_subscription_sent(&room_owner_vk, request_id);
             Err(format!(
-                "Unexpected response for EnsureRoomSubscription: {other:?}"
+                "Unexpected response for EnsureRoomSubscription: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
             ))
         }
     }
@@ -8494,7 +8591,10 @@ where
                     Ok(ChatDelegateResponseMsg::GetVersionedResponse {
                         value, generation, ..
                     }) => Ok((value, generation)),
-                    Ok(other) => Err(format!("Unexpected response to GetVersioned: {other:?}")),
+                    Ok(other) => Err(format!(
+                        "Unexpected response to GetVersioned: {}",
+                        crate::components::app::freenet_api::response_handler::describe_delegate_response(&other)
+                    )),
                     Err(e) => Err(e),
                 }
             }
@@ -8509,7 +8609,10 @@ where
                 };
                 match send_delegate_request(request).await {
                     Ok(ChatDelegateResponseMsg::CasStoreResponse { result, .. }) => Ok(result),
-                    Ok(other) => Err(format!("Unexpected response to CasStore: {other:?}")),
+                    Ok(other) => Err(format!(
+                        "Unexpected response to CasStore: {}",
+                        crate::components::app::freenet_api::response_handler::describe_delegate_response(&other)
+                    )),
                     Err(e) => Err(e),
                 }
             }
@@ -8990,6 +9093,9 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
 /// send returns.
 async fn fire_load_outbound_dms_request(attempt: u32) {
     info!("Firing request to load outbound DMs from delegate storage");
+    // Once per load attempt (list answered, registered, or the 30 s fallback):
+    // an avatar seed read that gave up may try again.
+    crate::avatar_salt::current_delegate_present();
 
     let request = ChatDelegateRequestMsg::GetRequest {
         key: ChatDelegateKey::new(OUTBOUND_DMS_STORAGE_KEY.to_vec()),
@@ -10104,7 +10210,12 @@ async fn do_save_outbound_dms_to_delegate() -> Result<(), String> {
 
     match send_delegate_request(request).await {
         Ok(ChatDelegateResponseMsg::StoreResponse { result, .. }) => result,
-        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Ok(other) => Err(format!(
+            "Unexpected response: {}",
+            crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                &other
+            )
+        )),
         Err(e) => Err(e),
     }
 }
@@ -10625,7 +10736,10 @@ async fn enqueue_delegate_request_inner(
     request: ChatDelegateRequestMsg,
     key_bytes: Vec<u8>,
 ) -> Result<PendingDelegateRequest, String> {
-    debug!("Sending delegate request: {:?}", request);
+    debug!(
+        "Sending delegate request: {}",
+        crate::components::app::freenet_api::response_handler::describe_delegate_request(&request)
+    );
 
     // Create a oneshot channel to receive the response
     let (sender, receiver) = oneshot::channel();
@@ -10731,7 +10845,10 @@ pub(crate) async fn await_delegate_response_outcome(
     match select(receiver, timeout).await {
         Either::Left((response, _)) => match response {
             Ok(resp) => {
-                debug!("Received delegate response: {:?}", resp);
+                debug!(
+                    "Received delegate response: {}",
+                    crate::components::app::freenet_api::response_handler::describe_delegate_response(&resp)
+                );
                 DelegateAwaitOutcome::Response(resp)
             }
             Err(_) => DelegateAwaitOutcome::Cancelled,

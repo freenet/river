@@ -715,7 +715,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                 class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
                 div {
                     class: "p-6",
-                    h1 { class: "text-xl font-semibold text-text mb-4", "Invitation Received" }
+                    h1 { class: "text-[16px] font-semibold text-text mb-4", "Invitation Received" }
                     {render_invitation_content(inv_data.unwrap(), invitation)}
                 }
             }
@@ -753,7 +753,7 @@ fn render_pending_subscription_state() -> Element {
             class: "text-center py-4",
             p { class: "mb-4 text-text", "Preparing to subscribe to room..." }
             div { class: "w-full h-2 bg-surface rounded-full overflow-hidden",
-                div { class: "h-full bg-accent animate-pulse w-1/2" }
+                div { class: "h-full bg-[var(--color-link)] animate-pulse w-1/2" }
             }
         }
     }
@@ -766,7 +766,7 @@ fn render_subscribing_state() -> Element {
             class: "text-center py-4",
             p { class: "mb-4 text-text", "Subscribing to room..." }
             div { class: "w-full h-2 bg-surface rounded-full overflow-hidden",
-                div { class: "h-full bg-blue-500 animate-pulse w-2/3" }
+                div { class: "h-full bg-[var(--color-link)] animate-pulse w-2/3" }
             }
         }
     }
@@ -783,12 +783,12 @@ fn render_error_state(
 
     rsx! {
         div {
-            class: "bg-red-500/10 border border-red-500/20 rounded-lg p-4",
-            p { class: "mb-4 text-red-400", "Failed to retrieve room: {error}" }
+            class: "bg-error-bg border-l-[3px] border-danger rounded-lg p-4",
+            p { class: "mb-4 text-text", "Failed to retrieve room: {error}" }
             div {
                 class: "flex gap-3",
                 button {
-                    class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
+                    class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium rounded-lg transition-colors",
                     onmounted: move |cx| {
                         let element = cx.data();
                         wasm_bindgen_futures::spawn_local(async move {
@@ -972,7 +972,7 @@ fn render_already_member(inv: Invitation, invitation: Signal<Option<Invitation>>
     rsx! {
         p { class: "text-text mb-4", "You are already a member of this room with your current key." }
         button {
-            class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
+            class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium rounded-lg transition-colors",
             onmounted: move |cx| {
                 let element = cx.data();
                 wasm_bindgen_futures::spawn_local(async move {
@@ -998,7 +998,7 @@ fn render_restore_access_option(
         div {
             class: "flex gap-3",
             button {
-                class: "px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white font-medium rounded-lg transition-colors",
+                class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium rounded-lg transition-colors",
                 onmounted: move |cx| {
                     let element = cx.data();
                     wasm_bindgen_futures::spawn_local(async move {
@@ -1032,7 +1032,7 @@ fn render_restore_access_option(
                 "Restore Access"
             }
             button {
-                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                 onclick: {
                     let inv_for_cancel = inv.clone();
                     move |_| {
@@ -1075,8 +1075,8 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
     let accept_disabled = invitation_accept_disabled(&nickname.read(), refusal.as_ref());
 
     rsx! {
-        p { class: "text-text mb-2", "You have been invited to join a new room." }
-        p { class: "text-text-muted mb-4",
+        p { class: "text-[15px] text-text mb-2", "You have been invited to join a new room." }
+        p { class: "text-[13px] text-text-muted mb-4",
             "Choose "
             span { class: "text-text font-medium", "your own display name" }
             " (not the room's name). It's what other members will see when you send messages:"
@@ -1087,9 +1087,9 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
             input {
                 "data-testid": "receive-invitation-nickname-input",
                 class: if nickname_has_emoji {
-                    "w-full px-3 py-2 bg-surface border border-red-500 rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent"
+                    "w-full px-3 py-2 bg-surface border border-danger rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-danger focus:border-transparent"
                 } else {
-                    "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent"
+                    "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:border-text-muted"
                 },
                 "aria-invalid": if nickname_has_emoji { "true" } else { "false" },
                 r#type: "text",
@@ -1112,7 +1112,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
             if nickname_has_emoji {
                 p {
                     "data-testid": "receive-invitation-nickname-emoji-error",
-                    class: "mt-1 text-xs text-red-400",
+                    class: "mt-1 text-xs text-danger",
                     role: "alert",
                     "{EMOJI_REJECTION_MESSAGE}"
                 }
@@ -1120,7 +1120,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
             if nickname_too_long {
                 p {
                     "data-testid": "receive-invitation-nickname-length-error",
-                    class: "mt-1 text-xs text-red-400",
+                    class: "mt-1 text-xs text-danger",
                     role: "alert",
                     "A display name can be at most {ceiling} bytes."
                 }
@@ -1128,19 +1128,19 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
             if let Some(refusal) = refusal.as_ref() {
                 p {
                     "data-testid": "receive-invitation-nickname-refused",
-                    class: "mt-1 text-xs text-red-400",
+                    class: "mt-1 text-xs text-danger",
                     role: "alert",
                     "{refusal.reason} Choose a shorter name and accept again."
                 }
             }
         }
 
-        p { class: "text-text mb-4", "Would you like to accept the invitation?" }
+        p { class: "text-[15px] text-text mb-4", "Would you like to accept the invitation?" }
         div {
             class: "flex gap-3",
             button {
                 "data-testid": "receive-invitation-accept-button",
-                class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                 disabled: accept_disabled,
                 onclick: move |_| {
                     accept_invitation(inv_for_accept.clone(), nickname.read().clone());
@@ -1149,7 +1149,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
             }
             button {
                 "data-testid": "receive-invitation-decline-button",
-                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                 onclick: {
                     let inv_for_decline = inv.clone();
                     move |_| {

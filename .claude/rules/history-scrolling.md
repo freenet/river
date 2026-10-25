@@ -147,7 +147,17 @@ Known limitations:
 - Outside that hold, a size change gets no correction: when the composer
   grows or the phone keyboard opens, the browser keeps the view's top edge,
   so the bottom of the view is covered. Paging and panel reveals retain their
-  reading-position corrections. A hide is noticed from the container's size
+  reading-position corrections, and so does the desktop member panel's
+  toggle: opening or closing it changes the chat column's width and rewraps
+  every row, so a reader at the end keeps the end hold (the resize takes the
+  view back to the end), and anyone else has their reading row measured at
+  the click and put back by an effect after each toggle's render, once the
+  column has its new width (`capture_before_reflow`, `after_panel_render`).
+  Two clicks before the first renders are two deferred writes, each
+  rendered on its own: the first render's effect restores and measures
+  again for the second. Once every toggle clicked has rendered, the capture
+  is dropped, so it can never move the view at some later resize. A window
+  resize gets no such correction. A hide is noticed from the container's size
   or from a patch landing while it has no layout (`note_patch_while_hidden`,
   which also re-observes the container), so a reveal restores the reader even
   when the ResizeObserver never reported the hide: a hide and reveal with no
@@ -168,6 +178,18 @@ Known limitations:
   without scrolling. Scrolling
   through a partial range does not advance it. Every mark-read path is
   bounded by the message published in `NEWEST_SEEN`.
+
+The app root's width is the viewport's (`.app-root { width: 100vw }` in
+`tailwind.css`), not just `position: fixed; inset: 0`. Narrowing the window,
+Chromium lays the page out once with the new media queries and `vw` units but
+the old width for the fixed root's `inset: 0`, so the chat column is briefly
+wider. Full-width rows rewrap to it, the history gets shorter for that one
+layout, the max-scroll clamp lowers `scrollTop` by 20-80px, and the end hold
+reads that as the reader scrolling up and releases (#791; it reproduces with
+a real window resize, not only in Playwright). `100vw` equals the viewport
+only because nothing outside the root scrolls, which is why `html, body` are
+`overflow: hidden`: a page scrollbar would make `100vw` wider than the root's
+box. Do not drop either rule in a layout edit.
 
 Browser scroll anchoring is disabled on the room scroller, and a browser test
 asserts the computed `overflow-anchor: none`. Custom position corrections
@@ -192,7 +214,7 @@ to go to the end, in render, and that render queues an effect
 the DOM, like the room's `complete_scroll_request`. Dioxus drops a removed
 scope's queued effects, so no placement can outlive its thread. An own send's
 plaintext is cached in the same `defer` block that adds it to `ROOMS`
-(`save_outbound_dm_now`), so the jump lands on the sent bubble's final
+(`save_outbound_dm_now`), so the jump lands on the sent row's final
 height. The placement and the read witness find the thread through the
 global `dm-scroll-container` and `dm-bottom-sentinel` ids, and every caller
 of the witness runs while its thread is mounted: its effects (whose queued

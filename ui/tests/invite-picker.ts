@@ -1,9 +1,9 @@
 import { expect, Locator, Page } from "@playwright/test";
 import { memberRows, selectRoom } from "./example-room";
 
-// member_display_parts marks only the local user with ⭐.
+// member_display_parts marks only the local user as "you" (`member-list-self`).
 export function nonSelfMemberRows(page: Page): Locator {
-  return memberRows(page).filter({ hasNotText: "⭐" });
+  return memberRows(page).filter({ hasNot: page.getByTestId("member-list-self") });
 }
 
 export function pickerHeading(page: Page): Locator {

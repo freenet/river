@@ -1,16 +1,17 @@
 import { test, expect, Locator } from "@playwright/test";
-import { colourOf, contrast, over, resolveColor, selectRoom, waitForApp } from "./example-room";
+import { colourOf, contrast, effectiveBackground, over, resolveColor, selectRoom, waitForApp } from "./example-room";
 
-// Text in a message row sits on the conversation background, the row's hover
-// band, or a mention chip's fill over either. Links, mentions, the own name
-// and quotes must clear WCAG AA (4.5:1) in both themes, measured from what the
-// browser renders; a quote must also stay visibly dimmer than body text.
+// Text in a message row sits on the conversation surface, the row's hover
+// band, your own rows' tint (at rest and hovered), or a mention chip's fill
+// over any of those. Links, mentions, the own name, quotes and times must
+// clear WCAG AA (4.5:1) in both themes, measured from what the browser
+// renders; a quote must also stay visibly dimmer than body text.
 // blockquote-contrast.spec.ts covers the quote on the outgoing DM bubble.
 
 const AA_TEXT = 4.5;
 
 for (const scheme of ["light", "dark"] as const) {
-  test(`${scheme}: links, mentions, quotes and reply strips clear 4.5:1`, { tag: "@chromium-only" }, async ({ page }) => {
+  test(`${scheme}: links, mentions, quotes, times and reply strips clear 4.5:1`, { tag: "@chromium-only" }, async ({ page }) => {
     await page.emulateMedia({ colorScheme: scheme });
     await page.goto("/");
     await waitForApp(page);
@@ -35,25 +36,39 @@ for (const scheme of ["light", "dark"] as const) {
       }
     };
 
-    const bg = await c("var(--color-bg)");
+    // The surfaces, as painted: a received row's background is the
+    // conversation surface, not a token the test assumes.
+    const bg = await effectiveBackground(await rendered('[data-message-self="false"]'));
+    const ownRest = await effectiveBackground(await rendered('[data-message-self="true"]'));
+    expect(ownRest, "premise: own rows are tinted").not.toEqual(bg);
     const band = over(await c("var(--color-row-hover)"), bg);
-    const surfaces: Record<string, number[]> = { bg, band };
+    const ownHover = over(await c("var(--color-row-self-hover)"), bg);
+    const rows: Record<string, number[]> = { bg, band, "own row": ownRest, "own row hovered": ownHover };
+    const surfaces: Record<string, number[]> = { ...rows };
     for (const cls of ["river-mention", "river-mention river-mention-self"]) {
       const fill = await probe(`<span class="${cls}">x</span>`, async (el) =>
         c(await el.evaluate((e) => getComputedStyle(e).backgroundColor)),
       );
-      surfaces[`${cls} on bg`] = over(fill, bg);
-      surfaces[`${cls} on band`] = over(fill, band);
+      for (const [name, s] of Object.entries(rows)) surfaces[`${cls} on ${name}`] = over(fill, s);
     }
 
-    // An undefined hover token would resolve to the inherited text colour and pass.
-    const hoverDeclared = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-link-hover").trim());
-    expect(hoverDeclared, "premise: --color-link-hover is declared").not.toBe("");
+    // Link hover, read off a hovered link once its colour transition ends.
+    const link = await rendered(".prose a");
+    await link.scrollIntoViewIfNeeded();
+    const linkRest = await colourOf(link);
+    await link.hover();
+    const linkHover = await link.evaluate(async (el) => {
+      await Promise.all(el.getAnimations().map((a) => a.finished));
+      return getComputedStyle(el).color;
+    });
+    expect(await c(linkHover), "premise: the hovered link changed colour").not.toEqual(linkRest);
+    await page.mouse.move(0, 0);
+
     const linkLike: Record<string, number[]> = {
-      link: await colourOf(await rendered(".prose a")),
+      link: linkRest,
+      "hovered link": await c(linkHover),
       mention: await colourOf(await rendered(".river-mention")),
       "own name": await colourOf(await rendered('[data-message-self="true"] [data-testid="message-author-name"]')),
-      "link hover": await c("var(--color-link-hover)"),
     };
     for (const [what, fg] of Object.entries(linkLike)) {
       for (const [name, s] of Object.entries(surfaces)) {
@@ -62,13 +77,20 @@ for (const scheme of ["light", "dark"] as const) {
     }
 
     const quote = await probe("<blockquote><p>quoted</p></blockquote>", colourOf);
+    const time = await colourOf(await rendered('[data-testid="message-group-header"] span[title]:last-child'));
     const normal = await colourOf(await rendered('[data-testid="message-body"] .prose p'));
-    for (const [name, s] of Object.entries({ bg, band })) {
+    for (const [name, s] of Object.entries(rows)) {
       expect(contrast(quote, s), `quote on ${name}`).toBeGreaterThanOrEqual(AA_TEXT);
+      expect(contrast(time, s), `time on ${name}`).toBeGreaterThanOrEqual(AA_TEXT);
     }
     expect(contrast(quote, bg), "a quote stays dimmer than body text").toBeLessThan(contrast(normal, bg) * 0.8);
 
-    const strip = await rendered('[data-testid="reply-strip"]');
-    expect(contrast(await colourOf(strip), await c("var(--color-surface)")), "reply strip").toBeGreaterThanOrEqual(AA_TEXT);
+    // Every reply strip, received and own, against what is painted behind it.
+    const strips = history.locator('[data-testid="reply-strip"]');
+    expect(await strips.count(), "premise: reply strips are rendered").toBeGreaterThan(0);
+    for (const strip of await strips.all()) {
+      const behind = await effectiveBackground(strip);
+      expect(contrast(over(await colourOf(strip), behind), behind), "reply strip").toBeGreaterThanOrEqual(AA_TEXT);
+    }
   });
 }

@@ -127,7 +127,7 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
             label { class: "block text-sm font-medium text-text-muted mb-2", "Room Name" }
             input {
                 "data-testid": "room-name-input",
-                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed",
+                class: "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:border-text-muted disabled:opacity-50 disabled:cursor-not-allowed",
                 value: "{room_name}",
                 readonly: !is_owner,
                 disabled: !is_owner,

@@ -1,3 +1,4 @@
+use crate::components::icons::{line_icon, REACT_ICON_PATH, REPLY_ICON_PATH, SEND_ICON_PATH};
 use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -219,7 +220,7 @@ pub fn MessageInput(
         if show_emoji_picker() {
             div {
                 class: "fixed inset-0 z-40",
-                onclick: move |_| show_emoji_picker.set(false),
+                onclick: move |_| crate::util::defer(move || show_emoji_picker.set(false)),
             }
         }
         // Backdrop for the @mention dropdown: a click anywhere outside the
@@ -233,9 +234,10 @@ pub fn MessageInput(
                 onclick: move |_| crate::util::defer(move || mention.set(None)),
             }
         }
-        div { class: "flex-shrink-0 border-t border-border bg-panel relative z-50",
+        div { class: "flex-shrink-0 bg-panel relative z-50",
             "data-testid": "message-composer",
-            div { class: "max-w-4xl mx-auto px-4 py-3",
+            // Spans the panel, on the header's left edge.
+            div { class: "px-3 md:px-5 pt-1 pb-3 md:pb-[18px]",
                 // Reply preview strip
                 {
                     let reply = replying_to.read();
@@ -243,9 +245,10 @@ pub fn MessageInput(
                         let author = ctx.author_name.clone();
                         let preview = ctx.content_preview.clone();
                         rsx! {
-                            div { class: "flex items-center gap-2 mb-2 px-3 py-1.5 bg-surface border-l-2 border-accent rounded text-sm text-text-muted",
+                            div { class: "flex items-center gap-2 mb-1.5 px-1 text-[13px] text-text-quote",
+                                span { "aria-hidden": "true", class: "flex-shrink-0 inline-flex", {line_icon(REPLY_ICON_PATH, 14)} }
                                 span { class: "flex-1 truncate",
-                                    span { class: "font-medium", "\u{21a9} @{author}: " }
+                                    span { class: "font-bold text-text-secondary", "Replying to {author} " }
                                     "{preview}"
                                 }
                                 button {
@@ -260,24 +263,30 @@ pub fn MessageInput(
                         rsx! {}
                     }
                 }
+                // One rounded box: emoji, the draft, Send. The box takes the
+                // focus ring, so the textarea inside needs none of its own.
                 form {
-                    class: "flex gap-3 items-end",
+                    "data-testid": "message-composer-box",
+                    class: "flex items-end gap-0.5 px-1.5 bg-surface border border-border rounded-xl focus-within:border-text-muted transition-colors",
                     onsubmit: move |evt| {
                         evt.prevent_default();
                         send_message();
                     },
                     // Emoji picker button and popup
-                    div { class: "relative self-center",
+                    div { class: "relative flex-shrink-0 mb-1",
                         button {
                             r#type: "button",
-                            class: "p-2.5 rounded-xl hover:bg-surface transition-colors",
+                            "data-testid": "composer-emoji-button",
+                            class: "inline-flex items-center justify-center w-9 h-9 rounded-lg text-text-muted hover:text-text hover:bg-surface-hover transition-colors",
                             title: "Insert emoji",
-                            onclick: move |_| show_emoji_picker.set(!show_emoji_picker()),
-                            span {
-                                class: "text-lg",
-                                style: "filter: grayscale(100%); opacity: 0.6;",
-                                "🙂"
-                            }
+                            "aria-label": "Insert emoji",
+                            onclick: move |_| {
+                                crate::util::defer(move || {
+                                    let open = *show_emoji_picker.peek();
+                                    show_emoji_picker.set(!open);
+                                })
+                            },
+                            {line_icon(REACT_ICON_PATH, 20)}
                         }
                         // Emoji picker popup (appears above the button)
                         if show_emoji_picker() {
@@ -319,12 +328,15 @@ pub fn MessageInput(
                             // cosmetic: see `auto_resize_message_input`. It pins the
                             // line box to 24px so one line of text plus `py-2.5`
                             // always exceeds `min-h-[44px]`, at every body font size.
+                            // The border is transparent (the box around the
+                            // textarea draws the visible one) but must stay: see
+                            // `auto_resize_message_input` for the slack it makes.
                             // Without it the mobile font clamp (`tailwind.css`: 13px
                             // below 768px) leaves the natural height under the
                             // minimum, min-height takes over the box, and the
                             // in-place measurement stops working — costing an EXTRA
                             // forced layout per keystroke instead of saving one.
-                            class: "w-full px-4 py-2.5 leading-6 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-hidden focus:border-text transition-colors resize-none min-h-[44px] field-sizing-content max-h-[30dvh] [@media(min-width:48rem)_and_(min-height:40rem)]:max-h-[50dvh] overflow-y-auto",
+                            class: "w-full px-2 py-2.5 leading-6 text-[15px] bg-transparent border border-transparent text-text placeholder-text-muted focus:outline-hidden resize-none min-h-[44px] field-sizing-content max-h-[30dvh] [@media(min-width:48rem)_and_(min-height:40rem)]:max-h-[50dvh] overflow-y-auto",
                             placeholder: "Type your message...",
                             value: "{message_text}",
                             rows: "1",
@@ -372,7 +384,7 @@ pub fn MessageInput(
                             if encoded_bytes > threshold {
                                 if over_limit {
                                     rsx! {
-                                        div { class: "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium",
+                                        div { class: "text-xs text-right mt-1 pr-1 text-danger font-medium",
                                             "Message too long \u{2014} {encoded_bytes}/{max_message_size} bytes"
                                         }
                                     }
@@ -389,15 +401,16 @@ pub fn MessageInput(
                         }
                     }
                     {
+                        // An accent-coloured icon, no solid fill.
                         let btn_class = if over_limit {
-                            "px-5 py-2.5 bg-gray-400 dark:bg-gray-600 text-white font-medium rounded-xl opacity-50 cursor-not-allowed"
+                            "flex-shrink-0 mb-1 inline-flex items-center justify-center w-9 h-9 rounded-lg text-text-muted opacity-50 cursor-not-allowed"
                         } else {
-                            "px-5 py-2.5 bg-accent hover:bg-accent-hover text-white font-medium rounded-xl transition-colors cursor-pointer"
+                            "flex-shrink-0 mb-1 inline-flex items-center justify-center w-9 h-9 rounded-lg text-link hover:bg-surface-hover transition-colors cursor-pointer"
                         };
                         let tooltip = if over_limit {
                             format!("Message exceeds the {} byte limit", max_message_size)
                         } else {
-                            String::new()
+                            "Send".to_string()
                         };
                         rsx! {
                             button {
@@ -411,7 +424,8 @@ pub fn MessageInput(
                                 // the keyboard to dismiss first, which triggers a viewport resize
                                 // that cancels the click→submit event chain.
                                 onclick: move |_| send_message(),
-                                "Send"
+                                "aria-label": "Send",
+                                {line_icon(SEND_ICON_PATH, 20)}
                             }
                         }
                     }

@@ -675,7 +675,12 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
             .await?
         {
             Some(ChatDelegateResponseMsg::ListResponse { keys }) => Ok(keys),
-            Some(other) => Err(format!("unexpected reply to legacy ListRequest: {other:?}")),
+            Some(other) => Err(format!(
+                "unexpected reply to legacy ListRequest: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
+            )),
             None => Err("legacy ListRequest timed out after a positive probe".to_string()),
         }
     }
@@ -726,7 +731,12 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
                 }
                 Ok(value)
             }
-            Some(other) => Err(format!("unexpected reply to legacy GetRequest: {other:?}")),
+            Some(other) => Err(format!(
+                "unexpected reply to legacy GetRequest: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
+            )),
             None => Err(format!(
                 "legacy GetRequest for {:?} timed out (silence is not absence)",
                 String::from_utf8_lossy(storage_key)
@@ -1031,6 +1041,9 @@ pub(crate) enum RecoveredItem {
     Meta(RoomsMeta),
     /// The outbound-DM plaintext cache.
     OutboundDms(Box<OutboundDmStore>),
+    /// The viewer's avatar colour seed (`crate::avatar_salt`). Carried to
+    /// the successor so palettes survive a re-key; the earliest seed wins.
+    AvatarSeed(crate::avatar_salt::AvatarSeedRecord),
     /// Migration bookkeeping (this module's markers, the crate's journal, the
     /// cadence counter: a future predecessor's store carries them) — never
     /// imported, never a failure. `fetch_secrets` already withholds them.
@@ -1070,6 +1083,14 @@ pub(crate) fn classify_recovered(key: &[u8], value: &[u8]) -> RecoveredItem {
         return match ciborium::from_reader::<RoomSlot, _>(value) {
             Ok(slot) => RecoveredItem::Room(vk, slot),
             Err(e) => RecoveredItem::Undecodable("room slot", e.to_string()),
+        };
+    }
+    if key == crate::avatar_salt::AVATAR_SEED_STORAGE_KEY {
+        // A seed that does not decode is skipped, not rejected: a permanent
+        // rejection would block the identity-import gate over a palette.
+        return match crate::avatar_salt::AvatarSeedRecord::decode(value) {
+            Some(record) => RecoveredItem::AvatarSeed(record),
+            None => RecoveredItem::Unrecognized,
         };
     }
     RecoveredItem::Unrecognized
@@ -1472,6 +1493,9 @@ pub(crate) struct RiverSuccessorIo<'a, C: RiverDelegateChannel, S: RiverImportSe
     /// key is written, so only a read that would otherwise have gone to the
     /// node a moment later is answered from here (freenet/river#809).
     prefetched_markers: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    /// The earliest avatar seed any predecessor exported this walk, imported
+    /// by the walk driver once the walk is recorded ([`carry_found_seed_with`]).
+    found_seed: Option<crate::avatar_salt::AvatarSeedRecord>,
     /// The journal as [`begin_with`] read it to decide on the prefetch, used
     /// by the first [`JournaledSuccessorIo::load_journal`] instead of reading
     /// it again, so the crate's `begin` sees the same journal the markers
@@ -1493,6 +1517,7 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
             rooms_merged: false,
             prefetched_markers: HashMap::new(),
             prefetched_journal: None,
+            found_seed: None,
         }
     }
 
@@ -1605,7 +1630,12 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
                 }
                 Ok(value)
             }
-            Some(other) => Err(format!("unexpected reply to marker GetRequest: {other:?}")),
+            Some(other) => Err(format!(
+                "unexpected reply to marker GetRequest: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
+            )),
             None => Err("marker GetRequest timed out (silence is not absence)".to_string()),
         }
     }
@@ -1662,8 +1692,11 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
             }) if reply_key == key => (value, generation),
             Some(other) => {
                 return Err(format!(
-                    "unexpected reply to wip-marker GetVersionedRequest: {other:?}"
-                ))
+                "unexpected reply to wip-marker GetVersionedRequest: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
+            ))
             }
             None => return Err("wip-marker GetVersionedRequest timed out".to_string()),
         };
@@ -1702,7 +1735,8 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
                 },
                 Some(other) => {
                     return Err(format!(
-                        "unexpected reply to wip-marker CasStoreRequest: {other:?}"
+                        "unexpected reply to wip-marker CasStoreRequest: {}",
+                    crate::components::app::freenet_api::response_handler::describe_delegate_response(&other)
                     ))
                 }
                 None => return Err("wip-marker CasStoreRequest timed out".to_string()),
@@ -1785,7 +1819,12 @@ async fn put_current<C: RiverDelegateChannel>(
         }) if reply_key.as_bytes() == key.as_slice() => {
             result.map_err(|e| format!("delegate refused store: {e}"))
         }
-        Some(other) => Err(format!("unexpected reply to StoreRequest: {other:?}")),
+        Some(other) => Err(format!(
+            "unexpected reply to StoreRequest: {}",
+            crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                &other
+            )
+        )),
         None => Err("StoreRequest timed out (an unacknowledged store is not durable)".to_string()),
     }
 }
@@ -1806,7 +1845,12 @@ async fn get_current<C: RiverDelegateChannel>(
             key: reply_key,
             value,
         }) if reply_key.as_bytes() == key.as_slice() => Ok(value),
-        Some(other) => Err(format!("unexpected reply to GetRequest: {other:?}")),
+        Some(other) => Err(format!(
+            "unexpected reply to GetRequest: {}",
+            crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                &other
+            )
+        )),
         None => Err("GetRequest timed out (silence is not absence)".to_string()),
     }
 }
@@ -1905,6 +1949,17 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
                     Ok(()) => ItemWrite::Written,
                     Err(e) => ItemWrite::retryable(e),
                 }
+            }
+            // Only remembered here (the earliest seen this walk) and returned by
+            // `walk_with`; the driver carries it after the journal is recorded
+            // and its lock released (`carry_found_seed_with`). Never a write
+            // and never a failure here, so a seed cannot keep a predecessor
+            // open or count against the identity-import gate.
+            RecoveredItem::AvatarSeed(record) => {
+                if self.found_seed.is_none_or(|held| record.precedes(&held)) {
+                    self.found_seed = Some(record);
+                }
+                ItemWrite::AlreadyAuthoritative
             }
             // Never imported, never a failure: the successor's state stands.
             RecoveredItem::MigrationMarker | RecoveredItem::Unrecognized => {
@@ -2326,7 +2381,14 @@ pub(crate) async fn top_up_from_with<C: RiverDelegateChannel, S: RiverImportSeam
         .await?
     {
         Some(ChatDelegateResponseMsg::ListResponse { keys }) => keys,
-        Some(other) => return Err(format!("unexpected reply to top-up ListRequest: {other:?}")),
+        Some(other) => {
+            return Err(format!(
+                "unexpected reply to top-up ListRequest: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
+            ))
+        }
         None => return Err("the predecessor did not answer the top-up ListRequest".to_string()),
     };
     let known = seam.known_rooms().await;
@@ -2381,12 +2443,20 @@ pub(crate) async fn top_up_from_with<C: RiverDelegateChannel, S: RiverImportSeam
 /// supply mocks — everything in between (probe semantics, the loud fetch,
 /// classification, ranked merge routing, markers, the journal) is EXACTLY the
 /// code production runs.
+///
+/// The third value is the earliest avatar seed any predecessor exported. The
+/// walk writes nothing for it; the caller carries it, after recording the walk
+/// and releasing the journal lock ([`carry_found_seed_with`]).
 pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     channel: &C,
     seam: S,
     successor: DelegateKey,
     lineage: &[DelegateLineageEntry],
-) -> (JournaledMigrationReport, S) {
+) -> (
+    JournaledMigrationReport,
+    S,
+    Option<crate::avatar_salt::AvatarSeedRecord>,
+) {
     let mut reader = RiverPredecessorIo::new(channel);
     // Unreadable: refuse short indexes the slow way this walk (cost only), and
     // write no record back (it would replace other predecessors' digests).
@@ -2403,12 +2473,40 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
         river_secret_policy(),
     )
     .await;
+    let found_seed = writer.found_seed;
     let mut seam = writer.seam;
     let salvage = std::mem::take(&mut reader.salvage);
     if !salvage.is_empty() {
         salvage_short_index_rooms(channel, &mut seam, &successor, lineage, refused, salvage).await;
     }
-    (report, seam)
+    (report, seam, found_seed)
+}
+
+/// Carry `record`, the earliest seed a walk found ([`walk_with`]'s third
+/// value), onto the successor, BEST-EFFORT. The caller runs it only after the
+/// walk's journal status is recorded and the journal lock is released, detached
+/// from the walk driver (`migration_journal::run_work_with`), so it never holds
+/// the identity-import gate Pending and never blocks the sweep's journal gate.
+/// It has no overall deadline of its own: each of its requests is bounded by
+/// the registry's 10 s response timeout, which bounds the task. (An overall
+/// budget would cancel it mid-request and free the seed lock while a reply is
+/// still in flight, letting that reply complete the session's own seed request
+/// on the same correlation key.) `on_held` is told the seed the successor
+/// holds afterwards: the one written, or the earlier one it already held,
+/// which may be another tab's that this tab has never seen; the UI recolours
+/// if it is not the session's seed. A failure is only logged: the worst case is that
+/// this device's palette changes once. The predecessors are resolved by then,
+/// so a seed whose carry failed is not tried again.
+pub(crate) async fn carry_found_seed_with<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+    record: crate::avatar_salt::AvatarSeedRecord,
+    on_held: impl FnOnce(crate::avatar_salt::AvatarSeedRecord),
+) {
+    match crate::avatar_salt::import_seed(channel, successor, record).await {
+        Ok(outcome) => on_held(outcome.held(record)),
+        Err(e) => warn!("avatar seed not carried to the successor (palette may change): {e}"),
+    }
 }
 
 /// Whether predecessor `generation` is the NEWEST generation holding DM
@@ -2742,6 +2840,16 @@ pub(crate) mod tests_support {
                 .get(delegate.bytes())
                 .and_then(|sim| sim.store.get(key).cloned())
         }
+        /// Requests of `kind` (a log prefix such as `cas:<key>`) sent to the
+        /// successor.
+        pub(crate) fn requests_to_successor(&self, kind: &str) -> usize {
+            let succ = successor_key().bytes().to_vec();
+            self.log
+                .borrow()
+                .iter()
+                .filter(|(target, what)| *target == succ && what.starts_with(kind))
+                .count()
+        }
         pub(crate) fn requests_to_predecessors(&self, kind: &str) -> usize {
             let succ = successor_key().bytes().to_vec();
             self.log
@@ -2900,7 +3008,7 @@ pub(crate) mod tests_support {
                         result,
                     }))
                 }
-                other => Err(format!("mock: unsupported request {other:?}")),
+                other => Err(format!("mock: unsupported request {}", crate::components::app::freenet_api::response_handler::describe_delegate_request(&other))),
             }
         }
     }
@@ -2976,7 +3084,7 @@ pub(crate) mod tests_support {
         channel = channel.with_delegate(&successor_key(), DelegateSim::default());
         let mut status = None;
         for _ in 0..streak {
-            let (report, _) = futures::executor::block_on(walk_with(
+            let (report, _, _) = futures::executor::block_on(walk_with(
                 &channel,
                 NoImports,
                 successor_key(),
@@ -3009,7 +3117,7 @@ pub(crate) mod tests_support {
         channel = channel.with_delegate(&successor_key(), DelegateSim::default());
         let mut status = None;
         for _ in 0..walks {
-            let (report, _) = futures::executor::block_on(walk_with(
+            let (report, _, _) = futures::executor::block_on(walk_with(
                 &channel,
                 NoImports,
                 successor_key(),
@@ -3227,7 +3335,37 @@ mod tests {
 
     /// One journaled walk, with the journal's status.
     fn walk_j(channel: &MockChannel, seam: MemorySeam) -> (JournaledMigrationReport, MemorySeam) {
-        block_on(walk_with(channel, seam, successor_key(), &lineage3()))
+        let (journaled, seam, _) = block_on(walk_with(channel, seam, successor_key(), &lineage3()));
+        (journaled, seam)
+    }
+
+    /// One walk, then the seed carry the driver runs after it: the walk's
+    /// report and the seed the carry reported the successor holding (empty if
+    /// the walk found no seed, or the carry failed).
+    fn walk_and_carry(
+        channel: &impl RiverDelegateChannel,
+    ) -> (
+        JournaledMigrationReport,
+        MemorySeam,
+        Vec<crate::avatar_salt::AvatarSeedRecord>,
+    ) {
+        let _seed_io = crate::avatar_salt::seed_io_test_guard();
+        let (journaled, seam, found) = block_on(walk_with(
+            channel,
+            MemorySeam::new(),
+            successor_key(),
+            &lineage3(),
+        ));
+        let mut held = Vec::new();
+        if let Some(record) = found {
+            block_on(carry_found_seed_with(
+                channel,
+                &successor_key(),
+                record,
+                |r| held.push(r),
+            ));
+        }
+        (journaled, seam, held)
     }
 
     // ---------------- marker keys ----------------
@@ -3351,6 +3489,18 @@ mod tests {
         ));
         assert!(matches!(
             classify_recovered(b"some_future_key", b"whatever"),
+            RecoveredItem::Unrecognized
+        ));
+        let seed = crate::avatar_salt::AvatarSeedRecord {
+            created_at_ms: 1,
+            seed: [4; 32],
+        };
+        assert!(matches!(
+            classify_recovered(crate::avatar_salt::AVATAR_SEED_STORAGE_KEY, &seed.encode()),
+            RecoveredItem::AvatarSeed(s) if s == seed
+        ));
+        assert!(matches!(
+            classify_recovered(crate::avatar_salt::AVATAR_SEED_STORAGE_KEY, b"not cbor"),
             RecoveredItem::Unrecognized
         ));
     }
@@ -4201,6 +4351,218 @@ mod tests {
             record.is_empty(),
             "a salvage that did not land must not be recorded"
         );
+    }
+
+    fn seed(created_at_ms: u64, fill: u8) -> crate::avatar_salt::AvatarSeedRecord {
+        crate::avatar_salt::AvatarSeedRecord {
+            created_at_ms,
+            seed: [fill; 32],
+        }
+    }
+
+    fn stored_seed(channel: &MockChannel) -> Option<crate::avatar_salt::AvatarSeedRecord> {
+        channel
+            .stored(
+                &successor_key(),
+                crate::avatar_salt::AVATAR_SEED_STORAGE_KEY,
+            )
+            .and_then(|v| crate::avatar_salt::AvatarSeedRecord::decode(&v))
+    }
+
+    /// Generation 2 holds `in_pred`; the successor holds `in_successor`.
+    fn channel_with_seeds(
+        in_pred: Vec<u8>,
+        in_successor: Option<crate::avatar_salt::AvatarSeedRecord>,
+    ) -> MockChannel {
+        let key = crate::avatar_salt::AVATAR_SEED_STORAGE_KEY.to_vec();
+        let mut gen2 = DelegateSim::default();
+        gen2.store.insert(key.clone(), in_pred);
+        let mut successor = DelegateSim::default();
+        if let Some(record) = in_successor {
+            successor.store.insert(key.clone(), record.encode());
+            successor.generations.insert(key, 1);
+        }
+        MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), successor)
+    }
+
+    /// The avatar seed is the one key the walk copies that is not room
+    /// state: without it every palette changes at each delegate re-key. (An
+    /// unrecognised key is still not copied; this is specific to the seed.)
+    #[test]
+    fn the_avatar_seed_is_carried_to_the_successor() {
+        let channel = channel_with_seeds(seed(5, 1).encode(), None);
+        let (journaled, _, replaced) = walk_and_carry(&channel);
+        let report = journaled.report;
+        assert_eq!(stored_seed(&channel), Some(seed(5, 1)));
+        assert_eq!(replaced, vec![seed(5, 1)], "the UI is told");
+        assert!(
+            report
+                .predecessors
+                .iter()
+                .any(|p| matches!(p, PredecessorMigration::Imported { generation: 2, .. })),
+            "carrying the seed completes the import: {:?}",
+            report.predecessors
+        );
+    }
+
+    /// On the first load after a re-key the UI may create a seed before the
+    /// walk gets to the old one; the user's original (earlier) seed wins.
+    #[test]
+    fn an_earlier_predecessor_seed_replaces_one_made_since() {
+        let channel = channel_with_seeds(seed(5, 1).encode(), Some(seed(9, 2)));
+        let (_, _, replaced) = walk_and_carry(&channel);
+        assert_eq!(stored_seed(&channel), Some(seed(5, 1)));
+        assert_eq!(replaced, vec![seed(5, 1)]);
+    }
+
+    #[test]
+    fn a_successor_seed_that_is_earlier_stands() {
+        let channel = channel_with_seeds(seed(9, 2).encode(), Some(seed(5, 1)));
+        let (_, _, held) = walk_and_carry(&channel);
+        assert_eq!(stored_seed(&channel), Some(seed(5, 1)));
+        assert_eq!(
+            held,
+            vec![seed(5, 1)],
+            "the UI is told the seed that stands, which may be one it never saw"
+        );
+    }
+
+    /// A corrupt seed is skipped: losing a palette must not count as a
+    /// rejected item (which would block the identity-import gate).
+    #[test]
+    fn an_undecodable_predecessor_seed_is_skipped_not_rejected() {
+        let channel = channel_with_seeds(vec![0xFF, 0x00, 0x13], None);
+        let (journaled, _, replaced) = walk_and_carry(&channel);
+        let report = journaled.report;
+        assert_eq!(stored_seed(&channel), None);
+        assert!(replaced.is_empty());
+        assert!(
+            report
+                .predecessors
+                .iter()
+                .any(|p| matches!(p, PredecessorMigration::Imported { generation: 2, .. })),
+            "a skipped seed is not a rejection: {:?}",
+            report.predecessors
+        );
+    }
+
+    /// Gen 0 holds `in_gen0`, gen 2 `in_gen2`; the successor holds nothing.
+    fn channel_with_gen0_and_gen2_seeds(
+        in_gen0: crate::avatar_salt::AvatarSeedRecord,
+        in_gen2: crate::avatar_salt::AvatarSeedRecord,
+    ) -> MockChannel {
+        let key = crate::avatar_salt::AVATAR_SEED_STORAGE_KEY.to_vec();
+        let mut gen0 = DelegateSim::default();
+        gen0.store.insert(key.clone(), in_gen0.encode());
+        let mut gen2 = DelegateSim::default();
+        gen2.store.insert(key, in_gen2.encode());
+        MockChannel::default()
+            .with_delegate(&pred_key(0), gen0)
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default())
+    }
+
+    /// Two predecessors hold seeds; the walk visits the newest generation
+    /// first. The EARLIEST seed is the one carried, in one write, whichever
+    /// generation held it and whichever was visited first. Both orders are
+    /// needed: with the earliest seed in gen 0 (visited last), "the last seed
+    /// found wins" would pass too.
+    #[test]
+    fn the_earliest_seed_of_several_predecessors_is_carried_once() {
+        for (in_gen0, in_gen2) in [(seed(3, 7), seed(9, 2)), (seed(9, 2), seed(3, 7))] {
+            let channel = channel_with_gen0_and_gen2_seeds(in_gen0, in_gen2);
+            let (_, _, replaced) = walk_and_carry(&channel);
+            assert_eq!(stored_seed(&channel), Some(seed(3, 7)));
+            assert_eq!(replaced, vec![seed(3, 7)]);
+            assert_eq!(
+                channel.requests_to_successor("cas:river_avatar_colour_seed_v1"),
+                1
+            );
+        }
+    }
+
+    /// Answers every seed request to the successor with silence; everything
+    /// else goes to the mock.
+    struct SeedSilentAtSuccessor<'a>(&'a MockChannel);
+
+    impl RiverDelegateChannel for SeedSilentAtSuccessor<'_> {
+        async fn request(
+            &self,
+            target: &DelegateKey,
+            request: ChatDelegateRequestMsg,
+        ) -> Result<Option<ChatDelegateResponseMsg>, String> {
+            let seed_key = crate::avatar_salt::AVATAR_SEED_STORAGE_KEY;
+            let is_seed = match &request {
+                ChatDelegateRequestMsg::GetVersionedRequest { key }
+                | ChatDelegateRequestMsg::CasStoreRequest { key, .. } => key.as_bytes() == seed_key,
+                _ => false,
+            };
+            if is_seed && *target == successor_key() {
+                return Ok(None);
+            }
+            self.0.request(target, request).await
+        }
+        async fn request_all(
+            &self,
+            requests: Vec<(DelegateKey, ChatDelegateRequestMsg)>,
+        ) -> Vec<Result<Option<ChatDelegateResponseMsg>, String>> {
+            let mut out = Vec::with_capacity(requests.len());
+            for (target, request) in requests {
+                out.push(self.request(&target, request).await);
+            }
+            out
+        }
+    }
+
+    /// A seed import that fails must not hold up real data: the
+    /// predecessor's rooms still merge, it is resolved, nothing is
+    /// interrupted or rejected, and the identity-import gate is open.
+    #[test]
+    fn a_failing_seed_import_leaves_the_predecessor_complete_and_the_gate_open() {
+        use crate::components::app::freenet_api::migration_journal::{
+            import_gate, ImportGate, JournalSession,
+        };
+        let mut gen2 = DelegateSim::default();
+        gen2.store
+            .insert(ROOMS_STORAGE_KEY.to_vec(), rooms_blob_with(vk(1), 3));
+        gen2.store.insert(
+            crate::avatar_salt::AVATAR_SEED_STORAGE_KEY.to_vec(),
+            seed(5, 1).encode(),
+        );
+        let mock = MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let channel = SeedSilentAtSuccessor(&mock);
+        let (journaled, seam, replaced) = walk_and_carry(&channel);
+
+        assert!(seam.rooms.map.contains_key(&vk(1)), "the room still merged");
+        assert!(replaced.is_empty());
+        assert_eq!(stored_seed(&mock), None);
+        assert!(
+            journaled
+                .report
+                .predecessors
+                .iter()
+                .any(|p| matches!(p, PredecessorMigration::Imported { generation: 2, .. })),
+            "{:?}",
+            journaled.report.predecessors
+        );
+        let status = journaled.status.expect("the journal was recorded");
+        assert!(!status.interrupted_import());
+        assert_eq!(status.rejected_items(), 0);
+        let session = JournalSession {
+            begun: true,
+            status: Some(status),
+            ..Default::default()
+        };
+        assert_eq!(import_gate(&session, false), ImportGate::Open);
     }
 
     fn gen0_with_blob() -> DelegateSim {
@@ -5600,7 +5962,8 @@ mod tests {
         let lineage = river_delegate_lineage(&table3()[..1]);
         let mut last = None;
         for _ in 0..3 {
-            let (report, _) = block_on(walk_with(&channel, NoImports, successor_key(), &lineage));
+            let (report, _, _) =
+                block_on(walk_with(&channel, NoImports, successor_key(), &lineage));
             last = report.status;
         }
         assert!(
@@ -5944,7 +6307,8 @@ mod tests {
         let lineage = river_delegate_lineage(&table);
         let mut last = None;
         for _ in 0..3 {
-            let (report, _) = block_on(walk_with(&channel, NoImports, successor_key(), &lineage));
+            let (report, _, _) =
+                block_on(walk_with(&channel, NoImports, successor_key(), &lineage));
             last = report.status;
         }
         assert!(
@@ -6762,7 +7126,7 @@ mod tests {
                 },
             )
             .with_delegate(&successor_key(), DelegateSim::default());
-        let (_, seam) = block_on(walk_with(
+        let (_, seam, _) = block_on(walk_with(
             &channel,
             MemorySeam::new(),
             successor_key(),

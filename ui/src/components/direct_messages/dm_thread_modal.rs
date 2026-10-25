@@ -15,6 +15,7 @@ use crate::components::direct_messages::{
     lookup_outbound_plaintext, open_invite_via_dm_picker, parse_outbound_invite_summary, DM_DRAFT,
     OPEN_DM_THREAD, OUTBOUND_DMS,
 };
+use crate::components::icons::{line_icon, SEND_ICON_PATH};
 use crate::components::members::Invitation;
 use crate::components::room_list::receive_invitation_modal::present_invitation;
 use crate::components::scroll_to_latest::{is_arrival, LatestButton};
@@ -200,7 +201,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
             // INBOUND bodies are ECIES-sealed to us, so reading them needs the
             // private key — but its absence must not blank the thread. Outbound
-            // bubbles come from the plaintext cache, and an unreadable inbound
+            // rows come from the plaintext cache, and an unreadable inbound
             // body degrades to the same placeholder a decrypt failure already
             // renders. `None` here only costs the bodies.
             let self_sk = room_data.signing_key().cloned();
@@ -211,10 +212,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // involves `peer`, and picking a default would render some other
             // member's message as one the user sent. Constraint: never
             // mislabel. So the message loop is skipped entirely and the thread
-            // renders with no bubbles (the peer's name, membership state and the
+            // renders with no rows (the peer's name, membership state and the
             // composer's own key check are unaffected) rather than wrong.
             //
-            // That "no bubbles" state is NOT the same as an empty thread, and
+            // That "no rows" state is NOT the same as an empty thread, and
             // `identity_known` below carries the difference to the render: the
             // empty-state copy must not claim a thread with real history is
             // empty.
@@ -254,17 +255,17 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     .any(|m| m.member.id() == peer);
 
             // Snapshot the outbound-DM cache once so each rendered
-            // outbound bubble does an O(1) HashMap lookup instead of
+            // outbound row does an O(1) HashMap lookup instead of
             // re-acquiring the signal guard per message. Reading via
             // `try_read` here registers the memo's subscription to
             // [`OUTBOUND_DMS`], so a successful save_outbound_dm_now write
-            // also re-runs this memo and the bubble flips from
+            // also re-runs this memo and the row flips from
             // placeholder to plaintext (see AGENTS.md "Dioxus WASM
             // Signal Safety": the subscription is registered ONLY on
             // the success path).
             // Second fallible read in this memo, so it needs its own nudge: the
             // anchor above keeps the memo alive, but a contended OUTBOUND_DMS
-            // read still drops THAT subscription, and without a retry the bubble
+            // read still drops THAT subscription, and without a retry the row
             // stays on the placeholder until some other subscribed signal moves.
             let outbound_cache = match OUTBOUND_DMS.try_read() {
                 Ok(g) => Some(g.clone()),
@@ -402,7 +403,31 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             }
             rendered.sort_by_key(|d| d.timestamp);
 
+            // The avatar salt for the DM's ROOM, a further fallible read: on
+            // contention both discs render neutral and the nudge re-runs this.
+            let salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
+                Ok(salts) => salts.get(&room.to_bytes()).copied(),
+                Err(_) => {
+                    crate::util::signal_guard::schedule_nudge();
+                    None
+                }
+            };
+            let hue_of = |member: MemberId| {
+                let salt = salt?;
+                crate::components::conversation::avatar::member_vk_bytes(
+                    &room_data.room_state,
+                    &room,
+                    member,
+                )
+                .map(|vk| crate::components::conversation::avatar::display_hue(&salt, &vk))
+            };
+            let self_nickname = self_id
+                .and_then(|id| nicknames.get(&id).cloned())
+                .unwrap_or_else(|| "You".to_string());
             let view = ViewData {
+                self_hue: self_id.and_then(hue_of),
+                peer_hue: hue_of(peer),
+                self_nickname,
                 peer_nickname,
                 peer_still_member,
                 messages: rendered,
@@ -536,6 +561,8 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     }
     #[cfg(not(target_arch = "wasm32"))]
     let _ = arrival;
+    // The avatars' colour salt for the DM's room (safe from render).
+    crate::avatar_salt::ensure_avatar_salt(room.to_bytes());
     let peer_label = view_data.peer_nickname.clone();
     let peer_still_member = view_data.peer_still_member;
     let identity_known = view_data.identity_known;
@@ -915,9 +942,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 // the close ✕ — no visual collision with the per-row
                 // archive control.
                 div { class: "flex items-center justify-between px-5 py-4 border-b border-border",
-                    h2 { class: "text-lg font-semibold text-text",
+                    h2 { class: "text-[16px] font-semibold text-text",
                         "Direct messages with "
-                        span { class: "text-accent", "{peer_label}" }
+                        span { class: "font-bold", "{peer_label}" }
                     }
                     button {
                         "data-testid": "dm-thread-close-button",
@@ -935,11 +962,15 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     // tree.
                     div {
                         id: "dm-scroll-container",
-                        class: "flex-1 min-h-0 overflow-y-auto px-5 py-4",
+                        // No side padding: rows and their tint span the thread.
+                        class: "flex-1 min-h-0 overflow-y-auto py-4",
                         // The spacing lives on this inner list, not on the
                         // container, so the sentinel below gets no gap: its top
                         // edge is the newest DM's bottom.
-                        div { class: "space-y-2",
+                        // `.msg-history` (main.css): grouped rows like the
+                        // room's, and the newest row's bottom padding cancelled
+                        // so the sentinel below sits at the newest DM's bottom.
+                        div { class: "msg-history",
                             if view_data.messages.is_empty() && !identity_known {
                                 // NOT "No messages yet". With no local identity every
                                 // DM in this thread was skipped rather than shown (see
@@ -957,8 +988,35 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                     "No messages yet. Say hello!"
                                 }
                             } else {
-                                for (idx, m) in view_data.messages.iter().enumerate() {
-                                    DmBubble { key: "{idx}_{m.timestamp}", message: m.clone() }
+                                // Day breaks as in a room: a hairline with the
+                                // label above each day's first group, labels
+                                // taken at render so "Today" stays fresh.
+                                for row in dm_thread_rows(&view_data.messages, |ts| {
+                                    crate::util::local_message_date((ts as i64).saturating_mul(1000))
+                                }, crate::util::local_today(), unix_now_secs()) {
+                                    match row {
+                                        DmThreadRow::Day { key, label } => rsx! {
+                                            div {
+                                                key: "{key}",
+                                                "data-testid": "dm-date-separator",
+                                                class: "msg-day",
+                                                "{label}"
+                                            }
+                                        },
+                                        DmThreadRow::Group { key, messages } => rsx! {
+                                            div { key: "{key}", class: "msg-group",
+                                                for (idx, m) in messages.iter().enumerate() {
+                                                    DmRow {
+                                                        key: "{idx}_{m.timestamp}",
+                                                        message: m.clone(),
+                                                        first: idx == 0,
+                                                        author: if m.outgoing { view_data.self_nickname.clone() } else { view_data.peer_nickname.clone() },
+                                                        hue: if m.outgoing { view_data.self_hue } else { view_data.peer_hue },
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    }
                                 }
                             }
                         }
@@ -1019,10 +1077,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 // Footer with composer + actions
                 div { class: "border-t border-border px-5 py-3 space-y-2",
                     if let Some(err) = send_error.read().as_ref() {
-                        div { class: "text-xs text-red-400", "{err}" }
+                        div { class: "text-xs text-danger", "{err}" }
                     }
                     if !peer_still_member {
-                        div { class: "text-xs text-yellow-400",
+                        div { class: "text-xs text-warning-text",
                             "This member is not currently in the room — outbound DMs will be rejected by the contract."
                         }
                     }
@@ -1035,13 +1093,17 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     if !can_send {
                         div {
                             "data-testid": "dm-thread-no-key-notice",
-                            class: "text-xs text-yellow-400",
+                            class: "text-xs text-warning-text",
                             "This device doesn't hold your key for this room, so you can't send DMs here."
                         }
                     }
-                    div { class: "flex items-end gap-2",
+                    // One box like the room's composer: the draft and an icon
+                    // Send, the box drawing the border and the focus ring.
+                    div {
+                        "data-testid": "dm-composer-box",
+                        class: "flex items-end gap-0.5 px-1.5 bg-surface border border-border rounded-xl focus-within:border-text-muted transition-colors",
                         textarea {
-                            class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text resize-none min-h-[2.5rem] max-h-32",
+                            class: "flex-1 px-2 py-2.5 leading-6 bg-transparent border border-transparent text-[15px] text-text placeholder-text-muted focus:outline-hidden resize-none min-h-[44px] max-h-32",
                             placeholder: "Type a direct message...",
                             value: "{draft.read()}",
                             oninput: move |e| draft.set(e.value()),
@@ -1059,11 +1121,16 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             },
                             disabled: !peer_still_member || !can_send,
                         }
+                        // An accent-coloured icon, no solid fill: the primary
+                        // action by position and colour, as in the room.
                         button {
-                            class: "px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-colors",
+                            "data-testid": "dm-send-button",
+                            class: "flex-shrink-0 mb-1 inline-flex items-center justify-center w-9 h-9 rounded-lg text-link hover:bg-surface-hover disabled:opacity-50 disabled:text-text-muted transition-colors",
                             disabled: draft.read().trim().is_empty() || !peer_still_member || !can_send,
                             onclick: move |_| do_send(),
-                            "Send"
+                            title: "Send",
+                            "aria-label": "Send",
+                            {line_icon(SEND_ICON_PATH, 20)}
                         }
                     }
                     // Wraps rather than crushing: three children share this
@@ -1079,16 +1146,16 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // the sender cannot decrypt the network copy.
                         // If you delete or break that cache, this
                         // disclaimer becomes inaccurate ("you" can no
-                        // longer read your own outbound bubbles) and
+                        // longer read your own outbound rows) and
                         // should be revisited.
                         span { class: "text-[10px] text-text-muted",
                             "Only you and "
-                            span { class: "text-accent", "{peer_label}" }
+                            span { class: "text-text-secondary font-semibold", "{peer_label}" }
                             " can read these messages."
                         }
                         // Sharing an invite is a SECONDARY action here:
                         // sending a message is what this modal is for, so
-                        // Send keeps the only filled `bg-accent` treatment and
+                        // Send is the accent icon in the composer box, and
                         // this is a bare text link at the same SIZE as "Delete
                         // their messages" — no background, border or heavy
                         // padding. Its resting COLOUR deliberately differs;
@@ -1136,7 +1203,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             // whitespace stripped but comments INTACT, so do
                             // not write the forbidden class names here — this
                             // comment tripped it once already.)
-                            class: "text-xs py-1 text-accent hover:text-accent-hover disabled:opacity-50 disabled:hover:text-accent transition-colors",
+                            class: "text-xs py-1 text-link hover:text-link-hover disabled:opacity-50 disabled:hover:text-link transition-colors",
                             // Also disabled with no local private key, for the
                             // same reason Send is: an invitation IS an outbound
                             // DM, signed and sealed with that key.
@@ -1160,7 +1227,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // Destructive, so it keeps the far right of the row
                         // and the red hover, away from the invite link.
                         button {
-                            class: "text-xs text-text-muted hover:text-red-400 transition-colors",
+                            class: "text-xs text-text-muted hover:text-danger transition-colors",
                             onclick: move |_| confirm_delete_open.set(true),
                             title: "Removes messages they sent you from the network. Your own sent messages stay. Cannot be undone.",
                             "Delete their messages"
@@ -1215,9 +1282,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                     div {
                         class: "relative z-10 w-full max-w-sm mx-4 bg-panel rounded-xl shadow-xl border border-border p-5 space-y-4",
-                        h3 { class: "text-base font-semibold text-text",
+                        h3 { class: "text-[16px] font-semibold text-text",
                             "Delete messages from "
-                            span { class: "text-accent", "{peer_label}" }
+                            span { class: "font-bold", "{peer_label}" }
                             "?"
                         }
                         p { class: "text-sm text-text-muted",
@@ -1240,7 +1307,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                 "Cancel"
                             }
                             button {
-                                class: "px-3 py-1.5 text-sm rounded-lg bg-red-600 hover:bg-red-500 text-white transition-colors",
+                                class: "px-3 py-1.5 text-sm rounded-lg bg-danger hover:bg-danger-hover text-white transition-colors",
                                 onclick: purge_thread,
                                 "Delete"
                             }
@@ -1255,6 +1322,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 #[derive(Clone, PartialEq)]
 struct ViewData {
     peer_nickname: String,
+    /// The local user's nickname in this room, for the own rows' header.
+    self_nickname: String,
+    /// Avatar hues under this viewer's salt for the DM's room, or `None`
+    /// for the neutral disc (the conversation's rule).
+    self_hue: Option<u16>,
+    peer_hue: Option<u16>,
     peer_still_member: bool,
     messages: Vec<RenderedDm>,
     latest_inbound_ts: u64,
@@ -1280,7 +1353,7 @@ enum BodyKind {
     /// User-supplied plaintext — runs through the markdown / linkify pass
     /// so URLs (notably invite links — see #252) become anchors.
     Plaintext,
-    /// Local UI string (outbound bubble, "decrypt failed", etc.). Rendered
+    /// Local UI string (outbound row, "decrypt failed", etc.). Rendered
     /// as a muted text node, never through markdown — keeps the markdown
     /// crate from autolinking literal placeholders like
     /// `"unable to decrypt: …"` into broken `unable:` schemes.
@@ -1301,8 +1374,8 @@ enum BodyKind {
     /// plaintext-summary cache rather than from wire bytes.
     ///
     /// The sender's copy is ECIES-sealed to the recipient, so this is the
-    /// only material available for their own bubble, which previously
-    /// rendered as the literal text `[Invitation]` in a plain bubble. It now
+    /// only material available for their own row, which previously
+    /// rendered as the literal text `[Invitation]` in a plain message. It now
     /// gets the same card chrome the recipient sees, with no Accept button,
     /// because accepting one's own invitation is meaningless.
     ///
@@ -1311,7 +1384,7 @@ enum BodyKind {
     SentInvite(Box<SentInviteData>),
 }
 
-/// Parts of a sent-invite bubble, recovered from the outbound summary cache.
+/// Parts of a sent-invite card, recovered from the outbound summary cache.
 ///
 /// Boxed at the `BodyKind` use site for the same reason as
 /// [`InviteCardData`].
@@ -1328,7 +1401,7 @@ struct SentInviteData {
 }
 
 /// Pre-resolved metadata for an inbound invite-DM card. Built during the
-/// memo pass (under the existing ROOMS read) so the bubble render path
+/// memo pass (under the existing ROOMS read) so the row render path
 /// itself does no extra signal reads.
 #[derive(Clone, PartialEq)]
 struct InviteCardData {
@@ -1426,26 +1499,130 @@ fn note_newest_dm(recorded: &std::cell::Cell<Option<DmKey>>, now: Option<DmKey>)
     is_arrival(previous.as_ref(), now.as_ref(), true)
 }
 
+/// One keyed root of the thread body: a day break, or a group of rows.
+enum DmThreadRow {
+    Day {
+        key: String,
+        label: String,
+    },
+    Group {
+        key: String,
+        messages: Vec<RenderedDm>,
+    },
+}
+
+/// How far a DM's sender-supplied timestamp may run ahead of this client's
+/// clock before it is clamped for grouping, day breaks and the shown time:
+/// the room's own tolerance, one constant for both.
+const DM_CLOCK_SKEW_TOLERANCE_SECS: u64 =
+    crate::components::conversation::CLOCK_SKEW_TOLERANCE_SECS.unsigned_abs();
+
+/// A DM's timestamp as the thread presents it: the sender's, but no later
+/// than `now_secs` plus the tolerance, so a skewed or hostile clock (up to
+/// `u64::MAX`, which as an `i64` would read as 1970) cannot date or group a
+/// DM in the future. Ordering still uses the sender's value.
+fn shown_dm_secs(timestamp: u64, now_secs: u64) -> u64 {
+    timestamp.min(now_secs.saturating_add(DM_CLOCK_SKEW_TOLERANCE_SECS))
+}
+
+/// Seconds since the epoch, by this client's clock.
+fn unix_now_secs() -> u64 {
+    crate::util::get_current_system_time()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The thread's groups ([`dm_groups`]) with a day break above each local
+/// calendar day's first group, labelled like the room's
+/// ([`crate::util::date_separator_labels`]). `day_of` maps a DM's timestamp
+/// (seconds) to its local date; injected, with `today` and `now_secs`, so the
+/// rule is testable natively. Times are clamped ([`shown_dm_secs`]).
+fn dm_thread_rows(
+    messages: &[RenderedDm],
+    day_of: impl Fn(u64) -> chrono::NaiveDate,
+    today: chrono::NaiveDate,
+    now_secs: u64,
+) -> Vec<DmThreadRow> {
+    let groups = dm_groups(messages, &day_of, now_secs);
+    let days: Vec<chrono::NaiveDate> = groups
+        .iter()
+        .map(|g| day_of(shown_dm_secs(g[0].timestamp, now_secs)))
+        .collect();
+    let labels = crate::util::date_separator_labels(&days, today);
+    let mut rows = Vec::with_capacity(groups.len() * 2);
+    for (idx, (group, label)) in groups.into_iter().zip(labels).enumerate() {
+        let key = format!("{idx}_{}", group[0].timestamp);
+        if let Some(label) = label {
+            rows.push(DmThreadRow::Day {
+                key: format!("day-{key}"),
+                label,
+            });
+        }
+        rows.push(DmThreadRow::Group {
+            key,
+            messages: group,
+        });
+    }
+    rows
+}
+
+/// Consecutive DMs from one side, at most five minutes apart and on one
+/// local day (`day_of`), as one group: the same rule the room history groups
+/// by. The thread is in timestamp order; a DM older than the one before it
+/// starts a group rather than joining on a negative gap. Times are clamped
+/// ([`shown_dm_secs`]).
+fn dm_groups(
+    messages: &[RenderedDm],
+    day_of: impl Fn(u64) -> chrono::NaiveDate,
+    now_secs: u64,
+) -> Vec<Vec<RenderedDm>> {
+    const GROUP_WINDOW_SECS: u64 = 5 * 60;
+    let shown = |m: &RenderedDm| shown_dm_secs(m.timestamp, now_secs);
+    let mut groups: Vec<Vec<RenderedDm>> = Vec::new();
+    for m in messages {
+        let joins = groups.last().and_then(|g| g.last()).is_some_and(|last| {
+            let (at, before) = (shown(m), shown(last));
+            last.outgoing == m.outgoing
+                && at >= before
+                && at - before < GROUP_WINDOW_SECS
+                && day_of(at) == day_of(before)
+        });
+        if joins {
+            groups
+                .last_mut()
+                .expect("joins implies a group")
+                .push(m.clone());
+        } else {
+            groups.push(vec![m.clone()]);
+        }
+    }
+    groups
+}
+
+/// One DM as a row of the thread, laid out like a room message
+/// (`.msg-row`): the avatar and a name + time header on a group's first row,
+/// the time in the gutter on hover after that, and your own rows tinted.
 #[component]
-fn DmBubble(message: RenderedDm) -> Element {
-    let ts_label = format_local_time(message.timestamp);
-    let align_class = if message.outgoing {
-        "self-end bg-accent/20 text-text"
-    } else {
-        "self-start bg-surface text-text"
-    };
-    let bubble_body = match message.kind {
+fn DmRow(message: RenderedDm, first: bool, author: String, hue: Option<u16>) -> Element {
+    // The full stamp on hover; the row shows the time of day, as a room does.
+    // Both clamped like the grouping, so a far-future stamp never shows.
+    let shown = shown_dm_secs(message.timestamp, unix_now_secs());
+    let ts_full = format_local_time(shown);
+    let ts_label = crate::util::format_utc_as_local_time((shown as i64).saturating_mul(1000));
+    let body = match message.kind {
         BodyKind::Plaintext => {
             // Reuse the room-message linkify path so pasted URLs (notably
             // invite links shared via DM — see #252) render as clickable
             // anchors, and Freenet web-contract URLs get host-stripped to
             // a same-origin path the recipient's gateway can serve. The
-            // `prose prose-sm` wrapper matches `conversation.rs:2061` so
+            // `prose` wrapper matches the room's message body so
             // multi-paragraph bodies don't collapse to a single block.
             let body_html = crate::components::conversation::message_to_html(&message.body);
             rsx! {
                 div {
-                    class: "prose prose-sm max-w-[80%] px-3 py-2 rounded-lg text-sm break-words {align_class}",
+                    "data-testid": "dm-body",
+                    class: "prose prose-sm max-w-[76ch] text-[15px] leading-[22px] text-text break-words",
                     dangerous_inner_html: "{body_html}",
                 }
             }
@@ -1453,17 +1630,17 @@ fn DmBubble(message: RenderedDm) -> Element {
         BodyKind::Placeholder => {
             rsx! {
                 div {
-                    class: "max-w-[80%] px-3 py-2 rounded-lg text-xs italic text-text-muted {align_class}",
+                    "data-testid": "dm-body",
+                    class: "max-w-[76ch] text-[13px] italic text-text-muted",
                     "{message.body}"
                 }
             }
         }
         BodyKind::Invite(card) => {
-            // Inset card rendered inside the bubble column. The Accept
-            // button decodes the CBOR-encoded `Invitation` payload and
-            // hands off to `present_invitation`, which is the same entry
-            // point the URL-bar accept flow uses. Already-member rooms
-            // disable the button and relabel it to reduce confusion.
+            // Inset card. The Accept button decodes the CBOR-encoded
+            // `Invitation` payload and hands off to `present_invitation`,
+            // which is the same entry point the URL-bar accept flow uses.
+            // Already-member rooms disable the button and relabel it.
             //
             // Deref the box at the boundary so `DmInviteCard`'s prop
             // type stays the unboxed `InviteCardData` — the box exists
@@ -1481,12 +1658,50 @@ fn DmBubble(message: RenderedDm) -> Element {
             }
         }
     };
+    let initials = crate::components::conversation::avatar::initials(&author);
+    let avatar_class = format!(
+        "msg-avatar{}{}",
+        if hue.is_some() {
+            " msg-avatar-hued"
+        } else {
+            ""
+        },
+        if message.outgoing {
+            " msg-avatar-self"
+        } else {
+            ""
+        },
+    );
+    let name_class = if message.outgoing {
+        "text-link"
+    } else {
+        "text-text"
+    };
     rsx! {
-        div { class: "flex flex-col",
-            {bubble_body}
-            span {
-                class: if message.outgoing { "self-end text-[10px] text-text-muted mt-0.5" } else { "self-start text-[10px] text-text-muted mt-0.5" },
-                "{ts_label}"
+        div {
+            "data-testid": "dm-row",
+            "data-message-self": "{message.outgoing}",
+            class: "msg-row dm-row",
+            div { class: "msg-gutter",
+                if first {
+                    div {
+                        "aria-hidden": "true",
+                        class: "{avatar_class}",
+                        style: crate::components::conversation::avatar::avatar_style(hue),
+                        "{initials}"
+                    }
+                } else {
+                    span { class: "msg-gutter-time", title: "{ts_full}", "{ts_label}" }
+                }
+            }
+            div { class: "min-w-0",
+                if first {
+                    div { "data-testid": "dm-group-header", class: "flex flex-wrap items-baseline gap-x-2 mb-0.5 leading-5",
+                        span { class: "text-[15px] font-bold [overflow-wrap:anywhere] {name_class}", "{author}" }
+                        span { class: "text-xs text-text-muted tabular-nums", title: "{ts_full}", "{ts_label}" }
+                    }
+                }
+                {body}
             }
         }
     }
@@ -1504,6 +1719,14 @@ fn DmBubble(message: RenderedDm) -> Element {
 /// goes through `present_invitation` → `PRESENT_INVITATION_REQUEST` →
 /// the `App` bridge effect, which sets `receive_invitation` and pops
 /// the modal.
+/// Both invite cards' chrome: a quiet card at the body's start, no wider
+/// than the body's measure.
+const INVITE_CARD_CLASS: &str =
+    "mt-1 max-w-[min(100%,52ch)] rounded-lg border border-border bg-surface p-3 space-y-2";
+/// The cards' small-caps label.
+const INVITE_CARD_EYEBROW_CLASS: &str =
+    "flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-wide text-text-muted";
+
 #[component]
 fn DmInviteCard(card: InviteCardData) -> Element {
     let room_label = card.room_label.clone();
@@ -1531,10 +1754,10 @@ fn DmInviteCard(card: InviteCardData) -> Element {
             // mirrors the AlreadyMember styling so the affordance is
             // identical (the button doesn't act); the red tint
             // communicates the failure mode.
-            "px-3 py-1.5 text-sm rounded-lg bg-red-500/20 text-red-300 border border-red-500/40 cursor-not-allowed"
+            "px-3 py-1.5 text-sm rounded-lg bg-error-bg text-danger border border-danger cursor-not-allowed"
         }
         InviteCardState::Joinable => {
-            "px-3 py-1.5 text-sm rounded-lg bg-accent hover:bg-accent-hover text-white transition-colors"
+            "px-3 py-1.5 text-sm rounded-lg bg-surface hover:bg-surface-hover border border-border-hover text-text transition-colors"
         }
     };
     let is_disabled = !matches!(card_state, InviteCardState::Joinable);
@@ -1557,16 +1780,20 @@ fn DmInviteCard(card: InviteCardData) -> Element {
     };
 
     rsx! {
+        // A quiet card in the content column: a hairline and the raised
+        // surface, no accent fill (the design keeps the accent for text,
+        // links and focus).
         div {
-            class: "self-start max-w-[85%] rounded-lg border border-accent/40 bg-accent/10 p-3 space-y-2",
+            "data-testid": "dm-invite-card",
+            class: "{INVITE_CARD_CLASS}",
             // Subtle banner label so the recipient knows at a glance
             // this is structured (vs prose).
-            div { class: "flex items-center gap-2 text-[10px] uppercase tracking-wide text-accent",
+            div { class: "{INVITE_CARD_EYEBROW_CLASS}",
                 span { "Invitation" }
             }
-            div { class: "text-sm text-text font-medium",
+            div { class: "text-sm text-text",
                 "Invitation to "
-                span { class: "text-accent", "{room_label}" }
+                span { class: "font-semibold", "{room_label}" }
             }
             if let Some(msg) = personal_message.as_ref() {
                 // Render the personal message as plain text — no markdown
@@ -1578,7 +1805,7 @@ fn DmInviteCard(card: InviteCardData) -> Element {
                 }
             }
             if let Some(err) = accept_error.read().as_ref() {
-                div { class: "text-xs text-red-400", "{err}" }
+                div { class: "text-xs text-danger", "{err}" }
             }
             div { class: "flex justify-end pt-1",
                 button {
@@ -1595,23 +1822,23 @@ fn DmInviteCard(card: InviteCardData) -> Element {
 /// The local user's own sent invitation, rendered as the outbound twin of
 /// [`DmInviteCard`].
 ///
-/// Deliberately the same card chrome (accent border, eyebrow, optional note)
-/// so a thread reads as one conversation, with three differences that follow
-/// from it being the sender's own message: `self-end` and the outbound
-/// `bg-accent/20` tint that every other outgoing bubble uses, so direction is
-/// legible at a glance; no Accept button, because you cannot accept your own
-/// invitation; and a past-tense eyebrow.
+/// The same quiet card, in the row's content column, so a thread reads as
+/// one conversation. Two differences follow from it being the sender's own
+/// message: no Accept button, because you cannot accept your own invitation,
+/// and a past-tense eyebrow. Direction comes from the row (your avatar and
+/// name, the own-row tint), as for any other DM.
 ///
 /// It names no room — see [`SentInviteData`]. Before this existed the same
-/// message rendered as the raw string `"[Invitation]"` in a plain bubble.
+/// message rendered as the raw string `"[Invitation]"` in a plain message.
 #[component]
 fn DmSentInviteCard(sent: SentInviteData) -> Element {
     let note = sent.note.clone();
 
     rsx! {
         div {
-            class: "self-end max-w-[85%] rounded-lg border border-accent/40 bg-accent/20 p-3 space-y-2",
-            div { class: "flex items-center gap-2 text-[10px] uppercase tracking-wide text-accent",
+            "data-testid": "dm-sent-invite-card",
+            class: "{INVITE_CARD_CLASS}",
+            div { class: "{INVITE_CARD_EYEBROW_CLASS}",
                 span { "Invitation sent" }
             }
             if let Some(msg) = note.as_ref() {
@@ -1781,6 +2008,131 @@ fn merge_invite_into_draft(existing: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
 
+    mod grouping {
+        use super::super::*;
+        use chrono::NaiveDate;
+
+        fn dm(outgoing: bool, timestamp: u64) -> RenderedDm {
+            RenderedDm {
+                outgoing,
+                timestamp,
+                body: format!("at {timestamp}"),
+                kind: BodyKind::Plaintext,
+                token: PurgeToken([0; 16]),
+            }
+        }
+
+        /// Days of 100,000 s, so a test can cross midnight on purpose.
+        fn day(ts: u64) -> NaiveDate {
+            NaiveDate::from_ymd_opt(2026, 10, 1).unwrap() + chrono::Days::new(ts / 100_000)
+        }
+
+        /// A clock far past every test stamp, so nothing is clamped.
+        const NOW: u64 = 10_000_000;
+
+        fn shape(groups: &[Vec<RenderedDm>]) -> Vec<Vec<u64>> {
+            groups
+                .iter()
+                .map(|g| g.iter().map(|m| m.timestamp).collect())
+                .collect()
+        }
+
+        #[test]
+        fn the_five_minute_window_is_exclusive() {
+            let base = 1_000;
+            for (gap, joins) in [(299, true), (300, false), (301, false)] {
+                let groups = dm_groups(&[dm(false, base), dm(false, base + gap)], day, NOW);
+                assert_eq!(groups.len(), if joins { 1 } else { 2 }, "a {gap} s gap");
+            }
+        }
+
+        #[test]
+        fn a_change_of_sender_starts_a_group() {
+            let groups = dm_groups(
+                &[dm(false, 10), dm(true, 20), dm(true, 30), dm(false, 40)],
+                day,
+                NOW,
+            );
+            assert_eq!(shape(&groups), vec![vec![10], vec![20, 30], vec![40]]);
+        }
+
+        #[test]
+        fn an_out_of_order_dm_starts_a_group() {
+            let groups = dm_groups(&[dm(false, 500), dm(false, 400)], day, NOW);
+            assert_eq!(shape(&groups), vec![vec![500], vec![400]]);
+        }
+
+        #[test]
+        fn no_dms_no_groups() {
+            assert!(dm_groups(&[], day, NOW).is_empty());
+            assert!(dm_thread_rows(&[], day, day(0), NOW).is_empty());
+        }
+
+        #[test]
+        fn a_group_never_spans_midnight() {
+            let groups = dm_groups(&[dm(false, 99_990), dm(false, 100_010)], day, NOW);
+            assert_eq!(groups.len(), 2);
+        }
+
+        /// A sender's clock running ahead is clamped to now plus the
+        /// tolerance, for grouping and the day break, as in a room.
+        #[test]
+        fn a_future_stamp_is_clamped() {
+            let now = 100_010;
+            // An hour ahead joins the DM sent a moment ago, under today.
+            let dms = [dm(false, now - 5), dm(false, now + 3_600)];
+            let rows = dm_thread_rows(&dms, day, day(now), now);
+            assert_eq!(rows.len(), 2, "one break, one group");
+            assert!(matches!(&rows[0], DmThreadRow::Day { label, .. } if label == "Today"));
+            assert!(matches!(&rows[1], DmThreadRow::Group { messages, .. } if messages.len() == 2));
+            // Within the tolerance it is left alone.
+            assert_eq!(shown_dm_secs(now + 60, now), now + 60);
+            assert_eq!(shown_dm_secs(now + 61, now), now + 60);
+        }
+
+        /// A stamp at or past 2^63 is not read as a negative time (1970).
+        #[test]
+        fn a_huge_stamp_is_dated_today() {
+            let now = 100_010;
+            for stamp in [1u64 << 63, u64::MAX] {
+                let rows = dm_thread_rows(&[dm(true, stamp)], day, day(now), now);
+                assert!(
+                    matches!(&rows[0], DmThreadRow::Day { label, .. } if label == "Today"),
+                    "{stamp}"
+                );
+                assert_eq!(shown_dm_secs(stamp, now), now + 60);
+            }
+        }
+
+        #[test]
+        fn each_day_gets_one_break_above_its_first_group() {
+            let dms = [
+                dm(false, 10),
+                dm(true, 50_000),
+                dm(false, 100_010),
+                dm(false, 100_020),
+            ];
+            let rows = dm_thread_rows(&dms, day, day(100_000), NOW);
+            let labels: Vec<String> = rows
+                .iter()
+                .map(|r| match r {
+                    DmThreadRow::Day { label, .. } => format!("day {label}"),
+                    DmThreadRow::Group { messages, .. } => format!("group of {}", messages.len()),
+                })
+                .collect();
+            assert_eq!(
+                labels,
+                vec![
+                    "day Yesterday",
+                    "group of 1",
+                    "group of 1",
+                    "day Today",
+                    "group of 2"
+                ]
+            );
+        }
+    }
+
     /// This file's production source with whitespace stripped, cut at the test
     /// module so the needles below cannot match themselves.
     ///
@@ -1826,8 +2178,8 @@ mod tests {
         );
     }
 
-    /// Send stays the primary action: it keeps the ONLY filled `bg-accent`
-    /// treatment in the modal chrome, and the invite control stays a bare
+    /// Send stays the primary action: the accent icon in the composer box
+    /// (no solid fill anywhere since the redesign), and the invite control stays a bare
     /// text link — no background, border or button padding. Ian asked for
     /// smaller and less prominent than Send twice; a bordered same-height
     /// button beside Send was rejected for reading as MORE prominent.
@@ -1839,8 +2191,8 @@ mod tests {
             "the invite control's label changed; keep this pin in step with it"
         );
         assert!(
-            src.contains("bg-accenthover:bg-accent-hoverdisabled:opacity-50text-whitetext-smfont-mediumrounded-lgtransition-colors"),
-            "Send stopped being the filled primary button"
+            src.contains("\"data-testid\":\"dm-send-button\",class:\"flex-shrink-0mb-1inline-flexitems-centerjustify-centerw-9h-9rounded-lgtext-link"),
+            "Send stopped being the composer box's accent icon, the primary action"
         );
         // The window is bounded by the button's own label, so it cannot
         // silently slide onto neighbouring markup if this block shrinks.
@@ -1879,11 +2231,11 @@ mod tests {
         // but not comments, so a `split_once` on the label silently cut at
         // line 2 and made the assertion unreachable.
         assert!(
-            src.contains("class:\"text-xstext-text-mutedhover:text-red-400transition-colors\""),
+            src.contains("class:\"text-xstext-text-mutedhover:text-dangertransition-colors\""),
             "the delete control stopped being the recessive muted-until-hover one"
         );
         assert!(
-            invite_block.contains("text-accent") && !invite_block.contains("text-text-muted"),
+            invite_block.contains("text-link") && !invite_block.contains("text-text-muted"),
             "the invite control now renders identically to the destructive \
              \"Delete their messages\"; give it its own resting colour so the \
              two are not a matched pair"
@@ -1917,7 +2269,7 @@ mod tests {
         // Belt and braces: it must also come after Send, so it cannot end up
         // between the textarea and Send either.
         let send = src
-            .find("onclick:move|_|do_send(),\"Send\"")
+            .find("onclick:move|_|do_send(),title:\"Send\",\"aria-label\":\"Send\"")
             .expect("the Send button is present");
         assert!(invite > send, "the invite control is ahead of Send");
     }
@@ -1988,10 +2340,11 @@ mod tests {
             !card.contains("present_invitation") && !card.contains("Acceptinvitation"),
             "the sender's own invite card must not carry an Accept button"
         );
+        // Rows, not bubbles: both cards sit in the content column, in the
+        // same quiet chrome, never aligned to a side.
         assert!(
-            card.contains("self-end"),
-            "an outbound bubble sits on the right; `self-start` is the \
-             inbound card's alignment"
+            card.contains("INVITE_CARD_CLASS") && !card.contains("self-end"),
+            "the sent card shares the inbound card's chrome and alignment"
         );
     }
 

@@ -45,7 +45,12 @@ pub async fn store_signing_key(room_key: RoomKey, signing_key: &SigningKey) -> R
 
     match send_delegate_request(request).await {
         Ok(ChatDelegateResponseMsg::StoreSigningKeyResponse { result, .. }) => result,
-        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Ok(other) => Err(format!(
+            "Unexpected response: {}",
+            crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                &other
+            )
+        )),
         Err(e) => Err(e),
     }
 }
@@ -66,7 +71,12 @@ pub async fn get_public_key(room_key: RoomKey) -> Result<Option<VerifyingKey>, S
                 Ok(None)
             }
         }
-        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Ok(other) => Err(format!(
+            "Unexpected response: {}",
+            crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                &other
+            )
+        )),
         Err(e) => Err(e),
     }
 }
@@ -182,7 +192,12 @@ fn extract_signature(
             }
             Err(e) => Err(e),
         },
-        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Ok(other) => Err(format!(
+            "Unexpected response: {}",
+            crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                &other
+            )
+        )),
         Err(e) => Err(e),
     }
 }

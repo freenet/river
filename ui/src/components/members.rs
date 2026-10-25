@@ -1,16 +1,13 @@
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS, SYNC_STATUS};
 use crate::components::back_to_chat::BackToChatButton;
+use crate::components::icons::*;
 use crate::util::confusable::{
     ConfusableTier, ImpersonationChecker, ImpersonationWarning, ProtectedName, ProtectedRole,
 };
 use crate::util::display_name::display_nickname;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{
-    FaFileExport, FaMagnifyingGlass, FaUserPlus, FaUsers,
-};
-use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::identity::IdentityExport;
 use river_core::room_state::member::MembersV1;
@@ -23,7 +20,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use crate::util::to_cbor_vec;
 use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 
-/// Move focus back to the Active Members control after Escape closes the
+/// Move focus back to the Members control after Escape closes the
 /// search. The button stays mounted; the field does not.
 fn focus_member_search_toggle() {
     #[cfg(target_arch = "wasm32")]
@@ -73,35 +70,21 @@ pub fn ConnectionStatusIndicator() -> Element {
         .unwrap_or(SynchronizerStatus::Connecting);
 
     let (pill_classes, dot_classes, label) = match &status {
-        SynchronizerStatus::Connected => (
-            "bg-success-bg text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800",
-            "bg-green-500",
-            "Connected".to_string(),
-        ),
-        SynchronizerStatus::Connecting => (
-            "bg-warning-bg text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-800",
-            "bg-yellow-500",
-            "Connecting...".to_string(),
-        ),
-        SynchronizerStatus::Disconnected => (
-            "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
-            "bg-red-500",
-            "Disconnected".to_string(),
-        ),
-        SynchronizerStatus::Error(msg) => (
-            "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
-            "bg-red-500",
-            format!("Error: {}", msg),
-        ),
+        SynchronizerStatus::Connected => ("text-text-muted", "bg-success", "Connected".to_string()),
+        SynchronizerStatus::Connecting => {
+            ("text-text-muted", "bg-warning", "Connecting...".to_string())
+        }
+        SynchronizerStatus::Disconnected => ("text-danger", "bg-error", "Disconnected".to_string()),
+        SynchronizerStatus::Error(msg) => ("text-danger", "bg-error", format!("Error: {}", msg)),
     };
 
     rsx! {
-        div { class: "px-3 pb-3 flex-shrink-0",
+        div { class: "px-4 flex-shrink-0",
             div {
                 "aria-label": "WebSocket connection status",
                 "data-testid": "connection-status-indicator",
-                class: "w-full px-3 py-1.5 rounded-full flex items-center justify-center text-xs font-medium {pill_classes}",
-                div { class: "w-2 h-2 rounded-full mr-2 {dot_classes}" }
+                class: "flex items-center gap-2 text-[12.5px] font-medium {pill_classes}",
+                div { class: "w-[7px] h-[7px] rounded-full flex-shrink-0 {dot_classes}" }
                 span { "{label}" }
             }
         }
@@ -261,6 +244,12 @@ fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: Memb
 struct MemberDisplayParts {
     nickname: String,
     tags: Vec<MemberTag>,
+    /// The avatar's text (`conversation::avatar::initials`).
+    initials: String,
+    /// The avatar's hue under this viewer's salt for the room, or `None` for
+    /// the neutral disc. Same rule as the conversation's avatars.
+    avatar_hue: Option<u16>,
+    is_self: bool,
 }
 
 /// One badge in a member row.
@@ -285,6 +274,36 @@ impl MemberTag {
             tooltip,
             test_id,
         }
+    }
+}
+
+/// The line icon a relationship glyph is drawn as. `None` for the self
+/// marker (drawn as "you") and the impersonation warning (drawn as itself, in
+/// the warning colour); `member_tag_glyphs_all_have_a_drawing` pins that
+/// nothing else falls through.
+fn marker_icon(glyph: &str) -> Option<&'static str> {
+    match glyph {
+        "👑" => Some(CROWN_ICON_PATH),
+        "🛡" => Some(SHIELD_ICON_PATH),
+        "🔑" => Some(KEY_ICON_PATH),
+        "🌐" => Some(GLOBE_ICON_PATH),
+        "🎪" => Some(JOIN_ICON_PATH),
+        "🔭" => Some(LINK_ICON_PATH),
+        _ => None,
+    }
+}
+
+/// A member-row marker, drawn from its glyph (the tag's meaning): the ⚠ stays
+/// its glyph, in the warning colour; "you" is a muted word; every other mark
+/// is a monochrome line icon. Its span carries the tooltip and label.
+fn member_marker(glyph: &str) -> Element {
+    let icon = marker_icon(glyph);
+    match (glyph, icon) {
+        ("⭐", _) => rsx! { span { class: "text-[12.5px] text-text-muted", "you" } },
+        (_, Some(path)) => {
+            rsx! { span { class: "text-text-muted inline-flex", {line_icon(path, 14)} } }
+        }
+        (other, None) => rsx! { span { class: "text-warning-text", "{other}" } },
     }
 }
 
@@ -348,6 +367,9 @@ fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
     MemberDisplayParts {
         nickname: member.nickname.clone(),
         tags,
+        initials: crate::components::conversation::avatar::initials(&member.nickname),
+        avatar_hue: None,
+        is_self: member.is_self,
     }
 }
 
@@ -1441,7 +1463,7 @@ fn badge_for_target(
 pub fn MemberList() -> Element {
     let mut invite_modal_active = use_signal(|| false);
     let mut export_modal_active = use_signal(|| false);
-    // Hidden until the Active Members heading is clicked, so a quiet room
+    // Hidden until the Members heading is clicked, so a quiet room
     // does not spend a row on a box nobody is using (freenet/river#493).
     let mut member_search_open = use_signal(|| false);
     let mut member_query = use_signal(String::new);
@@ -1478,6 +1500,18 @@ pub fn MemberList() -> Element {
         };
         let room_data = rooms_read.map.get(&room_owner)?;
         let room_state = room_data.room_state.clone();
+        // The avatar salt, a second fallible read: on contention the list
+        // still renders, with neutral avatars, and the nudge re-runs the memo
+        // (dioxus-signal-safety.md). Asked for here too, not only by the
+        // history: a room with no messages renders no history rows.
+        crate::avatar_salt::ensure_avatar_salt(room_owner.to_bytes());
+        let avatar_salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
+            Ok(salts) => salts.get(&room_owner.to_bytes()).copied(),
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                None
+            }
+        };
         // `None` when this build holds no locally-known identity for the room.
         // The roster is public room state and stays fully readable; only the
         // per-row "relationship to me" flags (is_self, invited_you, sponsor,
@@ -1610,7 +1644,16 @@ pub fn MemberList() -> Element {
                 impersonation: impersonation_warning,
             };
 
-            all_members.push((member_display_parts(&member_display), member_id));
+            let mut parts = member_display_parts(&member_display);
+            parts.avatar_hue = avatar_salt.as_ref().and_then(|salt| {
+                crate::components::conversation::avatar::member_vk_bytes(
+                    &room_state,
+                    &room_owner,
+                    member_id,
+                )
+                .map(|vk| crate::components::conversation::avatar::display_hue(salt, &vk))
+            });
+            all_members.push((parts, member_id));
         }
 
         // freenet/river#584: your own row goes to the top, so finding yourself
@@ -1627,6 +1670,7 @@ pub fn MemberList() -> Element {
     // contended). "No matching members" must not show then.
     let members_loaded = members.is_some();
     let members = members.unwrap_or_default();
+    let members_total = members.len();
 
     let needle = member_query.read().trim().to_lowercase();
     let members: Vec<_> = members
@@ -1643,6 +1687,8 @@ pub fn MemberList() -> Element {
     };
 
     let search_open = *member_search_open.read();
+    // Before the search filter: the room's member count, not the matches.
+    let member_total = members_total;
     let no_match = members_loaded && members.is_empty() && !needle.is_empty();
 
     // Don't show members panel if no room is selected
@@ -1657,12 +1703,14 @@ pub fn MemberList() -> Element {
             // (freenet/river#274): the members rail is the PRE-FIX location
             // of the connection pill (Bug #5). Tests assert this rail
             // carries no indicator, anchoring on the testid instead of the
-            // brittle visible text "Active Members".
+            // brittle visible text "Members".
             "data-testid": "members-rail",
-            class: "w-full md:w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col",
+            // The header's members toggle controls this panel.
+            id: "members-rail",
+            class: "w-full md:w-62 flex-shrink-0 bg-rail border-l border-border flex flex-col",
             // Header
-            div { class: "px-4 py-3 border-b border-border flex-shrink-0",
-                div { class: "flex items-center gap-2",
+            div { class: "pl-4 pr-2.5 py-3 border-b border-border flex-shrink-0",
+                div { class: "flex items-center gap-2 min-h-9",
                     // Mobile back button
                     BackToChatButton {
                         class: "md:hidden p-1",
@@ -1678,7 +1726,7 @@ pub fn MemberList() -> Element {
                             "data-testid": "member-search-toggle",
                             r#type: "button",
                             // `min-h-6`: a 24px target (WCAG 2.2) for a 20px line.
-                            class: "w-full min-h-6 text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2 text-left",
+                            class: "w-full min-h-6 text-[14.5px] font-bold text-text flex items-center gap-2 text-left",
                             "aria-expanded": if search_open { "true" } else { "false" },
                             "aria-controls": "member-search-input",
                             onclick: move |_| {
@@ -1690,10 +1738,10 @@ pub fn MemberList() -> Element {
                                     }
                                 });
                             },
-                            Icon { icon: FaUsers, width: 16, height: 16 }
-                            span { class: "truncate", "Active Members" }
-                            span { class: "flex-shrink-0 inline-flex",
-                                Icon { icon: FaMagnifyingGlass, width: 14, height: 14 }
+                            span { class: "truncate", "Members" }
+                            span { class: "text-xs font-medium text-text-muted tabular-nums", "{member_total}" }
+                            span { class: "ml-auto flex-shrink-0 inline-flex p-1.5 rounded-lg text-text-muted hover:text-text hover:bg-surface",
+                                {line_icon(SEARCH_ICON_PATH, 18)}
                             }
                         }
                     }
@@ -1704,7 +1752,7 @@ pub fn MemberList() -> Element {
                     input {
                         id: "member-search-input",
                         "data-testid": "member-search-input",
-                        class: "mt-2 w-full px-3 py-2 bg-surface border border-border rounded-lg text-base text-text",
+                        class: "mt-2 w-full px-3 py-2 bg-surface border border-border rounded-xl text-base text-text",
                         r#type: "search",
                         placeholder: "Search members",
                         "aria-label": "Search members by name",
@@ -1774,13 +1822,25 @@ pub fn MemberList() -> Element {
                         // and every badge is `flex-shrink-0` so it can never be
                         // clipped, whatever the name's length.
                         button {
-                            class: "w-full text-left px-3 py-1.5 rounded-lg text-sm text-text hover:bg-surface transition-colors flex items-center min-w-0",
+                            class: "w-full text-left h-10 px-2 gap-2.5 rounded-lg text-[14px] text-text-secondary hover:text-text hover:bg-surface transition-colors flex items-center min-w-0",
                             title: "Member ID: {member_id}",
                             onclick: move |_| handle_member_click(member_id),
+                            // Decorative: the row's own text names the member.
+                            span {
+                                "aria-hidden": "true",
+                                class: format!(
+                                    "msg-avatar member-avatar{}{}",
+                                    if parts.avatar_hue.is_some() { " msg-avatar-hued" } else { "" },
+                                    if parts.is_self { " msg-avatar-self" } else { "" },
+                                ),
+                                style: crate::components::conversation::avatar::avatar_style(parts.avatar_hue),
+                                "{parts.initials}"
+                            }
                             // Nickname rendered as a plain text node — attacker-controlled
                             // bytes from `MemberInfoV1.preferred_nickname` MUST NOT be
                             // routed through `dangerous_inner_html` (freenet/river#227).
-                            span { class: "truncate min-w-0", "{parts.nickname}" }
+                            span { "data-testid": "member-name", class: "truncate min-w-0", "{parts.nickname}" }
+                            span { class: "inline-flex items-center gap-1.5 flex-shrink-0",
                             for tag in parts.tags {
                                 span {
                                     // Addressable from a browser test — see
@@ -1790,14 +1850,15 @@ pub fn MemberList() -> Element {
                                     // only thing that can check it renders at
                                     // all at narrow widths.
                                     "data-testid": "{tag.test_id}",
-                                    class: "member-icon flex-shrink-0",
+                                    class: "member-icon flex-shrink-0 inline-flex items-center",
                                     title: "{tag.tooltip}",
                                     // The glyph alone means nothing to a
                                     // screen reader, and the deputy shield is
                                     // now a security-relevant signal.
                                     "aria-label": "{tag.tooltip}",
-                                    " {tag.glyph}"
+                                    {member_marker(tag.glyph)}
                                 }
+                            }
                             }
                         }
                     }
@@ -1805,24 +1866,27 @@ pub fn MemberList() -> Element {
             }
 
             // Action buttons - fixed at bottom
-            div { class: "p-3 border-t border-border flex-shrink-0 space-y-2",
+            div { class: "px-3 pt-2.5 pb-3 flex-shrink-0 space-y-1.5",
+                // Outlined, not a solid accent fill: the accent is kept for
+                // your own name, links and counts.
                 button {
                     "data-testid": "invite-member-button",
-                    class: "w-full flex items-center justify-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
+                    class: "w-full h-[38px] flex items-center justify-center gap-2 px-3 bg-transparent hover:bg-surface text-text text-[14px] font-medium rounded-xl border border-border-hover transition-colors",
                     onclick: move |_| invite_modal_active.set(true),
-                    Icon { icon: FaUserPlus, width: 14, height: 14 }
-                    span { "Invite Member" }
+                    {line_icon(INVITE_ICON_PATH, 18)}
+                    span { "Invite someone" }
                 }
                 // The "Direct Messages" button used to live here, but
                 // zorolin (#244 feedback, 2026-05-16) and Ian agreed it
                 // belonged in the left rail next to Rooms — that's where
                 // it now lives via `DmRailSection`. Per-room and
                 // cross-room DM discovery are both surfaced there.
+                // Quiet and secondary, below the invite.
                 button {
                     "data-testid": "export-id-button",
-                    class: "w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
+                    class: "w-full flex items-center justify-center gap-1.5 px-2 py-1 text-text-muted hover:text-text text-xs font-medium rounded-lg transition-colors",
                     onclick: move |_| export_modal_active.set(true),
-                    Icon { icon: FaFileExport, width: 12, height: 12 }
+                    {line_icon(EXPORT_ICON_PATH, 13)}
                     span { "Export ID" }
                 }
             }
@@ -2010,28 +2074,28 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-xl w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
-                h3 { class: "text-lg font-semibold text-text mb-4",
+                h3 { class: "text-[16px] font-semibold text-text mb-4",
                     "Export Identity"
                 }
-                p { class: "text-sm text-text-muted mb-3",
+                p { class: "text-[13px] text-text-muted mb-3",
                     "Copy this token and import it in another River client (UI or riverctl) to use the same identity."
                 }
-                p { class: "text-sm text-yellow-500 font-medium mb-3",
+                p { class: "text-[13px] text-text font-medium mb-3 px-3 py-2 rounded-lg bg-warning-bg border-l-[3px] border-warning",
                     "⚠ This token contains your private key. Treat it like a password — do not share it publicly."
                 }
                 textarea {
-                    class: "w-full h-40 bg-surface border border-border rounded-lg p-3 text-xs font-mono text-text resize-none",
+                    class: "w-full h-40 bg-surface border border-border rounded-xl p-3 text-xs font-mono text-text resize-none",
                     readonly: true,
                     value: "{token_text}",
                 }
                 div { class: "flex justify-end gap-3 mt-4",
                     button {
-                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                        class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                         onclick: move |_| is_active.set(false),
                         "Close"
                     }
                     button {
-                        class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
+                        class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] font-medium rounded-lg transition-colors",
                         onclick: handle_copy,
                         "{copy_button_text}"
                     }
@@ -2740,19 +2804,22 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
 
     rsx! {
         div {
-            class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
+            // z-[60] over the composer: mounted in the rooms rail, before the
+            // conversation in the DOM (see `JoinWithCodeModal`).
+            "data-testid": "import-identity-backdrop",
+            class: "fixed inset-0 bg-black/50 flex items-center justify-center z-[60]",
             onclick: move |_| reset_and_close(),
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
-                h3 { class: "text-lg font-semibold text-text mb-4",
+                h3 { class: "text-[16px] font-semibold text-text mb-4",
                     "Import Identity"
                 }
-                p { class: "text-sm text-text-muted mb-3",
+                p { class: "text-[13px] text-text-muted mb-3",
                     "Paste a River identity token exported from another client."
                 }
                 textarea {
-                    class: "w-full h-40 bg-surface border border-border rounded-lg p-3 text-xs font-mono text-text resize-none",
+                    class: "w-full h-40 bg-surface border border-border rounded-xl p-3 text-xs font-mono text-text resize-none",
                     placeholder: "-----BEGIN RIVER IDENTITY-----\n...\n-----END RIVER IDENTITY-----",
                     value: "{token_input}",
                     // Controlled input: set the value signal synchronously (the
@@ -2777,12 +2844,12 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     },
                 }
                 if let Some(err) = &*error_msg.read() {
-                    div { class: "mt-2 text-sm text-red-400",
+                    div { class: "mt-2 text-sm text-danger",
                         "{err}"
                     }
                 }
                 if let Some(msg) = &*success_msg.read() {
-                    div { class: "mt-2 text-sm text-green-400",
+                    div { class: "mt-2 text-sm text-success",
                         "{msg}"
                     }
                 }
@@ -2790,7 +2857,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     // A room identity already exists — warn before replacing it.
                     div {
                         "data-testid": "import-identity-replace-warning",
-                        class: "mt-3 text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3",
+                        class: "mt-3 text-sm text-text bg-warning-bg border-l-[3px] border-warning rounded-lg p-3",
                         "This room already has an identity. Importing will REPLACE it \u{2014} you'll lose access to your current identity for this room unless you've exported it first."
                     }
                     // Multi-tab reversal caveat (freenet/river#420): another
@@ -2798,19 +2865,19 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     // the switch on next load, so tell the user to close them first.
                     div {
                         "data-testid": "import-identity-replace-multitab-warning",
-                        class: "mt-2 text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3",
+                        class: "mt-2 text-sm text-text bg-warning-bg border-l-[3px] border-warning rounded-lg p-3",
                         "Close any other tabs or devices open to this room first. A session still using the old identity can write it back and undo the switch."
                     }
                     div { class: "flex justify-end gap-3 mt-4",
                         button {
                             "data-testid": "import-identity-replace-cancel",
-                            class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                            class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                             onclick: handle_replace_cancel,
                             "Cancel"
                         }
                         button {
                             "data-testid": "import-identity-replace-confirm",
-                            class: "px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors",
+                            class: "px-4 py-2 bg-danger hover:bg-danger-hover text-white text-sm font-medium rounded-lg transition-colors",
                             onclick: handle_replace_confirm,
                             "Replace identity"
                         }
@@ -2830,7 +2897,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                             // the missing rooms hydrate (freenet/river#414 round-10 P2).
                             div {
                                 "data-testid": "import-identity-load-failed",
-                                class: "mt-3 text-sm text-amber-400",
+                                class: "mt-3 text-sm text-warning-text",
                                 "Some rooms didn't finish loading, so importing is paused to avoid overwriting one. Retry loading your rooms to continue."
                             }
                             div { class: "flex justify-end mt-2",
@@ -2857,7 +2924,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                             // entry is freenet-migrate#39).
                             div {
                                 "data-testid": "import-identity-migration-incomplete",
-                                class: "mt-3 text-sm text-amber-400",
+                                class: "mt-3 text-sm text-warning-text",
                                 "Some rooms from an earlier version of River may not have finished moving over. Importing now could overwrite one of them. River keeps trying on each load; import anyway only if you know the room is not one of them."
                             }
                             div { class: "flex justify-end mt-2",
@@ -2880,7 +2947,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                             // user may go ahead knowingly (#768).
                             div {
                                 "data-testid": "import-identity-migration-unresolved",
-                                class: "mt-3 text-sm text-amber-400",
+                                class: "mt-3 text-sm text-warning-text",
                                 "Rooms from an earlier version of River on this node haven't answered yet. Importing now could replace the identity one of them brings back. River keeps checking on each load; import anyway only if you know the room is not one of them."
                             }
                             div { class: "flex justify-end mt-2",
@@ -2896,20 +2963,20 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                         } else {
                             div {
                                 "data-testid": "import-identity-loading-rooms",
-                                class: "mt-3 text-sm text-text-muted",
+                                class: "mt-3 text-[13px] text-text-muted",
                                 "Loading your rooms\u{2026} the import will be available in a moment."
                             }
                         }
                     }
                     div { class: "flex justify-end gap-3 mt-4",
                         button {
-                            class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                            class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                             onclick: move |_| reset_and_close(),
                             "Cancel"
                         }
                         button {
                             "data-testid": "import-identity-submit",
-                            class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                            class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                             disabled: !rooms_hydrated,
                             onclick: handle_import,
                             "Import"
@@ -2923,6 +2990,44 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every glyph a `MemberTag` is built with is drawn as a line icon, as
+    /// "you", or (only the impersonation warning) as itself in the warning
+    /// colour. A new tag glyph without an icon would otherwise render as a
+    /// bare emoji in the warning colour, reading as a warning.
+    #[test]
+    fn member_tag_glyphs_all_have_a_drawing() {
+        let raw = include_str!("members.rs");
+        let src = &raw[..raw.find("mod tests {").expect("a test module")];
+        let mut glyphs = Vec::new();
+        for (at, _) in src.match_indices("MemberTag::new(") {
+            let rest = src[at + "MemberTag::new(".len()..].trim_start();
+            if let Some(lit) = rest.strip_prefix('"') {
+                glyphs.push(lit[..lit.find('"').expect("a closed literal")].to_string());
+            } else {
+                // The only non-literal glyph is the shared warning glyph.
+                assert!(
+                    rest.starts_with("crate::util::confusable::WARNING_GLYPH"),
+                    "a MemberTag built from an unexpected glyph: {}",
+                    &rest[..rest.len().min(60)]
+                );
+            }
+        }
+        assert!(
+            glyphs.len() >= 7,
+            "premise: the scan found the tags: {glyphs:?}"
+        );
+        for glyph in &glyphs {
+            assert!(
+                glyph == "⭐" || super::marker_icon(glyph).is_some(),
+                "MemberTag glyph {glyph:?} has no line icon in `marker_icon`"
+            );
+        }
+        assert_eq!(
+            super::marker_icon(crate::util::confusable::WARNING_GLYPH),
+            None
+        );
+    }
     use super::*;
     use river_core::room_state::member::Member;
 
@@ -5376,7 +5481,8 @@ mod tests {
             .iter()
             .position(|l| l.contains("\"data-testid\": \"member-item-"))
             .expect("the row");
-        let row_lines = &lines[row_start..(row_start + 40).min(lines.len())];
+        // The row, its avatar, name and badges, with their comments.
+        let row_lines = &lines[row_start..(row_start + 60).min(lines.len())];
 
         let button_line = row_lines
             .iter()
@@ -7480,7 +7586,7 @@ mod tests {
         let group_fn = between(
             conversation,
             "fn group_messages(",
-            "\n/// Format an event summary",
+            "\n/// A join notice's names",
             "group_messages",
         );
         assert!(
@@ -7509,7 +7615,18 @@ mod tests {
             conversation.contains("impersonation_checker_for_viewer("),
             "the conversation no longer builds an impersonation checker"
         );
-        // The rendered element and its glyph: impersonation-warning.spec.ts.
+        // The rendered element, anchored on its call, and the glyph it renders
+        // (the browser side is impersonation-warning.spec.ts).
+        let author_warning = between(
+            conversation,
+            "name_mark(\"message-author-impersonation-warning\"",
+            "\n",
+            "author-line warning element",
+        );
+        assert!(
+            author_warning.contains("WARNING_GLYPH"),
+            "the message author line no longer renders the warning glyph"
+        );
 
         // --- Member-info modal -------------------------------------------
         //

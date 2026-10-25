@@ -140,7 +140,7 @@ pub static DM_DRAFT: GlobalSignal<Option<(VerifyingKey, MemberId, String)>> = Gl
 /// `(room_owner_vk, recipient, purge_token)`. Hydrated from the chat
 /// delegate on app startup and re-written on every send / purge. Used
 /// by [`DmThreadModal`] (and CLI/`riverctl dm list` via the equivalent
-/// CLI cache) to render the sender's own outbound bubbles as plaintext
+/// CLI cache) to render the sender's own outbound DMs as plaintext
 /// instead of "sent — ciphertext only". See issue freenet/river#256.
 ///
 /// Miss on lookup → caller falls back to the placeholder, so DMs sent
@@ -213,7 +213,7 @@ pub fn is_thread_hidden_for(
         .is_some_and(|h| max_message_ts <= h.hidden_at_ts)
 }
 
-/// Pure helper: decide how to render an outbound DM bubble given the
+/// Pure helper: decide how to render an outbound DM row given the
 /// loaded plaintext cache.
 ///
 /// `Ok(plaintext)` — render as user-supplied prose (markdown / linkify
@@ -557,7 +557,7 @@ pub async fn send_structured_dm(
 
 /// Marks a cached outbound summary as an invitation rather than ordinary
 /// text. The sender cannot decrypt their own outbound DM (it is ECIES-sealed
-/// to the recipient), so this cached string is the ONLY thing their own bubble
+/// to the recipient), so this cached string is the ONLY thing their own row
 /// can be rendered from — this prefix is what lets the renderer tell a sent
 /// invitation from an ordinary message.
 pub(crate) const OUTBOUND_INVITE_SENTINEL: &str = "[Invitation]";
@@ -570,14 +570,14 @@ pub(crate) struct OutboundInviteSummary {
 }
 
 /// Compute the plaintext string we cache for the sender's own outbound
-/// bubble rendering. For `Text` bodies that's just the text; for `Invite`
+/// row rendering. For `Text` bodies that's just the text; for `Invite`
 /// it's a human-readable summary so the sender's list view doesn't
 /// render a blank "Invite (binary payload)" placeholder. The recipient
 /// decodes the wire body directly — they never look at this string.
 ///
 /// **This format is deliberately unchanged, and is not a data channel.**
 /// The obvious improvement — recording the invited ROOM's name here, so the
-/// sender's bubble can name it the way the recipient's card does — was tried
+/// sender's row can name it the way the recipient's card does — was tried
 /// and reverted, because this one `String` is a shared display field:
 /// `riverctl dm list` prints it as a single line per message
 /// (`cli/src/commands/dm.rs`), so a second line there becomes an orphan row
@@ -998,7 +998,7 @@ mod tests {
     }
 
     /// A sent invitation must be recognisable in the sender's own thread —
-    /// it is the only signal their bubble has, since the outbound copy is
+    /// it is the only signal their row has, since the outbound copy is
     /// sealed to the recipient.
     #[test]
     fn a_sent_invite_is_recognisable_in_the_senders_own_thread() {
@@ -1073,7 +1073,7 @@ mod tests {
             parsed.note.as_deref(),
             Some("to the pub at 7"),
             "the user's words must survive into the card, so a mislabelled \
-             bubble still shows what they actually wrote"
+             row still shows what they actually wrote"
         );
     }
 
@@ -1724,7 +1724,7 @@ mod tests {
 
     /// Issue freenet/river#256 regression: a cache hit on
     /// `(room, recipient, purge_token)` MUST return the original
-    /// plaintext so the sender's own outbound bubble renders as
+    /// plaintext so the sender's own outbound row renders as
     /// markdown prose instead of the "sent — ciphertext only"
     /// placeholder. Pins the load-bearing lookup tuple — any future
     /// refactor that drops a field from the key (or swaps key order)

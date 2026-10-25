@@ -8,14 +8,15 @@ import { waitForApp, selectRoom } from "./example-room";
 //     saying whether they can ban you. Authors without that authority don't.
 //
 //  2. That badge cannot be faked by a nickname. Example data deliberately
-//     gives the room OWNER the stored nickname "… (Owner) 🛡👑" — a spoof
+//     gives the room OWNER a stored nickname ending "🛡👑" — a spoof
 //     attempt — and `crate::util::display_name` strips it at render time, so
 //     the owner's author line shows no glyph at all.
 //
 // Example data (ui/src/example_data.rs): in "Team Chat Room" the owner
-// deputizes the "(Member)" member (a global moderator, relevant to every
-// viewer) and that member is given one guaranteed message so this spec is
-// deterministic. The local user is "(You)" and the owner is "(Owner)".
+// deputizes one member (a global moderator, relevant to every viewer) and
+// that member is given one guaranteed message so this spec is
+// deterministic. Names are random, so the owner and the deputy are found by
+// their markers (the OWNER tag, the member panel's deputy shield).
 //
 // Rust unit tests pin the predicate itself (`deputy_badges_for_viewer`) and
 // the sanitiser; this spec pins that the two are actually wired to the DOM.
@@ -66,7 +67,14 @@ test.describe("Deputy badge on message authors", { tag: "@chromium-only" }, () =
     );
     expect(badgedNames.length).toBeGreaterThan(0);
     expect(new Set(badgedNames).size).toBe(1);
-    expect(badgedNames[0]).toContain("(Member)");
+    // …and that author is the member the panel marks as the deputy.
+    const deputyName = await page
+      .getByTestId("member-list")
+      .locator('[data-testid^="member-item-"] button')
+      .filter({ has: page.getByTestId("member-list-deputy") })
+      .getByTestId("member-name")
+      .textContent();
+    expect(badgedNames[0]).toBe((deputyName ?? "").trim());
   });
 
   test("a non-deputy author has no badge", async ({ page }) => {
@@ -75,11 +83,11 @@ test.describe("Deputy badge on message authors", { tag: "@chromium-only" }, () =
     // The owner also posts in example data, and the owner is nobody's deputy,
     // so their author line must carry no badge.
     const ownerHeader = page
-      .locator(AUTHOR_NAME)
-      .filter({ hasText: "(Owner)" })
+      .getByTestId("message-group-header")
+      .filter({ has: page.getByTestId("message-author-owner-tag") })
       .first();
     await expect(ownerHeader).toBeVisible();
-    await expect(ownerHeader.locator("xpath=..").locator(BADGE)).toHaveCount(0);
+    await expect(ownerHeader.locator(BADGE)).toHaveCount(0);
   });
 
   test("an emoji nickname cannot paint a badge into the author line", async ({
@@ -100,6 +108,12 @@ test.describe("Deputy badge on message authors", { tag: "@chromium-only" }, () =
       }
     }
     // Sanity: the owner really is on screen, so the loop above wasn't vacuous.
-    expect(names.some((n) => n.includes("(Owner)"))).toBe(true);
+    const ownerName = await page
+      .getByTestId("message-group-header")
+      .filter({ has: page.getByTestId("message-author-owner-tag") })
+      .first()
+      .getByTestId("message-author-name")
+      .textContent();
+    expect(names.map((n) => n.trim())).toContain((ownerName ?? "").trim());
   });
 });

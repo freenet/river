@@ -13,7 +13,7 @@ test.describe("Desktop layout (1280px)", () => {
       page.locator("aside").filter({ hasText: "Rooms" })
     ).toBeVisible();
     await expect(
-      page.locator("aside").filter({ hasText: "Active Members" })
+      page.getByTestId("members-rail")
     ).toBeVisible();
     await expect(
       page.getByRole("heading", { name: "Team Chat Room" })
@@ -40,7 +40,7 @@ test.describe("Tablet layout (768px)", () => {
       page.locator("aside").filter({ hasText: "Rooms" })
     ).toBeVisible();
     await expect(
-      page.locator("aside").filter({ hasText: "Active Members" })
+      page.getByTestId("members-rail")
     ).toBeVisible();
 
     const hasHScroll = await page.evaluate(
@@ -72,7 +72,7 @@ test.describe("Breakpoint boundary (767px)", () => {
       page.locator("aside").filter({ hasText: "Rooms" })
     ).not.toBeVisible();
     await expect(
-      page.locator("aside").filter({ hasText: "Active Members" })
+      page.getByTestId("members-rail")
     ).not.toBeVisible();
 
     // No horizontal scrollbar
@@ -147,13 +147,11 @@ test.describe("Mobile layout (480px)", () => {
 
     // Members panel visible
     await expect(
-      page.locator("aside").filter({ hasText: "Active Members" })
+      page.getByTestId("members-rail")
     ).toBeVisible();
 
     // Back button returns to chat
-    const memberPanel = page
-      .locator("aside")
-      .filter({ hasText: "Active Members" });
+    const memberPanel = page.getByTestId("members-rail");
     await memberPanel.locator("button").first().click();
 
     await expect(
@@ -199,7 +197,7 @@ test.describe("Desktop recovery after mobile", () => {
     // Switch to members view on mobile
     await page.getByTestId("header-members-button").click();
     await expect(
-      page.locator("aside").filter({ hasText: "Active Members" })
+      page.getByTestId("members-rail")
     ).toBeVisible();
 
     // Resize to desktop
@@ -210,7 +208,7 @@ test.describe("Desktop recovery after mobile", () => {
       page.locator("aside").filter({ hasText: "Rooms" })
     ).toBeVisible();
     await expect(
-      page.locator("aside").filter({ hasText: "Active Members" })
+      page.getByTestId("members-rail")
     ).toBeVisible();
     await expect(
       page.getByPlaceholder("Type your message...")

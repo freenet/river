@@ -139,8 +139,9 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
       nonSelf.nth(1),
       "Team Chat Room lists at least two members other than the local user",
     ).toBeVisible({ timeout: 5_000 });
-    const textA = ((await nonSelf.nth(0).textContent()) || "").trim();
-    const textB = ((await nonSelf.nth(1).textContent()) || "").trim();
+    // The name span alone: the row also holds the avatar's initials.
+    const textA = ((await nonSelf.nth(0).getByTestId("member-name").textContent()) || "").trim();
+    const textB = ((await nonSelf.nth(1).getByTestId("member-name").textContent()) || "").trim();
 
     // First invite: open the picker for member A.
     const titleA = await openPickerAndReadTitle(page, nonSelf.nth(0));
@@ -150,8 +151,8 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     // title still read member A's name here.
     const titleB = await openPickerAndReadTitle(page, nonSelf.nth(1));
 
-    // The picker title is the unsealed nickname; a member row renders
-    // "<nickname> <badges>", so a row text always starts with that
+    // The picker title is the unsealed nickname; a member row's name span
+    // holds "<nickname>", so it always starts with that
     // member's own title. These assertions pin each title to the member
     // it was opened for — with the bug, titleB held member A's name and
     // `textB.startsWith(titleB)` was false. (A row text can't

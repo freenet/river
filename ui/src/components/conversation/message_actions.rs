@@ -83,7 +83,7 @@ pub fn MessageActions(props: MessageActionsProps) -> Element {
             // Delete button (only for own messages)
             if props.is_own_message {
                 button {
-                    class: "p-1.5 rounded hover:bg-error-bg hover:text-red-600 transition-colors text-text-muted",
+                    class: "p-1.5 rounded hover:bg-error-bg hover:text-danger transition-colors text-text-muted",
                     title: "Delete message",
                     onclick: move |_| {
                         props.on_delete.call(message_id_for_delete.clone());

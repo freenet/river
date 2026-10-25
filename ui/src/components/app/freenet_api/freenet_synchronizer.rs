@@ -803,11 +803,15 @@ impl FreenetSynchronizer {
                                                     info!("Value #{} is ApplicationMessage, processed: {}, payload size: {}",
                                                           i, app_msg.processed, app_msg.payload.len());
                                                 }
-                                                _ => debug!("Value #{} is: {:?}", i, v),
+                                                _ => debug!(
+                                                    "Value #{} is: {}",
+                                                    i,
+                                                    super::response_handler::outbound_delegate_msg_kind(v)
+                                                ),
                                             }
                                         }
                                     }
-                                    _ => debug!("Other response type: {:?}", host_response),
+                                    _ => debug!("Other response type: {}", host_response),
                                 }
 
                                 match response_handler.handle_api_response(host_response).await {

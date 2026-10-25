@@ -111,9 +111,10 @@ test.describe("Reading position when content above changes (A02)", () => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page, "purge-me");
     await fillHistory(page, "keep");
-    await parkWithRowAtTop(page, await keyOf(page, "keep 2:"));
+    // "keep 1:", so the rows below it hold the reader well away from the end.
+    await parkWithRowAtTop(page, await keyOf(page, "keep 1:"));
     await expectParkedAwayFromEnd(page);
-    const row = await readingRow(page, "keep 2:");
+    const row = await readingRow(page, "keep 1:");
     expect(row, "premise: the reader is looking at a surviving row").not.toBeNull();
     expect(
       (await rowOffset(page, await keyOf(page, "purge-me 7:")))!,

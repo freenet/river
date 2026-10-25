@@ -7,9 +7,13 @@ type RiverTestHooks = {
   appendMessage(text: string): void;
   insertMessageBeforeLast(text: string): void;
   appendMessages(count: number): void;
+  // `count` join events from Test Sender A and B, alternating (two fold into one notice).
+  appendJoinEvents(count: number): void;
   removeMessages(containing: string): void;
   // Each emoji as a reaction on the newest message, all held by one test author.
   addReactionsToNewest(emojis: string[]): void;
+  // The current room's avatar salt: 32 bytes of `fill`, or none (neutral avatars).
+  setAvatarSalt(fill: number | null): void;
   makeRoomPrivateWithoutSecret(): void;
   forgeNextSendSignature(): void;
   setRoomsLoadState(state: RoomsLoadState): void;
@@ -23,6 +27,7 @@ type RiverTestHooks = {
   switchRoom(name: string): void;
   // Peer 0 and peer 1 are two fixed test identities, each with its own thread. Others throw.
   appendDmsForPeer(peerIndex: 0 | 1, count: number): void;
+  appendDmsAcrossDaysForPeer(peerIndex: 0 | 1, count: number): void;
   deliverDmForPeer(peerIndex: 0 | 1, text: string): void;
   // Admits the peer as a member with no DMs, for an empty thread.
   admitDmPeer(peerIndex: 0 | 1): void;

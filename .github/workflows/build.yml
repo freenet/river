@@ -71,14 +71,30 @@ jobs:
     - name: Install cargo-binstall
       uses: taiki-e/install-action@cargo-binstall
 
+    - name: Read the locked dioxus version
+      id: dioxus-version
+      # `dx` must match the dioxus crate exactly. A newer or older CLI prints
+      # "dx and dioxus versions are incompatible" and then builds anyway, so
+      # the suite would test a bundle the publish (made with the matching dx)
+      # never ships. Read the RESOLVED version from Cargo.lock, not the
+      # requirement in ui/Cargo.toml. The build tasks' check-dx-version
+      # (Makefile.toml) then fails if the installed dx differs.
+      run: |
+        version=$(awk '/^name = "dioxus"$/ { getline; gsub(/version = |"/, ""); print }' Cargo.lock)
+        if [ "$(printf '%s\n' "$version" | grep -c .)" != 1 ]; then
+          echo "::error::expected exactly one dioxus entry in Cargo.lock, found: ${version:-none}"
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
     - name: Cache Dioxus CLI
       id: cache-dioxus-cli
       uses: actions/cache@v3
       with:
         path: ~/.cargo/bin/dx
-        # Re-key on ui/Cargo.toml so a dioxus version bump invalidates the
-        # cached `dx` rather than pinning it to a stale CLI version forever.
-        key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('ui/Cargo.toml') }}
+        # Keyed on the locked dioxus version, so a bump installs the matching
+        # CLI rather than restoring a stale one.
+        key: ${{ runner.os }}-dioxus-cli-${{ steps.dioxus-version.outputs.version }}
 
     - name: Install Dioxus CLI
       # Gate on the cache *result*, not on whether the file exists: a
@@ -99,7 +115,7 @@ jobs:
       if: steps.cache-dioxus-cli.outputs.cache-hit != 'true'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: cargo binstall -y --force dioxus-cli
+      run: cargo binstall -y --force "dioxus-cli@${{ steps.dioxus-version.outputs.version }}"
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -331,14 +347,30 @@ jobs:
     - name: Install cargo-binstall
       uses: taiki-e/install-action@cargo-binstall
 
+    - name: Read the locked dioxus version
+      id: dioxus-version
+      # `dx` must match the dioxus crate exactly. A newer or older CLI prints
+      # "dx and dioxus versions are incompatible" and then builds anyway, so
+      # the suite would test a bundle the publish (made with the matching dx)
+      # never ships. Read the RESOLVED version from Cargo.lock, not the
+      # requirement in ui/Cargo.toml. The build tasks' check-dx-version
+      # (Makefile.toml) then fails if the installed dx differs.
+      run: |
+        version=$(awk '/^name = "dioxus"$/ { getline; gsub(/version = |"/, ""); print }' Cargo.lock)
+        if [ "$(printf '%s\n' "$version" | grep -c .)" != 1 ]; then
+          echo "::error::expected exactly one dioxus entry in Cargo.lock, found: ${version:-none}"
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
     - name: Cache Dioxus CLI
       id: cache-dioxus-cli
       uses: actions/cache@v3
       with:
         path: ~/.cargo/bin/dx
-        # Re-key on ui/Cargo.toml so a dioxus version bump invalidates the
-        # cached `dx` rather than pinning it to a stale CLI version forever.
-        key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('ui/Cargo.toml') }}
+        # Keyed on the locked dioxus version, so a bump installs the matching
+        # CLI rather than restoring a stale one.
+        key: ${{ runner.os }}-dioxus-cli-${{ steps.dioxus-version.outputs.version }}
 
     - name: Install Dioxus CLI
       # Gate on the cache *result*, not on whether the file exists: a
@@ -359,7 +391,7 @@ jobs:
       if: steps.cache-dioxus-cli.outputs.cache-hit != 'true'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: cargo binstall -y --force dioxus-cli
+      run: cargo binstall -y --force "dioxus-cli@${{ steps.dioxus-version.outputs.version }}"
 
     - name: Setup Node.js
       uses: actions/setup-node@v4

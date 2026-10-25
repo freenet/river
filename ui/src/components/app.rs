@@ -93,6 +93,12 @@ pub fn mark_needs_sync(room_key: ed25519_dalek::VerifyingKey) {
 /// Which panel is active on mobile. Defaults to Chat (conversation view).
 pub static MOBILE_VIEW: GlobalSignal<MobileView> = Global::new(|| MobileView::Chat);
 
+/// Whether the member panel is shown on desktop (md+), toggled by the room
+/// header's members button. Open by default, and for this session only: it
+/// is not persisted, since `localStorage` throws in the gateway's sandboxed
+/// iframe. Phones ignore it; there `MOBILE_VIEW` picks the panel.
+pub static MEMBERS_PANEL_OPEN: GlobalSignal<bool> = Global::new(|| true);
+
 // Build metadata from build.rs
 const BUILD_TIMESTAMP: &str = env!("BUILD_TIMESTAMP_ISO");
 const GIT_COMMIT: &str = env!("GIT_COMMIT_HASH");
@@ -555,6 +561,7 @@ pub fn App() -> Element {
         // Stylesheets
         Stylesheet { href: asset!("/assets/styles.css") }
         Stylesheet { href: asset!("/assets/main.css") }
+        crate::fonts::LatoFontFaces {}
 
         // Main chat layout - grid with fixed sidebars and flexible center
         div { class: "flex bg-bg overflow-hidden app-root",
@@ -575,9 +582,17 @@ pub fn App() -> Element {
                 Conversation {}
             }
             div {
+                // Desktop shows it while `MEMBERS_PANEL_OPEN`; a phone shows
+                // it as the Members view, whatever the desktop setting.
                 class: {
                     let is_members = *MOBILE_VIEW.read() == MobileView::Members;
-                    if is_members { "w-full md:w-56 md:flex-shrink-0 flex" } else { "hidden md:w-56 md:flex-shrink-0 md:flex" }
+                    let open = *MEMBERS_PANEL_OPEN.read();
+                    match (is_members, open) {
+                        (true, true) => "w-full md:w-62 md:flex-shrink-0 flex",
+                        (true, false) => "w-full md:w-62 md:flex-shrink-0 flex md:hidden",
+                        (false, true) => "hidden md:w-62 md:flex-shrink-0 md:flex",
+                        (false, false) => "hidden",
+                    }
                 },
                 MemberList {}
             }
