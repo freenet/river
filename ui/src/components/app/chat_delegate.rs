@@ -7041,7 +7041,10 @@ mod tests {
                             result,
                         }
                     }
-                    other => panic!("test node: unsupported request {other:?}"),
+                    other => panic!(
+                        "test node: unsupported request {}",
+                        crate::components::app::freenet_api::response_handler::describe_delegate_request(other)
+                    ),
                 }
             }
 
@@ -7926,7 +7929,10 @@ pub(crate) async fn ensure_room_subscription_once(
         other => {
             clear_ensure_subscription_sent(&room_owner_vk, request_id);
             Err(format!(
-                "Unexpected response for EnsureRoomSubscription: {other:?}"
+                "Unexpected response for EnsureRoomSubscription: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
             ))
         }
     }
@@ -8585,7 +8591,10 @@ where
                     Ok(ChatDelegateResponseMsg::GetVersionedResponse {
                         value, generation, ..
                     }) => Ok((value, generation)),
-                    Ok(other) => Err(format!("Unexpected response to GetVersioned: {other:?}")),
+                    Ok(other) => Err(format!(
+                        "Unexpected response to GetVersioned: {}",
+                        crate::components::app::freenet_api::response_handler::describe_delegate_response(&other)
+                    )),
                     Err(e) => Err(e),
                 }
             }
@@ -8600,7 +8609,10 @@ where
                 };
                 match send_delegate_request(request).await {
                     Ok(ChatDelegateResponseMsg::CasStoreResponse { result, .. }) => Ok(result),
-                    Ok(other) => Err(format!("Unexpected response to CasStore: {other:?}")),
+                    Ok(other) => Err(format!(
+                        "Unexpected response to CasStore: {}",
+                        crate::components::app::freenet_api::response_handler::describe_delegate_response(&other)
+                    )),
                     Err(e) => Err(e),
                 }
             }
@@ -10198,7 +10210,12 @@ async fn do_save_outbound_dms_to_delegate() -> Result<(), String> {
 
     match send_delegate_request(request).await {
         Ok(ChatDelegateResponseMsg::StoreResponse { result, .. }) => result,
-        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Ok(other) => Err(format!(
+            "Unexpected response: {}",
+            crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                &other
+            )
+        )),
         Err(e) => Err(e),
     }
 }
@@ -10719,7 +10736,10 @@ async fn enqueue_delegate_request_inner(
     request: ChatDelegateRequestMsg,
     key_bytes: Vec<u8>,
 ) -> Result<PendingDelegateRequest, String> {
-    debug!("Sending delegate request: {:?}", request);
+    debug!(
+        "Sending delegate request: {}",
+        crate::components::app::freenet_api::response_handler::describe_delegate_request(&request)
+    );
 
     // Create a oneshot channel to receive the response
     let (sender, receiver) = oneshot::channel();
@@ -10825,7 +10845,10 @@ pub(crate) async fn await_delegate_response_outcome(
     match select(receiver, timeout).await {
         Either::Left((response, _)) => match response {
             Ok(resp) => {
-                debug!("Received delegate response: {:?}", resp);
+                debug!(
+                    "Received delegate response: {}",
+                    crate::components::app::freenet_api::response_handler::describe_delegate_response(&resp)
+                );
                 DelegateAwaitOutcome::Response(resp)
             }
             Err(_) => DelegateAwaitOutcome::Cancelled,

@@ -675,7 +675,12 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
             .await?
         {
             Some(ChatDelegateResponseMsg::ListResponse { keys }) => Ok(keys),
-            Some(other) => Err(format!("unexpected reply to legacy ListRequest: {other:?}")),
+            Some(other) => Err(format!(
+                "unexpected reply to legacy ListRequest: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
+            )),
             None => Err("legacy ListRequest timed out after a positive probe".to_string()),
         }
     }
@@ -726,7 +731,12 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
                 }
                 Ok(value)
             }
-            Some(other) => Err(format!("unexpected reply to legacy GetRequest: {other:?}")),
+            Some(other) => Err(format!(
+                "unexpected reply to legacy GetRequest: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
+            )),
             None => Err(format!(
                 "legacy GetRequest for {:?} timed out (silence is not absence)",
                 String::from_utf8_lossy(storage_key)
@@ -1620,7 +1630,12 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
                 }
                 Ok(value)
             }
-            Some(other) => Err(format!("unexpected reply to marker GetRequest: {other:?}")),
+            Some(other) => Err(format!(
+                "unexpected reply to marker GetRequest: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
+            )),
             None => Err("marker GetRequest timed out (silence is not absence)".to_string()),
         }
     }
@@ -1677,8 +1692,11 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
             }) if reply_key == key => (value, generation),
             Some(other) => {
                 return Err(format!(
-                    "unexpected reply to wip-marker GetVersionedRequest: {other:?}"
-                ))
+                "unexpected reply to wip-marker GetVersionedRequest: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
+            ))
             }
             None => return Err("wip-marker GetVersionedRequest timed out".to_string()),
         };
@@ -1717,7 +1735,8 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
                 },
                 Some(other) => {
                     return Err(format!(
-                        "unexpected reply to wip-marker CasStoreRequest: {other:?}"
+                        "unexpected reply to wip-marker CasStoreRequest: {}",
+                    crate::components::app::freenet_api::response_handler::describe_delegate_response(&other)
                     ))
                 }
                 None => return Err("wip-marker CasStoreRequest timed out".to_string()),
@@ -1800,7 +1819,12 @@ async fn put_current<C: RiverDelegateChannel>(
         }) if reply_key.as_bytes() == key.as_slice() => {
             result.map_err(|e| format!("delegate refused store: {e}"))
         }
-        Some(other) => Err(format!("unexpected reply to StoreRequest: {other:?}")),
+        Some(other) => Err(format!(
+            "unexpected reply to StoreRequest: {}",
+            crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                &other
+            )
+        )),
         None => Err("StoreRequest timed out (an unacknowledged store is not durable)".to_string()),
     }
 }
@@ -1821,7 +1845,12 @@ async fn get_current<C: RiverDelegateChannel>(
             key: reply_key,
             value,
         }) if reply_key.as_bytes() == key.as_slice() => Ok(value),
-        Some(other) => Err(format!("unexpected reply to GetRequest: {other:?}")),
+        Some(other) => Err(format!(
+            "unexpected reply to GetRequest: {}",
+            crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                &other
+            )
+        )),
         None => Err("GetRequest timed out (silence is not absence)".to_string()),
     }
 }
@@ -2352,7 +2381,14 @@ pub(crate) async fn top_up_from_with<C: RiverDelegateChannel, S: RiverImportSeam
         .await?
     {
         Some(ChatDelegateResponseMsg::ListResponse { keys }) => keys,
-        Some(other) => return Err(format!("unexpected reply to top-up ListRequest: {other:?}")),
+        Some(other) => {
+            return Err(format!(
+                "unexpected reply to top-up ListRequest: {}",
+                crate::components::app::freenet_api::response_handler::describe_delegate_response(
+                    &other
+                )
+            ))
+        }
         None => return Err("the predecessor did not answer the top-up ListRequest".to_string()),
     };
     let known = seam.known_rooms().await;
@@ -2971,7 +3007,7 @@ pub(crate) mod tests_support {
                         result,
                     }))
                 }
-                other => Err(format!("mock: unsupported request {other:?}")),
+                other => Err(format!("mock: unsupported request {}", crate::components::app::freenet_api::response_handler::describe_delegate_request(&other))),
             }
         }
     }
