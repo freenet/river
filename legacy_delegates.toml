@@ -272,3 +272,10 @@ description = "Last chat-delegate generation before the cleanup merge-law change
 date = "2026-10-19"
 delegate_key = "668ba4fddce481714db89bb113614bbb60c064a6047233bb291a15deec04e799"
 code_hash = "0fc3625e5ec0eee35d614938327e8d0dee9ce9ceacafaa3204a54673ba2a580d"
+
+[[entry]]
+version = "V38"
+description = "Last chat-delegate generation before the GetAvatarSalt request (per-room avatar colour salt derived from the member signing key)"
+date = "2026-10-24"
+delegate_key = "5e2084d5877214dd8717f0200de956808e11cf4134fc9f12db645c5cb8cdfdd5"
+code_hash = "da47cbd9e5264828b80d229a292e23e05951737844cd289c8f53e99bf55e0848"
