@@ -7366,7 +7366,7 @@ mod tests {
                 )
                 .await;
                 live.set(live.get() - 1);
-                out
+                (out.0, out.1)
             };
 
             let (sweep_outcome, (report, seam), ()) =
@@ -7534,7 +7534,7 @@ mod tests {
                 )
                 .await;
                 live.set(live.get() - 1);
-                out
+                (out.0, out.1)
             };
 
             let (sweep_outcome, (report, seam), ()) =

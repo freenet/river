@@ -358,10 +358,15 @@ ONLY, and best-effort:
   admission queue (freenet/river#809), for a key no shipped generation before
   this change holds. A predecessor whose index reads corrupt loses its seed;
 - the walk only remembers the earliest seed it sees (`RecoveredItem::AvatarSeed`
-  answers `AlreadyAuthoritative`) and `walk_with` writes it once, AFTER every
-  predecessor's real data, ignoring failure. A seed can never keep a
-  predecessor open, interrupt the journal, or block the identity-import gate;
-  the worst case is a palette that changes once;
+  answers `AlreadyAuthoritative`) and `walk_with` returns it. The walk driver
+  (`migration_journal::run_work_with`) records the walk's journal status,
+  RELEASES the journal lock, and only then starts the carry
+  (`carry_found_seed_with`) as a detached task with a 15 s overall budget,
+  ignoring failure. So a seed never keeps a predecessor open, never interrupts
+  the journal, never holds the identity-import gate `Pending`, and never
+  blocks the sweep's journal gate (`JOURNAL_OPS`); pinned by
+  `a_slow_seed_import_holds_neither_the_gate_nor_the_journal_lock`. The worst
+  case is a palette that changes once;
 - earliest `created_at_ms` wins (ties by seed bytes), so the seed the UI
   creates on the first load after a re-key gives way to the user's original;
 - an undecodable seed is skipped (`Unrecognized`), never rejected;
@@ -373,7 +378,9 @@ ONLY, and best-effort:
 
 All seed requests in a tab go through one mutex (`SEED_IO`): the session's read
 and the walk's import ask the same delegate for the same key, which is one slot
-in the single-waiter `PENDING_REQUESTS` registry.
+in the single-waiter `PENDING_REQUESTS` registry. Residual: a reply arriving
+after its request timed out can fill the NEXT seed request's waiter (no request
+id in the protocol, so no cheap guard); the worst case is one palette change.
 
 ## The crate walk and the completeness journal (freenet-migrate 0.7)
 

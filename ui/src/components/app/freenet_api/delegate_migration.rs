@@ -1211,12 +1211,6 @@ pub(crate) trait RiverImportSeam {
     fn known_rooms(&mut self) -> impl Future<Output = HashSet<[u8; 32]>> {
         std::future::ready(HashSet::new())
     }
-
-    /// The walk stored a predecessor's avatar seed over the successor's (or
-    /// where it had none). Default: nothing (a seam with no avatars).
-    fn avatar_seed_replaced(&mut self, record: crate::avatar_salt::AvatarSeedRecord) {
-        let _ = record;
-    }
 }
 
 /// Production import seam: ranked merge into the `ROOMS` signal (inside
@@ -1263,10 +1257,6 @@ impl LiveImportSeam {
 }
 
 impl RiverImportSeam for LiveImportSeam {
-    fn avatar_seed_replaced(&mut self, record: crate::avatar_salt::AvatarSeedRecord) {
-        crate::avatar_salt::seed_replaced(record);
-    }
-
     async fn merge_rooms(&mut self, rooms: Rooms, source_rank: u32) -> Result<(), String> {
         self.ensure_room_set_complete()?;
         self.rooms_dirty = true;
@@ -1494,7 +1484,7 @@ pub(crate) struct RiverSuccessorIo<'a, C: RiverDelegateChannel, S: RiverImportSe
     /// node a moment later is answered from here (freenet/river#809).
     prefetched_markers: HashMap<Vec<u8>, Option<Vec<u8>>>,
     /// The earliest avatar seed any predecessor exported this walk, imported
-    /// once the walk is done ([`import_found_seed`]).
+    /// by the walk driver once the walk is recorded ([`carry_found_seed_with`]).
     found_seed: Option<crate::avatar_salt::AvatarSeedRecord>,
     /// The journal as [`begin_with`] read it to decide on the prefetch, used
     /// by the first [`JournaledSuccessorIo::load_journal`] instead of reading
@@ -1931,13 +1921,11 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
                     Err(e) => ItemWrite::retryable(e),
                 }
             }
-            // Written straight to the successor (it is not room state), unless
-            // the successor's own seed is earlier.
-            // Only remembered here (the earliest seen this walk); `walk_with`
-            // imports it once, best-effort, after every predecessor's real data
-            // (`import_found_seed`). Never a write and never a failure, so a
-            // seed cannot keep a predecessor open or count against the
-            // identity-import gate.
+            // Only remembered here (the earliest seen this walk) and returned by
+            // `walk_with`; the driver carries it after the journal is recorded
+            // and its lock released (`carry_found_seed_with`). Never a write
+            // and never a failure here, so a seed cannot keep a predecessor
+            // open or count against the identity-import gate.
             RecoveredItem::AvatarSeed(record) => {
                 if self.found_seed.is_none_or(|held| record.precedes(&held)) {
                     self.found_seed = Some(record);
@@ -2419,12 +2407,20 @@ pub(crate) async fn top_up_from_with<C: RiverDelegateChannel, S: RiverImportSeam
 /// supply mocks — everything in between (probe semantics, the loud fetch,
 /// classification, ranked merge routing, markers, the journal) is EXACTLY the
 /// code production runs.
+///
+/// The third value is the earliest avatar seed any predecessor exported. The
+/// walk writes nothing for it; the caller carries it, after recording the walk
+/// and releasing the journal lock ([`carry_found_seed_with`]).
 pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     channel: &C,
     seam: S,
     successor: DelegateKey,
     lineage: &[DelegateLineageEntry],
-) -> (JournaledMigrationReport, S) {
+) -> (
+    JournaledMigrationReport,
+    S,
+    Option<crate::avatar_salt::AvatarSeedRecord>,
+) {
     let mut reader = RiverPredecessorIo::new(channel);
     // Unreadable: refuse short indexes the slow way this walk (cost only), and
     // write no record back (it would replace other predecessors' digests).
@@ -2447,28 +2443,45 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     if !salvage.is_empty() {
         salvage_short_index_rooms(channel, &mut seam, &successor, lineage, refused, salvage).await;
     }
-    if let Some(record) = found_seed {
-        import_found_seed(channel, &mut seam, &successor, record).await;
-    }
-    (report, seam)
+    (report, seam, found_seed)
 }
 
-/// Carry the earliest predecessor avatar seed onto the successor, LAST and
-/// BEST-EFFORT: every predecessor's rooms, DMs and markers are already
-/// written and the journal recorded, and a failure here is only logged. The
-/// worst case is that this device's palette changes once. A predecessor
-/// resolved by this walk is not walked again, so a seed whose import failed
-/// is not retried.
-async fn import_found_seed<C: RiverDelegateChannel, S: RiverImportSeam>(
+/// Overall budget for [`carry_found_seed_with`]: the wait for the seed lock
+/// (a session read can hold it for a few round trips) plus the import itself.
+pub(crate) const SEED_CARRY_BUDGET_MS: u64 = 15_000;
+
+/// Carry `record`, the earliest seed a walk found ([`walk_with`]'s third
+/// value), onto the successor: BEST-EFFORT and within
+/// [`SEED_CARRY_BUDGET_MS`]. The caller runs it only after the walk's journal
+/// status is recorded and the journal lock is released, detached from the walk
+/// driver (`migration_journal::run_work_with`), so it never holds the
+/// identity-import gate Pending and never blocks the sweep's journal gate.
+/// `on_replaced` is told when the seed was written (the UI recolours). A
+/// failure or timeout is only logged: the worst case is that this device's
+/// palette changes once. The predecessors are resolved by then, so a seed
+/// whose carry failed is not tried again.
+pub(crate) async fn carry_found_seed_with<C: RiverDelegateChannel>(
     channel: &C,
-    seam: &mut S,
     successor: &DelegateKey,
     record: crate::avatar_salt::AvatarSeedRecord,
+    on_replaced: impl FnOnce(crate::avatar_salt::AvatarSeedRecord),
 ) {
-    match crate::avatar_salt::import_seed(channel, successor, record).await {
-        Ok(crate::avatar_salt::SeedImport::Replaced) => seam.avatar_seed_replaced(record),
-        Ok(crate::avatar_salt::SeedImport::Kept) => {}
-        Err(e) => warn!("avatar seed not carried to the successor (palette may change): {e}"),
+    let import = std::pin::pin!(crate::avatar_salt::import_seed(channel, successor, record));
+    let budget = std::pin::pin!(crate::util::sleep(crate::util::millis(
+        SEED_CARRY_BUDGET_MS
+    )));
+    match futures::future::select(import, budget).await {
+        futures::future::Either::Left((Ok(crate::avatar_salt::SeedImport::Replaced), _)) => {
+            on_replaced(record)
+        }
+        futures::future::Either::Left((Ok(crate::avatar_salt::SeedImport::Kept), _)) => {}
+        futures::future::Either::Left((Err(e), _)) => {
+            warn!("avatar seed not carried to the successor (palette may change): {e}")
+        }
+        futures::future::Either::Right(_) => warn!(
+            "avatar seed not carried to the successor within {SEED_CARRY_BUDGET_MS} ms \
+             (palette may change)"
+        ),
     }
 }
 
@@ -3047,7 +3060,7 @@ pub(crate) mod tests_support {
         channel = channel.with_delegate(&successor_key(), DelegateSim::default());
         let mut status = None;
         for _ in 0..streak {
-            let (report, _) = futures::executor::block_on(walk_with(
+            let (report, _, _) = futures::executor::block_on(walk_with(
                 &channel,
                 NoImports,
                 successor_key(),
@@ -3080,7 +3093,7 @@ pub(crate) mod tests_support {
         channel = channel.with_delegate(&successor_key(), DelegateSim::default());
         let mut status = None;
         for _ in 0..walks {
-            let (report, _) = futures::executor::block_on(walk_with(
+            let (report, _, _) = futures::executor::block_on(walk_with(
                 &channel,
                 NoImports,
                 successor_key(),
@@ -3188,8 +3201,6 @@ mod tests {
         /// A merge carrying this room applies in full, then reports an error,
         /// like `merge_from_source` after a per-room failure (#591).
         err_after_apply_for: Option<VerifyingKey>,
-        /// Every avatar seed the walk reported storing.
-        seeds_replaced: Vec<crate::avatar_salt::AvatarSeedRecord>,
     }
 
     impl MemorySeam {
@@ -3209,15 +3220,11 @@ mod tests {
                 order_only_merges: 0,
                 raw_orders_seen: Vec::new(),
                 err_after_apply_for: None,
-                seeds_replaced: Vec::new(),
             }
         }
     }
 
     impl RiverImportSeam for MemorySeam {
-        fn avatar_seed_replaced(&mut self, record: crate::avatar_salt::AvatarSeedRecord) {
-            self.seeds_replaced.push(record);
-        }
         async fn merge_rooms(&mut self, rooms: Rooms, source_rank: u32) -> Result<(), String> {
             if let Some(e) = &self.fail_merge {
                 return Err(e.clone());
@@ -3304,7 +3311,35 @@ mod tests {
 
     /// One journaled walk, with the journal's status.
     fn walk_j(channel: &MockChannel, seam: MemorySeam) -> (JournaledMigrationReport, MemorySeam) {
-        block_on(walk_with(channel, seam, successor_key(), &lineage3()))
+        let (journaled, seam, _) = block_on(walk_with(channel, seam, successor_key(), &lineage3()));
+        (journaled, seam)
+    }
+
+    /// One walk, then the seed carry the driver runs after it: the walk's
+    /// report and every seed the carry reported writing.
+    fn walk_and_carry(
+        channel: &impl RiverDelegateChannel,
+    ) -> (
+        JournaledMigrationReport,
+        MemorySeam,
+        Vec<crate::avatar_salt::AvatarSeedRecord>,
+    ) {
+        let (journaled, seam, found) = block_on(walk_with(
+            channel,
+            MemorySeam::new(),
+            successor_key(),
+            &lineage3(),
+        ));
+        let mut replaced = Vec::new();
+        if let Some(record) = found {
+            block_on(carry_found_seed_with(
+                channel,
+                &successor_key(),
+                record,
+                |r| replaced.push(r),
+            ));
+        }
+        (journaled, seam, replaced)
     }
 
     // ---------------- marker keys ----------------
@@ -4334,9 +4369,10 @@ mod tests {
     #[test]
     fn the_avatar_seed_is_carried_to_the_successor() {
         let channel = channel_with_seeds(seed(5, 1).encode(), None);
-        let (report, seam) = walk(&channel, MemorySeam::new());
+        let (journaled, _, replaced) = walk_and_carry(&channel);
+        let report = journaled.report;
         assert_eq!(stored_seed(&channel), Some(seed(5, 1)));
-        assert_eq!(seam.seeds_replaced, vec![seed(5, 1)], "the UI is told");
+        assert_eq!(replaced, vec![seed(5, 1)], "the UI is told");
         assert!(
             report
                 .predecessors
@@ -4352,17 +4388,17 @@ mod tests {
     #[test]
     fn an_earlier_predecessor_seed_replaces_one_made_since() {
         let channel = channel_with_seeds(seed(5, 1).encode(), Some(seed(9, 2)));
-        let (_, seam) = walk(&channel, MemorySeam::new());
+        let (_, _, replaced) = walk_and_carry(&channel);
         assert_eq!(stored_seed(&channel), Some(seed(5, 1)));
-        assert_eq!(seam.seeds_replaced, vec![seed(5, 1)]);
+        assert_eq!(replaced, vec![seed(5, 1)]);
     }
 
     #[test]
     fn a_successor_seed_that_is_earlier_stands() {
         let channel = channel_with_seeds(seed(9, 2).encode(), Some(seed(5, 1)));
-        let (_, seam) = walk(&channel, MemorySeam::new());
+        let (_, _, replaced) = walk_and_carry(&channel);
         assert_eq!(stored_seed(&channel), Some(seed(5, 1)));
-        assert!(seam.seeds_replaced.is_empty());
+        assert!(replaced.is_empty());
     }
 
     /// A corrupt seed is skipped: losing a palette must not count as a
@@ -4370,9 +4406,10 @@ mod tests {
     #[test]
     fn an_undecodable_predecessor_seed_is_skipped_not_rejected() {
         let channel = channel_with_seeds(vec![0xFF, 0x00, 0x13], None);
-        let (report, seam) = walk(&channel, MemorySeam::new());
+        let (journaled, _, replaced) = walk_and_carry(&channel);
+        let report = journaled.report;
         assert_eq!(stored_seed(&channel), None);
-        assert!(seam.seeds_replaced.is_empty());
+        assert!(replaced.is_empty());
         assert!(
             report
                 .predecessors
@@ -4383,28 +4420,40 @@ mod tests {
         );
     }
 
-    /// Two predecessors hold seeds; the walk goes newest first. The earliest
-    /// seed is the one carried, in ONE write after the walk, whichever
-    /// generation held it.
-    #[test]
-    fn the_earliest_seed_of_several_predecessors_is_carried_once() {
+    /// Gen 0 holds `in_gen0`, gen 2 `in_gen2`; the successor holds nothing.
+    fn channel_with_gen0_and_gen2_seeds(
+        in_gen0: crate::avatar_salt::AvatarSeedRecord,
+        in_gen2: crate::avatar_salt::AvatarSeedRecord,
+    ) -> MockChannel {
         let key = crate::avatar_salt::AVATAR_SEED_STORAGE_KEY.to_vec();
         let mut gen0 = DelegateSim::default();
-        gen0.store.insert(key.clone(), seed(3, 7).encode());
+        gen0.store.insert(key.clone(), in_gen0.encode());
         let mut gen2 = DelegateSim::default();
-        gen2.store.insert(key, seed(9, 2).encode());
-        let channel = MockChannel::default()
+        gen2.store.insert(key, in_gen2.encode());
+        MockChannel::default()
             .with_delegate(&pred_key(0), gen0)
             .with_delegate(&pred_key(1), DelegateSim::default())
             .with_delegate(&pred_key(2), gen2)
-            .with_delegate(&successor_key(), DelegateSim::default());
-        let (_, seam) = walk(&channel, MemorySeam::new());
-        assert_eq!(stored_seed(&channel), Some(seed(3, 7)));
-        assert_eq!(seam.seeds_replaced, vec![seed(3, 7)]);
-        assert_eq!(
-            channel.requests_to_successor("cas:river_avatar_colour_seed_v1"),
-            1
-        );
+            .with_delegate(&successor_key(), DelegateSim::default())
+    }
+
+    /// Two predecessors hold seeds; the walk visits the newest generation
+    /// first. The EARLIEST seed is the one carried, in one write, whichever
+    /// generation held it and whichever was visited first. Both orders are
+    /// needed: with the earliest seed in gen 0 (visited last), "the last seed
+    /// found wins" would pass too.
+    #[test]
+    fn the_earliest_seed_of_several_predecessors_is_carried_once() {
+        for (in_gen0, in_gen2) in [(seed(3, 7), seed(9, 2)), (seed(9, 2), seed(3, 7))] {
+            let channel = channel_with_gen0_and_gen2_seeds(in_gen0, in_gen2);
+            let (_, _, replaced) = walk_and_carry(&channel);
+            assert_eq!(stored_seed(&channel), Some(seed(3, 7)));
+            assert_eq!(replaced, vec![seed(3, 7)]);
+            assert_eq!(
+                channel.requests_to_successor("cas:river_avatar_colour_seed_v1"),
+                1
+            );
+        }
     }
 
     /// Answers every seed request to the successor with silence; everything
@@ -4461,15 +4510,10 @@ mod tests {
             .with_delegate(&pred_key(2), gen2)
             .with_delegate(&successor_key(), DelegateSim::default());
         let channel = SeedSilentAtSuccessor(&mock);
-        let (journaled, seam) = block_on(walk_with(
-            &channel,
-            MemorySeam::new(),
-            successor_key(),
-            &lineage3(),
-        ));
+        let (journaled, seam, replaced) = walk_and_carry(&channel);
 
         assert!(seam.rooms.map.contains_key(&vk(1)), "the room still merged");
-        assert!(seam.seeds_replaced.is_empty());
+        assert!(replaced.is_empty());
         assert_eq!(stored_seed(&mock), None);
         assert!(
             journaled
@@ -5888,7 +5932,8 @@ mod tests {
         let lineage = river_delegate_lineage(&table3()[..1]);
         let mut last = None;
         for _ in 0..3 {
-            let (report, _) = block_on(walk_with(&channel, NoImports, successor_key(), &lineage));
+            let (report, _, _) =
+                block_on(walk_with(&channel, NoImports, successor_key(), &lineage));
             last = report.status;
         }
         assert!(
@@ -6232,7 +6277,8 @@ mod tests {
         let lineage = river_delegate_lineage(&table);
         let mut last = None;
         for _ in 0..3 {
-            let (report, _) = block_on(walk_with(&channel, NoImports, successor_key(), &lineage));
+            let (report, _, _) =
+                block_on(walk_with(&channel, NoImports, successor_key(), &lineage));
             last = report.status;
         }
         assert!(
@@ -7050,7 +7096,7 @@ mod tests {
                 },
             )
             .with_delegate(&successor_key(), DelegateSim::default());
-        let (_, seam) = block_on(walk_with(
+        let (_, seam, _) = block_on(walk_with(
             &channel,
             MemorySeam::new(),
             successor_key(),

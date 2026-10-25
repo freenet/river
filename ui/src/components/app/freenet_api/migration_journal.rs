@@ -45,9 +45,10 @@ use freenet_migrate::{DelegateLineageEntry, JournalStatus};
 use freenet_stdlib::prelude::DelegateKey;
 
 use super::delegate_migration::{
-    begin_with, log_migration_report, note_sweep_import_with, read_walk_cadence,
-    river_delegate_lineage, store_walk_cadence, top_up_in_window_with, walk_with, LiveImportSeam,
-    NodeDelegateChannel, SweepWrite, TopUpOutcome, TopUpWindow,
+    begin_with, carry_found_seed_with, log_migration_report, note_sweep_import_with,
+    read_walk_cadence, river_delegate_lineage, store_walk_cadence, top_up_in_window_with,
+    walk_with, LiveImportSeam, NodeDelegateChannel, RiverDelegateChannel, RiverImportSeam,
+    SweepWrite, TopUpOutcome, TopUpWindow,
 };
 use crate::components::app::chat_delegate;
 
@@ -933,23 +934,52 @@ pub(crate) fn walk_may_run(check: WalkCheck) -> bool {
     check.settled && check.same_attempt && check.room_set_complete
 }
 
-/// One driver run under the journal lock, on behalf of load attempt
-/// `attempt`: the post-resolve top-up and/or a journaled walk (recording its
-/// status). The top-up shares the walk's gate (a complete room set for this
-/// attempt) and its seam's re-checks.
+/// One driver run on behalf of load attempt `attempt`: [`run_work_with`] over
+/// the node, with the walk's avatar seed carried by a DETACHED task once the
+/// journal lock is released, so the driver never waits for it.
 async fn run_work_locked(attempt: u32, work: DriverWork) {
-    let _ops = JOURNAL_OPS.lock().await;
+    run_work_with(
+        &NodeDelegateChannel,
+        || LiveImportSeam::new(attempt),
+        chat_delegate::current_delegate_key(),
+        &LINEAGE,
+        work,
+        |seed| {
+            crate::util::safe_spawn_local(async move {
+                carry_found_seed_with(
+                    &NodeDelegateChannel,
+                    &chat_delegate::current_delegate_key(),
+                    seed,
+                    crate::avatar_salt::seed_replaced,
+                )
+                .await
+            })
+        },
+    )
+    .await
+}
+
+/// One driver run under the journal lock: the post-resolve top-up and/or a
+/// journaled walk (recording its status). The top-up shares the walk's gate (a
+/// complete room set for this attempt) and its seam's re-checks.
+///
+/// The avatar seed the walk found goes to `carry` only AFTER the status is
+/// recorded and the journal lock is DROPPED. `carry` is synchronous: it starts
+/// the seed import and returns, so neither this run nor the driver awaiting it
+/// waits for the seed. While it runs, the identity-import gate is not held
+/// Pending and the sweep's journal gate is not blocked on the lock.
+pub(crate) async fn run_work_with<C: RiverDelegateChannel, S: RiverImportSeam>(
+    channel: &C,
+    seam: impl Fn() -> S,
+    successor: DelegateKey,
+    lineage: &[DelegateLineageEntry],
+    work: DriverWork,
+    carry: impl FnOnce(crate::avatar_salt::AvatarSeedRecord),
+) {
+    let ops = JOURNAL_OPS.lock().await;
     if work.topup {
-        if let Some(newest) = LINEAGE.iter().max_by_key(|e| e.generation) {
-            match top_up_in_window_with(
-                &NodeDelegateChannel,
-                &mut LiveImportSeam::new(attempt),
-                &chat_delegate::current_delegate_key(),
-                newest,
-                now_ms(),
-            )
-            .await
-            {
+        if let Some(newest) = lineage.iter().max_by_key(|e| e.generation) {
+            match top_up_in_window_with(channel, &mut seam(), &successor, newest, now_ms()).await {
                 Ok(TopUpOutcome::Ran { merged, window }) => info!(
                     "migration journal: top-up merged {merged} item(s) from the newest \
                      predecessor (run {} of the window)",
@@ -966,23 +996,16 @@ async fn run_work_locked(attempt: u32, work: DriverWork) {
         return;
     }
     if RESET_CADENCE_ON_WALK.swap(false, Ordering::Relaxed) {
-        let _ = store_walk_cadence(
-            &NodeDelegateChannel,
-            &chat_delegate::current_delegate_key(),
-            0,
-        )
-        .await;
+        let _ = store_walk_cadence(channel, &successor, 0).await;
     }
-    let (report, _seam) = walk_with(
-        &NodeDelegateChannel,
-        LiveImportSeam::new(attempt),
-        chat_delegate::current_delegate_key(),
-        &LINEAGE,
-    )
-    .await;
+    let (report, _seam, found_seed) = walk_with(channel, seam(), successor, lineage).await;
     log_migration_report(&report);
     let status = report.status.clone();
     update_session(move |s| s.on_walk_done(status));
+    drop(ops);
+    if let Some(seed) = found_seed {
+        carry(seed);
+    }
 }
 
 #[cfg(test)]
@@ -1387,8 +1410,8 @@ mod tests {
         // the early return of a run without a walk, and before the walk.
         let run = block(
             src,
-            src.find("async fn run_work_locked(")
-                .expect("run_work_locked"),
+            src.find("pub(crate) async fn run_work_with<")
+                .expect("run_work_with"),
         );
         let gate_at = run.find("if !work.walk {").expect("walk gate");
         let gate = block(run, gate_at);
@@ -2000,5 +2023,158 @@ mod tests {
 
         session().walk_in_flight = true;
         assert_eq!(current_import_gate(), ImportGate::Pending);
+    }
+
+    // ---------------- the avatar seed carry, outside the journal ----------------
+
+    /// A channel that never answers: a seed import through it stays in
+    /// progress for as long as it is polled.
+    struct Hanging;
+
+    impl RiverDelegateChannel for Hanging {
+        async fn request(
+            &self,
+            _target: &DelegateKey,
+            _request: river_core::chat_delegate::ChatDelegateRequestMsg,
+        ) -> Result<Option<river_core::chat_delegate::ChatDelegateResponseMsg>, String> {
+            futures::future::pending().await
+        }
+        async fn request_all(
+            &self,
+            requests: Vec<(
+                DelegateKey,
+                river_core::chat_delegate::ChatDelegateRequestMsg,
+            )>,
+        ) -> Vec<Result<Option<river_core::chat_delegate::ChatDelegateResponseMsg>, String>>
+        {
+            let mut out = Vec::new();
+            for (target, request) in requests {
+                out.push(self.request(&target, request).await);
+            }
+            out
+        }
+    }
+
+    static HANGING: Hanging = Hanging;
+
+    type Started = Vec<std::pin::Pin<Box<dyn Future<Output = ()>>>>;
+
+    /// Runs the REAL `run_work_with` over a mock node whose predecessor holds
+    /// a seed. Its `carry` does what the live one does (start the import and
+    /// return) with an import that never finishes, and records whether the
+    /// journal lock was free when it was handed the seed.
+    struct SeedCarryEnv<'a> {
+        mock: &'a super::super::delegate_migration::tests_support::MockChannel,
+        lineage: Vec<DelegateLineageEntry>,
+        started: RefCell<Started>,
+        lock_free_at_carry: Cell<Option<bool>>,
+    }
+
+    fn poll_once(fut: &mut std::pin::Pin<Box<dyn Future<Output = ()>>>) -> std::task::Poll<()> {
+        let waker = futures::task::noop_waker();
+        fut.as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+    }
+
+    impl WalkEnv for SeedCarryEnv<'_> {
+        fn pending_load_workers(&self) -> u32 {
+            0
+        }
+        fn load_attempt(&self) -> u32 {
+            0
+        }
+        fn room_set_complete(&self, _attempt: u32) -> bool {
+            true
+        }
+        async fn sleep(&self, _ms: u64) {}
+        async fn run_work(&self, _attempt: u32, work: DriverWork) {
+            use super::super::delegate_migration::{tests_support::successor_key, NoImports};
+            run_work_with(
+                self.mock,
+                || NoImports,
+                successor_key(),
+                &self.lineage,
+                work,
+                |seed| {
+                    self.lock_free_at_carry
+                        .set(Some(JOURNAL_OPS.try_lock().is_some()));
+                    let successor: &'static DelegateKey = Box::leak(Box::new(successor_key()));
+                    let mut import: std::pin::Pin<Box<dyn Future<Output = ()>>> =
+                        Box::pin(carry_found_seed_with(&HANGING, successor, seed, |_| {}));
+                    assert!(
+                        poll_once(&mut import).is_pending(),
+                        "the import is under way"
+                    );
+                    self.started.borrow_mut().push(import);
+                },
+            )
+            .await
+        }
+    }
+
+    /// The avatar seed import must not hold up the identity-import gate or
+    /// the sweep's journal gate (which waits on `JOURNAL_OPS`): it is handed
+    /// over only after the walk's status is recorded and the journal lock is
+    /// released, and the driver finishes while it is still running.
+    #[test]
+    fn a_slow_seed_import_holds_neither_the_gate_nor_the_journal_lock() {
+        use super::super::delegate_migration::tests_support::{
+            successor_key, DelegateSim, MockChannel,
+        };
+        let _g = fresh_load();
+        let lineage = river_delegate_lineage(&[([10u8; 32], [110u8; 32])]);
+        let pred = DelegateKey::new(
+            [10u8; 32],
+            freenet_stdlib::prelude::CodeHash::new([110u8; 32]),
+        );
+        let mut held = DelegateSim::default();
+        held.store.insert(
+            crate::avatar_salt::AVATAR_SEED_STORAGE_KEY.to_vec(),
+            crate::avatar_salt::AvatarSeedRecord {
+                created_at_ms: 5,
+                seed: [1; 32],
+            }
+            .encode(),
+        );
+        let mock = MockChannel::default()
+            .with_delegate(&pred, held)
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let env = SeedCarryEnv {
+            mock: &mock,
+            lineage,
+            started: RefCell::new(Vec::new()),
+            lock_free_at_carry: Cell::new(None),
+        };
+
+        poke_and_drive_env(&env);
+
+        assert_eq!(
+            env.started.borrow().len(),
+            1,
+            "the walk's seed was handed over"
+        );
+        assert_eq!(
+            env.lock_free_at_carry.get(),
+            Some(true),
+            "the journal lock is released before the seed import starts"
+        );
+        let mut started = env.started.take();
+        assert!(
+            poll_once(&mut started[0]).is_pending(),
+            "the seed import is still running"
+        );
+        assert!(!session().walk_in_flight, "the driver finished without it");
+        assert_eq!(import_gate(&session(), false), ImportGate::Open);
+        assert!(
+            JOURNAL_OPS.try_lock().is_some(),
+            "the sweep's journal gate is not blocked behind the seed"
+        );
+        // Dropping the import releases the seed lock it holds.
+        drop(started);
+    }
+
+    fn poke_and_drive_env(env: &impl WalkEnv) {
+        poke_walk();
+        futures::executor::block_on(walk_driver_with(env));
     }
 }

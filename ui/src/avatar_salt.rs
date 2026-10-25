@@ -24,10 +24,13 @@
 //! avatars; there is no fallback to any key.
 //!
 //! The seed is per device: identity export does not carry it. It normally
-//! survives a chat-delegate re-key: the migration walk imports it last and
-//! best-effort, earliest seed winning (`delegate_migration`'s
-//! `import_found_seed`, [`import_seed`]). A failed import changes the palette
-//! once; it never holds up the migration of real data.
+//! survives a chat-delegate re-key: the migration walk only finds it (earliest
+//! seed winning), and the walk driver carries it after the walk's journal
+//! status is recorded and the journal lock released, in a detached task with
+//! a 15 s budget (`delegate_migration::carry_found_seed_with`, [`import_seed`]).
+//! So it never holds up the migration of real data, the identity-import gate
+//! or the sweep's journal gate; a failed or timed-out carry changes the
+//! palette once.
 
 use crate::components::app::freenet_api::delegate_migration::RiverDelegateChannel;
 // Never `{:?}` a reply here: a seed-bearing reply would print the seed.
@@ -134,6 +137,16 @@ const SEED_CAS_ATTEMPTS: u32 = 3;
 /// requests share one correlation slot in the single-waiter `PENDING_REQUESTS`
 /// registry: run together, the second registration displaces the first's
 /// waiter, or the replies cross and each acts on the other's answer.
+///
+/// Residual this does not close: a reply that arrives AFTER its request's
+/// 10 s timeout (or after a carry gave up at its budget) finds the slot empty
+/// or, if the next seed request has registered by then, fills that request's
+/// waiter. The reply's key is checked and matches; the protocol carries no
+/// request id for these operations and the generation alone cannot tell two
+/// requests for one key apart, so there is no cheap guard. Worst case: one
+/// operation acts on a stale read or a stale store result, and this device's
+/// palette changes once (the CAS still refuses any write against a stale
+/// generation, so no seed is overwritten blindly).
 static SEED_IO: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
 
 fn seed_key() -> ChatDelegateKey {
