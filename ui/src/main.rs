@@ -2,7 +2,8 @@
 
 use dioxus::prelude::*;
 
-// Consumed by the avatar UI of the room redesign; nothing calls it yet.
+// Its read side (AVATAR_SALTS, ensure_avatar_salt, avatar_hue) is for the room
+// redesign's avatar UI, which does not exist yet.
 #[allow(dead_code)]
 mod avatar_salt;
 mod components;

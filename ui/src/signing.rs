@@ -317,6 +317,7 @@ pub async fn migrate_signing_key(
             // Verify it matches our key
             if existing_vk == signing_key.verifying_key() {
                 info!("Signing key already migrated to delegate for room");
+                crate::avatar_salt::signing_key_confirmed(room_key);
                 return MigrationResult::AlreadyCurrent;
             } else {
                 // Delegate has a stale key (e.g. from before re-invitation).
@@ -360,6 +361,9 @@ pub async fn migrate_signing_key(
     // Store the key
     match store_signing_key(room_key, signing_key).await {
         Ok(()) => {
+            // The avatar salt derives from the delegate's key, which just
+            // changed, whatever the verification below finds.
+            crate::avatar_salt::signing_key_written(room_key);
             // Verify the key was stored correctly
             match get_public_key(room_key).await {
                 Ok(Some(stored_vk)) if stored_vk == signing_key.verifying_key() => {
