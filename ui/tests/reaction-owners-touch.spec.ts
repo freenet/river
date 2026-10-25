@@ -1,5 +1,6 @@
 import { expect, Locator, Page, test } from "@playwright/test";
 import { coarsePointer, openInlinePicker, selectRoom, settle, touchOnly, waitForApp } from "./example-room";
+import { callRiverTest } from "./river-test";
 
 // Regression coverage for freenet/river#714.
 //
@@ -121,8 +122,16 @@ async function removeOwnReaction(page: Page, chip: Locator) {
 
 /// Scroll the history so `chip` is just out of view, without leaving the
 /// rendered range.
+///
+/// The example data is random, so where the chip sits is too. A chip about
+/// one view down from the top of a short history has neither room above it
+/// (to park it below the view) nor history enough below it (to park it
+/// above): the scroll clamped at the end with the chip still on screen, and
+/// the premise failed about once a CI run (#823 review). Callers give the
+/// history room first (`appendMessages`); the placement chosen here is
+/// checked to be possible rather than clamped, and says so if not.
 async function scrollChipOutOfView(page: Page, chip: Locator): Promise<void> {
-  await chip.evaluate((el) => {
+  const plan = await chip.evaluate((el) => {
     const scroller = document.getElementById("chat-scroll-container")!;
     const chipRect = el.getBoundingClientRect();
     const viewRect = scroller.getBoundingClientRect();
@@ -132,15 +141,18 @@ async function scrollChipOutOfView(page: Page, chip: Locator): Promise<void> {
     // Put the chip just below the view if there is room above it, else just
     // above the view.
     const below = chipTop - scroller.clientHeight - 24;
-    scroller.scrollTop = below >= 0 ? below : Math.min(chipBottom + 24, max);
+    const target = below >= 0 ? below : chipBottom + 24;
+    if (target <= max) scroller.scrollTop = target;
+    return { chipTop, chipBottom, max, client: scroller.clientHeight, target };
   });
+  expect(plan.target, `premise: the history has room to move the chip out of view ${JSON.stringify(plan)}`).toBeLessThanOrEqual(plan.max);
   await settle(page);
   const inView = await chip.evaluate((el) => {
     const r = el.getBoundingClientRect();
     const v = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
     return r.bottom > v.top && r.top < v.bottom;
   });
-  expect(inView, "premise: the chip is scrolled out of view").toBe(false);
+  expect(inView, `premise: the chip is scrolled out of view ${JSON.stringify(plan)}`).toBe(false);
 }
 
 function historyScrollTop(page: Page): Promise<number> {
@@ -261,6 +273,10 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
+    // History below every fixture chip, so the chip can be parked above the
+    // view whatever the random example data put around it.
+    await callRiverTest(page, "appendMessages", 20);
+    await expect(page.getByText("batched arrival 19")).toHaveCount(1, { timeout: 5_000 });
     await waitSettledAtBottom(page);
 
     const owners = page.getByTestId("reaction-owners");
