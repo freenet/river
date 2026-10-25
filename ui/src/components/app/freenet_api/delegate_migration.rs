@@ -1031,6 +1031,9 @@ pub(crate) enum RecoveredItem {
     Meta(RoomsMeta),
     /// The outbound-DM plaintext cache.
     OutboundDms(Box<OutboundDmStore>),
+    /// The viewer's avatar colour seed (`crate::avatar_salt`). Carried to
+    /// the successor so palettes survive a re-key; the earliest seed wins.
+    AvatarSeed(crate::avatar_salt::AvatarSeedRecord),
     /// Migration bookkeeping (this module's markers, the crate's journal, the
     /// cadence counter: a future predecessor's store carries them) — never
     /// imported, never a failure. `fetch_secrets` already withholds them.
@@ -1070,6 +1073,14 @@ pub(crate) fn classify_recovered(key: &[u8], value: &[u8]) -> RecoveredItem {
         return match ciborium::from_reader::<RoomSlot, _>(value) {
             Ok(slot) => RecoveredItem::Room(vk, slot),
             Err(e) => RecoveredItem::Undecodable("room slot", e.to_string()),
+        };
+    }
+    if key == crate::avatar_salt::AVATAR_SEED_STORAGE_KEY {
+        // A seed that does not decode is skipped, not rejected: a permanent
+        // rejection would block the identity-import gate over a palette.
+        return match crate::avatar_salt::AvatarSeedRecord::decode(value) {
+            Some(record) => RecoveredItem::AvatarSeed(record),
+            None => RecoveredItem::Unrecognized,
         };
     }
     RecoveredItem::Unrecognized
@@ -1200,6 +1211,12 @@ pub(crate) trait RiverImportSeam {
     fn known_rooms(&mut self) -> impl Future<Output = HashSet<[u8; 32]>> {
         std::future::ready(HashSet::new())
     }
+
+    /// The walk stored a predecessor's avatar seed over the successor's (or
+    /// where it had none). Default: nothing (a seam with no avatars).
+    fn avatar_seed_replaced(&mut self, record: crate::avatar_salt::AvatarSeedRecord) {
+        let _ = record;
+    }
 }
 
 /// Production import seam: ranked merge into the `ROOMS` signal (inside
@@ -1246,6 +1263,10 @@ impl LiveImportSeam {
 }
 
 impl RiverImportSeam for LiveImportSeam {
+    fn avatar_seed_replaced(&mut self, record: crate::avatar_salt::AvatarSeedRecord) {
+        crate::avatar_salt::seed_replaced(record);
+    }
+
     async fn merge_rooms(&mut self, rooms: Rooms, source_rank: u32) -> Result<(), String> {
         self.ensure_room_set_complete()?;
         self.rooms_dirty = true;
@@ -1903,6 +1924,18 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
                     .await
                 {
                     Ok(()) => ItemWrite::Written,
+                    Err(e) => ItemWrite::retryable(e),
+                }
+            }
+            // Written straight to the successor (it is not room state), unless
+            // the successor's own seed is earlier.
+            RecoveredItem::AvatarSeed(record) => {
+                match crate::avatar_salt::import_seed(self.channel, &self.successor, record).await {
+                    Ok(crate::avatar_salt::SeedImport::Replaced) => {
+                        self.seam.avatar_seed_replaced(record);
+                        ItemWrite::Written
+                    }
+                    Ok(crate::avatar_salt::SeedImport::Kept) => ItemWrite::AlreadyAuthoritative,
                     Err(e) => ItemWrite::retryable(e),
                 }
             }
@@ -3117,6 +3150,8 @@ mod tests {
         /// A merge carrying this room applies in full, then reports an error,
         /// like `merge_from_source` after a per-room failure (#591).
         err_after_apply_for: Option<VerifyingKey>,
+        /// Every avatar seed the walk reported storing.
+        seeds_replaced: Vec<crate::avatar_salt::AvatarSeedRecord>,
     }
 
     impl MemorySeam {
@@ -3136,11 +3171,15 @@ mod tests {
                 order_only_merges: 0,
                 raw_orders_seen: Vec::new(),
                 err_after_apply_for: None,
+                seeds_replaced: Vec::new(),
             }
         }
     }
 
     impl RiverImportSeam for MemorySeam {
+        fn avatar_seed_replaced(&mut self, record: crate::avatar_salt::AvatarSeedRecord) {
+            self.seeds_replaced.push(record);
+        }
         async fn merge_rooms(&mut self, rooms: Rooms, source_rank: u32) -> Result<(), String> {
             if let Some(e) = &self.fail_merge {
                 return Err(e.clone());
@@ -3351,6 +3390,18 @@ mod tests {
         ));
         assert!(matches!(
             classify_recovered(b"some_future_key", b"whatever"),
+            RecoveredItem::Unrecognized
+        ));
+        let seed = crate::avatar_salt::AvatarSeedRecord {
+            created_at_ms: 1,
+            seed: [4; 32],
+        };
+        assert!(matches!(
+            classify_recovered(crate::avatar_salt::AVATAR_SEED_STORAGE_KEY, &seed.encode()),
+            RecoveredItem::AvatarSeed(s) if s == seed
+        ));
+        assert!(matches!(
+            classify_recovered(crate::avatar_salt::AVATAR_SEED_STORAGE_KEY, b"not cbor"),
             RecoveredItem::Unrecognized
         ));
     }
@@ -4200,6 +4251,97 @@ mod tests {
         assert!(
             record.is_empty(),
             "a salvage that did not land must not be recorded"
+        );
+    }
+
+    fn seed(created_at_ms: u64, fill: u8) -> crate::avatar_salt::AvatarSeedRecord {
+        crate::avatar_salt::AvatarSeedRecord {
+            created_at_ms,
+            seed: [fill; 32],
+        }
+    }
+
+    fn stored_seed(channel: &MockChannel) -> Option<crate::avatar_salt::AvatarSeedRecord> {
+        channel
+            .stored(
+                &successor_key(),
+                crate::avatar_salt::AVATAR_SEED_STORAGE_KEY,
+            )
+            .and_then(|v| crate::avatar_salt::AvatarSeedRecord::decode(&v))
+    }
+
+    /// Generation 2 holds `in_pred`; the successor holds `in_successor`.
+    fn channel_with_seeds(
+        in_pred: Vec<u8>,
+        in_successor: Option<crate::avatar_salt::AvatarSeedRecord>,
+    ) -> MockChannel {
+        let key = crate::avatar_salt::AVATAR_SEED_STORAGE_KEY.to_vec();
+        let mut gen2 = DelegateSim::default();
+        gen2.store.insert(key.clone(), in_pred);
+        let mut successor = DelegateSim::default();
+        if let Some(record) = in_successor {
+            successor.store.insert(key.clone(), record.encode());
+            successor.generations.insert(key, 1);
+        }
+        MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), successor)
+    }
+
+    /// The avatar seed is the one key the walk copies that is not room
+    /// state: without it every palette changes at each delegate re-key. (An
+    /// unrecognised key is still not copied; this is specific to the seed.)
+    #[test]
+    fn the_avatar_seed_is_carried_to_the_successor() {
+        let channel = channel_with_seeds(seed(5, 1).encode(), None);
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert_eq!(stored_seed(&channel), Some(seed(5, 1)));
+        assert_eq!(seam.seeds_replaced, vec![seed(5, 1)], "the UI is told");
+        assert!(
+            report
+                .predecessors
+                .iter()
+                .any(|p| matches!(p, PredecessorMigration::Imported { generation: 2, .. })),
+            "carrying the seed completes the import: {:?}",
+            report.predecessors
+        );
+    }
+
+    /// On the first load after a re-key the UI may create a seed before the
+    /// walk gets to the old one; the user's original (earlier) seed wins.
+    #[test]
+    fn an_earlier_predecessor_seed_replaces_one_made_since() {
+        let channel = channel_with_seeds(seed(5, 1).encode(), Some(seed(9, 2)));
+        let (_, seam) = walk(&channel, MemorySeam::new());
+        assert_eq!(stored_seed(&channel), Some(seed(5, 1)));
+        assert_eq!(seam.seeds_replaced, vec![seed(5, 1)]);
+    }
+
+    #[test]
+    fn a_successor_seed_that_is_earlier_stands() {
+        let channel = channel_with_seeds(seed(9, 2).encode(), Some(seed(5, 1)));
+        let (_, seam) = walk(&channel, MemorySeam::new());
+        assert_eq!(stored_seed(&channel), Some(seed(5, 1)));
+        assert!(seam.seeds_replaced.is_empty());
+    }
+
+    /// A corrupt seed is skipped: losing a palette must not count as a
+    /// rejected item (which would block the identity-import gate).
+    #[test]
+    fn an_undecodable_predecessor_seed_is_skipped_not_rejected() {
+        let channel = channel_with_seeds(vec![0xFF, 0x00, 0x13], None);
+        let (report, seam) = walk(&channel, MemorySeam::new());
+        assert_eq!(stored_seed(&channel), None);
+        assert!(seam.seeds_replaced.is_empty());
+        assert!(
+            report
+                .predecessors
+                .iter()
+                .any(|p| matches!(p, PredecessorMigration::Imported { generation: 2, .. })),
+            "a skipped seed is not a rejection: {:?}",
+            report.predecessors
         );
     }
 

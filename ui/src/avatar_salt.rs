@@ -5,21 +5,30 @@
 //! this viewer knows. An impersonator therefore cannot pick a key whose avatar
 //! colour matches someone else's, because they cannot compute anyone's colours.
 //!
-//! The salt comes from the chat delegate (`ChatDelegateRequestMsg::GetAvatarSalt`),
-//! which derives it from this viewer's member signing key for the room, so the
-//! display code never touches the private key. There is deliberately no
-//! fallback to `RoomData::self_sk`: a room whose salt is absent (the delegate
-//! did not answer, or holds no key for it) renders neutral avatars.
+//! The salt derives from a random SEED that only this viewer holds: 32 bytes
+//! from the CSPRNG, stored in the chat delegate under
+//! [`AVATAR_SEED_STORAGE_KEY`], read once per session. Each room's salt is
+//! [`room_salt`]`(seed, room_owner_vk)`, computed locally. It deliberately
+//! does NOT derive from the member signing key: the inviter generates that key
+//! and ships its private half in the invitation, so anyone who invited this
+//! viewer could compute a key-derived salt and grind a lookalike.
 //!
-//! The salt follows the key the delegate holds, so `crate::signing` reports
-//! every write of a room's signing key ([`signing_key_written`]) and every
-//! confirmation that it is current ([`signing_key_confirmed`]).
+//! A room whose salt is absent (the seed could not be read) renders neutral
+//! avatars; there is no fallback to any key.
+//!
+//! The seed is per device: identity export does not carry it. It survives a
+//! chat-delegate re-key because the migration walk imports it
+//! (`delegate_migration`'s `RecoveredItem::AvatarSeed`, [`import_seed`]).
 
-use crate::components::app::chat_delegate::{generate_request_id, send_delegate_request};
+use crate::components::app::freenet_api::delegate_migration::RiverDelegateChannel;
 use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
-use river_core::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg, RoomKey};
-use std::collections::HashMap;
+use freenet_stdlib::prelude::DelegateKey;
+use river_core::chat_delegate::{
+    CasStoreResult, ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, RoomKey,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
@@ -31,168 +40,414 @@ use std::sync::{LazyLock, Mutex};
 /// `util::signal_guard` anchor and nudge (dioxus-signal-safety.md).
 pub static AVATAR_SALTS: GlobalSignal<HashMap<RoomKey, [u8; 32]>> = Global::new(HashMap::new);
 
-/// Fetch attempts per claim before the room is left without a salt.
-const MAX_AVATAR_SALT_ATTEMPTS: u8 = 3;
+// ---------------------------------------------------------------------------
+// The seed and the per-room salt
+// ---------------------------------------------------------------------------
+
+/// Chat-delegate storage key of the viewer's [`AvatarSeedRecord`].
+pub(crate) const AVATAR_SEED_STORAGE_KEY: &[u8] = b"river_avatar_colour_seed_v1";
+
+/// Domain tag hashed ahead of the room key in [`room_salt`].
+const ROOM_SALT_DOMAIN: &[u8] = b"freenet river avatar colour salt v1";
+
+/// The viewer's avatar seed as stored in the chat delegate (CBOR).
+///
+/// `created_at_ms` orders two seeds that meet (a re-key's walk importing a
+/// predecessor's seed into a successor that already made one): the earliest
+/// wins, ties broken by the seed bytes, so every importer converges on the
+/// user's original palette ([`AvatarSeedRecord::precedes`]).
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AvatarSeedRecord {
+    pub(crate) created_at_ms: u64,
+    pub(crate) seed: [u8; 32],
+}
+
+/// Redacts the seed: it is the secret that keeps the palette private.
+impl std::fmt::Debug for AvatarSeedRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvatarSeedRecord")
+            .field("created_at_ms", &self.created_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AvatarSeedRecord {
+    /// A fresh seed from the CSPRNG (the one invitations use, which in the
+    /// browser is `crypto.getRandomValues`).
+    #[cfg_attr(all(feature = "example-data", feature = "no-sync"), allow(dead_code))]
+    fn generate() -> Self {
+        use rand::RngCore;
+        let mut seed = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut seed);
+        Self {
+            created_at_ms: crate::components::app::sync_info::now_ms() as u64,
+            seed,
+        }
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(self, &mut out).expect("a seed record always encodes");
+        out
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        ciborium::from_reader(bytes).ok()
+    }
+
+    /// Whether `self` wins over `other` when two seeds meet.
+    pub(crate) fn precedes(&self, other: &Self) -> bool {
+        (self.created_at_ms, self.seed) < (other.created_at_ms, other.seed)
+    }
+}
+
+/// This viewer's salt for the room owned by `room_key`: a BLAKE3 keyed hash,
+/// keyed by the seed, of [`ROOM_SALT_DOMAIN`] followed by the room key.
+pub(crate) fn room_salt(seed: &[u8; 32], room_key: &RoomKey) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_keyed(seed);
+    hasher.update(ROOM_SALT_DOMAIN);
+    hasher.update(room_key);
+    *hasher.finalize().as_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// Delegate storage
+// ---------------------------------------------------------------------------
+
+/// Compare-and-swap rounds for one seed write. Each conflict means another
+/// session wrote the seed in between; a handful is plenty.
+const SEED_CAS_ATTEMPTS: u32 = 3;
+
+fn seed_key() -> ChatDelegateKey {
+    ChatDelegateKey::new(AVATAR_SEED_STORAGE_KEY.to_vec())
+}
+
+/// The stored seed bytes and their CAS generation on `delegate`.
+async fn read_seed_versioned<C: RiverDelegateChannel>(
+    channel: &C,
+    delegate: &DelegateKey,
+) -> Result<(Option<Vec<u8>>, u64), String> {
+    let key = seed_key();
+    match channel
+        .request(
+            delegate,
+            ChatDelegateRequestMsg::GetVersionedRequest { key: key.clone() },
+        )
+        .await?
+    {
+        Some(ChatDelegateResponseMsg::GetVersionedResponse {
+            key: reply_key,
+            value,
+            generation,
+        }) if reply_key == key => Ok((value, generation)),
+        Some(other) => Err(format!(
+            "unexpected reply to seed GetVersionedRequest: {other:?}"
+        )),
+        None => Err("seed GetVersionedRequest timed out".to_string()),
+    }
+}
+
+/// Store `record` on `delegate` if its generation is still `generation`.
+async fn cas_seed<C: RiverDelegateChannel>(
+    channel: &C,
+    delegate: &DelegateKey,
+    record: &AvatarSeedRecord,
+    generation: u64,
+) -> Result<CasStoreResult, String> {
+    let key = seed_key();
+    match channel
+        .request(
+            delegate,
+            ChatDelegateRequestMsg::CasStoreRequest {
+                key: key.clone(),
+                value: record.encode(),
+                expected_generation: generation,
+            },
+        )
+        .await?
+    {
+        Some(ChatDelegateResponseMsg::CasStoreResponse {
+            key: reply_key,
+            result,
+        }) if reply_key == key => Ok(result),
+        Some(other) => Err(format!(
+            "unexpected reply to seed CasStoreRequest: {other:?}"
+        )),
+        None => Err("seed CasStoreRequest timed out".to_string()),
+    }
+}
+
+/// The seed stored on `delegate`, storing `fresh` first if there is none.
+///
+/// The store is a compare-and-swap, so two tabs cannot both create one: the
+/// one that loses adopts the winner's. A stored value that does not decode is
+/// replaced (the key is versioned; a different format gets a new key).
+#[cfg_attr(all(feature = "example-data", feature = "no-sync"), allow(dead_code))]
+pub(crate) async fn load_or_create_seed<C: RiverDelegateChannel>(
+    channel: &C,
+    delegate: &DelegateKey,
+    fresh: AvatarSeedRecord,
+) -> Result<AvatarSeedRecord, String> {
+    let (mut value, mut generation) = read_seed_versioned(channel, delegate).await?;
+    for _ in 0..SEED_CAS_ATTEMPTS {
+        if let Some(record) = value.as_deref().and_then(AvatarSeedRecord::decode) {
+            return Ok(record);
+        }
+        match cas_seed(channel, delegate, &fresh, generation).await? {
+            CasStoreResult::Stored { .. } => return Ok(fresh),
+            CasStoreResult::Conflict {
+                current_generation,
+                current_value,
+            } => {
+                value = current_value;
+                generation = current_generation;
+            }
+            CasStoreResult::Failed(e) => return Err(format!("delegate refused seed store: {e}")),
+        }
+    }
+    Err("seed store kept conflicting".to_string())
+}
+
+/// What [`import_seed`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SeedImport {
+    /// The incoming seed now stands on the successor.
+    Replaced,
+    /// The successor's seed precedes (or is) the incoming one, and stands.
+    Kept,
+}
+
+/// Carry a predecessor's seed onto `successor`: written unless the successor
+/// already holds a seed that precedes it ([`AvatarSeedRecord::precedes`]).
+pub(crate) async fn import_seed<C: RiverDelegateChannel>(
+    channel: &C,
+    successor: &DelegateKey,
+    incoming: AvatarSeedRecord,
+) -> Result<SeedImport, String> {
+    let (mut value, mut generation) = read_seed_versioned(channel, successor).await?;
+    for _ in 0..SEED_CAS_ATTEMPTS {
+        let held = value.as_deref().and_then(AvatarSeedRecord::decode);
+        if held.is_some_and(|held| !incoming.precedes(&held)) {
+            return Ok(SeedImport::Kept);
+        }
+        match cas_seed(channel, successor, &incoming, generation).await? {
+            CasStoreResult::Stored { .. } => return Ok(SeedImport::Replaced),
+            CasStoreResult::Conflict {
+                current_generation,
+                current_value,
+            } => {
+                value = current_value;
+                generation = current_generation;
+            }
+            CasStoreResult::Failed(e) => return Err(format!("delegate refused seed import: {e}")),
+        }
+    }
+    Err("seed import kept conflicting".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// The session: one seed read, rooms filled as they are asked for
+// ---------------------------------------------------------------------------
+
+/// Seed read attempts before the session is left without a seed.
+const MAX_SEED_ATTEMPTS: u8 = 3;
 
 /// Wait before attempt `n + 1` after attempt `n` fails.
-const AVATAR_SALT_RETRY_DELAYS_MS: [u64; (MAX_AVATAR_SALT_ATTEMPTS - 1) as usize] = [2_000, 8_000];
+const SEED_RETRY_DELAYS_MS: [u64; (MAX_SEED_ATTEMPTS - 1) as usize] = [2_000, 8_000];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FetchState {
-    /// A task is fetching, or waiting to retry.
-    InFlight,
-    /// The salt was fetched and stored.
-    Done,
-    /// Every attempt failed. Stays absent until the delegate's key for the
-    /// room is confirmed or written.
+/// Where the session's seed read stands. (No `Debug`: `Ready` holds the seed.)
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SeedFetch {
+    /// Not asked for yet.
+    #[default]
+    Idle,
+    /// The task with this epoch is reading, or waiting to retry.
+    InFlight { epoch: u64 },
+    /// Read.
+    Ready { seed: [u8; 32] },
+    /// Every attempt failed; re-armed when the delegate is known present.
     Exhausted,
 }
 
-/// One room's fetch, owned by the task whose `epoch` it carries. Epochs are
-/// never reused, so a task whose claim was dropped (the room's signing key
-/// changed) can tell, and its result is discarded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SaltClaim {
-    epoch: u64,
-    state: FetchState,
+/// Salts to store, by room.
+type Salts = Vec<(RoomKey, [u8; 32])>;
+
+#[derive(Default)]
+struct SeedSession {
+    fetch: SeedFetch,
+    /// Rooms the UI has asked for.
+    wanted: BTreeSet<RoomKey>,
+    /// Rooms whose salt has been handed out for the current seed, so a room
+    /// asked for on every render is stored once.
+    filled: BTreeSet<RoomKey>,
 }
 
-/// What a task does after an attempt.
-#[derive(Debug, PartialEq, Eq)]
+/// What [`SeedSession::want`] asks the caller to do.
+#[derive(PartialEq, Eq)]
+enum Want {
+    Fill(Salts),
+    Fetch(u64),
+    Nothing,
+}
+
+/// What a fetch task does after an attempt.
+#[derive(PartialEq, Eq)]
 enum AfterAttempt {
-    /// Store the salt.
-    Store,
-    /// Try again after this many milliseconds.
+    Fill(Salts),
     RetryAfterMs(u64),
-    /// The last attempt failed; leave the room without a salt.
     GiveUp,
-    /// The claim is no longer this task's; do nothing.
+    /// The session moved on (the seed was replaced, or re-armed); do nothing.
     Stale,
 }
 
-/// Claim `slot` for a new fetch with `epoch`, unless a fetch is running, done
-/// or exhausted.
-fn claim_fetch(slot: &mut Option<SaltClaim>, epoch: u64) -> bool {
-    if slot.is_some() {
-        return false;
+impl SeedSession {
+    fn salts(seed: &[u8; 32], rooms: impl IntoIterator<Item = RoomKey>) -> Salts {
+        rooms
+            .into_iter()
+            .map(|room| (room, room_salt(seed, &room)))
+            .collect()
     }
-    *slot = Some(SaltClaim {
-        epoch,
-        state: FetchState::InFlight,
-    });
-    true
-}
 
-/// Whether the task with `epoch` still owns a running fetch.
-fn owns_fetch(slot: &Option<SaltClaim>, epoch: u64) -> bool {
-    *slot
-        == Some(SaltClaim {
-            epoch,
-            state: FetchState::InFlight,
-        })
-}
-
-/// Record the outcome of attempt number `attempt` (1-based).
-fn after_attempt(slot: &mut Option<SaltClaim>, epoch: u64, attempt: u8, ok: bool) -> AfterAttempt {
-    if !owns_fetch(slot, epoch) {
-        return AfterAttempt::Stale;
+    /// The UI asks for `room`'s salt; `epoch` is used if a read starts.
+    fn want(&mut self, room: RoomKey, epoch: u64) -> Want {
+        self.wanted.insert(room);
+        match self.fetch {
+            SeedFetch::Ready { seed } if self.filled.insert(room) => {
+                Want::Fill(Self::salts(&seed, [room]))
+            }
+            SeedFetch::Idle => {
+                self.fetch = SeedFetch::InFlight { epoch };
+                Want::Fetch(epoch)
+            }
+            _ => Want::Nothing,
+        }
     }
-    let claim = slot.as_mut().expect("owns_fetch checked it");
-    if ok {
-        claim.state = FetchState::Done;
-        AfterAttempt::Store
-    } else if attempt < MAX_AVATAR_SALT_ATTEMPTS {
-        AfterAttempt::RetryAfterMs(AVATAR_SALT_RETRY_DELAYS_MS[usize::from(attempt) - 1])
-    } else {
-        claim.state = FetchState::Exhausted;
-        AfterAttempt::GiveUp
+
+    /// Whether the task with `epoch` still owns the read.
+    fn owns(&self, epoch: u64) -> bool {
+        self.fetch == SeedFetch::InFlight { epoch }
+    }
+
+    /// Record attempt number `attempt` (1-based): the seed, or `None`.
+    fn after_attempt(&mut self, epoch: u64, attempt: u8, seed: Option<[u8; 32]>) -> AfterAttempt {
+        if !self.owns(epoch) {
+            return AfterAttempt::Stale;
+        }
+        match seed {
+            Some(seed) => {
+                self.fetch = SeedFetch::Ready { seed };
+                let rooms: Vec<RoomKey> = self.wanted.difference(&self.filled).copied().collect();
+                self.filled.extend(rooms.iter().copied());
+                AfterAttempt::Fill(Self::salts(&seed, rooms))
+            }
+            None if attempt < MAX_SEED_ATTEMPTS => {
+                AfterAttempt::RetryAfterMs(SEED_RETRY_DELAYS_MS[usize::from(attempt) - 1])
+            }
+            None => {
+                self.fetch = SeedFetch::Exhausted;
+                AfterAttempt::GiveUp
+            }
+        }
+    }
+
+    /// The delegate is known present: an exhausted read starts again with
+    /// `epoch` if any room is waiting. Returns the epoch to run.
+    fn rearm_if_exhausted(&mut self, epoch: u64) -> Option<u64> {
+        if self.fetch != SeedFetch::Exhausted {
+            return None;
+        }
+        if self.wanted.is_empty() {
+            self.fetch = SeedFetch::Idle;
+            return None;
+        }
+        self.fetch = SeedFetch::InFlight { epoch };
+        Some(epoch)
+    }
+
+    /// The migration walk replaced the stored seed: every room asked for so
+    /// far is recoloured under the new one, and a read still running is stale.
+    fn replace_seed(&mut self, seed: [u8; 32]) -> Salts {
+        self.fetch = SeedFetch::Ready { seed };
+        self.filled.extend(self.wanted.iter().copied());
+        Self::salts(&seed, self.filled.iter().copied())
     }
 }
 
-/// Whether a salt fetched under `epoch` may still be stored.
-fn may_store(slot: &Option<SaltClaim>, epoch: u64) -> bool {
-    *slot
-        == Some(SaltClaim {
-            epoch,
-            state: FetchState::Done,
-        })
-}
-
-/// The delegate confirmed it holds the key the room already had: a room
-/// whose attempts were exhausted gets a fresh claim. Returns whether the
-/// room should be fetched again.
-fn rearm_if_exhausted(slot: &mut Option<SaltClaim>) -> bool {
-    if matches!(slot, Some(c) if c.state == FetchState::Exhausted) {
-        *slot = None;
-        true
-    } else {
-        false
-    }
-}
-
-/// The delegate's key for the room was written: any salt or running fetch
-/// belongs to the old key. Returns whether the room had been asked for (and
-/// so should be fetched again).
-fn invalidate(slot: &mut Option<SaltClaim>) -> bool {
-    slot.take().is_some()
-}
-
-static AVATAR_SALT_CLAIMS: LazyLock<Mutex<HashMap<RoomKey, SaltClaim>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SESSION: LazyLock<Mutex<SeedSession>> = LazyLock::new(|| Mutex::new(SeedSession::default()));
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-/// Run `f` against `room_key`'s claim slot.
-fn with_claim<R>(room_key: RoomKey, f: impl FnOnce(&mut Option<SaltClaim>) -> R) -> R {
-    let mut claims = AVATAR_SALT_CLAIMS
+fn with_session<R>(f: impl FnOnce(&mut SeedSession) -> R) -> R {
+    let mut session = SESSION
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut slot = claims.get(&room_key).copied();
-    let out = f(&mut slot);
-    match slot {
-        Some(claim) => claims.insert(room_key, claim),
-        None => claims.remove(&room_key),
-    };
-    out
+    f(&mut session)
 }
 
-/// Fetch this viewer's avatar salt for `room_key` from the delegate and
-/// store it in [`AVATAR_SALTS`]. One fetch per room runs at a time; it makes
-/// up to [`MAX_AVATAR_SALT_ATTEMPTS`] attempts (waiting 2 s, then 8 s), after
-/// which the room's salt stays absent until the delegate's key for the room
-/// is confirmed or written (see [`signing_key_confirmed`] and
-/// [`signing_key_written`]). A stored salt is not fetched again.
-///
-/// Safe to call from render: it writes no signal synchronously; the store is
-/// deferred.
-pub fn ensure_avatar_salt(room_key: RoomKey) {
-    let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
-    if !with_claim(room_key, |slot| claim_fetch(slot, epoch)) {
+fn next_epoch() -> u64 {
+    NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Store `salts` in [`AVATAR_SALTS`], deferred.
+fn store_salts(salts: Salts) {
+    if salts.is_empty() {
         return;
     }
+    crate::util::defer(move || {
+        let mut map = AVATAR_SALTS.write();
+        for (room, salt) in salts {
+            map.insert(room, salt);
+        }
+    });
+}
+
+/// Make `room_key`'s salt available in [`AVATAR_SALTS`].
+///
+/// The first call of the session reads the seed (one delegate request, two
+/// the first time a device ever runs: the read and the creating store), up
+/// to 3 attempts 2 s then 8 s apart; every later call costs no request.
+/// Safe to call from render: it writes no signal synchronously, and a room
+/// already filled is not stored again.
+pub fn ensure_avatar_salt(room_key: RoomKey) {
+    match with_session(|s| s.want(room_key, next_epoch())) {
+        Want::Fill(salts) => store_salts(salts),
+        Want::Fetch(epoch) => spawn_seed_read(epoch),
+        Want::Nothing => {}
+    }
+}
+
+/// The current chat delegate is known to be on the node (its room list was
+/// answered, or it was registered). A seed read that gave up, typically
+/// because it ran before the delegate was registered, starts again.
+pub(crate) fn current_delegate_present() {
+    if let Some(epoch) = with_session(|s| s.rearm_if_exhausted(next_epoch())) {
+        spawn_seed_read(epoch);
+    }
+}
+
+/// The migration walk stored a predecessor's earlier seed over this
+/// session's: recolour every room under it.
+pub(crate) fn seed_replaced(record: AvatarSeedRecord) {
+    store_salts(with_session(|s| s.replace_seed(record.seed)));
+}
+
+fn spawn_seed_read(epoch: u64) {
     crate::util::safe_spawn_local(async move {
         let mut attempt = 1u8;
         loop {
-            if !with_claim(room_key, |slot| owns_fetch(slot, epoch)) {
+            if !with_session(|s| s.owns(epoch)) {
                 return;
             }
-            let result = fetch_avatar_salt(room_key).await;
-            if let Err(e) = &result {
-                warn!(
-                    "No avatar salt for room {:?} (attempt {}): {}",
-                    room_key, attempt, e
-                );
-            }
-            match with_claim(room_key, |slot| {
-                after_attempt(slot, epoch, attempt, result.is_ok())
-            }) {
-                AfterAttempt::Store => {
-                    let salt = result.expect("Store follows a fetched salt");
-                    crate::util::defer(move || {
-                        if with_claim(room_key, |slot| may_store(slot, epoch)) {
-                            AVATAR_SALTS.write().insert(room_key, salt);
-                        }
-                    });
+            let seed = match read_seed().await {
+                Ok(seed) => Some(seed),
+                Err(e) => {
+                    warn!("No avatar seed (attempt {}): {}", attempt, e);
+                    None
+                }
+            };
+            match with_session(|s| s.after_attempt(epoch, attempt, seed)) {
+                AfterAttempt::Fill(salts) => {
+                    store_salts(salts);
                     return;
                 }
                 AfterAttempt::RetryAfterMs(ms) => {
@@ -205,63 +460,26 @@ pub fn ensure_avatar_salt(room_key: RoomKey) {
     });
 }
 
-/// The delegate already held the room's signing key (`migrate_signing_key`
-/// found it current). A room whose fetch attempts were exhausted, typically
-/// because they ran before the key reached the delegate, is fetched again.
-/// A room the UI never asked about is left alone.
-pub fn signing_key_confirmed(room_key: RoomKey) {
-    if with_claim(room_key, rearm_if_exhausted) {
-        ensure_avatar_salt(room_key);
-    }
-}
-
-/// The delegate's signing key for the room was just written (a key stored
-/// for the first time, a stale key overwritten, an identity import
-/// (freenet/river#414), a new room). The salt derives from that key, so the
-/// room's salt and any running fetch are dropped, and the room is fetched
-/// again if the UI had asked for it. A room the UI never asked about is left
-/// alone, so a startup migration sends no extra delegate request.
-pub fn signing_key_written(room_key: RoomKey) {
-    if with_claim(room_key, invalidate) {
-        crate::util::defer(move || {
-            AVATAR_SALTS.write().remove(&room_key);
-        });
-        ensure_avatar_salt(room_key);
-    }
-}
-
-/// Ask the chat delegate for this viewer's avatar salt for `room_key`.
+/// This viewer's seed, from the current chat delegate.
 #[cfg(not(all(feature = "example-data", feature = "no-sync")))]
-pub async fn fetch_avatar_salt(room_key: RoomKey) -> Result<[u8; 32], String> {
-    fetch_avatar_salt_from_delegate(room_key).await
+async fn read_seed() -> Result<[u8; 32], String> {
+    use crate::components::app::chat_delegate::current_delegate_key;
+    use crate::components::app::freenet_api::delegate_migration::NodeDelegateChannel;
+    load_or_create_seed(
+        &NodeDelegateChannel,
+        &current_delegate_key(),
+        AvatarSeedRecord::generate(),
+    )
+    .await
+    .map(|record| record.seed)
 }
 
-/// The offline example build has no delegate to ask, so it stands one in:
-/// a salt derived from the room key, so example avatars are coloured as a
-/// real viewer's would be. Tests clear it with `__riverTest.setAvatarSalt`.
+/// The offline example build has no delegate, so it stands in a fixed seed
+/// and its avatars are coloured as a real viewer's would be. Tests clear a
+/// room's salt with `__riverTest.setAvatarSalt`.
 #[cfg(all(feature = "example-data", feature = "no-sync"))]
-pub async fn fetch_avatar_salt(room_key: RoomKey) -> Result<[u8; 32], String> {
-    Ok(*blake3::keyed_hash(b"river example-data avatar salt!!", &room_key).as_bytes())
-}
-
-#[cfg_attr(all(feature = "example-data", feature = "no-sync"), allow(dead_code))]
-async fn fetch_avatar_salt_from_delegate(room_key: RoomKey) -> Result<[u8; 32], String> {
-    let request = ChatDelegateRequestMsg::GetAvatarSalt {
-        room_key,
-        request_id: generate_request_id(),
-    };
-    extract_avatar_salt(send_delegate_request(request).await)
-}
-
-/// Extract the salt from a delegate response.
-fn extract_avatar_salt(
-    response: Result<ChatDelegateResponseMsg, String>,
-) -> Result<[u8; 32], String> {
-    match response {
-        Ok(ChatDelegateResponseMsg::AvatarSaltResponse { salt, .. }) => salt,
-        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
-        Err(e) => Err(e),
-    }
+async fn read_seed() -> Result<[u8; 32], String> {
+    Ok(*blake3::hash(b"river example-data avatar seed").as_bytes())
 }
 
 /// The avatar hue (`0..360`) this viewer gives the member with verifying-key
@@ -291,6 +509,10 @@ pub fn avatar_hue_step(hue: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::app::freenet_api::delegate_migration::tests_support::{
+        successor_key, DelegateSim, MockChannel,
+    };
+    use futures::executor::block_on;
 
     #[test]
     fn avatar_hue_step_rounds_to_the_nearest_of_ten_hues() {
@@ -343,171 +565,293 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_avatar_salt_passes_the_delegate_answer_through() {
-        let ok = ChatDelegateResponseMsg::AvatarSaltResponse {
-            room_key: [3u8; 32],
-            request_id: 1,
-            salt: Ok([9u8; 32]),
-        };
-        assert_eq!(extract_avatar_salt(Ok(ok)), Ok([9u8; 32]));
-
-        let refused = ChatDelegateResponseMsg::AvatarSaltResponse {
-            room_key: [3u8; 32],
-            request_id: 1,
-            salt: Err("Signing key not found for this room".into()),
-        };
-        assert!(extract_avatar_salt(Ok(refused)).is_err());
-
-        let other = ChatDelegateResponseMsg::GetPublicKeyResponse {
-            room_key: [3u8; 32],
-            public_key: None,
-        };
-        assert!(extract_avatar_salt(Ok(other)).is_err());
-        assert!(extract_avatar_salt(Err("timeout".into())).is_err());
+    fn record(created_at_ms: u64, fill: u8) -> AvatarSeedRecord {
+        AvatarSeedRecord {
+            created_at_ms,
+            seed: [fill; 32],
+        }
     }
 
-    #[test]
-    fn a_room_is_claimed_by_one_fetch_at_a_time() {
-        let mut slot = None;
-        assert!(claim_fetch(&mut slot, 1));
-        assert!(!claim_fetch(&mut slot, 2), "a running fetch keeps the room");
-        assert!(owns_fetch(&slot, 1));
-        assert!(!owns_fetch(&slot, 2));
+    fn channel_with(store: Option<AvatarSeedRecord>) -> MockChannel {
+        let mut sim = DelegateSim::default();
+        if let Some(r) = store {
+            sim.store
+                .insert(AVATAR_SEED_STORAGE_KEY.to_vec(), r.encode());
+            sim.generations.insert(AVATAR_SEED_STORAGE_KEY.to_vec(), 1);
+        }
+        MockChannel::default().with_delegate(&successor_key(), sim)
     }
 
+    fn stored(channel: &MockChannel) -> Option<AvatarSeedRecord> {
+        channel
+            .stored(&successor_key(), AVATAR_SEED_STORAGE_KEY)
+            .and_then(|v| AvatarSeedRecord::decode(&v))
+    }
+
+    /// Pins the construction. Expected value computed independently:
+    /// `b3sum --keyed`, key 32 bytes of 0x01, over the domain tag followed by
+    /// 32 bytes of 0x02.
     #[test]
-    fn a_fetch_retries_twice_with_backoff_then_gives_up() {
-        let mut slot = None;
-        assert!(claim_fetch(&mut slot, 1));
+    fn room_salt_golden_vector() {
+        let hex: String = room_salt(&[1u8; 32], &[2u8; 32])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         assert_eq!(
-            after_attempt(&mut slot, 1, 1, false),
-            AfterAttempt::RetryAfterMs(2_000)
+            hex,
+            "9845ac3806756122f0e80c3d6c8560559366d7b9053f12ea8cb6f21e7c942e97"
         );
-        assert!(owns_fetch(&slot, 1), "a retrying fetch keeps its claim");
+    }
+
+    #[test]
+    fn per_room_salts_differ_and_depend_on_the_seed() {
+        let seed = [7u8; 32];
+        assert_ne!(room_salt(&seed, &[1u8; 32]), room_salt(&seed, &[2u8; 32]));
+        assert_ne!(
+            room_salt(&seed, &[1u8; 32]),
+            room_salt(&[8u8; 32], &[1u8; 32])
+        );
+        assert_eq!(room_salt(&seed, &[1u8; 32]), room_salt(&seed, &[1u8; 32]));
+    }
+
+    /// The salt depends on the viewer's seed and the room only. This is
+    /// structural: neither `room_salt` nor `ensure_avatar_salt` takes a
+    /// signing key, so the inviter (who generated the invitee's key) has no
+    /// input to it. Pinned here as the two cases the threat names: one
+    /// signing key held in two rooms gives two different salts, and a room's
+    /// salt is the same before and after its signing key changes (here, two
+    /// `RoomData`s for one room with different `self_sk`, salted through the
+    /// session as the UI does).
+    #[test]
+    fn the_salt_is_independent_of_the_member_signing_key() {
+        use ed25519_dalek::SigningKey;
+        let seed = [7u8; 32];
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let rotated = SigningKey::from_bytes(&[4u8; 32]);
+        let room_with = |owner: u8, sk: &SigningKey| {
+            let owner = SigningKey::from_bytes(&[owner; 32]).verifying_key();
+            let mut rd = crate::room_data::test_minimal_room_data(owner);
+            rd.self_sk = Some(sk.clone());
+            rd
+        };
+        let salt_of = |rd: &crate::room_data::RoomData| {
+            let mut session = SeedSession::default();
+            session.replace_seed(seed);
+            match session.want(rd.owner_vk.to_bytes(), 0) {
+                Want::Fill(salts) => salts[0].1,
+                _ => panic!("a ready seed fills at once"),
+            }
+        };
+
+        let (a, b) = (room_with(0xA1, &key), room_with(0xB2, &key));
+        assert_ne!(
+            salt_of(&a),
+            salt_of(&b),
+            "one signing key in two rooms, two salts"
+        );
+
         assert_eq!(
-            after_attempt(&mut slot, 1, 2, false),
-            AfterAttempt::RetryAfterMs(8_000)
+            salt_of(&room_with(0xA1, &key)),
+            salt_of(&room_with(0xA1, &rotated)),
+            "changing the room's signing key must not change its salt"
         );
-        assert_eq!(after_attempt(&mut slot, 1, 3, false), AfterAttempt::GiveUp);
-        assert_eq!(slot.unwrap().state, FetchState::Exhausted);
-        assert!(!claim_fetch(&mut slot, 2), "exhausted stays absent");
+        for salt in [salt_of(&a), salt_of(&b)] {
+            assert_ne!(salt, key.to_bytes());
+            assert_ne!(salt, key.verifying_key().to_bytes());
+        }
     }
 
     #[test]
-    fn a_fetched_salt_is_stored_once_and_not_fetched_again() {
-        let mut slot = None;
-        assert!(claim_fetch(&mut slot, 1));
-        assert_eq!(after_attempt(&mut slot, 1, 2, true), AfterAttempt::Store);
-        assert!(may_store(&slot, 1));
-        assert!(!claim_fetch(&mut slot, 2));
+    fn a_seed_is_created_once_and_read_back() {
+        let channel = channel_with(None);
+        let created = block_on(load_or_create_seed(
+            &channel,
+            &successor_key(),
+            record(5, 1),
+        ))
+        .unwrap();
+        assert_eq!(created, record(5, 1));
+        assert_eq!(stored(&channel), Some(record(5, 1)));
+
+        let again = block_on(load_or_create_seed(
+            &channel,
+            &successor_key(),
+            record(9, 2),
+        ))
+        .unwrap();
+        assert_eq!(again, record(5, 1), "a stored seed is read, never replaced");
+        assert_eq!(stored(&channel), Some(record(5, 1)));
+    }
+
+    /// Two tabs read "no seed" at once; the second's store conflicts and it
+    /// adopts the first's, so the device has one palette.
+    #[test]
+    fn a_tab_that_loses_the_create_race_adopts_the_stored_seed() {
+        let channel = channel_with(None);
+        channel
+            .delegates
+            .borrow_mut()
+            .get_mut(successor_key().bytes())
+            .unwrap()
+            .cas_interleave = Some((AVATAR_SEED_STORAGE_KEY.to_vec(), record(3, 9).encode()));
+        let got = block_on(load_or_create_seed(
+            &channel,
+            &successor_key(),
+            record(5, 1),
+        ))
+        .unwrap();
+        assert_eq!(got, record(3, 9));
+        assert_eq!(stored(&channel), Some(record(3, 9)));
     }
 
     #[test]
-    fn confirming_the_key_rearms_only_an_exhausted_room() {
-        let mut never_asked = None;
-        assert!(!rearm_if_exhausted(&mut never_asked));
-
-        let mut running = Some(SaltClaim {
-            epoch: 1,
-            state: FetchState::InFlight,
-        });
-        assert!(!rearm_if_exhausted(&mut running));
-        assert!(owns_fetch(&running, 1));
-
-        let mut done = Some(SaltClaim {
-            epoch: 1,
-            state: FetchState::Done,
-        });
-        assert!(!rearm_if_exhausted(&mut done));
-
-        let mut exhausted = Some(SaltClaim {
-            epoch: 1,
-            state: FetchState::Exhausted,
-        });
-        assert!(rearm_if_exhausted(&mut exhausted));
-        assert!(claim_fetch(&mut exhausted, 2));
+    fn an_undecodable_stored_seed_is_replaced() {
+        let mut sim = DelegateSim::default();
+        sim.store
+            .insert(AVATAR_SEED_STORAGE_KEY.to_vec(), vec![0xFF, 0x00]);
+        sim.generations.insert(AVATAR_SEED_STORAGE_KEY.to_vec(), 1);
+        let channel = MockChannel::default().with_delegate(&successor_key(), sim);
+        let got = block_on(load_or_create_seed(
+            &channel,
+            &successor_key(),
+            record(5, 1),
+        ))
+        .unwrap();
+        assert_eq!(got, record(5, 1));
+        assert_eq!(stored(&channel), Some(record(5, 1)));
     }
 
-    /// A new key supersedes everything fetched or fetching under the old one:
-    /// the old task's result is dropped, it stops retrying, and a salt it
-    /// already queued is not stored over the new claim.
     #[test]
-    fn writing_the_key_supersedes_the_old_fetch() {
-        let mut never_asked = None;
+    fn a_silent_delegate_is_an_error_not_a_new_seed() {
+        let channel = channel_with(None);
+        channel.silence(&successor_key(), true);
+        assert!(block_on(load_or_create_seed(
+            &channel,
+            &successor_key(),
+            record(5, 1)
+        ))
+        .is_err());
+        channel.silence(&successor_key(), false);
+        assert_eq!(stored(&channel), None);
+    }
+
+    #[test]
+    fn importing_keeps_the_earliest_seed() {
+        // Absent: the incoming seed lands.
+        let channel = channel_with(None);
+        assert_eq!(
+            block_on(import_seed(&channel, &successor_key(), record(5, 1))),
+            Ok(SeedImport::Replaced)
+        );
+        assert_eq!(stored(&channel), Some(record(5, 1)));
+
+        // A newer held seed (made before the walk got here) gives way.
+        let channel = channel_with(Some(record(9, 2)));
+        assert_eq!(
+            block_on(import_seed(&channel, &successor_key(), record(5, 1))),
+            Ok(SeedImport::Replaced)
+        );
+        assert_eq!(stored(&channel), Some(record(5, 1)));
+
+        // An earlier, or the same, held seed stands.
+        for held in [record(3, 7), record(5, 1)] {
+            let channel = channel_with(Some(held));
+            assert_eq!(
+                block_on(import_seed(&channel, &successor_key(), record(5, 1))),
+                Ok(SeedImport::Kept)
+            );
+            assert_eq!(stored(&channel), Some(held));
+        }
+    }
+
+    #[test]
+    fn the_first_room_starts_one_read_and_later_rooms_wait_for_it() {
+        let mut s = SeedSession::default();
+        assert!(s.want([1; 32], 10) == Want::Fetch(10));
+        assert!(s.want([2; 32], 11) == Want::Nothing, "one read per session");
+        assert!(s.owns(10) && !s.owns(11));
+        match s.after_attempt(10, 1, Some([7; 32])) {
+            AfterAttempt::Fill(salts) => {
+                let rooms: Vec<RoomKey> = salts.iter().map(|(r, _)| *r).collect();
+                assert_eq!(rooms, vec![[1; 32], [2; 32]]);
+                assert_eq!(salts[0].1, room_salt(&[7; 32], &[1; 32]));
+            }
+            _ => panic!("a read seed fills every waiting room"),
+        }
         assert!(
-            !invalidate(&mut never_asked),
-            "an unasked room is not fetched"
+            s.want([1; 32], 12) == Want::Nothing,
+            "a filled room is stored once"
         );
-
-        let mut slot = None;
-        assert!(claim_fetch(&mut slot, 1));
-        assert!(invalidate(&mut slot));
-        assert!(claim_fetch(&mut slot, 2));
-        assert!(!owns_fetch(&slot, 1), "the old task stops before retrying");
-        assert_eq!(after_attempt(&mut slot, 1, 1, true), AfterAttempt::Stale);
-        assert_eq!(after_attempt(&mut slot, 1, 1, false), AfterAttempt::Stale);
-        assert!(
-            owns_fetch(&slot, 2),
-            "a stale result leaves the new claim alone"
-        );
-
-        // The old task fetched and queued its store; then the key changed.
-        let mut slot = None;
-        assert!(claim_fetch(&mut slot, 3));
-        assert_eq!(after_attempt(&mut slot, 3, 1, true), AfterAttempt::Store);
-        assert!(invalidate(&mut slot));
-        assert!(claim_fetch(&mut slot, 4));
-        assert!(!may_store(&slot, 3));
+        match s.want([3; 32], 13) {
+            Want::Fill(salts) => assert_eq!(salts, vec![([3; 32], room_salt(&[7; 32], &[3; 32]))]),
+            _ => panic!("a new room fills from the ready seed"),
+        }
     }
 
-    /// The salt follows the delegate's key only if every write of that key
-    /// reports it. Pins the two `migrate_signing_key` hooks (inside their
-    /// branches) and room creation's.
     #[test]
-    fn every_signing_key_write_reports_to_the_avatar_salt() {
-        use crate::util::source_scan::production_only;
+    fn a_read_retries_twice_with_backoff_then_gives_up_until_rearmed() {
+        let mut s = SeedSession::default();
+        assert!(s.want([1; 32], 1) == Want::Fetch(1));
+        assert!(s.after_attempt(1, 1, None) == AfterAttempt::RetryAfterMs(2_000));
+        assert!(s.owns(1), "a retrying read keeps its claim");
+        assert!(s.after_attempt(1, 2, None) == AfterAttempt::RetryAfterMs(8_000));
+        assert!(s.after_attempt(1, 3, None) == AfterAttempt::GiveUp);
+        assert!(
+            s.want([2; 32], 2) == Want::Nothing,
+            "exhausted stays absent"
+        );
+        assert_eq!(s.rearm_if_exhausted(3), Some(3));
+        assert!(s.owns(3));
+        assert_eq!(
+            s.rearm_if_exhausted(4),
+            None,
+            "only an exhausted read re-arms"
+        );
+        assert!(
+            matches!(s.after_attempt(3, 1, Some([7; 32])), AfterAttempt::Fill(f) if f.len() == 2)
+        );
+    }
 
-        let signing = production_only(include_str!("signing.rs"));
-        let start = signing
-            .find("pub async fn migrate_signing_key(")
-            .expect("migrate_signing_key exists");
-        let body = &signing[start..];
+    #[test]
+    fn an_exhausted_session_nobody_waits_on_starts_no_read() {
+        let mut s = SeedSession {
+            fetch: SeedFetch::Exhausted,
+            ..SeedSession::default()
+        };
+        assert_eq!(s.rearm_if_exhausted(1), None);
+        assert!(s.want([1; 32], 2) == Want::Fetch(2));
+    }
+
+    #[test]
+    fn a_replaced_seed_recolours_every_room_and_stales_a_running_read() {
+        let mut s = SeedSession::default();
+        assert!(s.want([1; 32], 1) == Want::Fetch(1));
+        let salts = s.replace_seed([9; 32]);
+        assert_eq!(salts, vec![([1; 32], room_salt(&[9; 32], &[1; 32]))]);
+        assert!(s.after_attempt(1, 1, Some([7; 32])) == AfterAttempt::Stale);
+        assert!(s.want([1; 32], 2) == Want::Nothing);
+    }
+
+    #[test]
+    fn the_seed_record_never_prints_its_seed() {
+        let printed = format!("{:?}", record(5, 0xAB));
+        assert!(!printed.contains("171"), "the seed bytes leaked: {printed}");
+        assert!(printed.contains("created_at_ms"));
+    }
+
+    /// A seed read that gave up is re-armed only if the delegate-present
+    /// point reports in. Fails if the call is dropped from it.
+    #[test]
+    fn the_delegate_present_point_rearms_the_seed_read() {
+        // Not `production_only`: this file's test module sits above the
+        // function. Anchored at a line start, so the copy of the signature a
+        // test there quotes as a string cannot match.
+        let src = crate::util::strip_comments(include_str!("components/app/chat_delegate.rs"));
+        let start = src
+            .find("\nasync fn fire_load_outbound_dms_request(attempt: u32) {\n")
+            .expect("the outbound-DM load");
+        let body = &src[start..];
         let body = &body[..body.find("\n}\n").expect("function end")];
-
-        let confirmed = body
-            .find("crate::avatar_salt::signing_key_confirmed(room_key);")
-            .expect("migrate_signing_key reports a current key");
-        let already_current = body
-            .find("return MigrationResult::AlreadyCurrent;")
-            .expect("the AlreadyCurrent return");
-        assert!(
-            confirmed < already_current && !body[confirmed..already_current].contains('}'),
-            "the confirmation must sit in the AlreadyCurrent branch"
-        );
-
-        let store = body
-            .find("match store_signing_key(room_key, signing_key).await")
-            .expect("the store");
-        let written = body
-            .find("crate::avatar_salt::signing_key_written(room_key);")
-            .expect("migrate_signing_key reports a written key");
-        let verify = store
-            + body[store..]
-                .find("get_public_key(room_key)")
-                .expect("the verifying read");
-        assert!(
-            store < written && written < verify,
-            "the write must be reported on the stored branch, before verification"
-        );
-
-        let create = production_only(include_str!("components/room_list/create_room_modal.rs"));
-        let stored = create
-            .find("store_signing_key(room_key_bytes, &sk_clone).await")
-            .expect("room creation stores the key");
-        assert!(
-            create[stored..].contains("crate::avatar_salt::signing_key_written(room_key_bytes);"),
-            "room creation must report the key it stored"
-        );
+        assert!(body.contains("crate::avatar_salt::current_delegate_present();"));
     }
 }

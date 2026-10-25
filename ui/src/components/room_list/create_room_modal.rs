@@ -83,7 +83,6 @@ pub fn CreateRoomModal() -> Element {
                     return;
                 }
                 info!("Signing key stored in delegate for new room");
-                crate::avatar_salt::signing_key_written(room_key_bytes);
 
                 // Owner-mode room: ask the delegate to subscribe so it
                 // drives async secret rotation when membership changes

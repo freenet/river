@@ -370,9 +370,6 @@ const SIGN_PREFIX: &[u8] = b"__sign:";
 /// Must match the bytes built in `get_request_key()` so `send_delegate_request`
 /// and the response router agree on the lookup key.
 const ROOM_SUBSCRIPTION_PREFIX: &[u8] = b"__room_subscription:";
-/// Tracking-key prefix for an in-flight `GetAvatarSalt` request, followed by
-/// the room key and `request_id` (built in `get_request_key()`).
-const AVATAR_SALT_PREFIX: &[u8] = b"__avatar_salt:";
 
 /// Atomic counter for generating unique request IDs
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -451,19 +448,6 @@ pub fn complete_pending_room_subscription_request(
 ) -> bool {
     let mut key_bytes = ROOM_SUBSCRIPTION_PREFIX.to_vec();
     key_bytes.extend_from_slice(room_owner_vk);
-    key_bytes.extend_from_slice(&request_id.to_le_bytes());
-    complete_pending_request_bytes(&key_bytes, response)
-}
-
-/// Complete a pending `GetAvatarSalt` request, correlated on
-/// `(room_key, request_id)` like the signing requests.
-pub fn complete_pending_avatar_salt_request(
-    room_key: &RoomKey,
-    request_id: RequestId,
-    response: ChatDelegateResponseMsg,
-) -> bool {
-    let mut key_bytes = AVATAR_SALT_PREFIX.to_vec();
-    key_bytes.extend_from_slice(room_key);
     key_bytes.extend_from_slice(&request_id.to_le_bytes());
     complete_pending_request_bytes(&key_bytes, response)
 }
@@ -6400,46 +6384,6 @@ mod tests {
         );
     }
 
-    /// The `GetAvatarSalt` waiter must register under the key the response
-    /// handler completes, and two requests for one room must not share a slot.
-    #[test]
-    fn avatar_salt_pending_key_round_trips() {
-        let room_key = sk(13).verifying_key().to_bytes();
-        let request_id: RequestId = 0x0fed_cba9_8765_4321;
-        let key_bytes = get_request_key(&ChatDelegateRequestMsg::GetAvatarSalt {
-            room_key,
-            request_id,
-        });
-        let response = ChatDelegateResponseMsg::AvatarSaltResponse {
-            room_key,
-            request_id,
-            salt: Ok([5u8; 32]),
-        };
-        assert_eq!(response_correlation_base(&response), None);
-
-        let (sender, mut receiver) = oneshot::channel();
-        PENDING_REQUESTS
-            .lock()
-            .unwrap()
-            .insert(key_bytes.clone(), sender);
-        assert!(
-            complete_pending_avatar_salt_request(&room_key, request_id, response),
-            "the response must complete the waiter its request registered"
-        );
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(Some(ChatDelegateResponseMsg::AvatarSaltResponse { .. }))
-        ));
-
-        assert_ne!(
-            key_bytes,
-            get_request_key(&ChatDelegateRequestMsg::GetAvatarSalt {
-                room_key,
-                request_id: request_id + 1,
-            })
-        );
-    }
-
     /// Two concurrent `EnsureRoomSubscription` calls for the same
     /// `room_owner_vk` MUST produce distinct pending-request keys —
     /// otherwise the second caller would clobber the first's sender slot,
@@ -6757,15 +6701,12 @@ mod tests {
     /// caps decided after removals): the delegate links the room-state code
     /// it changes, and the river-core 0.3.0 -> 0.3.1 bump moves it
     /// regardless. V37 (`0fc3625e…`) is the outgoing generation.
-    ///
-    /// Updated for V38 (the `GetAvatarSalt` request, a new delegate handler).
-    /// V38 (`da47cbd9…`) is the outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "13b05b9fcd31b49a61630c9413be24bd1fa4a7c8a25f6fa9ab01b607fc3318ae",
+            "da47cbd9e5264828b80d229a292e23e05951737844cd289c8f53e99bf55e0848",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
@@ -9049,6 +8990,9 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
 /// send returns.
 async fn fire_load_outbound_dms_request(attempt: u32) {
     info!("Firing request to load outbound DMs from delegate storage");
+    // The delegate is known present here: an avatar seed read that gave up
+    // (it ran before the delegate was registered) may try again.
+    crate::avatar_salt::current_delegate_present();
 
     let request = ChatDelegateRequestMsg::GetRequest {
         key: ChatDelegateKey::new(OUTBOUND_DMS_STORAGE_KEY.to_vec()),
@@ -10490,13 +10434,12 @@ pub(crate) fn response_correlation_base(response: &ChatDelegateResponseMsg) -> O
         // re-open exactly the class of bug B1 was: a newly added storage
         // variant would silently correlate to nothing (`completed` stays
         // false, the waiter never fires) instead of failing to compile. These
-        // five correlate through their own registries and never touch
+        // four correlate through their own registries and never touch
         // `PENDING_REQUESTS`.
         ChatDelegateResponseMsg::StoreSigningKeyResponse { .. }
         | ChatDelegateResponseMsg::GetPublicKeyResponse { .. }
         | ChatDelegateResponseMsg::SignResponse { .. }
-        | ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse { .. }
-        | ChatDelegateResponseMsg::AvatarSaltResponse { .. } => None,
+        | ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse { .. } => None,
     }
 }
 
@@ -10586,17 +10529,6 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
         } => {
             let mut key = ROOM_SUBSCRIPTION_PREFIX.to_vec();
             key.extend_from_slice(room_owner_vk);
-            key.extend_from_slice(&request_id.to_le_bytes());
-            key
-        }
-
-        // Routed via `complete_pending_avatar_salt_request`.
-        ChatDelegateRequestMsg::GetAvatarSalt {
-            room_key,
-            request_id,
-        } => {
-            let mut key = AVATAR_SALT_PREFIX.to_vec();
-            key.extend_from_slice(room_key);
             key.extend_from_slice(&request_id.to_le_bytes());
             key
         }

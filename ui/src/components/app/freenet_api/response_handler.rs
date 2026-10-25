@@ -324,15 +324,6 @@ impl ResponseHandler {
                                         *request_id,
                                         response.clone(),
                                     ),
-                                    ChatDelegateResponseMsg::AvatarSaltResponse {
-                                        room_key,
-                                        request_id,
-                                        ..
-                                    } => crate::components::app::chat_delegate::complete_pending_avatar_salt_request(
-                                        room_key,
-                                        *request_id,
-                                        response.clone(),
-                                    ),
                                 };
 
                                 if completed {
@@ -753,16 +744,6 @@ impl ResponseHandler {
                                             "Delegate failed to subscribe to room {:?}: {}",
                                             room_owner_vk, e
                                         ),
-                                    },
-                                    ChatDelegateResponseMsg::AvatarSaltResponse {
-                                        room_key,
-                                        salt,
-                                        ..
-                                    } => match salt {
-                                        Ok(_) => info!("Got avatar salt for room: {:?}", room_key),
-                                        Err(e) => {
-                                            warn!("No avatar salt for room {:?}: {}", room_key, e)
-                                        }
                                     },
                                 }
                             } else {
@@ -2671,16 +2652,6 @@ fn describe_delegate_response(r: &ChatDelegateResponseMsg) -> String {
             room_key_fp(room_owner_vk),
             request_id,
             result.is_ok()
-        ),
-        R::AvatarSaltResponse {
-            room_key,
-            request_id,
-            salt,
-        } => format!(
-            "AvatarSaltResponse {{ room: {}, request_id: {:?}, ok: {} }}",
-            room_key_fp(room_key),
-            request_id,
-            salt.is_ok()
         ),
         // Deliberately NO catch-all arm. An exhaustive match makes a newly added
         // variant a COMPILE error here, which is the only thing that reliably stops
