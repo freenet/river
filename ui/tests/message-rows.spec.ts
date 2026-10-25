@@ -388,6 +388,9 @@ test.describe("Avatars", () => {
     await callRiverTest(page, "setAvatarSalt", null);
     await expect.poll(isGrey, { message: "no salt: a neutral disc" }).toBe(true);
     await expect(avatar).not.toHaveAttribute("style", /--avatar-hue/);
+    // And it stays neutral: nothing restarts a read that gave up here.
+    await page.waitForTimeout(500);
+    expect(await isGrey(), "still neutral").toBe(true);
 
     // Exact hues for the fixed-key sender (Test Sender Insert) under two
     // salts, pinned natively by `the_fixed_test_senders_hues_are_pinned`:
@@ -412,6 +415,14 @@ test.describe("Avatars", () => {
     expect(underOne.every((h) => h !== ""), "every listed author is coloured").toBe(true);
     expect(first).not.toBe("");
 
+    // A read seed colours the disc before its salt is stored: render
+    // computes the salt from the seed (`salt_for_render`). The hue is the
+    // one the stored salt would give, so it differs from salt 2's.
+    await callRiverTest(page, "setSeedReadUnstored", 3);
+    await expect(avatar).toHaveAttribute("style", /--avatar-hue/);
+    expect(await isGrey(), "a read seed colours the disc").toBe(false);
+    await expect.poll(hueOf).not.toBe("288");
+
     // Your own avatar carries the accent ring.
     const ring = await own.getByTestId("message-author-avatar").evaluate((el) => getComputedStyle(el).outlineStyle);
     expect(ring).toBe("solid");
@@ -431,7 +442,7 @@ test.describe("Reaction row", () => {
     await reactTo(page, row);
     if (!(await coarsePointer(page))) await row.hover({ position: { x: 4, y: 4 } });
 
-    const anchor = row.getByTestId("add-reaction-button");
+    const anchor = row.getByTestId("reaction-picker-anchor");
     await expect(anchor).toBeAttached();
     await expect(anchor).toBeHidden();
     const m = await anchor.evaluate((el) => {
@@ -443,6 +454,15 @@ test.describe("Reaction row", () => {
     const reactionRow = row.getByTestId("message-reaction-row");
     await expect(reactionRow.getByTestId("reaction-chip")).toHaveCount(1);
     await expect(reactionRow.locator('button:not([data-testid="reaction-chip"]):visible')).toHaveCount(0);
+
+    // The picker opens below or above the chips, never over them.
+    await openInlinePicker(page, row);
+    const picker = page.getByTestId("emoji-picker");
+    await expect(picker).toBeVisible();
+    const p = (await picker.boundingBox())!;
+    const c = (await reactionRow.getByTestId("reaction-chip").boundingBox())!;
+    const clear = p.y >= c.y + c.height - 0.5 || p.y + p.height <= c.y + 0.5;
+    expect(clear, `picker ${p.y}..${p.y + p.height} vs chips ${c.y}..${c.y + c.height}`).toBe(true);
   });
 });
 
@@ -569,12 +589,12 @@ test.describe("Message rows at 320px", () => {
   });
 });
 
-// The inline picker hangs off the "+" after a row's chips, and the scroller
+// The inline picker hangs off the anchor after a row's chips, and the scroller
 // clips its sides, so at 320px it opens toward the roomier side. Each case
 // checks every emoji is inside the scroller and takes a tap at its centre.
 type PickerReport = Awaited<ReturnType<typeof measurePicker>>;
 
-/// The open picker, its "+" wrapper (the picker's containing block) and the
+/// The open picker, its anchor's wrapper (the picker's containing block) and the
 /// scroller, with no click in between: a click elsewhere would close it.
 async function measurePicker(page: Page) {
   await expect(page.getByTestId("emoji-picker")).toBeVisible();
@@ -585,7 +605,7 @@ async function measurePicker(page: Page) {
     };
     const scroller = box(document.getElementById("chat-scroll-container")!);
     const picker = document.querySelector('[data-testid="emoji-picker"]')!;
-    const plus = picker.parentElement!.querySelector('[data-testid="add-reaction-button"]')!;
+    const anchorEl = picker.parentElement!.querySelector('[data-testid="reaction-picker-anchor"]')!;
     const buttons = Array.from(picker.querySelectorAll("button")).map((b) => {
       const r = b.getBoundingClientRect();
       const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
@@ -596,7 +616,7 @@ async function measurePicker(page: Page) {
         hit: at !== null && (at === b || b.contains(at)),
       };
     });
-    return { scroller, anchor: box(plus.parentElement!), picker: box(picker), buttons };
+    return { scroller, anchor: box(anchorEl.parentElement!), picker: box(picker), buttons };
   });
 }
 
@@ -609,9 +629,9 @@ function expectEveryEmojiTappable(report: PickerReport) {
 }
 
 /// The newest message, "picker edge", with as many reaction chips as leave its
-/// "+" on their line, so "+" ends near the column's right edge. A fixed count
-/// does not do it: four chips left "+" at 160px in Chromium, where a 140px
-/// picker still fit, and six wrapped "+" to the line's start in WebKit, whose
+/// the anchor on their line, so the anchor sits near the column's right edge. A fixed count
+/// does not do it: four chips left the anchor at 160px in Chromium, where a 140px
+/// picker still fit, and six wrapped the anchor to the line's start in WebKit, whose
 /// emoji chips are 3px wider.
 async function nearEdgeRow(page: Page): Promise<Locator> {
   const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"];
@@ -623,10 +643,10 @@ async function nearEdgeRow(page: Page): Promise<Locator> {
   await expect(chips).toHaveCount(1);
   const fit = await row.evaluate((el) => {
     const chip = el.querySelector('[data-testid="reaction-chip"]')!.getBoundingClientRect();
-    const plus = el.querySelector('[data-testid="add-reaction-button"]')!.getBoundingClientRect();
+    const anchorEl = el.querySelector('[data-testid="reaction-picker-anchor"]')!.getBoundingClientRect();
     const line = el.querySelector('[data-testid="message-reaction-row"]')!.getBoundingClientRect();
-    // Each chip moves "+" one chip and its gap further right.
-    return Math.floor((line.right - plus.right) / (plus.left - chip.left)) + 1;
+    // Each chip moves the anchor one chip and its gap further right.
+    return Math.floor((line.right - anchorEl.right) / (anchorEl.left - chip.left)) + 1;
   });
   expect(fit, "chips that fit one line").toBeLessThanOrEqual(emojis.length);
   await callRiverTest(page, "addReactionsToNewest", emojis.slice(1, fit));
@@ -635,7 +655,7 @@ async function nearEdgeRow(page: Page): Promise<Locator> {
   return row;
 }
 
-/// What `left-0` would do: a rightward picker from this "+" ends past the scroller.
+/// What `left-0` would do: a rightward picker from this anchor ends past the scroller.
 function expectRightwardWouldClip(report: PickerReport) {
   expect(report.anchor.left + width(report.picker), "premise: a rightward picker would clip").toBeGreaterThan(report.scroller.right);
 }
@@ -698,7 +718,7 @@ test.describe("Reaction picker at 320px", () => {
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
     await openInlinePicker(page, row);
     const report = await measurePicker(page);
-    // What an unconditional `right-0` would do: a leftward picker from this "+" starts before the scroller.
+    // What an unconditional `right-0` would do: a leftward picker from this anchor starts before the scroller.
     expect(report.anchor.right - width(report.picker), "premise: + starts the line").toBeLessThan(report.scroller.left);
     expectEveryEmojiTappable(report);
   });
@@ -716,7 +736,7 @@ test.describe("Reaction picker at 320px", () => {
 });
 
 // #791 review: the picker opened from the keyboard reports no click
-// position, so its side must come from the "+" it hangs off. The newest
+// position, so its side must come from the anchor it hangs off. The newest
 // message, at the bottom of the view, has no room for the picker below it.
 test("the picker opened from the keyboard at the bottom of the view opens upward", async ({ page }) => {
   test.skip(await touchOnly(page), "no hover bar, so no keyboard path, on touch");
@@ -725,7 +745,7 @@ test("the picker opened from the keyboard at the bottom of the view opens upward
   const row = page.getByTestId("message-row").filter({ hasText: "keyboard picker" });
   await expect(row).toBeInViewport();
   const room = await row.evaluate((el) => {
-    const r = el.querySelector('[data-testid="add-reaction-button"]')!.parentElement!.getBoundingClientRect();
+    const r = el.querySelector('[data-testid="reaction-picker-anchor"]')!.parentElement!.getBoundingClientRect();
     const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
     return { below: s.bottom - r.bottom, above: r.top - s.top };
   });
@@ -955,7 +975,7 @@ test.describe("Hover bar", () => {
   });
 });
 
-// React on a message taller than the view: the picker hangs off the "+" at
+// React on a message taller than the view: the picker hangs off the anchor at
 // the message's foot, below the fold when React is taken from the top of the
 // message. Opening brings it into view, and the next click is the reader's
 // pick, not swallowed by the invisible backdrop.
@@ -977,13 +997,13 @@ test.describe("React on a tall message", () => {
       page.evaluate(() => {
         const c = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
         const p = document.querySelector('[data-testid="emoji-picker"]')?.getBoundingClientRect();
-        const plus = Array.from(document.querySelectorAll('[data-testid="message-row"]'))
+        const anchorEl = Array.from(document.querySelectorAll('[data-testid="message-row"]'))
           .find((r) => r.textContent!.includes("tall paragraph 59"))!
-          .querySelector('[data-testid="add-reaction-button"]')!
+          .querySelector('[data-testid="reaction-picker-anchor"]')!
           .parentElement!.getBoundingClientRect();
-        return { view: [c.top, c.bottom], picker: p ? [p.top, p.bottom] : null, plusTop: plus.top };
+        return { view: [c.top, c.bottom], picker: p ? [p.top, p.bottom] : null, anchorTop: anchorEl.top };
       });
-    expect((await geometry()).plusTop, "premise: the message's foot is below the view").toBeGreaterThan((await geometry()).view[1]);
+    expect((await geometry()).anchorTop, "premise: the message's foot is below the view").toBeGreaterThan((await geometry()).view[1]);
 
     await openInlinePicker(page, row);
     const picker = page.getByTestId("emoji-picker");

@@ -489,9 +489,10 @@ fn store_salts(salts: Salts) {
 
 /// Make `room_key`'s salt available in [`AVATAR_SALTS`].
 ///
-/// The first call of the session reads the seed (one delegate request, two
-/// the first time a device ever runs: the read and the creating store), up
-/// to 3 attempts 2 s then 8 s apart; every later call costs no request.
+/// Starts the session's seed read if [`current_delegate_present`] has not
+/// (one delegate request, two the first time a device ever runs: the read
+/// and the creating store), up to 3 attempts 2 s then 8 s apart; every later
+/// call costs no request.
 /// Safe to call from render: it writes no signal synchronously, and a room
 /// already filled is not stored again.
 pub fn ensure_avatar_salt(room_key: RoomKey) {
@@ -509,12 +510,18 @@ pub fn ensure_avatar_salt(room_key: RoomKey) {
 /// for it. Neither source holds a salt while the seed is unread, so a room
 /// without one stays neutral as before.
 ///
-/// Reading [`AVATAR_SALTS`] subscribes the caller; a contended read nudges
-/// (dioxus-signal-safety.md, #555), so call `signal_guard::anchor()` first.
+/// Reading [`AVATAR_SALTS`] subscribes the caller. A contended read reads the
+/// anchor and nudges, so the caller renders again (dioxus-signal-safety.md,
+/// #555); a memo reads the anchor itself before any fallible read.
+///
+/// The session is not a signal: the seed arriving renders nothing by itself.
+/// The fallback colours whatever renders between the seed and the store,
+/// which on a load is most of it; the store renders the rest.
 pub fn salt_for_render(room_key: &RoomKey) -> Option<[u8; 32]> {
     let held = match AVATAR_SALTS.try_read() {
         Ok(salts) => salts.get(room_key).copied(),
         Err(_) => {
+            crate::util::signal_guard::anchor();
             crate::util::signal_guard::schedule_nudge();
             None
         }
@@ -543,6 +550,17 @@ pub(crate) fn current_delegate_present() {
 #[cfg(all(feature = "example-data", feature = "no-sync"))]
 pub(crate) fn give_up_for_test() {
     with_session(|s| s.fetch = SeedFetch::Exhausted);
+}
+
+/// Test hook: the seed is read but no salt is stored yet, the window
+/// [`salt_for_render`]'s fallback covers. Every room asked for counts as
+/// filled, so nothing stores one.
+#[cfg(all(feature = "example-data", feature = "no-sync"))]
+pub(crate) fn seed_read_unstored_for_test(seed: [u8; 32]) {
+    with_session(|s| {
+        s.fetch = SeedFetch::Ready { seed };
+        s.filled = s.wanted.clone();
+    });
 }
 
 /// The delegate holds `record` after a migration seed carry: the walk stored

@@ -8,7 +8,7 @@
  *
  * `ch` depends on the font size and, in practice, on the engine's rounding
  * at that size, so the column computes it at the body's own 15px; its
- * children get back the 16px they inherited before. Only from 768px: on a
+ * children get back the size they inherited before. Only from 768px: on a
  * phone the panel is always narrower than a row needs, and the body's size
  * is different there. Horizontal only: every line in a row is already
  * bounded by the measure, so no row's height changes. */
@@ -21,7 +21,7 @@
     }
 
     .conversation-column > * {
-        font-size: 16px;
+        font-size: 1rem;
     }
 }
 
@@ -269,6 +269,12 @@
 }
 
 .join-names-list {
+    max-height: 10rem;
+    overflow-y: auto;
+}
+
+.join-name {
+    font-weight: 700;
     color: var(--color-text-secondary);
 }
 

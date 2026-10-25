@@ -230,6 +230,25 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // The seed is read (32 copies of `fill`) but the current room's salt is
+    // not stored: what a render sees between the seed read and the deferred
+    // store, which `avatar_salt::salt_for_render` covers.
+    set_hook(
+        "setSeedReadUnstored",
+        Closure::<dyn FnMut(u8)>::new(move |fill: u8| {
+            crate::util::defer(move || {
+                let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+                    return;
+                };
+                crate::avatar_salt::seed_read_unstored_for_test([fill; 32]);
+                crate::avatar_salt::AVATAR_SALTS.with_mut(|salts| {
+                    salts.remove(&room_key.to_bytes());
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
     // Append `count` join events in ONE mutation, from the alternating
     // appended identities ("Test Sender A" / "Test Sender B"), so two fold into
     // one "A and B joined" notice.

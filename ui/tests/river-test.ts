@@ -14,6 +14,8 @@ type RiverTestHooks = {
   addReactionsToNewest(emojis: string[]): void;
   // The current room's avatar salt: 32 bytes of `fill`, or none (neutral avatars).
   setAvatarSalt(fill: number | null): void;
+  // The seed is read (32 bytes of `fill`) but no salt is stored for the current room.
+  setSeedReadUnstored(fill: number): void;
   makeRoomPrivateWithoutSecret(): void;
   forgeNextSendSignature(): void;
   setRoomsLoadState(state: RoomsLoadState): void;

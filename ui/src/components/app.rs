@@ -111,7 +111,8 @@ pub static WIDE_VIEWPORT: GlobalSignal<bool> = Global::new(wide_viewport_now);
 
 /// The media query behind [`WIDE_VIEWPORT`]; Tailwind's `lg`.
 #[cfg(target_arch = "wasm32")]
-const WIDE_VIEWPORT_QUERY: &str = "(min-width: 1024px)";
+/// In rem, as Tailwind's `lg:` is, so both follow the reader's font size.
+const WIDE_VIEWPORT_QUERY: &str = "(min-width: 64rem)";
 
 /// Whether the member panel is shown on a window at least 768px wide: the
 /// stored choice, else automatic by width.

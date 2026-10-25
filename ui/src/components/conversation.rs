@@ -2952,9 +2952,8 @@ pub fn Conversation() -> Element {
                                         let owner_vk = CURRENT_ROOM.peek().owner_key;
                                         let salt = owner_vk.and_then(|vk| {
                                             crate::avatar_salt::ensure_avatar_salt(vk.to_bytes());
-                                            // A contended read nudges, and the anchor
-                                            // lets the nudge render it again (#555).
-                                            crate::util::signal_guard::anchor();
+                                            // A contended read anchors and nudges, so
+                                            // the nudge renders this again (#555).
                                             crate::avatar_salt::salt_for_render(&vk.to_bytes())
                                         });
                                         match (salt, owner_vk, current_room_data.as_ref()) {
@@ -3118,10 +3117,16 @@ pub fn Conversation() -> Element {
                                                                                 span { class: "join-names-count", "{rest}" }
                                                                                 " · {time}"
                                                                             }
+                                                                            // One span per name, the separators
+                                                                            // muted, so a nickname holding ", "
+                                                                            // does not read as two people.
                                                                             div {
                                                                                 "data-testid": "join-notice-names",
                                                                                 class: "join-names-list",
-                                                                                "{join_names_list(&summary.names)}"
+                                                                                for (i, name) in summary.names.iter().enumerate() {
+                                                                                    if i > 0 { ", " }
+                                                                                    span { class: "join-name", "{name}" }
+                                                                                }
                                                                             }
                                                                         }
                                                                     } else {
@@ -3898,7 +3903,7 @@ fn inline_picker_placement(msg_id: &str) -> PickerPlacement {
         let document = web_sys::window()?.document()?;
         let plus = document
             .get_element_by_id(&format!("msg-{msg_id}"))?
-            .query_selector("[data-testid=\"add-reaction-button\"]")
+            .query_selector("[data-testid=\"reaction-picker-anchor\"]")
             .ok()??
             .parent_element()?
             .get_bounding_client_rect();
@@ -4140,15 +4145,17 @@ fn MessageGroupComponent(
                         return;
                     }
                     // The chip is gone: Remove took the only reaction with that
-                    // emoji. The message's React action takes focus: the
-                    // kebab on touch, the hover bar's React otherwise. Each
-                    // is tried until one actually holds focus, since a
+                    // emoji. Focus stays on the reaction line: another chip
+                    // while one remains, else the message's React action
+                    // (the kebab on touch, the hover bar's React otherwise).
+                    // Each is tried until one actually holds focus, since a
                     // hidden one refuses it. If the message is
                     // gone too, focus stays where the browser put it.
                     let Some(row) = document.get_element_by_id(&format!("msg-{message_id}")) else {
                         return;
                     };
                     for selector in [
+                        "[data-testid=\"reaction-chip\"]",
                         "[data-testid=\"message-kebab\"]",
                         "[data-testid=\"message-hover-actions\"] button",
                     ] {
@@ -5164,8 +5171,11 @@ fn MessageGroupComponent(
                                                     // Collapsed, it takes no hits, so it never sits over
                                                     // the next row; the backdrop and the picker take
                                                     // them back.
+                                                    // `self-stretch`: as tall as the chip line, so the
+                                                    // picker opens below or above the chips, not over
+                                                    // them. In a row with no reactions the line is 0.
                                                     class: format!(
-                                                        "relative group/react inline-flex items-center h-0 pointer-events-none {}",
+                                                        "relative group/react inline-flex items-center self-stretch pointer-events-none {}",
                                                         if is_inline_picker_open { "z-[60]" } else { "" },
                                                     ),
                                                     // Invisible backdrop when picker is open
@@ -5179,7 +5189,7 @@ fn MessageGroupComponent(
                                                     // React is the hover bar's button, or the kebab
                                                     // menu's on touch, so a message has one way in.
                                                     span {
-                                                        "data-testid": "add-reaction-button",
+                                                        "data-testid": "reaction-picker-anchor",
                                                         "aria-hidden": "true",
                                                         class: "invisible inline-block h-0 w-0 overflow-hidden",
                                                     }
