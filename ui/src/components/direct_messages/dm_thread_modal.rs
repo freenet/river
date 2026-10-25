@@ -1513,8 +1513,9 @@ enum DmThreadRow {
 
 /// How far a DM's sender-supplied timestamp may run ahead of this client's
 /// clock before it is clamped for grouping, day breaks and the shown time:
-/// the room's tolerance (`CLOCK_SKEW_TOLERANCE_SECS` in conversation.rs).
-const DM_CLOCK_SKEW_TOLERANCE_SECS: u64 = 60;
+/// the room's own tolerance, one constant for both.
+const DM_CLOCK_SKEW_TOLERANCE_SECS: u64 =
+    crate::components::conversation::CLOCK_SKEW_TOLERANCE_SECS.unsigned_abs();
 
 /// A DM's timestamp as the thread presents it: the sender's, but no later
 /// than `now_secs` plus the tolerance, so a skewed or hostile clock (up to

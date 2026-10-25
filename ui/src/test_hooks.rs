@@ -732,25 +732,26 @@ enum DmStamp {
 /// today whatever the time (a spec stamped "now less a few minutes" failed
 /// just after midnight).
 fn two_day_stamp(i: u64, count: u64, now: u64) -> u64 {
-    // Local midnight today and yesterday, by the calendar (a DST change
-    // makes a day other than 86,400 s).
-    let midnight_days_ago = |days: u32| {
+    let midnight = {
         let d = js_sys::Date::new_0();
         d.set_hours(0);
         d.set_minutes(0);
         d.set_seconds(0);
         d.set_milliseconds(0);
-        d.set_date(d.get_date() - days);
         (d.get_time() / 1000.0) as u64
     };
-    let (midnight, yesterday) = (midnight_days_ago(0), midnight_days_ago(1));
     let half = count / 2;
     let today = count - half;
     let slot = if i < half { i } else { i - half };
     let spacing = (now.saturating_sub(midnight) / (today + 1)).min(60);
     let at = now.saturating_sub((today - slot) * spacing);
     if i < half {
-        yesterday + (at - midnight)
+        // The same wall-clock time on the previous calendar day: the day
+        // after a DST change, yesterday was not 86,400 s (nor midnight plus
+        // today's offset) long.
+        let d = js_sys::Date::new(&JsValue::from_f64(at as f64 * 1000.0));
+        d.set_date(d.get_date() - 1);
+        (d.get_time() / 1000.0) as u64
     } else {
         at
     }

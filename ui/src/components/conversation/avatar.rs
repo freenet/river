@@ -53,7 +53,7 @@ fn word_initial(word: &str) -> Vec<String> {
         // a mark (a lone mark forms a cluster of its own).
         let Some(base) = chars
             .by_ref()
-            .find(|c| c.is_alphanumeric() && !extends_cluster(*c))
+            .find(|c| c.is_alphanumeric() && !is_format(*c) && !extends_cluster(*c))
         else {
             continue;
         };
@@ -89,16 +89,21 @@ fn extends_cluster(c: char) -> bool {
     probe.graphemes(true).count() == 1
 }
 
-/// Invisible format characters a disc never shows: zero-width spaces and
-/// joiners, bidi marks, embeddings, overrides and isolates, the word joiner
-/// family, variation selectors, the BOM and the soft hyphen.
+/// Invisible characters a disc never shows: zero-width spaces and joiners,
+/// bidi marks, embeddings, overrides and isolates, the word joiner family,
+/// variation selectors, the BOM and the soft hyphen; and the blanks that
+/// Unicode files as letters or symbols (the Hangul fillers, the blank
+/// Braille pattern), which would draw an empty disc.
 fn is_format(c: char) -> bool {
-    matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}' | '\u{E0100}'..='\u{E01EF}')
+    matches!(c, '\u{115F}' | '\u{1160}' | '\u{2800}' | '\u{3164}' | '\u{FFA0}' | '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}' | '\u{E0100}'..='\u{E01EF}')
 }
 
-/// Emoji and pictographic symbols, regional indicators (flags) included.
+/// Emoji: the emoji planes (flags' regional indicators included), the
+/// miscellaneous symbols and dingbats, and the few emoji elsewhere in the
+/// BMP. Not arrows, box drawing, Braille or other symbols, which read as
+/// noise in a disc.
 fn is_pictographic(c: char) -> bool {
-    matches!(c, '\u{2190}'..='\u{2BFF}' | '\u{3297}' | '\u{3299}' | '\u{1F000}'..='\u{1FAFF}')
+    matches!(c, '\u{1F000}'..='\u{1FAFF}' | '\u{2600}'..='\u{27BF}' | '\u{231A}' | '\u{231B}' | '\u{23E9}'..='\u{23F3}' | '\u{23F8}'..='\u{23FA}' | '\u{2B1B}' | '\u{2B1C}' | '\u{2B50}' | '\u{2B55}' | '\u{3297}' | '\u{3299}')
 }
 
 /// The verifying-key bytes of `member`, the input the hue is keyed on: the
@@ -241,6 +246,28 @@ mod tests {
         assert_eq!(initials("\u{200E}cat dog"), "CD");
         // Nothing but format characters.
         assert_eq!(initials("\u{200B}\u{200E}\u{202E}\u{2066}"), "?");
+    }
+
+    /// Characters that draw nothing, though Unicode files them as letters or
+    /// symbols, are skipped like format characters; a name of nothing else
+    /// gets "?". Arrows, box drawing and Braille are not emoji.
+    #[test]
+    fn blank_and_non_emoji_symbols_never_fill_the_disc() {
+        for blank in [
+            "\u{3164}",
+            "\u{115F}\u{1160}",
+            "\u{FFA0}",
+            "\u{2800}\u{2800}",
+        ] {
+            assert_eq!(initials(blank), "?", "{blank:?}");
+        }
+        assert_eq!(initials("\u{3164} bob"), "B");
+        assert_eq!(initials("\u{3164}x"), "X");
+        for symbol in ["\u{2192}", "\u{2503}", "\u{2840}", "\u{2B05}"] {
+            assert_eq!(initials(symbol), "?", "{symbol:?}");
+        }
+        assert_eq!(initials("\u{2B50}"), "\u{2B50}");
+        assert_eq!(initials("\u{231A}"), "\u{231A}");
     }
 
     #[test]
