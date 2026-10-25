@@ -236,8 +236,9 @@ pub fn MessageInput(
         }
         div { class: "flex-shrink-0 bg-panel relative z-50",
             "data-testid": "message-composer",
-            // Spans the panel, on the header's left edge.
-            div { class: "px-3 md:px-5 pt-1 pb-3 md:pb-[18px]",
+            // Spans the conversation column (`.conversation-column`, centred
+            // on a wide window), on the header's left edge otherwise.
+            div { class: "px-3 md:px-5 pt-1 pb-3 md:pb-[18px] conversation-column",
                 // Reply preview strip
                 {
                     let reply = replying_to.read();

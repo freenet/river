@@ -2875,9 +2875,10 @@ pub fn Conversation() -> Element {
                     style: "overflow-anchor:none;",
                     id: "chat-scroll-container",
                     "data-testid": "chat-scroll-container",
-                    // Full width: rows and their hover band span the column, and
+                    // Rows and their hover band span the conversation column,
+                    // which is centred on a wide window (`.conversation-column`);
                     // the body text keeps its own 76ch measure.
-                    div { class: "py-4", id: "chat-content",
+                    div { class: "py-4 conversation-column", id: "chat-content",
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
@@ -3233,6 +3234,12 @@ pub fn Conversation() -> Element {
                 // Latest (#402): shown while the newest message's bottom is off
                 // screen, or a held range withholds newer items.
                 if !newest_in_view() || reader_position.has_newer.get() {
+                    // In the conversation column's frame, so Latest sits at the
+                    // column's corner on a wide window and the panel's otherwise.
+                    // The frame takes no hits; the button does.
+                    div { class: "absolute inset-0 pointer-events-none",
+                    div { "data-testid": "latest-frame", class: "conversation-column relative h-full",
+                    span { class: "pointer-events-auto",
                     LatestButton {
                         aria_label: "Scroll to latest messages",
                         test_id: "scroll-to-bottom",
@@ -3256,6 +3263,9 @@ pub fn Conversation() -> Element {
                                 }
                             }
                         }},
+                    }
+                    }
+                    }
                     }
                 }
             }

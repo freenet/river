@@ -191,6 +191,13 @@ only because nothing outside the root scrolls, which is why `html, body` are
 `overflow: hidden`: a page scrollbar would make `100vw` wider than the root's
 box. Do not drop either rule in a layout edit.
 
+The conversation column (`.conversation-column` in `main.css`: the
+history's content, Latest's frame and the composer) is capped at what a row
+needs and centred on a wide window. That is horizontal only: every line in a
+row is already bounded by the body's measure, so no row's height changes
+with the panel's width beyond the cap (`message-rows.spec.ts`, "centring
+changes no row's height"), and the scroller itself stays panel-wide.
+
 Browser scroll anchoring is disabled on the room scroller, and a browser test
 asserts the computed `overflow-anchor: none`. Custom position corrections
 remain in place. Known limitation: late images and bulk removal above a parked

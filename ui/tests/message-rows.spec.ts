@@ -152,98 +152,167 @@ test.describe("Message rows", () => {
     test.use({ viewport: { width: 1440, height: 900 } });
 
     // #791 review: nothing caught a width cap (65ch, max-w-prose, max-w-4xl)
-    // coming back. Rows span the column and a long body fills the 76ch measure.
+    // coming back. Rows span the conversation column (the panel, up to what a
+    // row needs) and a long body fills the 76ch measure.
     test("rows span the column and a long body fills its 76ch measure", async ({ page }) => {
       await openRoomWithComposer(page);
       const long = "A long line that keeps going ".repeat(12) + "until the end";
       await deliver(page, long);
       const row = page.getByTestId("message-row").filter({ hasText: "until the end" });
-      const m = await row.evaluate((el) => {
-        const scroller = document.getElementById("chat-scroll-container")!;
-        const body = el.querySelector('[data-testid="message-body"]')!;
-        const probe = document.createElement("div");
-        probe.style.width = "76ch";
-        body.appendChild(probe);
-        const measure = probe.getBoundingClientRect().width;
-        probe.remove();
-        const r = el.getBoundingClientRect();
-        const s = scroller.getBoundingClientRect();
-        return {
-          rowWidth: r.width,
-          scrollerInner: scroller.clientWidth,
-          rowLeft: r.left - s.left,
-          bodyWidth: body.getBoundingClientRect().width,
-          measure,
-          contentWidth: el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect().width,
-        };
-      });
-      expect(m.rowLeft, "the row starts at the scroller's edge").toBeCloseTo(0, 0);
-      expect(m.rowWidth, "the row spans the scroller").toBeCloseTo(m.scrollerInner, 0);
-      expect(m.contentWidth, "premise: the column is wider than the measure").toBeGreaterThan(m.measure);
+      const m = await columnMetrics(row);
+      expect(m.rowWidth, "the row spans the column").toBeCloseTo(m.columnWidth, 0);
       expect(m.bodyWidth, "the body fills the 76ch measure").toBeCloseTo(m.measure, 0);
+      expect(m.columnWidth, "the column is the panel, up to what a row needs").toBeCloseTo(
+        Math.min(m.scrollerInner, m.rowNeeds),
+        0,
+      );
     });
   });
 });
 
-// The design critique's first complaint: a narrow column centred in a broad
-// empty panel. On a wide window nothing centres: rows start at the panel's
-// edge and span it, the header and composer share one left edge near it, and
-// only the message text keeps its measure.
+/// Where a row sits in the history: the conversation column (`#chat-content`,
+/// `.conversation-column`) inside the scroller's client area, and what a row
+/// needs (its gutter, the body's measure and its right padding).
+async function columnMetrics(row: Locator) {
+  return row.evaluate((el) => {
+    const scroller = document.getElementById("chat-scroll-container")!;
+    const s = scroller.getBoundingClientRect();
+    const column = document.getElementById("chat-content")!.getBoundingClientRect();
+    const body = el.querySelector('[data-testid="message-body"]')!;
+    const probe = document.createElement("div");
+    probe.style.width = "76ch";
+    body.appendChild(probe);
+    const measure = probe.getBoundingClientRect().width;
+    probe.remove();
+    const cs = getComputedStyle(el);
+    const gutter = parseFloat(cs.gridTemplateColumns);
+    return {
+      scrollerInner: scroller.clientWidth,
+      columnLeft: column.left - s.left,
+      columnRight: s.left + scroller.clientWidth - column.right,
+      columnWidth: column.width,
+      rowLeft: el.getBoundingClientRect().left - s.left,
+      rowWidth: el.getBoundingClientRect().width,
+      bodyWidth: body.getBoundingClientRect().width,
+      bodyLeft: body.getBoundingClientRect().left - s.left,
+      measure,
+      rowNeeds: gutter + measure + parseFloat(cs.paddingRight),
+    };
+  });
+}
+
+// The design critique's first complaint was a narrow column centred in a
+// broad empty panel; its fix (#823) let rows span the panel, and on a wide
+// window that left the conversation hugging the left with an empty band on
+// the right. The conversation COLUMN is now centred once the panel is wider
+// than a row needs: equal gaps either side, text left-aligned at its measure.
+// The scroller stays panel-wide, so its scrollbar is at the panel's edge.
 test.describe("at 1920px", () => {
   test.use({ viewport: { width: 1920, height: 1080 } });
 
-  test("the conversation fills its panel, left-aligned, and text keeps its measure", async ({ page }) => {
+  test("the conversation column is centred, and text keeps its measure", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "A wide-window line that keeps going ".repeat(12) + "to the wide end");
     const row = page.getByTestId("message-row").filter({ hasText: "to the wide end" });
-    const m = await row.evaluate((el) => {
-      const scroller = document.getElementById("chat-scroll-container")!;
-      const s = scroller.getBoundingClientRect();
-      const body = el.querySelector('[data-testid="message-body"]')!;
-      const probe = document.createElement("div");
-      probe.style.width = "76ch";
-      body.appendChild(probe);
-      const measure = probe.getBoundingClientRect().width;
-      probe.remove();
-      const left = (sel: string) => document.querySelector(sel)!.getBoundingClientRect().left;
-      return {
-        rowLeft: el.getBoundingClientRect().left - s.left,
-        rowWidth: el.getBoundingClientRect().width,
-        scrollerInner: scroller.clientWidth,
-        bodyWidth: body.getBoundingClientRect().width,
-        contentWidth: el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect().width,
-        measure,
-        header: left('[data-testid="room-header-row"]') - s.left,
-        // The composer's content edge: its padded inner wrapper.
-        composer: (() => {
-          const inner = document.querySelector('[data-testid="message-composer"] > div')!;
-          return inner.getBoundingClientRect().left + parseFloat(getComputedStyle(inner).paddingLeft) - s.left;
-        })(),
-      };
-    });
-    expect(m.rowLeft, "the row starts at the panel's edge: no centring gutter").toBeCloseTo(0, 0);
-    expect(m.rowWidth, "the row spans the panel").toBeCloseTo(m.scrollerInner, 0);
-    expect(m.contentWidth, "premise: the column is far wider than the measure").toBeGreaterThan(m.measure + 200);
+    const m = await columnMetrics(row);
+    expect(m.scrollerInner, "premise: the panel is far wider than a row needs").toBeGreaterThan(m.rowNeeds + 200);
+    expect(m.columnWidth, "the column is what a row needs").toBeCloseTo(m.rowNeeds, 0);
+    expect(Math.abs(m.columnLeft - m.columnRight), "equal side gaps").toBeLessThanOrEqual(1);
+    expect(m.rowLeft, "the row starts at the column's edge").toBeCloseTo(m.columnLeft, 0);
     expect(m.bodyWidth, "the text keeps its 76ch measure").toBeCloseTo(m.measure, 0);
-    expect(m.header, "the header sits at the panel's left padding").toBeLessThanOrEqual(24);
-    expect(m.composer, "the composer shares the header's left edge").toBeCloseTo(m.header, 0);
+    // The scroller itself spans the panel (its scrollbar at the panel's edge).
+    const panel = await page.locator("#chat-scroll-container").evaluate((el) => ({
+      scroller: el.getBoundingClientRect().width,
+      parent: el.parentElement!.getBoundingClientRect().width,
+    }));
+    expect(panel.scroller).toBeCloseTo(panel.parent, 0);
 
-    // A date separator is centred over the text column (gutter + measure),
-    // not the whole panel, so its label stays near the text.
+    // The composer sits in the same column: its box starts at the column's
+    // left plus the composer's padding, as it starts at the panel's otherwise.
+    // Centred in the panel, where the history centres in the scroller's
+    // client area: they differ by half a classic scrollbar, if any.
+    const composer = await page.getByTestId("message-composer").evaluate((el) => {
+      const sc = document.getElementById("chat-scroll-container")!;
+      const s = sc.getBoundingClientRect();
+      const inner = el.firstElementChild as HTMLElement;
+      const r = inner.getBoundingClientRect();
+      return { left: r.left - s.left, width: r.width, halfScrollbar: (sc.offsetWidth - sc.clientWidth) / 2 };
+    });
+    expect(Math.abs(composer.left - m.columnLeft - composer.halfScrollbar), "the composer's column lines up with the history's").toBeLessThanOrEqual(1);
+    expect(composer.width).toBeCloseTo(m.columnWidth, 0);
+
+    // A date separator stays within the column, its label over the text.
     await callRiverTest(page, "appendJoinEvents", 1);
     const sep = page.getByTestId("date-separator").last();
     await expect(sep).toBeAttached();
-    const d = await sep.evaluate((el, measure) => {
+    const d = await sep.evaluate((el) => {
       const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
       const r = el.getBoundingClientRect();
-      // The label is the text node between the two rules.
       const range = document.createRange();
       range.selectNodeContents(el);
       const label = range.getBoundingClientRect();
-      return { right: r.right - s.left, labelCentre: (label.left + label.right) / 2 - s.left, textEnd: 60 + (measure as number) };
-    }, m.measure);
-    expect(d.right, "the separator ends near the text's measure").toBeLessThanOrEqual(d.textEnd + 2);
-    expect(d.labelCentre, "its label sits over the text column").toBeLessThan(d.textEnd);
+      return { left: r.left - s.left, right: r.right - s.left, labelCentre: (label.left + label.right) / 2 - s.left };
+    });
+    expect(d.left, "the separator is inside the column").toBeGreaterThanOrEqual(m.columnLeft);
+    expect(d.right, "the separator ends near the text's measure").toBeLessThanOrEqual(m.columnLeft + 60 + m.measure + 2);
+    expect(d.labelCentre, "its label sits over the text column").toBeLessThan(m.columnLeft + 60 + m.measure);
+  });
+
+  // Horizontal only: every line in a row is already bounded by the measure,
+  // so centring the column changes no row's height, and so nothing the
+  // history's scroll corrections measure (history-scrolling.md).
+  test("centring changes no row's height", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await deliver(page, "A wide-window line that keeps going ".repeat(12) + "to the wide end");
+    const heights = () =>
+      page.locator("#chat-content [data-item-key]").evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().height)));
+    const centred = await heights();
+    await page.addStyleTag({ content: ".conversation-column { max-width: none !important; }" });
+    await expect.poll(async () => (await page.locator("#chat-content").boundingBox())!.width, { message: "premise: the column is panel-wide again" }).toBeGreaterThan(1300);
+    expect(await heights(), "row heights, centred and full-width").toEqual(centred);
+  });
+
+  test("Latest sits at the column's corner", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await readerScrollsWithoutGesture(page, 0);
+    const latest = page.getByTestId("scroll-to-bottom");
+    await expect(latest).toBeVisible();
+    // Its frame is centred in the panel, the history in the scroller's client
+    // area: they differ by half a classic scrollbar, if any.
+    const g = await page.evaluate(() => {
+      const sc = document.getElementById("chat-scroll-container")!;
+      const column = document.getElementById("chat-content")!.getBoundingClientRect();
+      const b = document.querySelector('[data-testid="scroll-to-bottom"]')!.getBoundingClientRect();
+      return { columnRight: column.right, buttonRight: b.right, halfScrollbar: (sc.offsetWidth - sc.clientWidth) / 2 };
+    });
+    expect(Math.abs(g.columnRight + g.halfScrollbar - g.buttonRight - 16), "16px in from the column's right edge").toBeLessThanOrEqual(1);
+    // It still takes the click (its frame takes none).
+    await latest.click();
+    await expect(latest).toBeHidden();
+  });
+});
+
+// Below a row's width nothing changes: at 1024 (both side panels, at their
+// tablet widths) the panel is narrower than a row needs, and the column is
+// exactly the panel, as before the centring. At 1280 the panel is within a
+// few tens of px of a row's width (8px in Chromium, more where an engine's
+// `ch` is narrower), so the column is the row's width with small equal gaps.
+test.describe("narrower windows", () => {
+  test("at 1024px the column is the whole panel, as before", async ({ page }) => {
+    await page.setViewportSize({ width: 1024, height: 900 });
+    await openRoomWithComposer(page);
+    const m = await columnMetrics(page.getByTestId("message-row").last());
+    expect(m.scrollerInner, "premise: the panel is narrower than a row needs").toBeLessThan(m.rowNeeds);
+    expect(m.columnWidth).toBeCloseTo(m.scrollerInner, 0);
+    expect(m.columnLeft).toBeCloseTo(0, 0);
+  });
+
+  test("at 1280px the column is at most a row wide, centred", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await openRoomWithComposer(page);
+    const m = await columnMetrics(page.getByTestId("message-row").last());
+    expect(m.columnWidth).toBeCloseTo(Math.min(m.scrollerInner, m.rowNeeds), 0);
+    expect(Math.abs(m.columnLeft - m.columnRight)).toBeLessThanOrEqual(1);
   });
 });
 
@@ -958,24 +1027,28 @@ test.describe("Latest over row controls", () => {
   });
 });
 
-// On a wide window rows span the panel while text stops at the body's 76ch
-// measure; the hover bar ends at that measure, not at the row's far edge, so
-// it stays next to the message it acts on.
-test("the hover bar ends at the text column, not the row's edge, on a wide window", async ({ page }) => {
-  test.skip(await touchOnly(page), "touch has no hover bar");
-  await page.setViewportSize({ width: 1920, height: 900 });
-  const { received } = await openRoomWithPairs(page);
-  const row = received.getByTestId("message-row").last();
-  await row.hover();
-  const bar = (await row.getByTestId("message-hover-actions").boundingBox())!;
-  const m = await row.evaluate((el) => {
-    const body = el.querySelector('[data-testid="message-body"]')!;
-    const content = el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect();
-    return {
-      measureRight: body.getBoundingClientRect().left + parseFloat(getComputedStyle(body).maxWidth),
-      contentRight: content.right,
-    };
+// The hover bar ends at the text measure, not the row's far edge, so it
+// stays next to the message it acts on: in the centred column (where the
+// row's content is the measure) and wherever a row is wider than that (here
+// forced, by lifting the column's cap).
+for (const wide of [false, true]) {
+  test(`the hover bar ends at the text column on a wide window${wide ? ", in a row wider than the measure" : ""}`, async ({ page }) => {
+    test.skip(await touchOnly(page), "touch has no hover bar");
+    await page.setViewportSize({ width: 1920, height: 900 });
+    const { received } = await openRoomWithPairs(page);
+    if (wide) await page.addStyleTag({ content: ".conversation-column { max-width: none !important; }" });
+    const row = received.getByTestId("message-row").last();
+    await row.hover();
+    const bar = (await row.getByTestId("message-hover-actions").boundingBox())!;
+    const m = await row.evaluate((el) => {
+      const body = el.querySelector('[data-testid="message-body"]')!;
+      const content = el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect();
+      return {
+        measureRight: body.getBoundingClientRect().left + parseFloat(getComputedStyle(body).maxWidth),
+        contentRight: content.right,
+      };
+    });
+    if (wide) expect(m.contentRight - m.measureRight, "premise: the row is wider than the text measure").toBeGreaterThan(100);
+    expect(Math.abs(bar.x + bar.width - m.measureRight), "bar's right edge at the measure").toBeLessThanOrEqual(1);
   });
-  expect(m.contentRight - m.measureRight, "premise: the column is wider than the text measure").toBeGreaterThan(100);
-  expect(Math.abs(bar.x + bar.width - m.measureRight), "bar's right edge at the measure").toBeLessThanOrEqual(1);
-});
+}

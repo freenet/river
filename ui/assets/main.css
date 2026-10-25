@@ -51,6 +51,40 @@
     }
 }
 
+/* The conversation column: no wider than a row needs (the 60px avatar
+ * gutter, the body's 76ch measure at its 15px, the row's right padding) and
+ * centred in the panel, so on a wide window the conversation sits in the
+ * middle instead of hugging the left with an empty band on the right. The
+ * text stays left-aligned inside it. Applied to the history's content (the
+ * scroller itself stays panel-wide, so its scrollbar is at the panel's
+ * edge), Latest's frame and the composer. Narrower panels are as before.
+ *
+ * `ch` depends on the font size and, in practice, on the engine's rounding
+ * at that size, so the column computes it at the body's own 15px; its
+ * children get back the 16px they inherited before. Only from 768px: on a
+ * phone the panel is always narrower than a row needs, and the body's size
+ * is different there. Horizontal only: every line in a row is already
+ * bounded by the measure, so no row's height changes. */
+@media (min-width: 768px) {
+    .conversation-column {
+        --conversation-row-pad: 24px;
+        font-size: 15px;
+        max-width: calc(60px + 76ch + var(--conversation-row-pad));
+        margin-inline: auto;
+    }
+
+    .conversation-column > * {
+        font-size: 16px;
+    }
+}
+
+@media (min-width: 768px) and (hover: none) {
+    .conversation-column {
+        /* Rows keep a 40px right gutter for the kebab on touch. */
+        --conversation-row-pad: 40px;
+    }
+}
+
 /* Message history. A row is a grid: the avatar gutter, then the content
  * column. A body's text starts at the same edge as a header's name, so what
  * tells a real header from a body that imitates one (`**Name** 🛡`) is the
