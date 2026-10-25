@@ -1277,6 +1277,15 @@ pub fn Conversation() -> Element {
     let mut window_items = use_signal(|| INITIAL_WINDOW_ITEMS);
     // See `ReaderPosition`.
     let reader_position = use_hook(|| Rc::new(ReaderPosition::default()));
+    // After a member-panel toggle has rendered, the column has its new
+    // width: put a parked reader back on their row (`after_panel_render`).
+    {
+        let reader_position = reader_position.clone();
+        use_effect(move || {
+            let _open = *MEMBERS_PANEL_OPEN.read();
+            reader_position.after_panel_render();
+        });
+    }
     // Whether the opening snap for the CURRENT room has landed. The backfill
     // sentinel only mounts once this is true: a freshly-opened >window room
     // renders at `scrollTop = 0` for a beat before the snap runs, and a
@@ -2912,8 +2921,8 @@ pub fn Conversation() -> Element {
                                     let deputy_badges = deputy_badges.clone();
                                     // This viewer's avatar hue for each author in the
                                     // rendered range, under the room's salt. No salt
-                                    // (not fetched yet, or the delegate has no key for
-                                    // the room) leaves every avatar neutral; there is
+                                    // (the viewer's seed not read yet, or unreadable)
+                                    // leaves every avatar neutral; there is
                                     // deliberately no other source (`avatar_salt.rs`).
                                     let author_hues: HashMap<MemberId, u16> = {
                                         let owner_vk = CURRENT_ROOM.peek().owner_key;
@@ -3516,7 +3525,7 @@ pub fn Conversation() -> Element {
                         }
                         div { class: "flex gap-3 justify-end",
                             button {
-                                class: "px-4 py-2 rounded-lg bg-surface hover:bg-surface-hover border border-border-hover text-sm font-semibold text-text transition-colors",
+                                class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                                 onclick: move |_| crate::util::defer(move || pending_delete.set(None)),
                                 "Cancel"
                             }
@@ -3728,6 +3737,89 @@ fn placement_within(
     (above, max_h)
 }
 
+thread_local! {
+    /// The popover (an inline picker or an edit form, by element id) whose
+    /// next mount brings it into the history's view. Set when it opens and
+    /// taken by its first mount, so a later re-mount (a re-render, a group
+    /// re-key) never moves the reader again.
+    static REVEAL_ON_MOUNT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Ask the next mount of the element `id` to bring it into view.
+fn request_reveal(id: String) {
+    REVEAL_ON_MOUNT.with(|r| *r.borrow_mut() = Some(id));
+}
+
+/// Whether this mount of `id` is the one its opening asked to reveal; true
+/// at most once per [`request_reveal`].
+fn take_reveal(id: &str) -> bool {
+    REVEAL_ON_MOUNT.with(|r| {
+        let mut r = r.borrow_mut();
+        let wanted = r.as_deref() == Some(id);
+        if wanted {
+            r.take();
+        }
+        wanted
+    })
+}
+
+/// Bring the element `id` into the room history's view, if its opening asked
+/// for that and this is the first mount since ([`request_reveal`]). Only the
+/// history's `scrollTop` moves, by the least that shows it ([`reveal_shift`]):
+/// `scrollIntoView` would also scroll `overflow: hidden` ancestors (the
+/// history's `scrollLeft`, the app root on a short phone view), which nothing
+/// scrolls back. After the mount's task, so the layout is the new one.
+fn reveal_once_in_history(id: String) {
+    if !take_reveal(&id) {
+        return;
+    }
+    crate::util::safe_spawn_local(async move {
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        let (Some(el), Some(history)) = (
+            document.get_element_by_id(&id),
+            document.get_element_by_id("chat-scroll-container"),
+        ) else {
+            return;
+        };
+        let (r, view) = (
+            el.get_bounding_client_rect(),
+            history.get_bounding_client_rect(),
+        );
+        let shift = reveal_shift(
+            r.top(),
+            r.bottom(),
+            view.top(),
+            view.bottom(),
+            REVEAL_MARGIN_PX,
+        );
+        if shift != 0 {
+            history.set_scroll_top(history.scroll_top() + shift);
+        }
+    });
+}
+
+/// Space kept between a revealed popover and the history's edge.
+const REVEAL_MARGIN_PX: f64 = 8.0;
+
+/// How far to scroll the history (positive: down) so an element spanning
+/// viewport `top..bottom` is inside `view_top..view_bottom` with `margin` to
+/// spare: the least move that shows its bottom, never so far that its top
+/// leaves the view; or up to show its top. Zero when it is already in view.
+fn reveal_shift(top: f64, bottom: f64, view_top: f64, view_bottom: f64, margin: f64) -> i32 {
+    let below = bottom + margin - view_bottom;
+    let above = view_top + margin - top;
+    if below > 0.0 {
+        below.min((top - margin - view_top).max(0.0)).ceil() as i32
+    } else if above > 0.0 {
+        -(above.ceil() as i32)
+    } else {
+        0
+    }
+}
+
 /// The inline picker's height: 16 emoji in four rows of four, plus padding.
 const INLINE_PICKER_HEIGHT_PX: f64 = 140.0;
 
@@ -3901,6 +3993,7 @@ fn MessageGroupComponent(
     // step (.claude/rules/dioxus-signal-safety.md). Every open path (the "+",
     // the hover bar's React, the kebab's React) comes through here.
     let open_inline_picker = move |msg_id: &str| {
+        request_reveal(format!("emoji-picker-{msg_id}"));
         let placement = inline_picker_placement(msg_id);
         let picker_id = format!("inline-{msg_id}");
         crate::util::defer(move || {
@@ -4047,6 +4140,7 @@ fn MessageGroupComponent(
         if let Some((trigger_id, trigger_text)) = trigger {
             if message_ids.contains(&trigger_id) {
                 edit_text.set(trigger_text);
+                request_reveal(format!("edit-form-{trigger_id}"));
                 editing_message.set(Some(trigger_id));
                 edit_trigger.set(None);
             }
@@ -4207,21 +4301,13 @@ fn MessageGroupComponent(
                                                 div {
                                                     class: "p-3 rounded-2xl bg-surface",
                                                     tabindex: "0",
-                                                    // Scroll into view when edit dialog appears (#93),
-                                                    // only as far as needed. Instant: the textarea's
-                                                    // focus right after cancels a smooth scroll before
-                                                    // it moves, leaving Save below the view.
-                                                    onmounted: move |cx| {
-                                                        let el = cx.data();
-                                                        wasm_bindgen_futures::spawn_local(async move {
-                                                            let _ = el
-                                                                .scroll_to_with_options(dioxus::html::ScrollToOptions {
-                                                                    behavior: ScrollBehavior::Instant,
-                                                                    vertical: dioxus::html::ScrollLogicalPosition::Nearest,
-                                                                    horizontal: dioxus::html::ScrollLogicalPosition::Nearest,
-                                                                })
-                                                                .await;
-                                                        });
+                                                    id: "edit-form-{msg.id}",
+                                                    // Bring the form into the history's view when it
+                                                    // opens (#93), only as far as needed, once per
+                                                    // opening (`reveal_once_in_history`).
+                                                    onmounted: {
+                                                        let form_id = format!("edit-form-{}", msg.id);
+                                                        move |_| reveal_once_in_history(form_id.clone())
                                                     },
                                                     // Global key bindings on the container (#94): Esc cancels,
                                                     // Enter saves. Kept here (not solely on the textarea) so the
@@ -4549,6 +4635,7 @@ fn MessageGroupComponent(
                                                                 let (t, id) = (current_text.clone(), msg_id_str_for_edit.clone());
                                                                 crate::util::defer(move || {
                                                                     edit_text.set(t);
+                                                                    request_reveal(format!("edit-form-{id}"));
                                                                     editing_message.set(Some(id));
                                                                 });
                                                             },
@@ -4698,6 +4785,7 @@ fn MessageGroupComponent(
                                                                     let id = msg_id_menu_edit.clone();
                                                                     crate::util::defer(move || {
                                                                         edit_text.set(t);
+                                                                        request_reveal(format!("edit-form-{id}"));
                                                                         editing_message.set(Some(id));
                                                                         open_action_menu.set(None);
                                                                     });
@@ -5042,24 +5130,17 @@ fn MessageGroupComponent(
                                                     if is_inline_picker_open {
                                                         div {
                                                             "data-testid": "emoji-picker",
+                                                            id: "emoji-picker-{msg_id_for_inline}",
                                                             // It hangs off the "+" at the message's foot.
                                                             // Opened from the hover bar's React at the top
                                                             // of a message taller than the view, that is
                                                             // below the fold: bring it into view, only as
                                                             // far as needed, or the reader sees nothing
                                                             // open and the invisible backdrop takes their
-                                                            // next click. Instant, like the edit form.
-                                                            onmounted: move |cx| {
-                                                                let el = cx.data();
-                                                                wasm_bindgen_futures::spawn_local(async move {
-                                                                    let _ = el
-                                                                        .scroll_to_with_options(dioxus::html::ScrollToOptions {
-                                                                            behavior: ScrollBehavior::Instant,
-                                                                            vertical: dioxus::html::ScrollLogicalPosition::Nearest,
-                                                                            horizontal: dioxus::html::ScrollLogicalPosition::Nearest,
-                                                                        })
-                                                                        .await;
-                                                                });
+                                                            // next click (`reveal_once_in_history`).
+                                                            onmounted: {
+                                                                let picker_id = format!("emoji-picker-{msg_id_for_inline}");
+                                                                move |_| reveal_once_in_history(picker_id.clone())
                                                             },
                                                             class: format!(
                                                                 "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid pointer-events-auto {} {}",
@@ -5113,6 +5194,33 @@ fn MessageGroupComponent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A popover is revealed on the first mount after it opens, never on a
+    /// re-mount, and another popover's mount does not use up the request.
+    #[test]
+    fn a_reveal_is_taken_once_per_opening() {
+        request_reveal("emoji-picker-a".into());
+        assert!(!take_reveal("edit-form-b"), "another element's mount");
+        assert!(take_reveal("emoji-picker-a"), "the first mount");
+        assert!(!take_reveal("emoji-picker-a"), "a re-mount");
+        request_reveal("emoji-picker-a".into());
+        assert!(take_reveal("emoji-picker-a"), "a new opening");
+    }
+
+    /// The reveal scrolls only as far as needed, and never past the top.
+    #[test]
+    fn reveal_shift_is_the_least_move() {
+        // In view: nothing.
+        assert_eq!(reveal_shift(200.0, 300.0, 100.0, 700.0, 8.0), 0);
+        // Below the fold: just enough to show the bottom with the margin.
+        assert_eq!(reveal_shift(650.0, 790.0, 100.0, 700.0, 8.0), 98);
+        // Wholly below: the same rule.
+        assert_eq!(reveal_shift(900.0, 1040.0, 100.0, 700.0, 8.0), 348);
+        // Taller than the view: its top stays in view.
+        assert_eq!(reveal_shift(400.0, 1400.0, 100.0, 700.0, 8.0), 292);
+        // Above the view: up, to show the top.
+        assert_eq!(reveal_shift(40.0, 180.0, 100.0, 700.0, 8.0), -68);
+    }
 
     /// The popover side rule at its edges: a scrollport from 100 to 700,
     /// a 140px popover.

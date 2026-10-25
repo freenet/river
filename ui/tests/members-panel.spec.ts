@@ -5,8 +5,11 @@ import {
   expectParkedAwayFromEnd,
   expectSettledAtBottom,
   fillHistory,
+  gateResizeObservers,
+  holdResizeObservations,
   openRoomAtBottom,
   readerScrollsWithoutGesture,
+  releaseResizeObservations,
   scrollMetrics,
 } from "./history-geometry";
 import { callRiverTest } from "./river-test";
@@ -164,6 +167,79 @@ test.describe("Member panel on desktop", () => {
       expect(after, `after ${step}: the reading row is still rendered`).not.toBeNull();
       expect(Math.abs(after!.top - row.top), `after ${step}: the reading row stays put`).toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
     }
+  });
+
+  /// Park the reader mid-history at 820px (where rows rewrap) and return
+  /// their reading row.
+  async function parkMidHistory(page: import("@playwright/test").Page) {
+    await page.setViewportSize({ width: 820, height: 768 });
+    await openRoomAtBottom(page, "Your Private Room");
+    await fillHistory(page);
+    const m = await scrollMetrics(page);
+    await readerScrollsWithoutGesture(page, Math.round(m.max / 2));
+    await settle(page);
+    await expectParkedAwayFromEnd(page);
+    const row = await anchorRow(page);
+    expect(row, "premise: a row starts in view").not.toBeNull();
+    return row!;
+  }
+
+  test("a slow resize report does not lose the reader's row", async ({ page }) => {
+    // No time limit: the correction follows the toggle's render, not a
+    // resize that might come late (a slow tablet), here held over a second.
+    await gateResizeObservers(page);
+    const row = await parkMidHistory(page);
+    const height = (await scrollMetrics(page)).height;
+    await holdResizeObservations(page);
+    await page.getByTestId("members-panel-toggle").click();
+    await expect.poll(async () => (await scrollMetrics(page)).height, { message: "premise: the rows rewrap" }).not.toBe(height);
+    await page.waitForTimeout(1_200);
+    await releaseResizeObservations(page);
+    await settle(page);
+    const after = await anchorRow(page, row.key);
+    expect(Math.abs(after!.top - row.top), "the reading row stays put").toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
+  });
+
+  /// After a toggle that changed nothing it can correct, the reader moves far
+  /// away and the window then resizes: the old capture must not pull them
+  /// back.
+  async function expectNoStaleRestore(page: import("@playwright/test").Page, why: string) {
+    const scroller = page.locator("#chat-scroll-container");
+    const m = await scrollMetrics(page);
+    await readerScrollsWithoutGesture(page, Math.max(0, m.top - 700));
+    await settle(page);
+    const moved = await scroller.evaluate((c) => c.scrollTop);
+    const size = page.viewportSize()!;
+    await page.setViewportSize({ width: size.width + 24, height: size.height });
+    await settle(page);
+    expect(Math.abs((await scroller.evaluate((c) => c.scrollTop)) - moved), why).toBeLessThan(300);
+  }
+
+  test("a double toggle in one frame leaves no stale correction", async ({ page }) => {
+    await parkMidHistory(page);
+    // Two clicks in one task: the panel ends as it began, no width changes.
+    await page.getByTestId("members-panel-toggle").evaluate((el) => {
+      (el as HTMLElement).click();
+      (el as HTMLElement).click();
+    });
+    await settle(page);
+    await expect(page.getByTestId("members-rail")).toBeVisible();
+    await expectNoStaleRestore(page, "a later resize did not apply the double toggle's capture");
+  });
+
+  test("a toggle that rewraps nothing leaves no stale correction", async ({ page }) => {
+    // At 1920 the text is at its measure either way.
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    await openRoomAtBottom(page, "Your Private Room");
+    await fillHistory(page);
+    const m = await scrollMetrics(page);
+    await readerScrollsWithoutGesture(page, Math.round(m.max / 2));
+    await settle(page);
+    await expectParkedAwayFromEnd(page);
+    await page.getByTestId("members-panel-toggle").click();
+    await expect(page.getByTestId("members-rail")).toBeHidden();
+    await settle(page);
+    await expectNoStaleRestore(page, "a later resize did not apply the toggle's capture");
   });
 
   test("an empty room's member avatars are coloured", async ({ page }) => {

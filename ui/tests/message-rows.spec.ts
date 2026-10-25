@@ -328,8 +328,9 @@ test.describe("Avatars", () => {
     await callRiverTest(page, "setAvatarSalt", 1);
     await expect.poll(isGrey, { message: "a salt colours the disc" }).toBe(false);
     const first = await disc();
-    // A different salt is a different viewer's mapping. One hue can collide by
-    // chance, so compare the whole set of authors on screen.
+    // Every author on screen is coloured, and the set changes with the salt.
+    // (The exact difference is pinned above for one fixed key; the fixture's
+    // other authors have random keys, so only the set is compared here.)
     const hues = () =>
       page.getByTestId("message-author-avatar").evaluateAll((els) => els.map((e) => (e as HTMLElement).style.getPropertyValue("--avatar-hue")));
     const underOne = await hues();
@@ -827,6 +828,44 @@ test.describe("React on a tall message", () => {
         return !!g.picker && g.picker[0] >= g.view[0] - 1 && g.picker[1] <= g.view[1] + 1;
       }, { message: "the picker is wholly inside the history's view" })
       .toBe(true);
+    // Only the history's scrollTop moved: no horizontal scroll, and no
+    // overflow-hidden ancestor (the app root, the page) scrolled.
+    expect(
+      await page.evaluate(() => ({
+        historyLeft: document.getElementById("chat-scroll-container")!.scrollLeft,
+        root: [document.querySelector(".app-root")!.scrollTop, document.querySelector(".app-root")!.scrollLeft],
+        page: [document.scrollingElement!.scrollTop, document.scrollingElement!.scrollLeft],
+      })),
+    ).toEqual({ historyLeft: 0, root: [0, 0], page: [0, 0] });
+
+    // Opened once, revealed once: with the picker open, the reader moves up,
+    // and a re-render of that row (a reaction added) and an arrival leave
+    // the view where the reader put it.
+    const scroller = page.locator("#chat-scroll-container");
+    await scroller.evaluate((c) => (c.scrollTop -= 160));
+    await page.waitForTimeout(150);
+    const parked = await scroller.evaluate((c) => c.scrollTop);
+    await callRiverTest(page, "addReactionsToNewest", ["🎉"]);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
+    await page.waitForTimeout(300);
+    expect(Math.abs((await scroller.evaluate((c) => c.scrollTop)) - parked), "no second reveal").toBeLessThanOrEqual(2);
+    await page.mouse.move(0, 0);
+    await page.keyboard.press("Escape");
+  });
+
+  test("the picker takes the next click after the reveal", async ({ page }) => {
+    await openRoomWithComposer(page);
+    const text = Array.from({ length: 40 }, (_, i) => `tall ${i}`).join("\n\n") + "\n\ntall paragraph 59";
+    await callRiverTest(page, "appendMessage", text);
+    const row = page.getByTestId("message-row").filter({ hasText: "tall paragraph 59" });
+    await expect(row).toHaveCount(1);
+    await row.evaluate((el) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.scrollTop += el.getBoundingClientRect().top - c.getBoundingClientRect().top - 40;
+    });
+    await openInlinePicker(page, row);
+    const picker = page.getByTestId("emoji-picker");
+    await expect(picker).toBeVisible();
     await picker.getByRole("button").first().click();
     await expect(picker).toHaveCount(0);
     await expect(row.getByTestId("reaction-chip"), "the click reacted").toHaveCount(1);
