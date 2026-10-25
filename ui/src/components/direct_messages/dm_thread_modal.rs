@@ -201,7 +201,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
             // INBOUND bodies are ECIES-sealed to us, so reading them needs the
             // private key — but its absence must not blank the thread. Outbound
-            // bubbles come from the plaintext cache, and an unreadable inbound
+            // rows come from the plaintext cache, and an unreadable inbound
             // body degrades to the same placeholder a decrypt failure already
             // renders. `None` here only costs the bodies.
             let self_sk = room_data.signing_key().cloned();
@@ -212,10 +212,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // involves `peer`, and picking a default would render some other
             // member's message as one the user sent. Constraint: never
             // mislabel. So the message loop is skipped entirely and the thread
-            // renders with no bubbles (the peer's name, membership state and the
+            // renders with no rows (the peer's name, membership state and the
             // composer's own key check are unaffected) rather than wrong.
             //
-            // That "no bubbles" state is NOT the same as an empty thread, and
+            // That "no rows" state is NOT the same as an empty thread, and
             // `identity_known` below carries the difference to the render: the
             // empty-state copy must not claim a thread with real history is
             // empty.
@@ -255,17 +255,17 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     .any(|m| m.member.id() == peer);
 
             // Snapshot the outbound-DM cache once so each rendered
-            // outbound bubble does an O(1) HashMap lookup instead of
+            // outbound row does an O(1) HashMap lookup instead of
             // re-acquiring the signal guard per message. Reading via
             // `try_read` here registers the memo's subscription to
             // [`OUTBOUND_DMS`], so a successful save_outbound_dm_now write
-            // also re-runs this memo and the bubble flips from
+            // also re-runs this memo and the row flips from
             // placeholder to plaintext (see AGENTS.md "Dioxus WASM
             // Signal Safety": the subscription is registered ONLY on
             // the success path).
             // Second fallible read in this memo, so it needs its own nudge: the
             // anchor above keeps the memo alive, but a contended OUTBOUND_DMS
-            // read still drops THAT subscription, and without a retry the bubble
+            // read still drops THAT subscription, and without a retry the row
             // stays on the placeholder until some other subscribed signal moves.
             let outbound_cache = match OUTBOUND_DMS.try_read() {
                 Ok(g) => Some(g.clone()),
@@ -988,17 +988,34 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                     "No messages yet. Say hello!"
                                 }
                             } else {
-                                for (group_idx, group) in dm_groups(&view_data.messages).into_iter().enumerate() {
-                                    div { key: "{group_idx}_{group[0].timestamp}", class: "msg-group",
-                                        for (idx, m) in group.iter().enumerate() {
-                                            DmRow {
-                                                key: "{idx}_{m.timestamp}",
-                                                message: m.clone(),
-                                                first: idx == 0,
-                                                author: if m.outgoing { view_data.self_nickname.clone() } else { view_data.peer_nickname.clone() },
-                                                hue: if m.outgoing { view_data.self_hue } else { view_data.peer_hue },
+                                // Day breaks as in a room: a hairline with the
+                                // label above each day's first group, labels
+                                // taken at render so "Today" stays fresh.
+                                for row in dm_thread_rows(&view_data.messages, |ts| {
+                                    crate::util::local_message_date((ts as i64).saturating_mul(1000))
+                                }, crate::util::local_today()) {
+                                    match row {
+                                        DmThreadRow::Day { key, label } => rsx! {
+                                            div {
+                                                key: "{key}",
+                                                "data-testid": "dm-date-separator",
+                                                class: "msg-day",
+                                                "{label}"
                                             }
-                                        }
+                                        },
+                                        DmThreadRow::Group { key, messages } => rsx! {
+                                            div { key: "{key}", class: "msg-group",
+                                                for (idx, m) in messages.iter().enumerate() {
+                                                    DmRow {
+                                                        key: "{idx}_{m.timestamp}",
+                                                        message: m.clone(),
+                                                        first: idx == 0,
+                                                        author: if m.outgoing { view_data.self_nickname.clone() } else { view_data.peer_nickname.clone() },
+                                                        hue: if m.outgoing { view_data.self_hue } else { view_data.peer_hue },
+                                                    }
+                                                }
+                                            }
+                                        },
                                     }
                                 }
                             }
@@ -1129,7 +1146,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // the sender cannot decrypt the network copy.
                         // If you delete or break that cache, this
                         // disclaimer becomes inaccurate ("you" can no
-                        // longer read your own outbound bubbles) and
+                        // longer read your own outbound rows) and
                         // should be revisited.
                         span { class: "text-[10px] text-text-muted",
                             "Only you and "
@@ -1336,7 +1353,7 @@ enum BodyKind {
     /// User-supplied plaintext — runs through the markdown / linkify pass
     /// so URLs (notably invite links — see #252) become anchors.
     Plaintext,
-    /// Local UI string (outbound bubble, "decrypt failed", etc.). Rendered
+    /// Local UI string (outbound row, "decrypt failed", etc.). Rendered
     /// as a muted text node, never through markdown — keeps the markdown
     /// crate from autolinking literal placeholders like
     /// `"unable to decrypt: …"` into broken `unable:` schemes.
@@ -1357,8 +1374,8 @@ enum BodyKind {
     /// plaintext-summary cache rather than from wire bytes.
     ///
     /// The sender's copy is ECIES-sealed to the recipient, so this is the
-    /// only material available for their own bubble, which previously
-    /// rendered as the literal text `[Invitation]` in a plain bubble. It now
+    /// only material available for their own row, which previously
+    /// rendered as the literal text `[Invitation]` in a plain message. It now
     /// gets the same card chrome the recipient sees, with no Accept button,
     /// because accepting one's own invitation is meaningless.
     ///
@@ -1367,7 +1384,7 @@ enum BodyKind {
     SentInvite(Box<SentInviteData>),
 }
 
-/// Parts of a sent-invite bubble, recovered from the outbound summary cache.
+/// Parts of a sent-invite card, recovered from the outbound summary cache.
 ///
 /// Boxed at the `BodyKind` use site for the same reason as
 /// [`InviteCardData`].
@@ -1384,7 +1401,7 @@ struct SentInviteData {
 }
 
 /// Pre-resolved metadata for an inbound invite-DM card. Built during the
-/// memo pass (under the existing ROOMS read) so the bubble render path
+/// memo pass (under the existing ROOMS read) so the row render path
 /// itself does no extra signal reads.
 #[derive(Clone, PartialEq)]
 struct InviteCardData {
@@ -1482,15 +1499,63 @@ fn note_newest_dm(recorded: &std::cell::Cell<Option<DmKey>>, now: Option<DmKey>)
     is_arrival(previous.as_ref(), now.as_ref(), true)
 }
 
-/// Consecutive DMs from one side, at most five minutes apart, as one group:
-/// the same rule the room history groups by.
-fn dm_groups(messages: &[RenderedDm]) -> Vec<Vec<RenderedDm>> {
+/// One keyed root of the thread body: a day break, or a group of rows.
+enum DmThreadRow {
+    Day {
+        key: String,
+        label: String,
+    },
+    Group {
+        key: String,
+        messages: Vec<RenderedDm>,
+    },
+}
+
+/// The thread's groups ([`dm_groups`]) with a day break above each local
+/// calendar day's first group, labelled like the room's
+/// ([`crate::util::date_separator_labels`]). `day_of` maps a DM's timestamp
+/// (seconds) to its local date; injected so the rule is testable natively.
+fn dm_thread_rows(
+    messages: &[RenderedDm],
+    day_of: impl Fn(u64) -> chrono::NaiveDate,
+    today: chrono::NaiveDate,
+) -> Vec<DmThreadRow> {
+    let groups = dm_groups(messages, &day_of);
+    let days: Vec<chrono::NaiveDate> = groups.iter().map(|g| day_of(g[0].timestamp)).collect();
+    let labels = crate::util::date_separator_labels(&days, today);
+    let mut rows = Vec::with_capacity(groups.len() * 2);
+    for (idx, (group, label)) in groups.into_iter().zip(labels).enumerate() {
+        let key = format!("{idx}_{}", group[0].timestamp);
+        if let Some(label) = label {
+            rows.push(DmThreadRow::Day {
+                key: format!("day-{key}"),
+                label,
+            });
+        }
+        rows.push(DmThreadRow::Group {
+            key,
+            messages: group,
+        });
+    }
+    rows
+}
+
+/// Consecutive DMs from one side, at most five minutes apart and on one
+/// local day (`day_of`), as one group: the same rule the room history groups
+/// by. The thread is in timestamp order; a DM older than the one before it
+/// starts a group rather than joining on a negative gap.
+fn dm_groups(
+    messages: &[RenderedDm],
+    day_of: impl Fn(u64) -> chrono::NaiveDate,
+) -> Vec<Vec<RenderedDm>> {
     const GROUP_WINDOW_SECS: u64 = 5 * 60;
     let mut groups: Vec<Vec<RenderedDm>> = Vec::new();
     for m in messages {
         let joins = groups.last().and_then(|g| g.last()).is_some_and(|last| {
             last.outgoing == m.outgoing
-                && m.timestamp.saturating_sub(last.timestamp) < GROUP_WINDOW_SECS
+                && m.timestamp >= last.timestamp
+                && m.timestamp - last.timestamp < GROUP_WINDOW_SECS
+                && day_of(m.timestamp) == day_of(last.timestamp)
         });
         if joins {
             groups
@@ -1622,6 +1687,14 @@ fn DmRow(message: RenderedDm, first: bool, author: String, hue: Option<u16>) -> 
 /// goes through `present_invitation` → `PRESENT_INVITATION_REQUEST` →
 /// the `App` bridge effect, which sets `receive_invitation` and pops
 /// the modal.
+/// Both invite cards' chrome: a quiet card at the body's start, no wider
+/// than the body's measure.
+const INVITE_CARD_CLASS: &str =
+    "mt-1 max-w-[min(100%,52ch)] rounded-lg border border-border bg-surface p-3 space-y-2";
+/// The cards' small-caps label.
+const INVITE_CARD_EYEBROW_CLASS: &str =
+    "flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-wide text-text-muted";
+
 #[component]
 fn DmInviteCard(card: InviteCardData) -> Element {
     let room_label = card.room_label.clone();
@@ -1675,16 +1748,20 @@ fn DmInviteCard(card: InviteCardData) -> Element {
     };
 
     rsx! {
+        // A quiet card in the content column: a hairline and the raised
+        // surface, no accent fill (the design keeps the accent for text,
+        // links and focus).
         div {
-            class: "self-start max-w-[85%] rounded-lg border border-accent/40 bg-accent/10 p-3 space-y-2",
+            "data-testid": "dm-invite-card",
+            class: "{INVITE_CARD_CLASS}",
             // Subtle banner label so the recipient knows at a glance
             // this is structured (vs prose).
-            div { class: "flex items-center gap-2 text-[10px] uppercase tracking-wide text-accent",
+            div { class: "{INVITE_CARD_EYEBROW_CLASS}",
                 span { "Invitation" }
             }
-            div { class: "text-sm text-text font-medium",
+            div { class: "text-sm text-text",
                 "Invitation to "
-                span { class: "text-accent", "{room_label}" }
+                span { class: "font-semibold", "{room_label}" }
             }
             if let Some(msg) = personal_message.as_ref() {
                 // Render the personal message as plain text — no markdown
@@ -1713,23 +1790,23 @@ fn DmInviteCard(card: InviteCardData) -> Element {
 /// The local user's own sent invitation, rendered as the outbound twin of
 /// [`DmInviteCard`].
 ///
-/// Deliberately the same card chrome (accent border, eyebrow, optional note)
-/// so a thread reads as one conversation, with three differences that follow
-/// from it being the sender's own message: `self-end` and the outbound
-/// `bg-accent/20` tint that every other outgoing bubble uses, so direction is
-/// legible at a glance; no Accept button, because you cannot accept your own
-/// invitation; and a past-tense eyebrow.
+/// The same quiet card, in the row's content column, so a thread reads as
+/// one conversation. Two differences follow from it being the sender's own
+/// message: no Accept button, because you cannot accept your own invitation,
+/// and a past-tense eyebrow. Direction comes from the row (your avatar and
+/// name, the own-row tint), as for any other DM.
 ///
 /// It names no room — see [`SentInviteData`]. Before this existed the same
-/// message rendered as the raw string `"[Invitation]"` in a plain bubble.
+/// message rendered as the raw string `"[Invitation]"` in a plain message.
 #[component]
 fn DmSentInviteCard(sent: SentInviteData) -> Element {
     let note = sent.note.clone();
 
     rsx! {
         div {
-            class: "self-end max-w-[85%] rounded-lg border border-accent/40 bg-accent/20 p-3 space-y-2",
-            div { class: "flex items-center gap-2 text-[10px] uppercase tracking-wide text-accent",
+            "data-testid": "dm-sent-invite-card",
+            class: "{INVITE_CARD_CLASS}",
+            div { class: "{INVITE_CARD_EYEBROW_CLASS}",
                 span { "Invitation sent" }
             }
             if let Some(msg) = note.as_ref() {
@@ -1898,6 +1975,97 @@ fn merge_invite_into_draft(existing: &str, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    mod grouping {
+        use super::super::*;
+        use chrono::NaiveDate;
+
+        fn dm(outgoing: bool, timestamp: u64) -> RenderedDm {
+            RenderedDm {
+                outgoing,
+                timestamp,
+                body: format!("at {timestamp}"),
+                kind: BodyKind::Plaintext,
+                token: PurgeToken([0; 16]),
+            }
+        }
+
+        /// Days of 100,000 s, so a test can cross midnight on purpose.
+        fn day(ts: u64) -> NaiveDate {
+            NaiveDate::from_ymd_opt(2026, 10, 1).unwrap() + chrono::Days::new(ts / 100_000)
+        }
+
+        fn shape(groups: &[Vec<RenderedDm>]) -> Vec<Vec<u64>> {
+            groups
+                .iter()
+                .map(|g| g.iter().map(|m| m.timestamp).collect())
+                .collect()
+        }
+
+        #[test]
+        fn the_five_minute_window_is_exclusive() {
+            let base = 1_000;
+            for (gap, joins) in [(299, true), (300, false), (301, false)] {
+                let groups = dm_groups(&[dm(false, base), dm(false, base + gap)], day);
+                assert_eq!(groups.len(), if joins { 1 } else { 2 }, "a {gap} s gap");
+            }
+        }
+
+        #[test]
+        fn a_change_of_sender_starts_a_group() {
+            let groups = dm_groups(
+                &[dm(false, 10), dm(true, 20), dm(true, 30), dm(false, 40)],
+                day,
+            );
+            assert_eq!(shape(&groups), vec![vec![10], vec![20, 30], vec![40]]);
+        }
+
+        #[test]
+        fn an_out_of_order_dm_starts_a_group() {
+            let groups = dm_groups(&[dm(false, 500), dm(false, 400)], day);
+            assert_eq!(shape(&groups), vec![vec![500], vec![400]]);
+        }
+
+        #[test]
+        fn no_dms_no_groups() {
+            assert!(dm_groups(&[], day).is_empty());
+            assert!(dm_thread_rows(&[], day, day(0)).is_empty());
+        }
+
+        #[test]
+        fn a_group_never_spans_midnight() {
+            let groups = dm_groups(&[dm(false, 99_990), dm(false, 100_010)], day);
+            assert_eq!(groups.len(), 2);
+        }
+
+        #[test]
+        fn each_day_gets_one_break_above_its_first_group() {
+            let dms = [
+                dm(false, 10),
+                dm(true, 50_000),
+                dm(false, 100_010),
+                dm(false, 100_020),
+            ];
+            let rows = dm_thread_rows(&dms, day, day(100_000));
+            let labels: Vec<String> = rows
+                .iter()
+                .map(|r| match r {
+                    DmThreadRow::Day { label, .. } => format!("day {label}"),
+                    DmThreadRow::Group { messages, .. } => format!("group of {}", messages.len()),
+                })
+                .collect();
+            assert_eq!(
+                labels,
+                vec![
+                    "day Yesterday",
+                    "group of 1",
+                    "group of 1",
+                    "day Today",
+                    "group of 2"
+                ]
+            );
+        }
+    }
 
     /// This file's production source with whitespace stripped, cut at the test
     /// module so the needles below cannot match themselves.
@@ -2106,10 +2274,11 @@ mod tests {
             !card.contains("present_invitation") && !card.contains("Acceptinvitation"),
             "the sender's own invite card must not carry an Accept button"
         );
+        // Rows, not bubbles: both cards sit in the content column, in the
+        // same quiet chrome, never aligned to a side.
         assert!(
-            card.contains("self-end"),
-            "an outbound bubble sits on the right; `self-start` is the \
-             inbound card's alignment"
+            card.contains("INVITE_CARD_CLASS") && !card.contains("self-end"),
+            "the sent card shares the inbound card's chrome and alignment"
         );
     }
 

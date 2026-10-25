@@ -93,6 +93,26 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // `count` DMs from test peer `peer`, labelled like `appendDmsForPeer`'s,
+    // across two days: the first half a minute apart a day ago, the rest a
+    // minute apart ending a minute ago. The thread shows a day break between.
+    set_hook(
+        "appendDmsAcrossDaysForPeer",
+        Closure::<dyn FnMut(u32, u32)>::new(move |peer: u32, count: u32| {
+            let peer = dm_peer(peer);
+            crate::util::defer(move || {
+                deliver_dms(
+                    peer,
+                    (0..count)
+                        .map(|i| format!("{} {i:02}", peer.history_label))
+                        .collect(),
+                    DmStamp::TwoDays,
+                )
+            });
+        })
+        .into_js_value(),
+    );
+
     // One inbound DM from test peer `peer`, stamped after every DM in the
     // thread so it renders as the newest.
     set_hook(
@@ -696,6 +716,8 @@ fn append_dm_history(peer: &DmPeer, count: u32) {
 enum DmStamp {
     /// A minute apart, the last one a minute ago.
     History,
+    /// `History`, with the first half a further day earlier.
+    TwoDays,
     /// Now, or one second after the thread's newest DM if that is later, so
     /// the delivery sorts last even within one second of the previous one
     /// (the thread orders same-second DMs by signature).
@@ -723,7 +745,7 @@ fn deliver_dms(peer: &DmPeer, texts: Vec<String>, stamp: DmStamp) {
             .unwrap_or(0);
         let count = texts.len() as u64;
         let (first, step) = match stamp {
-            DmStamp::History => (now.saturating_sub(count * 60), 60),
+            DmStamp::History | DmStamp::TwoDays => (now.saturating_sub(count * 60), 60),
             DmStamp::Newest => (
                 room.room_state
                     .direct_messages
@@ -742,7 +764,10 @@ fn deliver_dms(peer: &DmPeer, texts: Vec<String>, stamp: DmStamp) {
             .into_iter()
             .zip(0..)
             .filter_map(|(text, i)| {
-                let ts = first + i * step;
+                let mut ts = first + i * step;
+                if matches!(stamp, DmStamp::TwoDays) && i < count / 2 {
+                    ts = ts.saturating_sub(86_400);
+                }
                 compose_direct_message(&peer_sk, &self_vk, &room_key, ts, now, text.as_bytes())
                     .inspect_err(|e| {
                         web_sys::console::error_1(&format!("__riverTest DM compose: {e}").into())

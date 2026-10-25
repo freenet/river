@@ -27,6 +27,7 @@ type RiverTestHooks = {
   switchRoom(name: string): void;
   // Peer 0 and peer 1 are two fixed test identities, each with its own thread. Others throw.
   appendDmsForPeer(peerIndex: 0 | 1, count: number): void;
+  appendDmsAcrossDaysForPeer(peerIndex: 0 | 1, count: number): void;
   deliverDmForPeer(peerIndex: 0 | 1, text: string): void;
   // Admits the peer as a member with no DMs, for an empty thread.
   admitDmPeer(peerIndex: 0 | 1): void;
