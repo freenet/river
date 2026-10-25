@@ -990,3 +990,109 @@ mod volatile_value_binding_audit {
         ));
     }
 }
+
+/// The accent is one token set in `assets/tailwind.css` (`--color-accent`,
+/// `--color-accent-hover`, `--color-link`, `--color-link-hover`,
+/// `--color-accent-soft`), so a new accent is a change to those lines alone.
+/// This fails on an accent written anywhere else: a Tailwind palette blue in
+/// a class string, or one of the hex values the app has used for the accent.
+#[cfg(test)]
+mod accent_token_audit {
+    use std::path::{Path, PathBuf};
+
+    fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read ui/src") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// `bg-blue-500`, `text-sky-400/50`, …: a palette hue followed by a shade.
+    fn palette_blues(src: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for hue in ["-blue-", "-sky-", "-indigo-"] {
+            for (at, _) in src.match_indices(hue) {
+                if src[at + hue.len()..].starts_with(|c: char| c.is_ascii_digit()) {
+                    let start = src[..at].rfind([' ', '"', ':']).map_or(0, |i| i + 1);
+                    found.push(src[start..at + hue.len() + 3].to_string());
+                }
+            }
+        }
+        found
+    }
+
+    const OLD_ACCENTS: [&str; 7] = [
+        "#0265e7",
+        "#0255c7",
+        "#2563eb",
+        "#024cb0",
+        "#5c9dff",
+        "rgba(2, 101, 231",
+        "rgba(59, 130, 246",
+    ];
+
+    #[test]
+    fn no_accent_colour_is_written_outside_the_tokens() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths = Vec::new();
+        files(&root.join("src"), &mut paths);
+        paths.push(root.join("assets/main.css"));
+        paths.push(root.join("assets/tailwind.css"));
+        let mut bad = Vec::new();
+        for path in &paths {
+            let src = std::fs::read_to_string(path).expect("read source");
+            // This file names the patterns it forbids.
+            let src = match src.find("mod accent_token_audit") {
+                Some(cut) => &src[..cut],
+                None => &src[..],
+            };
+            for hit in palette_blues(src) {
+                bad.push(format!("{}: {hit}", path.display()));
+            }
+            for old in OLD_ACCENTS {
+                if src.to_lowercase().contains(old) {
+                    bad.push(format!("{}: {old}", path.display()));
+                }
+            }
+        }
+        assert!(paths.len() > 50, "premise: the scan found the sources");
+        assert!(
+            bad.is_empty(),
+            "accent colours outside the tokens:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn the_scan_sees_a_palette_blue() {
+        assert_eq!(
+            palette_blues(r#"class: "p-1 bg-blue-500/20""#),
+            vec!["bg-blue-500"]
+        );
+        assert!(palette_blues("text-blue-gray").is_empty());
+    }
+
+    #[test]
+    fn each_accent_token_is_defined_once_per_theme() {
+        let css = include_str!("../assets/tailwind.css");
+        let definitions = |token: &str| {
+            css.lines()
+                .filter(|l| l.trim_start().starts_with(token))
+                .count()
+        };
+        for token in ["--color-accent:", "--color-accent-hover:"] {
+            assert_eq!(definitions(token), 1, "{token}");
+        }
+        for token in [
+            "--color-link:",
+            "--color-link-hover:",
+            "--color-accent-soft:",
+        ] {
+            assert_eq!(definitions(token), 2, "{token}: light and dark");
+        }
+    }
+}

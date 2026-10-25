@@ -4115,7 +4115,7 @@ fn MessageGroupComponent(
                                             button {
                                                 r#type: "button",
                                                 "data-testid": "message-author-name",
-                                                class: "msg-author-name text-[15px] font-bold text-left min-w-0 [overflow-wrap:anywhere] cursor-pointer rounded-sm focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent {name_colour}",
+                                                class: "msg-author-name text-[15px] font-bold text-left min-w-0 [overflow-wrap:anywhere] cursor-pointer rounded-sm focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--color-link)] {name_colour}",
                                                 title: "Member ID: {author_id}",
                                                 onclick: open_author_info,
                                                 "{group.author_name}"
@@ -4335,7 +4335,7 @@ fn MessageGroupComponent(
                                                                     style: if over_limit {
                                                                         "background-color: #9ca3af; color: white; cursor: not-allowed; opacity: 0.6;"
                                                                     } else {
-                                                                        "background-color: #2563eb; color: white;"
+                                                                        "background-color: var(--color-accent); color: white;"
                                                                     },
                                                                     disabled: over_limit,
                                                                     title: if over_limit {

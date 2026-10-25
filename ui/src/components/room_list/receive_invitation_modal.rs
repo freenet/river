@@ -766,7 +766,7 @@ fn render_subscribing_state() -> Element {
             class: "text-center py-4",
             p { class: "mb-4 text-text", "Subscribing to room..." }
             div { class: "w-full h-2 bg-surface rounded-full overflow-hidden",
-                div { class: "h-full bg-blue-500 animate-pulse w-2/3" }
+                div { class: "h-full bg-accent animate-pulse w-2/3" }
             }
         }
     }

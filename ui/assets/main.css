@@ -330,12 +330,15 @@
     text-decoration: underline;
 }
 
+/* A mention of you: the same fill plus a ring, not a stronger fill. A
+ * stronger fill would take the chip's text under 4.5:1 on your own rows'
+ * tint. */
 .river-mention-self {
-    background-color: rgba(2, 101, 231, 0.28);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-link) 55%, transparent);
 }
 
 .river-mention:focus-visible {
-    outline: 2px solid var(--color-accent, #0265e7);
+    outline: 2px solid var(--color-link);
     outline-offset: 1px;
 }
 
@@ -345,7 +348,7 @@
 }
 
 @keyframes replyHighlight {
-    0% { background-color: rgba(59, 130, 246, 0.2); }
+    0% { background-color: color-mix(in srgb, var(--color-link) 20%, transparent); }
     100% { background-color: transparent; }
 }
 

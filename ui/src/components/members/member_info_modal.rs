@@ -487,7 +487,7 @@ pub fn MemberInfoModal() -> Element {
                             if is_owner {
                                 span {
                                     "data-testid": "member-info-owner-tag",
-                                    class: "{TAG_CHIP_CLASS} bg-blue-500/20 text-text",
+                                    class: "{TAG_CHIP_CLASS} bg-accent-soft text-text",
                                     "👑 Room Owner"
                                 }
                             }
