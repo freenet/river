@@ -274,9 +274,38 @@ pub fn avatar_hue(salt: &[u8; 32], member_vk_bytes: &[u8]) -> u16 {
     (u64::from_le_bytes(head) % 360) as u16
 }
 
+/// Steps the displayed hue is quantised to, [`AVATAR_HUE_STEP_DEGREES`] apart.
+pub const AVATAR_HUE_STEPS: u16 = 10;
+/// Degrees between two displayed avatar hues.
+pub const AVATAR_HUE_STEP_DEGREES: u16 = 360 / AVATAR_HUE_STEPS;
+
+/// The hue an avatar is DRAWN with: [`avatar_hue`]'s raw output rounded to
+/// the nearest of [`AVATAR_HUE_STEPS`] evenly spaced hues. At the avatars'
+/// low chroma two hues 15° apart look the same, so two discs are either the
+/// same colour or clearly different, never confusably close.
+pub fn avatar_hue_step(hue: u16) -> u16 {
+    let half = AVATAR_HUE_STEP_DEGREES / 2;
+    ((hue % 360 + half) / AVATAR_HUE_STEP_DEGREES % AVATAR_HUE_STEPS) * AVATAR_HUE_STEP_DEGREES
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avatar_hue_step_rounds_to_the_nearest_of_ten_hues() {
+        assert_eq!(avatar_hue_step(0), 0);
+        assert_eq!(avatar_hue_step(17), 0);
+        assert_eq!(avatar_hue_step(18), 36);
+        assert_eq!(avatar_hue_step(53), 36);
+        assert_eq!(avatar_hue_step(262), 252);
+        // The top wraps to red, not to a 360th hue.
+        assert_eq!(avatar_hue_step(342), 0);
+        assert_eq!(avatar_hue_step(359), 0);
+        let steps: std::collections::BTreeSet<u16> = (0..360).map(avatar_hue_step).collect();
+        assert_eq!(steps.len(), AVATAR_HUE_STEPS as usize);
+        assert!(steps.iter().all(|h| h % AVATAR_HUE_STEP_DEGREES == 0));
+    }
 
     /// Pins the construction (keyed hash, byte order, reduction). Expected
     /// value computed independently: `b3sum --keyed` over 32 bytes of 0x02

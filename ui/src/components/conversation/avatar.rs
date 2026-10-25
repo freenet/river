@@ -66,6 +66,12 @@ pub(crate) fn member_vk_bytes(
         .map(|vk| vk.to_bytes())
 }
 
+/// The hue this viewer draws `member_vk`'s avatar with under `salt`: the
+/// keyed hash's hue, quantised ([`crate::avatar_salt::avatar_hue_step`]).
+pub(crate) fn display_hue(salt: &[u8; 32], member_vk: &[u8]) -> u16 {
+    crate::avatar_salt::avatar_hue_step(crate::avatar_salt::avatar_hue(salt, member_vk))
+}
+
 /// The disc's inline style: its hue, or no style attribute at all (the
 /// neutral disc). `None` rather than an empty string, so a disc that loses
 /// its salt drops the attribute instead of keeping the old value.

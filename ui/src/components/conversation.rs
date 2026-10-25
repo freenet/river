@@ -2905,7 +2905,7 @@ pub fn Conversation() -> Element {
                                                 .into_iter()
                                                 .filter_map(|author| {
                                                     avatar::member_vk_bytes(&rd.room_state, &owner_vk, author)
-                                                        .map(|vk| (author, crate::avatar_salt::avatar_hue(&salt, &vk)))
+                                                        .map(|vk| (author, avatar::display_hue(&salt, &vk)))
                                                 })
                                                 .collect(),
                                             _ => HashMap::new(),
