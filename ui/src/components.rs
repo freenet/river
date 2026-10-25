@@ -1026,34 +1026,209 @@ mod accent_token_audit {
         found
     }
 
-    /// Solid accent fills: the accent as a background, other than the soft
-    /// fill (`-soft`) or a translucent tint (`/N`). White text on the dark
-    /// theme's accent is 2.15:1, and the design keeps the accent for text,
-    /// lines and faint tints.
+    /// The accent and the link colour, which IS the accent (`--color-link`
+    /// resolves to `--color-accent`), with their hover shades. Not `-soft`.
+    const ACCENT_NAMES: [&str; 4] = ["accent-hover", "accent", "link-hover", "link"];
+
+    /// Whether `value` (a CSS colour) paints the accent nearly solid: a bare
+    /// `var(--color-accent)` (or link, or a hover shade), or a `color-mix`
+    /// giving it half or more. Lower-case, whitespace already removed.
+    fn paints_accent(value: &str) -> bool {
+        // The length of an accent reference at the start of `v`: complete
+        // `var(...)` / `(...)` forms (their closing paren rules out `-soft`),
+        // or a bare `--color-*` token not followed by more of a name.
+        let reference = |v: &str| -> Option<usize> {
+            ACCENT_NAMES.iter().find_map(|name| {
+                let token = format!("--color-{name}");
+                for form in [format!("var({token})"), format!("({token})")] {
+                    if v.starts_with(&form) {
+                        return Some(form.len());
+                    }
+                }
+                (v.starts_with(&token)
+                    && !v[token.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '-'))
+                .then_some(token.len())
+            })
+        };
+        if reference(value).is_some() {
+            return true;
+        }
+        // color-mix(in <space>, <a> [p%], <b> [q%]): the accent's share,
+        // 50% when neither side gives one.
+        let Some(args) = value
+            .strip_prefix("color-mix(")
+            .and_then(|v| v.split_once(',').map(|(_, rest)| rest))
+        else {
+            return false;
+        };
+        // Only color-mix's own closing paren: a `var(...)` keeps its own.
+        let args = args.strip_suffix(')').unwrap_or(args);
+        let parts: Vec<&str> = args.splitn(2, ',').collect();
+        let share = |part: &str| -> Option<f64> {
+            let p = part.strip_suffix('%')?;
+            let start = p
+                .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .map_or(0, |i| i + 1);
+            p[start..].parse().ok()
+        };
+        parts.iter().enumerate().any(|(i, part)| {
+            reference(part).is_some() && {
+                let theirs = parts.get(1 - i).and_then(|p| share(p));
+                share(part).or(theirs.map(|t| 100.0 - t)).unwrap_or(50.0) >= 50.0
+            }
+        })
+    }
+
+    /// Solid accent fills: the accent (or the link colour, which is the
+    /// accent) as a background, other than the soft fill (`-soft`) or a faint
+    /// tint (`/N` below 50). White text on the dark theme's accent is 2.15:1,
+    /// and the design keeps the accent for text, lines and faint tints.
+    /// Covers Tailwind classes in any variant (`hover:`, `!`, v4 `(--x)` and
+    /// v3 `[...]` arbitrary values) and CSS or inline `background[-color]`
+    /// declarations, whitespace ignored.
     fn solid_accent_fills(src: &str) -> Vec<String> {
         let mut found = Vec::new();
-        for (at, _) in src.match_indices("bg-accent") {
-            let after = &src[at + "bg-accent".len()..];
-            let (token, rest) = match after.strip_prefix("-hover") {
-                Some(rest) => ("bg-accent-hover", rest),
-                None => ("bg-accent", after),
+        // Classes: split on anything a class cannot contain.
+        let is_class_char = |c: char| c.is_ascii_alphanumeric() || "-_:/[]().%!#,".contains(c);
+        for raw in src.split(|c: char| !is_class_char(c)) {
+            // Punctuation around a class is not part of it: commas, and
+            // parens that open before it or close unmatched after it.
+            let mut token = raw.trim_matches(',').trim_start_matches('(');
+            while token.ends_with(')') && token.matches(')').count() > token.matches('(').count() {
+                token = &token[..token.len() - 1];
+            }
+            // Drop variants (`hover:`, `md:`), outside brackets/parens.
+            let mut depth = 0i32;
+            let mut cut = 0;
+            for (i, c) in token.char_indices() {
+                match c {
+                    '[' | '(' => depth += 1,
+                    ']' | ')' => depth -= 1,
+                    ':' if depth == 0 => cut = i + 1,
+                    _ => {}
+                }
+            }
+            let utility = token[cut..].trim_start_matches('!').trim_end_matches('!');
+            let Some(value) = utility.strip_prefix("bg-") else {
+                continue;
             };
-            if rest.is_empty() || rest.starts_with([' ', '"', '}', ',']) {
+            let (colour, alpha) = match value.rsplit_once('/') {
+                Some((c, a)) if !c.ends_with('(') && !a.contains(')') => (c, Some(a)),
+                _ => (value, None),
+            };
+            // The alpha as a fraction; not a number, not a class at all.
+            let alpha = match alpha.map(|a| a.trim_start_matches('[').trim_end_matches(']')) {
+                None => 1.0,
+                Some(a) => match a.strip_suffix('%') {
+                    Some(p) => match p.parse::<f64>() {
+                        Ok(p) => p / 100.0,
+                        Err(_) => continue,
+                    },
+                    None => match a.parse::<f64>() {
+                        Ok(n) if a.contains('.') => n,
+                        Ok(n) => n / 100.0,
+                        Err(_) => continue,
+                    },
+                },
+            };
+            if alpha < 0.5 {
+                continue;
+            }
+            let colour = colour.to_lowercase();
+            let solid = ACCENT_NAMES.contains(&colour.as_str())
+                || colour
+                    .strip_prefix('[')
+                    .and_then(|v| v.strip_suffix(']'))
+                    .or_else(|| {
+                        colour
+                            .strip_prefix('(')
+                            .and_then(|v| v.strip_suffix(')'))
+                            .map(|v| v)
+                    })
+                    .is_some_and(|v| {
+                        let v = v.replace('_', "");
+                        paints_accent(&v) || paints_accent(&format!("var({v})"))
+                    });
+            if solid {
                 found.push(token.to_string());
             }
         }
-        for needle in [
-            "background-color: var(--color-accent",
-            "background: var(--color-accent",
-            "bg-[var(--color-accent",
-        ] {
-            for (at, _) in src.match_indices(needle) {
-                if !src[at + needle.len()..].starts_with("-soft") {
-                    found.push(needle.to_string());
+        // Declarations: whitespace out, then every background value.
+        let flat: String = src
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for prop in ["background-color:", "background:"] {
+            for (at, _) in flat.match_indices(prop) {
+                // `--x-background-color:` is a custom property, not a fill.
+                if flat[..at].ends_with('-') {
+                    continue;
+                }
+                let value = &flat[at + prop.len()..];
+                let end = value.find([';', '"', '}', '\'']).unwrap_or(value.len());
+                let value = value[..end].trim_end_matches("!important");
+                if paints_accent(value) {
+                    found.push(format!("{prop}{value}"));
                 }
             }
         }
         found
+    }
+
+    /// Solid fills reviewed and kept, as (file suffix, what the scan
+    /// reports, why).
+    const ALLOWED_FILLS: [(&str, &str, &str); 2] = [
+        (
+            "components/back_to_chat.rs",
+            "bg-[var(--color-link)]",
+            "the hamburger's unread count: a small badge, panel-coloured text on the link colour, clearing contrast in both themes",
+        ),
+        (
+            "components/room_list/receive_invitation_modal.rs",
+            "bg-[var(--color-link)]",
+            "the subscribe progress bars: an 8px indicator with no text on it",
+        ),
+    ];
+
+    /// `src` without its `#[cfg(test)]` modules (their assertions name the
+    /// patterns the scan forbids), however many there are and wherever they
+    /// sit, so production code after one is still scanned.
+    fn without_test_modules(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(at) = rest.find("#[cfg(test)]") {
+            out.push_str(&rest[..at]);
+            let after = &rest[at..];
+            // The attributed item: up to its block's closing brace, or the
+            // end of a one-line item.
+            let Some(open) = after.find(['{', ';']) else {
+                rest = "";
+                break;
+            };
+            if after.as_bytes()[open] == b';' {
+                rest = &after[open + 1..];
+                continue;
+            }
+            let mut depth = 0usize;
+            let mut close = after.len();
+            for (i, c) in after[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = open + i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = &after[close..];
+        }
+        out.push_str(rest);
+        out
     }
 
     const OLD_ACCENTS: [&str; 7] = [
@@ -1076,18 +1251,17 @@ mod accent_token_audit {
         let mut bad = Vec::new();
         for path in &paths {
             let src = std::fs::read_to_string(path).expect("read source");
-            // This file names the patterns it forbids, and test modules
-            // name them in assertions: scan production code only.
-            let src = match src.find("mod accent_token_audit") {
-                Some(cut) => &src[..cut],
-                None => &src[..],
-            };
-            let src = match src.find("#[cfg(test)]\nmod tests") {
-                Some(cut) => &src[..cut],
-                None => src,
-            };
+            // Test modules (this one included) name the patterns in their
+            // assertions: scan production code only.
+            let src = without_test_modules(&src);
+            let src = src.as_str();
             for hit in solid_accent_fills(src) {
-                bad.push(format!("{}: solid accent fill `{hit}`", path.display()));
+                let allowed = ALLOWED_FILLS
+                    .iter()
+                    .any(|(file, fill, _)| path.ends_with(file) && hit == *fill);
+                if !allowed {
+                    bad.push(format!("{}: solid accent fill `{hit}`", path.display()));
+                }
             }
             for hit in palette_blues(src) {
                 bad.push(format!("{}: {hit}", path.display()));
@@ -1108,28 +1282,73 @@ mod accent_token_audit {
 
     #[test]
     fn the_scan_sees_a_solid_accent_fill() {
-        assert_eq!(
-            solid_accent_fills(r#"class: "px-3 bg-accent text-white""#),
-            vec!["bg-accent"]
-        );
-        assert_eq!(
-            solid_accent_fills(r#"class: "hover:bg-accent-hover text-white""#),
-            vec!["bg-accent-hover"]
-        );
-        assert_eq!(
-            solid_accent_fills(r#"style: "background-color: var(--color-accent); color: white;""#),
-            vec!["background-color: var(--color-accent"]
-        );
-        assert_eq!(
-            solid_accent_fills("x bg-[var(--color-accent)] y"),
-            vec!["bg-[var(--color-accent"]
-        );
-        // The soft fill and translucent tints are allowed.
+        let sees = |src: &str| !solid_accent_fills(src).is_empty();
+        for src in [
+            r#"class: "px-3 bg-accent text-white""#,
+            r#"class: "hover:bg-accent-hover text-white""#,
+            r#"class: "md:hover:bg-accent""#,
+            // The link colour is the accent.
+            r#"class: "bg-link text-white""#,
+            r#"class: "bg-link-hover""#,
+            // Near-solid alpha.
+            r#"class: "bg-accent/50""#,
+            r#"class: "bg-accent/90""#,
+            r#"class: "bg-link/[0.6]""#,
+            // Important, either side (v3 prefix, v4 suffix).
+            r#"class: "bg-accent!""#,
+            r#"class: "!bg-accent""#,
+            // Arbitrary values, v3 and v4.
+            "x bg-[var(--color-accent)] y",
+            "x bg-(--color-accent) y",
+            "x bg-[--color-link] y",
+            "x bg-[color-mix(in_oklab,var(--color-accent)_60%,transparent)] y",
+            // Any terminator.
+            "{bg-accent}",
+            "(bg-accent)",
+            "'bg-accent'",
+            "`bg-accent`",
+            "bg-accent\n",
+            // Declarations, with and without spaces, and the shorthand.
+            r#"style: "background-color: var(--color-accent); color: white;""#,
+            r#"style: "background-color:var(--color-accent)""#,
+            "background:   var( --color-link );",
+            ".x { background-color: var(--color-accent-hover) }",
+            "background-color: color-mix(in oklab, var(--color-accent) 60%, transparent);",
+            "background-color: color-mix(in oklab, var(--color-link), transparent);",
+            "background-color: color-mix(in oklab, white 30%, var(--color-accent));",
+        ] {
+            assert!(sees(src), "the scan should see: {src}");
+        }
+        // The soft fill, faint tints and other colours are allowed.
+        for src in [
+            r#"class: "bg-accent-soft bg-accent/20 hover:bg-accent/10 bg-link/[0.15]""#,
+            r#"class: "text-accent border-accent bg-surface bg-linked-thing""#,
+            "background-color: var(--color-accent-soft);",
+            "background-color: color-mix(in oklab, var(--color-accent) 15%, transparent);",
+            "background-color: color-mix(in oklab, white 60%, var(--color-accent));",
+            "--color-link: var(--color-accent);",
+            "--my-background-color: var(--color-accent);",
+        ] {
+            assert!(
+                !sees(src),
+                "the scan should allow: {src} ({:?})",
+                solid_accent_fills(src)
+            );
+        }
+    }
+
+    /// Production code after a test module is still scanned, and every test
+    /// module is skipped, not just the first.
+    #[test]
+    fn test_modules_are_cut_out_and_nothing_else() {
+        let src = "fn a() {}\n#[cfg(test)]\nmod tests { fn t() { let s = \"bg-accent\"; } }\nfn b() { let c = \"bg-accent\"; }\n#[cfg(test)]\nmod more { fn u() { \"bg-link\"; } }\n";
+        let kept = without_test_modules(src);
+        assert!(kept.contains("fn b()"), "{kept}");
         assert!(
-            solid_accent_fills(r#"class: "bg-accent-soft bg-accent/20 hover:bg-accent/10""#)
-                .is_empty()
+            !kept.contains("fn t()") && !kept.contains("fn u()"),
+            "{kept}"
         );
-        assert!(solid_accent_fills("background-color: var(--color-accent-soft);").is_empty());
+        assert_eq!(solid_accent_fills(&kept), vec!["bg-accent"]);
     }
 
     #[test]
