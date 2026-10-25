@@ -70,35 +70,33 @@ pub fn ConnectionStatusIndicator() -> Element {
         .unwrap_or(SynchronizerStatus::Connecting);
 
     let (pill_classes, dot_classes, label) = match &status {
-        SynchronizerStatus::Connected => (
-            "bg-success-bg text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800",
-            "bg-green-500",
-            "Connected".to_string(),
-        ),
+        SynchronizerStatus::Connected => {
+            ("text-text-muted", "bg-green-500", "Connected".to_string())
+        }
         SynchronizerStatus::Connecting => (
-            "bg-warning-bg text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-800",
+            "text-text-muted",
             "bg-yellow-500",
             "Connecting...".to_string(),
         ),
         SynchronizerStatus::Disconnected => (
-            "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
+            "text-red-700 dark:text-red-400",
             "bg-red-500",
             "Disconnected".to_string(),
         ),
         SynchronizerStatus::Error(msg) => (
-            "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
+            "text-red-700 dark:text-red-400",
             "bg-red-500",
             format!("Error: {}", msg),
         ),
     };
 
     rsx! {
-        div { class: "px-3 pb-3 flex-shrink-0",
+        div { class: "px-4 flex-shrink-0",
             div {
                 "aria-label": "WebSocket connection status",
                 "data-testid": "connection-status-indicator",
-                class: "w-full px-3 py-1.5 rounded-full flex items-center justify-center text-xs font-medium {pill_classes}",
-                div { class: "w-2 h-2 rounded-full mr-2 {dot_classes}" }
+                class: "flex items-center gap-2 text-[12.5px] font-medium {pill_classes}",
+                div { class: "w-[7px] h-[7px] rounded-full flex-shrink-0 {dot_classes}" }
                 span { "{label}" }
             }
         }
