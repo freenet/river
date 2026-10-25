@@ -10,6 +10,7 @@ mod components;
 mod constants;
 #[cfg(feature = "example-data")]
 mod example_data;
+mod fonts;
 mod invite_qr;
 mod invites;
 mod nickname;

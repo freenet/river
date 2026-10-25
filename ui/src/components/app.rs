@@ -555,6 +555,7 @@ pub fn App() -> Element {
         // Stylesheets
         Stylesheet { href: asset!("/assets/styles.css") }
         Stylesheet { href: asset!("/assets/main.css") }
+        crate::fonts::LatoFontFaces {}
 
         // Main chat layout - grid with fixed sidebars and flexible center
         div { class: "flex bg-bg overflow-hidden app-root",

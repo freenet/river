@@ -21,8 +21,9 @@
   --spacing-message-gap: 0.25rem;
   --spacing-block-gap: 1rem;
 
-  /* Font settings */
-  --font-family-sans: 'Lato', system-ui, sans-serif;
+  /* Lato is bundled (ui/src/fonts.rs). `--font-sans` is the token Tailwind's
+     `font-sans` utility reads, and the body rule below uses it too. */
+  --font-sans: 'Lato', system-ui, sans-serif;
 }
 
 /* Light mode colors (default) */
@@ -106,7 +107,7 @@
 html, body {
   height: 100%;
   margin: 0;
-  font-family: var(--font-family-sans);
+  font-family: var(--font-sans);
   background-color: var(--color-bg);
   color: var(--color-text);
 }
