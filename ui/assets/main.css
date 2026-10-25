@@ -1,53 +1,34 @@
-/* Reaction button hover visibility */
-.add-reaction-btn {
-    opacity: 0;
-    color: currentColor;
-    transition: opacity 0.15s, transform 0.15s;
-}
-
-.group:hover .add-reaction-btn {
-    opacity: 0.4;
-}
-
-.add-reaction-btn:hover {
-    opacity: 0.7 !important;
-}
-
-.add-reaction-btn.has-reactions {
-    opacity: 0.2;
-}
-
-.group:hover .add-reaction-btn.has-reactions {
-    opacity: 0.4;
-}
-
-/* The inline add-reaction "+" on touch. The "+" is a visible control only
- * on a message that already has reactions, after its chips (`.has-reactions`;
- * 0.2 at rest on a hover pointer, brighter on hover). On a message with none
- * it is collapsed and invisible (`invisible h-0`, its wrapper
- * `pointer-events-none`), kept only as the anchor the picker opens from;
- * React there comes from the hover bar on a hover pointer and from the kebab
- * menu on touch (`conversation.rs`, `.touch-actions`).
+/* The conversation column: no wider than a row needs (the 60px avatar
+ * gutter, the body's 76ch measure at its 15px, the row's right padding) and
+ * centred in the panel, so on a wide window the conversation sits in the
+ * middle instead of hugging the left with an empty band on the right. The
+ * text stays left-aligned inside it. Applied to the history's content (the
+ * scroller itself stays panel-wide, so its scrollbar is at the panel's
+ * edge), Latest's frame and the composer. Narrower panels are as before.
  *
- * Touch cannot trigger the `.group:hover` reveal, so where there is a "+" to
- * see it rests at 0.4. Gate on pointer CAPABILITY, not viewport width — see
- * the #462 comment above for why `(hover: none), (any-pointer: coarse)` is
- * the correct query (`any-pointer: coarse` also catches a touchscreen laptop,
- * which reports `hover: hover` while a finger is on the glass).
- *
- * Deliberately does NOT widen the tap target the way #462 did: a min-size
- * here (tried in #605, reverted after user feedback) grows the reaction
- * row's line height on every message with reactions, which reads as "the
- * composer now takes up more room". A mis-tap only opens the emoji picker,
- * and the kebab's React is a full menu row, above the WCAG 2.5.8 AA 24px
- * floor though short of the 44px AAA target. So: visibility only. */
-@media (hover: none), (any-pointer: coarse) {
-    .add-reaction-btn {
-        opacity: 0.4;
+ * `ch` depends on the font size and, in practice, on the engine's rounding
+ * at that size, so the column computes it at the body's own 15px; its
+ * children get back the size they inherited before. Only from 768px: on a
+ * phone the panel is always narrower than a row needs, and the body's size
+ * is different there. Horizontal only: every line in a row is already
+ * bounded by the measure, so no row's height changes. */
+@media (min-width: 768px) {
+    .conversation-column {
+        --conversation-row-pad: 24px;
+        font-size: 15px;
+        max-width: calc(60px + 76ch + var(--conversation-row-pad));
+        margin-inline: auto;
     }
 
-    .add-reaction-btn.has-reactions {
-        opacity: 0.4;
+    .conversation-column > * {
+        font-size: 1rem;
+    }
+}
+
+@media (min-width: 768px) and (hover: none) {
+    .conversation-column {
+        /* Rows keep a 40px right gutter for the kebab on touch. */
+        --conversation-row-pad: 40px;
     }
 }
 
@@ -160,9 +141,15 @@
  * so it never covers Latest (z-30); it rests at z-20, under Latest and the
  * z-40 dismiss backdrops. Keyboard focus inside the row reveals it too
  * (below). */
+/* Pinned to the right edge of the text column, not the row: rows span the
+ * panel but text stops at the body's 76ch measure, so on a wide window a bar
+ * at the row's edge sat far from the message. `ch` is font-relative, so the
+ * bar takes the body's 15px size (its buttons are fixed-size icons). Where
+ * the column is narrower than the measure, the bar sits at its edge. */
 .hover-actions {
     position: absolute;
-    right: 0;
+    font-size: 15px;
+    right: max(0px, calc(100% - 76ch));
     top: -1.125rem;
     z-index: 20;
     display: flex;
@@ -257,6 +244,42 @@
 
 .msg-event .msg-gutter {
     align-items: center;
+}
+
+/* "N people joined": a disclosure listing who. The marker is hidden; the
+ * dotted underline says the count can be opened. Opened, the icon stays by
+ * the first line. */
+.join-names > summary {
+    list-style: none;
+    cursor: pointer;
+}
+
+.join-names > summary::-webkit-details-marker {
+    display: none;
+}
+
+.join-names > summary:focus-visible {
+    outline: 2px solid var(--color-link);
+    outline-offset: 1px;
+}
+
+.join-names-count {
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+}
+
+.join-names-list {
+    max-height: 10rem;
+    overflow-y: auto;
+}
+
+.join-name {
+    font-weight: 700;
+    color: var(--color-text-secondary);
+}
+
+.msg-event:has(.join-names[open]) {
+    align-items: start;
 }
 
 /* Date separators: a hairline with a label, centred over the text column

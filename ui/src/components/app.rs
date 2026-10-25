@@ -93,11 +93,79 @@ pub fn mark_needs_sync(room_key: ed25519_dalek::VerifyingKey) {
 /// Which panel is active on mobile. Defaults to Chat (conversation view).
 pub static MOBILE_VIEW: GlobalSignal<MobileView> = Global::new(|| MobileView::Chat);
 
-/// Whether the member panel is shown on desktop (md+), toggled by the room
-/// header's members button. Open by default, and for this session only: it
-/// is not persisted, since `localStorage` throws in the gateway's sandboxed
+/// Whether the member panel is shown beside the conversation (md+, 768px
+/// and wider). `None`, the default, is automatic: shown on a window at least
+/// `lg` wide (1024px) and hidden on a tablet-width one (768-1023px), by CSS,
+/// so rotating an iPad or resizing across 1024 just works. The room header's
+/// members toggle stores the opposite of what is shown (`Some(..)`,
+/// [`members_panel_shown`]), which then holds at any width for the session.
+/// Not persisted, since `localStorage` throws in the gateway's sandboxed
 /// iframe. Phones ignore it; there `MOBILE_VIEW` picks the panel.
-pub static MEMBERS_PANEL_OPEN: GlobalSignal<bool> = Global::new(|| true);
+pub static MEMBERS_PANEL_OPEN: GlobalSignal<Option<bool>> = Global::new(|| None);
+
+/// Whether the window is at least `lg` wide (64rem, 1024px at the default
+/// font size), the automatic member panel's breakpoint, kept current by a
+/// `matchMedia` change listener
+/// (`install_wide_viewport_listener`). Read for the toggle's pressed state;
+/// the panel itself is shown or hidden by CSS.
+pub static WIDE_VIEWPORT: GlobalSignal<bool> = Global::new(wide_viewport_now);
+
+/// The media query behind [`WIDE_VIEWPORT`]; Tailwind's `lg`.
+#[cfg(target_arch = "wasm32")]
+/// In rem, as Tailwind's `lg:` is, so both follow the reader's font size.
+const WIDE_VIEWPORT_QUERY: &str = "(min-width: 64rem)";
+
+/// Whether the member panel is shown on a window at least 768px wide: the
+/// stored choice, else automatic by width.
+pub fn members_panel_shown(open: Option<bool>, wide: bool) -> bool {
+    open.unwrap_or(wide)
+}
+
+fn wide_viewport_now() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|w| w.match_media(WIDE_VIEWPORT_QUERY).ok().flatten())
+            .is_none_or(|m| m.matches())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        true
+    }
+}
+
+/// Keep [`WIDE_VIEWPORT`] current as the window crosses 64rem (a rotation,
+/// a resize). The write is deferred (dioxus-signal-safety.md). Installs once.
+fn install_wide_viewport_listener() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        thread_local! {
+            static INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if INSTALLED.with(|i| i.replace(true)) {
+            return;
+        }
+        let Some(query) =
+            web_sys::window().and_then(|w| w.match_media(WIDE_VIEWPORT_QUERY).ok().flatten())
+        else {
+            return;
+        };
+        let watched = query.clone();
+        let on_change = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+            let wide = watched.matches();
+            crate::util::defer(move || {
+                if *WIDE_VIEWPORT.peek() != wide {
+                    *WIDE_VIEWPORT.write() = wide;
+                }
+            });
+        });
+        let _ =
+            query.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
+        // Lives as long as the page.
+        on_change.forget();
+    }
+}
 
 // Build metadata from build.rs
 const BUILD_TIMESTAMP: &str = env!("BUILD_TIMESTAMP_ISO");
@@ -136,6 +204,9 @@ pub fn App() -> Element {
     // inside message bodies, so they can't carry a Dioxus onclick directly).
     // Clicking a chip opens the member-info modal. Idempotent.
     crate::components::mention_click_interceptor::install_mention_click_interceptor();
+
+    // Track the automatic member panel's breakpoint. Idempotent.
+    install_wide_viewport_listener();
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
@@ -582,16 +653,19 @@ pub fn App() -> Element {
                 Conversation {}
             }
             div {
-                // Desktop shows it while `MEMBERS_PANEL_OPEN`; a phone shows
-                // it as the Members view, whatever the desktop setting.
+                // From 768px it follows `MEMBERS_PANEL_OPEN` (automatic: `lg:`
+                // only, so the CSS follows the width); a phone shows it as the
+                // Members view, whatever that setting.
                 class: {
                     let is_members = *MOBILE_VIEW.read() == MobileView::Members;
                     let open = *MEMBERS_PANEL_OPEN.read();
                     match (is_members, open) {
-                        (true, true) => "w-full md:w-62 md:flex-shrink-0 flex",
-                        (true, false) => "w-full md:w-62 md:flex-shrink-0 flex md:hidden",
-                        (false, true) => "hidden md:w-62 md:flex-shrink-0 md:flex",
-                        (false, false) => "hidden",
+                        (true, Some(true)) => "w-full md:w-62 md:flex-shrink-0 flex",
+                        (true, None) => "w-full md:w-62 md:flex-shrink-0 flex md:hidden lg:flex",
+                        (true, Some(false)) => "w-full md:w-62 md:flex-shrink-0 flex md:hidden",
+                        (false, Some(true)) => "hidden md:w-62 md:flex-shrink-0 md:flex",
+                        (false, None) => "hidden md:w-62 md:flex-shrink-0 lg:flex",
+                        (false, Some(false)) => "hidden",
                     }
                 },
                 MemberList {}

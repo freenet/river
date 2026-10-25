@@ -209,13 +209,7 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
     let initials = crate::components::conversation::avatar::initials(&entry.peer_nickname);
     crate::avatar_salt::ensure_avatar_salt(room.to_bytes());
     crate::util::signal_guard::anchor();
-    let salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
-        Ok(salts) => salts.get(&room.to_bytes()).copied(),
-        Err(_) => {
-            crate::util::signal_guard::schedule_nudge();
-            None
-        }
-    };
+    let salt = crate::avatar_salt::salt_for_render(&room.to_bytes());
     let avatar_hue = salt.and_then(|salt| {
         let Ok(rooms) = crate::components::app::ROOMS.try_read() else {
             crate::util::signal_guard::schedule_nudge();

@@ -787,6 +787,11 @@ fn event_summary_parts(names: &[String]) -> (Vec<String>, String) {
     }
 }
 
+/// Who a folded join notice stands for, in join order: "Alice, Bob, Carol".
+fn join_names_list(names: &[String]) -> String {
+    names.join(", ")
+}
+
 /// The message body's readable text, or `None` when the body is private and
 /// cannot be read at all — either its secret version is missing, or the
 /// secret we hold for that version does not decrypt it.
@@ -2536,7 +2541,11 @@ pub fn Conversation() -> Element {
                     // Members in the room: the owner plus every member record,
                     // the same set the member panel lists.
                     let member_count = header_room.room_state.members.members.len() + 1;
-                    let members_open = *MEMBERS_PANEL_OPEN.read();
+                    // What is shown: the stored choice, else automatic by width.
+                    let members_open = crate::components::app::members_panel_shown(
+                        *MEMBERS_PANEL_OPEN.read(),
+                        *crate::components::app::WIDE_VIEWPORT.read(),
+                    );
                     let description_expanded = expanded_description_room.read().as_ref()
                         == room_key.as_ref()
                         && room_key.is_some();
@@ -2794,8 +2803,9 @@ pub fn Conversation() -> Element {
                                         }
                                             }
                                         }
-                                    // Desktop: show or hide the member panel, for this
-                                    // session (`MEMBERS_PANEL_OPEN`, no localStorage).
+                                    // 768px and wider: show or hide the member panel, for
+                                    // this session (`MEMBERS_PANEL_OPEN`, no localStorage):
+                                    // the opposite of what is shown now, held at any width.
                                     button {
                                         "data-testid": "members-panel-toggle",
                                         class: "hidden md:inline-flex items-center gap-1 h-8 px-2 rounded-lg text-text-muted hover:text-text hover:bg-surface aria-pressed:bg-surface aria-pressed:text-text transition-colors flex-shrink-0",
@@ -2812,8 +2822,11 @@ pub fn Conversation() -> Element {
                                                 let reader_position = reader_position.clone();
                                                 crate::util::defer(move || {
                                                     reader_position.note_panel_toggle_written();
-                                                    let open = *MEMBERS_PANEL_OPEN.peek();
-                                                    *MEMBERS_PANEL_OPEN.write() = !open;
+                                                    let shown = crate::components::app::members_panel_shown(
+                                                        *MEMBERS_PANEL_OPEN.peek(),
+                                                        *crate::components::app::WIDE_VIEWPORT.peek(),
+                                                    );
+                                                    *MEMBERS_PANEL_OPEN.write() = Some(!shown);
                                                 });
                                             }
                                         },
@@ -2867,9 +2880,10 @@ pub fn Conversation() -> Element {
                     style: "overflow-anchor:none;",
                     id: "chat-scroll-container",
                     "data-testid": "chat-scroll-container",
-                    // Full width: rows and their hover band span the column, and
+                    // Rows and their hover band span the conversation column,
+                    // which is centred on a wide window (`.conversation-column`);
                     // the body text keeps its own 76ch measure.
-                    div { class: "py-4", id: "chat-content",
+                    div { class: "py-4 conversation-column", id: "chat-content",
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
@@ -2938,16 +2952,9 @@ pub fn Conversation() -> Element {
                                         let owner_vk = CURRENT_ROOM.peek().owner_key;
                                         let salt = owner_vk.and_then(|vk| {
                                             crate::avatar_salt::ensure_avatar_salt(vk.to_bytes());
-                                            match crate::avatar_salt::AVATAR_SALTS.try_read() {
-                                                Ok(salts) => salts.get(&vk.to_bytes()).copied(),
-                                                Err(_) => {
-                                                    // No subscription this render; the
-                                                    // nudge renders it again (#555).
-                                                    crate::util::signal_guard::anchor();
-                                                    crate::util::signal_guard::schedule_nudge();
-                                                    None
-                                                }
-                                            }
+                                            // A contended read anchors and nudges, so
+                                            // the nudge renders this again (#555).
+                                            crate::avatar_salt::salt_for_render(&vk.to_bytes())
                                         });
                                         match (salt, owner_vk, current_room_data.as_ref()) {
                                             (Some(salt), Some(owner_vk), Some(rd)) => groups
@@ -3096,14 +3103,42 @@ pub fn Conversation() -> Element {
                                                                 class: "msg-event",
                                                                 span { class: "msg-gutter", {line_icon(JOIN_ICON_PATH, 14)} }
                                                                 span { class: "min-w-0 [overflow-wrap:anywhere]",
-                                                                    if let Some(first) = names.first() {
-                                                                        span { class: "font-bold text-text-secondary", "{first}" }
+                                                                    if names.is_empty() {
+                                                                        // "N people joined" names them on
+                                                                        // hover (`title`) and on a tap or
+                                                                        // click, which opens the list
+                                                                        // below. A native `details` keeps
+                                                                        // the open state in the DOM, so a
+                                                                        // re-render does not close it.
+                                                                        details { class: "join-names",
+                                                                            summary {
+                                                                                "data-testid": "join-notice-toggle",
+                                                                                title: "{join_names_list(&summary.names)}",
+                                                                                span { class: "join-names-count", "{rest}" }
+                                                                                " · {time}"
+                                                                            }
+                                                                            // One span per name, the separators
+                                                                            // muted, so a nickname holding ", "
+                                                                            // does not read as two people.
+                                                                            div {
+                                                                                "data-testid": "join-notice-names",
+                                                                                class: "join-names-list",
+                                                                                for (i, name) in summary.names.iter().enumerate() {
+                                                                                    if i > 0 { ", " }
+                                                                                    span { class: "join-name", "{name}" }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    } else {
+                                                                        if let Some(first) = names.first() {
+                                                                            span { class: "font-bold text-text-secondary", "{first}" }
+                                                                        }
+                                                                        if let Some(second) = names.get(1) {
+                                                                            " and "
+                                                                            span { class: "font-bold text-text-secondary", "{second}" }
+                                                                        }
+                                                                        "{rest} · {time}"
                                                                     }
-                                                                    if let Some(second) = names.get(1) {
-                                                                        " and "
-                                                                        span { class: "font-bold text-text-secondary", "{second}" }
-                                                                    }
-                                                                    "{rest} · {time}"
                                                                 }
                                                             }
                                                         }
@@ -3225,6 +3260,12 @@ pub fn Conversation() -> Element {
                 // Latest (#402): shown while the newest message's bottom is off
                 // screen, or a held range withholds newer items.
                 if !newest_in_view() || reader_position.has_newer.get() {
+                    // In the conversation column's frame, so Latest sits at the
+                    // column's corner on a wide window and the panel's otherwise.
+                    // The frame takes no hits; the button does.
+                    div { class: "absolute inset-0 pointer-events-none",
+                    div { "data-testid": "latest-frame", class: "conversation-column relative h-full",
+                    span { class: "pointer-events-auto",
                     LatestButton {
                         aria_label: "Scroll to latest messages",
                         test_id: "scroll-to-bottom",
@@ -3248,6 +3289,9 @@ pub fn Conversation() -> Element {
                                 }
                             }
                         }},
+                    }
+                    }
+                    }
                     }
                 }
             }
@@ -3679,12 +3723,16 @@ fn reaction_owners_popover_at(
     }
 }
 
-/// Where the inline emoji picker opens from its "+", set when it opens (#402).
+/// Where the inline emoji picker opens from its anchor, set when it opens (#402).
 #[derive(Clone, Copy, Default, PartialEq)]
 struct PickerPlacement {
     above: bool,
     /// Leftward (`right-0`).
     align_right: bool,
+    /// How far the anchor's line sits below the reaction row's first line,
+    /// in px: opening above, the picker rises by this much more, so it clears
+    /// every chip line, not only the last one the anchor shares.
+    rise_px: f64,
 }
 
 /// The centre of the element with this id, in client coordinates.
@@ -3844,33 +3892,38 @@ fn chat_scrollport_bounds() -> (f64, f64) {
         .unwrap_or((60.0, 600.0))
 }
 
-/// Where `msg-{msg_id}`'s inline picker opens, measured from its "+" wrapper,
+/// Where `msg-{msg_id}`'s inline picker opens, measured from its anchor's wrapper,
 /// never from a click: a key press reports no position, and the kebab's React
-/// is tapped nowhere near "+".
+/// is tapped nowhere near the anchor.
 ///
 /// - Leftward (`right-0`) when the wrapper sits right of the chat scroller's
 ///   centre, so the picker opens toward the roomier side.
 /// - Above when it does not fit below the wrapper inside the scroller and
-///   there is more room above ([`vertical_placement_from`]).
+///   there is more room above the reaction row ([`vertical_placement_from`]),
+///   rising past every chip line (`rise_px`).
 ///
 /// Unmeasurable, it opens below and rightward.
 fn inline_picker_placement(msg_id: &str) -> PickerPlacement {
     let measure = || {
         let document = web_sys::window()?.document()?;
-        let plus = document
+        let wrapper = document
             .get_element_by_id(&format!("msg-{msg_id}"))?
-            .query_selector("[data-testid=\"add-reaction-button\"]")
+            .query_selector("[data-testid=\"reaction-picker-anchor\"]")
             .ok()??
-            .parent_element()?
-            .get_bounding_client_rect();
+            .parent_element()?;
+        let plus = wrapper.get_bounding_client_rect();
+        // The chips can wrap; the wrapper shares only the last line.
+        let line_top = wrapper
+            .parent_element()
+            .map_or(plus.top(), |row| row.get_bounding_client_rect().top());
         let scroller = document
             .get_element_by_id("chat-scroll-container")?
             .get_bounding_client_rect();
-        let (above, _) =
-            vertical_placement_from(plus.top(), plus.bottom(), INLINE_PICKER_HEIGHT_PX);
+        let (above, _) = vertical_placement_from(line_top, plus.bottom(), INLINE_PICKER_HEIGHT_PX);
         Some(PickerPlacement {
             above,
             align_right: plus.left() + plus.right() > scroller.left() + scroller.right(),
+            rise_px: (plus.top() - line_top).max(0.0),
         })
     };
     measure().unwrap_or_default()
@@ -3974,7 +4027,7 @@ fn MessageGroupComponent(
 ) -> Element {
     let mut open_action_menu = open_action_menu;
     // Per-group: at most one picker per group, and while a picker is open its
-    // raised (z-[60]) backdrop covers every other group's kebabs and "+"
+    // raised (z-[60]) backdrop covers every other group's kebabs and React
     // buttons, so tapping one dismisses the picker rather than stacking a
     // second popover — the single-popover guarantee comes from the z-order, not
     // a shared signal (#402).
@@ -4013,9 +4066,9 @@ fn MessageGroupComponent(
     let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
 
     let mut picker_placement: Signal<PickerPlacement> = use_signal(PickerPlacement::default);
-    // Measures the "+" now, then places and opens the picker in one deferred
-    // step (.claude/rules/dioxus-signal-safety.md). Every open path (the "+",
-    // the hover bar's React, the kebab's React) comes through here.
+    // Measures the anchor now, then places and opens the picker in one deferred
+    // step (.claude/rules/dioxus-signal-safety.md). Every open path
+    // (the hover bar's React, the kebab's React) comes through here.
     let open_inline_picker = move |msg_id: &str| {
         request_reveal(format!("emoji-picker-{msg_id}"));
         let placement = inline_picker_placement(msg_id);
@@ -4101,18 +4154,17 @@ fn MessageGroupComponent(
                         return;
                     }
                     // The chip is gone: Remove took the only reaction with that
-                    // emoji. The nearest control left on the message takes
-                    // focus: its "+" while other chips remain, else its React
-                    // action, which is the kebab on touch and the hover bar's
-                    // React otherwise (a message with no reactions has no
-                    // visible "+"). Each is tried until one actually holds
-                    // focus, since a hidden one refuses it. If the message is
+                    // emoji. Focus stays on the reaction line: another chip
+                    // while one remains, else the message's React action
+                    // (the kebab on touch, the hover bar's React otherwise).
+                    // Each is tried until one actually holds focus, since a
+                    // hidden one refuses it. If the message is
                     // gone too, focus stays where the browser put it.
                     let Some(row) = document.get_element_by_id(&format!("msg-{message_id}")) else {
                         return;
                     };
                     for selector in [
-                        "[data-testid=\"add-reaction-button\"].has-reactions",
+                        "[data-testid=\"reaction-chip\"]",
                         "[data-testid=\"message-kebab\"]",
                         "[data-testid=\"message-hover-actions\"] button",
                     ] {
@@ -4806,7 +4858,7 @@ fn MessageGroupComponent(
                                                         button {
                                                             class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
                                                             onclick: move |_| {
-                                                                // Placed from this message's "+", like every
+                                                                // Placed from this message's anchor, like every
                                                                 // other open path (#402).
                                                                 open_inline_picker(&msg_id_menu_react);
                                                             },
@@ -4870,11 +4922,10 @@ fn MessageGroupComponent(
                                         rsx! {
                                             div {
                                                 "data-testid": "message-reaction-row",
-                                                // A message with no reactions has no reaction line:
-                                                // its "+" stays in the DOM, collapsed and inert, only
-                                                // as the anchor the picker opens from (the hover
-                                                // bar's React, the kebab's React). With reactions,
-                                                // the chips and a visible "+" form the line.
+                                                // A message with no reactions has no reaction line.
+                                                // Either way the picker's anchor sits at its end,
+                                                // collapsed and inert; the picker is opened by the
+                                                // hover bar's React or the kebab's React.
                                                 class: if has_reactions { "flex flex-wrap items-center gap-[5px] mt-[5px] mb-0.5" } else { "flex h-0" },
                                                 // Existing reactions (clickable to toggle if user has reacted)
                                                 {
@@ -5120,19 +5171,21 @@ fn MessageGroupComponent(
                                                         }
                                                     })
                                                 }
-                                                // Inline add reaction button (same line height as reactions)
+                                                // The inline picker's anchor, after the chips.
                                                 div {
                                                     // Raise the whole picker (grid + z-40 backdrop) above the
                                                     // closed z-20 kebabs and hover bars while it's open, so a
                                                     // nearby one can't paint over the emoji grid and steal a tap
                                                     // (mirrors the action menu's z-[60] behaviour). (#402)
-                                                    // Collapsed (no reactions), it takes no hits, so it
-                                                    // never sits over the next row; the backdrop and the
-                                                    // picker take them back.
+                                                    // Collapsed, it takes no hits, so it never sits over
+                                                    // the next row; the backdrop and the picker take
+                                                    // them back.
+                                                    // `self-stretch`: as tall as the chip line, so the
+                                                    // picker opens below or above the chips, not over
+                                                    // them. In a row with no reactions the line is 0.
                                                     class: format!(
-                                                        "relative group/react inline-flex items-center {} {}",
+                                                        "relative group/react inline-flex items-center self-stretch pointer-events-none {}",
                                                         if is_inline_picker_open { "z-[60]" } else { "" },
-                                                        if has_reactions { "" } else { "h-0 pointer-events-none" },
                                                     ),
                                                     // Invisible backdrop when picker is open
                                                     if is_inline_picker_open {
@@ -5141,33 +5194,20 @@ fn MessageGroupComponent(
                                                             onclick: move |_| crate::util::defer(move || open_emoji_picker.set(None)),
                                                         }
                                                     }
-                                                    button {
-                                                        "data-testid": "add-reaction-button",
-                                                        class: format!(
-                                                            "add-reaction-btn inline-flex items-center justify-center text-xl leading-none hover:scale-110 {}",
-                                                            if has_reactions { "has-reactions" } else { "invisible h-0 overflow-hidden" }
-                                                        ),
-                                                        title: "Add reaction",
-                                                        onclick: {
-                                                            let picker_id = format!("inline-{}", msg_id_for_inline);
-                                                            let msg_id = msg_id_for_inline.clone();
-                                                            move |e: MouseEvent| {
-                                                                e.stop_propagation();
-                                                                if open_emoji_picker.peek().as_ref() == Some(&picker_id) {
-                                                                    crate::util::defer(move || open_emoji_picker.set(None));
-                                                                } else {
-                                                                    open_inline_picker(&msg_id);
-                                                                }
-                                                            }
-                                                        },
-                                                        "+"
+                                                    // Where the picker opens from. Not a control:
+                                                    // React is the hover bar's button, or the kebab
+                                                    // menu's on touch, so a message has one way in.
+                                                    span {
+                                                        "data-testid": "reaction-picker-anchor",
+                                                        "aria-hidden": "true",
+                                                        class: "invisible inline-block h-0 w-0 overflow-hidden",
                                                     }
                                                     // Inline emoji picker; placed by `open_inline_picker`.
                                                     if is_inline_picker_open {
                                                         div {
                                                             "data-testid": "emoji-picker",
                                                             id: "emoji-picker-{msg_id_for_inline}",
-                                                            // It hangs off the "+" at the message's foot.
+                                                            // It hangs off the anchor at the message's foot.
                                                             // Opened from the hover bar's React at the top
                                                             // of a message taller than the view, that is
                                                             // below the fold: bring it into view, only as
@@ -5180,10 +5220,17 @@ fn MessageGroupComponent(
                                                             },
                                                             class: format!(
                                                                 "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid pointer-events-auto {} {}",
-                                                                if picker_placement.read().above { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                                if picker_placement.read().above { "bottom-full" } else { "top-full mt-1" },
                                                                 if picker_placement.read().align_right { "right-0" } else { "left-0" },
                                                             ),
-                                                            style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
+                                                            style: format!(
+                                                                "grid-template-columns: repeat(4, 1fr); gap: 2px;{}",
+                                                                if picker_placement.read().above {
+                                                                    format!(" margin-bottom: {}px;", 4.0 + picker_placement.read().rise_px)
+                                                                } else {
+                                                                    String::new()
+                                                                },
+                                                            ),
                                                             onclick: move |e: MouseEvent| e.stop_propagation(),
                                                             {FREQUENT_EMOJIS.iter().map(|emoji| {
                                                                 let emoji_str = emoji.to_string();
@@ -5302,6 +5349,7 @@ mod tests {
             event_summary_parts(&names(3)),
             (vec![], "3 people joined".to_string())
         );
+        assert_eq!(join_names_list(&names(3)), "M0, M1, M2");
     }
 
     /// The @mention pickers and name lookup offer the owner and present

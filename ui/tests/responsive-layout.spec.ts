@@ -31,7 +31,9 @@ test.describe("Desktop layout (1280px)", () => {
 test.describe("Tablet layout (768px)", () => {
   test.use({ viewport: { width: 768, height: 1024 } });
 
-  test("shows all panels with narrower sidebars, no horizontal scrollbar", async ({ page }) => {
+  // Below 1024px the member panel is hidden until asked for (three columns
+  // are cramped on a tablet in portrait); the rooms rail stays.
+  test("shows the rail and the conversation, the member panel on request, no horizontal scrollbar", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
@@ -39,9 +41,9 @@ test.describe("Tablet layout (768px)", () => {
     await expect(
       page.locator("aside").filter({ hasText: "Rooms" })
     ).toBeVisible();
-    await expect(
-      page.getByTestId("members-rail")
-    ).toBeVisible();
+    await expect(page.getByTestId("members-rail")).toBeHidden();
+    await page.getByTestId("members-panel-toggle").click();
+    await expect(page.getByTestId("members-rail")).toBeVisible();
 
     const hasHScroll = await page.evaluate(
       () =>
@@ -199,6 +201,13 @@ test.describe("Desktop recovery after mobile", () => {
     await expect(
       page.getByTestId("members-rail")
     ).toBeVisible();
+
+    // Resize to a tablet width: the rail and the conversation, the member
+    // panel hidden (automatic below 1024px), whatever the phone view was.
+    await page.setViewportSize({ width: 900, height: 800 });
+    await expect(page.locator("aside").filter({ hasText: "Rooms" })).toBeVisible();
+    await expect(page.getByPlaceholder("Type your message...")).toBeVisible();
+    await expect(page.getByTestId("members-rail")).toBeHidden();
 
     // Resize to desktop
     await page.setViewportSize({ width: 1280, height: 800 });

@@ -1505,13 +1505,7 @@ pub fn MemberList() -> Element {
         // (dioxus-signal-safety.md). Asked for here too, not only by the
         // history: a room with no messages renders no history rows.
         crate::avatar_salt::ensure_avatar_salt(room_owner.to_bytes());
-        let avatar_salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
-            Ok(salts) => salts.get(&room_owner.to_bytes()).copied(),
-            Err(_) => {
-                crate::util::signal_guard::schedule_nudge();
-                None
-            }
-        };
+        let avatar_salt = crate::avatar_salt::salt_for_render(&room_owner.to_bytes());
         // `None` when this build holds no locally-known identity for the room.
         // The roster is public room state and stays fully readable; only the
         // per-row "relationship to me" flags (is_self, invited_you, sponsor,

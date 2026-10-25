@@ -102,14 +102,14 @@ async function removeOwnReaction(page: Page, chip: Locator) {
     await owners.getByTestId("reaction-remove").click();
     await expect(owners).toHaveCount(0);
     await expect(chip).toHaveCount(0);
-    // The chip that opened the list is gone, so focus goes to the nearest
-    // control left on that message rather than nowhere: its "+" while other
-    // chips remain, else its React action (the kebab on touch, the hover
-    // bar's React otherwise), since a message with no reactions has no "+".
+    // The chip that opened the list is gone, so focus stays on the reaction
+    // line rather than going nowhere: another chip while one remains, else
+    // the message's React action (the kebab on touch, the hover bar's React
+    // otherwise).
     const message = page.locator(`[id="${messageId}"]`);
     const nearest =
       (await message.getByTestId("reaction-chip").count()) > 0
-        ? message.getByTestId("add-reaction-button")
+        ? message.getByTestId("reaction-chip").first()
         : (await touchOnly(page))
           ? message.getByTestId("message-kebab")
           : message.getByTestId("message-hover-actions").getByRole("button", { name: "React" });
@@ -263,6 +263,37 @@ test.describe("Reaction owner list (#714)", () => {
       const added = await addOwnReaction(page);
       await removeOwnReaction(page, added);
     }
+  });
+});
+
+// Removing your reaction from the list while another member's chip remains
+// leaves focus on that chip, not on the React action at the message's top.
+test.describe("Reaction removed from the owner list", () => {
+  test("focus stays on the reaction line while a chip remains", async ({ page }) => {
+    test.skip(!(await coarsePointer(page)), "the list opens only on a coarse pointer");
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+    await settle(page);
+    await callRiverTest(page, "memberReactsToNewest", "🦀");
+    const target = page.locator('[id^="msg-"]').filter({ has: page.getByTestId("reaction-chip").filter({ hasText: "🦀" }) });
+    await expect(target).toHaveCount(1);
+    const message = page.locator(`[id="${await target.getAttribute("id")}"]`);
+    const chips = message.getByTestId("reaction-chip");
+    await message.scrollIntoViewIfNeeded();
+    await openInlinePicker(page, message);
+    await page.getByTestId("emoji-picker").getByRole("button").filter({ hasNotText: "🦀" }).first().click();
+    const own = message.locator('[data-testid="reaction-chip"][title*="click to remove"]');
+    await expect(own).toHaveCount(1);
+    await expect(chips).toHaveCount(2);
+
+    await pressChip(own);
+    const owners = page.getByTestId("reaction-owners");
+    await expect(owners).toBeVisible();
+    await owners.getByTestId("reaction-remove").click();
+    await expect(own).toHaveCount(0);
+    await expect(chips).toHaveCount(1);
+    await expect(chips.first()).toBeFocused();
   });
 });
 

@@ -152,98 +152,167 @@ test.describe("Message rows", () => {
     test.use({ viewport: { width: 1440, height: 900 } });
 
     // #791 review: nothing caught a width cap (65ch, max-w-prose, max-w-4xl)
-    // coming back. Rows span the column and a long body fills the 76ch measure.
+    // coming back. Rows span the conversation column (the panel, up to what a
+    // row needs) and a long body fills the 76ch measure.
     test("rows span the column and a long body fills its 76ch measure", async ({ page }) => {
       await openRoomWithComposer(page);
       const long = "A long line that keeps going ".repeat(12) + "until the end";
       await deliver(page, long);
       const row = page.getByTestId("message-row").filter({ hasText: "until the end" });
-      const m = await row.evaluate((el) => {
-        const scroller = document.getElementById("chat-scroll-container")!;
-        const body = el.querySelector('[data-testid="message-body"]')!;
-        const probe = document.createElement("div");
-        probe.style.width = "76ch";
-        body.appendChild(probe);
-        const measure = probe.getBoundingClientRect().width;
-        probe.remove();
-        const r = el.getBoundingClientRect();
-        const s = scroller.getBoundingClientRect();
-        return {
-          rowWidth: r.width,
-          scrollerInner: scroller.clientWidth,
-          rowLeft: r.left - s.left,
-          bodyWidth: body.getBoundingClientRect().width,
-          measure,
-          contentWidth: el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect().width,
-        };
-      });
-      expect(m.rowLeft, "the row starts at the scroller's edge").toBeCloseTo(0, 0);
-      expect(m.rowWidth, "the row spans the scroller").toBeCloseTo(m.scrollerInner, 0);
-      expect(m.contentWidth, "premise: the column is wider than the measure").toBeGreaterThan(m.measure);
+      const m = await columnMetrics(row);
+      expect(m.rowWidth, "the row spans the column").toBeCloseTo(m.columnWidth, 0);
       expect(m.bodyWidth, "the body fills the 76ch measure").toBeCloseTo(m.measure, 0);
+      expect(m.columnWidth, "the column is the panel, up to what a row needs").toBeCloseTo(
+        Math.min(m.scrollerInner, m.rowNeeds),
+        0,
+      );
     });
   });
 });
 
-// The design critique's first complaint: a narrow column centred in a broad
-// empty panel. On a wide window nothing centres: rows start at the panel's
-// edge and span it, the header and composer share one left edge near it, and
-// only the message text keeps its measure.
+/// Where a row sits in the history: the conversation column (`#chat-content`,
+/// `.conversation-column`) inside the scroller's client area, and what a row
+/// needs (its gutter, the body's measure and its right padding).
+async function columnMetrics(row: Locator) {
+  return row.evaluate((el) => {
+    const scroller = document.getElementById("chat-scroll-container")!;
+    const s = scroller.getBoundingClientRect();
+    const column = document.getElementById("chat-content")!.getBoundingClientRect();
+    const body = el.querySelector('[data-testid="message-body"]')!;
+    const probe = document.createElement("div");
+    probe.style.width = "76ch";
+    body.appendChild(probe);
+    const measure = probe.getBoundingClientRect().width;
+    probe.remove();
+    const cs = getComputedStyle(el);
+    const gutter = parseFloat(cs.gridTemplateColumns);
+    return {
+      scrollerInner: scroller.clientWidth,
+      columnLeft: column.left - s.left,
+      columnRight: s.left + scroller.clientWidth - column.right,
+      columnWidth: column.width,
+      rowLeft: el.getBoundingClientRect().left - s.left,
+      rowWidth: el.getBoundingClientRect().width,
+      bodyWidth: body.getBoundingClientRect().width,
+      bodyLeft: body.getBoundingClientRect().left - s.left,
+      measure,
+      rowNeeds: gutter + measure + parseFloat(cs.paddingRight),
+    };
+  });
+}
+
+// The design critique's first complaint was a narrow column centred in a
+// broad empty panel; its fix (#823) let rows span the panel, and on a wide
+// window that left the conversation hugging the left with an empty band on
+// the right. The conversation COLUMN is now centred once the panel is wider
+// than a row needs: equal gaps either side, text left-aligned at its measure.
+// The scroller stays panel-wide, so its scrollbar is at the panel's edge.
 test.describe("at 1920px", () => {
   test.use({ viewport: { width: 1920, height: 1080 } });
 
-  test("the conversation fills its panel, left-aligned, and text keeps its measure", async ({ page }) => {
+  test("the conversation column is centred, and text keeps its measure", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "A wide-window line that keeps going ".repeat(12) + "to the wide end");
     const row = page.getByTestId("message-row").filter({ hasText: "to the wide end" });
-    const m = await row.evaluate((el) => {
-      const scroller = document.getElementById("chat-scroll-container")!;
-      const s = scroller.getBoundingClientRect();
-      const body = el.querySelector('[data-testid="message-body"]')!;
-      const probe = document.createElement("div");
-      probe.style.width = "76ch";
-      body.appendChild(probe);
-      const measure = probe.getBoundingClientRect().width;
-      probe.remove();
-      const left = (sel: string) => document.querySelector(sel)!.getBoundingClientRect().left;
-      return {
-        rowLeft: el.getBoundingClientRect().left - s.left,
-        rowWidth: el.getBoundingClientRect().width,
-        scrollerInner: scroller.clientWidth,
-        bodyWidth: body.getBoundingClientRect().width,
-        contentWidth: el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect().width,
-        measure,
-        header: left('[data-testid="room-header-row"]') - s.left,
-        // The composer's content edge: its padded inner wrapper.
-        composer: (() => {
-          const inner = document.querySelector('[data-testid="message-composer"] > div')!;
-          return inner.getBoundingClientRect().left + parseFloat(getComputedStyle(inner).paddingLeft) - s.left;
-        })(),
-      };
-    });
-    expect(m.rowLeft, "the row starts at the panel's edge: no centring gutter").toBeCloseTo(0, 0);
-    expect(m.rowWidth, "the row spans the panel").toBeCloseTo(m.scrollerInner, 0);
-    expect(m.contentWidth, "premise: the column is far wider than the measure").toBeGreaterThan(m.measure + 200);
+    const m = await columnMetrics(row);
+    expect(m.scrollerInner, "premise: the panel is far wider than a row needs").toBeGreaterThan(m.rowNeeds + 200);
+    expect(m.columnWidth, "the column is what a row needs").toBeCloseTo(m.rowNeeds, 0);
+    expect(Math.abs(m.columnLeft - m.columnRight), "equal side gaps").toBeLessThanOrEqual(1);
+    expect(m.rowLeft, "the row starts at the column's edge").toBeCloseTo(m.columnLeft, 0);
     expect(m.bodyWidth, "the text keeps its 76ch measure").toBeCloseTo(m.measure, 0);
-    expect(m.header, "the header sits at the panel's left padding").toBeLessThanOrEqual(24);
-    expect(m.composer, "the composer shares the header's left edge").toBeCloseTo(m.header, 0);
+    // The scroller itself spans the panel (its scrollbar at the panel's edge).
+    const panel = await page.locator("#chat-scroll-container").evaluate((el) => ({
+      scroller: el.getBoundingClientRect().width,
+      parent: el.parentElement!.getBoundingClientRect().width,
+    }));
+    expect(panel.scroller).toBeCloseTo(panel.parent, 0);
 
-    // A date separator is centred over the text column (gutter + measure),
-    // not the whole panel, so its label stays near the text.
+    // The composer sits in the same column: its box starts at the column's
+    // left plus the composer's padding, as it starts at the panel's otherwise.
+    // Centred in the panel, where the history centres in the scroller's
+    // client area: they differ by half a classic scrollbar, if any.
+    const composer = await page.getByTestId("message-composer").evaluate((el) => {
+      const sc = document.getElementById("chat-scroll-container")!;
+      const s = sc.getBoundingClientRect();
+      const inner = el.firstElementChild as HTMLElement;
+      const r = inner.getBoundingClientRect();
+      return { left: r.left - s.left, width: r.width, halfScrollbar: (sc.offsetWidth - sc.clientWidth) / 2 };
+    });
+    expect(Math.abs(composer.left - m.columnLeft - composer.halfScrollbar), "the composer's column lines up with the history's").toBeLessThanOrEqual(1);
+    expect(composer.width).toBeCloseTo(m.columnWidth, 0);
+
+    // A date separator stays within the column, its label over the text.
     await callRiverTest(page, "appendJoinEvents", 1);
     const sep = page.getByTestId("date-separator").last();
     await expect(sep).toBeAttached();
-    const d = await sep.evaluate((el, measure) => {
+    const d = await sep.evaluate((el) => {
       const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
       const r = el.getBoundingClientRect();
-      // The label is the text node between the two rules.
       const range = document.createRange();
       range.selectNodeContents(el);
       const label = range.getBoundingClientRect();
-      return { right: r.right - s.left, labelCentre: (label.left + label.right) / 2 - s.left, textEnd: 60 + (measure as number) };
-    }, m.measure);
-    expect(d.right, "the separator ends near the text's measure").toBeLessThanOrEqual(d.textEnd + 2);
-    expect(d.labelCentre, "its label sits over the text column").toBeLessThan(d.textEnd);
+      return { left: r.left - s.left, right: r.right - s.left, labelCentre: (label.left + label.right) / 2 - s.left };
+    });
+    expect(d.left, "the separator is inside the column").toBeGreaterThanOrEqual(m.columnLeft);
+    expect(d.right, "the separator ends near the text's measure").toBeLessThanOrEqual(m.columnLeft + 60 + m.measure + 2);
+    expect(d.labelCentre, "its label sits over the text column").toBeLessThan(m.columnLeft + 60 + m.measure);
+  });
+
+  // Horizontal only: every line in a row is already bounded by the measure,
+  // so centring the column changes no row's height, and so nothing the
+  // history's scroll corrections measure (history-scrolling.md).
+  test("centring changes no row's height", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await deliver(page, "A wide-window line that keeps going ".repeat(12) + "to the wide end");
+    const heights = () =>
+      page.locator("#chat-content [data-item-key]").evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().height)));
+    const centred = await heights();
+    await page.addStyleTag({ content: ".conversation-column { max-width: none !important; }" });
+    await expect.poll(async () => (await page.locator("#chat-content").boundingBox())!.width, { message: "premise: the column is panel-wide again" }).toBeGreaterThan(1300);
+    expect(await heights(), "row heights, centred and full-width").toEqual(centred);
+  });
+
+  test("Latest sits at the column's corner", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await readerScrollsWithoutGesture(page, 0);
+    const latest = page.getByTestId("scroll-to-bottom");
+    await expect(latest).toBeVisible();
+    // Its frame is centred in the panel, the history in the scroller's client
+    // area: they differ by half a classic scrollbar, if any.
+    const g = await page.evaluate(() => {
+      const sc = document.getElementById("chat-scroll-container")!;
+      const column = document.getElementById("chat-content")!.getBoundingClientRect();
+      const b = document.querySelector('[data-testid="scroll-to-bottom"]')!.getBoundingClientRect();
+      return { columnRight: column.right, buttonRight: b.right, halfScrollbar: (sc.offsetWidth - sc.clientWidth) / 2 };
+    });
+    expect(Math.abs(g.columnRight + g.halfScrollbar - g.buttonRight - 16), "16px in from the column's right edge").toBeLessThanOrEqual(1);
+    // It still takes the click (its frame takes none).
+    await latest.click();
+    await expect(latest).toBeHidden();
+  });
+});
+
+// Below a row's width nothing changes: at 1024 (both side panels, at their
+// tablet widths) the panel is narrower than a row needs, and the column is
+// exactly the panel, as before the centring. At 1280 the panel is within a
+// few tens of px of a row's width (8px in Chromium, more where an engine's
+// `ch` is narrower), so the column is the row's width with small equal gaps.
+test.describe("narrower windows", () => {
+  test("at 1024px the column is the whole panel, as before", async ({ page }) => {
+    await page.setViewportSize({ width: 1024, height: 900 });
+    await openRoomWithComposer(page);
+    const m = await columnMetrics(page.getByTestId("message-row").last());
+    expect(m.scrollerInner, "premise: the panel is narrower than a row needs").toBeLessThan(m.rowNeeds);
+    expect(m.columnWidth).toBeCloseTo(m.scrollerInner, 0);
+    expect(m.columnLeft).toBeCloseTo(0, 0);
+  });
+
+  test("at 1280px the column is at most a row wide, centred", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await openRoomWithComposer(page);
+    const m = await columnMetrics(page.getByTestId("message-row").last());
+    expect(m.columnWidth).toBeCloseTo(Math.min(m.scrollerInner, m.rowNeeds), 0);
+    expect(Math.abs(m.columnLeft - m.columnRight)).toBeLessThanOrEqual(1);
   });
 });
 
@@ -319,6 +388,9 @@ test.describe("Avatars", () => {
     await callRiverTest(page, "setAvatarSalt", null);
     await expect.poll(isGrey, { message: "no salt: a neutral disc" }).toBe(true);
     await expect(avatar).not.toHaveAttribute("style", /--avatar-hue/);
+    // And it stays neutral: nothing restarts a read that gave up here.
+    await page.waitForTimeout(500);
+    expect(await isGrey(), "still neutral").toBe(true);
 
     // Exact hues for the fixed-key sender (Test Sender Insert) under two
     // salts, pinned natively by `the_fixed_test_senders_hues_are_pinned`:
@@ -343,10 +415,93 @@ test.describe("Avatars", () => {
     expect(underOne.every((h) => h !== ""), "every listed author is coloured").toBe(true);
     expect(first).not.toBe("");
 
+    // A read seed colours the disc before its salt is stored: render
+    // computes the salt from the seed (`salt_for_render`). No salt is stored
+    // (cleared first, and the hook stores none), so the colour can only come
+    // from that fallback. (Not compared with a hue: the example room's key
+    // is random per load, so the seed's hue is too.)
+    await callRiverTest(page, "setAvatarSalt", null);
+    await expect.poll(isGrey, { message: "cleared: neutral" }).toBe(true);
+    await callRiverTest(page, "setSeedReadUnstored", 3);
+    await expect(avatar).toHaveAttribute("style", /--avatar-hue/);
+    await expect.poll(isGrey, { message: "a read seed colours the disc" }).toBe(false);
+
     // Your own avatar carries the accent ring.
     const ring = await own.getByTestId("message-author-avatar").evaluate((el) => getComputedStyle(el).outlineStyle);
     expect(ring).toBe("solid");
     expect(await avatar.evaluate((el) => getComputedStyle(el).outlineStyle)).toBe("none");
+  });
+});
+
+// React has one way in per pointer: the hover bar's React with a mouse, the
+// kebab menu's React on touch. A faint "+" after a message's reaction chips
+// was a second way; Ian found two controls for one action untidy
+// (2026-10-25), so it was removed. Its element stays only as the inert
+// anchor the picker opens from, so it must never show or take a tap.
+test.describe("Reaction row", () => {
+  test("a message with reactions shows no add-reaction control after its chips", async ({ page }) => {
+    const { own } = await openRoomWithPairs(page);
+    const row = own.getByTestId("message-row").last();
+    await reactTo(page, row);
+    if (!(await coarsePointer(page))) await row.hover({ position: { x: 4, y: 4 } });
+
+    const anchor = row.getByTestId("reaction-picker-anchor");
+    await expect(anchor).toBeAttached();
+    await expect(anchor).toBeHidden();
+    const m = await anchor.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      return { w: r.width, h: r.height, events: getComputedStyle(el.parentElement!).pointerEvents, text: el.textContent };
+    });
+    expect(m).toEqual({ w: 0, h: 0, events: "none", text: "" });
+    // The reaction line holds the chips and nothing else a reader can press.
+    const reactionRow = row.getByTestId("message-reaction-row");
+    await expect(reactionRow.getByTestId("reaction-chip")).toHaveCount(1);
+    await expect(reactionRow.locator('button:not([data-testid="reaction-chip"]):visible')).toHaveCount(0);
+
+    // The picker opens below or above the chips, never over them.
+    await openInlinePicker(page, row);
+    const picker = page.getByTestId("emoji-picker");
+    await expect(picker).toBeVisible();
+    const p = (await picker.boundingBox())!;
+    const c = (await reactionRow.getByTestId("reaction-chip").boundingBox())!;
+    const clear = p.y >= c.y + c.height - 0.5 || p.y + p.height <= c.y + 0.5;
+    expect(clear, `picker ${p.y}..${p.y + p.height} vs chips ${c.y}..${c.y + c.height}`).toBe(true);
+  });
+});
+
+// Chips that wrap onto several lines: the anchor shares only the last one,
+// and a picker opening upward must clear the lines above it too.
+test.describe("Reaction row that wraps, at 320px", () => {
+  test.use({ viewport: { width: 320, height: 700 } });
+
+  test("the picker covers no chip on any line", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await callRiverTest(page, "appendMessage", "wrap target");
+    const row = page.getByTestId("message-row").filter({ hasText: "wrap target" });
+    await expect(row).toBeVisible();
+    await callRiverTest(page, "addReactionsToNewest", ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"]);
+    const chips = row.getByTestId("reaction-chip");
+    await expect(chips).toHaveCount(10);
+    await row.evaluate((el) => el.scrollIntoView({ block: "end" }));
+    const lines = new Set((await chips.evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().top)))));
+    expect(lines.size, "premise: the chips wrap").toBeGreaterThan(1);
+
+    await openInlinePicker(page, row);
+    const picker = page.getByTestId("emoji-picker");
+    await expect(picker).toBeVisible();
+    const p = (await picker.boundingBox())!;
+    const overlaps = await chips.evaluateAll(
+      (els, p) =>
+        els.filter((e) => {
+          const r = e.getBoundingClientRect();
+          return r.left < p.x + p.width && r.right > p.x && r.top < p.y + p.height - 0.5 && r.bottom > p.y + 0.5;
+        }).length,
+      p,
+    );
+    expect(overlaps, "chips under the picker").toBe(0);
+    // Premise: it opened upward, past the first line, so the rise mattered.
+    expect(p.y + p.height, "the picker sits above the first chip line").toBeLessThanOrEqual(Math.min(...lines) + 0.5);
+    expectEveryEmojiTappable(await measurePicker(page));
   });
 });
 
@@ -377,6 +532,35 @@ test.describe("Join notices and date separators", () => {
     }));
     expect(rule.before).toBe("1px");
     expect(rule.bg).toBe("rgba(0, 0, 0, 0)");
+  });
+
+  // Ivvor: "8 people joined" should say who, to tell new members from
+  // established ones. Hover shows the names; a tap or click lists them.
+  test("a count of joins names who on hover and when opened", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await callRiverTest(page, "appendJoinEvents", 3);
+    const notice = page.getByTestId("join-notice").last();
+    const toggle = notice.getByTestId("join-notice-toggle");
+    const list = notice.getByTestId("join-notice-names");
+    const who = /^Test Sender [AB], Test Sender [AB], Test Sender [AB]$/;
+    await expect(toggle).toContainText(/^3 people joined · \d{1,2}:\d{2}/);
+    await expect(toggle).toHaveAttribute("title", who);
+    await expect(list).toBeHidden();
+
+    await toggle.click();
+    await expect(list).toBeVisible();
+    await expect(list).toHaveText(who);
+    // One element per name, so a nickname holding ", " reads as one person.
+    await expect(list.locator(".join-name")).toHaveCount(3);
+
+    // A re-render (another join folding in) keeps it open and adds the name.
+    await callRiverTest(page, "appendJoinEvents", 1);
+    await expect(toggle).toContainText(/^4 people joined/);
+    await expect(list).toBeVisible();
+    await expect(list).toHaveText(/^(Test Sender [AB], ){3}Test Sender [AB]$/);
+
+    await toggle.click();
+    await expect(list).toBeHidden();
   });
 });
 
@@ -446,12 +630,12 @@ test.describe("Message rows at 320px", () => {
   });
 });
 
-// The inline picker hangs off the "+" after a row's chips, and the scroller
+// The inline picker hangs off the anchor after a row's chips, and the scroller
 // clips its sides, so at 320px it opens toward the roomier side. Each case
 // checks every emoji is inside the scroller and takes a tap at its centre.
 type PickerReport = Awaited<ReturnType<typeof measurePicker>>;
 
-/// The open picker, its "+" wrapper (the picker's containing block) and the
+/// The open picker, its anchor's wrapper (the picker's containing block) and the
 /// scroller, with no click in between: a click elsewhere would close it.
 async function measurePicker(page: Page) {
   await expect(page.getByTestId("emoji-picker")).toBeVisible();
@@ -462,7 +646,7 @@ async function measurePicker(page: Page) {
     };
     const scroller = box(document.getElementById("chat-scroll-container")!);
     const picker = document.querySelector('[data-testid="emoji-picker"]')!;
-    const plus = picker.parentElement!.querySelector('[data-testid="add-reaction-button"]')!;
+    const anchorEl = picker.parentElement!.querySelector('[data-testid="reaction-picker-anchor"]')!;
     const buttons = Array.from(picker.querySelectorAll("button")).map((b) => {
       const r = b.getBoundingClientRect();
       const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
@@ -473,7 +657,7 @@ async function measurePicker(page: Page) {
         hit: at !== null && (at === b || b.contains(at)),
       };
     });
-    return { scroller, anchor: box(plus.parentElement!), picker: box(picker), buttons };
+    return { scroller, anchor: box(anchorEl.parentElement!), picker: box(picker), buttons };
   });
 }
 
@@ -486,9 +670,9 @@ function expectEveryEmojiTappable(report: PickerReport) {
 }
 
 /// The newest message, "picker edge", with as many reaction chips as leave its
-/// "+" on their line, so "+" ends near the column's right edge. A fixed count
-/// does not do it: four chips left "+" at 160px in Chromium, where a 140px
-/// picker still fit, and six wrapped "+" to the line's start in WebKit, whose
+/// the anchor on their line, so the anchor sits near the column's right edge. A fixed count
+/// does not do it: four chips left the anchor at 160px in Chromium, where a 140px
+/// picker still fit, and six wrapped the anchor to the line's start in WebKit, whose
 /// emoji chips are 3px wider.
 async function nearEdgeRow(page: Page): Promise<Locator> {
   const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"];
@@ -500,10 +684,10 @@ async function nearEdgeRow(page: Page): Promise<Locator> {
   await expect(chips).toHaveCount(1);
   const fit = await row.evaluate((el) => {
     const chip = el.querySelector('[data-testid="reaction-chip"]')!.getBoundingClientRect();
-    const plus = el.querySelector('[data-testid="add-reaction-button"]')!.getBoundingClientRect();
+    const anchorEl = el.querySelector('[data-testid="reaction-picker-anchor"]')!.getBoundingClientRect();
     const line = el.querySelector('[data-testid="message-reaction-row"]')!.getBoundingClientRect();
-    // Each chip moves "+" one chip and its gap further right.
-    return Math.floor((line.right - plus.right) / (plus.left - chip.left)) + 1;
+    // Each chip moves the anchor one chip and its gap further right.
+    return Math.floor((line.right - anchorEl.right) / (anchorEl.left - chip.left)) + 1;
   });
   expect(fit, "chips that fit one line").toBeLessThanOrEqual(emojis.length);
   await callRiverTest(page, "addReactionsToNewest", emojis.slice(1, fit));
@@ -512,7 +696,7 @@ async function nearEdgeRow(page: Page): Promise<Locator> {
   return row;
 }
 
-/// What `left-0` would do: a rightward picker from this "+" ends past the scroller.
+/// What `left-0` would do: a rightward picker from this anchor ends past the scroller.
 function expectRightwardWouldClip(report: PickerReport) {
   expect(report.anchor.left + width(report.picker), "premise: a rightward picker would clip").toBeGreaterThan(report.scroller.right);
 }
@@ -575,7 +759,7 @@ test.describe("Reaction picker at 320px", () => {
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
     await openInlinePicker(page, row);
     const report = await measurePicker(page);
-    // What an unconditional `right-0` would do: a leftward picker from this "+" starts before the scroller.
+    // What an unconditional `right-0` would do: a leftward picker from this anchor starts before the scroller.
     expect(report.anchor.right - width(report.picker), "premise: + starts the line").toBeLessThan(report.scroller.left);
     expectEveryEmojiTappable(report);
   });
@@ -593,7 +777,7 @@ test.describe("Reaction picker at 320px", () => {
 });
 
 // #791 review: the picker opened from the keyboard reports no click
-// position, so its side must come from the "+" it hangs off. The newest
+// position, so its side must come from the anchor it hangs off. The newest
 // message, at the bottom of the view, has no room for the picker below it.
 test("the picker opened from the keyboard at the bottom of the view opens upward", async ({ page }) => {
   test.skip(await touchOnly(page), "no hover bar, so no keyboard path, on touch");
@@ -602,7 +786,7 @@ test("the picker opened from the keyboard at the bottom of the view opens upward
   const row = page.getByTestId("message-row").filter({ hasText: "keyboard picker" });
   await expect(row).toBeInViewport();
   const room = await row.evaluate((el) => {
-    const r = el.querySelector('[data-testid="add-reaction-button"]')!.parentElement!.getBoundingClientRect();
+    const r = el.querySelector('[data-testid="reaction-picker-anchor"]')!.parentElement!.getBoundingClientRect();
     const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
     return { below: s.bottom - r.bottom, above: r.top - s.top };
   });
@@ -832,7 +1016,7 @@ test.describe("Hover bar", () => {
   });
 });
 
-// React on a message taller than the view: the picker hangs off the "+" at
+// React on a message taller than the view: the picker hangs off the anchor at
 // the message's foot, below the fold when React is taken from the top of the
 // message. Opening brings it into view, and the next click is the reader's
 // pick, not swallowed by the invisible backdrop.
@@ -854,13 +1038,13 @@ test.describe("React on a tall message", () => {
       page.evaluate(() => {
         const c = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
         const p = document.querySelector('[data-testid="emoji-picker"]')?.getBoundingClientRect();
-        const plus = Array.from(document.querySelectorAll('[data-testid="message-row"]'))
+        const anchorEl = Array.from(document.querySelectorAll('[data-testid="message-row"]'))
           .find((r) => r.textContent!.includes("tall paragraph 59"))!
-          .querySelector('[data-testid="add-reaction-button"]')!
+          .querySelector('[data-testid="reaction-picker-anchor"]')!
           .parentElement!.getBoundingClientRect();
-        return { view: [c.top, c.bottom], picker: p ? [p.top, p.bottom] : null, plusTop: plus.top };
+        return { view: [c.top, c.bottom], picker: p ? [p.top, p.bottom] : null, anchorTop: anchorEl.top };
       });
-    expect((await geometry()).plusTop, "premise: the message's foot is below the view").toBeGreaterThan((await geometry()).view[1]);
+    expect((await geometry()).anchorTop, "premise: the message's foot is below the view").toBeGreaterThan((await geometry()).view[1]);
 
     await openInlinePicker(page, row);
     const picker = page.getByTestId("emoji-picker");
@@ -957,3 +1141,29 @@ test.describe("Latest over row controls", () => {
     await expect(latest).toBeHidden();
   });
 });
+
+// The hover bar ends at the text measure, not the row's far edge, so it
+// stays next to the message it acts on: in the centred column (where the
+// row's content is the measure) and wherever a row is wider than that (here
+// forced, by lifting the column's cap).
+for (const wide of [false, true]) {
+  test(`the hover bar ends at the text column on a wide window${wide ? ", in a row wider than the measure" : ""}`, async ({ page }) => {
+    test.skip(await touchOnly(page), "touch has no hover bar");
+    await page.setViewportSize({ width: 1920, height: 900 });
+    const { received } = await openRoomWithPairs(page);
+    if (wide) await page.addStyleTag({ content: ".conversation-column { max-width: none !important; }" });
+    const row = received.getByTestId("message-row").last();
+    await row.hover();
+    const bar = (await row.getByTestId("message-hover-actions").boundingBox())!;
+    const m = await row.evaluate((el) => {
+      const body = el.querySelector('[data-testid="message-body"]')!;
+      const content = el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect();
+      return {
+        measureRight: body.getBoundingClientRect().left + parseFloat(getComputedStyle(body).maxWidth),
+        contentRight: content.right,
+      };
+    });
+    if (wide) expect(m.contentRight - m.measureRight, "premise: the row is wider than the text measure").toBeGreaterThan(100);
+    expect(Math.abs(bar.x + bar.width - m.measureRight), "bar's right edge at the measure").toBeLessThanOrEqual(1);
+  });
+}

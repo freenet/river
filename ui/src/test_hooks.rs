@@ -202,6 +202,18 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // A signed reaction from a test member to the newest message (not an
+    // action or event), so it survives the rebuild every toggle does, as the
+    // chips `addReactionsToNewest` writes straight into state do not. Public
+    // rooms only: a private room does not admit a public action.
+    set_hook(
+        "memberReactsToNewest",
+        Closure::<dyn FnMut(String)>::new(move |emoji: String| {
+            crate::util::defer(move || member_reacts_to_newest(emoji));
+        })
+        .into_js_value(),
+    );
+
     // Replace the current room's avatar salt with 32 copies of `fill`, or
     // remove it with `null`, so a spec can see both the neutral disc and two
     // different salts colouring one member differently.
@@ -219,8 +231,30 @@ pub fn install_test_hooks() {
                         salts.insert(key, [b; 32]);
                     }
                     None => {
+                        // Render also computes a salt from a read seed,
+                        // so "no salt" means the seed read gave up.
+                        crate::avatar_salt::give_up_for_test();
                         salts.remove(&key);
                     }
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
+    // The seed is read (32 copies of `fill`) but the current room's salt is
+    // not stored: what a render sees between the seed read and the deferred
+    // store, which `avatar_salt::salt_for_render` covers.
+    set_hook(
+        "setSeedReadUnstored",
+        Closure::<dyn FnMut(u8)>::new(move |fill: u8| {
+            crate::util::defer(move || {
+                let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+                    return;
+                };
+                crate::avatar_salt::seed_read_unstored_for_test([fill; 32]);
+                crate::avatar_salt::AVATAR_SALTS.with_mut(|salts| {
+                    salts.remove(&room_key.to_bytes());
                 });
             });
         })
@@ -651,6 +685,30 @@ fn add_reactions_to_newest(emojis: Vec<String>) {
         for emoji in emojis {
             reactions.insert(emoji, vec![reactor]);
         }
+    });
+}
+
+fn member_reacts_to_newest(emoji: String) {
+    with_current_room_mut(|room, room_key| {
+        let Some(target) = room
+            .room_state
+            .recent_messages
+            .messages
+            .iter()
+            .rev()
+            .find(|m| !m.message.content.is_action() && !m.message.content.is_event())
+            .map(|m| m.id())
+        else {
+            web_sys::console::error_1(&"__riverTest.memberReactsToNewest: no messages".into());
+            return;
+        };
+        push_test_body(
+            room,
+            room_key,
+            RoomMessageBody::reaction(target, emoji),
+            Delivery::Append,
+        );
+        room.room_state.recent_messages.rebuild_actions_state();
     });
 }
 

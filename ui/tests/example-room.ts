@@ -195,15 +195,10 @@ export function coarsePointer(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none), (any-pointer: coarse)").matches);
 }
 
-/// Open `row`'s inline reaction picker. A row with reactions shows a "+"
-/// after its chips: hover the row unless a finger is the pointer, then click
-/// it. A row without any has no "+" to click, so take its React action: the
-/// hover bar's on a hover pointer, the kebab menu's on touch.
+/// Open `row`'s inline reaction picker through its React action, the only
+/// way in: the hover bar's on a hover pointer, the kebab menu's on touch.
 export async function openInlinePicker(page: Page, row: Locator) {
-  if ((await row.getByTestId("reaction-chip").count()) > 0) {
-    if (!(await coarsePointer(page))) await row.hover();
-    await row.getByTestId("add-reaction-button").click();
-  } else if (await touchOnly(page)) {
+  if (await touchOnly(page)) {
     await row.getByTestId("message-kebab").click();
     await page.getByTestId("message-action-menu").getByRole("button", { name: "React" }).click();
   } else {

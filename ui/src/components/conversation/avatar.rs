@@ -1,9 +1,10 @@
 //! Initials avatars for message authors.
 //!
 //! The disc's colour is per viewer: [`crate::avatar_salt::avatar_hue`] under
-//! the room's salt in [`crate::avatar_salt::AVATAR_SALTS`]. A room whose salt
-//! is absent gets a neutral grey disc; there is deliberately no other source
-//! of colour (see `avatar_salt.rs`).
+//! the room's salt from [`crate::avatar_salt::salt_for_render`] (stored, or
+//! computed from this viewer's read seed). A room with no salt gets a neutral
+//! grey disc; there is deliberately no other source of colour (see
+//! `avatar_salt.rs`).
 
 use river_core::room_state::member::MemberId;
 use river_core::room_state::ChatRoomStateV1;
