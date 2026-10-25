@@ -37,10 +37,16 @@
   --color-text-muted: #6b6b6b;
   --color-text-quote: #5c5c5c;
   --color-text-inverse: #ffffff;
+  /* Text links and mentions: 4.5:1 on the row, its hover band and a mention chip. */
+  --color-link: #024cb0;
+  --color-link-hover: #013b8a;
   --color-success-bg: #f0fdf4;
   --color-warning-bg: #fefce8;
   --color-error-bg: #fef2f2;
   --color-accent-soft: oklch(from #0265e7 l c h / 12%);
+  /* Message-row hover band. Derived from the surface token, so the dark
+     value follows the dark --color-surface below. */
+  --color-row-hover: color-mix(in srgb, var(--color-surface) 40%, transparent);
 }
 
 /* Dark mode colors */
@@ -56,6 +62,8 @@
     --color-text-muted: #9a9a9e;
     --color-text-quote: #b4b4b9;
     --color-text-inverse: #1a1a1a;
+    --color-link: #5c9dff;
+    --color-link-hover: #7db2ff;
     --color-success-bg: #052e16;
     --color-warning-bg: #422006;
     --color-error-bg: #450a0a;
@@ -75,6 +83,9 @@
 
 @utility text-text { color: var(--color-text); }
 @utility text-text-muted { color: var(--color-text-muted); }
+@utility text-text-quote { color: var(--color-text-quote); }
+@utility text-link { color: var(--color-link); }
+@utility text-link-hover { color: var(--color-link-hover); }
 @utility text-text-inverse { color: var(--color-text-inverse); }
 
 @utility border-border { border-color: var(--color-border); }
@@ -105,7 +116,7 @@ html, body {
    <p> blocks the Markdown renderer emits for blank-line-separated
    paragraphs collapse into a single wall of text (freenet/river#158).
    Re-add vertical spacing between paragraphs, but trim the outer edges
-   so a message bubble has no dangling gap above its first paragraph or
+   so a message body has no dangling gap above its first paragraph or
    below its last. Single newlines are already preserved as <br> by
    message_to_html, so this rule only affects true paragraph breaks. */
 .prose p {
@@ -118,28 +129,17 @@ html, body {
 
 /* Link styling for prose content (Markdown messages) */
 .prose a {
-  color: var(--color-accent);
+  color: var(--color-link);
   text-decoration: underline;
   text-underline-offset: 2px;
   transition: color 0.15s ease;
 }
 
 .prose a:hover {
-  color: var(--color-accent-hover);
+  color: var(--color-link-hover);
 }
 
-/* Links in self-messages (blue background, white text) */
-.bg-accent .prose a {
-  color: white;
-  text-decoration: underline;
-  opacity: 0.95;
-}
-
-.bg-accent .prose a:hover {
-  opacity: 1;
-}
-
-/* Inline code in prose (received messages) */
+/* Inline code in prose */
 .prose code {
   background-color: rgba(0, 0, 0, 0.08);
   padding: 0.125rem 0.25rem;
@@ -153,13 +153,7 @@ html, body {
   }
 }
 
-/* Inline code in sent messages (blue background) */
-.bg-accent .prose code {
-  background-color: rgba(255, 255, 255, 0.2);
-  color: inherit;
-}
-
-/* Code blocks in prose (received messages) */
+/* Code blocks in prose */
 .prose pre {
   background-color: rgba(0, 0, 0, 0.08);
   padding: 0.75rem 1rem;
@@ -173,71 +167,30 @@ html, body {
   }
 }
 
-/* Code blocks in sent messages (blue background) */
-.bg-accent .prose pre {
-  background-color: rgba(0, 0, 0, 0.15);
-  color: inherit;
-}
-
 .prose pre code {
   background-color: transparent;
   padding: 0;
 }
 
-/* Blockquotes in prose (received bubbles, DM bubbles, room descriptions).
+/* Blockquotes in prose (message rows, DM bubbles, room descriptions).
  *
  * `--color-text-quote` rather than `--color-text-muted`: a quote must stay
- * READABLE while reading as secondary, and the muted token — which is tuned
- * for timestamps and field labels, i.e. glanceable metadata — falls under the
- * 4.5:1 WCAG AA floor on two of the backgrounds a quote actually appears over,
- * BOTH of them in light mode: 4.47:1 on `--color-surface` (a received bubble)
- * and 3.96:1 on the `bg-accent/20` outgoing DM bubble, which is the worst
- * quote surface in the app. The dark-mode equivalents were already fine
- * (5.93:1 and 5.56:1). The quote token is one step further from the background
- * in each mode, which clears AA on every quote surface (5.61:1 / 4.97:1 light,
- * 8.05:1 / 7.55:1 dark) while staying well clear of `--color-text` so the
- * muted look survives. It is deliberately a SEPARATE token: nudging
- * `--color-text-muted` itself would repaint every timestamp, placeholder and
- * label in the app.
+ * READABLE while reading as secondary, and the muted token (tuned for
+ * timestamps and labels) falls under the 4.5:1 WCAG AA floor on the light
+ * `bg-accent/20` outgoing DM bubble, the worst quote surface in the app.
+ * message-contrast.spec.ts and blockquote-contrast.spec.ts measure the row
+ * and DM-bubble surfaces in both themes.
+ * It is deliberately a SEPARATE token: nudging `--color-text-muted` itself
+ * would repaint every timestamp, placeholder and label in the app.
  *
- * Those numbers are measured against the REAL DM modal, not a stand-in. An
- * earlier revision of this comment claimed "4.40:1 on a dark-mode DM bubble",
- * which was wrong in both the scheme and the value: it came from a synthetic
- * page that put the bubble on `--color-bg` instead of the modal's panel, read
- * through a colour helper that un-premultiplied an already-straight-alpha
- * canvas readback. Both errors inflated a translucent background. Measure a
- * translucent surface where it actually renders. */
+ * Measure a translucent surface where it renders (the DM bubble over the
+ * modal panel, not `--color-bg`). */
 .prose blockquote {
   border-left: 3px solid var(--color-accent);
   padding-left: 1rem;
   margin-left: 0;
   color: var(--color-text-quote);
   font-style: italic;
-}
-
-/* Blockquotes in own message bubbles (solid brand-blue bg, white text).
- *
- * This rule used to paint the quote `rgba(0, 0, 0, 0.8)` — near-black text in
- * a bubble whose every other word is white. That is the same failure the
- * `.bg-accent .river-mention` / `.bg-accent .prose a` overrides in main.css
- * exist to prevent, just for a different element: `.bg-accent` is the SAME
- * brand blue in light and dark mode, so the quote read as black-on-blue in
- * BOTH (3.52:1, under the 4.5:1 WCAG AA floor, against 5.23:1 for the normal
- * text right beside it). The `--color-accent-hover` border made it worse — at
- * 1.29:1 against the accent background it was invisible, so a quote in a sent
- * bubble had no marker at all beyond the indent.
- *
- * Take the bubble's own text colour (`inherit` → white) rather than a
- * hardcoded one, so the quote can never drift from the bubble's palette again.
- * Dimming is deliberately NOT how the quote is distinguished here: white on
- * the accent blue is only 5.23:1 to begin with, so any meaningful reduction
- * drops under AA. The affordance is carried by the border + the inherited
- * `font-style: italic` instead — the same convention `.bg-accent .prose a`
- * (white + underline) and the reply strip (`bg-white/25 text-white/90`) use
- * for sent bubbles. */
-.bg-accent .prose blockquote {
-  border-left-color: rgba(255, 255, 255, 0.7);
-  color: inherit;
 }
 
 /* Lists in prose (Tailwind reset strips list-style) */
@@ -265,12 +218,6 @@ html, body {
   list-style-type: square;
 }
 
-/* Lists in own message bubbles (blue bg) */
-.bg-accent .prose ul,
-.bg-accent .prose ol {
-  color: inherit;
-}
-
 /* iOS Safari viewport and touch fixes */
 
 /* Use fixed positioning for the app root to prevent iOS Safari's
@@ -281,6 +228,10 @@ html, body {
 .app-root {
   position: fixed;
   inset: 0;
+  /* The width the breakpoints read: narrowing the window, Chromium briefly
+     lays `inset: 0` out at the old width, and that one reflow moved a reader
+     held at the end. The root never scrolls, so 100vw is the viewport. */
+  width: 100vw;
 }
 
 /* Disable 300ms tap delay on all interactive elements.

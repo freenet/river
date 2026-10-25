@@ -100,25 +100,28 @@ export function memberRows(page: Page): Locator {
   return page.getByTestId("member-list").locator('[data-testid^="member-item-"] button');
 }
 
-// Self owns "Your Private Room"; in "Public Discussion Room" self is an observer with no composer.
+// Opens the app at "/" and the room self owns, "Your Private Room" (in
+// "Public Discussion Room" self is an observer with no composer).
 export async function openRoomWithComposer(page: Page) {
+  await page.goto("/");
+  await waitForApp(page);
   await selectRoom(page, "Your Private Room");
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
 }
 
-// The edit form on an own (accent) message: its kebab on touch, its hover
-// actions otherwise (freenet/river#402). Returns the edit textarea. Without a
+// The edit form on an own message: its kebab on touch, its hover actions
+// otherwise (freenet/river#402). Returns the edit textarea. Without a
 // `message`, the first own message is scrolled into view first; a given
 // `message` is used from wherever it already is.
 export async function openOwnMessageEdit(page: Page, message?: Locator): Promise<Locator> {
-  const ownRow = message ?? page.locator('[id^="msg-"]:has(.bg-accent)').first();
+  const ownRow = message ?? page.locator('[id^="msg-"][data-message-self="true"]').first();
   await expect(ownRow).toBeVisible();
   if (!message) await ownRow.scrollIntoViewIfNeeded();
-  if (await page.evaluate(() => window.matchMedia("(hover: none)").matches)) {
+  if (await touchOnly(page)) {
     await ownRow.getByTestId("message-kebab").click();
     await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();
   } else {
-    await ownRow.getByTestId("message-bubble").hover();
+    await ownRow.getByTestId("message-body").hover();
     await ownRow.getByRole("button", { name: /edit/i }).click();
   }
   const editArea = page.locator('textarea[id^="edit-msg-"]');
@@ -141,4 +144,57 @@ export function resolveColor(page: Page, css: string): Promise<number[]> {
     const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
     return [r, g, b, a / 255];
   }, css);
+}
+
+/// WCAG 2.x relative luminance of an 8-bit sRGB colour (alpha ignored).
+function luminance(c: number[]): number {
+  const [r, g, b] = c.slice(0, 3).map((v) => {
+    const s = v / 255;
+    return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/// WCAG contrast ratio of two 8-bit sRGB colours, in either order.
+export function contrast(a: number[], b: number[]): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/// `fg` (an [r, g, b, a] from `resolveColor`) composited over an opaque `bg`.
+export function over(fg: number[], bg: number[]): number[] {
+  const a = fg[3] ?? 1;
+  return [0, 1, 2].map((i) => fg[i] * a + bg[i] * (1 - a)).concat(1);
+}
+
+/// The element's computed text colour, as `resolveColor` returns it.
+export async function colourOf(locator: Locator): Promise<number[]> {
+  return resolveColor(locator.page(), await locator.evaluate((el) => getComputedStyle(el).color));
+}
+
+/// Whether there is no hover pointer, so rows show the kebab, not the hover bar.
+export function touchOnly(page: Page): Promise<boolean> {
+  return page.evaluate(() => window.matchMedia("(hover: none)").matches);
+}
+
+/// Whether a finger can be the pointer: the same query as main.css.
+export function coarsePointer(page: Page): Promise<boolean> {
+  return page.evaluate(() => window.matchMedia("(hover: none), (any-pointer: coarse)").matches);
+}
+
+/// Open `row`'s inline reaction picker from its "+": hover the row unless a
+/// finger is the pointer, then click "+".
+export async function openInlinePicker(page: Page, row: Locator) {
+  if (!(await coarsePointer(page))) await row.hover();
+  await row.getByTestId("add-reaction-button").click();
+}
+
+/// React to `row` with the picker's first emoji. Expects the row to end with
+/// exactly one reaction chip, so pass a row that has none.
+export async function reactTo(page: Page, row: Locator): Promise<Locator> {
+  await openInlinePicker(page, row);
+  await page.getByTestId("emoji-picker").getByRole("button").first().click();
+  const chip = row.getByTestId("reaction-chip");
+  await expect(chip).toHaveCount(1);
+  return chip;
 }

@@ -93,6 +93,7 @@ test.describe("Impersonation warning (#489)", { tag: "@chromium-only" }, () => {
 
     const badge = page.locator(CONVERSATION_WARNING).first();
     await expect(badge).toBeVisible({ timeout: 15_000 });
+    await expect(badge).toHaveText("⚠");
     // The tooltip must name the remedy, not merely alarm — and must never
     // contain a nickname (see `tooltip_contains_no_nickname_content`).
     await expect(badge).toHaveAttribute("title", /is NOT a moderator/i);

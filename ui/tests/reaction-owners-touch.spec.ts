@@ -1,5 +1,5 @@
 import { expect, Locator, Page, test } from "@playwright/test";
-import { selectRoom, settle, waitForApp } from "./example-room";
+import { coarsePointer, selectRoom, settle, waitForApp } from "./example-room";
 
 // Regression coverage for freenet/river#714.
 //
@@ -48,12 +48,6 @@ async function waitSettledAtBottom(page: Page) {
       { timeout: 5_000 }
     )
     .toBeLessThan(120);
-}
-
-async function coarsePointer(page: Page): Promise<boolean> {
-  return page.evaluate(() =>
-    window.matchMedia("(hover: none), (any-pointer: coarse)").matches
-  );
 }
 
 // Fixture reactions are written into example state, not sent as signed

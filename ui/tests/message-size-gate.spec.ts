@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { waitForApp, openRoomWithComposer, openOwnMessageEdit } from "./example-room";
+import { openRoomWithComposer, openOwnMessageEdit } from "./example-room";
 
 // Regression tests for the "message was lost" bug (HostFat, Matrix 2026-07):
 // the input gate compared raw text bytes against max_message_size, but the
@@ -14,8 +14,6 @@ import { waitForApp, openRoomWithComposer, openOwnMessageEdit } from "./example-
 // {text: "..."} = raw bytes + 9 for texts in the 256..65535-byte range.
 
 test.beforeEach(async ({ page }) => {
-  await page.goto("/");
-  await waitForApp(page);
   await openRoomWithComposer(page);
 });
 
