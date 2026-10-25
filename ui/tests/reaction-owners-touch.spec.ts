@@ -266,6 +266,37 @@ test.describe("Reaction owner list (#714)", () => {
   });
 });
 
+// Removing your reaction from the list while another member's chip remains
+// leaves focus on that chip, not on the React action at the message's top.
+test.describe("Reaction removed from the owner list", () => {
+  test("focus stays on the reaction line while a chip remains", async ({ page }) => {
+    test.skip(!(await coarsePointer(page)), "the list opens only on a coarse pointer");
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+    await settle(page);
+    await callRiverTest(page, "memberReactsToNewest", "🦀");
+    const target = page.locator('[id^="msg-"]').filter({ has: page.getByTestId("reaction-chip").filter({ hasText: "🦀" }) });
+    await expect(target).toHaveCount(1);
+    const message = page.locator(`[id="${await target.getAttribute("id")}"]`);
+    const chips = message.getByTestId("reaction-chip");
+    await message.scrollIntoViewIfNeeded();
+    await openInlinePicker(page, message);
+    await page.getByTestId("emoji-picker").getByRole("button").filter({ hasNotText: "🦀" }).first().click();
+    const own = message.locator('[data-testid="reaction-chip"][title*="click to remove"]');
+    await expect(own).toHaveCount(1);
+    await expect(chips).toHaveCount(2);
+
+    await pressChip(own);
+    const owners = page.getByTestId("reaction-owners");
+    await expect(owners).toBeVisible();
+    await owners.getByTestId("reaction-remove").click();
+    await expect(own).toHaveCount(0);
+    await expect(chips).toHaveCount(1);
+    await expect(chips.first()).toBeFocused();
+  });
+});
+
 test.describe("Reaction chip from the keyboard (#714)", () => {
   test("Enter and Space open the list, and closing it does not scroll the history", async ({
     page,
