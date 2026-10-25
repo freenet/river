@@ -1085,10 +1085,9 @@ mod accent_token_audit {
                 .filter(|l| l.trim_start().starts_with(token))
                 .count()
         };
-        for token in ["--color-accent:", "--color-accent-hover:"] {
-            assert_eq!(definitions(token), 1, "{token}");
-        }
         for token in [
+            "--color-accent:",
+            "--color-accent-hover:",
             "--color-link:",
             "--color-link-hover:",
             "--color-accent-soft:",

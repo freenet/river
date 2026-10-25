@@ -137,7 +137,7 @@ pub fn EditRoomModal() -> Element {
                     class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border max-h-[90vh] overflow-y-auto",
                     div {
                         class: "p-6",
-                        h1 { class: "text-xl font-semibold text-text mb-4", "Room Details" }
+                        h1 { class: "text-[16px] font-semibold text-text mb-4", "Room Details" }
 
                         // A key-less owner gets the read-only modal. Say why,
                         // rather than leaving every control unexplainedly
@@ -240,7 +240,7 @@ pub fn EditRoomModal() -> Element {
                                         // `select-text`, NOT `select-all` — see the note on
                                         // `CopyButton` below. `user-select: all` makes this
                                         // field completely unselectable in Firefox.
-                                        class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-text",
+                                        class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-xl text-text-muted text-[13px] font-mono cursor-text select-text",
                                         value: "{bs58::encode(room_data.owner_vk.as_bytes()).into_string()}"
                                     }
                                     CopyButton {
@@ -264,7 +264,7 @@ pub fn EditRoomModal() -> Element {
                                         readonly: true,
                                         "data-testid": "contract-id-input",
                                         // `select-text`, NOT `select-all` — see `CopyButton`.
-                                        class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-text",
+                                        class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-xl text-text-muted text-[13px] font-mono cursor-text select-text",
                                         value: "{room_data.contract_key.id()}"
                                     }
                                     CopyButton {
@@ -314,7 +314,7 @@ pub fn EditRoomModal() -> Element {
                                                     readonly: true,
                                                     "data-testid": "secret-version-input",
                                                     // `select-text`, NOT `select-all` — see `CopyButton`.
-                                                    class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-text",
+                                                    class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-xl text-text-muted text-[13px] font-mono cursor-text select-text",
                                                     value: "{secret_version}"
                                                 }
                                                 if is_owner {
@@ -329,7 +329,7 @@ pub fn EditRoomModal() -> Element {
                                                     // converges via the contract's duplicate-version
                                                     // dedup.
                                                     button {
-                                                        class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                                                        class: "px-3 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                                                         title: "{rotate_title}",
                                                         disabled: !can_rotate,
                                                         onclick: move |_| {
@@ -444,7 +444,7 @@ pub fn EditRoomModal() -> Element {
                                         "Confirm Leave"
                                     }
                                     button {
-                                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                                        class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                                         onclick: move |_| show_leave_confirmation.set(false),
                                         "Cancel"
                                     }
@@ -523,7 +523,7 @@ fn CopyButton(value: String, testid: String, label: String) -> Element {
             "data-testid": "{testid}",
             "aria-label": "{label}",
             title: "{label}",
-            class: "flex-shrink-0 px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text-muted hover:text-text text-sm transition-colors flex items-center gap-1.5",
+            class: "flex-shrink-0 px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text-muted hover:text-text text-[15px] transition-colors flex items-center gap-1.5",
             onclick: move |_| {
                 crate::util::copy_to_clipboard(&value_for_clipboard);
                 copied.set(true);
@@ -633,7 +633,7 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
             label { class: "block text-sm font-medium text-text-muted mb-2", "Room Description" }
             textarea {
                 "data-testid": "room-description-input",
-                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed resize-y",
+                class: "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:border-text-muted disabled:opacity-50 disabled:cursor-not-allowed resize-y",
                 rows: "3",
                 placeholder: "Optional room description",
                 value: "{description}",
@@ -751,7 +751,7 @@ fn NumericConfigField(
             input {
                 r#type: "number",
                 min: "1",
-                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
+                class: "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text focus:outline-none focus:border-text-muted",
                 value: "{input_value}",
                 // Track the live value so a re-render cannot reset the field
                 // mid-typing (freenet/river#564). See the RoomDescriptionField
@@ -818,7 +818,7 @@ fn MaxMembersField(
                     "data-testid": "max-members-input",
                     r#type: "number",
                     min: "1",
-                    class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
+                    class: "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text focus:outline-none focus:border-text-muted",
                     value: "{max_members_input}",
                     // Track the live value so a re-render cannot reset the
                     // field mid-typing (freenet/river#564). This one re-renders

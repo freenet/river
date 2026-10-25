@@ -89,7 +89,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
                 // Header
                 div { class: "px-6 py-4 border-b border-border flex items-center justify-between",
-                    h2 { class: "text-lg font-semibold text-text", "Invite Member" }
+                    h2 { class: "text-[16px] font-semibold text-text", "Invite Member" }
                     button {
                         "data-testid": "invite-member-close-button",
                         class: "p-1 text-text-muted hover:text-text transition-colors",
@@ -180,8 +180,8 @@ fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> El
                 // link/code it is meant to displace.
                 div {
                     "data-testid": "invite-dm-recommendation",
-                    class: "mb-4 p-3 bg-accent-soft border-l-4 border-accent rounded-r-lg",
-                    p { class: "text-sm text-text",
+                    class: "mb-4 p-3 bg-surface border-l-2 border-[var(--color-link)] rounded-r-lg",
+                    p { class: "text-[15px] text-text",
                         span { class: "font-medium", "Best way to invite someone: send the invitation in a DM. " }
                         "Ask whether they'd like to join first. Then, in any room you already share with them, click their name in the member list, choose "
                         span { class: "font-medium", "Share invite" }
@@ -195,8 +195,8 @@ fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> El
                 // one-person-only warning.
                 div {
                     "data-testid": "invite-share-warning",
-                    class: "mb-4 p-3 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
-                    p { class: "text-sm text-text",
+                    class: "mb-4 p-3 bg-surface border-l-2 border-[var(--color-warning-text)] rounded-r-lg",
+                    p { class: "text-[15px] text-text",
                         span { class: "font-medium", "No DM yet? Share the link or code below privately, with one person only. " }
                         "Each invitation creates a unique identity and is good for exactly one person. If two people use the same link or code, they share one identity and neither works correctly. Click "
                         span { class: "font-medium", "New Invitation" }
@@ -293,14 +293,14 @@ fn InvitationContent(
             div { class: "flex gap-2",
                 input {
                     "data-testid": "invite-link-input",
-                    class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text font-mono truncate",
+                    class: "flex-1 px-3 py-2 bg-surface border border-border rounded-xl text-[15px] text-text font-mono truncate",
                     r#type: "text",
                     value: invitation_url,
                     readonly: true
                 }
                 button {
                     "data-testid": "invite-copy-link-button",
-                    class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors flex items-center gap-2",
+                    class: "px-3 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] rounded-lg transition-colors flex items-center gap-2",
                     onclick: copy_link_to_clipboard,
                     Icon { icon: FaCopy, width: 14, height: 14 }
                     span { "{copy_link_text}" }
@@ -320,20 +320,20 @@ fn InvitationContent(
         // above applies.
         div { class: "mb-4",
             label { class: "block text-sm font-medium text-text mb-1", "Portable invite code:" }
-            p { class: "text-xs text-text-muted mb-1",
+            p { class: "text-[13px] text-text-muted mb-1",
                 "Works on any host or peer. The recipient pastes this into River's \u{201c}Enter Invite Code\u{201d} box."
             }
             div { class: "flex gap-2",
                 input {
                     "data-testid": "invite-code-input",
-                    class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text font-mono truncate",
+                    class: "flex-1 px-3 py-2 bg-surface border border-border rounded-xl text-[15px] text-text font-mono truncate",
                     r#type: "text",
                     value: invitation_code,
                     readonly: true
                 }
                 button {
                     "data-testid": "invite-copy-code-button",
-                    class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors flex items-center gap-2",
+                    class: "px-3 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] rounded-lg transition-colors flex items-center gap-2",
                     onclick: copy_code_to_clipboard,
                     Icon { icon: FaCopy, width: 14, height: 14 }
                     span { "{copy_code_text}" }
@@ -352,7 +352,7 @@ fn InvitationContent(
                 Icon { icon: FaQrcode, width: 14, height: 14 }
                 span { class: "text-sm font-medium text-text", "QR code" }
             }
-            p { class: "text-xs text-text-muted mb-2",
+            p { class: "text-[13px] text-text-muted mb-2",
                 "Have the other person open Enter Invite Code and tap Scan QR code. This is the same single-use code as above."
             }
             match qr_markup {
@@ -386,14 +386,14 @@ fn InvitationContent(
         div { class: "flex flex-wrap gap-2",
             button {
                 "data-testid": "invite-copy-message-button",
-                class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2",
+                class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] font-medium rounded-lg transition-colors flex items-center gap-2",
                 onclick: copy_message_to_clipboard,
                 Icon { icon: FaCopy, width: 14, height: 14 }
                 span { "{copy_msg_text}" }
             }
             button {
                 "data-testid": "invite-new-invitation-button",
-                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors flex items-center gap-2",
+                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-[15px] rounded-lg transition-colors flex items-center gap-2",
                 onclick: move |_| {
                     copy_msg_text.set("Copy Message".to_string());
                     copy_link_text.set("Copy Link".to_string());
@@ -405,7 +405,7 @@ fn InvitationContent(
             }
             button {
                 "data-testid": "invite-member-close-footer-button",
-                class: "px-4 py-2 text-text-muted hover:text-text text-sm rounded-lg transition-colors",
+                class: "px-4 py-2 text-text-muted hover:text-text text-[15px] rounded-lg transition-colors",
                 onclick: move |_| is_active.set(false),
                 "Close"
             }

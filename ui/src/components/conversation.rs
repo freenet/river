@@ -3500,17 +3500,17 @@ pub fn Conversation() -> Element {
                     class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
                     onclick: move |_| crate::util::defer(move || pending_delete.set(None)),
                     div {
-                        class: "bg-panel rounded-lg shadow-xl p-6 max-w-sm mx-4",
+                        class: "bg-panel rounded-xl shadow-xl border border-border p-6 max-w-sm mx-4",
                         onclick: move |e| e.stop_propagation(),
-                        h3 { class: "text-lg font-semibold text-text mb-2",
+                        h3 { class: "text-[16px] font-semibold text-text mb-2",
                             "Delete Message?"
                         }
-                        p { class: "text-text-muted text-sm mb-4",
+                        p { class: "text-text-muted text-[13px] mb-4",
                             "This action cannot be undone. The message will be permanently deleted."
                         }
                         div { class: "flex gap-3 justify-end",
                             button {
-                                class: "px-4 py-2 rounded-lg bg-surface hover:bg-surface/80 text-text transition-colors",
+                                class: "px-4 py-2 rounded-lg bg-surface hover:bg-surface-hover border border-border-hover text-sm font-semibold text-text transition-colors",
                                 onclick: move |_| crate::util::defer(move || pending_delete.set(None)),
                                 "Cancel"
                             }

@@ -10,9 +10,10 @@
   /* The accent, a muted blue used thinly. Every accent colour in the app is
      one of the tokens here and in the two `:root` blocks below; nothing else
      names an accent hex, so a new accent is a change to these lines.
-     - --color-accent: fills that carry white text (buttons, badges, the
-       outgoing DM bubble's tint), the same in both themes so white stays
-       legible on it.
+     - --color-accent: the accent itself (rings, borders, the faint
+       `bg-accent/N` tints). Lighter in the dark theme. Nothing in the app
+       is a solid accent fill carrying white text any more, so it no longer
+       has to stay dark there.
      - --color-link (`:root`): accent TEXT and lines — your own name, links,
        mentions, focus rings, your avatar's ring, your rows' tint. Lighter in
        the dark theme, so it clears 4.5:1 on the dark panel.
@@ -90,8 +91,10 @@
     --color-text-muted: #9a9a9e;
     --color-text-quote: #b4b4b9;
     --color-text-inverse: #1a1a1a;
-    --color-link: oklch(0.76 0.075 262);
-    --color-link-hover: oklch(0.84 0.075 262);
+    --color-accent: oklch(0.76 0.075 262);
+    --color-accent-hover: oklch(0.84 0.075 262);
+    --color-link: var(--color-accent);
+    --color-link-hover: var(--color-accent-hover);
     --color-success-bg: #052e16;
     --color-warning-bg: #422006;
     --color-error-bg: #450a0a;

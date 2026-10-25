@@ -1754,7 +1754,7 @@ pub fn MemberList() -> Element {
                     input {
                         id: "member-search-input",
                         "data-testid": "member-search-input",
-                        class: "mt-2 w-full px-3 py-2 bg-surface border border-border rounded-lg text-base text-text",
+                        class: "mt-2 w-full px-3 py-2 bg-surface border border-border rounded-xl text-base text-text",
                         r#type: "search",
                         placeholder: "Search members",
                         "aria-label": "Search members by name",
@@ -2076,28 +2076,28 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-xl w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
-                h3 { class: "text-lg font-semibold text-text mb-4",
+                h3 { class: "text-[16px] font-semibold text-text mb-4",
                     "Export Identity"
                 }
-                p { class: "text-sm text-text-muted mb-3",
+                p { class: "text-[13px] text-text-muted mb-3",
                     "Copy this token and import it in another River client (UI or riverctl) to use the same identity."
                 }
                 p { class: "text-sm text-yellow-500 font-medium mb-3",
                     "⚠ This token contains your private key. Treat it like a password — do not share it publicly."
                 }
                 textarea {
-                    class: "w-full h-40 bg-surface border border-border rounded-lg p-3 text-xs font-mono text-text resize-none",
+                    class: "w-full h-40 bg-surface border border-border rounded-xl p-3 text-xs font-mono text-text resize-none",
                     readonly: true,
                     value: "{token_text}",
                 }
                 div { class: "flex justify-end gap-3 mt-4",
                     button {
-                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-[15px] rounded-lg transition-colors border border-border",
                         onclick: move |_| is_active.set(false),
                         "Close"
                     }
                     button {
-                        class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
+                        class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] font-medium rounded-lg transition-colors",
                         onclick: handle_copy,
                         "{copy_button_text}"
                     }
@@ -2806,19 +2806,22 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
 
     rsx! {
         div {
-            class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
+            // z-[60] over the composer: mounted in the rooms rail, before the
+            // conversation in the DOM (see `JoinWithCodeModal`).
+            "data-testid": "import-identity-backdrop",
+            class: "fixed inset-0 bg-black/50 flex items-center justify-center z-[60]",
             onclick: move |_| reset_and_close(),
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
-                h3 { class: "text-lg font-semibold text-text mb-4",
+                h3 { class: "text-[16px] font-semibold text-text mb-4",
                     "Import Identity"
                 }
-                p { class: "text-sm text-text-muted mb-3",
+                p { class: "text-[13px] text-text-muted mb-3",
                     "Paste a River identity token exported from another client."
                 }
                 textarea {
-                    class: "w-full h-40 bg-surface border border-border rounded-lg p-3 text-xs font-mono text-text resize-none",
+                    class: "w-full h-40 bg-surface border border-border rounded-xl p-3 text-xs font-mono text-text resize-none",
                     placeholder: "-----BEGIN RIVER IDENTITY-----\n...\n-----END RIVER IDENTITY-----",
                     value: "{token_input}",
                     // Controlled input: set the value signal synchronously (the
@@ -2870,7 +2873,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     div { class: "flex justify-end gap-3 mt-4",
                         button {
                             "data-testid": "import-identity-replace-cancel",
-                            class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                            class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                             onclick: handle_replace_cancel,
                             "Cancel"
                         }
@@ -2962,20 +2965,20 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                         } else {
                             div {
                                 "data-testid": "import-identity-loading-rooms",
-                                class: "mt-3 text-sm text-text-muted",
+                                class: "mt-3 text-[13px] text-text-muted",
                                 "Loading your rooms\u{2026} the import will be available in a moment."
                             }
                         }
                     }
                     div { class: "flex justify-end gap-3 mt-4",
                         button {
-                            class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                            class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                             onclick: move |_| reset_and_close(),
                             "Cancel"
                         }
                         button {
                             "data-testid": "import-identity-submit",
-                            class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                            class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                             disabled: !rooms_hydrated,
                             onclick: handle_import,
                             "Import"

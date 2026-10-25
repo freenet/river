@@ -162,7 +162,7 @@ pub fn CreateRoomModal() -> Element {
 
                 // Header
                 div { class: "px-6 py-4 border-b border-border",
-                    h2 { class: "text-lg font-semibold text-text", "Create New Room" }
+                    h2 { class: "text-[16px] font-semibold text-text", "Create New Room" }
                 }
 
                 // Body
@@ -171,7 +171,7 @@ pub fn CreateRoomModal() -> Element {
                         label { class: "block text-sm font-medium text-text mb-1", "Room Name" }
                         input {
                             "data-testid": "create-room-name-input",
-                            class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent",
+                            class: "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:border-text-muted",
                             value: "{room_name}",
                             placeholder: "Enter room name",
                             // `oninput` tracks the live value so a re-render
@@ -202,7 +202,7 @@ pub fn CreateRoomModal() -> Element {
                             class: if nickname_has_emoji {
                                 "w-full px-3 py-2 bg-surface border border-red-500 rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-red-500/50 focus:border-red-500"
                             } else {
-                                "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent"
+                                "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:border-text-muted"
                             },
                             "aria-invalid": if nickname_has_emoji { "true" } else { "false" },
                             value: "{nickname}",
@@ -240,7 +240,7 @@ pub fn CreateRoomModal() -> Element {
                             checked: "{is_private}",
                             onchange: move |evt| is_private.set(evt.value() == "true")
                         }
-                        span { class: "text-sm text-text",
+                        span { class: "text-[15px] text-text",
                             "Private room (messages will be encrypted)"
                         }
                     }
@@ -250,7 +250,7 @@ pub fn CreateRoomModal() -> Element {
                 div { class: "px-6 py-4 border-t border-border flex justify-end gap-3",
                     button {
                         "data-testid": "create-room-cancel-button",
-                        class: "px-4 py-2 text-sm text-text-muted hover:text-text hover:bg-surface rounded-lg transition-colors",
+                        class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                         // Deferred close — same signal-safety rule as the
                         // backdrop handler above.
                         onclick: move |_| {
@@ -264,7 +264,7 @@ pub fn CreateRoomModal() -> Element {
                     }
                     button {
                         "data-testid": "create-room-submit-button",
-                        class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                        class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                         // Disabled rather than silently no-op, matching the
                         // accept-invitation modal's nickname gate.
                         disabled: nickname_has_emoji || limit_blocked,

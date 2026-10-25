@@ -111,7 +111,7 @@ pub fn UpdateBanner() -> Element {
                 if show_reload {
                     button {
                         "data-testid": "update-banner-reload",
-                        class: "px-3 py-1.5 rounded-md bg-accent text-white font-medium",
+                        class: "px-3 py-1.5 rounded-md bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium",
                         onclick: move |_| reload_now(),
                         "Reload"
                     }

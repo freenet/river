@@ -181,6 +181,23 @@ pub fn InviteViaDmPickerModal() -> Element {
             });
         nickname.unwrap_or_else(|| target_peer.to_string().chars().take(8).collect())
     };
+    // The invitee's avatar for the header, by the conversation's colouring
+    // rule (the current room's salt). Neutral when anything is unreadable.
+    let peer_hue: Option<u16> = (|| {
+        let salt = crate::avatar_salt::AVATAR_SALTS
+            .try_read()
+            .ok()?
+            .get(&current_room.to_bytes())
+            .copied()?;
+        let rooms = ROOMS.try_read().ok()?;
+        let room_data = rooms.map.get(&current_room)?;
+        crate::components::conversation::avatar::member_vk_bytes(
+            &room_data.room_state,
+            &current_room,
+            target_peer,
+        )
+        .map(|vk| crate::components::conversation::avatar::display_hue(&salt, &vk))
+    })();
 
     // Build a sorted list of candidate rooms — every room the local user
     // has loaded that isn't the current one. Per the module doc, we
@@ -393,10 +410,17 @@ pub fn InviteViaDmPickerModal() -> Element {
                 class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border flex flex-col max-h-[80vh]",
                 // Header — peer name inline so the user remembers who
                 // they're inviting.
-                div { class: "flex items-center justify-between px-5 py-4 border-b border-border",
-                    h2 { class: "text-base font-semibold text-text",
+                div { class: "flex items-center justify-between gap-3 px-5 py-4 border-b border-border",
+                    div {
+                        "aria-hidden": "true",
+                        "data-testid": "invite-picker-avatar",
+                        class: if peer_hue.is_some() { "msg-avatar member-avatar msg-avatar-hued" } else { "msg-avatar member-avatar" },
+                        style: crate::components::conversation::avatar::avatar_style(peer_hue),
+                        {crate::components::conversation::avatar::initials(&peer_label_value)}
+                    }
+                    h2 { class: "flex-1 min-w-0 text-[16px] font-semibold text-text",
                         "Invite "
-                        span { class: "text-accent", "{peer_label_value}" }
+                        span { class: "font-bold", "{peer_label_value}" }
                         " to another room"
                     }
                     button {
@@ -412,11 +436,11 @@ pub fn InviteViaDmPickerModal() -> Element {
                 }
                 div { class: "flex-1 overflow-y-auto px-5 py-4 space-y-3",
                     if candidates_value.is_empty() {
-                        p { class: "text-sm text-text-muted",
+                        p { class: "text-[13px] text-text-muted",
                             "You aren't a member of any other rooms. Create or join one, then come back here."
                         }
                     } else {
-                        p { class: "text-xs text-text-muted",
+                        p { class: "text-[13px] text-text-muted",
                             "Send an invitation card to "
                             span { class: "text-text", "{peer_label_value}" }
                             ". They'll see an Accept button right inside the DM thread — no link to copy."
@@ -425,7 +449,7 @@ pub fn InviteViaDmPickerModal() -> Element {
                         // it (radio-style). Sorted alphabetical; private
                         // rooms get a lock icon.
                         div { class: "space-y-1",
-                            label { class: "text-xs text-text-muted block",
+                            label { class: "text-[13px] text-text-muted block",
                                 "Which room?"
                             }
                             for room in candidates_value.iter() {
@@ -445,11 +469,11 @@ pub fn InviteViaDmPickerModal() -> Element {
                         }
                         // Optional personal message.
                         div { class: "space-y-1",
-                            label { class: "text-xs text-text-muted block",
+                            label { class: "text-[13px] text-text-muted block",
                                 "Add a personal message (optional)"
                             }
                             textarea {
-                                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text resize-none min-h-[3rem] max-h-32",
+                                class: "w-full px-3 py-2 bg-surface border border-border rounded-xl text-[15px] text-text resize-none min-h-[3rem] max-h-32",
                                 placeholder: "e.g. \"Thought you'd enjoy this room\"",
                                 value: "{personal_message_value}",
                                 disabled: any_pending,
@@ -488,7 +512,7 @@ pub fn InviteViaDmPickerModal() -> Element {
                 if !candidates_value.is_empty() {
                     div { class: "border-t border-border px-5 py-3 flex items-center justify-between",
                         if any_pending {
-                            div { class: "flex items-center gap-2 text-xs text-text-muted",
+                            div { class: "flex items-center gap-2 text-[13px] text-text-muted",
                                 div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full" }
                                 "Sending invite…"
                             }
@@ -496,7 +520,7 @@ pub fn InviteViaDmPickerModal() -> Element {
                             span { class: "text-[10px] text-text-muted" }
                         }
                         button {
-                            class: "px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg transition-colors",
+                            class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover disabled:opacity-50 disabled:cursor-not-allowed text-text text-[15px] font-medium rounded-lg transition-colors",
                             disabled: !can_send,
                             onclick: do_send,
                             "Send invite"
@@ -530,7 +554,7 @@ fn CandidateRow(
     rsx! {
         button {
             class: format!(
-                "w-full text-left px-3 py-2 rounded-lg border text-sm text-text flex items-center gap-2 transition-colors {}",
+                "w-full text-left px-3 py-2 rounded-lg border text-[15px] text-text flex items-center gap-2 transition-colors {}",
                 select_class
             ),
             disabled: any_pending,

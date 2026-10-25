@@ -166,8 +166,8 @@ test.describe("DM thread modal (Phase 3 structure)", () => {
     await expect(page.getByText(/invite .+ to another room/i)).toBeVisible();
   });
 
-  // Sending is the modal's primary purpose, so Send keeps the only filled
-  // accent treatment and the invite control sits on the secondary tier.
+  // Sending is the modal's primary purpose, so Send is the composer box's
+  // accent icon and the invite control sits on the secondary tier.
   // Asserted on the rendered DOM rather than on the source, so it survives
   // a class list being moved or recomputed.
   test("share-invite is styled below Send", async ({ page }) => {
@@ -187,9 +187,10 @@ test.describe("DM thread modal (Phase 3 structure)", () => {
     const inviteClass = (await shareInvite.getAttribute("class")) || "";
     const sendClass = (await send.getAttribute("class")) || "";
 
-    // Send keeps the filled accent treatment; the invite link carries no
+    // Send is the composer box's accent icon; the invite link carries no
     // background at all.
-    expect(sendClass).toContain("bg-accent");
+    await expect(send).toHaveAttribute("data-testid", "dm-send-button");
+    expect(sendClass).toContain("text-link");
     expect(inviteClass).not.toContain("bg-accent");
     expect(inviteClass).not.toContain("bg-surface");
 

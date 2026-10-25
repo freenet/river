@@ -9,7 +9,7 @@ pub fn InvitedByField(invited_by: String, inviter_id: Option<MemberId>) -> Eleme
             class: "mb-4",
             label { class: "block text-sm font-medium text-text-muted mb-2", "Invited by" }
             div {
-                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text flex items-center min-h-[2.5rem]",
+                class: "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text flex items-center min-h-[2.5rem]",
                 {
                     if inviter_id.is_some() {
                         rsx! {

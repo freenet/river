@@ -332,7 +332,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                     class: if invalid {
                         "w-full px-3 py-2 bg-surface border border-red-500 rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent"
                     } else {
-                        "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent"
+                        "w-full px-3 py-2 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:border-text-muted"
                     },
                     "aria-invalid": if invalid { "true" } else { "false" },
                     value: "{temp_nickname}",

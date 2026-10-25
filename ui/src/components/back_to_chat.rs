@@ -72,13 +72,16 @@ fn back_to_chat(
     }
 }
 
-/// A visual-only count on a `relative` button's corner, absent at zero.
+/// A visual-only count on a `relative` button's corner, absent at zero. The
+/// accent text colour as its fill and the panel colour as its text, so it
+/// reads in both themes (a white count on the light dark-theme accent would
+/// not).
 #[component]
 pub fn CountBadge(count: usize, position: &'static str, testid: &'static str) -> Element {
     rsx! {
         if count > 0 {
             span {
-                class: "absolute {position} flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-accent text-white text-[10px] font-semibold leading-none pointer-events-none",
+                class: "absolute {position} flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-[var(--color-link)] text-[var(--color-panel)] text-[10px] font-semibold leading-none pointer-events-none",
                 "data-testid": testid,
                 "aria-hidden": "true",
                 "{count}"

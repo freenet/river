@@ -15,6 +15,7 @@ use crate::components::direct_messages::{
     lookup_outbound_plaintext, open_invite_via_dm_picker, parse_outbound_invite_summary, DM_DRAFT,
     OPEN_DM_THREAD, OUTBOUND_DMS,
 };
+use crate::components::icons::{line_icon, SEND_ICON_PATH};
 use crate::components::members::Invitation;
 use crate::components::room_list::receive_invitation_modal::present_invitation;
 use crate::components::scroll_to_latest::{is_arrival, LatestButton};
@@ -941,9 +942,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 // the close ✕ — no visual collision with the per-row
                 // archive control.
                 div { class: "flex items-center justify-between px-5 py-4 border-b border-border",
-                    h2 { class: "text-lg font-semibold text-text",
+                    h2 { class: "text-[16px] font-semibold text-text",
                         "Direct messages with "
-                        span { class: "text-accent", "{peer_label}" }
+                        span { class: "font-bold", "{peer_label}" }
                     }
                     button {
                         "data-testid": "dm-thread-close-button",
@@ -1079,9 +1080,13 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             "This device doesn't hold your key for this room, so you can't send DMs here."
                         }
                     }
-                    div { class: "flex items-end gap-2",
+                    // One box like the room's composer: the draft and an icon
+                    // Send, the box drawing the border and the focus ring.
+                    div {
+                        "data-testid": "dm-composer-box",
+                        class: "flex items-end gap-0.5 px-1.5 bg-surface border border-border rounded-xl focus-within:border-text-muted transition-colors",
                         textarea {
-                            class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text resize-none min-h-[2.5rem] max-h-32",
+                            class: "flex-1 px-2 py-2.5 leading-6 bg-transparent border border-transparent text-[15px] text-text placeholder-text-muted focus:outline-hidden resize-none min-h-[44px] max-h-32",
                             placeholder: "Type a direct message...",
                             value: "{draft.read()}",
                             oninput: move |e| draft.set(e.value()),
@@ -1099,11 +1104,16 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             },
                             disabled: !peer_still_member || !can_send,
                         }
+                        // An accent-coloured icon, no solid fill: the primary
+                        // action by position and colour, as in the room.
                         button {
-                            class: "px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-colors",
+                            "data-testid": "dm-send-button",
+                            class: "flex-shrink-0 mb-1 inline-flex items-center justify-center w-9 h-9 rounded-lg text-link hover:bg-surface-hover disabled:opacity-50 disabled:text-text-muted transition-colors",
                             disabled: draft.read().trim().is_empty() || !peer_still_member || !can_send,
                             onclick: move |_| do_send(),
-                            "Send"
+                            title: "Send",
+                            "aria-label": "Send",
+                            {line_icon(SEND_ICON_PATH, 20)}
                         }
                     }
                     // Wraps rather than crushing: three children share this
@@ -1123,12 +1133,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // should be revisited.
                         span { class: "text-[10px] text-text-muted",
                             "Only you and "
-                            span { class: "text-accent", "{peer_label}" }
+                            span { class: "text-text-secondary font-semibold", "{peer_label}" }
                             " can read these messages."
                         }
                         // Sharing an invite is a SECONDARY action here:
                         // sending a message is what this modal is for, so
-                        // Send keeps the only filled `bg-accent` treatment and
+                        // Send is the accent icon in the composer box, and
                         // this is a bare text link at the same SIZE as "Delete
                         // their messages" — no background, border or heavy
                         // padding. Its resting COLOUR deliberately differs;
@@ -1176,7 +1186,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             // whitespace stripped but comments INTACT, so do
                             // not write the forbidden class names here — this
                             // comment tripped it once already.)
-                            class: "text-xs py-1 text-accent hover:text-accent-hover disabled:opacity-50 disabled:hover:text-accent transition-colors",
+                            class: "text-xs py-1 text-link hover:text-link-hover disabled:opacity-50 disabled:hover:text-link transition-colors",
                             // Also disabled with no local private key, for the
                             // same reason Send is: an invitation IS an outbound
                             // DM, signed and sealed with that key.
@@ -1255,9 +1265,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                     div {
                         class: "relative z-10 w-full max-w-sm mx-4 bg-panel rounded-xl shadow-xl border border-border p-5 space-y-4",
-                        h3 { class: "text-base font-semibold text-text",
+                        h3 { class: "text-[16px] font-semibold text-text",
                             "Delete messages from "
-                            span { class: "text-accent", "{peer_label}" }
+                            span { class: "font-bold", "{peer_label}" }
                             "?"
                         }
                         p { class: "text-sm text-text-muted",
@@ -1499,7 +1509,10 @@ fn dm_groups(messages: &[RenderedDm]) -> Vec<Vec<RenderedDm>> {
 /// the time in the gutter on hover after that, and your own rows tinted.
 #[component]
 fn DmRow(message: RenderedDm, first: bool, author: String, hue: Option<u16>) -> Element {
-    let ts_label = format_local_time(message.timestamp);
+    // The full stamp on hover; the row shows the time of day, as a room does.
+    let ts_full = format_local_time(message.timestamp);
+    let ts_label =
+        crate::util::format_utc_as_local_time((message.timestamp as i64).saturating_mul(1000));
     let body = match message.kind {
         BodyKind::Plaintext => {
             // Reuse the room-message linkify path so pasted URLs (notably
@@ -1581,14 +1594,14 @@ fn DmRow(message: RenderedDm, first: bool, author: String, hue: Option<u16>) -> 
                         "{initials}"
                     }
                 } else {
-                    span { class: "msg-gutter-time", "{ts_label}" }
+                    span { class: "msg-gutter-time", title: "{ts_full}", "{ts_label}" }
                 }
             }
             div { class: "min-w-0",
                 if first {
                     div { "data-testid": "dm-group-header", class: "flex flex-wrap items-baseline gap-x-2 mb-0.5 leading-5",
                         span { class: "text-[15px] font-bold [overflow-wrap:anywhere] {name_class}", "{author}" }
-                        span { class: "text-xs text-text-muted tabular-nums", "{ts_label}" }
+                        span { class: "text-xs text-text-muted tabular-nums", title: "{ts_full}", "{ts_label}" }
                     }
                 }
                 {body}
@@ -1639,7 +1652,7 @@ fn DmInviteCard(card: InviteCardData) -> Element {
             "px-3 py-1.5 text-sm rounded-lg bg-red-500/20 text-red-300 border border-red-500/40 cursor-not-allowed"
         }
         InviteCardState::Joinable => {
-            "px-3 py-1.5 text-sm rounded-lg bg-accent hover:bg-accent-hover text-white transition-colors"
+            "px-3 py-1.5 text-sm rounded-lg bg-surface hover:bg-surface-hover border border-border-hover text-text transition-colors"
         }
     };
     let is_disabled = !matches!(card_state, InviteCardState::Joinable);
@@ -1931,8 +1944,8 @@ mod tests {
         );
     }
 
-    /// Send stays the primary action: it keeps the ONLY filled `bg-accent`
-    /// treatment in the modal chrome, and the invite control stays a bare
+    /// Send stays the primary action: the accent icon in the composer box
+    /// (no solid fill anywhere since the redesign), and the invite control stays a bare
     /// text link — no background, border or button padding. Ian asked for
     /// smaller and less prominent than Send twice; a bordered same-height
     /// button beside Send was rejected for reading as MORE prominent.
@@ -1944,8 +1957,8 @@ mod tests {
             "the invite control's label changed; keep this pin in step with it"
         );
         assert!(
-            src.contains("bg-accenthover:bg-accent-hoverdisabled:opacity-50text-whitetext-smfont-mediumrounded-lgtransition-colors"),
-            "Send stopped being the filled primary button"
+            src.contains("\"data-testid\":\"dm-send-button\",class:\"flex-shrink-0mb-1inline-flexitems-centerjustify-centerw-9h-9rounded-lgtext-link"),
+            "Send stopped being the composer box's accent icon, the primary action"
         );
         // The window is bounded by the button's own label, so it cannot
         // silently slide onto neighbouring markup if this block shrinks.
@@ -1988,7 +2001,7 @@ mod tests {
             "the delete control stopped being the recessive muted-until-hover one"
         );
         assert!(
-            invite_block.contains("text-accent") && !invite_block.contains("text-text-muted"),
+            invite_block.contains("text-link") && !invite_block.contains("text-text-muted"),
             "the invite control now renders identically to the destructive \
              \"Delete their messages\"; give it its own resting colour so the \
              two are not a matched pair"
@@ -2022,7 +2035,7 @@ mod tests {
         // Belt and braces: it must also come after Send, so it cannot end up
         // between the textarea and Send either.
         let send = src
-            .find("onclick:move|_|do_send(),\"Send\"")
+            .find("onclick:move|_|do_send(),title:\"Send\",\"aria-label\":\"Send\"")
             .expect("the Send button is present");
         assert!(invite > send, "the invite control is ahead of Send");
     }
