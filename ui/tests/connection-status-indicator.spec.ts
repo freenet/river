@@ -46,13 +46,15 @@ async function waitForApp(page: Page) {
 // A genuinely-rendered pill ALWAYS matches one of these rows; a stuck or
 // blank pill (e.g. a regression that replaces the reactive `try_read()`
 // with a non-subscribing `peek()` and renders no real state) would not.
+// The dots use the theme's status tokens (no raw palette shades; the
+// accent audit in components.rs forbids them).
 const STATUS_STATES = [
-  { dot: "bg-green-500", label: "Connected" },
-  { dot: "bg-yellow-500", label: "Connecting..." },
-  { dot: "bg-red-500", label: "Disconnected" },
-  // SynchronizerStatus::Error renders "Error: <msg>" with the red dot; the
+  { dot: "bg-success", label: "Connected" },
+  { dot: "bg-warning", label: "Connecting..." },
+  { dot: "bg-error", label: "Disconnected" },
+  // SynchronizerStatus::Error renders "Error: <msg>" with the error dot; the
   // label is matched with a prefix below rather than an exact string.
-  { dot: "bg-red-500", label: "Error:" },
+  { dot: "bg-error", label: "Error:" },
 ];
 
 // Assert the visible pill renders a coherent connection state: its dot
@@ -71,7 +73,7 @@ async function expectCoherentState(visiblePill: Locator) {
   const dotClass = (await dot.getAttribute("class")) ?? "";
   const labelText = ((await visiblePill.textContent()) ?? "").trim();
 
-  // Distinct status colours — `bg-red-500` is shared by Disconnected and
+  // Distinct status colours — `bg-error` is shared by Disconnected and
   // Error, so dedupe before counting how many the dot carries.
   const colours = [...new Set(STATUS_STATES.map((s) => s.dot))];
   const present = colours.filter((c) =>
