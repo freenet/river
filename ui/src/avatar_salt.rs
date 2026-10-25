@@ -2,8 +2,15 @@
 //!
 //! Each message author's avatar is coloured per VIEWER: the hue is
 //! [`avatar_hue`]`(salt, member_vk)`, a BLAKE3 keyed hash under a salt only
-//! this viewer knows. An impersonator therefore cannot pick a key whose avatar
-//! colour matches someone else's, because they cannot compute anyone's colours.
+//! this viewer knows.
+//!
+//! Colour is a weak HINT, not an identity check. With 10 drawn hues a blind
+//! guess matches a given member's colour 1 time in 10, and keys are free, so
+//! an impersonator can try sockpuppets until one happens to match for some
+//! viewer. What the salt stops is an attacker CHOOSING or COMPUTING the colour
+//! a particular viewer sees for a key: without that viewer's seed they cannot
+//! aim. The real defence against lookalikes is the confusable-name warning;
+//! never present the colour as more than a hint.
 //!
 //! The salt derives from a random SEED that only this viewer holds: 32 bytes
 //! from the CSPRNG, stored in the chat delegate under
@@ -11,16 +18,20 @@
 //! [`room_salt`]`(seed, room_owner_vk)`, computed locally. It deliberately
 //! does NOT derive from the member signing key: the inviter generates that key
 //! and ships its private half in the invitation, so anyone who invited this
-//! viewer could compute a key-derived salt and grind a lookalike.
+//! viewer could compute a key-derived salt and aim a lookalike at them.
 //!
 //! A room whose salt is absent (the seed could not be read) renders neutral
 //! avatars; there is no fallback to any key.
 //!
-//! The seed is per device: identity export does not carry it. It survives a
-//! chat-delegate re-key because the migration walk imports it
-//! (`delegate_migration`'s `RecoveredItem::AvatarSeed`, [`import_seed`]).
+//! The seed is per device: identity export does not carry it. It normally
+//! survives a chat-delegate re-key: the migration walk imports it last and
+//! best-effort, earliest seed winning (`delegate_migration`'s
+//! `import_found_seed`, [`import_seed`]). A failed import changes the palette
+//! once; it never holds up the migration of real data.
 
 use crate::components::app::freenet_api::delegate_migration::RiverDelegateChannel;
+// Never `{:?}` a reply here: a seed-bearing reply would print the seed.
+use crate::components::app::freenet_api::response_handler::describe_delegate_response;
 use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
 use freenet_stdlib::prelude::DelegateKey;
@@ -118,6 +129,13 @@ pub(crate) fn room_salt(seed: &[u8; 32], room_key: &RoomKey) -> [u8; 32] {
 /// session wrote the seed in between; a handful is plenty.
 const SEED_CAS_ATTEMPTS: u32 = 3;
 
+/// Serialises every seed read and write in this tab. The session's read and
+/// the migration walk's import ask the SAME delegate for the SAME key, so their
+/// requests share one correlation slot in the single-waiter `PENDING_REQUESTS`
+/// registry: run together, the second registration displaces the first's
+/// waiter, or the replies cross and each acts on the other's answer.
+static SEED_IO: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
+
 fn seed_key() -> ChatDelegateKey {
     ChatDelegateKey::new(AVATAR_SEED_STORAGE_KEY.to_vec())
 }
@@ -141,7 +159,8 @@ async fn read_seed_versioned<C: RiverDelegateChannel>(
             generation,
         }) if reply_key == key => Ok((value, generation)),
         Some(other) => Err(format!(
-            "unexpected reply to seed GetVersionedRequest: {other:?}"
+            "unexpected reply to seed GetVersionedRequest: {}",
+            describe_delegate_response(&other)
         )),
         None => Err("seed GetVersionedRequest timed out".to_string()),
     }
@@ -171,7 +190,8 @@ async fn cas_seed<C: RiverDelegateChannel>(
             result,
         }) if reply_key == key => Ok(result),
         Some(other) => Err(format!(
-            "unexpected reply to seed CasStoreRequest: {other:?}"
+            "unexpected reply to seed CasStoreRequest: {}",
+            describe_delegate_response(&other)
         )),
         None => Err("seed CasStoreRequest timed out".to_string()),
     }
@@ -188,6 +208,7 @@ pub(crate) async fn load_or_create_seed<C: RiverDelegateChannel>(
     delegate: &DelegateKey,
     fresh: AvatarSeedRecord,
 ) -> Result<AvatarSeedRecord, String> {
+    let _io = SEED_IO.lock().await;
     let (mut value, mut generation) = read_seed_versioned(channel, delegate).await?;
     for _ in 0..SEED_CAS_ATTEMPTS {
         if let Some(record) = value.as_deref().and_then(AvatarSeedRecord::decode) {
@@ -205,7 +226,11 @@ pub(crate) async fn load_or_create_seed<C: RiverDelegateChannel>(
             CasStoreResult::Failed(e) => return Err(format!("delegate refused seed store: {e}")),
         }
     }
-    Err("seed store kept conflicting".to_string())
+    // The last conflict may have carried a seed another tab stored: adopt it.
+    value
+        .as_deref()
+        .and_then(AvatarSeedRecord::decode)
+        .ok_or_else(|| "seed store kept conflicting".to_string())
 }
 
 /// What [`import_seed`] did.
@@ -224,10 +249,16 @@ pub(crate) async fn import_seed<C: RiverDelegateChannel>(
     successor: &DelegateKey,
     incoming: AvatarSeedRecord,
 ) -> Result<SeedImport, String> {
+    let _io = SEED_IO.lock().await;
     let (mut value, mut generation) = read_seed_versioned(channel, successor).await?;
+    let stands = |value: &Option<Vec<u8>>| {
+        value
+            .as_deref()
+            .and_then(AvatarSeedRecord::decode)
+            .is_some_and(|held| !incoming.precedes(&held))
+    };
     for _ in 0..SEED_CAS_ATTEMPTS {
-        let held = value.as_deref().and_then(AvatarSeedRecord::decode);
-        if held.is_some_and(|held| !incoming.precedes(&held)) {
+        if stands(&value) {
             return Ok(SeedImport::Kept);
         }
         match cas_seed(channel, successor, &incoming, generation).await? {
@@ -241,6 +272,10 @@ pub(crate) async fn import_seed<C: RiverDelegateChannel>(
             }
             CasStoreResult::Failed(e) => return Err(format!("delegate refused seed import: {e}")),
         }
+    }
+    // The last conflict may have stored a seed at least as early: it stands.
+    if stands(&value) {
+        return Ok(SeedImport::Kept);
     }
     Err("seed import kept conflicting".to_string())
 }
@@ -416,9 +451,14 @@ pub fn ensure_avatar_salt(room_key: RoomKey) {
     }
 }
 
-/// The current chat delegate is known to be on the node (its room list was
-/// answered, or it was registered). A seed read that gave up, typically
-/// because it ran before the delegate was registered, starts again.
+/// Called where the outbound-DM load is sent, once per load attempt: after the
+/// current delegate's room list was answered, after it was registered, or by
+/// the 30 s fallback when neither happened (`DM_LOAD_FALLBACK_MS`). The
+/// delegate is therefore probably, not certainly, present. Every reconnect and
+/// refresh-on-wake re-runs `set_up_chat_delegate`, a new attempt, so this runs
+/// again then too. A seed read that gave up (typically one sent before the
+/// delegate was registered) starts again; nothing else does, so the cost is
+/// at most one 3-attempt read per load attempt, and only after a failure.
 pub(crate) fn current_delegate_present() {
     if let Some(epoch) = with_session(|s| s.rearm_if_exhausted(next_epoch())) {
         spawn_seed_read(epoch);
@@ -614,53 +654,6 @@ mod tests {
         assert_eq!(room_salt(&seed, &[1u8; 32]), room_salt(&seed, &[1u8; 32]));
     }
 
-    /// The salt depends on the viewer's seed and the room only. This is
-    /// structural: neither `room_salt` nor `ensure_avatar_salt` takes a
-    /// signing key, so the inviter (who generated the invitee's key) has no
-    /// input to it. Pinned here as the two cases the threat names: one
-    /// signing key held in two rooms gives two different salts, and a room's
-    /// salt is the same before and after its signing key changes (here, two
-    /// `RoomData`s for one room with different `self_sk`, salted through the
-    /// session as the UI does).
-    #[test]
-    fn the_salt_is_independent_of_the_member_signing_key() {
-        use ed25519_dalek::SigningKey;
-        let seed = [7u8; 32];
-        let key = SigningKey::from_bytes(&[3u8; 32]);
-        let rotated = SigningKey::from_bytes(&[4u8; 32]);
-        let room_with = |owner: u8, sk: &SigningKey| {
-            let owner = SigningKey::from_bytes(&[owner; 32]).verifying_key();
-            let mut rd = crate::room_data::test_minimal_room_data(owner);
-            rd.self_sk = Some(sk.clone());
-            rd
-        };
-        let salt_of = |rd: &crate::room_data::RoomData| {
-            let mut session = SeedSession::default();
-            session.replace_seed(seed);
-            match session.want(rd.owner_vk.to_bytes(), 0) {
-                Want::Fill(salts) => salts[0].1,
-                _ => panic!("a ready seed fills at once"),
-            }
-        };
-
-        let (a, b) = (room_with(0xA1, &key), room_with(0xB2, &key));
-        assert_ne!(
-            salt_of(&a),
-            salt_of(&b),
-            "one signing key in two rooms, two salts"
-        );
-
-        assert_eq!(
-            salt_of(&room_with(0xA1, &key)),
-            salt_of(&room_with(0xA1, &rotated)),
-            "changing the room's signing key must not change its salt"
-        );
-        for salt in [salt_of(&a), salt_of(&b)] {
-            assert_ne!(salt, key.to_bytes());
-            assert_ne!(salt, key.verifying_key().to_bytes());
-        }
-    }
-
     #[test]
     fn a_seed_is_created_once_and_read_back() {
         let channel = channel_with(None);
@@ -733,6 +726,119 @@ mod tests {
         .is_err());
         channel.silence(&successor_key(), false);
         assert_eq!(stored(&channel), None);
+    }
+
+    /// Replays fixed replies, in order, whatever is asked.
+    struct Scripted(std::cell::RefCell<std::collections::VecDeque<ChatDelegateResponseMsg>>);
+
+    impl Scripted {
+        fn new(replies: Vec<ChatDelegateResponseMsg>) -> Self {
+            Self(std::cell::RefCell::new(replies.into()))
+        }
+    }
+
+    impl RiverDelegateChannel for Scripted {
+        async fn request(
+            &self,
+            _target: &DelegateKey,
+            _request: ChatDelegateRequestMsg,
+        ) -> Result<Option<ChatDelegateResponseMsg>, String> {
+            Ok(self.0.borrow_mut().pop_front())
+        }
+        async fn request_all(
+            &self,
+            requests: Vec<(DelegateKey, ChatDelegateRequestMsg)>,
+        ) -> Vec<Result<Option<ChatDelegateResponseMsg>, String>> {
+            let mut out = Vec::new();
+            for (target, request) in requests {
+                out.push(self.request(&target, request).await);
+            }
+            out
+        }
+    }
+
+    fn versioned(value: Option<Vec<u8>>, generation: u64) -> ChatDelegateResponseMsg {
+        ChatDelegateResponseMsg::GetVersionedResponse {
+            key: seed_key(),
+            value,
+            generation,
+        }
+    }
+
+    fn cas(result: CasStoreResult) -> ChatDelegateResponseMsg {
+        ChatDelegateResponseMsg::CasStoreResponse {
+            key: seed_key(),
+            result,
+        }
+    }
+
+    fn conflict(value: Vec<u8>, generation: u64) -> ChatDelegateResponseMsg {
+        cas(CasStoreResult::Conflict {
+            current_generation: generation,
+            current_value: Some(value),
+        })
+    }
+
+    /// The read, then exactly `SEED_CAS_ATTEMPTS` conflicting stores.
+    fn three_conflicts(last: Vec<u8>) -> Vec<ChatDelegateResponseMsg> {
+        assert_eq!(SEED_CAS_ATTEMPTS, 3);
+        vec![
+            versioned(None, 0),
+            conflict(vec![0xFF], 1),
+            conflict(vec![0xFF], 2),
+            conflict(last, 3),
+        ]
+    }
+
+    #[test]
+    fn a_valid_seed_in_the_last_conflict_is_adopted() {
+        let channel = Scripted::new(three_conflicts(record(3, 9).encode()));
+        let got = block_on(load_or_create_seed(
+            &channel,
+            &successor_key(),
+            record(5, 1),
+        ));
+        assert_eq!(got, Ok(record(3, 9)));
+
+        // The importer: the last conflict holds an earlier seed, which stands.
+        let channel = Scripted::new(three_conflicts(record(3, 9).encode()));
+        let got = block_on(import_seed(&channel, &successor_key(), record(5, 1)));
+        assert_eq!(got, Ok(SeedImport::Kept));
+    }
+
+    #[test]
+    fn conflicts_that_never_settle_are_an_error() {
+        let channel = Scripted::new(three_conflicts(vec![0xFF]));
+        assert!(block_on(load_or_create_seed(
+            &channel,
+            &successor_key(),
+            record(5, 1)
+        ))
+        .is_err());
+
+        // The importer: the last conflict holds a LATER seed, which must not
+        // be reported as kept.
+        let channel = Scripted::new(three_conflicts(record(9, 2).encode()));
+        assert!(block_on(import_seed(&channel, &successor_key(), record(5, 1))).is_err());
+    }
+
+    #[test]
+    fn a_refused_store_is_an_error() {
+        let refused = || {
+            vec![
+                versioned(None, 0),
+                cas(CasStoreResult::Failed("no space".into())),
+            ]
+        };
+        let channel = Scripted::new(refused());
+        assert!(block_on(load_or_create_seed(
+            &channel,
+            &successor_key(),
+            record(5, 1)
+        ))
+        .is_err());
+        let channel = Scripted::new(refused());
+        assert!(block_on(import_seed(&channel, &successor_key(), record(5, 1))).is_err());
     }
 
     #[test]
@@ -853,5 +959,116 @@ mod tests {
         let body = &src[start..];
         let body = &body[..body.find("\n}\n").expect("function end")];
         assert!(body.contains("crate::avatar_salt::current_delegate_present();"));
+    }
+
+    const KEY_WORDS: [&str; 3] = ["self_sk", "SigningKey", "signing_key"];
+    const SALT_CALLS: [&str; 5] = [
+        "display_hue(",
+        "avatar_hue(",
+        "avatar_hue_step(",
+        "room_salt(",
+        "ensure_avatar_salt(",
+    ];
+
+    /// Every mention of a signing key at a salt or hue call site in `src`
+    /// (comments stripped): the call's arguments, and the statement leading
+    /// up to it (back to the previous `;`, `{` or `}`), as `"name: text"`.
+    fn key_mentions_at_salt_calls(name: &str, src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for call in SALT_CALLS {
+            let mut from = 0;
+            while let Some(i) = src[from..].find(call) {
+                let at = from + i;
+                from = at + call.len();
+                // `fn display_hue(` is the definition, not a call.
+                if src[..at].trim_end().ends_with("fn") {
+                    continue;
+                }
+                let lead = src[..at].rfind([';', '{', '}']).map_or(0, |j| j + 1);
+                let mut depth = 1usize;
+                let mut end = from;
+                for (k, c) in src[from..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = from + k;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let site = &src[lead..end];
+                for word in KEY_WORDS {
+                    if site.contains(word) {
+                        out.push(format!("{name}: {word} in `{}`", site.trim()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The salt must never be derived from a signing key: the inviter
+    /// generated the invitee's key, so anything derived from it is computable
+    /// by them. Scans `avatar_salt.rs` outside its tests whole, and every salt
+    /// or hue call site in the UI. A text scan sees only the call's own
+    /// statement: a key bound in an EARLIER statement and passed by name is
+    /// not caught. What stops that is the module scan, since nothing in the
+    /// salt API takes or names a key.
+    #[test]
+    fn no_salt_or_hue_call_site_mentions_a_signing_key() {
+        use crate::util::source_scan::{production_only, rust_files};
+        let module = production_only(include_str!("avatar_salt.rs"));
+        for word in KEY_WORDS {
+            assert!(!module.contains(word), "avatar_salt.rs mentions {word}");
+        }
+        let mut sites = 0;
+        let mut found = Vec::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for path in rust_files(&root) {
+            let src = production_only(&std::fs::read_to_string(&path).unwrap());
+            sites += SALT_CALLS
+                .iter()
+                .map(|c| src.matches(c).count())
+                .sum::<usize>();
+            found.extend(key_mentions_at_salt_calls(
+                &path.display().to_string(),
+                &src,
+            ));
+        }
+        assert!(
+            sites >= 8,
+            "the scan found only {sites} call sites; it is looking in the wrong place"
+        );
+        assert!(found.is_empty(), "{found:#?}");
+    }
+
+    /// The scan above is not vacuous: a copy of a real call site, mutated to
+    /// salt with the room's signing key, is caught, and so is a key in the
+    /// module itself.
+    #[test]
+    fn the_signing_key_scan_catches_a_mutated_call_site() {
+        let real =
+            crate::util::strip_comments(include_str!("components/room_list/dm_rail_section.rs"));
+        assert!(key_mentions_at_salt_calls("dm_rail_section.rs", &real).is_empty());
+        let call = "display_hue(&salt, &vk)";
+        assert!(real.contains(call), "the fixture call site moved");
+        let mutated = real.replacen(call, "display_hue(&rd.self_sk_bytes(), &vk)", 1);
+        assert_eq!(key_mentions_at_salt_calls("mutated", &mutated).len(), 1);
+
+        let in_statement = real.replacen(
+            "crate::avatar_salt::ensure_avatar_salt(room.to_bytes());",
+            "crate::avatar_salt::ensure_avatar_salt(rd.self_sk.as_ref().unwrap().to_bytes());",
+            1,
+        );
+        assert_ne!(in_statement, real, "the fixture ensure call moved");
+        assert!(!key_mentions_at_salt_calls("in_statement", &in_statement).is_empty());
+
+        let module = crate::util::source_scan::production_only(include_str!("avatar_salt.rs"))
+            + "fn derive(k: &SigningKey) {}";
+        assert!(KEY_WORDS.iter().any(|w| module.contains(w)));
     }
 }

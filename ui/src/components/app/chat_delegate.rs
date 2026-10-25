@@ -7247,6 +7247,66 @@ mod tests {
 
         // ---------------- the tests ----------------
 
+        /// The session's avatar-seed read and the migration walk's seed import
+        /// ask the CURRENT delegate for the same key, so they share one slot in
+        /// the single-waiter registry. Run together without serialising, the
+        /// second registration displaces the first (`Cancelled`) or their
+        /// replies cross. `avatar_salt`'s one seed mutex makes them take turns:
+        /// both complete, and the earlier seed is what the delegate ends with.
+        #[test]
+        fn the_seed_read_and_the_seed_import_take_turns_in_the_registry() {
+            use crate::avatar_salt::{
+                import_seed, load_or_create_seed, AvatarSeedRecord, SeedImport,
+                AVATAR_SEED_STORAGE_KEY,
+            };
+            let _guard = registry_guard();
+            let current = current_delegate_key();
+            let node = TestNode::default();
+            let channel = RegistryChannel { node: &node };
+            let live = Cell::new(2usize);
+            let later = AvatarSeedRecord {
+                created_at_ms: 9,
+                seed: [2; 32],
+            };
+            let earlier = AvatarSeedRecord {
+                created_at_ms: 5,
+                seed: [1; 32],
+            };
+
+            let session = async {
+                let out = load_or_create_seed(&channel, &current, later).await;
+                live.set(live.get() - 1);
+                out
+            };
+            let walk = async {
+                let out = import_seed(&channel, &current, earlier).await;
+                live.set(live.get() - 1);
+                out
+            };
+            let (read, import, ()) =
+                block_on(futures::future::join3(session, walk, pump(&node, &live)));
+
+            let read = read.expect("the session's read must not be displaced");
+            let import = import.expect("the walk's import must not be displaced");
+            // Whichever went first, the delegate ends with the earlier seed.
+            let stored = node
+                .stored(&current, AVATAR_SEED_STORAGE_KEY)
+                .and_then(|v| AvatarSeedRecord::decode(&v));
+            assert_eq!(stored, Some(earlier));
+            match import {
+                // The session created its seed first; the import replaced it.
+                SeedImport::Replaced => assert_eq!(read, later),
+                // The import landed first; the session adopted it.
+                SeedImport::Kept => assert_eq!(read, earlier),
+            }
+            assert!(
+                node.completed_for(&current, AVATAR_SEED_STORAGE_KEY)
+                    .iter()
+                    .all(|c| *c),
+                "every seed reply reached a waiter"
+            );
+        }
+
         /// **The property B1 broke.** A legacy delegate's reply must complete
         /// the waiter the legacy read registered, and must NOT complete a
         /// concurrently-outstanding CURRENT-delegate waiter for the same
@@ -8990,8 +9050,8 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
 /// send returns.
 async fn fire_load_outbound_dms_request(attempt: u32) {
     info!("Firing request to load outbound DMs from delegate storage");
-    // The delegate is known present here: an avatar seed read that gave up
-    // (it ran before the delegate was registered) may try again.
+    // Once per load attempt (list answered, registered, or the 30 s fallback):
+    // an avatar seed read that gave up may try again.
     crate::avatar_salt::current_delegate_present();
 
     let request = ChatDelegateRequestMsg::GetRequest {

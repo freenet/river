@@ -1493,6 +1493,9 @@ pub(crate) struct RiverSuccessorIo<'a, C: RiverDelegateChannel, S: RiverImportSe
     /// key is written, so only a read that would otherwise have gone to the
     /// node a moment later is answered from here (freenet/river#809).
     prefetched_markers: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    /// The earliest avatar seed any predecessor exported this walk, imported
+    /// once the walk is done ([`import_found_seed`]).
+    found_seed: Option<crate::avatar_salt::AvatarSeedRecord>,
     /// The journal as [`begin_with`] read it to decide on the prefetch, used
     /// by the first [`JournaledSuccessorIo::load_journal`] instead of reading
     /// it again, so the crate's `begin` sees the same journal the markers
@@ -1514,6 +1517,7 @@ impl<'a, C: RiverDelegateChannel, S: RiverImportSeam> RiverSuccessorIo<'a, C, S>
             rooms_merged: false,
             prefetched_markers: HashMap::new(),
             prefetched_journal: None,
+            found_seed: None,
         }
     }
 
@@ -1929,15 +1933,16 @@ impl<C: RiverDelegateChannel, S: RiverImportSeam> SuccessorSecretsIo
             }
             // Written straight to the successor (it is not room state), unless
             // the successor's own seed is earlier.
+            // Only remembered here (the earliest seen this walk); `walk_with`
+            // imports it once, best-effort, after every predecessor's real data
+            // (`import_found_seed`). Never a write and never a failure, so a
+            // seed cannot keep a predecessor open or count against the
+            // identity-import gate.
             RecoveredItem::AvatarSeed(record) => {
-                match crate::avatar_salt::import_seed(self.channel, &self.successor, record).await {
-                    Ok(crate::avatar_salt::SeedImport::Replaced) => {
-                        self.seam.avatar_seed_replaced(record);
-                        ItemWrite::Written
-                    }
-                    Ok(crate::avatar_salt::SeedImport::Kept) => ItemWrite::AlreadyAuthoritative,
-                    Err(e) => ItemWrite::retryable(e),
+                if self.found_seed.is_none_or(|held| record.precedes(&held)) {
+                    self.found_seed = Some(record);
                 }
+                ItemWrite::AlreadyAuthoritative
             }
             // Never imported, never a failure: the successor's state stands.
             RecoveredItem::MigrationMarker | RecoveredItem::Unrecognized => {
@@ -2436,12 +2441,35 @@ pub(crate) async fn walk_with<C: RiverDelegateChannel, S: RiverImportSeam>(
         river_secret_policy(),
     )
     .await;
+    let found_seed = writer.found_seed;
     let mut seam = writer.seam;
     let salvage = std::mem::take(&mut reader.salvage);
     if !salvage.is_empty() {
         salvage_short_index_rooms(channel, &mut seam, &successor, lineage, refused, salvage).await;
     }
+    if let Some(record) = found_seed {
+        import_found_seed(channel, &mut seam, &successor, record).await;
+    }
     (report, seam)
+}
+
+/// Carry the earliest predecessor avatar seed onto the successor, LAST and
+/// BEST-EFFORT: every predecessor's rooms, DMs and markers are already
+/// written and the journal recorded, and a failure here is only logged. The
+/// worst case is that this device's palette changes once. A predecessor
+/// resolved by this walk is not walked again, so a seed whose import failed
+/// is not retried.
+async fn import_found_seed<C: RiverDelegateChannel, S: RiverImportSeam>(
+    channel: &C,
+    seam: &mut S,
+    successor: &DelegateKey,
+    record: crate::avatar_salt::AvatarSeedRecord,
+) {
+    match crate::avatar_salt::import_seed(channel, successor, record).await {
+        Ok(crate::avatar_salt::SeedImport::Replaced) => seam.avatar_seed_replaced(record),
+        Ok(crate::avatar_salt::SeedImport::Kept) => {}
+        Err(e) => warn!("avatar seed not carried to the successor (palette may change): {e}"),
+    }
 }
 
 /// Whether predecessor `generation` is the NEWEST generation holding DM
@@ -2774,6 +2802,16 @@ pub(crate) mod tests_support {
                 .borrow()
                 .get(delegate.bytes())
                 .and_then(|sim| sim.store.get(key).cloned())
+        }
+        /// Requests of `kind` (a log prefix such as `cas:<key>`) sent to the
+        /// successor.
+        pub(crate) fn requests_to_successor(&self, kind: &str) -> usize {
+            let succ = successor_key().bytes().to_vec();
+            self.log
+                .borrow()
+                .iter()
+                .filter(|(target, what)| *target == succ && what.starts_with(kind))
+                .count()
         }
         pub(crate) fn requests_to_predecessors(&self, kind: &str) -> usize {
             let succ = successor_key().bytes().to_vec();
@@ -4343,6 +4381,114 @@ mod tests {
             "a skipped seed is not a rejection: {:?}",
             report.predecessors
         );
+    }
+
+    /// Two predecessors hold seeds; the walk goes newest first. The earliest
+    /// seed is the one carried, in ONE write after the walk, whichever
+    /// generation held it.
+    #[test]
+    fn the_earliest_seed_of_several_predecessors_is_carried_once() {
+        let key = crate::avatar_salt::AVATAR_SEED_STORAGE_KEY.to_vec();
+        let mut gen0 = DelegateSim::default();
+        gen0.store.insert(key.clone(), seed(3, 7).encode());
+        let mut gen2 = DelegateSim::default();
+        gen2.store.insert(key, seed(9, 2).encode());
+        let channel = MockChannel::default()
+            .with_delegate(&pred_key(0), gen0)
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let (_, seam) = walk(&channel, MemorySeam::new());
+        assert_eq!(stored_seed(&channel), Some(seed(3, 7)));
+        assert_eq!(seam.seeds_replaced, vec![seed(3, 7)]);
+        assert_eq!(
+            channel.requests_to_successor("cas:river_avatar_colour_seed_v1"),
+            1
+        );
+    }
+
+    /// Answers every seed request to the successor with silence; everything
+    /// else goes to the mock.
+    struct SeedSilentAtSuccessor<'a>(&'a MockChannel);
+
+    impl RiverDelegateChannel for SeedSilentAtSuccessor<'_> {
+        async fn request(
+            &self,
+            target: &DelegateKey,
+            request: ChatDelegateRequestMsg,
+        ) -> Result<Option<ChatDelegateResponseMsg>, String> {
+            let seed_key = crate::avatar_salt::AVATAR_SEED_STORAGE_KEY;
+            let is_seed = match &request {
+                ChatDelegateRequestMsg::GetVersionedRequest { key }
+                | ChatDelegateRequestMsg::CasStoreRequest { key, .. } => key.as_bytes() == seed_key,
+                _ => false,
+            };
+            if is_seed && *target == successor_key() {
+                return Ok(None);
+            }
+            self.0.request(target, request).await
+        }
+        async fn request_all(
+            &self,
+            requests: Vec<(DelegateKey, ChatDelegateRequestMsg)>,
+        ) -> Vec<Result<Option<ChatDelegateResponseMsg>, String>> {
+            let mut out = Vec::with_capacity(requests.len());
+            for (target, request) in requests {
+                out.push(self.request(&target, request).await);
+            }
+            out
+        }
+    }
+
+    /// A seed import that fails must not hold up real data: the
+    /// predecessor's rooms still merge, it is resolved, nothing is
+    /// interrupted or rejected, and the identity-import gate is open.
+    #[test]
+    fn a_failing_seed_import_leaves_the_predecessor_complete_and_the_gate_open() {
+        use crate::components::app::freenet_api::migration_journal::{
+            import_gate, ImportGate, JournalSession,
+        };
+        let mut gen2 = DelegateSim::default();
+        gen2.store
+            .insert(ROOMS_STORAGE_KEY.to_vec(), rooms_blob_with(vk(1), 3));
+        gen2.store.insert(
+            crate::avatar_salt::AVATAR_SEED_STORAGE_KEY.to_vec(),
+            seed(5, 1).encode(),
+        );
+        let mock = MockChannel::default()
+            .with_delegate(&pred_key(0), DelegateSim::default())
+            .with_delegate(&pred_key(1), DelegateSim::default())
+            .with_delegate(&pred_key(2), gen2)
+            .with_delegate(&successor_key(), DelegateSim::default());
+        let channel = SeedSilentAtSuccessor(&mock);
+        let (journaled, seam) = block_on(walk_with(
+            &channel,
+            MemorySeam::new(),
+            successor_key(),
+            &lineage3(),
+        ));
+
+        assert!(seam.rooms.map.contains_key(&vk(1)), "the room still merged");
+        assert!(seam.seeds_replaced.is_empty());
+        assert_eq!(stored_seed(&mock), None);
+        assert!(
+            journaled
+                .report
+                .predecessors
+                .iter()
+                .any(|p| matches!(p, PredecessorMigration::Imported { generation: 2, .. })),
+            "{:?}",
+            journaled.report.predecessors
+        );
+        let status = journaled.status.expect("the journal was recorded");
+        assert!(!status.interrupted_import());
+        assert_eq!(status.rejected_items(), 0);
+        let session = JournalSession {
+            begun: true,
+            status: Some(status),
+            ..Default::default()
+        };
+        assert_eq!(import_gate(&session, false), ImportGate::Open);
     }
 
     fn gen0_with_blob() -> DelegateSim {

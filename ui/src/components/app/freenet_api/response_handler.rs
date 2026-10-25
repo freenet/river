@@ -2542,7 +2542,7 @@ fn delegate_storage_key_str(key: &ChatDelegateKey) -> String {
 /// console bytes River emits during startup** (freenet/river#569), and the
 /// per-key bytes were never what anyone read. This keeps the variant, the key
 /// names and the sizes -- everything the logs were actually used for.
-fn describe_delegate_response(r: &ChatDelegateResponseMsg) -> String {
+pub(crate) fn describe_delegate_response(r: &ChatDelegateResponseMsg) -> String {
     use ChatDelegateResponseMsg as R;
     match r {
         R::GetResponse { key, value } => format!(
