@@ -194,7 +194,7 @@ test.describe("Member panel on desktop", () => {
     await page.getByTestId("members-panel-toggle").click();
     await expect.poll(async () => (await scrollMetrics(page)).height, { message: "premise: the rows rewrap" }).not.toBe(height);
     await page.waitForTimeout(1_200);
-    await releaseResizeObservations(page);
+    expect(await releaseResizeObservations(page), "premise: the toggle's resize reports were held").toBeGreaterThan(0);
     await settle(page);
     const after = await anchorRow(page, row.key);
     expect(Math.abs(after!.top - row.top), "the reading row stays put").toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
@@ -215,19 +215,25 @@ test.describe("Member panel on desktop", () => {
     expect(Math.abs((await scroller.evaluate((c) => c.scrollTop)) - moved), why).toBeLessThan(300);
   }
 
-  test("a double toggle in one frame leaves no stale correction", async ({ page }) => {
-    await parkMidHistory(page);
-    // Two clicks in one task: the panel ends as it began, no width changes.
+  test("a double toggle keeps the reading row and leaves no stale correction", async ({ page }) => {
+    const row = await parkMidHistory(page);
+    // Two clicks before either renders: two deferred writes, each rendered
+    // on its own (closed, then open again), so the rows rewrap twice.
     await page.getByTestId("members-panel-toggle").evaluate((el) => {
       (el as HTMLElement).click();
       (el as HTMLElement).click();
     });
     await settle(page);
     await expect(page.getByTestId("members-rail")).toBeVisible();
+    const after = await anchorRow(page, row.key);
+    expect(Math.abs(after!.top - row.top), "the reading row stays put").toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
     await expectNoStaleRestore(page, "a later resize did not apply the double toggle's capture");
   });
 
-  test("a toggle that rewraps nothing leaves no stale correction", async ({ page }) => {
+  // A regression guard for the path where a capture could outlive its
+  // toggle. Both the old (deadline) and the new (render) design pass it; it
+  // does not tell them apart.
+  test("a toggle at 1920, where nothing rewraps, leaves nothing for a later resize", async ({ page }) => {
     // At 1920 the text is at its measure either way.
     await page.setViewportSize({ width: 1920, height: 1080 });
     await openRoomAtBottom(page, "Your Private Room");

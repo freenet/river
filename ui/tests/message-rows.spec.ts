@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { coarsePointer, openInlinePicker, openRoomWithComposer, reactTo, resolveColor, selectRoom, touchOnly, waitForApp } from "./example-room";
+import { coarsePointer, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, selectRoom, touchOnly, waitForApp } from "./example-room";
 import { deliver, deliverOffscreen, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
@@ -513,6 +513,45 @@ function expectRightwardWouldClip(report: PickerReport) {
   expect(report.anchor.left + width(report.picker), "premise: a rightward picker would clip").toBeGreaterThan(report.scroller.right);
 }
 
+/// The scroll offsets a reveal must leave alone: the history's horizontal
+/// one, the app root's and the page's (all `overflow: hidden`).
+function strayScroll(page: Page) {
+  return page.evaluate(() => ({
+    historyLeft: document.getElementById("chat-scroll-container")!.scrollLeft,
+    root: [document.querySelector(".app-root")!.scrollTop, document.querySelector(".app-root")!.scrollLeft],
+    page: [document.scrollingElement!.scrollTop, document.scrollingElement!.scrollLeft],
+  }));
+}
+const NO_STRAY_SCROLL = { historyLeft: 0, root: [0, 0], page: [0, 0] };
+
+// A popover that overflows sideways, on a short phone view, is revealed by
+// the history's scrollTop alone: `scrollIntoView` also scrolled the
+// history's scrollLeft and overflow-hidden ancestors, which nothing scrolls
+// back. The overflow is forced (the picker and the form fit at every real
+// width), so the old behaviour would show.
+test.describe("Revealing a popover on a short phone view", () => {
+  test.use({ viewport: { width: 320, height: 480 } });
+
+  test("the picker and the edit form scroll nothing sideways or outside the history", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await page.addStyleTag({
+      content: '[data-testid="emoji-picker"] { min-width: 520px; min-height: 700px; } [id^="edit-form-"] { min-width: 600px; }',
+    });
+    const row = page.getByTestId("message-row").last();
+    await openInlinePicker(page, row);
+    await expect(page.getByTestId("emoji-picker")).toBeVisible();
+    await nextFrames(page);
+    expect(await strayScroll(page), "picker").toEqual(NO_STRAY_SCROLL);
+    await page.keyboard.press("Escape");
+    await page.mouse.click(2, 2);
+    await expect(page.getByTestId("emoji-picker")).toHaveCount(0);
+
+    await openOwnMessageEdit(page);
+    await nextFrames(page);
+    expect(await strayScroll(page), "edit form").toEqual(NO_STRAY_SCROLL);
+  });
+});
+
 test.describe("Reaction picker at 320px", () => {
   test.use({ viewport: { width: 320, height: 700 } });
 
@@ -828,16 +867,6 @@ test.describe("React on a tall message", () => {
         return !!g.picker && g.picker[0] >= g.view[0] - 1 && g.picker[1] <= g.view[1] + 1;
       }, { message: "the picker is wholly inside the history's view" })
       .toBe(true);
-    // Only the history's scrollTop moved: no horizontal scroll, and no
-    // overflow-hidden ancestor (the app root, the page) scrolled.
-    expect(
-      await page.evaluate(() => ({
-        historyLeft: document.getElementById("chat-scroll-container")!.scrollLeft,
-        root: [document.querySelector(".app-root")!.scrollTop, document.querySelector(".app-root")!.scrollLeft],
-        page: [document.scrollingElement!.scrollTop, document.scrollingElement!.scrollLeft],
-      })),
-    ).toEqual({ historyLeft: 0, root: [0, 0], page: [0, 0] });
-
     // Opened once, revealed once: with the picker open, the reader moves up,
     // and a re-render of that row (a reaction added) and an arrival leave
     // the view where the reader put it.

@@ -151,12 +151,13 @@ Known limitations:
   toggle: opening or closing it changes the chat column's width and rewraps
   every row, so a reader at the end keeps the end hold (the resize takes the
   view back to the end), and anyone else has their reading row measured at
-  the click and put back by an effect after the toggle's render, once the
+  the click and put back by an effect after each toggle's render, once the
   column has its new width (`capture_before_reflow`, `after_panel_render`).
-  The capture is used up by that render whether or not the width changed (a
-  double toggle in one frame changes none), and a new toggle replaces it, so
-  it can never move the view at some later resize. A window resize gets no
-  such correction. A hide is noticed from the container's size
+  Two clicks before the first renders are two deferred writes, each
+  rendered on its own: the first render's effect restores and measures
+  again for the second. Once every toggle clicked has rendered, the capture
+  is dropped, so it can never move the view at some later resize. A window
+  resize gets no such correction. A hide is noticed from the container's size
   or from a patch landing while it has no layout (`note_patch_while_hidden`,
   which also re-observes the container), so a reveal restores the reader even
   when the ResizeObserver never reported the hide: a hide and reveal with no

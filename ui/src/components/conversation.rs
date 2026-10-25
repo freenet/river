@@ -557,7 +557,8 @@ fn resolve_member_nickname(
 /// between two ordinary machines is normal. A minute is roughly where the
 /// rendered `HH:MM` would start disagreeing with reality, which is the point at
 /// which telling the reader the timestamp is untrustworthy earns its keep.
-const CLOCK_SKEW_TOLERANCE_SECS: i64 = 60;
+/// DM threads clamp by the same tolerance (`dm_thread_modal::shown_dm_secs`).
+pub(crate) const CLOCK_SKEW_TOLERANCE_SECS: i64 = 60;
 
 /// What a grouping pass knows about time.
 ///
@@ -1282,7 +1283,14 @@ pub fn Conversation() -> Element {
     {
         let reader_position = reader_position.clone();
         use_effect(move || {
-            let _open = *MEMBERS_PANEL_OPEN.read();
+            // A fallible read with a dependency the nudge can wake, so a
+            // contended read cannot leave the effect unsubscribed
+            // (dioxus-signal-safety.md, #555).
+            crate::util::signal_guard::anchor();
+            if MEMBERS_PANEL_OPEN.try_read().is_err() {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            }
             reader_position.after_panel_render();
         });
     }
@@ -2801,7 +2809,9 @@ pub fn Conversation() -> Element {
                                                 // The chat column changes width and every row
                                                 // rewraps: keep the reader on their row.
                                                 reader_position.capture_before_reflow();
+                                                let reader_position = reader_position.clone();
                                                 crate::util::defer(move || {
+                                                    reader_position.note_panel_toggle_written();
                                                     let open = *MEMBERS_PANEL_OPEN.peek();
                                                     *MEMBERS_PANEL_OPEN.write() = !open;
                                                 });
@@ -4363,11 +4373,23 @@ fn MessageGroupComponent(
                                                             id: "{edit_id}",
                                                             class: "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none bg-bg text-text border border-border",
                                                             value: "{edit_text}",
-                                                            onmounted: move |cx| {
-                                                                let element = cx.data();
-                                                                wasm_bindgen_futures::spawn_local(async move {
-                                                                    let _ = element.set_focus(true).await;
-                                                                });
+                                                            // Focus without scrolling: a plain focus scrolls
+                                                            // every ancestor to the textarea (overflow-hidden
+                                                            // ones too); the form's reveal moves only the
+                                                            // history (`reveal_once_in_history`).
+                                                            onmounted: {
+                                                                let focus_id = edit_id.clone();
+                                                                move |_| {
+                                                                    #[cfg(target_arch = "wasm32")]
+                                                                    if let Some(el) = web_sys::window()
+                                                                        .and_then(|w| w.document())
+                                                                        .and_then(|d| d.get_element_by_id(&focus_id))
+                                                                    {
+                                                                        focus_without_scrolling(&el);
+                                                                    }
+                                                                    #[cfg(not(target_arch = "wasm32"))]
+                                                                    let _ = &focus_id;
+                                                                }
                                                             },
                                                             oninput: move |e| {
                                                                 let value = e.value().to_string();

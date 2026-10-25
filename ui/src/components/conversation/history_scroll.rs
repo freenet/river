@@ -134,11 +134,17 @@ pub(super) struct ReaderPosition {
     restore_after_patch: std::cell::RefCell<Option<ReadingAnchor>>,
     /// The reading rows measured just before the member panel opens or
     /// closes. The panel changes the chat column's width and every row
-    /// rewraps; the effect after the toggle's render puts the reader back on
-    /// their row, or drops the capture if the width did not change
-    /// (`after_panel_render`). No time limit, and a new toggle replaces it.
+    /// rewraps; the effect after each toggle's render puts the reader back
+    /// on their row (`after_panel_render`). No time limit; it is dropped once
+    /// every toggle clicked so far has rendered.
     #[cfg(target_arch = "wasm32")]
     restore_after_reflow: std::cell::RefCell<Option<ReflowRestore>>,
+    /// Member-panel toggles clicked, and their deferred writes performed. A
+    /// render whose effect sees fewer writes than clicks is not the last of
+    /// a burst (two clicks before the first renders are two writes, each
+    /// rendered on its own), so the capture is kept for the next.
+    #[cfg(target_arch = "wasm32")]
+    panel_toggles: std::cell::Cell<(u32, u32)>,
 }
 
 impl ReaderPosition {
@@ -180,31 +186,52 @@ impl ReaderPosition {
     /// toggle's, for `after_panel_render` to put back.
     #[cfg(target_arch = "wasm32")]
     pub(super) fn capture_before_reflow(&self) {
+        let (clicked, written) = self.panel_toggles.get();
+        self.panel_toggles.set((clicked + 1, written));
         let mut pending = self.restore_after_reflow.borrow_mut();
-        *pending = None;
-        if self.end_hold.get().is_some() || self.hidden() {
+        // A toggle already in flight keeps its capture: the view has not
+        // moved since, and its render has yet to restore against it.
+        if pending.is_some() {
             return;
         }
-        let Some(container) = ROOM_HISTORY.container() else {
-            return;
-        };
-        if let Some(anchor) = capture_reading_anchor(0) {
-            *pending = Some(ReflowRestore {
-                anchor,
-                width: container.get_bounding_client_rect().width(),
-            });
-        }
+        *pending = self.measure_for_reflow();
     }
 
     /// Natively there is no layout to measure.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn capture_before_reflow(&self) {}
 
-    /// The member panel's toggle has rendered (an effect after the render
-    /// that read `MEMBERS_PANEL_OPEN`): measuring now lays the new width out.
-    /// If it changed, put the reader back on their row; either way the
-    /// capture is used up, so a toggle that changed no width (a double toggle
-    /// in one frame) leaves nothing for a later, unrelated resize to apply.
+    /// The reading rows and the history's width now, or `None` for a reader
+    /// the end hold keeps or a hidden history.
+    #[cfg(target_arch = "wasm32")]
+    fn measure_for_reflow(&self) -> Option<ReflowRestore> {
+        if self.end_hold.get().is_some() || self.hidden() {
+            return None;
+        }
+        let container = ROOM_HISTORY.container()?;
+        Some(ReflowRestore {
+            anchor: capture_reading_anchor(0)?,
+            width: container.get_bounding_client_rect().width(),
+        })
+    }
+
+    /// A toggle's deferred write of `MEMBERS_PANEL_OPEN` is about to happen.
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn note_panel_toggle_written(&self) {
+        let (clicked, written) = self.panel_toggles.get();
+        self.panel_toggles.set((clicked, written + 1));
+    }
+
+    /// Natively nothing is counted.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn note_panel_toggle_written(&self) {}
+
+    /// A member-panel toggle has rendered (an effect after the render that
+    /// read `MEMBERS_PANEL_OPEN`): measuring now lays the new width out. If
+    /// it changed, put the reader back on their row. If more toggles are
+    /// still to render (two clicks before the first rendered), measure again
+    /// for the next one; else the capture is used up, so nothing is left for
+    /// a later, unrelated resize.
     #[cfg(target_arch = "wasm32")]
     pub(super) fn after_panel_render(&self) {
         let Some(reflow) = self.restore_after_reflow.borrow_mut().take() else {
@@ -213,12 +240,16 @@ impl ReaderPosition {
         let Some(container) = ROOM_HISTORY.container() else {
             return;
         };
-        if self.end_hold.get().is_some() || !has_layout(&container) {
-            return;
-        }
-        if (container.get_bounding_client_rect().width() - reflow.width).abs() >= 0.5 {
+        if self.end_hold.get().is_none()
+            && has_layout(&container)
+            && (container.get_bounding_client_rect().width() - reflow.width).abs() >= 0.5
+        {
             restore_reading_anchor(&reflow.anchor);
             remember_reading_position(self);
+        }
+        let (clicked, written) = self.panel_toggles.get();
+        if written < clicked {
+            *self.restore_after_reflow.borrow_mut() = self.measure_for_reflow();
         }
     }
 
