@@ -405,13 +405,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
             // The avatar salt for the DM's ROOM, a further fallible read: on
             // contention both discs render neutral and the nudge re-runs this.
-            let salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
-                Ok(salts) => salts.get(&room.to_bytes()).copied(),
-                Err(_) => {
-                    crate::util::signal_guard::schedule_nudge();
-                    None
-                }
-            };
+            let salt = crate::avatar_salt::salt_for_render(&room.to_bytes());
             let hue_of = |member: MemberId| {
                 let salt = salt?;
                 crate::components::conversation::avatar::member_vk_bytes(

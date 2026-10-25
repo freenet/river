@@ -448,13 +448,7 @@ pub fn MemberInfoModal() -> Element {
             crate::avatar_salt::ensure_avatar_salt(owner_vk.to_bytes());
             // A dependency the nudge can wake (#555).
             crate::util::signal_guard::anchor();
-            let salt = match crate::avatar_salt::AVATAR_SALTS.try_read() {
-                Ok(salts) => salts.get(&owner_vk.to_bytes()).copied()?,
-                Err(_) => {
-                    crate::util::signal_guard::schedule_nudge();
-                    return None;
-                }
-            };
+            let salt = crate::avatar_salt::salt_for_render(&owner_vk.to_bytes())?;
             let vk = if is_owner {
                 owner_vk
             } else {

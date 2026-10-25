@@ -423,18 +423,27 @@ impl SeedSession {
         }
     }
 
-    /// The delegate is known present: an exhausted read starts again with
-    /// `epoch` if any room is waiting. Returns the epoch to run.
-    fn rearm_if_exhausted(&mut self, epoch: u64) -> Option<u64> {
-        if self.fetch != SeedFetch::Exhausted {
-            return None;
+    /// The delegate is known present: a read not yet asked for, or one that
+    /// gave up, starts now with `epoch`, before any room asks. Returns the
+    /// epoch to run. Starting here rather than at the first render puts the
+    /// read ahead of the startup work queued behind the room loads.
+    fn delegate_present(&mut self, epoch: u64) -> Option<u64> {
+        match self.fetch {
+            SeedFetch::Idle | SeedFetch::Exhausted => {
+                self.fetch = SeedFetch::InFlight { epoch };
+                Some(epoch)
+            }
+            SeedFetch::InFlight { .. } | SeedFetch::Ready { .. } => None,
         }
-        if self.wanted.is_empty() {
-            self.fetch = SeedFetch::Idle;
-            return None;
+    }
+
+    /// `room`'s salt from the session's seed, once it is read. Render uses it
+    /// while the deferred store into [`AVATAR_SALTS`] has not landed yet.
+    fn salt_now(&self, room: &RoomKey) -> Option<[u8; 32]> {
+        match self.fetch {
+            SeedFetch::Ready { seed } => Some(room_salt(&seed, room)),
+            _ => None,
         }
-        self.fetch = SeedFetch::InFlight { epoch };
-        Some(epoch)
     }
 
     /// The migration walk replaced the stored seed: every room asked for so
@@ -493,18 +502,47 @@ pub fn ensure_avatar_salt(room_key: RoomKey) {
     }
 }
 
+/// `room_key`'s salt for a render: [`AVATAR_SALTS`]'s entry, else the salt
+/// computed from the session's seed when it has been read. The second source
+/// covers the time between the seed arriving and the deferred store landing,
+/// which on a busy load is seconds, so the first coloured paint does not wait
+/// for it. Neither source holds a salt while the seed is unread, so a room
+/// without one stays neutral as before.
+///
+/// Reading [`AVATAR_SALTS`] subscribes the caller; a contended read nudges
+/// (dioxus-signal-safety.md, #555), so call `signal_guard::anchor()` first.
+pub fn salt_for_render(room_key: &RoomKey) -> Option<[u8; 32]> {
+    let held = match AVATAR_SALTS.try_read() {
+        Ok(salts) => salts.get(room_key).copied(),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            None
+        }
+    };
+    held.or_else(|| with_session(|s| s.salt_now(room_key)))
+}
+
 /// Called where the outbound-DM load is sent, once per load attempt: after the
 /// current delegate's room list was answered, after it was registered, or by
 /// the 30 s fallback when neither happened (`DM_LOAD_FALLBACK_MS`). The
 /// delegate is therefore probably, not certainly, present. Every reconnect and
 /// refresh-on-wake re-runs `set_up_chat_delegate`, a new attempt, so this runs
-/// again then too. A seed read that gave up (typically one sent before the
-/// delegate was registered) starts again; nothing else does, so the cost is
-/// at most one 3-attempt read per load attempt, and only after a failure.
+/// again then too. The session's seed read starts here if no render has
+/// started it yet, and a read that gave up (typically one sent before the
+/// delegate was registered) starts again. A read in flight or done is left
+/// alone, so the cost is one read per session plus at most one 3-attempt read
+/// per load attempt after a failure.
 pub(crate) fn current_delegate_present() {
-    if let Some(epoch) = with_session(|s| s.rearm_if_exhausted(next_epoch())) {
+    if let Some(epoch) = with_session(|s| s.delegate_present(next_epoch())) {
         spawn_seed_read(epoch);
     }
+}
+
+/// Test hook: the session behaves as if the seed could not be read, so the
+/// current room renders neutral until a spec stores a salt itself.
+#[cfg(all(feature = "example-data", feature = "no-sync"))]
+pub(crate) fn give_up_for_test() {
+    with_session(|s| s.fetch = SeedFetch::Exhausted);
 }
 
 /// The delegate holds `record` after a migration seed carry: the walk stored
@@ -1004,26 +1042,62 @@ mod tests {
             s.want([2; 32], 2) == Want::Nothing,
             "exhausted stays absent"
         );
-        assert_eq!(s.rearm_if_exhausted(3), Some(3));
+        assert_eq!(s.delegate_present(3), Some(3));
         assert!(s.owns(3));
         assert_eq!(
-            s.rearm_if_exhausted(4),
+            s.delegate_present(4),
             None,
-            "only an exhausted read re-arms"
+            "a read in flight is not restarted"
         );
         assert!(
             matches!(s.after_attempt(3, 1, Some([7; 32])), AfterAttempt::Fill(f) if f.len() == 2)
         );
     }
 
+    /// The delegate-present point starts the read before any room asks, so
+    /// the seed is not queued behind the load's startup work. A room asked
+    /// for meanwhile waits for that read and is filled by it.
     #[test]
-    fn an_exhausted_session_nobody_waits_on_starts_no_read() {
+    fn the_delegate_present_point_starts_the_read_before_any_room_asks() {
+        let mut s = SeedSession::default();
+        assert_eq!(s.delegate_present(1), Some(1));
+        assert!(s.owns(1));
+        assert!(s.want([1; 32], 2) == Want::Nothing, "no second read");
+        assert!(
+            matches!(s.after_attempt(1, 1, Some([7; 32])), AfterAttempt::Fill(f) if f == vec![([1; 32], room_salt(&[7; 32], &[1; 32]))])
+        );
+        assert_eq!(s.delegate_present(3), None, "a read seed is not read again");
+    }
+
+    #[test]
+    fn an_exhausted_session_nobody_waits_on_reads_again() {
         let mut s = SeedSession {
             fetch: SeedFetch::Exhausted,
             ..SeedSession::default()
         };
-        assert_eq!(s.rearm_if_exhausted(1), None);
-        assert!(s.want([1; 32], 2) == Want::Fetch(2));
+        assert_eq!(s.delegate_present(1), Some(1));
+        assert!(s.owns(1));
+    }
+
+    /// Render's second source: the salt from the read seed, for any room,
+    /// and nothing before the seed is read or after the read gave up.
+    #[test]
+    fn the_salt_is_computed_at_render_only_from_a_read_seed() {
+        let mut s = SeedSession::default();
+        assert_eq!(s.salt_now(&[1; 32]), None, "idle");
+        assert!(s.want([1; 32], 1) == Want::Fetch(1));
+        assert_eq!(s.salt_now(&[1; 32]), None, "in flight");
+        let _ = s.after_attempt(1, 1, Some([7; 32]));
+        assert_eq!(s.salt_now(&[1; 32]), Some(room_salt(&[7; 32], &[1; 32])));
+        assert_eq!(
+            s.salt_now(&[2; 32]),
+            Some(room_salt(&[7; 32], &[2; 32])),
+            "a room not yet asked for"
+        );
+        let _ = s.replace_seed([9; 32]);
+        assert_eq!(s.salt_now(&[1; 32]), Some(room_salt(&[9; 32], &[1; 32])));
+        s.fetch = SeedFetch::Exhausted;
+        assert_eq!(s.salt_now(&[1; 32]), None, "gave up");
     }
 
     #[test]
@@ -1059,8 +1133,35 @@ mod tests {
         assert!(body.contains("crate::avatar_salt::current_delegate_present();"));
     }
 
+    /// Every render reads a salt through [`salt_for_render`], so none waits
+    /// for the deferred store once the seed is read. Only the test hook,
+    /// which writes salts, touches [`AVATAR_SALTS`] outside this module.
+    #[test]
+    fn every_salt_reader_falls_back_to_the_read_seed() {
+        use crate::util::source_scan::{production_only, rust_files};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut readers = 0;
+        for path in rust_files(&root) {
+            let name = path.display().to_string();
+            if name.ends_with("avatar_salt.rs") || name.ends_with("test_hooks.rs") {
+                continue;
+            }
+            let src = production_only(&std::fs::read_to_string(&path).unwrap());
+            assert!(
+                !src.contains("AVATAR_SALTS"),
+                "{name} reads AVATAR_SALTS directly"
+            );
+            readers += src.matches("salt_for_render(").count();
+        }
+        assert!(readers >= 6, "found only {readers} readers");
+        let module = production_only(include_str!("avatar_salt.rs"));
+        let body = &module[module.find("pub fn salt_for_render(").unwrap()..];
+        assert!(body[..body.find("\n}\n").unwrap()].contains("s.salt_now(room_key)"));
+    }
+
     const KEY_WORDS: [&str; 3] = ["self_sk", "SigningKey", "signing_key"];
-    const SALT_CALLS: [&str; 5] = [
+    const SALT_CALLS: [&str; 6] = [
+        "salt_for_render(",
         "display_hue(",
         "avatar_hue(",
         "avatar_hue_step(",

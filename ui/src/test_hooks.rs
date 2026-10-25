@@ -219,6 +219,9 @@ pub fn install_test_hooks() {
                         salts.insert(key, [b; 32]);
                     }
                     None => {
+                        // Render also computes a salt from a read seed,
+                        // so "no salt" means the seed read gave up.
+                        crate::avatar_salt::give_up_for_test();
                         salts.remove(&key);
                     }
                 });

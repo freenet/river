@@ -187,12 +187,7 @@ pub fn InviteViaDmPickerModal() -> Element {
     crate::avatar_salt::ensure_avatar_salt(current_room.to_bytes());
     crate::util::signal_guard::anchor();
     let peer_hue: Option<u16> = (|| {
-        let Ok(salts) = crate::avatar_salt::AVATAR_SALTS.try_read() else {
-            crate::util::signal_guard::schedule_nudge();
-            return None;
-        };
-        let salt = salts.get(&current_room.to_bytes()).copied()?;
-        drop(salts);
+        let salt = crate::avatar_salt::salt_for_render(&current_room.to_bytes())?;
         let Ok(rooms) = ROOMS.try_read() else {
             crate::util::signal_guard::schedule_nudge();
             return None;

@@ -2947,16 +2947,10 @@ pub fn Conversation() -> Element {
                                         let owner_vk = CURRENT_ROOM.peek().owner_key;
                                         let salt = owner_vk.and_then(|vk| {
                                             crate::avatar_salt::ensure_avatar_salt(vk.to_bytes());
-                                            match crate::avatar_salt::AVATAR_SALTS.try_read() {
-                                                Ok(salts) => salts.get(&vk.to_bytes()).copied(),
-                                                Err(_) => {
-                                                    // No subscription this render; the
-                                                    // nudge renders it again (#555).
-                                                    crate::util::signal_guard::anchor();
-                                                    crate::util::signal_guard::schedule_nudge();
-                                                    None
-                                                }
-                                            }
+                                            // A contended read nudges, and the anchor
+                                            // lets the nudge render it again (#555).
+                                            crate::util::signal_guard::anchor();
+                                            crate::avatar_salt::salt_for_render(&vk.to_bytes())
                                         });
                                         match (salt, owner_vk, current_room_data.as_ref()) {
                                             (Some(salt), Some(owner_vk), Some(rd)) => groups
