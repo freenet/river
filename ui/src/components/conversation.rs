@@ -2968,7 +2968,8 @@ pub fn Conversation() -> Element {
                                         groups[history_window.start..history_window.end].to_vec();
                                     let self_member_id = *self_member_id;
                                     let owner_id = *owner_id;
-                                    let member_names = member_names.clone();
+                                    // One copy shared by every group, which clone the pointer.
+                                    let member_names = Rc::new(member_names.clone());
                                     let impersonation = impersonation.clone();
                                     let deputy_badges = deputy_badges.clone();
                                     // This viewer's avatar hue for each author in the
@@ -4015,6 +4016,11 @@ fn reply_preview(text: &str, member_names: &HashMap<MemberId, String>) -> String
         .collect()
 }
 
+/// One author's run of messages. It renders again only when its props change,
+/// not on every render of the conversation: the props compare by value, and the
+/// handlers are `Conversation`'s `use_callback`s, which stay the same. So
+/// anything its render reads must be a prop or a signal; any other input would
+/// go stale.
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -4023,7 +4029,7 @@ fn MessageGroupComponent(
     /// yourself from the @mention list), and each degrades to the "not me"
     /// answer.
     self_member_id: Option<MemberId>,
-    member_names: HashMap<MemberId, String>,
+    member_names: Rc<HashMap<MemberId, String>>,
     impersonation: ImpersonationChecker,
     deputy_badges: HashMap<MemberId, DeputyBadge>,
     owner_id: MemberId,
@@ -4236,7 +4242,7 @@ fn MessageGroupComponent(
     };
 
     // Shared by every row's reply buttons, which build their preview on click.
-    let preview_names = Rc::new(member_names.clone());
+    let preview_names = member_names.clone();
 
     // Watch for external edit requests (e.g. up-arrow in empty input)
     let message_ids: Vec<String> = group.messages.iter().map(|m| m.id.clone()).collect();

@@ -1187,10 +1187,11 @@ test.describe("Message group renders", () => {
     await selectRoom(page, "Team Chat Room");
     await nextFrames(page);
     await page.waitForTimeout(300);
+    // Counted after the take, so a group mounted in between is not missed.
+    const renders = await callRiverTest(page, "takeMessageGroupRenders");
     const groups = await groupCount(page);
     expect(groups, "premise: the room has enough groups to tell one render from several").toBeGreaterThanOrEqual(5);
-    const renders = await callRiverTest(page, "takeMessageGroupRenders");
-    expect(renders, `renders for ${groups} groups`).toBeLessThanOrEqual(groups);
+    expect(renders, `renders for ${groups} groups`).toBe(groups);
   });
 
   test("an arrival renders only the group it changes", async ({ page }) => {
@@ -1215,7 +1216,29 @@ test.describe("Message group renders", () => {
     await page.waitForTimeout(300);
     // The new message's group, plus the group above it when the arrival
     // changes how that one ends.
-    expect(await callRiverTest(page, "takeMessageGroupRenders")).toBeLessThanOrEqual(2);
+    const renders = await callRiverTest(page, "takeMessageGroupRenders");
+    expect(renders, "the new message's group renders").toBeGreaterThanOrEqual(1);
+    expect(renders).toBeLessThanOrEqual(2);
+  });
+
+  // A group skipped by a render still holds the handlers from its last
+  // render. They are `use_callback`s, so they run the latest body: a reaction
+  // on an older message after an arrival still lands.
+  test("a group skipped by a render still reacts", async ({ page }) => {
+    await openRoomWithComposer(page);
+    for (const text of ["skip probe A", "skip probe B", "skip probe C"]) {
+      await callRiverTest(page, "appendMessage", text);
+      await expect(page.getByTestId("conversation-history")).toContainText(text);
+    }
+    await nextFrames(page);
+    await callRiverTest(page, "takeMessageGroupRenders");
+    await callRiverTest(page, "appendMessage", "skip probe D");
+    await expect(page.getByTestId("conversation-history")).toContainText("skip probe D");
+    await nextFrames(page);
+    const row = page.getByTestId("message-row").filter({ hasText: "skip probe B" });
+    expect(await callRiverTest(page, "takeMessageGroupRenders"), "premise: the arrival skipped the reacted group").toBeLessThanOrEqual(2);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
+    await reactTo(page, row);
   });
 });
 
