@@ -289,9 +289,6 @@ impl MemberTag {
     }
 }
 
-/// A member-row marker, drawn from its glyph (the tag's meaning): the ⚠ stays
-/// its glyph, in the warning colour; "you" is a muted word; every other mark
-/// is a monochrome line icon. Its span carries the tooltip and label.
 /// The line icon a relationship glyph is drawn as. `None` for the self
 /// marker (drawn as "you") and the impersonation warning (drawn as itself, in
 /// the warning colour); `member_tag_glyphs_all_have_a_drawing` pins that
@@ -308,6 +305,9 @@ fn marker_icon(glyph: &str) -> Option<&'static str> {
     }
 }
 
+/// A member-row marker, drawn from its glyph (the tag's meaning): the ⚠ stays
+/// its glyph, in the warning colour; "you" is a muted word; every other mark
+/// is a monochrome line icon. Its span carries the tooltip and label.
 fn member_marker(glyph: &str) -> Element {
     let icon = marker_icon(glyph);
     match (glyph, icon) {
@@ -2092,7 +2092,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                 p { class: "text-[13px] text-text-muted mb-3",
                     "Copy this token and import it in another River client (UI or riverctl) to use the same identity."
                 }
-                p { class: "text-sm text-yellow-500 font-medium mb-3",
+                p { class: "text-[13px] text-yellow-500 font-medium mb-3",
                     "⚠ This token contains your private key. Treat it like a password — do not share it publicly."
                 }
                 textarea {
@@ -2102,7 +2102,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                 }
                 div { class: "flex justify-end gap-3 mt-4",
                     button {
-                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-[15px] rounded-lg transition-colors border border-border",
+                        class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                         onclick: move |_| is_active.set(false),
                         "Close"
                     }

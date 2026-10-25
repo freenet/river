@@ -1075,8 +1075,8 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
     let accept_disabled = invitation_accept_disabled(&nickname.read(), refusal.as_ref());
 
     rsx! {
-        p { class: "text-text mb-2", "You have been invited to join a new room." }
-        p { class: "text-text-muted mb-4",
+        p { class: "text-[15px] text-text mb-2", "You have been invited to join a new room." }
+        p { class: "text-[13px] text-text-muted mb-4",
             "Choose "
             span { class: "text-text font-medium", "your own display name" }
             " (not the room's name). It's what other members will see when you send messages:"
@@ -1135,7 +1135,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
             }
         }
 
-        p { class: "text-text mb-4", "Would you like to accept the invitation?" }
+        p { class: "text-[15px] text-text mb-4", "Would you like to accept the invitation?" }
         div {
             class: "flex gap-3",
             button {
@@ -1149,7 +1149,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
             }
             button {
                 "data-testid": "receive-invitation-decline-button",
-                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                class: "px-4 py-2 rounded-lg text-sm font-semibold text-text-secondary hover:text-text hover:bg-surface transition-colors",
                 onclick: {
                     let inv_for_decline = inv.clone();
                     move |_| {

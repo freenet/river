@@ -394,7 +394,7 @@ fn InvitationContent(
             }
             button {
                 "data-testid": "invite-new-invitation-button",
-                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-[15px] rounded-lg transition-colors flex items-center gap-2",
+                class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text text-[15px] rounded-lg transition-colors flex items-center gap-2",
                 onclick: move |_| {
                     copy_msg_text.set("Copy Message".to_string());
                     copy_link_text.set("Copy Link".to_string());

@@ -854,12 +854,11 @@ fn add_example_messages(
 
     // A SELF (owner-authored) reply whose quoted preview is the long URL above.
     // The reply strip renders its preview with `white-space: nowrap`, so an
-    // unbreakable long URL in the preview is as wide as text gets. When
-    // messages were bubbles, a self (right-aligned) one with this preview
-    // overflowed the viewport on narrow mobile screens, clipping it off both
-    // edges. Kept in example data so the mobile-overflow Playwright
-    // regression test has a self row whose strip WOULD overflow without the
-    // width clamp (the strip truncates inside the row).
+    // unbreakable long URL in the preview is as wide as text gets. It once
+    // overflowed the viewport on narrow mobile screens (#212). Kept in example
+    // data so the mobile-overflow Playwright regression test has a self row
+    // whose strip WOULD overflow without the width clamp (the strip truncates
+    // inside the row).
     if let Some(long_url_msg) = messages.messages.last().cloned() {
         let target_id = long_url_msg.id();
         let target_author_id = long_url_msg.message.author;

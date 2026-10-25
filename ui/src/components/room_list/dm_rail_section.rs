@@ -203,8 +203,8 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
     let archive_title =
         "Archive this conversation. It will return if either of you sends a new DM.";
 
-    // The avatar: the room's salt (fetched once per room) and the peer's
-    // key. Both reads are fallible; a contended one renders the neutral disc
+    // The avatar: the room's salt (derived locally from this viewer's seed,
+    // read once per session) and the peer's key. Both reads are fallible; a contended one renders the neutral disc
     // and the nudge renders the row again (dioxus-signal-safety.md).
     let initials = crate::components::conversation::avatar::initials(&entry.peer_nickname);
     crate::avatar_salt::ensure_avatar_salt(room.to_bytes());

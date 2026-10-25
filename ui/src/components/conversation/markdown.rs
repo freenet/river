@@ -1847,9 +1847,8 @@ mod tests {
     /// app-wide `--color-text-muted`.
     ///
     /// The muted token is tuned for glanceable metadata (timestamps, field
-    /// labels) and fell under 4.5:1 on the outgoing DM bubble's accent tint
-    /// in LIGHT mode (3.96:1), the worst quote surface the app had; quotes
-    /// now also sit on the own-row tint.
+    /// labels) and fell under 4.5:1 on an accent-tinted surface in LIGHT mode
+    /// (3.96:1); quotes now sit on the own-row tint, among others.
     ///
     /// The token must be declared in BOTH colour schemes, and the two ways to
     /// break that fail DIFFERENTLY — which is why this counts declarations

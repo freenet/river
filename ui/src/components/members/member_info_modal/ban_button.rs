@@ -236,7 +236,7 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
                             // Body
                             div {
                                 class: "px-6 py-4",
-                                p { class: "text-text",
+                                p { class: "text-[15px] text-text",
                                     "Are you sure you want to ban "
                                     span { class: "font-semibold", "{nickname}" }
                                     " (ID: "

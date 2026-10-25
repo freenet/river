@@ -204,7 +204,8 @@
  * `:focus-within`: a mouse click on a chip or a reply strip focuses it, and
  * `:focus-within` would keep the bar shown and clickable over the row above
  * after the pointer had left. A separate rule, so a browser that does not
- * know `:has()` drops only this one and keeps the hover reveal. */
+ * know `:has()` drops only this one and keeps the hover reveal; such a
+ * browser has no keyboard-only reveal (an accepted trade-off). */
 @media (hover: hover) {
     .msg-row:has(:focus-visible) .hover-actions {
         opacity: 1;
