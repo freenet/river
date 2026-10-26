@@ -20,6 +20,11 @@ pub mod migration;
 #[cfg(any(feature = "own-purges", test))]
 pub mod own_purges;
 pub mod room_state;
+/// Room state v2 (merge-lawful by construction). Not yet used by the room
+/// contract: gated on the `room-state-v2` feature (and tests) so the
+/// room-contract and chat-delegate WASM stay byte-identical.
+#[cfg(any(feature = "room-state-v2", test))]
+pub mod room_state_v2;
 pub mod util;
 pub mod web_container;
 

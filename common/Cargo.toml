@@ -82,6 +82,9 @@ mentions = []
 # `migration` and `mentions`, so the room-contract and chat-delegate WASM
 # (and their keys) stay byte-identical.
 own-purges = []
+# Room state v2 (common/src/room_state_v2/), not yet wired into the room
+# contract. Off for every WASM build, so their bytes (and keys) do not change.
+room-state-v2 = []
 
 [build-dependencies]
 # Parses legacy_room_contracts.toml, validates every hash, and generates the

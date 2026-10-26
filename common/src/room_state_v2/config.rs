@@ -1,0 +1,229 @@
+//! The v2 room configuration: v1's settings plus the caps and authority
+//! lists the layered retention reads. Every cap has a ceiling; a
+//! configuration outside them is not valid, so `f` never chooses one and the
+//! state byte ceiling holds whatever the owner signs.
+
+use super::encoding::{compact_struct, Digest, Key};
+use super::records::Sealed;
+
+/// Hours since 2026-01-01 UTC; the unit of `Clock`, activity and `clock_ref`.
+pub const EPOCH_2026_SECS: u64 = 1_767_225_600;
+
+/// The placeholder ceilings of the design's bounds table. Not tuned: see the
+/// WASM measurement in `wasm-measure/` before changing any of them.
+pub mod ceiling {
+    pub const MAX_MEMBERS: u32 = 4_000;
+    pub const MAX_LINKS: u32 = 16_000;
+    pub const MAX_LINKS_PER_MEMBER: u32 = 8;
+    pub const MAX_CHILDREN_PER_LINK: u32 = 4_000;
+    pub const MAX_CHAIN_DEPTH: u32 = 16;
+    pub const MAX_OWNER_BANS: u32 = 2_000;
+    pub const MAX_DEPUTY_BANS: u32 = 2_000;
+    pub const MAX_BANS_PER_DEPUTY: u32 = 1_000;
+    pub const MAX_MEMBER_BANS: u32 = 1_000;
+    pub const MAX_BANS_PER_ISSUER: u32 = 100;
+    pub const MAX_SECRET_BLOBS: u32 = 16_000;
+    pub const MAX_SECRET_VERSIONS: u32 = 256;
+    /// v1 has no ceiling for these four; placeholders.
+    pub const MAX_RECENT_MESSAGES: u32 = 1_000;
+    pub const MAX_MESSAGE_SIZE: u32 = 10_000;
+    pub const MAX_DIRECT_MESSAGES: u32 = 1_000;
+    pub const MAX_ROOM_DESCRIPTION: u32 = 4_000;
+    pub const MAX_ROOM_NAME: u32 = 1_000;
+    /// v1's `NICKNAME_CEILING`.
+    pub const MAX_NICKNAME_SIZE: u32 = 1_000;
+    pub const AUTHORITY_KEYS: usize = 64;
+    pub const CHILD_EXCEPTIONS: usize = 64;
+    /// v1 constants.
+    pub const DMS_PER_PAIR: usize = 100;
+    pub const DM_CIPHERTEXT: usize = 32_768;
+    pub const PURGE_TOKENS: usize = 1_000;
+    pub const SECRET_BLOB_CIPHERTEXT: usize = 512;
+    pub const BAN_REASON: usize = 256;
+    pub const ROSTER_BATCHES: usize = 1_000;
+    pub const ROSTER_BATCH_ENTRIES: usize = 1_000;
+    pub const RESTORE_REQUESTS: usize = 1_000;
+}
+
+compact_struct! {
+    /// Owner-signed; the highest valid `version` is the room's configuration.
+    pub struct ConfigurationV2 {
+        pub version: u32,
+        /// 0 public, 1 private.
+        pub privacy_mode: u8,
+        pub display_name: Sealed,
+        pub display_description: Option<Sealed>,
+        pub max_room_name: u32,
+        pub max_room_description: u32,
+        pub max_recent_messages: u32,
+        pub max_message_size: u32,
+        pub max_nickname_size: u32,
+        pub max_members: u32,
+        pub max_direct_messages: u32,
+        pub max_chain_depth: u32,
+        pub max_links: u32,
+        pub max_links_per_member: u32,
+        pub max_children_per_link: u32,
+        /// The owner's own child quota.
+        pub max_owner_children: u32,
+        /// Per-link child quotas (sorted by link, no duplicates).
+        pub child_exceptions: Vec<(Digest, u32)>,
+        pub max_owner_bans: u32,
+        pub max_deputy_bans: u32,
+        pub max_bans_per_deputy: u32,
+        pub max_member_bans: u32,
+        pub max_bans_per_issuer: u32,
+        /// Sorted, no duplicates, never the owner.
+        pub deputies: Vec<Key>,
+        /// Sorted, no duplicates.
+        pub protected: Vec<Key>,
+        pub max_secret_versions: u32,
+        pub max_secret_blobs: u32,
+        pub legacy_window_open: bool,
+        /// The `Clock` hours at which the window closed (read only while
+        /// `legacy_window_open` is false): legacy times are capped at it.
+        pub legacy_window_closed_at: u32,
+        /// Hours; read by the owner's maintenance client, not by `f`.
+        pub link_retention: u32,
+        /// Hours.
+        pub member_ban_activity_window: u32,
+    }
+}
+
+impl ConfigurationV2 {
+    /// The defaults of the design's bounds table for a room of
+    /// `max_members`, as used when a room has no configuration at all.
+    pub fn defaults(max_members: u32) -> Self {
+        let max_members = max_members.min(ceiling::MAX_MEMBERS);
+        ConfigurationV2 {
+            version: 0,
+            privacy_mode: 0,
+            display_name: Sealed::Public(Default::default()),
+            display_description: None,
+            max_room_name: 100,
+            max_room_description: 500,
+            max_recent_messages: 100,
+            max_message_size: 1_000,
+            max_nickname_size: 50,
+            max_members,
+            max_direct_messages: 300,
+            max_chain_depth: 6,
+            max_links: (2 * max_members).min(ceiling::MAX_LINKS),
+            max_links_per_member: 2,
+            max_children_per_link: 50,
+            max_owner_children: 1_000,
+            child_exceptions: vec![],
+            max_owner_bans: 200,
+            max_deputy_bans: 200,
+            max_bans_per_deputy: 100,
+            max_member_bans: 100,
+            max_bans_per_issuer: 20,
+            deputies: vec![],
+            protected: vec![],
+            max_secret_versions: 256,
+            max_secret_blobs: (4 * max_members).min(ceiling::MAX_SECRET_BLOBS),
+            legacy_window_open: true,
+            legacy_window_closed_at: 0,
+            link_retention: 365 * 24,
+            member_ban_activity_window: 30 * 24,
+        }
+    }
+
+    /// The configuration of a room whose owner never signed a v2 one: its v1
+    /// values, the defaults for everything new, and the legacy window open.
+    pub fn from_v1(v1: &crate::room_state::configuration::Configuration) -> Self {
+        let clamp = |v: usize, c: u32| (v.min(c as usize)) as u32;
+        let mut c = Self::defaults(clamp(v1.max_members, ceiling::MAX_MEMBERS));
+        c.version = 0;
+        c.privacy_mode = match v1.privacy_mode {
+            crate::room_state::privacy::PrivacyMode::Public => 0,
+            crate::room_state::privacy::PrivacyMode::Private => 1,
+        };
+        c.max_recent_messages = clamp(v1.max_recent_messages, ceiling::MAX_RECENT_MESSAGES);
+        c.max_message_size = clamp(v1.max_message_size, ceiling::MAX_MESSAGE_SIZE);
+        c.max_nickname_size = clamp(v1.max_nickname_size, ceiling::MAX_NICKNAME_SIZE);
+        c.max_room_name = clamp(v1.max_room_name, ceiling::MAX_ROOM_NAME);
+        c.max_room_description = clamp(v1.max_room_description, ceiling::MAX_ROOM_DESCRIPTION);
+        c.max_direct_messages = clamp(
+            v1.effective_max_direct_messages(),
+            ceiling::MAX_DIRECT_MESSAGES,
+        );
+        let bans = clamp(v1.max_user_bans, ceiling::MAX_OWNER_BANS);
+        c.max_owner_bans = c.max_owner_bans.max(bans);
+        c
+    }
+
+    /// Whether every value is within its ceiling and every list is sorted
+    /// without duplicates. Only valid configurations compete.
+    pub fn check(&self, owner: &Key) -> bool {
+        use ceiling::*;
+        let sorted_unique = |v: &[Key]| v.windows(2).all(|w| w[0] < w[1]);
+        let within = [
+            (self.max_members, MAX_MEMBERS),
+            (self.max_links, MAX_LINKS),
+            (self.max_links_per_member, MAX_LINKS_PER_MEMBER),
+            (self.max_children_per_link, MAX_CHILDREN_PER_LINK),
+            (self.max_owner_children, MAX_CHILDREN_PER_LINK),
+            (self.max_chain_depth, MAX_CHAIN_DEPTH),
+            (self.max_owner_bans, MAX_OWNER_BANS),
+            (self.max_deputy_bans, MAX_DEPUTY_BANS),
+            (self.max_bans_per_deputy, MAX_BANS_PER_DEPUTY),
+            (self.max_member_bans, MAX_MEMBER_BANS),
+            (self.max_bans_per_issuer, MAX_BANS_PER_ISSUER),
+            (self.max_secret_blobs, MAX_SECRET_BLOBS),
+            (self.max_secret_versions, MAX_SECRET_VERSIONS),
+            (self.max_recent_messages, MAX_RECENT_MESSAGES),
+            (self.max_message_size, MAX_MESSAGE_SIZE),
+            (self.max_direct_messages, MAX_DIRECT_MESSAGES),
+            (self.max_room_description, MAX_ROOM_DESCRIPTION),
+            (self.max_room_name, MAX_ROOM_NAME),
+            (self.max_nickname_size, MAX_NICKNAME_SIZE),
+        ]
+        .iter()
+        .all(|(v, c)| v <= c);
+        // The v1 settings v1 refused at zero stay refused at zero.
+        let nonzero = [
+            self.max_recent_messages,
+            self.max_message_size,
+            self.max_nickname_size,
+            self.max_members,
+            self.max_room_name,
+            self.max_room_description,
+            self.max_direct_messages,
+        ]
+        .iter()
+        .all(|&v| v > 0);
+        within
+            && nonzero
+            && self.privacy_mode <= 1
+            && !(self.privacy_mode == 1 && matches!(self.display_name, Sealed::Public(_)))
+            && self.display_name.size_ok()
+            && self
+                .display_description
+                .as_ref()
+                .is_none_or(|d| d.size_ok())
+            && self.display_name.declared_len() <= self.max_room_name as usize
+            && self
+                .display_description
+                .as_ref()
+                .is_none_or(|d| d.declared_len() <= self.max_room_description as usize)
+            && self.deputies.len() <= AUTHORITY_KEYS
+            && self.protected.len() <= AUTHORITY_KEYS
+            && sorted_unique(&self.deputies)
+            && sorted_unique(&self.protected)
+            && !self.deputies.contains(owner)
+            && self.child_exceptions.len() <= CHILD_EXCEPTIONS
+            && self.child_exceptions.windows(2).all(|w| w[0].0 < w[1].0)
+            && self
+                .child_exceptions
+                .iter()
+                .all(|(_, q)| *q <= MAX_CHILDREN_PER_LINK)
+    }
+
+    pub fn child_quota(&self, link: &Digest) -> u32 {
+        match self.child_exceptions.binary_search_by(|(d, _)| d.cmp(link)) {
+            Ok(i) => self.child_exceptions[i].1,
+            Err(_) => self.max_children_per_link,
+        }
+    }
+}
