@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type S = u128;
 
-/// The model's verdicts, counts and drivers follow.
+// The model's verdicts, counts and drivers follow.
 
 pub fn bit(i: usize) -> S {
     1u128 << i

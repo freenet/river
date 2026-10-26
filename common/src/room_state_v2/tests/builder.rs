@@ -310,6 +310,7 @@ impl Builder {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ban(
         &mut self,
         name: String,
@@ -716,7 +717,7 @@ impl Builder {
                 digest: self.recs[i].digest(),
             })
             .collect();
-        batch.sort_by(|a, b| (a.kind, a.digest).cmp(&(b.kind, b.digest)));
+        batch.sort_by_key(|e| (e.kind, e.digest));
         batch.dedup();
         if batch.is_empty() {
             return;
@@ -760,7 +761,7 @@ impl Builder {
                     }
                 })
                 .collect();
-            batch.sort_by(|a, b| (a.kind, a.digest).cmp(&(b.kind, b.digest)));
+            batch.sort_by_key(|e| (e.kind, e.digest));
             let p = RosterP { seq, batch };
             self.recs[i] = Record::Roster(Signed {
                 sig: sign_payload(tag::ROSTER, &o, &p, &sk(0)),

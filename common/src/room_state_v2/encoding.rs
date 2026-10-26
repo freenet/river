@@ -179,6 +179,7 @@ macro_rules! compact_enum {
     ($(#[$m:meta])* pub enum $name:ident { $($(#[$vm:meta])* $tag:literal => $v:ident($t:ty)),* $(,)? }) => {
         $(#[$m])*
         #[derive(Clone, Debug, PartialEq, Eq)]
+        #[allow(clippy::large_enum_variant)]
         pub enum $name { $($(#[$vm])* $v($t)),* }
 
         impl serde::Serialize for $name {

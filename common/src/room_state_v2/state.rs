@@ -102,7 +102,7 @@ impl RoomStateV2 {
     /// normalized: see [`normalize`].
     pub fn from_records(mut records: Vec<Record>) -> Self {
         let mut keyed: Vec<(Digest, Record)> = records.drain(..).map(|r| (r.digest(), r)).collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.sort_by_key(|a| a.0);
         keyed.dedup_by(|a, b| a.0 == b.0);
         RoomStateV2 {
             version: STATE_VERSION,

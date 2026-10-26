@@ -499,7 +499,7 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
             });
         }
     }
-    entries.sort_by(|a, b| (a.kind, a.digest).cmp(&(b.kind, b.digest)));
+    entries.sort_by_key(|e| (e.kind, e.digest));
     for (seq, batch) in entries.chunks(ceiling::ROSTER_BATCH_ENTRIES).enumerate() {
         let p = RosterP {
             seq: seq as u32,

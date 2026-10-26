@@ -277,6 +277,7 @@ pub fn retain(owner: &Key, recs: &[Record], v: &mut Verifier) -> Retained {
 }
 
 /// [`retain`] over borrowed records whose digests are already known.
+#[allow(clippy::type_complexity)]
 pub fn retain_refs(
     owner: &Key,
     recs: &[&Record],
@@ -339,7 +340,7 @@ pub fn retain_refs(
                 _ => None,
             })
             .collect();
-        cands.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        cands.sort_by_key(|a| (a.0, a.1, a.2));
         for (_, _, i, cfg) in cands {
             if c.ok(i) {
                 c.keep[i] = true;
@@ -1025,7 +1026,7 @@ pub fn retain_refs(
             TargetView::Id(v.target),
         ));
     }
-    mb.sort_by(|x, y| x.0.cmp(&y.0));
+    mb.sort_by_key(|x| x.0);
     let mut per_issuer: HashMap<Key, u32> = HashMap::new();
     let mut kept_mb: Vec<(usize, TargetView)> = vec![];
     for (_, i, a, k, t) in mb {
@@ -1333,7 +1334,7 @@ pub fn retain_refs(
             ));
         }
     }
-    dms.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    dms.sort_by_key(|a| (a.0, a.1, a.2));
     let mut per_pair: HashMap<(Key, Recipient), usize> = HashMap::new();
     let mut n_dms = 0;
     for (_, _, _, i, pair) in dms {
@@ -1432,6 +1433,14 @@ pub fn retain_refs(
     }
 }
 
+/// A DM's purge token: the first 16 bytes of BLAKE3 of its signature, as v1.
+pub fn token_of(sig: &Sig) -> [u8; 16] {
+    let d = blake3::hash(&sig.0);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&d.as_bytes()[..16]);
+    out
+}
+
 /// Variants of `f` that break a design rule, for the negative law tests.
 /// Each makes a lower step delete or hide something an upper step read.
 #[cfg(test)]
@@ -1526,12 +1535,4 @@ pub(crate) mod mutant {
             members = next;
         }
     }
-}
-
-/// A DM's purge token: the first 16 bytes of BLAKE3 of its signature, as v1.
-pub fn token_of(sig: &Sig) -> [u8; 16] {
-    let d = blake3::hash(&sig.0);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&d.as_bytes()[..16]);
-    out
 }
