@@ -255,3 +255,68 @@ fn write_fdev_corpora() {
     }
     println!("wrote corpora to {}", root.display());
 }
+
+/// Strict delta permutation invariance on the `universes` corpus shape:
+/// for a receiver and two deltas computed against its summary, the two
+/// application orders may differ (a cap can evict in one order what the
+/// other order keeps). Counts how often, and checks that each pair heals:
+/// merging the two results, then re-merging every input, reaches one state
+/// that no further merge changes.
+#[test]
+fn delta_permutation_pairs_heal() {
+    let ok = builder_owner();
+    let (mut pairs, mut differ, mut healed) = (0, 0, 0);
+    for fi in 0..6 {
+        let mut rng = Rng(36 * 100_000 + fi);
+        let keys = 4 + rng.below(2) as usize;
+        let (c0, v1, v2) = (
+            rand_cfg(&mut rng, keys),
+            rand_cfg(&mut rng, keys),
+            rand_cfg(&mut rng, keys),
+        );
+        let b = rand_universe_l5(&mut rng, keys, c0, v1, v2);
+        let mut srng = Rng(100 + fi);
+        let states: Vec<RoomStateV2> = (0..10)
+            .map(|i| subset(&ok, &b.recs, &mut srng, 300 + (i as u64 * 677) % 650))
+            .collect();
+        for base in &states {
+            let sum = base.summarize();
+            let ds: Vec<Vec<Record>> = states.iter().filter_map(|s| s.delta(&sum)).collect();
+            for x in 0..ds.len() {
+                for y in x + 1..ds.len() {
+                    pairs += 1;
+                    let ap = |s: &RoomStateV2, d: &Vec<Record>| {
+                        crate::room_state_v2::apply_delta(&ok, s, d.clone(), &mut Verifier::new())
+                            .unwrap()
+                    };
+                    let l = ap(&ap(base, &ds[x]), &ds[y]);
+                    let r = ap(&ap(base, &ds[y]), &ds[x]);
+                    if l == r {
+                        continue;
+                    }
+                    differ += 1;
+                    let mut conv = merge(&ok, &l, &r, &mut Verifier::new());
+                    assert_eq!(conv, merge(&ok, &r, &l, &mut Verifier::new()));
+                    for _ in 0..4 {
+                        let before = conv.clone();
+                        for input in [&l, &r, base] {
+                            conv = merge(&ok, &conv, input, &mut Verifier::new());
+                        }
+                        for d in [&ds[x], &ds[y]] {
+                            conv = ap(&conv, d);
+                        }
+                        if conv == before {
+                            break;
+                        }
+                    }
+                    let fixed = [&l, &r, base]
+                        .iter()
+                        .all(|s| merge(&ok, &conv, s, &mut Verifier::new()) == conv);
+                    healed += fixed as usize;
+                }
+            }
+        }
+    }
+    println!("delta pairs {pairs}, orders differ {differ}, healed {healed}");
+    assert_eq!(differ, healed);
+}
