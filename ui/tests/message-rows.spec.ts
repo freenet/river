@@ -1167,3 +1167,109 @@ for (const wide of [false, true]) {
     expect(Math.abs(bar.x + bar.width - m.measureRight), "bar's right edge at the measure").toBeLessThanOrEqual(1);
   });
 }
+
+// Opening a room or receiving a message re-renders the conversation, and a
+// message group whose data did not change must not render again with it. The
+// groups' event handlers used to be new closures on every render, which never
+// compare equal, so every group re-rendered three or four times on opening a
+// room: most of the delay on clicking a busy room.
+test.describe("Message group renders", () => {
+  async function groupCount(page: Page): Promise<number> {
+    return page.getByTestId("conversation-history").locator(".msg-group").count();
+  }
+
+  test("opening a room renders each group once", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Public Discussion Room");
+    await nextFrames(page);
+    await callRiverTest(page, "takeMessageGroupRenders");
+    await selectRoom(page, "Team Chat Room");
+    await nextFrames(page);
+    await page.waitForTimeout(300);
+    // The wait above lets the opening settle, so no group mounts or unmounts
+    // between these two reads.
+    const renders = await callRiverTest(page, "takeMessageGroupRenders");
+    const groups = await groupCount(page);
+    expect(groups, "premise: the room has enough groups to tell one render from several").toBeGreaterThanOrEqual(5);
+    expect(renders, `renders for ${groups} groups`).toBe(groups);
+  });
+
+  test("an arrival renders only the group it changes", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+    await nextFrames(page);
+    await page.waitForTimeout(300);
+    expect(await groupCount(page), "premise: groups an arrival leaves alone").toBeGreaterThanOrEqual(5);
+    // The hook alternates between two senders and admits each on first use. A
+    // new member changes the names every group is given, so both are admitted
+    // before the measured arrival.
+    for (const text of ["group render warm-up A", "group render warm-up B"]) {
+      await callRiverTest(page, "appendMessage", text);
+      await expect(page.getByTestId("conversation-history")).toContainText(text);
+    }
+    await nextFrames(page);
+    await callRiverTest(page, "takeMessageGroupRenders");
+    await callRiverTest(page, "appendMessage", "group render probe");
+    await expect(page.getByTestId("conversation-history")).toContainText("group render probe");
+    await nextFrames(page);
+    await page.waitForTimeout(300);
+    // The new message's group, plus the group above it when the arrival
+    // changes how that one ends.
+    const renders = await callRiverTest(page, "takeMessageGroupRenders");
+    expect(renders, "the new message's group renders").toBeGreaterThanOrEqual(1);
+    expect(renders).toBeLessThanOrEqual(2);
+  });
+
+  // Reacting still works on an older group after an arrival the groups above
+  // it were skipped for. (A skipped child's handlers are re-pointed by Dioxus,
+  // and `handle_toggle_reaction` reads the room when called, so this checks
+  // the behaviour, not which mechanism keeps the handler current.)
+  test("a group skipped by a render still reacts", async ({ page }) => {
+    await openRoomWithComposer(page);
+    for (const text of ["skip probe A", "skip probe B", "skip probe C"]) {
+      await callRiverTest(page, "appendMessage", text);
+      await expect(page.getByTestId("conversation-history")).toContainText(text);
+    }
+    await nextFrames(page);
+    await callRiverTest(page, "takeMessageGroupRenders");
+    await callRiverTest(page, "appendMessage", "skip probe D");
+    await expect(page.getByTestId("conversation-history")).toContainText("skip probe D");
+    await nextFrames(page);
+    const row = page.getByTestId("message-row").filter({ hasText: "skip probe B" });
+    expect(await callRiverTest(page, "takeMessageGroupRenders"), "premise: the arrival skipped the reacted group").toBeLessThanOrEqual(2);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
+    await reactTo(page, row);
+  });
+});
+
+// Reply builds the quoted preview when it is clicked rather than on every
+// render: the preview is the message cleaned of markdown, then truncated.
+test("Reply quotes the message as plain text", async ({ page }) => {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "appendMessage", "**reply probe** with [a link](https://example.com/x)");
+  const row = page.getByTestId("message-row").filter({ hasText: "reply probe" }).last();
+  await expect(row).toBeVisible();
+  if (await touchOnly(page)) {
+    await row.getByTestId("message-kebab").click();
+    await page.getByTestId("message-action-menu").getByRole("button", { name: "Reply" }).click();
+  } else {
+    await row.getByTestId("message-body").hover();
+    await row.getByRole("button", { name: "Reply" }).click();
+  }
+  const composer = page.getByTestId("message-composer");
+  await expect(composer).toContainText("Replying to");
+  await expect(composer).toContainText("reply probe with a link");
+  await expect(composer).not.toContainText("**");
+  await expect(composer).not.toContainText("example.com");
+});
+
+// The edit form's @ list is built only while a message is being edited.
+test("the edit form offers members to mention", async ({ page }) => {
+  await openRoomWithComposer(page);
+  const editArea = await openOwnMessageEdit(page);
+  await editArea.press("End");
+  await editArea.pressSequentially(" @");
+  await expect(page.getByRole("listbox").getByRole("option").first()).toBeVisible({ timeout: 5_000 });
+});

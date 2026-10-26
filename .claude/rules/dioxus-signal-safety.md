@@ -336,3 +336,23 @@ scheduled via `defer()` (not called bare) AND that, textually, it comes
 AFTER the `defer()` calls for the work it depends on. A pin that misses the
 ordering check passes even after the ordering is silently broken by a later
 edit (e.g. hoisting the flag-flip above the merge calls "for readability").
+
+## Pass a list item's handlers from `use_callback`, not inline closures
+
+A component's derived props compare every field, and an `EventHandler` (or
+`Callback`) compares by pointer. A closure written at the call site is a new
+handler on every render of the parent, so the child's props never compare
+equal and the child renders again with every parent render, data unchanged or
+not. For one component that is a small cost. For a list it multiplies: every
+message group re-rendered three or four times when a room opened, which was
+most of the delay on clicking a busy room (freenet/river#830).
+
+Create the handler once in the parent with `use_callback`, which keeps one
+`Callback` and replaces its body on each render, and pass that. A skipped child
+still calls the latest body (the derived `memoize` also re-points a skipped
+child's handlers at the new ones). `message-rows.spec.ts`'s "Message group renders"
+tests count renders through the `takeMessageGroupRenders` test hook, and fail
+on all five projects if one handler goes back to an inline closure.
+
+The child then renders only when its props or its own signals change, so
+anything its render reads must be one of those.

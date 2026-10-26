@@ -39,6 +39,8 @@ type RiverTestHooks = {
   sendDmToPeer(peerIndex: 0 | 1, text: string): Promise<string>;
   // How long a mouse click on the room description waits before toggling.
   setDescriptionClickWaitMs(ms: number): void;
+  // Message group renders since the last call (the count restarts at 0).
+  takeMessageGroupRenders(): number;
 };
 
 // One hook per round trip.
