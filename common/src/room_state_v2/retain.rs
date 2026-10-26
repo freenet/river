@@ -192,7 +192,7 @@ impl TargetView {
 
 struct Ctx<'a> {
     owner: Key,
-    recs: &'a [Record],
+    recs: &'a [&'a Record],
     digests: Vec<Digest>,
     by_kind: Vec<Vec<usize>>,
     keep: Vec<bool>,
@@ -201,7 +201,7 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     fn ok(&mut self, i: usize) -> bool {
-        self.v.ok(&self.owner, &self.recs[i], &self.digests[i])
+        self.v.ok(&self.owner, self.recs[i], &self.digests[i])
     }
     fn kind(&self, k: Kind) -> Vec<usize> {
         self.by_kind[k as usize].clone()
@@ -271,7 +271,18 @@ fn sorted_unique<T: Ord>(v: &[T]) -> bool {
 
 /// `f` over a set of records (no two with one digest). Returns which survive.
 pub fn retain(owner: &Key, recs: &[Record], v: &mut Verifier) -> Retained {
+    let refs: Vec<&Record> = recs.iter().collect();
     let digests: Vec<Digest> = recs.iter().map(|r| r.digest()).collect();
+    retain_refs(owner, &refs, digests, v)
+}
+
+/// [`retain`] over borrowed records whose digests are already known.
+pub fn retain_refs(
+    owner: &Key,
+    recs: &[&Record],
+    digests: Vec<Digest>,
+    v: &mut Verifier,
+) -> Retained {
     let mut by_kind = vec![vec![]; 24];
     for (i, r) in recs.iter().enumerate() {
         by_kind[r.kind() as usize].push(i);
@@ -671,6 +682,12 @@ pub fn retain(owner: &Key, recs: &[Record], v: &mut Verifier) -> Retained {
                 }
                 None
             }
+            #[cfg(test)]
+            Parent::Link(d)
+                if mutant::get() == mutant::Mutant::NoSelfContained && !c.digests.contains(d) =>
+            {
+                None
+            }
             Parent::Link(d) => Some(*d),
         };
         if a.acceptance.invitation != inv_d
@@ -868,11 +885,15 @@ pub fn retain(owner: &Key, recs: &[Record], v: &mut Verifier) -> Retained {
     }
     acts.sort();
     let mut activity: HashMap<Key, u32> = HashMap::new();
+    #[cfg(test)]
+    let mut act_rec: HashMap<Key, usize> = HashMap::new();
     for (k, Reverse(h), _, _, i) in acts {
         if activity.contains_key(&k) || !c.ok(i) {
             continue;
         }
         activity.insert(k, h);
+        #[cfg(test)]
+        act_rec.insert(k, i);
         c.keep[i] = true;
     }
     let rank_act = |k: &Key| match (time.clock, activity.get(k)) {
@@ -1011,6 +1032,14 @@ pub fn retain(owner: &Key, recs: &[Record], v: &mut Verifier) -> Retained {
         if kept_mb.len() >= cfg.max_member_bans as usize {
             break;
         }
+        #[cfg(test)]
+        if mutant::get() == mutant::Mutant::PresenceMsgBans
+            && !recs
+                .iter()
+                .any(|r| matches!(r, Record::Message(x) if x.payload.author == k))
+        {
+            continue;
+        }
         if per_issuer.get(&k).copied().unwrap_or(0) >= cfg.max_bans_per_issuer || !c.ok(i) {
             continue;
         }
@@ -1064,6 +1093,10 @@ pub fn retain(owner: &Key, recs: &[Record], v: &mut Verifier) -> Retained {
         .map(|(k, &a)| (adm[a].depth, Reverse(rank_act(k)), a, *k))
         .collect();
     cands.sort();
+    #[cfg(test)]
+    if mutant::get() == mutant::Mutant::UpwardRetention {
+        cands = mutant::upward_retention(&owner, recs, &cfg, &time, cands);
+    }
     cands.truncate(cfg.max_members as usize);
     let mut members: Vec<Key> = cands.iter().map(|x| x.3).collect();
     members.sort();
@@ -1081,6 +1114,39 @@ pub fn retain(owner: &Key, recs: &[Record], v: &mut Verifier) -> Retained {
 
     // ---------------------------------------------------------------- L5
     // Member-dependent records. Reads: L1, L4.
+    #[cfg(test)]
+    if mutant::get() == mutant::Mutant::SweepAfterL4 {
+        // Keep a link only on the chain of a kept member's entry or of a
+        // kept member ban's issuer; drop activity of keys left unlinked.
+        let kept_keys: HashSet<Key> = cands.iter().map(|x| x.3).collect();
+        let mut on_chain = vec![false; adm.len()];
+        let mark = |mut a: Option<usize>, on_chain: &mut Vec<bool>| {
+            while let Some(x) = a {
+                on_chain[x] = true;
+                a = adm[x].parent;
+            }
+        };
+        for a in 0..adm.len() {
+            if !removed[a] && kept_keys.contains(&adm[a].member) {
+                mark(Some(a), &mut on_chain);
+            }
+        }
+        for (a, _) in &kept_mb {
+            mark(Some(*a), &mut on_chain);
+        }
+        let mut linked_after = HashSet::new();
+        for a in 0..adm.len() {
+            c.keep[adm[a].rec] = on_chain[a];
+            if on_chain[a] {
+                linked_after.insert(adm[a].member);
+            }
+        }
+        for (k, i) in &act_rec {
+            if !linked_after.contains(k) {
+                c.keep[*i] = false;
+            }
+        }
+    }
     let private = cfg.privacy_mode == 1;
 
     // Member info: highest version per kept key, ties by lower signature.
@@ -1363,6 +1429,102 @@ pub fn retain(owner: &Key, recs: &[Record], v: &mut Verifier) -> Retained {
         clock,
         links: adm.iter().map(|a| (a.rec, a.member, a.depth)).collect(),
         members,
+    }
+}
+
+/// Variants of `f` that break a design rule, for the negative law tests.
+/// Each makes a lower step delete or hide something an upper step read.
+#[cfg(test)]
+pub(crate) mod mutant {
+    use super::*;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Mutant {
+        None,
+        /// A member ban counts only if its issuer has a message in the input
+        /// (a record the message cap and member eviction delete).
+        PresenceMsgBans,
+        /// Members are kept only while a kept message or DM needs them.
+        UpwardRetention,
+        /// An accepted link whose parent is absent is admitted as a root.
+        NoSelfContained,
+        /// A link sweep after the member cap.
+        SweepAfterL4,
+    }
+
+    thread_local! {
+        static CURRENT: std::cell::Cell<Mutant> = const { std::cell::Cell::new(Mutant::None) };
+    }
+
+    pub fn get() -> Mutant {
+        CURRENT.with(|c| c.get())
+    }
+
+    pub fn set(m: Mutant) {
+        CURRENT.with(|c| c.set(m))
+    }
+
+    /// The member cap re-run until the members are exactly those a kept
+    /// message or DM needs (v1's prune loop, reduced to v2 messages and DMs).
+    pub(super) fn upward_retention(
+        owner: &Key,
+        recs: &[&Record],
+        cfg: &ConfigurationV2,
+        time: &Time,
+        cands: Vec<(u32, Reverse<u32>, usize, Key)>,
+    ) -> Vec<(u32, Reverse<u32>, usize, Key)> {
+        let cap = |v: &[(u32, Reverse<u32>, usize, Key)]| {
+            v.iter()
+                .take(cfg.max_members as usize)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // As v1's loop: requirements are first read with every candidate kept.
+        let mut members = cands;
+        loop {
+            let k: HashSet<Key> = members.iter().map(|x| x.3).chain([*owner]).collect();
+            let mut msgs: Vec<(Reverse<u64>, Key)> = vec![];
+            let mut dms: Vec<(Reverse<u64>, Sig, Key, Key)> = vec![];
+            for r in recs {
+                match r {
+                    Record::Message(s) if k.contains(&s.payload.author) => msgs.push((
+                        Reverse(time.eff(s.payload.time, s.payload.clock_ref)),
+                        s.payload.author,
+                    )),
+                    Record::DirectMessage(s)
+                        if k.contains(&s.payload.sender) && k.contains(&s.payload.recipient) =>
+                    {
+                        dms.push((
+                            Reverse(time.eff(s.payload.time, s.payload.clock_ref)),
+                            s.sig,
+                            s.payload.sender,
+                            s.payload.recipient,
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+            msgs.sort();
+            dms.sort();
+            let mut req: HashSet<Key> = HashSet::new();
+            for (_, a) in msgs.iter().take(cfg.max_recent_messages as usize) {
+                req.insert(*a);
+            }
+            for (_, _, a, b) in dms.iter().take(cfg.max_direct_messages as usize) {
+                req.insert(*a);
+                req.insert(*b);
+            }
+            let pruned: Vec<_> = members
+                .iter()
+                .filter(|x| req.contains(&x.3))
+                .cloned()
+                .collect();
+            let next = cap(&pruned);
+            if next == members {
+                return members;
+            }
+            members = next;
+        }
     }
 }
 
