@@ -6,10 +6,20 @@
 //! records `f` must choose between.
 
 use super::config::{ceiling, ConfigurationV2, EPOCH_2026_SECS};
+use super::encoding::to_cbor;
 use super::encoding::{sign_payload, ByteBuf, Bytes32, Digest, Key, Nonce12, Token16};
 use super::records::*;
 use super::retain::Verifier;
 use super::state::{normalize, RoomStateV2};
+use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+use crate::room_state::direct_messages::{
+    sign_direct_message, sign_recipient_purges, PurgeToken, RecipientPurges,
+};
+use crate::room_state::member::MemberId;
+use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+use crate::room_state::privacy::SealedBytes;
+use crate::room_state::secret::{AuthorizedEncryptedSecretForMember, EncryptedSecretForMemberV1};
 use ed25519_dalek::SigningKey;
 
 /// The caps of the configuration the largest state is built under, plus the
@@ -38,6 +48,11 @@ pub struct Caps {
     pub dm_bytes: usize,
     /// Members with a purge envelope (the cap is one per kept member).
     pub purges: usize,
+    /// Carry owner bans, activity, member info, messages, DMs, purges and
+    /// blobs as legacy v1 records (window open) instead of v2 ones. v1
+    /// encodes byte vectors as CBOR arrays, so these are the largest records
+    /// of their kinds.
+    pub legacy: bool,
 }
 
 impl Caps {
@@ -65,6 +80,7 @@ impl Caps {
             purge_tokens: PURGE_TOKENS,
             dm_bytes: DM_CIPHERTEXT,
             purges: MAX_MEMBERS as usize + 1,
+            legacy: false,
         }
     }
 
@@ -78,7 +94,7 @@ impl Caps {
             max_members: 166,
             max_links: 166,
             max_owner_children: 166,
-            max_children_per_link: 4_000,
+            max_children_per_link: 400,
             max_owner_bans: 200,
             max_deputy_bans: 200,
             max_bans_per_deputy: 134,
@@ -95,55 +111,16 @@ impl Caps {
             purge_tokens: 50,
             dm_bytes: 630,
             purges: 18,
+            legacy: false,
         }
     }
 
-    /// A candidate set of ceilings sized from the WASM measurement (see the
-    /// measurement tool's README): about 3,900 signatures and 3 MB at most.
-    pub fn proposed() -> Self {
+    /// The ceilings with the member-dependent records carried as legacy v1
+    /// records.
+    pub fn ceilings_legacy() -> Self {
         Caps {
-            max_members: 300,
-            max_links: 400,
-            max_owner_children: 400,
-            max_children_per_link: 400,
-            max_owner_bans: 250,
-            max_deputy_bans: 250,
-            max_bans_per_deputy: 150,
-            max_member_bans: 50,
-            max_bans_per_issuer: 10,
-            max_secret_versions: 32,
-            max_secret_blobs: 400,
-            max_recent_messages: 200,
-            max_message_size: 2_000,
-            max_nickname_size: 100,
-            max_direct_messages: 300,
-            restore_requests: 10,
-            restore_chain: 8,
-            purge_tokens: 200,
-            dm_bytes: 4_096,
-            purges: 301,
-        }
-    }
-
-    /// `proposed` with `max_members` at 2,000 and the counts the design's
-    /// defaults derive from it: links 2 x members, the owner's child quota
-    /// at members, blobs 4 x members, a purge envelope per member; bans at
-    /// the design's migration values for the Official room (400 owner, 400
-    /// deputy at 250 each) and member-ban defaults (100, 20 per issuer).
-    /// Messages, DMs and restore requests as `proposed`.
-    pub fn members_2000() -> Self {
-        Caps {
-            max_members: 2_000,
-            max_links: 4_000,
-            max_owner_children: 2_000,
-            max_owner_bans: 400,
-            max_deputy_bans: 400,
-            max_bans_per_deputy: 250,
-            max_member_bans: 100,
-            max_bans_per_issuer: 20,
-            max_secret_blobs: 8_000,
-            purges: 2_001,
-            ..Self::proposed()
+            legacy: true,
+            ..Self::ceilings()
         }
     }
 
@@ -172,6 +149,7 @@ impl Caps {
             purge_tokens: self.purge_tokens,
             dm_bytes: self.dm_bytes,
             purges: su(self.purges),
+            legacy: self.legacy,
         }
     }
 }
@@ -253,7 +231,7 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
     cfg.max_direct_messages = caps.max_direct_messages;
     cfg.deputies = deputies.clone();
     cfg.protected = protected;
-    cfg.legacy_window_open = false;
+    cfg.legacy_window_open = caps.legacy;
     cfg.legacy_window_closed_at = clock_hours;
     let mut exceptions: Vec<(Digest, u32)> = (0..ceiling::CHILD_EXCEPTIONS as u32)
         .map(|i| (Bytes32([i as u8; 32]), 1))
@@ -291,7 +269,17 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
 
     // Owner and deputy bans on keys that are never linked.
     for i in 0..caps.max_owner_bans {
-        recs.push(ban(&o, &osk, Issuer::Owner(()), k(&sk(3, v, i)), i, v));
+        if caps.legacy {
+            let ub = UserBan {
+                owner_member_id: id(&osk),
+                banned_at: v1_time(EPOCH_2026_SECS + 3600 * 24 * 299 - i as u64 - v as u64),
+                banned_user: id(&sk(3, v, i)),
+            };
+            let ab = AuthorizedUserBan::new(ub, id(&osk), &osk);
+            recs.push(Record::LegacyBan(legacy(&osk, to_cbor(&ab))));
+        } else {
+            recs.push(ban(&o, &osk, Issuer::Owner(()), k(&sk(3, v, i)), i, v));
+        }
     }
     for i in 0..caps.max_deputy_bans {
         let d = (i / caps.max_bans_per_deputy) as usize % deputies.len().max(1);
@@ -334,6 +322,11 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
     depth1.truncate(n1 as usize);
     for (l, msk) in &links {
         recs.push(Record::Link(l.clone()));
+        if caps.legacy {
+            let m = v1_message(&osk, msk, clock_hours, v as u64, &caps, private);
+            recs.push(Record::LegacyActivity(legacy(msk, to_cbor(&m))));
+            continue;
+        }
         let p = ActivityP {
             member: k(msk),
             hours: clock_hours - v as u32,
@@ -387,6 +380,23 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
 
     // Member info for every member and the owner.
     for m in members.iter().copied().chain(std::iter::once(&osk)) {
+        if caps.legacy {
+            let n = caps.max_nickname_size as usize;
+            let nick = if private {
+                SealedBytes::private(vec![0xcc; n + AEAD_TAG], [1; 12], 1, n as u32)
+            } else {
+                SealedBytes::public(vec![0xcc; n])
+            };
+            let info = MemberInfo {
+                member_id: id(m),
+                version: 1 + v as u32,
+                preferred_nickname: nick,
+                deputies: vec![],
+            };
+            let a = AuthorizedMemberInfo::new_with_member_key(info, m);
+            recs.push(Record::LegacyMemberInfo(legacy(m, to_cbor(&a))));
+            continue;
+        }
         let p = MemberInfoP {
             member: k(m),
             version: 1 + v as u32,
@@ -401,6 +411,18 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
     // Messages, private, at the size limit.
     for i in 0..caps.max_recent_messages {
         let a = members[i as usize % members.len()];
+        if caps.legacy {
+            let m = v1_message(
+                &osk,
+                a,
+                clock_hours,
+                i as u64 * 60 + v as u64,
+                &caps,
+                private,
+            );
+            recs.push(Record::LegacyMessage(legacy(a, to_cbor(&m))));
+            continue;
+        }
         let p = MessageP {
             author: k(a),
             time: EPOCH_2026_SECS + clock_hours as u64 * 3600 - i as u64 * 60 - v as u64,
@@ -432,6 +454,19 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
         let a = members[i as usize % members.len()];
         let b = members[(i as usize + 1) % members.len()];
         let b = if k(a) == k(b) { &osk } else { b };
+        if caps.legacy {
+            let dm = sign_direct_message(
+                a,
+                id(a),
+                id(b),
+                &osk.verifying_key(),
+                EPOCH_2026_SECS + clock_hours as u64 * 3600 - i as u64 * 60 - v as u64,
+                vec![0xdd; caps.dm_bytes.min(ceiling::LEGACY_DM_CIPHERTEXT)],
+            )
+            .expect("a DM within the size limits signs");
+            recs.push(Record::LegacyDirectMessage(legacy(a, to_cbor(&dm))));
+            continue;
+        }
         let p = DirectMessageP {
             sender: k(a),
             recipient: k(b),
@@ -463,6 +498,16 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
             })
             .collect();
         purged.sort();
+        if caps.legacy {
+            let state = RecipientPurges {
+                version: 1 + v as u64,
+                purged: purged.iter().map(|t| PurgeToken(t.0)).collect(),
+            };
+            let p = sign_recipient_purges(m, id(m), &osk.verifying_key(), state)
+                .expect("a purge list within the limits signs");
+            recs.push(Record::LegacyPurge(legacy(m, to_cbor(&p))));
+            continue;
+        }
         let p = PurgeP {
             recipient: k(m),
             version: 1 + v as u64,
@@ -478,6 +523,19 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
     for i in 0..caps.max_secret_blobs * private as u32 {
         let m = members[i as usize % members.len()];
         let ver = caps.max_secret_versions - (i / members.len() as u32) % caps.max_secret_versions;
+        if caps.legacy {
+            let blob = EncryptedSecretForMemberV1 {
+                member_id: id(m),
+                secret_version: ver,
+                ciphertext: vec![0xbb + v; ceiling::SECRET_BLOB_CIPHERTEXT],
+                nonce: [v; 12],
+                sender_ephemeral_public_key: [v; 32],
+                provider: id(&osk),
+            };
+            let a = AuthorizedEncryptedSecretForMember::new(blob, &osk);
+            recs.push(Record::LegacySecretBlob(legacy(&osk, to_cbor(&a))));
+            continue;
+        }
         let p = SecretBlobP {
             recipient: k(m),
             version: ver,
@@ -537,6 +595,46 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
     let (s, _) = normalize(&o, recs, &mut Verifier::new());
     let dropped = n - s.records.len();
     (s, dropped)
+}
+
+fn id(s: &SigningKey) -> MemberId {
+    MemberId::from(&s.verifying_key())
+}
+
+fn v1_time(secs: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+}
+
+fn legacy(signer: &SigningKey, v1: Vec<u8>) -> Legacy {
+    Legacy {
+        signer: k(signer),
+        v1: ByteBuf(v1),
+    }
+}
+
+/// A v1 message at the size limit (private when the room is), `back`
+/// seconds before the clock.
+fn v1_message(
+    owner: &SigningKey,
+    author: &SigningKey,
+    clock_hours: u32,
+    back: u64,
+    caps: &Caps,
+    private: bool,
+) -> AuthorizedMessageV1 {
+    let n = (caps.max_message_size as usize).min(ceiling::LEGACY_MESSAGE_SIZE);
+    let content = if private {
+        RoomMessageBody::private(1, 1, vec![0xee; n], [1; 12], 1)
+    } else {
+        RoomMessageBody::public_raw(1, 1, vec![0xee; n])
+    };
+    let m = MessageV1 {
+        room_owner: id(owner),
+        author: id(author),
+        time: v1_time(EPOCH_2026_SECS + clock_hours as u64 * 3600 - back),
+        content,
+    };
+    AuthorizedMessageV1::new(m, author)
 }
 
 fn sealed(declared: usize) -> Sealed {

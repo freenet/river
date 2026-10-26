@@ -103,7 +103,7 @@ fn legacy_record_size_ceilings_hold() {
         content: RoomMessageBody::private(
             u32::MAX,
             u32::MAX,
-            big(ceiling::MAX_MESSAGE_SIZE as usize),
+            big(ceiling::LEGACY_MESSAGE_SIZE),
             [0xff; 12],
             u32::MAX,
         ),
@@ -140,7 +140,7 @@ fn legacy_record_size_ceilings_hold() {
         oid,
         &owner.verifying_key(),
         u64::MAX,
-        big(ceiling::DM_CIPHERTEXT),
+        big(ceiling::LEGACY_DM_CIPHERTEXT),
     )
     .unwrap();
     let l = wrap(&m, to_cbor(&dm));

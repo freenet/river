@@ -5,7 +5,10 @@
 //! freenet-core installs, `DEFAULT_MAX_MEMORY_PAGES` = 4096) with a matching
 //! reservation and one-page guard, an 8 MiB wasm stack, epoch interruption
 //! on, fuel off. Usage: `host <guest.wasm> <spec>...`, a spec being a divisor of the
-//! ceilings (1 = the ceilings), `official` or `proposed` (see `Caps`). `REPS=n`
+//! ceilings (1 = the ceilings), `official`, `ceilings` or `legacy` (see `Caps`). With `CHECK_SECS=s`,
+//! exits non-zero if any validate, update or merge call fails or takes longer
+//! than `s` seconds (the local check of the ceilings: `CHECK_SECS=2.5 host
+//! guest.wasm ceilings legacy`). `REPS=n`
 //! repeats each call and reports every run.
 
 use river_core::room_state_v2::bench::{largest_state, owner_key, Caps};
@@ -81,8 +84,25 @@ impl Guest {
     }
 }
 
+/// Calls that took longer than `CHECK_SECS`, when it is set.
+static OVER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 fn report(label: &str, r: Result<i64>, t: Instant, g: &mut Guest) {
     let el = t.elapsed();
+    let limit: Option<f64> = std::env::var("CHECK_SECS")
+        .ok()
+        .and_then(|x| x.parse().ok());
+    if let Some(l) = limit {
+        if label != "validate, no signatures" && label != "summarize_state" {
+            if r.is_err() {
+                OVER.lock().unwrap().push(format!("{label}: failed"));
+            } else if el.as_secs_f64() > l {
+                OVER.lock()
+                    .unwrap()
+                    .push(format!("{label}: {:.3} s > {l} s", el.as_secs_f64()));
+            }
+        }
+    }
     match r {
         Ok(n) => println!(
             "  {label:<22} {:>9.3} s  result {n:>7}  sig checks {:>7}  memory {} MiB",
@@ -145,8 +165,8 @@ fn main() {
     for d in specs {
         let caps = match d.as_str() {
             "official" => Caps::official_room(),
-            "proposed" => Caps::proposed(),
-            "members2000" => Caps::members_2000(),
+            "ceilings" => Caps::ceilings(),
+            "legacy" => Caps::ceilings_legacy(),
             n => Caps::ceilings().scaled(n.parse().unwrap()),
         };
         let reps: usize = std::env::var("REPS")
@@ -207,6 +227,9 @@ fn main() {
                     Ok(p) => p,
                     Err(e) => {
                         println!("  {name:<22} could not load inputs: {e:#}");
+                        OVER.lock()
+                            .unwrap()
+                            .push(format!("{name}: inputs did not load"));
                         continue;
                     }
                 };
@@ -214,6 +237,9 @@ fn main() {
                     Ok(p) => p,
                     Err(e) => {
                         println!("  {name:<22} could not load inputs: {e:#}");
+                        OVER.lock()
+                            .unwrap()
+                            .push(format!("{name}: inputs did not load"));
                         continue;
                     }
                 };
@@ -222,6 +248,18 @@ fn main() {
                 let r = f.call(&mut g.store, (po, pa, ab.len() as i32, pb, bb.len() as i32));
                 report(name, r, t, &mut g);
             }
+        }
+    }
+    let over = OVER.lock().unwrap();
+    if std::env::var("CHECK_SECS").is_ok() {
+        if over.is_empty() {
+            println!("CHECK PASSED: every validate and merge within CHECK_SECS");
+        } else {
+            println!("CHECK FAILED:");
+            for o in over.iter() {
+                println!("  {o}");
+            }
+            std::process::exit(1);
         }
     }
 }

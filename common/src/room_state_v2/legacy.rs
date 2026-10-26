@@ -52,7 +52,66 @@ fn sig_of(s: &ed25519_dalek::Signature) -> Sig {
     Sig(s.to_bytes())
 }
 
+/// The signed part of a decoded v1 record and its signature, kept from the
+/// structural decode so the signature check, which `f` runs lazily in
+/// admission order, does not decode the v1 bytes a second time.
+pub struct V1Sig {
+    inner: Inner,
+    sig: ed25519_dalek::Signature,
+}
+
+enum Inner {
+    Configuration(Configuration),
+    Member(crate::room_state::member::Member),
+    Ban(crate::room_state::ban::UserBan),
+    Message(crate::room_state::message::MessageV1),
+    MemberInfo(crate::room_state::member_info::MemberInfo),
+    Dm(crate::room_state::direct_messages::DirectMessage),
+    Purge(
+        MemberId,
+        crate::room_state::direct_messages::RecipientPurges,
+    ),
+    Blob(crate::room_state::secret::EncryptedSecretForMemberV1),
+}
+
+impl V1Sig {
+    /// `verify_strict` of the v1 signature under `signer`.
+    pub fn verify(&self, owner: &Key, signer: &Key) -> bool {
+        let owner_vk = || VerifyingKey::from_bytes(&owner.0).ok();
+        let msg = match &self.inner {
+            Inner::Configuration(x) => to_cbor(x),
+            Inner::Member(x) => to_cbor(x),
+            Inner::Ban(x) => to_cbor(x),
+            Inner::Message(x) => to_cbor(x),
+            Inner::MemberInfo(x) => to_cbor(x),
+            Inner::Blob(x) => to_cbor(x),
+            Inner::Dm(m) => {
+                let Some(o) = owner_vk() else { return false };
+                match build_direct_message_signed_bytes(
+                    m.sender,
+                    m.recipient,
+                    &o,
+                    m.timestamp,
+                    &m.ciphertext,
+                ) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                }
+            }
+            Inner::Purge(r, state) => {
+                let Some(o) = owner_vk() else { return false };
+                match build_recipient_purges_signed_bytes(*r, &o, state) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                }
+            }
+        };
+        verify_bytes(signer, &msg, &sig_of(&self.sig))
+    }
+}
+
 pub struct LegacyConfig {
+    pub v1: Option<V1Sig>,
     pub configuration: Configuration,
     pub sig: Sig,
 }
@@ -71,11 +130,16 @@ pub fn decode_config(owner: &Key, l: &Legacy) -> Option<LegacyConfig> {
     }
     Some(LegacyConfig {
         sig: sig_of(&v1.signature),
-        configuration: v1.configuration,
+        configuration: v1.configuration.clone(),
+        v1: Some(V1Sig {
+            inner: Inner::Configuration(v1.configuration),
+            sig: v1.signature,
+        }),
     })
 }
 
 pub struct LegacyLinkView {
+    pub v1: Option<V1Sig>,
     pub member: Key,
     pub inviter: Key,
 }
@@ -89,10 +153,15 @@ pub fn decode_link(owner: &Key, l: &Legacy) -> Option<LegacyLinkView> {
     Some(LegacyLinkView {
         member: Key::from(&m.member_vk),
         inviter: l.signer,
+        v1: Some(V1Sig {
+            inner: Inner::Member(v1.member),
+            sig: v1.signature,
+        }),
     })
 }
 
 pub struct LegacyBanView {
+    pub v1: Option<V1Sig>,
     pub target: i64,
     pub time: u64,
 }
@@ -105,10 +174,15 @@ pub fn decode_ban(owner: &Key, l: &Legacy) -> Option<LegacyBanView> {
     Some(LegacyBanView {
         target: v1.ban.banned_user.0 .0,
         time: secs(v1.ban.banned_at),
+        v1: Some(V1Sig {
+            inner: Inner::Ban(v1.ban),
+            sig: v1.signature,
+        }),
     })
 }
 
 pub struct LegacyMessageView {
+    pub v1: Option<V1Sig>,
     pub sig: Sig,
     pub author: Key,
     pub time: u64,
@@ -124,11 +198,16 @@ pub fn decode_message(owner: &Key, l: &Legacy) -> Option<LegacyMessageView> {
         sig: sig_of(&v1.signature),
         author: l.signer,
         time: secs(v1.message.time),
-        body: v1.message.content,
+        body: v1.message.content.clone(),
+        v1: Some(V1Sig {
+            inner: Inner::Message(v1.message),
+            sig: v1.signature,
+        }),
     })
 }
 
 pub struct LegacyMemberInfoView {
+    pub v1: Option<V1Sig>,
     pub sig: Sig,
     pub member: Key,
     pub version: u32,
@@ -148,10 +227,15 @@ pub fn decode_member_info(_owner: &Key, l: &Legacy) -> Option<LegacyMemberInfoVi
         member: l.signer,
         version: v1.member_info.version,
         declared_len: v1.member_info.preferred_nickname.declared_len(),
+        v1: Some(V1Sig {
+            inner: Inner::MemberInfo(v1.member_info),
+            sig: v1.signature,
+        }),
     })
 }
 
 pub struct LegacyDmView {
+    pub v1: Option<V1Sig>,
     pub sender: Key,
     pub sender_id: i64,
     pub recipient_id: i64,
@@ -174,10 +258,15 @@ pub fn decode_dm(_owner: &Key, l: &Legacy) -> Option<LegacyDmView> {
         ciphertext_len: v1.message.ciphertext.len(),
         sig: sig_of(&v1.sender_signature),
         token: PurgeToken::from_signature(&v1.sender_signature).0,
+        v1: Some(V1Sig {
+            inner: Inner::Dm(v1.message),
+            sig: v1.sender_signature,
+        }),
     })
 }
 
 pub struct LegacyPurgeView {
+    pub v1: Option<V1Sig>,
     pub sig: Sig,
     pub recipient_id: i64,
     pub version: u64,
@@ -194,10 +283,15 @@ pub fn decode_purge(_owner: &Key, l: &Legacy) -> Option<LegacyPurgeView> {
         recipient_id: v1.recipient_id.0 .0,
         version: v1.state.version,
         tokens: v1.state.purged.iter().map(|t| t.0).collect(),
+        v1: Some(V1Sig {
+            inner: Inner::Purge(v1.recipient_id, v1.state),
+            sig: v1.recipient_signature,
+        }),
     })
 }
 
 pub struct LegacyBlobView {
+    pub v1: Option<V1Sig>,
     pub sig: Sig,
     pub recipient_id: i64,
     pub version: u32,
@@ -214,6 +308,10 @@ pub fn decode_blob(owner: &Key, l: &Legacy) -> Option<LegacyBlobView> {
         recipient_id: v1.secret.member_id.0 .0,
         version: v1.secret.secret_version,
         ciphertext_len: v1.secret.ciphertext.len(),
+        v1: Some(V1Sig {
+            inner: Inner::Blob(v1.secret),
+            sig: v1.owner_signature,
+        }),
     })
 }
 

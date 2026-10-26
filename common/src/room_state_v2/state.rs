@@ -18,33 +18,34 @@ compact_struct! {
 pub type Summary = BTreeMap<Kind, BTreeSet<Digest>>;
 
 /// Largest encoded size of one record of each kind, pinned by
-/// `tests::record_size_ceilings_hold`, which builds the largest record of
-/// each kind the retention function keeps.
+/// `tests::sizes::legacy_record_size_ceilings_hold` and
+/// `tests::state_tests::largest_state_at_the_ceilings`, which build the
+/// largest record of each kind the retention function keeps.
 pub const MAX_RECORD_BYTES: [usize; 24] = [
-    13_000,  // Configuration
-    14_000,  // LegacyConfiguration
-    80,      // Clock
-    560_000, // Checkpoint (keep list of max_links digests)
-    120,     // Upgrade
-    40_000,  // Roster batch (1,000 entries)
-    80,      // SecretVersion
-    560,     // Ban
-    360,     // LegacyBan
-    420,     // Link
-    360,     // LegacyLink
-    120,     // Activity
-    21_000,  // LegacyActivity (a v1 message)
-    8_000,   // Restore (a chain of up to 16 links)
-    1_200,   // MemberInfo
-    3_300,   // LegacyMemberInfo
-    10_300,  // Message
-    21_000,  // LegacyMessage
-    33_100,  // DirectMessage
-    66_000,  // LegacyDirectMessage
-    17_200,  // Purge
-    17_400,  // LegacyPurge
-    720,     // SecretBlob
-    1_500,   // LegacySecretBlob
+    7_200,  // Configuration
+    5_200,  // LegacyConfiguration
+    80,     // Clock
+    14_000, // Checkpoint (keep list of max_links digests)
+    120,    // Upgrade
+    37_000, // Roster batch (1,000 entries)
+    80,     // SecretVersion
+    460,    // Ban
+    320,    // LegacyBan
+    360,    // Link
+    300,    // LegacyLink
+    120,    // Activity
+    2_500,  // LegacyActivity (a v1 message)
+    3_200,  // Restore (a chain of up to 8 links)
+    260,    // MemberInfo
+    1_200,  // LegacyMemberInfo
+    2_200,  // Message
+    2_500,  // LegacyMessage
+    4_300,  // DirectMessage
+    5_500,  // LegacyDirectMessage
+    3_600,  // Purge
+    3_700,  // LegacyPurge
+    700,    // SecretBlob
+    1_450,  // LegacySecretBlob
 ];
 
 /// The byte ceiling of a state: for each group of kinds that share a cap,
@@ -206,15 +207,22 @@ pub fn apply_delta(
 ) -> Result<RoomStateV2, Invalid> {
     let held: HashSet<Digest> = state.digests().into_iter().collect();
     v.trust(held.iter().copied());
-    for r in &delta {
-        let d = r.digest();
-        if !held.contains(&d) && !v.ok(owner, r, &d) {
-            return Err(Invalid::BadSignature(d));
+    let new: Vec<(Digest, Record)> = delta
+        .into_iter()
+        .map(|r| (r.digest(), r))
+        .filter(|(d, _)| !held.contains(d))
+        .collect();
+    let mut all = state.records.clone();
+    all.extend(new.iter().map(|(_, r)| r.clone()));
+    let out = normalize(owner, all, v).0;
+    // `f` has checked every record it keeps (memoized); check the rest, so
+    // the refusal covers every new record without checking any twice.
+    for (d, r) in &new {
+        if !v.ok(owner, r, d) {
+            return Err(Invalid::BadSignature(*d));
         }
     }
-    let mut all = state.records.clone();
-    all.extend(delta);
-    Ok(normalize(owner, all, v).0)
+    Ok(out)
 }
 
 /// Whether a record's signature verifies, without the rest of the state.

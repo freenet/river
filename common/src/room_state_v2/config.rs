@@ -9,40 +9,57 @@ use super::records::Sealed;
 /// Hours since 2026-01-01 UTC; the unit of `Clock`, activity and `clock_ref`.
 pub const EPOCH_2026_SECS: u64 = 1_767_225_600;
 
-/// The placeholder ceilings of the design's bounds table. Not tuned: see the
-/// WASM measurement in `wasm-measure/` before changing any of them.
+/// The ceilings: no configuration may set a cap above these, so they bound
+/// the largest valid state, and with it the work of every contract call.
+/// Sized from the WASM measurement (`tools/room-state-v2-measure`) so that
+/// `validate_state` and the merge of two largest states each stay within
+/// 2.5 s on nova under freenet-core's engine settings; the design's
+/// placeholder ceilings took over 60 s and did not fit in the 256 MiB
+/// contract memory. Raising them needs signature verification cheaper than
+/// in-guest WASM (a later re-key). Pinned by `largest_state_at_the_ceilings`
+/// and the measurement tool's `check` mode.
 pub mod ceiling {
-    pub const MAX_MEMBERS: u32 = 4_000;
-    pub const MAX_LINKS: u32 = 16_000;
-    pub const MAX_LINKS_PER_MEMBER: u32 = 8;
-    pub const MAX_CHILDREN_PER_LINK: u32 = 4_000;
-    pub const MAX_CHAIN_DEPTH: u32 = 16;
-    pub const MAX_OWNER_BANS: u32 = 2_000;
-    pub const MAX_DEPUTY_BANS: u32 = 2_000;
-    pub const MAX_BANS_PER_DEPUTY: u32 = 1_000;
-    pub const MAX_MEMBER_BANS: u32 = 1_000;
-    pub const MAX_BANS_PER_ISSUER: u32 = 100;
-    pub const MAX_SECRET_BLOBS: u32 = 16_000;
-    pub const MAX_SECRET_VERSIONS: u32 = 256;
-    /// v1 has no ceiling for these four; placeholders.
-    pub const MAX_RECENT_MESSAGES: u32 = 1_000;
-    pub const MAX_MESSAGE_SIZE: u32 = 10_000;
-    pub const MAX_DIRECT_MESSAGES: u32 = 1_000;
-    pub const MAX_ROOM_DESCRIPTION: u32 = 4_000;
-    pub const MAX_ROOM_NAME: u32 = 1_000;
-    /// v1's `NICKNAME_CEILING`.
-    pub const MAX_NICKNAME_SIZE: u32 = 1_000;
+    pub const MAX_MEMBERS: u32 = 300;
+    pub const MAX_LINKS: u32 = 400;
+    pub const MAX_LINKS_PER_MEMBER: u32 = 4;
+    pub const MAX_CHILDREN_PER_LINK: u32 = 400;
+    pub const MAX_CHAIN_DEPTH: u32 = 8;
+    pub const MAX_OWNER_BANS: u32 = 250;
+    pub const MAX_DEPUTY_BANS: u32 = 250;
+    pub const MAX_BANS_PER_DEPUTY: u32 = 150;
+    pub const MAX_MEMBER_BANS: u32 = 50;
+    pub const MAX_BANS_PER_ISSUER: u32 = 10;
+    pub const MAX_SECRET_BLOBS: u32 = 400;
+    pub const MAX_SECRET_VERSIONS: u32 = 32;
+    pub const MAX_RECENT_MESSAGES: u32 = 200;
+    pub const MAX_MESSAGE_SIZE: u32 = 2_000;
+    pub const MAX_DIRECT_MESSAGES: u32 = 300;
+    pub const MAX_ROOM_DESCRIPTION: u32 = 2_000;
+    pub const MAX_ROOM_NAME: u32 = 200;
+    pub const MAX_NICKNAME_SIZE: u32 = 100;
     pub const AUTHORITY_KEYS: usize = 64;
     pub const CHILD_EXCEPTIONS: usize = 64;
-    /// v1 constants.
+    /// v1's per-pair DM cap.
     pub const DMS_PER_PAIR: usize = 100;
-    pub const DM_CIPHERTEXT: usize = 32_768;
-    pub const PURGE_TOKENS: usize = 1_000;
+    /// v1 allowed 32 KiB.
+    pub const DM_CIPHERTEXT: usize = 4_096;
+    /// v1 allowed 1,000.
+    pub const PURGE_TOKENS: usize = 200;
     pub const SECRET_BLOB_CIPHERTEXT: usize = 512;
     pub const BAN_REASON: usize = 256;
     pub const ROSTER_BATCHES: usize = 1_000;
     pub const ROSTER_BATCH_ENTRIES: usize = 1_000;
-    pub const RESTORE_REQUESTS: usize = 1_000;
+    pub const RESTORE_REQUESTS: usize = 10;
+    /// Legacy v1 records encode byte vectors as CBOR arrays, which cost
+    /// about four times as much to decode in WASM as a v2 byte string, so
+    /// the legacy kinds that carry content have their own, smaller bounds:
+    /// a legacy message or activity record's content at most 1,000 bytes
+    /// (v1's default `max_message_size`; the Official room's largest message
+    /// on 2026-10-26 was 613 bytes) and a legacy DM's ciphertext at most
+    /// 2,560 bytes (its largest DM: 2,179 bytes). Without them the largest
+    /// legacy-heavy state's union merge took 3.0 s against the 2.5 s bound.
+    pub const LEGACY_MESSAGE_SIZE: usize = 1_000;
+    pub const LEGACY_DM_CIPHERTEXT: usize = 2_560;
 }
 
 compact_struct! {
@@ -94,7 +111,8 @@ impl ConfigurationV2 {
     /// The defaults of the design's bounds table for a room of
     /// `max_members`, as used when a room has no configuration at all.
     pub fn defaults(max_members: u32) -> Self {
-        let max_members = max_members.min(ceiling::MAX_MEMBERS);
+        use ceiling::*;
+        let max_members = max_members.min(MAX_MEMBERS);
         ConfigurationV2 {
             version: 0,
             privacy_mode: 0,
@@ -108,20 +126,20 @@ impl ConfigurationV2 {
             max_members,
             max_direct_messages: 300,
             max_chain_depth: 6,
-            max_links: (2 * max_members).min(ceiling::MAX_LINKS),
+            max_links: (2 * max_members).min(MAX_LINKS),
             max_links_per_member: 2,
             max_children_per_link: 50,
-            max_owner_children: 1_000,
+            max_owner_children: MAX_CHILDREN_PER_LINK,
             child_exceptions: vec![],
             max_owner_bans: 200,
             max_deputy_bans: 200,
             max_bans_per_deputy: 100,
-            max_member_bans: 100,
-            max_bans_per_issuer: 20,
+            max_member_bans: MAX_MEMBER_BANS,
+            max_bans_per_issuer: MAX_BANS_PER_ISSUER,
             deputies: vec![],
             protected: vec![],
-            max_secret_versions: 256,
-            max_secret_blobs: (4 * max_members).min(ceiling::MAX_SECRET_BLOBS),
+            max_secret_versions: MAX_SECRET_VERSIONS,
+            max_secret_blobs: (4 * max_members).min(MAX_SECRET_BLOBS),
             legacy_window_open: true,
             legacy_window_closed_at: 0,
             link_retention: 365 * 24,
@@ -129,27 +147,31 @@ impl ConfigurationV2 {
         }
     }
 
-    /// The configuration of a room whose owner never signed a v2 one: its v1
-    /// values, the defaults for everything new, and the legacy window open.
+    /// The configuration of a room whose owner never signed a v2 one, and
+    /// the starting point of the one a converting owner signs: each v1 value
+    /// clamped to its v2 ceiling (min(v1 value, ceiling)), the defaults for
+    /// everything v1 lacks, and the legacy window open. Ban caps take the v1
+    /// `max_user_bans`, clamped, so no v1 ban is dropped by a cap the
+    /// ceilings allow keeping.
     pub fn from_v1(v1: &crate::room_state::configuration::Configuration) -> Self {
+        use ceiling::*;
         let clamp = |v: usize, c: u32| (v.min(c as usize)) as u32;
-        let mut c = Self::defaults(clamp(v1.max_members, ceiling::MAX_MEMBERS));
+        let mut c = Self::defaults(clamp(v1.max_members, MAX_MEMBERS));
         c.version = 0;
         c.privacy_mode = match v1.privacy_mode {
             crate::room_state::privacy::PrivacyMode::Public => 0,
             crate::room_state::privacy::PrivacyMode::Private => 1,
         };
-        c.max_recent_messages = clamp(v1.max_recent_messages, ceiling::MAX_RECENT_MESSAGES);
-        c.max_message_size = clamp(v1.max_message_size, ceiling::MAX_MESSAGE_SIZE);
-        c.max_nickname_size = clamp(v1.max_nickname_size, ceiling::MAX_NICKNAME_SIZE);
-        c.max_room_name = clamp(v1.max_room_name, ceiling::MAX_ROOM_NAME);
-        c.max_room_description = clamp(v1.max_room_description, ceiling::MAX_ROOM_DESCRIPTION);
-        c.max_direct_messages = clamp(
-            v1.effective_max_direct_messages(),
-            ceiling::MAX_DIRECT_MESSAGES,
-        );
-        let bans = clamp(v1.max_user_bans, ceiling::MAX_OWNER_BANS);
-        c.max_owner_bans = c.max_owner_bans.max(bans);
+        c.max_recent_messages = clamp(v1.max_recent_messages, MAX_RECENT_MESSAGES);
+        c.max_message_size = clamp(v1.max_message_size, MAX_MESSAGE_SIZE);
+        c.max_nickname_size = clamp(v1.max_nickname_size, MAX_NICKNAME_SIZE);
+        c.max_room_name = clamp(v1.max_room_name, MAX_ROOM_NAME);
+        c.max_room_description = clamp(v1.max_room_description, MAX_ROOM_DESCRIPTION);
+        c.max_direct_messages = clamp(v1.effective_max_direct_messages(), MAX_DIRECT_MESSAGES);
+        c.max_owner_bans = clamp(v1.max_user_bans, MAX_OWNER_BANS);
+        c.max_deputy_bans = clamp(v1.max_user_bans, MAX_DEPUTY_BANS);
+        c.max_bans_per_deputy = clamp(v1.max_user_bans, MAX_BANS_PER_DEPUTY);
+        c.max_member_bans = clamp(v1.max_user_bans, MAX_MEMBER_BANS);
         c
     }
 

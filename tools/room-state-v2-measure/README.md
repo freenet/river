@@ -24,9 +24,24 @@ REPS=3 <dir>/host/host <dir>/wasm32-unknown-unknown/release/guest.wasm \
   official proposed 40 20 10 4 2 1
 ```
 
-A spec is `official` (the Official room's current contents in v2 records),
-`proposed` (the candidate ceilings, `Caps::proposed`), or a divisor `d` of the
-placeholder ceilings of the design's bounds table (`1` = the ceilings).
+A spec is `ceilings` (every cap at its ceiling, all v2 records), `legacy` (the
+same with owner bans, activity, member info, messages, DMs, purges and blobs as
+legacy v1 records), `official` (the Official room's contents in v2 records), or
+a divisor `d` of the ceilings.
+
+**The local check of the ceilings** (not in CI; run it on nova after any change
+to `room_state_v2` or the ceilings):
+
+```bash
+CHECK_SECS=2.5 REPS=3 <dir>/host/host <dir>/wasm32-unknown-unknown/release/guest.wasm ceilings legacy
+```
+
+It exits non-zero if any `validate_state`, `update_with_state` or untrusted
+merge of the union fails or takes longer than 2.5 s.
+
+The sections below "Results" record the measurements that set the ceilings;
+they were taken with the design's placeholder ceilings, which `official`,
+`proposed` and the divisors then referred to.
 
 The calls: `validate` is `validate_state`; `validate_no_signatures` the same
 with every signature taken as verified; `update_with_state` is the held state
@@ -77,3 +92,22 @@ members2000 29,752 and 19.2 MB; ceilings / 4 36,325 and 38.1 MB (its union
 merge now fits under the 256 MiB cap, at 255 MiB). The engine opt level buys 5
 to 15 percent. One run of the guest at `opt-level = 3` (profile `guest-o3`,
 engine None) gave proposed 1.41 / 1.51 s and members2000 11.1 / 10.3 s.
+
+## The ceilings as shipped, 2026-10-26 (load average 7 to 9)
+
+`config::ceiling` now holds the proposed caps (300 members, 400 links, 4 KiB DM
+ciphertext, ...), and legacy records carrying content have their own bounds
+(message or activity content 1,000 bytes, DM ciphertext 2,560 bytes; see
+`ceiling::LEGACY_MESSAGE_SIZE`). `apply_delta` checks the signatures of new
+records `f` did not keep after running `f`, so no record is decoded twice.
+
+| state | records | signatures | bytes | validate | update with a state | merge, untrusted |
+|---|---|---|---|---|---|---|
+| ceilings | 2,901 | 3,941 | 3.65 MB | 1.49 to 1.63 s | 1.23 to 1.33 s | 1.55 to 2.21 s |
+| legacy | 2,901 | 3,941 | 5.33 MB | 1.89 to 1.91 s | 2.15 to 2.23 s | 2.31 to 2.43 s |
+| official | 1,435 | 1,857 | 0.86 MB | 0.64 to 0.65 s | 0.52 to 0.55 s | 0.68 to 0.71 s |
+
+`CHECK_SECS=2.5`: passed. The legacy-heavy worst case has the least margin
+(about 0.1 to 0.2 s), and nova was loaded; a slower peer will exceed 2.5 s
+there, though not freenet-core's 5 s per call. Before the legacy bounds, the
+legacy-heavy merge took 3.0 s and the update 3.2 s.

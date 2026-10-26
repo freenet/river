@@ -45,11 +45,17 @@ impl Verifier {
     }
 
     pub fn ok(&mut self, owner: &Key, rec: &Record, digest: &Digest) -> bool {
+        self.ok_with(digest, || signature_ok(owner, rec))
+    }
+
+    /// As [`Self::ok`], with the check supplied (a legacy record's v1
+    /// signature, from its structural decode).
+    pub fn ok_with(&mut self, digest: &Digest, check: impl FnOnce() -> bool) -> bool {
         if self.verified.contains(digest) {
             return true;
         }
         self.checks += 1;
-        let ok = signature_ok(owner, rec);
+        let ok = check();
         if ok {
             self.verified.insert(*digest);
         }
@@ -197,11 +203,40 @@ struct Ctx<'a> {
     by_kind: Vec<Vec<usize>>,
     keep: Vec<bool>,
     v: &'a mut Verifier,
+    /// v1 signatures of legacy records decoded so far, by record index.
+    pending: std::cell::RefCell<HashMap<usize, legacy::V1Sig>>,
 }
 
 impl Ctx<'_> {
     fn ok(&mut self, i: usize) -> bool {
-        self.v.ok(&self.owner, self.recs[i], &self.digests[i])
+        let owner = self.owner;
+        let rec = self.recs[i];
+        match self.pending.get_mut().remove(&i) {
+            Some(v1) => {
+                let signer = match rec {
+                    Record::LegacyConfiguration(l)
+                    | Record::LegacyBan(l)
+                    | Record::LegacyLink(l)
+                    | Record::LegacyActivity(l)
+                    | Record::LegacyMemberInfo(l)
+                    | Record::LegacyMessage(l)
+                    | Record::LegacyDirectMessage(l)
+                    | Record::LegacyPurge(l)
+                    | Record::LegacySecretBlob(l) => l.signer,
+                    _ => unreachable!("only legacy records are pending"),
+                };
+                self.v
+                    .ok_with(&self.digests[i], || v1.verify(&owner, &signer))
+            }
+            None => self.v.ok(&owner, rec, &self.digests[i]),
+        }
+    }
+
+    /// Keeps a decoded legacy record's v1 signature for its check.
+    fn hold(&self, i: usize, v1: &mut Option<legacy::V1Sig>) {
+        if let Some(x) = v1.take() {
+            self.pending.borrow_mut().insert(i, x);
+        }
     }
     fn kind(&self, k: Kind) -> Vec<usize> {
         self.by_kind[k as usize].clone()
@@ -295,6 +330,7 @@ pub fn retain_refs(
         by_kind,
         keep: vec![false; recs.len()],
         v,
+        pending: Default::default(),
     };
     let owner = *owner;
 
@@ -329,7 +365,8 @@ pub fn retain_refs(
             .kind(1)
             .into_iter()
             .filter_map(|i| match &recs[i] {
-                Record::LegacyConfiguration(l) => legacy::decode_config(&owner, l).map(|v| {
+                Record::LegacyConfiguration(l) => legacy::decode_config(&owner, l).map(|mut v| {
+                    c.hold(i, &mut v.v1);
                     (
                         Reverse(v.configuration.configuration_version),
                         v.sig,
@@ -514,7 +551,10 @@ pub fn retain_refs(
         .into_iter()
         .filter_map(|i| match &recs[i] {
             Record::LegacyBan(l) if legacy_ok(LegacyKind::Ban, &c.digests[i]) => {
-                legacy::decode_ban(&owner, l).map(|v| (i, l.signer, v))
+                legacy::decode_ban(&owner, l).map(|mut v| {
+                    c.hold(i, &mut v.v1);
+                    (i, l.signer, v)
+                })
             }
             _ => None,
         })
@@ -716,9 +756,10 @@ pub fn retain_refs(
             continue;
         };
         let d = c.digests[i];
-        let Some(v) = legacy::decode_link(&owner, l) else {
+        let Some(mut v) = legacy::decode_link(&owner, l) else {
             continue;
         };
+        c.hold(i, &mut v.v1);
         if v.member == owner
             || v.member == v.inviter
             || key_banned(&v.member)
@@ -875,9 +916,13 @@ pub fn retain_refs(
         if !legacy_ok(LegacyKind::Activity, &c.digests[i]) {
             continue;
         }
-        let Some(v) = legacy::decode_message(&owner, l) else {
+        let Some(mut v) = legacy::decode_message(&owner, l) else {
             continue;
         };
+        c.hold(i, &mut v.v1);
+        if v.body.content_len() > ceiling::LEGACY_MESSAGE_SIZE {
+            continue;
+        }
         let h = (time.eff_legacy(v.time).saturating_sub(EPOCH_2026_SECS) / 3600)
             .min(u32::MAX as u64) as u32;
         if linked.contains(&v.author) && hours_ok(h) {
@@ -1171,7 +1216,8 @@ pub fn retain_refs(
         if !legacy_ok(LegacyKind::MemberInfo, &c.digests[i]) {
             continue;
         }
-        if let Some(v) = legacy::decode_member_info(&owner, l) {
+        if let Some(mut v) = legacy::decode_member_info(&owner, l) {
+            c.hold(i, &mut v.v1);
             if kept.contains(&v.member) && v.declared_len <= cfg.max_nickname_size as usize {
                 mi.push((v.member, Reverse(v.version), v.sig, i));
             }
@@ -1210,9 +1256,11 @@ pub fn retain_refs(
         if !legacy_ok(LegacyKind::Message, &c.digests[i]) {
             continue;
         }
-        if let Some(v) = legacy::decode_message(&owner, l) {
+        if let Some(mut v) = legacy::decode_message(&owner, l) {
+            c.hold(i, &mut v.v1);
             if kept.contains(&v.author)
-                && v.body.content_len() <= cfg.max_message_size as usize
+                && v.body.content_len()
+                    <= (cfg.max_message_size as usize).min(ceiling::LEGACY_MESSAGE_SIZE)
                 && admissible_v1(&v.body, private, &versions)
             {
                 msgs.push((Reverse(time.eff_legacy(v.time)), c.digests[i], i));
@@ -1252,7 +1300,8 @@ pub fn retain_refs(
         if !legacy_ok(LegacyKind::Purge, &c.digests[i]) {
             continue;
         }
-        if let Some(v) = legacy::decode_purge(&owner, l) {
+        if let Some(mut v) = legacy::decode_purge(&owner, l) {
+            c.hold(i, &mut v.v1);
             if v.tokens.len() > ceiling::PURGE_TOKENS {
                 continue;
             }
@@ -1315,14 +1364,15 @@ pub fn retain_refs(
         if !legacy_ok(LegacyKind::DirectMessage, &c.digests[i]) {
             continue;
         }
-        let Some(v) = legacy::decode_dm(&owner, l) else {
+        let Some(mut v) = legacy::decode_dm(&owner, l) else {
             continue;
         };
+        c.hold(i, &mut v.v1);
         let recips = matching(v.recipient_id);
         if kept.contains(&v.sender)
             && !recips.is_empty()
             && v.sender_id != v.recipient_id
-            && v.ciphertext_len <= ceiling::DM_CIPHERTEXT
+            && v.ciphertext_len <= ceiling::LEGACY_DM_CIPHERTEXT
             && !recips.iter().any(|k| is_purged(k, &v.token))
         {
             dms.push((
@@ -1375,7 +1425,8 @@ pub fn retain_refs(
         if !legacy_ok(LegacyKind::SecretBlob, &c.digests[i]) {
             continue;
         }
-        if let Some(v) = legacy::decode_blob(&owner, l) {
+        if let Some(mut v) = legacy::decode_blob(&owner, l) {
+            c.hold(i, &mut v.v1);
             if versions.contains(&v.version)
                 && !matching(v.recipient_id).is_empty()
                 && v.ciphertext_len <= ceiling::SECRET_BLOB_CIPHERTEXT

@@ -169,43 +169,43 @@ fn record_digest_golden_vector() {
 const GOLDEN_CLOCK_DIGEST: &str =
     "69a05020f977abf4ed4255f7bdda08a6add7de343b58c34bd1719469473b93e7";
 
-/// The largest state at the placeholder ceilings: its size against the
-/// computed ceiling, and per-kind record sizes against `MAX_RECORD_BYTES`.
+/// The largest valid states at the ceilings (all v2 records, and the
+/// member-dependent records as legacy v1 ones): each is a fixpoint, within
+/// the computed byte ceiling and freenet-core's 50 MiB state limit, with
+/// every record within `MAX_RECORD_BYTES`; and the merge of two is valid.
 #[test]
-#[ignore = "builds ~150k signed records (about a minute in the dev profile, which optimizes the crypto crates)"]
 fn largest_state_at_the_ceilings() {
     let o = owner();
-    let t = std::time::Instant::now();
-    let (s, dropped) = largest_state(Caps::ceilings(), 0);
-    println!("built in {:?}", t.elapsed());
-    assert_eq!(dropped, 0);
-    let bytes = s.to_bytes();
-    let mut per_kind: std::collections::BTreeMap<u8, (usize, usize, usize)> = Default::default();
-    for r in &s.records {
-        let n = to_cbor(r).len();
-        let e = per_kind.entry(r.kind()).or_default();
-        e.0 += 1;
-        e.1 += n;
-        e.2 = e.2.max(n);
+    for caps in [Caps::ceilings(), Caps::ceilings_legacy()] {
+        let (s, dropped) = largest_state(caps, 0);
+        assert_eq!(dropped, 0, "{caps:?}");
+        let (s1, _) = largest_state(caps, 1);
+        let bytes = s.to_bytes();
+        let mut per_kind: std::collections::BTreeMap<u8, (usize, usize, usize)> =
+            Default::default();
+        for r in &s.records {
+            let n = to_cbor(r).len();
+            let e = per_kind.entry(r.kind()).or_default();
+            e.0 += 1;
+            e.1 += n;
+            e.2 = e.2.max(n);
+        }
+        println!("legacy {}:", caps.legacy);
+        for (k, (n, total, max)) in &per_kind {
+            println!("  kind {k:2}: {n:5} records, {total:9} bytes, largest {max}");
+            assert!(*max <= MAX_RECORD_BYTES[*k as usize], "kind {k}: {max}");
+        }
+        println!(
+            "  state {} bytes; computed ceiling {}",
+            bytes.len(),
+            max_state_bytes()
+        );
+        assert!(bytes.len() <= max_state_bytes());
+        assert!(max_state_bytes() <= 50 * 1024 * 1024, "over MAX_STATE_SIZE");
+        let mut v = Verifier::new();
+        assert!(validate_state(&o, &bytes, &mut v).is_ok());
+        let m = merge(&o, &s, &s1, &mut Verifier::new());
+        assert!(validate_state(&o, &m.to_bytes(), &mut Verifier::new()).is_ok());
+        let _ = ceiling::MAX_LINKS;
     }
-    for (k, (n, total, max)) in &per_kind {
-        println!("kind {k:2}: {n:6} records, {total:10} bytes, largest {max}");
-        assert!(*max <= MAX_RECORD_BYTES[*k as usize], "kind {k}: {max}");
-    }
-    println!(
-        "state {} bytes; ceiling {}; freenet-core MAX_STATE_SIZE {}",
-        bytes.len(),
-        max_state_bytes(),
-        50 * 1024 * 1024
-    );
-    assert!(bytes.len() <= max_state_bytes());
-    let t = std::time::Instant::now();
-    let mut v = Verifier::new();
-    validate_state(&o, &bytes, &mut v).unwrap();
-    println!(
-        "native validate {:?}, {} signature checks",
-        t.elapsed(),
-        v.checks
-    );
-    let _ = ceiling::MAX_LINKS;
 }
