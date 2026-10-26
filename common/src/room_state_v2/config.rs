@@ -19,17 +19,32 @@ pub const EPOCH_2026_SECS: u64 = 1_767_225_600;
 /// in-guest WASM (a later re-key). Pinned by `largest_state_at_the_ceilings`
 /// and the measurement tool's `check` mode.
 pub mod ceiling {
+    #[cfg(not(river_v2_wide_ceilings))]
     pub const MAX_MEMBERS: u32 = 300;
+    #[cfg(not(river_v2_wide_ceilings))]
     pub const MAX_LINKS: u32 = 400;
+    // Measurement only (`--cfg river_v2_wide_ceilings` in RUSTFLAGS, never a
+    // Cargo feature, so no published build can turn it on): room for the
+    // member-scaled states `bench::Caps::members` builds above the ceilings.
+    #[cfg(river_v2_wide_ceilings)]
+    pub const MAX_MEMBERS: u32 = 4_000;
+    #[cfg(river_v2_wide_ceilings)]
+    pub const MAX_LINKS: u32 = 6_000;
     pub const MAX_LINKS_PER_MEMBER: u32 = 4;
+    #[cfg(not(river_v2_wide_ceilings))]
     pub const MAX_CHILDREN_PER_LINK: u32 = 400;
+    #[cfg(river_v2_wide_ceilings)]
+    pub const MAX_CHILDREN_PER_LINK: u32 = 6_000;
     pub const MAX_CHAIN_DEPTH: u32 = 8;
     pub const MAX_OWNER_BANS: u32 = 250;
     pub const MAX_DEPUTY_BANS: u32 = 250;
     pub const MAX_BANS_PER_DEPUTY: u32 = 150;
     pub const MAX_MEMBER_BANS: u32 = 50;
     pub const MAX_BANS_PER_ISSUER: u32 = 10;
+    #[cfg(not(river_v2_wide_ceilings))]
     pub const MAX_SECRET_BLOBS: u32 = 400;
+    #[cfg(river_v2_wide_ceilings)]
+    pub const MAX_SECRET_BLOBS: u32 = 6_000;
     pub const MAX_SECRET_VERSIONS: u32 = 32;
     pub const MAX_RECENT_MESSAGES: u32 = 200;
     pub const MAX_MESSAGE_SIZE: u32 = 2_000;

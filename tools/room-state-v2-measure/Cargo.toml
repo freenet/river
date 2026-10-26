@@ -21,6 +21,17 @@ opt-level = 3
 lto = false
 codegen-units = 16
 
+# The signature and hash crates at opt-level 3, as the v2 room contract is
+# built (1.5x faster signature checks than "z"); everything else "z".
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+[profile.release.package.ed25519-dalek]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.blake3]
+opt-level = 3
+
 # The same guest with opt-level 3 instead of the room contract's "z", to
 # show what the profile costs.
 [profile.guest-o3]

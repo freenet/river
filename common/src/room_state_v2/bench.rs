@@ -115,6 +115,23 @@ impl Caps {
         }
     }
 
+    /// The ceilings with the per-member counts scaled to `m` members as the
+    /// ceilings relate them to 300: links, the owner's child quota and blobs
+    /// 4/3 x m, a purge envelope per member and the owner; bans, messages,
+    /// DMs and restore requests as at the ceilings. Above 300 members it
+    /// needs a build with `--cfg river_v2_wide_ceilings`.
+    pub fn members(m: u32) -> Self {
+        let per = (m * 4).div_ceil(3);
+        Caps {
+            max_members: m,
+            max_links: per,
+            max_owner_children: per,
+            max_secret_blobs: per,
+            purges: m as usize + 1,
+            ..Self::ceilings()
+        }
+    }
+
     /// The ceilings with the member-dependent records carried as legacy v1
     /// records.
     pub fn ceilings_legacy() -> Self {

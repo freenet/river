@@ -116,4 +116,4 @@ serde_json = "1.0"
 # `--cfg river_force_all_cleanup_passes` makes every cleanup run all of its
 # passes (timing the worst case).
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(river_cleanup_counters)', 'cfg(river_force_all_cleanup_passes)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(river_cleanup_counters)', 'cfg(river_force_all_cleanup_passes)', 'cfg(river_v2_wide_ceilings)'] }

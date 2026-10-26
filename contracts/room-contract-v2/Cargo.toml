@@ -35,3 +35,16 @@ strip = true
 
 [profile.release.package."*"]
 opt-level = 'z'
+
+# The signature and hash crates at opt-level 3: signature checks dominate
+# validate and merge, and this makes them about 1.5x faster in freenet-core's
+# engine. Only this crate's own workspace sees these overrides, so the
+# deployed contract's and the delegate's builds are unchanged.
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+[profile.release.package.ed25519-dalek]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.blake3]
+opt-level = 3
