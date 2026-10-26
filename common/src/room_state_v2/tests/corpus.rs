@@ -256,16 +256,58 @@ fn write_fdev_corpora() {
     println!("wrote corpora to {}", root.display());
 }
 
-/// Strict delta permutation invariance on the `universes` corpus shape:
-/// for a receiver and two deltas computed against its summary, the two
-/// application orders may differ (a cap can evict in one order what the
-/// other order keeps). Counts how often, and checks that each pair heals:
-/// merging the two results, then re-merging every input, reaches one state
-/// that no further merge changes.
+/// For every receiver and pair of deltas computed against its summary, the
+/// two application orders; returns (pairs, orders that differ, differing
+/// pairs that heal: merging the two results, then re-merging every input,
+/// reaches one state no further merge changes).
+fn delta_pairs_heal(o: &Key, states: &[RoomStateV2]) -> (usize, usize, usize) {
+    let (mut pairs, mut differ, mut healed) = (0, 0, 0);
+    let ap = |s: &RoomStateV2, d: &Vec<Record>| {
+        crate::room_state_v2::apply_delta(o, s, d.clone(), &mut Verifier::new()).unwrap()
+    };
+    for base in states {
+        let sum = base.summarize();
+        let ds: Vec<Vec<Record>> = states.iter().filter_map(|s| s.delta(&sum)).collect();
+        for x in 0..ds.len() {
+            for y in x + 1..ds.len() {
+                pairs += 1;
+                let l = ap(&ap(base, &ds[x]), &ds[y]);
+                let r = ap(&ap(base, &ds[y]), &ds[x]);
+                if l == r {
+                    continue;
+                }
+                differ += 1;
+                let mut conv = merge(o, &l, &r, &mut Verifier::new());
+                assert_eq!(conv, merge(o, &r, &l, &mut Verifier::new()));
+                for _ in 0..4 {
+                    let before = conv.clone();
+                    for input in [&l, &r, base] {
+                        conv = merge(o, &conv, input, &mut Verifier::new());
+                    }
+                    for d in [&ds[x], &ds[y]] {
+                        conv = ap(&conv, d);
+                    }
+                    if conv == before {
+                        break;
+                    }
+                }
+                let fixed = [&l, &r, base]
+                    .iter()
+                    .all(|s| merge(o, &conv, s, &mut Verifier::new()) == conv);
+                healed += fixed as usize;
+            }
+        }
+    }
+    (pairs, differ, healed)
+}
+
+/// Strict delta permutation invariance fails for a contract with caps: a
+/// cap can evict in one order what the other order keeps. Over the random
+/// universes, every pair whose orders differ heals.
 #[test]
 fn delta_permutation_pairs_heal() {
     let ok = builder_owner();
-    let (mut pairs, mut differ, mut healed) = (0, 0, 0);
+    let mut tot = (0, 0, 0);
     for fi in 0..6 {
         let mut rng = Rng(36 * 100_000 + fi);
         let keys = 4 + rng.below(2) as usize;
@@ -279,44 +321,38 @@ fn delta_permutation_pairs_heal() {
         let states: Vec<RoomStateV2> = (0..10)
             .map(|i| subset(&ok, &b.recs, &mut srng, 300 + (i as u64 * 677) % 650))
             .collect();
-        for base in &states {
-            let sum = base.summarize();
-            let ds: Vec<Vec<Record>> = states.iter().filter_map(|s| s.delta(&sum)).collect();
-            for x in 0..ds.len() {
-                for y in x + 1..ds.len() {
-                    pairs += 1;
-                    let ap = |s: &RoomStateV2, d: &Vec<Record>| {
-                        crate::room_state_v2::apply_delta(&ok, s, d.clone(), &mut Verifier::new())
-                            .unwrap()
-                    };
-                    let l = ap(&ap(base, &ds[x]), &ds[y]);
-                    let r = ap(&ap(base, &ds[y]), &ds[x]);
-                    if l == r {
-                        continue;
-                    }
-                    differ += 1;
-                    let mut conv = merge(&ok, &l, &r, &mut Verifier::new());
-                    assert_eq!(conv, merge(&ok, &r, &l, &mut Verifier::new()));
-                    for _ in 0..4 {
-                        let before = conv.clone();
-                        for input in [&l, &r, base] {
-                            conv = merge(&ok, &conv, input, &mut Verifier::new());
-                        }
-                        for d in [&ds[x], &ds[y]] {
-                            conv = ap(&conv, d);
-                        }
-                        if conv == before {
-                            break;
-                        }
-                    }
-                    let fixed = [&l, &r, base]
-                        .iter()
-                        .all(|s| merge(&ok, &conv, s, &mut Verifier::new()) == conv);
-                    healed += fixed as usize;
-                }
-            }
-        }
+        let (p, d, h) = delta_pairs_heal(&ok, &states);
+        tot = (tot.0 + p, tot.1 + d, tot.2 + h);
     }
-    println!("delta pairs {pairs}, orders differ {differ}, healed {healed}");
-    assert_eq!(differ, healed);
+    println!(
+        "delta pairs {}, orders differ {}, healed {}",
+        tot.0, tot.1, tot.2
+    );
+    assert!(tot.1 > 0, "no pair exercised a cap");
+    assert_eq!(tot.1, tot.2);
+}
+
+/// The same over histories of a converted live room (RIVER_V1_STATE).
+#[test]
+#[ignore = "reads RIVER_V1_STATE and RIVER_V1_OWNER"]
+fn delta_permutation_pairs_heal_on_live_room() {
+    use crate::room_state::ChatRoomStateV1;
+    use crate::room_state_v2::convert::{legacy_configuration, legacy_records};
+    let v1: ChatRoomStateV1 = ciborium::de::from_reader(
+        &std::fs::read(std::env::var("RIVER_V1_STATE").unwrap()).unwrap()[..],
+    )
+    .unwrap();
+    let b = bs58::decode(std::env::var("RIVER_V1_OWNER").unwrap())
+        .into_vec()
+        .unwrap();
+    let o = crate::room_state_v2::encoding::Bytes32(b.try_into().unwrap());
+    let mut recs = vec![legacy_configuration(&o, &v1)];
+    recs.extend(legacy_records(&o, &v1).records);
+    let mut rng = Rng(1);
+    let states: Vec<RoomStateV2> = (0..12)
+        .map(|i| subset(&o, &recs, &mut rng, 300 + (i as u64 * 677) % 650))
+        .collect();
+    let (p, d, h) = delta_pairs_heal(&o, &states);
+    println!("delta pairs {p}, orders differ {d}, healed {h}");
+    assert_eq!(d, h);
 }
