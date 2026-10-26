@@ -4,7 +4,8 @@
 //! and `tNNN-base.cbor` / `tNNN-result.cbor` transitions (a peer held base,
 //! applied an update, reached result). Run by hand:
 //!
-//! `RIVER_V2_CORPUS=<dir> RIVER_V1_STATE=<v1.cbor> RIVER_V1_OWNER=<base58>
+//! `RIVER_V2_CORPUS=<dir> RIVER_V2_WASM=<room_contract_v2.wasm>
+//!  RIVER_V1_STATE=<v1.cbor> RIVER_V1_OWNER=<base58>
 //!  cargo test -p river-core --lib write_fdev_corpora -- --ignored`
 
 use super::builder::{owner as builder_owner, sk};
@@ -56,6 +57,11 @@ struct Transition {
 impl Drop for Out {
     fn drop(&mut self) {
         self.bundle.schema_version = 1;
+        // A bundle names its contract by code hash (RIVER_V2_WASM, the
+        // contract the corpus is for); the WASM itself is passed to fdev.
+        if let Ok(w) = std::env::var("RIVER_V2_WASM") {
+            self.bundle.code_hash = Some(*blake3::hash(&std::fs::read(w).unwrap()).as_bytes());
+        }
         self.bundle.parameters = self.params.clone();
         self.bundle.note = Some("room-state-v2 corpus".into());
         let mut bytes = b"FRNTCNF1".to_vec();
