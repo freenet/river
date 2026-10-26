@@ -4,9 +4,17 @@
 //! instant `t` hours after 2026-01-01).
 
 use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+use crate::room_state::direct_messages::{
+    sign_direct_message, sign_recipient_purges, AuthorizedDirectMessage, PurgeToken,
+    RecipientPurges,
+};
 use crate::room_state::member::{AuthorizedMember, Member, MemberId};
+use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+use crate::room_state::secret::{AuthorizedEncryptedSecretForMember, EncryptedSecretForMemberV1};
 use crate::room_state_v2::config::{ConfigurationV2, EPOCH_2026_SECS};
-use crate::room_state_v2::encoding::{sign_payload, to_cbor, ByteBuf, Digest, Key, Sig};
+use crate::room_state_v2::encoding::Token16;
+use crate::room_state_v2::encoding::{sign_payload, to_cbor, ByteBuf, Digest, Key, Nonce12, Sig};
 use crate::room_state_v2::records::*;
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
@@ -50,6 +58,11 @@ pub struct Cfg {
     pub protected: u8,
     pub window_open: bool,
     pub ban_window: u32,
+    /// Not in the model (which has no secrets): a private room, and its
+    /// secret version and blob caps.
+    pub private: bool,
+    pub max_versions: u32,
+    pub max_blobs: u32,
 }
 
 pub fn base() -> Cfg {
@@ -71,6 +84,9 @@ pub fn base() -> Cfg {
         protected: 0,
         window_open: false,
         ban_window: 3,
+        private: false,
+        max_versions: 2,
+        max_blobs: 2,
     }
 }
 
@@ -107,6 +123,17 @@ impl Cfg {
         c.protected = keys_of(self.protected);
         c.legacy_window_open = self.window_open;
         c.member_ban_activity_window = self.ban_window;
+        c.privacy_mode = self.private as u8;
+        if self.private {
+            c.display_name = Sealed::Private(SealedPrivate {
+                ciphertext: ByteBuf(vec![0; 20]),
+                nonce: Nonce12([0; 12]),
+                secret_version: 1,
+                declared_len: 4,
+            });
+        }
+        c.max_secret_versions = self.max_versions;
+        c.max_secret_blobs = self.max_blobs;
         c
     }
 }
@@ -473,6 +500,233 @@ impl Builder {
             payload: p,
         });
         self.push(format!("dm(k{a},k{b}@{time}r{cref})"), None, r);
+    }
+
+    fn id(i: usize) -> MemberId {
+        MemberId::from(&sk(i).verifying_key())
+    }
+
+    pub fn member_info(&mut self, member: usize, version: u32, nick: &[u8]) {
+        let p = MemberInfoP {
+            member: key(member),
+            version,
+            nickname: Sealed::Public(ByteBuf(nick.to_vec())),
+        };
+        let r = Record::MemberInfo(Signed {
+            sig: sign_payload(tag::MEMBER_INFO, &owner(), &p, &sk(member)),
+            payload: p,
+        });
+        self.push(format!("info(k{member} v{version})"), None, r);
+    }
+
+    pub fn secret_version(&mut self, version: u32) {
+        let p = SecretVersionP { version, cipher: 0 };
+        let r = Record::SecretVersion(Signed {
+            sig: sign_payload(tag::SECRET_VERSION, &owner(), &p, &sk(0)),
+            payload: p,
+        });
+        self.push(format!("secret v{version}"), None, r);
+    }
+
+    pub fn blob(&mut self, recipient: usize, version: u32, salt: u8) {
+        let p = SecretBlobP {
+            recipient: key(recipient),
+            version,
+            ciphertext: ByteBuf(vec![salt; 8]),
+            nonce: Nonce12([salt; 12]),
+            ephemeral_key: Key::from(&sk(recipient).verifying_key()),
+        };
+        let r = Record::SecretBlob(Signed {
+            sig: sign_payload(tag::SECRET_BLOB, &owner(), &p, &sk(0)),
+            payload: p,
+        });
+        self.push(format!("blob(k{recipient} v{version} #{salt})"), None, r);
+    }
+
+    pub fn private_msg(&mut self, author: usize, time: u32, version: u32) {
+        let p = MessageP {
+            author: key(author),
+            time: secs(time),
+            clock_ref: 0,
+            body: MessageBody::Private(PrivateBody {
+                content_type: 1,
+                content_version: 1,
+                ciphertext: ByteBuf(vec![time as u8; 4]),
+                nonce: Nonce12([0; 12]),
+                secret_version: version,
+            }),
+        };
+        let r = Record::Message(Signed {
+            sig: sign_payload(tag::MESSAGE, &owner(), &p, &sk(author)),
+            payload: p,
+        });
+        self.push(format!("pmsg(k{author}@{time} v{version})"), None, r);
+    }
+
+    /// The purge token of the DM at record index `i` (v2 or legacy).
+    fn token(&self, i: usize) -> Token16 {
+        match &self.recs[i] {
+            Record::DirectMessage(s) => Token16(crate::room_state_v2::retain::token_of(&s.sig)),
+            Record::LegacyDirectMessage(l) => {
+                let v1: AuthorizedDirectMessage = ciborium::de::from_reader(&l.v1.0[..]).unwrap();
+                Token16(PurgeToken::from_signature(&v1.sender_signature).0)
+            }
+            _ => panic!("not a DM"),
+        }
+    }
+
+    pub fn dm_indexes(&self) -> Vec<usize> {
+        (0..self.recs.len())
+            .filter(|&i| {
+                matches!(
+                    self.recs[i],
+                    Record::DirectMessage(_) | Record::LegacyDirectMessage(_)
+                )
+            })
+            .collect()
+    }
+
+    pub fn purge(&mut self, recipient: usize, version: u64, dms: &[usize]) {
+        let mut purged: Vec<Token16> = dms.iter().map(|&i| self.token(i)).collect();
+        purged.sort();
+        purged.dedup();
+        let p = PurgeP {
+            recipient: key(recipient),
+            version,
+            purged,
+        };
+        let r = Record::Purge(Signed {
+            sig: sign_payload(tag::PURGE, &owner(), &p, &sk(recipient)),
+            payload: p,
+        });
+        self.push(format!("purge(k{recipient} v{version} {dms:?})"), None, r);
+    }
+
+    pub fn legacy_msg(&mut self, author: usize, time: u32, as_activity: bool) {
+        let m = MessageV1 {
+            room_owner: Self::id(0),
+            author: Self::id(author),
+            time: UNIX_EPOCH + Duration::from_secs(secs(time)),
+            content: RoomMessageBody::public(format!("t{time}")),
+        };
+        let l = Legacy {
+            signer: key(author),
+            v1: ByteBuf(to_cbor(&AuthorizedMessageV1::new(m, &sk(author)))),
+        };
+        if as_activity {
+            self.push(
+                format!("lact(k{author}@{time})"),
+                None,
+                Record::LegacyActivity(l),
+            );
+        } else {
+            self.push(
+                format!("lmsg(k{author}@{time})"),
+                None,
+                Record::LegacyMessage(l),
+            );
+        }
+    }
+
+    pub fn legacy_dm(&mut self, a: usize, b: usize, time: u32) {
+        let dm = sign_direct_message(
+            &sk(a),
+            Self::id(a),
+            Self::id(b),
+            &sk(0).verifying_key(),
+            secs(time),
+            vec![9, 9],
+        )
+        .unwrap();
+        let l = Legacy {
+            signer: key(a),
+            v1: ByteBuf(to_cbor(&dm)),
+        };
+        self.push(
+            format!("ldm(k{a},k{b}@{time})"),
+            None,
+            Record::LegacyDirectMessage(l),
+        );
+    }
+
+    pub fn legacy_info(&mut self, member: usize, version: u32) {
+        let info = MemberInfo::new_public(Self::id(member), version, format!("n{version}"));
+        let a = AuthorizedMemberInfo::new_with_member_key(info, &sk(member));
+        let l = Legacy {
+            signer: key(member),
+            v1: ByteBuf(to_cbor(&a)),
+        };
+        self.push(
+            format!("linfo(k{member} v{version})"),
+            None,
+            Record::LegacyMemberInfo(l),
+        );
+    }
+
+    pub fn legacy_purge(&mut self, recipient: usize, version: u64, dms: &[usize]) {
+        let state = RecipientPurges {
+            version,
+            purged: dms.iter().map(|&i| PurgeToken(self.token(i).0)).collect(),
+        };
+        let p = sign_recipient_purges(
+            &sk(recipient),
+            Self::id(recipient),
+            &sk(0).verifying_key(),
+            state,
+        )
+        .unwrap();
+        let l = Legacy {
+            signer: key(recipient),
+            v1: ByteBuf(to_cbor(&p)),
+        };
+        self.push(
+            format!("lpurge(k{recipient} v{version} {dms:?})"),
+            None,
+            Record::LegacyPurge(l),
+        );
+    }
+
+    pub fn legacy_blob(&mut self, recipient: usize, version: u32) {
+        let blob = EncryptedSecretForMemberV1 {
+            member_id: Self::id(recipient),
+            secret_version: version,
+            ciphertext: vec![1; 8],
+            nonce: [2; 12],
+            sender_ephemeral_public_key: [3; 32],
+            provider: Self::id(0),
+        };
+        let a = AuthorizedEncryptedSecretForMember::new(blob, &sk(0));
+        let l = Legacy {
+            signer: key(0),
+            v1: ByteBuf(to_cbor(&a)),
+        };
+        self.push(
+            format!("lblob(k{recipient} v{version})"),
+            None,
+            Record::LegacySecretBlob(l),
+        );
+    }
+
+    /// A roster batch over records by index.
+    pub fn roster_indexes(&mut self, seq: u32, idx: &[usize]) {
+        let mut batch: Vec<RosterEntry> = idx
+            .iter()
+            .map(|&i| RosterEntry {
+                kind: self.recs[i].legacy_kind().unwrap(),
+                digest: self.recs[i].digest(),
+            })
+            .collect();
+        batch.sort_by(|a, b| (a.kind, a.digest).cmp(&(b.kind, b.digest)));
+        batch.dedup();
+        if batch.is_empty() {
+            return;
+        }
+        let p = RosterP { seq, batch };
+        let r = Record::Roster(Signed {
+            sig: sign_payload(tag::ROSTER, &owner(), &p, &sk(0)),
+            payload: p,
+        });
+        self.push(format!("roster s{seq} {idx:?}"), None, r);
     }
 
     /// Resolves records that name other records by their final digests.

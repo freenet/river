@@ -288,6 +288,9 @@ pub fn rand_cfg(rng: &mut Rng, keys: usize) -> Cfg {
         protected: prot,
         window_open: rng.below(2) == 0,
         ban_window: r(rng, 0, 4),
+        private: false,
+        max_versions: 2,
+        max_blobs: 2,
     }
 }
 
@@ -429,4 +432,80 @@ pub fn rand_universe(rng: &mut Rng, keys: usize, c0: Cfg, v1: Cfg, v2: Cfg) -> B
     b.cfg(1, v1);
     b.cfg(2, v2);
     b.finish()
+}
+
+/// Not in the model: the model's random universe plus the member-dependent
+/// and legacy records it leaves out (member info, secret versions, blobs and
+/// private messages, purge envelopes naming DMs, and legacy messages,
+/// activity, DMs, member info, purges and blobs, some attested by roster).
+pub fn rand_universe_l5(rng: &mut Rng, keys: usize, c0: Cfg, v1: Cfg, v2: Cfg) -> Builder {
+    let private = rng.below(2) == 0;
+    let set = |mut c: Cfg, rng: &mut Rng| {
+        c.private = private;
+        c.max_versions = 1 + rng.below(2) as u32;
+        c.max_blobs = 1 + rng.below(3) as u32;
+        c
+    };
+    let (c0, v1, v2) = (set(c0, rng), set(v1, rng), set(v2, rng));
+    let mut b = rand_universe(rng, keys, c0, v1, v2);
+    let rk = |rng: &mut Rng| 1 + rng.below(keys as u64) as usize;
+    for _ in 0..rng.below(4) {
+        let m = rng.below(keys as u64 + 1) as usize;
+        b.member_info(m, 1 + rng.below(2) as u32, b"nick");
+    }
+    let nver = rng.below(3) as u32;
+    for v in 1..=nver {
+        b.secret_version(v);
+    }
+    for i in 0..rng.below(4) {
+        b.blob(rk(rng), 1 + rng.below(nver.max(1) as u64) as u32, i as u8);
+    }
+    for i in 0..rng.below(3) {
+        b.private_msg(
+            rng.below(keys as u64 + 1) as usize,
+            10 + i as u32 * 7,
+            1 + rng.below(2) as u32,
+        );
+    }
+    for i in 0..rng.below(3) {
+        let a = rk(rng);
+        let mut c = rk(rng);
+        if c == a {
+            c = a % keys + 1;
+        }
+        b.legacy_dm(a, c, 5 + i as u32 * 11);
+    }
+    let dms = b.dm_indexes();
+    for _ in 0..1 + rng.below(3) {
+        let pick: Vec<usize> = dms.iter().copied().filter(|_| rng.below(2) == 0).collect();
+        let r = rk(rng);
+        if rng.below(2) == 0 {
+            b.legacy_purge(r, 1 + rng.below(2), &pick);
+        } else {
+            b.purge(r, 1 + rng.below(2), &pick);
+        }
+    }
+    for i in 0..rng.below(3) {
+        b.legacy_msg(
+            rng.below(keys as u64 + 1) as usize,
+            3 + i as u32 * 13,
+            false,
+        );
+    }
+    for _ in 0..rng.below(3) {
+        b.legacy_msg(rk(rng), rng.below(9) as u32, true);
+    }
+    for _ in 0..rng.below(2) {
+        b.legacy_info(rk(rng), 1 + rng.below(2) as u32);
+    }
+    for _ in 0..rng.below(2) {
+        b.legacy_blob(rk(rng), 1 + rng.below(nver.max(1) as u64) as u32);
+    }
+    let legacy: Vec<usize> = (0..b.recs.len())
+        .filter(|&i| b.recs[i].legacy_kind().is_some() && rng.below(2) == 0)
+        .collect();
+    if !legacy.is_empty() && rng.below(2) == 0 {
+        b.roster_indexes(7, &legacy);
+    }
+    b
 }

@@ -5,7 +5,7 @@
 //! run the model's full sizes (`cargo test --release -- --ignored`).
 
 use super::builder::owner;
-use super::families::{rand_cfg, rand_universe, tiny_families};
+use super::families::{rand_cfg, rand_universe, rand_universe_l5, tiny_families};
 use super::harness::{exhaustive, random, report_failures, row, Counts, Rng, HEADER};
 use super::universe::Universe;
 use crate::room_state_v2::retain::mutant::Mutant;
@@ -37,7 +37,14 @@ fn run_tiny(mutant: Mutant, triples: Option<u64>, only: Option<&str>) -> Vec<(St
     out
 }
 
-fn run_random(mutant: Mutant, fams: u64, pool: usize, pairs: u64, triples: u64) -> (Counts, u64) {
+fn run_random(
+    mutant: Mutant,
+    extended: bool,
+    fams: u64,
+    pool: usize,
+    pairs: u64,
+    triples: u64,
+) -> (Counts, u64) {
     println!("{HEADER}");
     let seed0 = env("RIVER_V2_SEED", 36);
     let mut tot = Counts::default();
@@ -50,7 +57,11 @@ fn run_random(mutant: Mutant, fams: u64, pool: usize, pairs: u64, triples: u64) 
             rand_cfg(&mut rng, keys),
             rand_cfg(&mut rng, keys),
         );
-        let b = rand_universe(&mut rng, keys, c0, v1, v2);
+        let b = if extended {
+            rand_universe_l5(&mut rng, keys, c0, v1, v2)
+        } else {
+            rand_universe(&mut rng, keys, c0, v1, v2)
+        };
         let m = Universe::new(&format!("{mutant:?} / univ{fi}"), b, mutant);
         let c = random(&m, seed0 * 7919 + fi, pool, pairs, triples);
         if c.bad() {
@@ -110,6 +121,7 @@ fn tiny_families_obey_the_laws_exhaustively() {
 fn random_universes_obey_the_laws() {
     let (t, detected) = run_random(
         Mutant::None,
+        false,
         env("RIVER_V2_FAMS", 4),
         env("RIVER_V2_POOL", 400) as usize,
         env("RIVER_V2_PAIRS", 2_000),
@@ -124,6 +136,7 @@ fn random_universes_obey_the_laws() {
 fn random_universes_obey_the_laws_at_model_size() {
     let (t, detected) = run_random(
         Mutant::None,
+        false,
         env("RIVER_V2_FAMS", 40),
         env("RIVER_V2_POOL", 5_000) as usize,
         env("RIVER_V2_PAIRS", 200_000),
@@ -164,7 +177,72 @@ fn mutant_link_sweep_after_member_cap_is_caught() {
     let (_, detected) = if r.iter().any(|(_, c)| c.bad()) {
         (Counts::default(), 1)
     } else {
-        run_random(Mutant::SweepAfterL4, 12, 300, 1_000, 3_000)
+        run_random(Mutant::SweepAfterL4, false, 12, 300, 1_000, 3_000)
     };
     assert!(detected > 0);
+}
+
+#[test]
+fn extended_random_universes_obey_the_laws() {
+    let (t, detected) = run_random(
+        Mutant::None,
+        true,
+        env("RIVER_V2_FAMS", 6),
+        env("RIVER_V2_POOL", 400) as usize,
+        env("RIVER_V2_PAIRS", 2_000),
+        env("RIVER_V2_RTRIPLES", 4_000),
+    );
+    assert_eq!(detected, 0);
+    assert!(!t.bad());
+}
+
+#[test]
+#[ignore = "full size: 40 extended random universes (release build)"]
+fn extended_random_universes_obey_the_laws_at_model_size() {
+    let (t, detected) = run_random(
+        Mutant::None,
+        true,
+        env("RIVER_V2_FAMS", 40),
+        env("RIVER_V2_POOL", 5_000) as usize,
+        env("RIVER_V2_PAIRS", 200_000),
+        env("RIVER_V2_RTRIPLES", 1_000_000),
+    );
+    assert_eq!(detected, 0);
+    assert!(!t.bad());
+}
+
+/// The extended universes are not vacuous: across f of random subsets, every
+/// record kind they add survives in some state.
+#[test]
+fn extended_universes_keep_every_kind_they_add() {
+    use super::harness::{bits, LawModel};
+    let mut seen = [0u32; 24];
+    for fi in 0..12 {
+        let mut rng = Rng(36 * 100_000 + fi);
+        let keys = 4 + rng.below(2) as usize;
+        let (c0, v1, v2) = (
+            rand_cfg(&mut rng, keys),
+            rand_cfg(&mut rng, keys),
+            rand_cfg(&mut rng, keys),
+        );
+        let m = Universe::new(
+            "cov",
+            rand_universe_l5(&mut rng, keys, c0, v1, v2),
+            Mutant::None,
+        );
+        let mut r = Rng(fi);
+        for _ in 0..300 {
+            let s = m.f(r.subset(m.n(), 700));
+            for i in bits(s) {
+                seen[m.recs[i].kind() as usize] += 1;
+            }
+        }
+    }
+    println!("kept per kind: {seen:?}");
+    // Every kind but the legacy configuration and the upgrade pointer.
+    for k in [
+        2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+    ] {
+        assert!(seen[k] > 0, "kind {k} never survives");
+    }
 }
