@@ -172,7 +172,7 @@ const GOLDEN_CLOCK_DIGEST: &str =
 /// The largest state at the placeholder ceilings: its size against the
 /// computed ceiling, and per-kind record sizes against `MAX_RECORD_BYTES`.
 #[test]
-#[ignore = "builds ~150k signed records (minutes); run with --release"]
+#[ignore = "builds ~150k signed records (about a minute in the dev profile, which optimizes the crypto crates)"]
 fn largest_state_at_the_ceilings() {
     let o = owner();
     let t = std::time::Instant::now();

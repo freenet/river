@@ -41,7 +41,7 @@ pub const MAX_RECORD_BYTES: [usize; 24] = [
     21_000,  // LegacyMessage
     33_100,  // DirectMessage
     66_000,  // LegacyDirectMessage
-    16_200,  // Purge
+    17_200,  // Purge
     17_400,  // LegacyPurge
     720,     // SecretBlob
     1_500,   // LegacySecretBlob

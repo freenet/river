@@ -66,8 +66,8 @@ compact_struct! {
     pub struct UpgradeP { pub version: u32, pub new_address: Bytes32 }
 }
 
-/// The record kinds a roster batch can attest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// The record kinds a roster batch can attest. Encoded as its `u8`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum LegacyKind {
     Link = 0,
@@ -78,6 +78,22 @@ pub enum LegacyKind {
     DirectMessage = 5,
     Purge = 6,
     SecretBlob = 7,
+}
+
+impl Serialize for LegacyKind {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u8(*self as u8)
+    }
+}
+
+impl<'de> Deserialize<'de> for LegacyKind {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let t = u8::deserialize(d)?;
+        LEGACY_KINDS
+            .get(t as usize)
+            .copied()
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown legacy kind {t}")))
+    }
 }
 
 pub const LEGACY_KINDS: [LegacyKind; 8] = [
