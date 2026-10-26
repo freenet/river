@@ -24,6 +24,7 @@
 //! Not yet wired into the room contract; compiled only for tests and under
 //! the `room-state-v2` feature, so the deployed contract's WASM is unchanged.
 
+pub mod bench;
 pub mod config;
 pub mod encoding;
 pub mod legacy;

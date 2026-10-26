@@ -42,9 +42,9 @@ pub const MAX_RECORD_BYTES: [usize; 24] = [
     33_100,  // DirectMessage
     66_000,  // LegacyDirectMessage
     16_200,  // Purge
-    32_300,  // LegacyPurge
+    17_400,  // LegacyPurge
     720,     // SecretBlob
-    1_400,   // LegacySecretBlob
+    1_500,   // LegacySecretBlob
 ];
 
 /// The byte ceiling of a state: for each group of kinds that share a cap,
@@ -52,15 +52,13 @@ pub const MAX_RECORD_BYTES: [usize; 24] = [
 /// so it never emits a state above this.
 pub fn max_state_bytes() -> usize {
     use ceiling::*;
-    let m = |ks: &[usize]| ks.iter().map(|&k| MAX_RECORD_BYTES[k]).max().unwrap();
-    let groups: [(&[usize], usize); 17] = [
+    let largest = |ks: &[usize]| ks.iter().map(|&k| MAX_RECORD_BYTES[k]).max().unwrap();
+    let members = MAX_MEMBERS as usize + 1;
+    let groups: [(&[usize], usize); 15] = [
         (&[0, 1], 1),
         (&[2], 1),
         (&[3], 1),
         (&[4], 1),
-        // Roster batches are bounded by entries: every kind's ceiling summed,
-        // plus a batch header each.
-        (&[5], 0),
         (&[6], MAX_SECRET_VERSIONS as usize),
         (
             &[7, 8],
@@ -69,26 +67,21 @@ pub fn max_state_bytes() -> usize {
         (&[9, 10], MAX_LINKS as usize),
         (&[11, 12], MAX_LINKS as usize),
         (&[13], RESTORE_REQUESTS),
-        (&[14, 15], MAX_MEMBERS as usize + 1),
+        (&[14, 15], members),
         (&[16, 17], MAX_RECENT_MESSAGES as usize),
         (&[18, 19], MAX_DIRECT_MESSAGES as usize),
-        (&[20], MAX_MEMBERS as usize + 1),
-        (&[21], MAX_MEMBERS as usize + 1),
+        (&[20, 21], members),
         (&[22, 23], MAX_SECRET_BLOBS as usize),
-        (&[], 0),
+        // Roster batches are bounded by their entries, below.
+        (&[5], 0),
     ];
+    // A roster entry is 36 bytes; a batch adds its header and signature.
     let roster_entries: usize = super::records::LEGACY_KINDS
         .iter()
         .map(|k| super::retain::roster_ceiling(*k))
         .sum();
-    let roster = roster_entries * 40 + ROSTER_BATCHES * 120;
-    groups
-        .iter()
-        .filter(|(ks, _)| !ks.is_empty())
-        .map(|(ks, n)| m(ks) * n)
-        .sum::<usize>()
-        + roster
-        + 64
+    let roster = roster_entries * 36 + ROSTER_BATCHES * 100;
+    groups.iter().map(|(ks, n)| largest(ks) * n).sum::<usize>() + roster + 16
 }
 
 /// Why `validate_state` refused.

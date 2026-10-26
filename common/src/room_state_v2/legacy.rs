@@ -138,6 +138,7 @@ pub struct LegacyMemberInfoView {
 pub fn decode_member_info(_owner: &Key, l: &Legacy) -> Option<LegacyMemberInfoView> {
     let v1: AuthorizedMemberInfo = from_cbor_canonical(&l.v1.0)?;
     if v1.member_info.member_id != id(&l.signer)
+        || v1.member_info.deputies.len() > crate::room_state::member_info::MAX_DEPUTIES
         || !sealed_v1_ok(&v1.member_info.preferred_nickname)
     {
         return None;
