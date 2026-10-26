@@ -435,7 +435,8 @@ test.describe("Avatars", () => {
 // kebab menu's React on touch. A faint "+" after a message's reaction chips
 // was a second way; Ian found two controls for one action untidy
 // (2026-10-25), so it was removed. Its element stays only as the inert
-// anchor the picker opens from, so it must never show or take a tap.
+// reference the picker is measured against when no control can be, so it
+// must never show or take a tap.
 test.describe("Reaction row", () => {
   test("a message with reactions shows no add-reaction control after its chips", async ({ page }) => {
     const { own } = await openRoomWithPairs(page);
@@ -475,6 +476,26 @@ test.describe("The picker opens at React", () => {
     expect(report.anchor.top - report.control.bottom, "premise: the chips sit well below the control").toBeGreaterThan(100);
     expectPickerAtControl(report);
     expectEveryEmojiTappable(report);
+  });
+
+  // The picker is placed in the box that also places React, so a message
+  // reflowing under it (here, its first reaction arriving, which adds the
+  // chip line and moves the end of the chips) leaves it at the control.
+  test("stays at React when a reaction arrives while it is open", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await deliverOffscreen(page, "reflow probe");
+    const row = page.getByTestId("message-row").filter({ hasText: "reflow probe" });
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await openInlinePicker(page, row);
+    const before = await measurePicker(page);
+    expectPickerAtControl(before);
+    await callRiverTest(page, "addReactionsToNewest", ["🎉", "👀", "🔥"]);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(3);
+    await nextFrames(page);
+    const after = await measurePicker(page);
+    expect(after.anchor.left - before.anchor.left, "premise: the chips moved the end of the reaction line").toBeGreaterThan(20);
+    expectPickerAtControl(after);
   });
 });
 
@@ -632,8 +653,8 @@ test.describe("Message rows at 320px", () => {
 // at its centre.
 type PickerReport = Awaited<ReturnType<typeof measurePicker>>;
 
-/// The open picker, its anchor's wrapper (the picker's containing block), the
-/// control it was opened from and the scroller, with no click in between: a
+/// The open picker, the reaction row's anchor wrapper, the control it was
+/// opened from and the scroller, with no click in between: a
 /// click elsewhere would close it.
 async function measurePicker(page: Page) {
   await expect(page.getByTestId("emoji-picker")).toBeVisible();
@@ -644,10 +665,10 @@ async function measurePicker(page: Page) {
     };
     const scroller = box(document.getElementById("chat-scroll-container")!);
     const picker = document.querySelector('[data-testid="emoji-picker"]')!;
-    const anchorEl = picker.parentElement!.querySelector('[data-testid="reaction-picker-anchor"]')!;
     // The control React was taken from: the hover bar's button, or on touch
     // (where the bar is not displayed) the kebab.
     const row = picker.closest('[id^="msg-"]')!;
+    const anchorEl = row.querySelector('[data-testid="reaction-picker-anchor"]')!;
     const control = [
       row.querySelector('[data-testid="message-hover-actions"] button[aria-label="React"]'),
       row.querySelector('[data-testid="message-kebab"]'),
@@ -687,10 +708,9 @@ function expectPickerAtControl(report: PickerReport) {
 }
 
 /// The newest message, "picker edge", with as many reaction chips as fit on one
-/// line, so the chips run to the column's right edge. A fixed count
-/// does not do it: four chips left the anchor at 160px in Chromium, where a 140px
-/// picker still fit, and six wrapped the anchor to the line's start in WebKit, whose
-/// emoji chips are 3px wider.
+/// line, so the chips run to the column's right edge, under where the picker
+/// opens. The count is measured: a fixed one fits a line in one engine and
+/// wraps in another (WebKit's emoji chips are 3px wider).
 async function nearEdgeRow(page: Page): Promise<Locator> {
   const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"];
   await openRoomWithComposer(page);
