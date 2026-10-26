@@ -1,0 +1,37 @@
+# The v2 room contract: River's room state v2 (river-core's room_state_v2)
+# behind the contract interface. A new contract with a new key; the deployed
+# room contract (../room-contract) is untouched. Its own workspace, so the
+# `room-state-v2` feature it enables on river-core can never be unified into
+# a build of the deployed contract or the chat delegate.
+[workspace]
+
+[package]
+name = "room-contract-v2"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ciborium = "0.2.2"
+freenet-stdlib = { version = "0.8.5", features = ["contract"] }
+river-core = { path = "../../common", features = ["room-state-v2"] }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+
+[profile.release]
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+[profile.release.package."*"]
+opt-level = 'z'

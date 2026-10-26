@@ -4,6 +4,7 @@
 
 mod builder;
 mod convert_tests;
+mod corpus;
 mod families;
 mod harness;
 mod laws;
