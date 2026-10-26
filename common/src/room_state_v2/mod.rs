@@ -21,6 +21,67 @@
 //! `validate_state` requires `f(S) == S`, so every state the contract
 //! accepts is one `f` emits.
 //!
+//! # Decisions taken in implementation
+//!
+//! Each choice below is a rule of `f` or of the encoding that a reviewer
+//! should read as deliberate. Every one is lawful by construction (it reads
+//! only the record's own bytes and the layers above it).
+//!
+//! - **(a) Legacy configuration.** A room whose owner never signs a v2
+//!   configuration still needs its v1 settings, so the owner's v1
+//!   configuration is carried as [`Record::LegacyConfiguration`] at L1. It
+//!   counts only while no valid v2 configuration exists, and maps to v2 by
+//!   [`ConfigurationV2::from_v1`]. Without either, the defaults apply.
+//! - **(b) Window-close time.** Legacy times are capped at the hour the
+//!   legacy window closed. That hour is a field of the closing configuration
+//!   (`legacy_window_closed_at`), so the cap is fixed by L1. While the window
+//!   is open the cap is `Clock + 24h`; with the window open and no `Clock`,
+//!   legacy times are uncapped, as v2 times are without a `Clock`.
+//! - **(c) Chain depth.** `max_chain_depth` limits accepted links only.
+//!   Legacy links are limited by the depth ceiling, so a migrated room keeps
+//!   every v1 member however deep its invite chain.
+//! - **(d) Member-ban issuer key.** A v2 member ban names its issuing link
+//!   and that link's member key, and is valid only if the two agree. The
+//!   signature can then be checked without the rest of the state, which the
+//!   contract-boundary refusal of a bad delta needs.
+//! - **(e) Named legacy signer.** Every legacy record names the key that
+//!   signed it, including a legacy link's inviter, and the key must hash to
+//!   the v1 id the record claims. `f` never searches keys by their 64-bit id,
+//!   so a colliding key costs no failed signature check.
+//! - **(f) Roster entries carry their kind.** A roster batch lists
+//!   `(kind, digest)` pairs, so the per-kind roster ceilings can be counted
+//!   from the batch alone.
+//! - **(g) Blob precedence.** Blobs are admitted by (version descending, v2
+//!   before legacy, recipient bytes, signature). Putting v2 blobs first at
+//!   each version is what makes "a v2 blob for a key takes precedence over a
+//!   legacy blob that matches it" a greedy rule over admitted blobs.
+//! - **(h) Legacy DM pairs.** A legacy DM's per-pair group is (sender,
+//!   recipient's 64-bit id), and it is dropped if the purge envelope of any
+//!   kept key matching that id lists its token. Two keys match one id only
+//!   in crafted states.
+//! - **(i) Ceilings v1 never had.** v1 bounded neither the message cap, nor
+//!   message size, nor the DM cap, nor room name or description length; the
+//!   ceilings in [`config::ceiling`] set them.
+//! - **(j) Restore requests.** A restore request is valid if its embedded
+//!   chain verifies and ends at an admitted link or the owner. Whether its
+//!   first link is in fact retired is not checked: a request for a link that
+//!   is not retired confers nothing.
+//! - **(k) Strict signatures everywhere.** Legacy v1 records are checked with
+//!   `verify_strict`, as v2 records are, though v1 used `verify`. A v1 record
+//!   whose signature only the lenient check accepts is dropped.
+//! - **(l) Size bounds that follow from the byte ceiling.** A sealed value's
+//!   ciphertext may exceed its declared length by at most the 16-byte AEAD
+//!   tag, and a legacy member info lists at most v1's 64 deputies. Without
+//!   these, a record's declared limits would not bound its size.
+//! - **(m) Legacy content bounds.** A legacy message or activity record holds
+//!   at most 1,000 bytes of content, and a legacy DM at most 2,560 bytes of
+//!   ciphertext ([`config::ceiling::LEGACY_MESSAGE_SIZE`]). v1 encodes bytes
+//!   as CBOR arrays, which are slow to decode in WASM, and these bounds keep
+//!   the largest legacy-heavy state within the timing bound.
+//! - **(n) Delta refusal.** [`apply_delta`] refuses a delta holding a record
+//!   whose signature fails. It checks after running `f`, memoized by digest,
+//!   so a record `f` already verified is not decoded or checked again.
+//!
 //! Not yet wired into the room contract; compiled only for tests and under
 //! the `room-state-v2` feature, so the deployed contract's WASM is unchanged.
 
