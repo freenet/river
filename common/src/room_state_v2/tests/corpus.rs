@@ -21,6 +21,48 @@ struct Out {
     dir: PathBuf,
     states: usize,
     transitions: usize,
+    params: Vec<u8>,
+    bundle: Bundle,
+}
+
+/// freenet-core's `conformance::bundle::ReplayBundle`, field for field, so
+/// bincode 1 encodes it identically. The bundle is how deltas, summaries
+/// and delta-carrying transitions reach the verifier.
+#[derive(serde::Serialize, Default)]
+struct Bundle {
+    schema_version: u16,
+    code: Option<Vec<u8>>,
+    code_hash: Option<[u8; 32]>,
+    parameters: Vec<u8>,
+    /// Always `None`: a `ContractInstanceId` never needs encoding here.
+    instance: Option<()>,
+    states: Vec<Vec<u8>>,
+    deltas: Vec<Vec<u8>>,
+    summaries: Vec<Vec<u8>>,
+    transitions: Vec<Transition>,
+    related: Vec<((), Vec<u8>)>,
+    note: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct Transition {
+    base_state: Vec<u8>,
+    delta: Option<Vec<u8>>,
+    incoming_state: Option<Vec<u8>>,
+    summary: Option<Vec<u8>>,
+    result_state: Vec<u8>,
+}
+
+impl Drop for Out {
+    fn drop(&mut self) {
+        self.bundle.schema_version = 1;
+        self.bundle.parameters = self.params.clone();
+        self.bundle.note = Some("room-state-v2 corpus".into());
+        let mut bytes = b"FRNTCNF1".to_vec();
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend(bincode::serialize(&self.bundle).unwrap());
+        std::fs::write(self.dir.with_extension("bundle"), bytes).unwrap();
+    }
 }
 
 impl Out {
@@ -33,9 +75,12 @@ impl Out {
             dir,
             states: 0,
             transitions: 0,
+            params: to_cbor(&p),
+            bundle: Bundle::default(),
         }
     }
     fn state_bytes(&mut self, bytes: Vec<u8>) {
+        self.bundle.states.push(bytes.clone());
         std::fs::write(self.dir.join(format!("s{:03}.cbor", self.states)), bytes).unwrap();
         self.states += 1;
     }
@@ -43,6 +88,13 @@ impl Out {
         self.state_bytes(s.to_bytes());
     }
     fn transition(&mut self, base: &RoomStateV2, result: &RoomStateV2) {
+        self.bundle.transitions.push(Transition {
+            base_state: base.to_bytes(),
+            delta: None,
+            incoming_state: Some(result.to_bytes()),
+            summary: None,
+            result_state: result.to_bytes(),
+        });
         let n = self.transitions;
         std::fs::write(self.dir.join(format!("t{n:03}-base.cbor")), base.to_bytes()).unwrap();
         std::fs::write(
@@ -79,6 +131,31 @@ fn histories(out: &mut Out, o: &Key, recs: &[Record], seed: u64, n: usize) {
         let j = (i * 7 + 3) % states.len();
         let m = merge(o, &states[i], &states[j], &mut Verifier::new());
         out.transition(&states[i], &m);
+    }
+    // Deltas as a peer computes them (from a sender's state against a
+    // receiver's summary), each with the receiver it was computed for, and
+    // the summaries.
+    for i in 0..states.len().min(10) {
+        out.bundle.summaries.push(to_cbor(&states[i].summarize()));
+        for k in 1..=2 {
+            let j = (i + k * 5) % states.len();
+            let (sender, receiver) = (&states[j], &states[i]);
+            let Some(d) = sender.delta(&receiver.summarize()) else {
+                continue;
+            };
+            let result =
+                crate::room_state_v2::apply_delta(o, receiver, d.clone(), &mut Verifier::new())
+                    .unwrap();
+            let db = to_cbor(&d);
+            out.bundle.deltas.push(db.clone());
+            out.bundle.transitions.push(Transition {
+                base_state: receiver.to_bytes(),
+                delta: Some(db),
+                incoming_state: None,
+                summary: Some(to_cbor(&receiver.summarize())),
+                result_state: result.to_bytes(),
+            });
+        }
     }
 }
 
