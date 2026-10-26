@@ -497,6 +497,28 @@ test.describe("The picker opens at React", () => {
     expect(after.anchor.left - before.anchor.left, "premise: the chips moved the end of the reaction line").toBeGreaterThan(20);
     expectPickerAtControl(after);
   });
+
+  // Opening upward its bottom edge is placed from the content's top, so the
+  // chip line growing below the text does not push it down onto React.
+  test("opened upward, stays at React when a reaction arrives", async ({ page }) => {
+    test.skip(await touchOnly(page), "the hover bar's React; the kebab case opens the same way");
+    await openRoomWithComposer(page);
+    await deliver(page, "upward reflow probe");
+    const row = page.getByTestId("message-row").filter({ hasText: "upward reflow probe" });
+    await expect(row).toBeInViewport();
+    await openInlinePicker(page, row);
+    const before = await measurePicker(page);
+    expect(before.picker.bottom, "premise: it opened upward").toBeLessThanOrEqual(before.control.top + 0.5);
+    await callRiverTest(page, "addReactionsToNewest", ["🎉"]);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
+    await nextFrames(page);
+    const after = await measurePicker(page);
+    // Relative to React: the view may follow the growth and scroll.
+    const below = (r: PickerReport) => r.anchor.bottom - r.control.top;
+    expect(below(after) - below(before), "premise: the chip line grew below React").toBeGreaterThan(10);
+    expectPickerAtControl(after);
+    expect(after.picker.bottom).toBeLessThanOrEqual(after.control.top + 0.5);
+  });
 });
 
 // Chips that wrap onto several lines at 320px: the picker still opens at the

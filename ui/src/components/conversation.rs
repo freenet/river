@@ -4145,6 +4145,7 @@ fn MessageGroupComponent(
     let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
 
     let mut picker_placement: Signal<Option<PickerPlacement>> = use_signal(|| None);
+    let mut open_reaction_owners: Signal<Option<ReactionOwnersPopover>> = use_signal(|| None);
     // Measures the control now, then places and opens the picker in one deferred
     // step (.claude/rules/dioxus-signal-safety.md). Every open path
     // (the hover bar's React, the kebab's React) comes through here.
@@ -4156,9 +4157,11 @@ fn MessageGroupComponent(
             picker_placement.set(placement);
             open_emoji_picker.set(Some(picker_id));
             open_action_menu.set(None);
+            // One popover at a time: React can be reached from the keyboard
+            // while a reactor list is open.
+            open_reaction_owners.set(None);
         });
     };
-    let mut open_reaction_owners: Signal<Option<ReactionOwnersPopover>> = use_signal(|| None);
     {
         let live_owner_keys: HashSet<String> = group
             .messages
@@ -5010,10 +5013,9 @@ fn MessageGroupComponent(
                                             div {
                                                 "data-testid": "message-reaction-row",
                                                 // A message with no reactions has no reaction line.
-                                                // Either way the picker's containing block sits at
-                                                // its end, collapsed and inert; the picker is
-                                                // opened by the hover bar's React or the kebab's
-                                                // React, and opens at that control.
+                                                // Either way an inert anchor sits at its end. The
+                                                // picker is opened by the hover bar's React or the
+                                                // kebab's React, and opens at that control.
                                                 class: if has_reactions { "flex flex-wrap items-center gap-[5px] mt-[5px] mb-0.5" } else { "flex h-0" },
                                                 // Existing reactions (clickable to toggle if user has reacted)
                                                 {
@@ -5259,24 +5261,17 @@ fn MessageGroupComponent(
                                                         }
                                                     })
                                                 }
-                                                // The inline picker's containing block, after the chips.
+                                                // The picker's fallback anchor, after the chips: what
+                                                // `inline_picker_placement` measures when no control
+                                                // can be. It takes no hits.
                                                 div {
-                                                    // Raise the whole picker (grid + z-40 backdrop) above the
-                                                    // closed z-20 kebabs and hover bars while it's open, so a
-                                                    // nearby one can't paint over the emoji grid and steal a tap
-                                                    // (mirrors the action menu's z-[60] behaviour). (#402)
-                                                    // Collapsed, it takes no hits, so it never sits over
-                                                    // the next row; the backdrop and the picker take
-                                                    // them back.
                                                     // `self-stretch`: as tall as the chip line, so the
-                                                    // fallback placement (no control measured) opens
-                                                    // below or above the chips, not over them. In a row
-                                                    // with no reactions the line is 0.
-                                                    class: "relative group/react inline-flex items-center self-stretch pointer-events-none",
-                                                    // What the picker is measured against. Not a
-                                                    // control: React is the hover bar's button, or the
-                                                    // kebab menu's on touch, so a message has one way
-                                                    // in, and the picker opens at that control.
+                                                    // fallback opens below or above the chips, not over
+                                                    // them. In a row with no reactions the line is 0.
+                                                    class: "relative inline-flex items-center self-stretch pointer-events-none",
+                                                    // Not a control: React is the hover bar's button,
+                                                    // or the kebab menu's on touch, so a message has
+                                                    // one way in.
                                                     span {
                                                         "data-testid": "reaction-picker-anchor",
                                                         "aria-hidden": "true",
