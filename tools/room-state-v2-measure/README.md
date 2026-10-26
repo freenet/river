@@ -111,3 +111,41 @@ records `f` did not keep after running `f`, so no record is decoded twice.
 (about 0.1 to 0.2 s), and nova was loaded; a slower peer will exceed 2.5 s
 there, though not freenet-core's 5 s per call. Before the legacy bounds, the
 legacy-heavy merge took 3.0 s and the update 3.2 s.
+
+## Signature crates at opt-level 3, 2026-10-26
+
+The guest (and the v2 room contract) now build curve25519-dalek,
+ed25519-dalek, sha2 and blake3 at opt-level 3, everything else at "z".
+`verify_strict` microbenchmark: 0.25 ms per signature (0.38 ms before). Same
+check, load average 9 to 12:
+
+| state | validate | update with a state | untrusted merge |
+|---|---|---|---|
+| ceilings | 1.08 s | 0.95 to 1.00 s | 1.17 to 1.28 s |
+| legacy | 1.52 to 1.54 s | 1.93 to 1.96 s | 1.97 to 2.00 s |
+| official | 0.47 s | 0.39 to 0.40 s | 0.50 s |
+
+`CHECK_SECS=2.5`: passed.
+
+### How many members fit
+
+`membersN` / `lmembersN` are `Caps::members(N)`: the ceilings with links, the
+owner's child quota and blobs at 4/3 x N and a purge envelope per member; the
+`l` form carries the member-dependent records as legacy v1 records. Built with
+`RUSTFLAGS="--cfg river_v2_wide_ceilings"` (guest and host) so the
+configuration may exceed the shipped ceilings. Five runs each, minimum and
+median, load average 12 to 30 (the larger counts ran under the heaviest load):
+
+| members | signatures | v2: validate / update / merge (median) | legacy: validate / update / merge (median) |
+|---|---|---|---|
+| 300 | 3,966 | (see above) | 1.62-1.66 / 2.14-2.17 / 2.12-2.20 (3 runs) |
+| 400 | 4,836 | 1.44 / 1.29 / 1.58 | 1.97 / 2.53 / 2.56 |
+| 500 | 5,701 | 1.65 / 1.41 / 1.81 | 2.23 / 2.69 / 2.88 |
+| 600 | 6,566 | 1.76 / 1.50 / 1.90 | 2.29 / 2.78 / 2.96 |
+| 700 | 7,436 | 1.95 / 1.68 / 2.14 | |
+| 800 | 8,301 | 2.20 / 1.83 / 2.41 | |
+| 1,000 | 10,036 | min 2.89 / 2.29 / 3.65 | |
+
+A room of v2 records stays under 2.5 s to about 800 members; a room whose
+member-dependent records are all legacy v1 records (the worst case a migrated
+room can reach) to about 300.
