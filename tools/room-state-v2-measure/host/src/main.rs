@@ -28,7 +28,15 @@ fn engine() -> Engine {
     c.memory_reservation(PAGES * PAGE);
     c.memory_guard_size(PAGE);
     c.memory_reservation_for_growth(0);
-    c.cranelift_opt_level(OptLevel::None);
+    // freenet-core uses None; OPT=speed or OPT=speed_and_size measures the
+    // alternatives with everything else unchanged.
+    let opt = match std::env::var("OPT").as_deref() {
+        Ok("speed") => OptLevel::Speed,
+        Ok("speed_and_size") => OptLevel::SpeedAndSize,
+        _ => OptLevel::None,
+    };
+    println!("engine cranelift_opt_level {opt:?}");
+    c.cranelift_opt_level(opt);
     Engine::new(&c).unwrap()
 }
 
@@ -138,6 +146,7 @@ fn main() {
         let caps = match d.as_str() {
             "official" => Caps::official_room(),
             "proposed" => Caps::proposed(),
+            "members2000" => Caps::members_2000(),
             n => Caps::ceilings().scaled(n.parse().unwrap()),
         };
         let reps: usize = std::env::var("REPS")

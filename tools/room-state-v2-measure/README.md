@@ -54,3 +54,26 @@ bytes (a 32 KiB DM is a 32 KiB SHA-512). Everything else costs about 70 ms per
 MB of state. At the placeholder ceilings the largest state is 145.8 MB (the
 computed byte ceiling, which allows for legacy records at their largest, is
 550 MB), above both `MAX_STATE_SIZE` and the 256 MiB memory cap.
+
+## The engine's Cranelift opt level, 2026-10-26 (same machine and load)
+
+`OPT=speed` or `OPT=speed_and_size` runs the host with that
+`cranelift_opt_level`; nothing else changes (guest `opt-level = "z"`, 256 MiB
+cap, epoch interruption). `members2000` is `Caps::members_2000()`: `proposed`
+with 2,000 members, 4,000 links, the owner's child quota at 2,000, 8,000 blobs
+(4 per member), a purge envelope per member, 400 owner and 400 deputy bans
+(250 per deputy) and 100 member bans (20 per issuer). Times are the median of
+three runs; per-signature cost is the 200-signature microbenchmark, per-MB cost
+is `validate, no signatures` over the state's bytes.
+
+| engine | per signature | per MB (no signatures) | official: validate / merge | proposed: validate / merge | members2000: validate / merge | ceilings / 4: validate / merge |
+|---|---|---|---|---|---|---|
+| None (freenet-core today) | 0.38 ms | 65 to 85 ms | 0.92 / 1.02 s | 1.59 / 1.90 s | 11.55 / 12.40 s | 15.2 / 21.5 s |
+| Speed | 0.33 ms | 60 to 85 ms | 0.82 / 0.98 s | 1.65 / 1.93 s | 10.90 / 11.42 s | 13.1 / 18.4 s |
+| SpeedAndSize | 0.34 ms | 60 to 85 ms | 0.78 / 0.90 s | 1.50 / 1.73 s | 10.53 / 11.21 s | 13.7 / 18.7 s |
+
+Sizes: official 1,918 signatures and 3.0 MB; proposed 4,002 and 5.8 MB;
+members2000 29,752 and 19.2 MB; ceilings / 4 36,325 and 38.1 MB (its union
+merge now fits under the 256 MiB cap, at 255 MiB). The engine opt level buys 5
+to 15 percent. One run of the guest at `opt-level = 3` (profile `guest-o3`,
+engine None) gave proposed 1.41 / 1.51 s and members2000 11.1 / 10.3 s.

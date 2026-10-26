@@ -125,6 +125,28 @@ impl Caps {
         }
     }
 
+    /// `proposed` with `max_members` at 2,000 and the counts the design's
+    /// defaults derive from it: links 2 x members, the owner's child quota
+    /// at members, blobs 4 x members, a purge envelope per member; bans at
+    /// the design's migration values for the Official room (400 owner, 400
+    /// deputy at 250 each) and member-ban defaults (100, 20 per issuer).
+    /// Messages, DMs and restore requests as `proposed`.
+    pub fn members_2000() -> Self {
+        Caps {
+            max_members: 2_000,
+            max_links: 4_000,
+            max_owner_children: 2_000,
+            max_owner_bans: 400,
+            max_deputy_bans: 400,
+            max_bans_per_deputy: 250,
+            max_member_bans: 100,
+            max_bans_per_issuer: 20,
+            max_secret_blobs: 8_000,
+            purges: 2_001,
+            ..Self::proposed()
+        }
+    }
+
     /// Every count divided by `d` (sizes kept), for scaling measurements.
     pub fn scaled(self, d: u32) -> Self {
         let s = |x: u32| (x / d).max(1);
