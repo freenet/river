@@ -66,13 +66,17 @@ pub mod ceiling {
     pub const ROSTER_BATCH_ENTRIES: usize = 1_000;
     pub const RESTORE_REQUESTS: usize = 10;
     /// Legacy v1 records encode byte vectors as CBOR arrays, which cost
-    /// about four times as much to decode in WASM as a v2 byte string, so
-    /// the legacy kinds that carry content have their own, smaller bounds:
-    /// a legacy message or activity record's content at most 1,000 bytes
-    /// (v1's default `max_message_size`; the Official room's largest message
-    /// on 2026-10-26 was 613 bytes) and a legacy DM's ciphertext at most
-    /// 2,560 bytes (its largest DM: 2,179 bytes). Without them the largest
-    /// legacy-heavy state's union merge took 3.0 s against the 2.5 s bound.
+    /// about four times as much to decode in WASM as a v2 byte string, so the
+    /// legacy kinds that carry content have smaller bounds than their v2
+    /// counterparts: a legacy message or activity record holds at most 1,000
+    /// bytes of content (v1's default `max_message_size`; v2: 2,000) and a
+    /// legacy DM at most 2,560 bytes of ciphertext (v2: 4,096). The Official
+    /// room's largest message on 2026-10-26 was 613 bytes and its largest DM
+    /// 2,179. Measured with the opt-level 3 build, largest legacy-heavy state,
+    /// update and untrusted merge against the 2.5 s bound: 1,000 / 2,560:
+    /// 1.8 to 2.0 s; 1,000 / 4,096: 2.1 to 2.9 s; 1,250 / 4,096: 2.2 to
+    /// 2.3 s; 1,500 / 3,072: 2.1 to 2.2 s; 1,500 / 4,096: 2.4 to 2.9 s;
+    /// 2,000 / 2,560: 3.2 to 4.3 s; 2,000 / 4,096: 2.5 to 2.8 s.
     pub const LEGACY_MESSAGE_SIZE: usize = 1_000;
     pub const LEGACY_DM_CIPHERTEXT: usize = 2_560;
 }

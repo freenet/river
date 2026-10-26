@@ -74,13 +74,30 @@
 //!   tag, and a legacy member info lists at most v1's 64 deputies. Without
 //!   these, a record's declared limits would not bound its size.
 //! - **(m) Legacy content bounds.** A legacy message or activity record holds
-//!   at most 1,000 bytes of content, and a legacy DM at most 2,560 bytes of
-//!   ciphertext ([`config::ceiling::LEGACY_MESSAGE_SIZE`]). v1 encodes bytes
-//!   as CBOR arrays, which are slow to decode in WASM, and these bounds keep
-//!   the largest legacy-heavy state within the timing bound.
+//!   at most 1,000 bytes of content and a legacy DM at most 2,560 bytes of
+//!   ciphertext ([`config::ceiling::LEGACY_MESSAGE_SIZE`]), below the v2
+//!   bounds of 2,000 and 4,096. v1 encodes bytes as CBOR arrays, which are
+//!   slow to decode in WASM; at the v2 bounds the largest legacy-heavy state
+//!   exceeds the 2.5 s timing bound. A migrated room therefore loses v1
+//!   messages over 1,000 bytes and DMs over 2,560 (none in the Official room
+//!   on 2026-10-26), an exception to keeping every v1 record.
 //! - **(n) Delta refusal.** [`apply_delta`] refuses a delta holding a record
 //!   whose signature fails. It checks after running `f`, memoized by digest,
 //!   so a record `f` already verified is not decoded or checked again.
+//! - **(o) Migrated quotas.** [`ConfigurationV2::from_v1`], which decides a
+//!   migrated room's configuration (the owner's starting point, and the
+//!   configuration of a room whose owner never converts), sets the link
+//!   quotas and the depth limit to their ceilings. v1 had neither, so a v1
+//!   inviter's children are never dropped by a quota v1 could not have
+//!   known about. This matters most for a room whose owner never converts:
+//!   its legacy links are unrostered, and unrostered links count against
+//!   quotas.
+//! - **(p) No deputies without a v2 configuration.** v1 keeps deputy lists in
+//!   member info (the owner's own list is owner-appointed, every other list
+//!   member-appointed); the v1 configuration names none. A room whose owner
+//!   never converts therefore has no deputies, and v1 deputy bans become
+//!   member bans of their signers, scoped to the signer's subtree and held to
+//!   the member-ban caps.
 //!
 //! Not yet wired into the room contract; compiled only for tests and under
 //! the `room-state-v2` feature, so the deployed contract's WASM is unchanged.

@@ -478,7 +478,7 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
                 id(b),
                 &osk.verifying_key(),
                 EPOCH_2026_SECS + clock_hours as u64 * 3600 - i as u64 * 60 - v as u64,
-                vec![0xdd; caps.dm_bytes.min(ceiling::LEGACY_DM_CIPHERTEXT)],
+                vec![0xdd; ceiling::LEGACY_DM_CIPHERTEXT],
             )
             .expect("a DM within the size limits signs");
             recs.push(Record::LegacyDirectMessage(legacy(a, to_cbor(&dm))));
