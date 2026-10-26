@@ -209,3 +209,141 @@ fn largest_state_at_the_ceilings() {
         let _ = ceiling::MAX_LINKS;
     }
 }
+
+/// The live-state conversion report: reads the v1 state at RIVER_V1_STATE
+/// (CBOR, as a node's GET returns it), converts it both ways (the owner
+/// converting first, with its records trusted since its key is not here,
+/// and the owner never converting), and prints what survives `f`.
+#[test]
+#[ignore = "reads RIVER_V1_STATE; run by hand against a fetched live state"]
+fn convert_live_v1_state() {
+    use crate::room_state::ChatRoomStateV1;
+    use crate::room_state_v2::convert::{legacy_configuration, legacy_records, owner_payloads};
+    use crate::room_state_v2::legacy;
+    use crate::room_state_v2::retain::retain;
+    use std::collections::BTreeMap;
+    let path = std::env::var("RIVER_V1_STATE").unwrap();
+    let v1: ChatRoomStateV1 = ciborium::de::from_reader(&std::fs::read(path).unwrap()[..]).unwrap();
+    let o = Key::from(&v1_owner(&v1));
+    let conv = legacy_records(&o, &v1);
+    println!("v1: {} members, {} bans, {} member info, {} messages, {} DMs, {} purges, {} blobs, {} secret versions, {} evidence",
+        v1.members.members.len(), v1.bans.0.len(), v1.member_info.member_info.len(),
+        v1.recent_messages.messages.len(), v1.direct_messages.messages.len(),
+        v1.direct_messages.purges.len(), v1.secrets.encrypted_secrets.len(),
+        v1.secrets.versions.len(), v1.ban_evidence.members.len());
+    println!(
+        "legacy records: {}; unconverted (no signer key): {:?}",
+        conv.records.len(),
+        conv.unconverted
+    );
+    let strict_fail: Vec<u8> = conv
+        .records
+        .iter()
+        .filter(|r| !legacy::verify(&o, r))
+        .map(|r| r.kind())
+        .collect();
+    println!("verify_strict failures by kind: {strict_fail:?}");
+    let v1_members: Vec<Key> = v1
+        .members
+        .members
+        .iter()
+        .map(|m| Key::from(&m.member.member_vk))
+        .collect();
+    let report = |label: &str, owner_recs: Vec<Record>, trusted: bool| {
+        let n = owner_recs.len();
+        let mut all = owner_recs;
+        all.extend(conv.records.iter().cloned());
+        let mut v = Verifier::new();
+        if trusted {
+            v.trust(all[..n].iter().map(|r| r.digest()));
+        }
+        let r = retain(&o, &all, &mut v);
+        let mut tally: BTreeMap<u8, (usize, usize)> = BTreeMap::new();
+        for (rec, k) in all.iter().zip(&r.keep) {
+            let e = tally.entry(rec.kind()).or_default();
+            e.0 += 1;
+            e.1 += *k as usize;
+        }
+        let lost: Vec<&Key> = v1_members
+            .iter()
+            .filter(|k| r.members.binary_search(k).is_err())
+            .collect();
+        println!(
+            "== {label}: {} members kept, {} v1 members lost",
+            r.members.len(),
+            lost.len()
+        );
+        for (k, (n, kept)) in tally {
+            println!(
+                "   kind {k:2}: {n:4} in, {kept:4} kept, {:4} dropped",
+                n - kept
+            );
+        }
+        println!(
+            "   deputies {}; config {:?}",
+            r.config.deputies.len(),
+            (
+                r.config.max_members,
+                r.config.max_owner_bans,
+                r.config.max_deputy_bans,
+                r.config.max_bans_per_deputy,
+                r.config.max_member_bans
+            )
+        );
+        (r, all, lost.len())
+    };
+    let clock = ((std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - crate::room_state_v2::config::EPOCH_2026_SECS)
+        / 3600) as u32;
+    let p = owner_payloads(&o, &v1, &conv.records, clock);
+    let stand_in = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    let (_, _, lost_a) = report(
+        "owner converts (owner records trusted)",
+        p.sign(&stand_in),
+        true,
+    );
+    let (r, all, lost_b) = report(
+        "owner never converts (v1 configuration, window open)",
+        vec![legacy_configuration(&o, &v1)],
+        false,
+    );
+    // The dropped records of the second path, by signer.
+    let members: std::collections::HashSet<Key> = r.members.iter().copied().collect();
+    let mut by_signer: BTreeMap<(u8, String), usize> = BTreeMap::new();
+    for (rec, k) in all.iter().zip(&r.keep) {
+        if *k {
+            continue;
+        }
+        let signer = match rec {
+            Record::LegacyBan(l) | Record::LegacyActivity(l) | Record::LegacyMemberInfo(l) => {
+                l.signer
+            }
+            _ => continue,
+        };
+        let who = if signer == o {
+            "owner".to_string()
+        } else if members.contains(&signer) {
+            format!("member {:?}", signer)
+        } else {
+            "not a member".to_string()
+        };
+        *by_signer.entry((rec.kind(), who)).or_default() += 1;
+    }
+    for ((k, who), n) in by_signer {
+        println!("   dropped kind {k}: {n} signed by {who}");
+    }
+    assert_eq!((lost_a, lost_b), (0, 0), "v1 members lost");
+}
+
+fn v1_owner(v1: &crate::room_state::ChatRoomStateV1) -> ed25519_dalek::VerifyingKey {
+    // The owner key is the room's contract parameter; the state names only its
+    // 64-bit id, so take it from RIVER_V1_OWNER (base58).
+    let _ = v1;
+    let b = bs58::decode(std::env::var("RIVER_V1_OWNER").unwrap())
+        .into_vec()
+        .unwrap();
+    ed25519_dalek::VerifyingKey::from_bytes(&b.try_into().unwrap()).unwrap()
+}

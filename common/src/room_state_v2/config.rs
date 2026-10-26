@@ -150,7 +150,8 @@ impl ConfigurationV2 {
     /// The configuration of a room whose owner never signed a v2 one, and
     /// the starting point of the one a converting owner signs: each v1 value
     /// clamped to its v2 ceiling (min(v1 value, ceiling)), the defaults for
-    /// everything v1 lacks, and the legacy window open. Ban caps take the v1
+    /// everything v1 lacks, link quotas and depth at their ceilings, and the
+    /// legacy window open. Ban caps take the v1
     /// `max_user_bans`, clamped, so no v1 ban is dropped by a cap the
     /// ceilings allow keeping.
     pub fn from_v1(v1: &crate::room_state::configuration::Configuration) -> Self {
@@ -172,6 +173,15 @@ impl ConfigurationV2 {
         c.max_deputy_bans = clamp(v1.max_user_bans, MAX_DEPUTY_BANS);
         c.max_bans_per_deputy = clamp(v1.max_user_bans, MAX_BANS_PER_DEPUTY);
         c.max_member_bans = clamp(v1.max_user_bans, MAX_MEMBER_BANS);
+        // v1 has no link quotas or depth limit, so a migrated room gets the
+        // ceilings: a link the v1 room holds is never dropped by a quota a
+        // v1 room could not have known about (rostered links are exempt
+        // anyway; unrostered ones, in a room whose owner never converts,
+        // are not).
+        c.max_links = MAX_LINKS;
+        c.max_links_per_member = MAX_LINKS_PER_MEMBER;
+        c.max_children_per_link = MAX_CHILDREN_PER_LINK;
+        c.max_chain_depth = MAX_CHAIN_DEPTH;
         c
     }
 

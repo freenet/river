@@ -87,6 +87,7 @@
 
 pub mod bench;
 pub mod config;
+pub mod convert;
 pub mod encoding;
 pub mod legacy;
 pub mod records;

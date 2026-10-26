@@ -3,6 +3,7 @@
 //! of encoding, validation, summaries and deltas.
 
 mod builder;
+mod convert_tests;
 mod families;
 mod harness;
 mod laws;
