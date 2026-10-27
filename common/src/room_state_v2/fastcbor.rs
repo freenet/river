@@ -51,17 +51,74 @@ fn err<T>(m: &str) -> Result<T, Error> {
 
 /// The CBOR bytes of `v`, as ciborium writes them.
 pub fn to_vec<T: Serialize + ?Sized>(v: &T) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Out::Vec(Vec::new());
     v.serialize(&mut Encoder { out: &mut out })
         .expect("v1 types encode");
-    out
+    match out {
+        Out::Vec(v) => v,
+        Out::Cmp { .. } => unreachable!(),
+    }
 }
 
-struct Encoder<'a> {
-    out: &'a mut Vec<u8>,
+/// Whether `v` encodes to exactly `want`, compared as it is encoded, with no
+/// buffer.
+pub fn encodes_to<T: Serialize + ?Sized>(v: &T, want: &[u8]) -> bool {
+    let mut out = Out::Cmp {
+        want,
+        at: 0,
+        same: true,
+    };
+    if v.serialize(&mut Encoder { out: &mut out }).is_err() {
+        return false;
+    }
+    match out {
+        Out::Cmp { at, same, .. } => same && at == want.len(),
+        Out::Vec(_) => unreachable!(),
+    }
 }
 
-fn head(out: &mut Vec<u8>, major: u8, v: u64) {
+/// Where the encoder writes: a buffer, or a comparison against the bytes
+/// the encoding must equal.
+enum Out<'w> {
+    Vec(Vec<u8>),
+    Cmp {
+        want: &'w [u8],
+        at: usize,
+        same: bool,
+    },
+}
+
+impl Out<'_> {
+    fn push(&mut self, b: u8) {
+        match self {
+            Out::Vec(v) => v.push(b),
+            Out::Cmp { want, at, same } => {
+                if *same {
+                    *same = want.get(*at) == Some(&b);
+                }
+                *at = at.saturating_add(1);
+            }
+        }
+    }
+
+    fn extend_from_slice(&mut self, s: &[u8]) {
+        match self {
+            Out::Vec(v) => v.extend_from_slice(s),
+            Out::Cmp { want, at, same } => {
+                if *same {
+                    *same = want.get(*at..).is_some_and(|w| w.starts_with(s));
+                }
+                *at = at.saturating_add(s.len());
+            }
+        }
+    }
+}
+
+struct Encoder<'a, 'w> {
+    out: &'a mut Out<'w>,
+}
+
+fn head(out: &mut Out<'_>, major: u8, v: u64) {
     let m = major << 5;
     if v < 24 {
         out.push(m | v as u8);
@@ -80,7 +137,7 @@ fn head(out: &mut Vec<u8>, major: u8, v: u64) {
     }
 }
 
-impl Encoder<'_> {
+impl Encoder<'_, '_> {
     fn int(&mut self, v: i128) -> Result<(), Error> {
         if v >= 0 {
             if v > u64::MAX as i128 {
@@ -102,7 +159,7 @@ impl Encoder<'_> {
     }
 }
 
-impl<'a, 'b> ser::Serializer for &'b mut Encoder<'a> {
+impl<'a, 'b, 'w> ser::Serializer for &'b mut Encoder<'a, 'w> {
     type Ok = ();
     type Error = Error;
     type SerializeSeq = Self;
@@ -259,7 +316,7 @@ impl<'a, 'b> ser::Serializer for &'b mut Encoder<'a> {
 
 macro_rules! compound {
     ($tr:ident, $method:ident) => {
-        impl ser::$tr for &mut Encoder<'_> {
+        impl ser::$tr for &mut Encoder<'_, '_> {
             type Ok = ();
             type Error = Error;
             fn $method<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), Error> {
@@ -276,7 +333,7 @@ compound!(SerializeTuple, serialize_element);
 compound!(SerializeTupleStruct, serialize_field);
 compound!(SerializeTupleVariant, serialize_field);
 
-impl ser::SerializeMap for &mut Encoder<'_> {
+impl ser::SerializeMap for &mut Encoder<'_, '_> {
     type Ok = ();
     type Error = Error;
     fn serialize_key<T: Serialize + ?Sized>(&mut self, k: &T) -> Result<(), Error> {
@@ -290,7 +347,7 @@ impl ser::SerializeMap for &mut Encoder<'_> {
     }
 }
 
-impl ser::SerializeStruct for &mut Encoder<'_> {
+impl ser::SerializeStruct for &mut Encoder<'_, '_> {
     type Ok = ();
     type Error = Error;
     fn serialize_field<T: Serialize + ?Sized>(
@@ -306,7 +363,7 @@ impl ser::SerializeStruct for &mut Encoder<'_> {
     }
 }
 
-impl ser::SerializeStructVariant for &mut Encoder<'_> {
+impl ser::SerializeStructVariant for &mut Encoder<'_, '_> {
     type Ok = ();
     type Error = Error;
     fn serialize_field<T: Serialize + ?Sized>(
@@ -331,7 +388,33 @@ pub fn from_canonical<T: Serialize + de::DeserializeOwned>(bytes: &[u8]) -> Opti
     if d.i != bytes.len() {
         return None;
     }
-    (to_vec(&v) == bytes).then_some(v)
+    encodes_to(&v, bytes).then_some(v)
+}
+
+/// The bytes of the value under text key `key` in the top-level map of
+/// `bytes`, which must already be known canonical (`from_canonical`
+/// accepted them). Because the encoder writes a struct as a map whose values
+/// are each field's own encoding, the span is that field's encoding: a v1
+/// record's signed bytes, without encoding them again.
+pub fn field_span(bytes: &[u8], key: &str) -> Option<std::ops::Range<usize>> {
+    let mut d = Decoder { b: bytes, i: 0 };
+    let (major, n) = d.head().ok()?;
+    if major != 5 {
+        return None;
+    }
+    for _ in 0..n {
+        let (km, kn) = d.head().ok()?;
+        if km != 3 {
+            return None;
+        }
+        let k = d.slice(kn).ok()?;
+        let start = d.i;
+        d.skip().ok()?;
+        if k == key.as_bytes() {
+            return Some(start..d.i);
+        }
+    }
+    None
 }
 
 struct Decoder<'de> {
@@ -396,6 +479,36 @@ impl<'de> Decoder<'de> {
             _ => return err("indefinite length or reserved header"),
         };
         Ok((major, v))
+    }
+
+    /// Moves past one item (with everything it contains), without
+    /// recursion.
+    fn skip(&mut self) -> Result<(), Error> {
+        let mut left: u64 = 1;
+        while left > 0 {
+            left -= 1;
+            let ib = self.peek()?;
+            if ib >> 5 == 7 {
+                self.i += 1;
+                continue;
+            }
+            let (major, a) = self.head()?;
+            match major {
+                0 | 1 => {}
+                2 | 3 => {
+                    self.slice(a)?;
+                }
+                4 => left = left.checked_add(a).ok_or_else(|| Error("length".into()))?,
+                5 => {
+                    left = a
+                        .checked_mul(2)
+                        .and_then(|x| left.checked_add(x))
+                        .ok_or_else(|| Error("length".into()))?
+                }
+                _ => return err("tags are not supported"),
+            }
+        }
+        Ok(())
     }
 
     fn slice(&mut self, n: u64) -> Result<&'de [u8], Error> {

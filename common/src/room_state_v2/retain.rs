@@ -213,7 +213,7 @@ impl Ctx<'_> {
         let rec = self.recs[i];
         match self.pending.get_mut().remove(&i) {
             Some(v1) => {
-                let signer = match rec {
+                let l = match rec {
                     Record::LegacyConfiguration(l)
                     | Record::LegacyBan(l)
                     | Record::LegacyLink(l)
@@ -222,11 +222,10 @@ impl Ctx<'_> {
                     | Record::LegacyMessage(l)
                     | Record::LegacyDirectMessage(l)
                     | Record::LegacyPurge(l)
-                    | Record::LegacySecretBlob(l) => l.signer,
+                    | Record::LegacySecretBlob(l) => l,
                     _ => unreachable!("only legacy records are pending"),
                 };
-                self.v
-                    .ok_with(&self.digests[i], || v1.verify(&owner, &signer))
+                self.v.ok_with(&self.digests[i], || v1.verify(&owner, l))
             }
             None => self.v.ok(&owner, rec, &self.digests[i]),
         }
