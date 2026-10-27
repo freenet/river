@@ -664,6 +664,22 @@ impl Builder {
         );
     }
 
+    /// The owner's v1 member info naming `deputies` (owner-appointed).
+    pub fn legacy_owner_info(&mut self, version: u32, deputies: &[usize]) {
+        let mut info = MemberInfo::new_public(Self::id(0), version, format!("o{version}"));
+        info.deputies = deputies.iter().map(|&d| Self::id(d)).collect();
+        let a = AuthorizedMemberInfo::new(info, &sk(0));
+        let l = Legacy {
+            signer: key(0),
+            v1: ByteBuf(to_cbor(&a)),
+        };
+        self.push(
+            format!("linfo(O v{version} deputies {deputies:?})"),
+            None,
+            Record::LegacyMemberInfo(l),
+        );
+    }
+
     pub fn legacy_purge(&mut self, recipient: usize, version: u64, dms: &[usize]) {
         let state = RecipientPurges {
             version,

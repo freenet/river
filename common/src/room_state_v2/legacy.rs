@@ -208,6 +208,8 @@ pub fn decode_message(owner: &Key, l: &Legacy) -> Option<LegacyMessageView> {
 
 pub struct LegacyMemberInfoView {
     pub v1: Option<V1Sig>,
+    /// The v1 deputy list, by v1 id.
+    pub deputies: Vec<i64>,
     pub sig: Sig,
     pub member: Key,
     pub version: u32,
@@ -227,6 +229,7 @@ pub fn decode_member_info(_owner: &Key, l: &Legacy) -> Option<LegacyMemberInfoVi
         member: l.signer,
         version: v1.member_info.version,
         declared_len: v1.member_info.preferred_nickname.declared_len(),
+        deputies: v1.member_info.deputies.iter().map(|d| d.0 .0).collect(),
         v1: Some(V1Sig {
             inner: Inner::MemberInfo(v1.member_info),
             sig: v1.signature,

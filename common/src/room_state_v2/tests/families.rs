@@ -498,6 +498,12 @@ pub fn rand_universe_l5(rng: &mut Rng, keys: usize, c0: Cfg, v1: Cfg, v2: Cfg) -
     for _ in 0..rng.below(2) {
         b.legacy_info(rk(rng), 1 + rng.below(2) as u32);
     }
+    // The owner's v1 deputy lists (read only when no v2 configuration is
+    // valid in the subset).
+    for v in 1..=rng.below(3) as u32 {
+        let d: Vec<usize> = (1..=keys).filter(|_| rng.below(3) == 0).collect();
+        b.legacy_owner_info(v, &d);
+    }
     for _ in 0..rng.below(2) {
         b.legacy_blob(rk(rng), 1 + rng.below(nver.max(1) as u64) as u32);
     }

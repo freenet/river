@@ -155,9 +155,9 @@ pub fn signature_ok(owner: &Key, rec: &Record) -> bool {
 pub fn roster_ceiling(k: LegacyKind) -> usize {
     use ceiling::*;
     (match k {
-        LegacyKind::Link => MAX_LINKS,
+        LegacyKind::Link => MAX_LEGACY_LINKS,
         LegacyKind::Ban => MAX_OWNER_BANS + MAX_DEPUTY_BANS + MAX_MEMBER_BANS,
-        LegacyKind::Activity => MAX_LINKS,
+        LegacyKind::Activity => MAX_LEGACY_LINKS,
         LegacyKind::MemberInfo => MAX_MEMBERS + 1,
         LegacyKind::Message => MAX_RECENT_MESSAGES,
         LegacyKind::DirectMessage => MAX_DIRECT_MESSAGES,
@@ -359,6 +359,7 @@ pub fn retain_refs(
             break;
         }
     }
+    let v2_configured = config.is_some();
     if config.is_none() {
         // No valid v2 configuration: the highest valid v1 one, or defaults.
         let mut cands: Vec<(Reverse<u32>, Sig, usize, ConfigurationV2)> = c
@@ -537,6 +538,34 @@ pub fn retain_refs(
         c.keep[i] = true;
     }
 
+    // The owner's v1 member info, when no v2 configuration exists: its
+    // deputy list is the room's owner-appointed deputies. Highest version,
+    // ties by lower signature; kept, since L1c reads it.
+    let mut v1_owner_deputies: HashSet<i64> = HashSet::new();
+    if !v2_configured {
+        let mut cands: Vec<(Reverse<u32>, Sig, usize, Vec<i64>)> = vec![];
+        for i in c.kind(15) {
+            let Record::LegacyMemberInfo(l) = &recs[i] else {
+                continue;
+            };
+            if l.signer != owner || !legacy_ok(LegacyKind::MemberInfo, &c.digests[i]) {
+                continue;
+            }
+            if let Some(mut v) = legacy::decode_member_info(&owner, l) {
+                c.hold(i, &mut v.v1);
+                cands.push((Reverse(v.version), v.sig, i, v.deputies));
+            }
+        }
+        cands.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        for (_, _, i, d) in cands {
+            if c.ok(i) {
+                c.keep[i] = true;
+                v1_owner_deputies = d.into_iter().collect();
+                break;
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- L1b
     // Owner bans. Reads: L1 and own records.
     struct BanCand {
@@ -613,12 +642,26 @@ pub fn retain_refs(
 
     // ---------------------------------------------------------------- L1c
     // Deputy bans. Reads: L1, L1b and own records.
-    let deputies: HashSet<Key> = cfg
+    let deputy_keys: HashSet<Key> = cfg
         .deputies
         .iter()
         .copied()
         .filter(|k| *k != owner && !banned_keys.contains(k) && !banned_ids.contains(&legacy_id(k)))
         .collect();
+    // In a room with no v2 configuration, the owner's own v1 deputy list
+    // (owner-appointed, by v1 id) names deputies too.
+    let owner_deputy_ids: HashSet<i64> = v1_owner_deputies
+        .iter()
+        .copied()
+        .filter(|x| *x != legacy_id(&owner) && !banned_ids.contains(x))
+        .collect();
+    let owner_banned_keys = banned_keys.clone();
+    let deputies = |k: &Key| {
+        deputy_keys.contains(k)
+            || (*k != owner
+                && owner_deputy_ids.contains(&legacy_id(k))
+                && !owner_banned_keys.contains(k))
+    };
     let shielded: Vec<Key> = cfg
         .protected
         .iter()
@@ -626,9 +669,13 @@ pub fn retain_refs(
         .copied()
         .chain(std::iter::once(owner))
         .collect();
-    let shielded_ids: HashSet<i64> = shielded.iter().map(legacy_id).collect();
+    let shielded_ids: HashSet<i64> = shielded
+        .iter()
+        .map(legacy_id)
+        .chain(v1_owner_deputies.iter().copied())
+        .collect();
     let target_ok_for_deputy = |t: &TargetView| match t {
-        TargetView::Key(k) => !shielded.contains(k),
+        TargetView::Key(k) => !shielded.contains(k) && !v1_owner_deputies.contains(&legacy_id(k)),
         TargetView::Inv(..) => false,
         TargetView::Id(x) => !shielded_ids.contains(x),
     };
@@ -640,10 +687,7 @@ pub fn retain_refs(
             continue;
         };
         let t = TargetView::of(&b.target);
-        if !deputies.contains(&d)
-            || !reason_ok(b)
-            || !time.ref_ok(b.clock_ref)
-            || !target_ok_for_deputy(&t)
+        if !deputies(&d) || !reason_ok(b) || !time.ref_ok(b.clock_ref) || !target_ok_for_deputy(&t)
         {
             continue;
         }
@@ -658,7 +702,7 @@ pub fn retain_refs(
     }
     for (i, signer, v) in &ban_legacy {
         let t = TargetView::Id(v.target);
-        if deputies.contains(signer) && target_ok_for_deputy(&t) {
+        if deputies(signer) && target_ok_for_deputy(&t) {
             db.push((
                 BanCand {
                     rec: *i,
@@ -792,6 +836,7 @@ pub fn retain_refs(
     let mut canonical: HashMap<Key, usize> = HashMap::new();
     let mut children: HashMap<Option<usize>, u32> = HashMap::new();
     let mut per_member: HashMap<Key, u32> = HashMap::new();
+    let mut legacy_admitted = 0u32;
     let mut frontier: Vec<usize> = vec![]; // admitted at depth d-1, in position order
     for depth in 1..=ceiling::MAX_CHAIN_DEPTH {
         // (parent position + 1 or 0 for the owner, rostered legacy first,
@@ -849,6 +894,13 @@ pub fn retain_refs(
             }
             let l = &lc[j];
             let exempt = l.legacy && l.rostered;
+            // At most MAX_LEGACY_LINKS legacy links, rostered or not, in the
+            // same admission order as every other L2 limit: a group limit of
+            // the greedy chooser over the links' own fields and shallower
+            // links, so it is lawful as the total cap is.
+            if l.legacy && legacy_admitted >= ceiling::MAX_LEGACY_LINKS {
+                continue;
+            }
             if !exempt {
                 let quota = match parent {
                     None => cfg.max_owner_children,
@@ -863,6 +915,7 @@ pub fn retain_refs(
             if !c.ok(l.rec) {
                 continue;
             }
+            legacy_admitted += l.legacy as u32;
             if !exempt {
                 *children.entry(parent).or_default() += 1;
                 *per_member.entry(l.member).or_default() += 1;
@@ -895,6 +948,11 @@ pub fn retain_refs(
         frontier = next;
     }
     let linked: HashSet<Key> = adm.iter().map(|a| a.member).collect();
+    let legacy_linked: HashSet<Key> = adm
+        .iter()
+        .filter(|a| matches!(recs[a.rec], Record::LegacyLink(_)))
+        .map(|a| a.member)
+        .collect();
 
     // ---------------------------------------------------------------- L2b
     // Activity. Reads: L1, L2. Kept for every linked key.
@@ -925,7 +983,9 @@ pub fn retain_refs(
         }
         let h = (time.eff_legacy(v.time).saturating_sub(EPOCH_2026_SECS) / 3600)
             .min(u32::MAX as u64) as u32;
-        if linked.contains(&v.author) && hours_ok(h) {
+        // A legacy activity record counts only for a key with an admitted
+        // legacy link, so their number is bounded by MAX_LEGACY_LINKS.
+        if legacy_linked.contains(&v.author) && hours_ok(h) {
             acts.push((v.author, Reverse(h), 1, v.sig, i));
         }
     }
@@ -1053,7 +1113,7 @@ pub fn retain_refs(
         ));
     }
     for (i, signer, v) in &ban_legacy {
-        if *signer == owner || deputies.contains(signer) {
+        if *signer == owner || deputies(signer) {
             continue;
         }
         let Some(&a) = canonical.get(signer) else {

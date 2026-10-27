@@ -168,10 +168,15 @@ fn main() {
             "ceilings" => Caps::ceilings(),
             "legacy" => Caps::ceilings_legacy(),
             n if n.starts_with("members") => Caps::members(n[7..].parse().unwrap()),
-            n if n.starts_with("lmembers") => Caps {
-                legacy: true,
-                ..Caps::members(n[8..].parse().unwrap())
-            },
+            n if n.starts_with("lmembers") => {
+                let m: u32 = n[8..].parse().unwrap();
+                Caps {
+                    legacy: true,
+                    legacy_links: m
+                        .min(river_core::room_state_v2::config::ceiling::MAX_LEGACY_LINKS),
+                    ..Caps::members(m)
+                }
+            }
             n => Caps::ceilings().scaled(n.parse().unwrap()),
         };
         let reps: usize = std::env::var("REPS")

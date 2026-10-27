@@ -53,6 +53,9 @@ pub struct Caps {
     /// encodes byte vectors as CBOR arrays, so these are the largest records
     /// of their kinds.
     pub legacy: bool,
+    /// How many of the owner's direct invitees join by a legacy v1 member
+    /// record (with a legacy activity record) instead of an accepted link.
+    pub legacy_links: u32,
 }
 
 impl Caps {
@@ -81,6 +84,7 @@ impl Caps {
             dm_bytes: DM_CIPHERTEXT,
             purges: MAX_MEMBERS as usize + 1,
             legacy: false,
+            legacy_links: 0,
         }
     }
 
@@ -112,6 +116,7 @@ impl Caps {
             dm_bytes: 630,
             purges: 18,
             legacy: false,
+            legacy_links: 0,
         }
     }
 
@@ -137,6 +142,7 @@ impl Caps {
     pub fn ceilings_legacy() -> Self {
         Caps {
             legacy: true,
+            legacy_links: ceiling::MAX_LEGACY_LINKS,
             ..Self::ceilings()
         }
     }
@@ -167,6 +173,7 @@ impl Caps {
             dm_bytes: self.dm_bytes,
             purges: su(self.purges),
             legacy: self.legacy,
+            legacy_links: (self.legacy_links / d).max(self.legacy_links.min(1)),
         }
     }
 }
@@ -317,15 +324,23 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
     // Links: owner children first (they become the members), the rest as
     // children of those, each with its own key.
     let n1 = caps.max_owner_children.min(caps.max_links);
-    let mut links: Vec<(AcceptedLink, SigningKey)> = vec![];
+    let mut links: Vec<(Record, SigningKey)> = vec![];
     for i in 0..n1 {
         let msk = sk(5, 0, i);
-        links.push((accepted(&o, &osk, Parent::Owner(()), i, &msk, i), msk));
+        if i < caps.legacy_links {
+            let m = crate::room_state::member::Member {
+                owner_member_id: id(&osk),
+                invited_by: id(&osk),
+                member_vk: msk.verifying_key(),
+            };
+            let am = crate::room_state::member::AuthorizedMember::new(m, &osk);
+            links.push((Record::LegacyLink(legacy(&osk, to_cbor(&am))), msk));
+        } else {
+            let l = accepted(&o, &osk, Parent::Owner(()), i, &msk, i);
+            links.push((Record::Link(l), msk));
+        }
     }
-    let mut depth1: Vec<Digest> = links
-        .iter()
-        .map(|(l, _)| Record::Link(l.clone()).digest())
-        .collect();
+    let mut depth1: Vec<Digest> = links.iter().map(|(l, _)| l.digest()).collect();
     let mut i = 0u32;
     while (links.len() as u32) < caps.max_links {
         let parent = (i / caps.max_children_per_link) as usize % depth1.len();
@@ -333,13 +348,13 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
         let psk = psk.clone();
         let msk = sk(6, v, i);
         let l = accepted(&o, &psk, Parent::Link(depth1[parent]), i, &msk, 10_000 + i);
-        links.push((l, msk));
+        links.push((Record::Link(l), msk));
         i += 1;
     }
     depth1.truncate(n1 as usize);
     for (l, msk) in &links {
-        recs.push(Record::Link(l.clone()));
-        if caps.legacy {
+        recs.push(l.clone());
+        if matches!(l, Record::LegacyLink(_)) {
             let m = v1_message(&osk, msk, clock_hours, v as u64, &caps, private);
             recs.push(Record::LegacyActivity(legacy(msk, to_cbor(&m))));
             continue;
@@ -364,7 +379,7 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
         let issuer = (i / caps.max_bans_per_issuer) as usize % links.len();
         let (l, isk) = &links[issuer];
         let issuer = Issuer::Member(MemberIssuer {
-            link: Record::Link(l.clone()).digest(),
+            link: l.digest(),
             key: k(isk),
         });
         recs.push(ban(&o, isk, issuer, k(&sk(7, v, i)), i, v));
@@ -567,10 +582,7 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
     }
 
     // The checkpoint keeps every link (it retires nothing).
-    let mut keep: Vec<Digest> = links
-        .iter()
-        .map(|(l, _)| Record::Link(l.clone()).digest())
-        .collect();
+    let mut keep: Vec<Digest> = links.iter().map(|(l, _)| l.digest()).collect();
     keep.sort();
     keep.truncate(caps.max_links as usize);
     let p = CheckpointP {

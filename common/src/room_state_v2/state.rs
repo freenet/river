@@ -25,7 +25,7 @@ pub const MAX_RECORD_BYTES: [usize; 24] = [
     7_200,  // Configuration
     5_200,  // LegacyConfiguration
     80,     // Clock
-    14_000, // Checkpoint (keep list of max_links digests)
+    23_000, // Checkpoint (keep list of max_links digests)
     120,    // Upgrade
     37_000, // Roster batch (1,000 entries)
     80,     // SecretVersion
@@ -55,7 +55,7 @@ pub fn max_state_bytes() -> usize {
     use ceiling::*;
     let largest = |ks: &[usize]| ks.iter().map(|&k| MAX_RECORD_BYTES[k]).max().unwrap();
     let members = MAX_MEMBERS as usize + 1;
-    let groups: [(&[usize], usize); 15] = [
+    let groups: [(&[usize], usize); 16] = [
         (&[0, 1], 1),
         (&[2], 1),
         (&[3], 1),
@@ -66,7 +66,9 @@ pub fn max_state_bytes() -> usize {
             (MAX_OWNER_BANS + MAX_DEPUTY_BANS + MAX_MEMBER_BANS) as usize,
         ),
         (&[9, 10], MAX_LINKS as usize),
-        (&[11, 12], MAX_LINKS as usize),
+        (&[11], MAX_LINKS as usize),
+        // Legacy activity counts only for keys with a legacy link.
+        (&[12], MAX_LEGACY_LINKS as usize),
         (&[13], RESTORE_REQUESTS),
         (&[14, 15], members),
         (&[16, 17], MAX_RECENT_MESSAGES as usize),

@@ -347,3 +347,19 @@ fn v1_owner(v1: &crate::room_state::ChatRoomStateV1) -> ed25519_dalek::Verifying
         .unwrap();
     ed25519_dalek::VerifyingKey::from_bytes(&b.try_into().unwrap()).unwrap()
 }
+
+/// Legacy links beyond `MAX_LEGACY_LINKS` are not admitted, rostered or
+/// not, and neither is a legacy activity record of a key without one.
+#[test]
+fn legacy_links_are_capped() {
+    use crate::room_state_v2::config::ceiling::MAX_LEGACY_LINKS;
+    let caps = Caps {
+        legacy_links: MAX_LEGACY_LINKS + 7,
+        ..Caps::ceilings_legacy().scaled(1)
+    };
+    let (s, dropped) = largest_state(caps, 0);
+    let count = |k: u8| s.records.iter().filter(|r| r.kind() == k).count();
+    assert_eq!(count(10), MAX_LEGACY_LINKS as usize);
+    assert_eq!(count(12), MAX_LEGACY_LINKS as usize);
+    assert!(dropped >= 14, "{dropped}");
+}

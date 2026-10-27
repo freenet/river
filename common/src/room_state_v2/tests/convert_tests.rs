@@ -199,3 +199,50 @@ fn a_record_signed_by_another_key_is_dropped() {
         4
     );
 }
+
+/// In a room whose owner never converts, the owner's own v1 deputy list
+/// still names deputies: a ban by one reaches outside its own subtree, as
+/// in v1 and as in the owner-converts path.
+#[test]
+fn owner_appointed_v1_deputies_stay_deputies_without_a_v2_configuration() {
+    let mut v1 = v1_room();
+    // k4, invited by the owner, is outside deputy k1's subtree.
+    let member = Member {
+        owner_member_id: id(0),
+        invited_by: id(0),
+        member_vk: sk(4).verifying_key(),
+    };
+    v1.members
+        .members
+        .push(AuthorizedMember::new(member, &sk(0)));
+    let b = UserBan {
+        owner_member_id: id(0),
+        banned_at: UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        banned_user: id(4),
+    };
+    v1.bans.0.push(AuthorizedUserBan::new(b, id(1), &sk(1)));
+    let o = Key::from(&sk(0).verifying_key());
+    let k4 = Key::from(&sk(4).verifying_key());
+    let conv = legacy_records(&o, &v1);
+    let mut recs = vec![legacy_configuration(&o, &v1)];
+    recs.extend(conv.records.iter().cloned());
+    let (_, r) = normalize(&o, recs, &mut Verifier::new());
+    assert!(
+        !r.members.contains(&k4),
+        "the deputy's ban did not reach k4"
+    );
+    assert_eq!(r.members.len(), 3);
+    // Without the owner's deputy list, k1's ban is a member ban and k4,
+    // outside k1's subtree, stays.
+    let mut v1b = v1.clone();
+    for i in &mut v1b.member_info.member_info {
+        if i.member_info.member_id == id(0) {
+            i.member_info.deputies.clear();
+            *i = AuthorizedMemberInfo::new(i.member_info.clone(), &sk(0));
+        }
+    }
+    let mut recs = vec![legacy_configuration(&o, &v1b)];
+    recs.extend(legacy_records(&o, &v1b).records);
+    let (_, r) = normalize(&o, recs, &mut Verifier::new());
+    assert!(r.members.contains(&k4));
+}
