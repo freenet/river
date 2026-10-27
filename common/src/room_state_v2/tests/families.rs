@@ -135,6 +135,26 @@ pub fn u6(base: Cfg, v1: Cfg) -> Builder {
     b.finish()
 }
 
+/// Not in the model: the owner's own v1 deputy list (read at L1 when no v2
+/// configuration is valid) and an owner member info of a higher version
+/// that L5 prefers, so the list's record must be kept by L1 itself. k1's
+/// legacy ban on k2 (outside k1's subtree) acts only while k1 is a deputy.
+pub fn u7(base: Cfg, v1: Cfg) -> Builder {
+    let mut b = Builder::new();
+    b.invitation(1, "O", 1, 0);
+    b.acc("A1", 1, 1);
+    b.invitation(2, "O", 2, 0);
+    b.acc("A2", 2, 2);
+    b.invitation(3, "A1", 1, 0);
+    b.acc("A3", 3, 3);
+    b.legacy_owner_info(1, &[1]);
+    b.member_info(0, 2, b"owner");
+    b.mban("L2", "A1", T::Key(2), 1, 0, true);
+    b.cfg(0, base);
+    b.cfg(1, v1);
+    b.finish()
+}
+
 pub type Family = (&'static str, fn(Cfg, Cfg) -> Builder, Cfg, Cfg);
 
 /// The model's nine tiny families, with the model's configurations.
@@ -240,6 +260,15 @@ pub fn tiny_families() -> Vec<Family> {
                 c.max_members = 1;
                 c.max_msgs = 2;
                 c.max_dms = 2;
+            }),
+        ),
+        (
+            "U7 owner v1 deputies",
+            u7,
+            with(|c| c.window_open = true),
+            with(|c| {
+                c.window_open = false;
+                c.max_members = 2;
             }),
         ),
         (

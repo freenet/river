@@ -71,3 +71,18 @@ fn the_clock_lapses_an_inactive_issuers_member_ban() {
     // The legacy member ban is exempt from the activity condition.
     assert!(kept(&all, "L3") && kept(&no_clock8, "L3"));
 }
+
+#[test]
+fn the_owners_v1_deputy_list_acts_only_without_a_v2_configuration() {
+    use super::builder::key;
+    let (b0, v1) = family("U7", 0);
+    let b = super::families::u7(b0, v1);
+    // No configuration: k1 is the owner's v1 deputy, its ban reaches k2.
+    let none = f_without(&b, &["cfg"]);
+    assert!(kept(&none, "linfo(O") && kept(&none, "L2"));
+    assert!(!none.0.members.contains(&key(2)));
+    // A v2 configuration: no v1 deputies; k1's ban is a member ban outside
+    // its own subtree, so k2 stays.
+    let all = f_without(&b, &[]);
+    assert!(all.0.members.contains(&key(2)));
+}
