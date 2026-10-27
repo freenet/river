@@ -119,6 +119,7 @@ pub mod bench;
 pub mod config;
 pub mod convert;
 pub mod encoding;
+pub mod fastcbor;
 pub mod legacy;
 pub mod records;
 pub mod retain;

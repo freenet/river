@@ -8,7 +8,8 @@
 //! `decode_*` checks everything but the signature; `verify` checks the
 //! signature, so `f` can verify lazily in admission order.
 
-use super::encoding::{from_cbor_canonical, legacy_id, to_cbor, verify_bytes, Key, Sig};
+use super::encoding::{legacy_id, verify_bytes, Key, Sig};
+use super::fastcbor;
 use super::records::{Legacy, Record};
 use crate::room_state::ban::AuthorizedUserBan;
 use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
@@ -79,12 +80,12 @@ impl V1Sig {
     pub fn verify(&self, owner: &Key, signer: &Key) -> bool {
         let owner_vk = || VerifyingKey::from_bytes(&owner.0).ok();
         let msg = match &self.inner {
-            Inner::Configuration(x) => to_cbor(x),
-            Inner::Member(x) => to_cbor(x),
-            Inner::Ban(x) => to_cbor(x),
-            Inner::Message(x) => to_cbor(x),
-            Inner::MemberInfo(x) => to_cbor(x),
-            Inner::Blob(x) => to_cbor(x),
+            Inner::Configuration(x) => fastcbor::to_vec(x),
+            Inner::Member(x) => fastcbor::to_vec(x),
+            Inner::Ban(x) => fastcbor::to_vec(x),
+            Inner::Message(x) => fastcbor::to_vec(x),
+            Inner::MemberInfo(x) => fastcbor::to_vec(x),
+            Inner::Blob(x) => fastcbor::to_vec(x),
             Inner::Dm(m) => {
                 let Some(o) = owner_vk() else { return false };
                 match build_direct_message_signed_bytes(
@@ -120,7 +121,7 @@ pub fn decode_config(owner: &Key, l: &Legacy) -> Option<LegacyConfig> {
     if l.signer != *owner {
         return None;
     }
-    let v1: AuthorizedConfigurationV1 = from_cbor_canonical(&l.v1.0)?;
+    let v1: AuthorizedConfigurationV1 = fastcbor::from_canonical(&l.v1.0)?;
     let vk = VerifyingKey::from_bytes(&owner.0).ok()?;
     let params = ChatRoomParametersV1 { owner: vk };
     v1.configuration.check_values(&params).ok()?;
@@ -145,7 +146,7 @@ pub struct LegacyLinkView {
 }
 
 pub fn decode_link(owner: &Key, l: &Legacy) -> Option<LegacyLinkView> {
-    let v1: AuthorizedMember = from_cbor_canonical(&l.v1.0)?;
+    let v1: AuthorizedMember = fastcbor::from_canonical(&l.v1.0)?;
     let m = &v1.member;
     if m.owner_member_id != id(owner) || m.invited_by != id(&l.signer) {
         return None;
@@ -167,7 +168,7 @@ pub struct LegacyBanView {
 }
 
 pub fn decode_ban(owner: &Key, l: &Legacy) -> Option<LegacyBanView> {
-    let v1: AuthorizedUserBan = from_cbor_canonical(&l.v1.0)?;
+    let v1: AuthorizedUserBan = fastcbor::from_canonical(&l.v1.0)?;
     if v1.ban.owner_member_id != id(owner) || v1.banned_by != id(&l.signer) {
         return None;
     }
@@ -190,7 +191,7 @@ pub struct LegacyMessageView {
 }
 
 pub fn decode_message(owner: &Key, l: &Legacy) -> Option<LegacyMessageView> {
-    let v1: AuthorizedMessageV1 = from_cbor_canonical(&l.v1.0)?;
+    let v1: AuthorizedMessageV1 = fastcbor::from_canonical(&l.v1.0)?;
     if v1.message.room_owner != id(owner) || v1.message.author != id(&l.signer) {
         return None;
     }
@@ -217,7 +218,7 @@ pub struct LegacyMemberInfoView {
 }
 
 pub fn decode_member_info(_owner: &Key, l: &Legacy) -> Option<LegacyMemberInfoView> {
-    let v1: AuthorizedMemberInfo = from_cbor_canonical(&l.v1.0)?;
+    let v1: AuthorizedMemberInfo = fastcbor::from_canonical(&l.v1.0)?;
     if v1.member_info.member_id != id(&l.signer)
         || v1.member_info.deputies.len() > crate::room_state::member_info::MAX_DEPUTIES
         || !sealed_v1_ok(&v1.member_info.preferred_nickname)
@@ -249,7 +250,7 @@ pub struct LegacyDmView {
 }
 
 pub fn decode_dm(_owner: &Key, l: &Legacy) -> Option<LegacyDmView> {
-    let v1: AuthorizedDirectMessage = from_cbor_canonical(&l.v1.0)?;
+    let v1: AuthorizedDirectMessage = fastcbor::from_canonical(&l.v1.0)?;
     if v1.message.sender != id(&l.signer) {
         return None;
     }
@@ -277,7 +278,7 @@ pub struct LegacyPurgeView {
 }
 
 pub fn decode_purge(_owner: &Key, l: &Legacy) -> Option<LegacyPurgeView> {
-    let v1: AuthorizedRecipientPurges = from_cbor_canonical(&l.v1.0)?;
+    let v1: AuthorizedRecipientPurges = fastcbor::from_canonical(&l.v1.0)?;
     if v1.recipient_id != id(&l.signer) || v1.state.version == 0 {
         return None;
     }
@@ -305,7 +306,7 @@ pub fn decode_blob(owner: &Key, l: &Legacy) -> Option<LegacyBlobView> {
     if l.signer != *owner {
         return None;
     }
-    let v1: AuthorizedEncryptedSecretForMember = from_cbor_canonical(&l.v1.0)?;
+    let v1: AuthorizedEncryptedSecretForMember = fastcbor::from_canonical(&l.v1.0)?;
     Some(LegacyBlobView {
         sig: sig_of(&v1.owner_signature),
         recipient_id: v1.secret.member_id.0 .0,
@@ -319,7 +320,7 @@ pub fn decode_blob(owner: &Key, l: &Legacy) -> Option<LegacyBlobView> {
 }
 
 fn strict<T: serde::Serialize>(signer: &Key, inner: &T, sig: &ed25519_dalek::Signature) -> bool {
-    verify_bytes(signer, &to_cbor(inner), &sig_of(sig))
+    verify_bytes(signer, &fastcbor::to_vec(inner), &sig_of(sig))
 }
 
 /// The v1 signature of a legacy record, checked strictly under its named
@@ -328,27 +329,27 @@ pub fn verify(owner: &Key, rec: &Record) -> bool {
     let decoded = || -> Option<bool> {
         Some(match rec {
             Record::LegacyConfiguration(l) => {
-                let v1: AuthorizedConfigurationV1 = from_cbor_canonical(&l.v1.0)?;
+                let v1: AuthorizedConfigurationV1 = fastcbor::from_canonical(&l.v1.0)?;
                 strict(&l.signer, &v1.configuration, &v1.signature)
             }
             Record::LegacyLink(l) => {
-                let v1: AuthorizedMember = from_cbor_canonical(&l.v1.0)?;
+                let v1: AuthorizedMember = fastcbor::from_canonical(&l.v1.0)?;
                 strict(&l.signer, &v1.member, &v1.signature)
             }
             Record::LegacyBan(l) => {
-                let v1: AuthorizedUserBan = from_cbor_canonical(&l.v1.0)?;
+                let v1: AuthorizedUserBan = fastcbor::from_canonical(&l.v1.0)?;
                 strict(&l.signer, &v1.ban, &v1.signature)
             }
             Record::LegacyActivity(l) | Record::LegacyMessage(l) => {
-                let v1: AuthorizedMessageV1 = from_cbor_canonical(&l.v1.0)?;
+                let v1: AuthorizedMessageV1 = fastcbor::from_canonical(&l.v1.0)?;
                 strict(&l.signer, &v1.message, &v1.signature)
             }
             Record::LegacyMemberInfo(l) => {
-                let v1: AuthorizedMemberInfo = from_cbor_canonical(&l.v1.0)?;
+                let v1: AuthorizedMemberInfo = fastcbor::from_canonical(&l.v1.0)?;
                 strict(&l.signer, &v1.member_info, &v1.signature)
             }
             Record::LegacyDirectMessage(l) => {
-                let v1: AuthorizedDirectMessage = from_cbor_canonical(&l.v1.0)?;
+                let v1: AuthorizedDirectMessage = fastcbor::from_canonical(&l.v1.0)?;
                 let owner_vk = VerifyingKey::from_bytes(&owner.0).ok()?;
                 let m = &v1.message;
                 let bytes = build_direct_message_signed_bytes(
@@ -362,7 +363,7 @@ pub fn verify(owner: &Key, rec: &Record) -> bool {
                 verify_bytes(&l.signer, &bytes, &sig_of(&v1.sender_signature))
             }
             Record::LegacyPurge(l) => {
-                let v1: AuthorizedRecipientPurges = from_cbor_canonical(&l.v1.0)?;
+                let v1: AuthorizedRecipientPurges = fastcbor::from_canonical(&l.v1.0)?;
                 let owner_vk = VerifyingKey::from_bytes(&owner.0).ok()?;
                 let bytes =
                     build_recipient_purges_signed_bytes(v1.recipient_id, &owner_vk, &v1.state)
@@ -370,7 +371,7 @@ pub fn verify(owner: &Key, rec: &Record) -> bool {
                 verify_bytes(&l.signer, &bytes, &sig_of(&v1.recipient_signature))
             }
             Record::LegacySecretBlob(l) => {
-                let v1: AuthorizedEncryptedSecretForMember = from_cbor_canonical(&l.v1.0)?;
+                let v1: AuthorizedEncryptedSecretForMember = fastcbor::from_canonical(&l.v1.0)?;
                 strict(&l.signer, &v1.secret, &v1.owner_signature)
             }
             _ => return None,

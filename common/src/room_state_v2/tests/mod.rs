@@ -6,6 +6,7 @@ mod builder;
 mod convert_tests;
 mod corpus;
 mod families;
+mod fastcbor_tests;
 mod harness;
 mod laws;
 mod mechanisms;

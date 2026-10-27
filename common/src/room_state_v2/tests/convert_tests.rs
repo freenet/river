@@ -22,11 +22,19 @@ fn sk(i: u8) -> SigningKey {
     SigningKey::from_bytes(&[i + 100; 32])
 }
 
+pub fn owner_vk() -> ed25519_dalek::VerifyingKey {
+    sk(0).verifying_key()
+}
+
+fn _unused_sk(i: u8) -> SigningKey {
+    SigningKey::from_bytes(&[i + 100; 32])
+}
+
 fn id(i: u8) -> MemberId {
     MemberId::from(&sk(i).verifying_key())
 }
 
-fn v1_room() -> ChatRoomStateV1 {
+pub fn v1_room() -> ChatRoomStateV1 {
     let mut s = ChatRoomStateV1::default();
     let cfg = Configuration {
         owner_member_id: id(0),
