@@ -226,3 +226,15 @@ Where the mixed case's time goes (perf over the guest's JIT code, lazy-error
 codec): update 50% signature checks (curve25519 and SHA-512), 22% the v1
 codec, 9% allocation, 7% BLAKE3, 5% memcmp/memcpy; merge 62% signatures, 17%
 codec, 8% allocation, 4% BLAKE3.
+
+### Tried and dropped: signing over the field's span
+
+Checking a legacy signature over the signed field's span of the canonical
+v1 bytes (instead of encoding the field again), with the canonical check
+comparing as it encodes rather than building a buffer, gave no measurable
+gain: interleaved runs on the mixed 400/300 case, medians of 15 calls,
+validate 1.252 against 1.245 s, update 1.450 against 1.421 s, merge 1.523
+against 1.529 s. The codec's cost is serde walking each v1 byte vector
+element by element (decode, and the re-encode the canonical check needs),
+not the second encode of the signed field or its allocation. The code is on
+the branch `exp/room-state-v2-signed-span`.
