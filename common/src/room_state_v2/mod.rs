@@ -92,12 +92,25 @@
 //!   known about. This matters most for a room whose owner never converts:
 //!   its legacy links are unrostered, and unrostered links count against
 //!   quotas.
-//! - **(p) No deputies without a v2 configuration.** v1 keeps deputy lists in
-//!   member info (the owner's own list is owner-appointed, every other list
-//!   member-appointed); the v1 configuration names none. A room whose owner
-//!   never converts therefore has no deputies, and v1 deputy bans become
-//!   member bans of their signers, scoped to the signer's subtree and held to
-//!   the member-ban caps.
+//! - **(p) Owner-appointed v1 deputies.** v1 keeps deputy lists in member
+//!   info: the owner's own list is owner-appointed, every other list is
+//!   member-appointed, and the v1 configuration names none. In a room with
+//!   no valid v2 configuration, L1 also chooses the owner's own legacy member
+//!   info (highest version, ties by lower signature; window open or
+//!   rostered) and keeps it, and its deputy list names deputies by v1 id: a
+//!   key whose id it lists, and that no owner ban targets, is a deputy at
+//!   L1c, and a deputy ban may not target it. Member-appointed lists confer
+//!   nothing (decision Q6). L1 keeps the record it read even when L5 prefers
+//!   another owner member info, which tiny family U7 pins.
+//! - **(q) Legacy links capped at 300.** L2 admits at most
+//!   [`config::ceiling::MAX_LEGACY_LINKS`] legacy links, rostered or not,
+//!   counted in its admission order (depth, parent position, rostered legacy
+//!   first, seq, digest), which is also the member ranking's depth-first
+//!   order. It is one more group limit of L2's greedy chooser, reading only
+//!   the links' own fields and shallower links, so it is lawful as the total
+//!   cap is. A legacy activity record counts only for a key with an admitted
+//!   legacy link, so their number is bounded too. Legacy records cost more to
+//!   decode, and this is what lets the member ceiling exceed 300.
 //!
 //! Not yet wired into the room contract; compiled only for tests and under
 //! the `room-state-v2` feature, so the deployed contract's WASM is unchanged.
