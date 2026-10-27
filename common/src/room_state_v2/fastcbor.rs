@@ -339,12 +339,15 @@ struct Decoder<'de> {
     i: usize,
 }
 
+// Errors are built lazily (`ok_or_else`): `peek` and `head` run once per
+// element of a v1 byte vector, and an eager `ok_or(Error(..))` allocated a
+// String for each, which made this codec slower than ciborium in WASM.
 impl<'de> Decoder<'de> {
     fn peek(&self) -> Result<u8, Error> {
         self.b
             .get(self.i)
             .copied()
-            .ok_or(Error("end of input".into()))
+            .ok_or_else(|| Error("end of input".into()))
     }
 
     /// A header: (major type, argument). Minimal encodings only.
@@ -354,7 +357,9 @@ impl<'de> Decoder<'de> {
         let major = ib >> 5;
         let info = ib & 31;
         let take = |d: &mut Self, n: usize| -> Result<u64, Error> {
-            let s = d.b.get(d.i..d.i + n).ok_or(Error("end of input".into()))?;
+            let s =
+                d.b.get(d.i..d.i + n)
+                    .ok_or_else(|| Error("end of input".into()))?;
             d.i += n;
             Ok(s.iter().fold(0u64, |a, &x| (a << 8) | x as u64))
         };
@@ -397,8 +402,14 @@ impl<'de> Decoder<'de> {
         let n = usize::try_from(n).map_err(|_| Error("length".into()))?;
         let s = self
             .b
-            .get(self.i..self.i.checked_add(n).ok_or(Error("length".into()))?)
-            .ok_or(Error("end of input".into()))?;
+            .get(
+                self.i
+                    ..self
+                        .i
+                        .checked_add(n)
+                        .ok_or_else(|| Error("length".into()))?,
+            )
+            .ok_or_else(|| Error("end of input".into()))?;
         self.i += n;
         Ok(s)
     }
