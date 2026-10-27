@@ -37,3 +37,9 @@ opt-level = 3
 [profile.guest-o3]
 inherits = "release"
 opt-level = 3
+
+# The guest with its function names kept, for `PROFILE=perfmap` with
+# `perf record`.
+[profile.guest-prof]
+inherits = "release"
+strip = false

@@ -26,8 +26,18 @@ REPS=3 <dir>/host/host <dir>/wasm32-unknown-unknown/release/guest.wasm \
 
 A spec is `ceilings` (every cap at its ceiling, all v2 records), `legacy` (the
 same with owner bans, activity, member info, messages, DMs, purges and blobs as
-legacy v1 records), `official` (the Official room's contents in v2 records), or
-a divisor `d` of the ceilings.
+legacy v1 records), `official` (the Official room's contents in v2 records),
+`membersN` / `lmembersN` / `lmembersN:L` (see "How many members fit"; `L` is
+the number of legacy links, default `min(N, MAX_LEGACY_LINKS)`), `live` (a
+fetched v1 room, `RIVER_V1_STATE` and `RIVER_V1_OWNER` in base58, converted
+as the corpus converts it: validate it, merge it with itself, and update a
+state holding only its configuration with it), or a divisor `d` of the
+ceilings.
+
+`ONLY=<call>` runs one call (`validate_state`, `update_with_state`, ...).
+To profile, build the guest with `--profile guest-prof` (function names
+kept) and run `PROFILE=perfmap ONLY=<call> perf record ./host ...`; the
+guest's samples are under the `[JIT]` DSO in `perf report --sort dso,symbol`.
 
 **The local check of the ceilings** (not in CI; run it on nova after any change
 to `room_state_v2` or the ceilings):
@@ -182,3 +192,37 @@ load average about 6:
 
 `CHECK_SECS=2.5`: passed. The legacy content bounds (decision m) stay: the
 mixed case has no room for larger legacy messages.
+
+## 400 members, at most 300 legacy, 2026-10-27
+
+The first build of the v1 codec (`fastcbor`) was slower than ciborium in
+WASM, not faster: its decoder built an error `String` (`ok_or(Error(..))`,
+evaluated eagerly) on every header and byte it read, so a legacy record
+allocated and freed once per byte of its v1 bytes. With the errors built
+lazily (`ok_or_else`) it is faster than ciborium. Same input, same host,
+five runs each, minimum to maximum, load average 3.4 to 5.6:
+
+| legacy (mixed, 400/300): 3,503 records, 4,211 signatures, 5.75 MB | validate | validate, no signatures | update | merge |
+|---|---|---|---|---|
+| ciborium (before the codec) | 1.51-1.70 s | 0.52-0.59 s | 1.98-2.50 s | 1.94-2.25 s |
+| codec, eager errors | 1.71-1.86 s | 0.76-0.82 s | 2.54-2.76 s | 2.35-2.63 s |
+| codec, lazy errors | 1.31-1.58 s | 0.32-0.51 s | 1.46-1.81 s | 1.58-1.91 s |
+
+The other states, lazy-error codec:
+
+| state | records | signatures | bytes | validate | update | merge |
+|---|---|---|---|---|---|---|
+| ceilings (all v2, 400 members) | 3,503 | 4,811 | 4.19 MB | 1.25-1.27 s | 1.05-1.13 s | 1.37-1.44 s |
+| official | 1,435 | 1,857 | 0.87 MB | 0.45-0.47 s | 0.36-0.38 s | 0.46-0.48 s |
+| live (Official room fetched 2026-10-26, converted) | 1,186 | 1,186 | 0.50 MB | 0.30-0.32 s | 0.31-0.36 s | 0.30-0.34 s |
+| lmembers400:200 | 3,503 | 4,411 | 5.53 MB | 1.29-1.42 s | 1.46-1.57 s | 1.58-1.70 s |
+| lmembers300:200 | 2,901 | 3,541 | 4.86 MB | 1.13-1.16 s | 1.29-1.37 s | 1.33-1.40 s |
+
+`CHECK_SECS=2.5`: passed; the mixed legacy case keeps at least 0.6 s. A
+legacy link now costs about what a v2 link does, so a legacy cap of 200
+instead of 300 saves under 0.1 s.
+
+Where the mixed case's time goes (perf over the guest's JIT code, lazy-error
+codec): update 50% signature checks (curve25519 and SHA-512), 22% the v1
+codec, 9% allocation, 7% BLAKE3, 5% memcmp/memcpy; merge 62% signatures, 17%
+codec, 8% allocation, 4% BLAKE3.

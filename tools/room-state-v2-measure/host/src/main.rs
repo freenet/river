@@ -5,7 +5,8 @@
 //! freenet-core installs, `DEFAULT_MAX_MEMORY_PAGES` = 4096) with a matching
 //! reservation and one-page guard, an 8 MiB wasm stack, epoch interruption
 //! on, fuel off. Usage: `host <guest.wasm> <spec>...`, a spec being a divisor of the
-//! ceilings (1 = the ceilings), `official`, `ceilings` or `legacy` (see `Caps`). With `CHECK_SECS=s`,
+//! ceilings (1 = the ceilings), `official`, `ceilings`, `legacy`, `membersN`,
+//! `lmembersN[:L]` (see `Caps`) or `live` (see [`live`]). With `CHECK_SECS=s`,
 //! exits non-zero if any validate, update or merge call fails or takes longer
 //! than `s` seconds (the local check of the ceilings: `CHECK_SECS=2.5 host
 //! guest.wasm ceilings legacy`). `REPS=n`
@@ -40,6 +41,11 @@ fn engine() -> Engine {
     };
     println!("engine cranelift_opt_level {opt:?}");
     c.cranelift_opt_level(opt);
+    // PROFILE=perfmap writes /tmp/perf-<pid>.map for `perf record` (build
+    // the guest with `--profile guest-prof` to keep its function names).
+    if std::env::var("PROFILE").as_deref() == Ok("perfmap") {
+        c.profiler(ProfilingStrategy::PerfMap);
+    }
     Engine::new(&c).unwrap()
 }
 
@@ -169,20 +175,28 @@ fn main() {
             "legacy" => Caps::ceilings_legacy(),
             n if n.starts_with("members") => Caps::members(n[7..].parse().unwrap()),
             n if n.starts_with("lmembers") => {
-                let m: u32 = n[8..].parse().unwrap();
+                // `lmembersN` or `lmembersN:L` (L legacy links, at most
+                // MAX_LEGACY_LINKS; default min(N, MAX_LEGACY_LINKS)).
+                let (m, l) = match n[8..].split_once(':') {
+                    Some((m, l)) => (m.parse().unwrap(), l.parse().unwrap()),
+                    None => {
+                        let m: u32 = n[8..].parse().unwrap();
+                        (m, m)
+                    }
+                };
                 Caps {
                     legacy: true,
-                    legacy_links: m
+                    legacy_links: l
                         .min(river_core::room_state_v2::config::ceiling::MAX_LEGACY_LINKS),
                     ..Caps::members(m)
                 }
             }
+            "live" => {
+                live(&engine, &module);
+                continue;
+            }
             n => Caps::ceilings().scaled(n.parse().unwrap()),
         };
-        let reps: usize = std::env::var("REPS")
-            .ok()
-            .and_then(|x| x.parse().ok())
-            .unwrap_or(1);
         let t = Instant::now();
         let (a, da) = largest_state(caps, 0);
         let (b, db) = largest_state(caps, 1);
@@ -196,69 +210,7 @@ fn main() {
             bb.len(),
             t.elapsed().as_secs_f64()
         );
-        for _ in 0..reps {
-            // A fresh instance per call, as freenet-core instantiates per call.
-            type F3 = TypedFunc<(i32, i32, i32), i64>;
-            type F5 = TypedFunc<(i32, i32, i32, i32, i32), i64>;
-            {
-                let mut g = Guest::new(&engine, &module);
-                let (po, pa) = (g.put(&o.0).unwrap(), g.put(&ab).unwrap());
-                let f: F3 = g.inst.get_typed_func(&mut g.store, "validate").unwrap();
-                let t = Instant::now();
-                let r = f.call(&mut g.store, (po, pa, ab.len() as i32));
-                report("validate_state", r, t, &mut g);
-            }
-            {
-                let mut g = Guest::new(&engine, &module);
-                let (po, pa) = (g.put(&o.0).unwrap(), g.put(&ab).unwrap());
-                let f: F3 = g
-                    .inst
-                    .get_typed_func(&mut g.store, "validate_no_signatures")
-                    .unwrap();
-                let t = Instant::now();
-                let r = f.call(&mut g.store, (po, pa, ab.len() as i32));
-                report("validate, no signatures", r, t, &mut g);
-            }
-            {
-                let mut g = Guest::new(&engine, &module);
-                let po = g.put(&o.0).unwrap();
-                let summ: TypedFunc<(i32, i32), i64> =
-                    g.inst.get_typed_func(&mut g.store, "summarize").unwrap();
-                let pa = g.put(&ab).unwrap();
-                let t = Instant::now();
-                let r = summ.call(&mut g.store, (pa, ab.len() as i32));
-                report("summarize_state", r, t, &mut g);
-                let _ = po;
-            }
-            for name in ["update_with_state", "merge_untrusted"] {
-                let mut g = Guest::new(&engine, &module);
-                let po = g.put(&o.0).unwrap();
-                let pa = match g.put(&ab) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        println!("  {name:<22} could not load inputs: {e:#}");
-                        OVER.lock()
-                            .unwrap()
-                            .push(format!("{name}: inputs did not load"));
-                        continue;
-                    }
-                };
-                let pb = match g.put(&bb) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        println!("  {name:<22} could not load inputs: {e:#}");
-                        OVER.lock()
-                            .unwrap()
-                            .push(format!("{name}: inputs did not load"));
-                        continue;
-                    }
-                };
-                let f: F5 = g.inst.get_typed_func(&mut g.store, name).unwrap();
-                let t = Instant::now();
-                let r = f.call(&mut g.store, (po, pa, ab.len() as i32, pb, bb.len() as i32));
-                report(name, r, t, &mut g);
-            }
-        }
+        run(&engine, &module, &o, &ab, &bb, &ab);
     }
     let over = OVER.lock().unwrap();
     if std::env::var("CHECK_SECS").is_ok() {
@@ -272,4 +224,124 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Times every entry point `REPS` times, a fresh instance per call:
+/// validate and summarize `ab`, update the held state `held` with `bb`, and
+/// merge `ab` with `bb`.
+fn run(engine: &Engine, module: &Module, o: &Bytes32, ab: &[u8], bb: &[u8], held: &[u8]) {
+    let reps: usize = std::env::var("REPS")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(1);
+    // ONLY=<call> (e.g. ONLY=merge_untrusted) runs just that call, for profiling.
+    let only = std::env::var("ONLY").ok();
+    let want = |n: &str| only.as_deref().is_none_or(|o| o == n);
+    for _ in 0..reps {
+        // A fresh instance per call, as freenet-core instantiates per call.
+        type F3 = TypedFunc<(i32, i32, i32), i64>;
+        type F5 = TypedFunc<(i32, i32, i32, i32, i32), i64>;
+        if want("validate_state") {
+            let mut g = Guest::new(engine, module);
+            let (po, pa) = (g.put(&o.0).unwrap(), g.put(ab).unwrap());
+            let f: F3 = g.inst.get_typed_func(&mut g.store, "validate").unwrap();
+            let t = Instant::now();
+            let r = f.call(&mut g.store, (po, pa, ab.len() as i32));
+            report("validate_state", r, t, &mut g);
+        }
+        if want("validate_no_signatures") {
+            let mut g = Guest::new(engine, module);
+            let (po, pa) = (g.put(&o.0).unwrap(), g.put(ab).unwrap());
+            let f: F3 = g
+                .inst
+                .get_typed_func(&mut g.store, "validate_no_signatures")
+                .unwrap();
+            let t = Instant::now();
+            let r = f.call(&mut g.store, (po, pa, ab.len() as i32));
+            report("validate, no signatures", r, t, &mut g);
+        }
+        if want("summarize_state") {
+            let mut g = Guest::new(engine, module);
+            let po = g.put(&o.0).unwrap();
+            let summ: TypedFunc<(i32, i32), i64> =
+                g.inst.get_typed_func(&mut g.store, "summarize").unwrap();
+            let pa = g.put(ab).unwrap();
+            let t = Instant::now();
+            let r = summ.call(&mut g.store, (pa, ab.len() as i32));
+            report("summarize_state", r, t, &mut g);
+            let _ = po;
+        }
+        for name in ["update_with_state", "merge_untrusted"] {
+            if !want(name) {
+                continue;
+            }
+            let mut g = Guest::new(engine, module);
+            let po = g.put(&o.0).unwrap();
+            let first = if name == "update_with_state" {
+                held
+            } else {
+                ab
+            };
+            let pa = match g.put(first) {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("  {name:<22} could not load inputs: {e:#}");
+                    OVER.lock()
+                        .unwrap()
+                        .push(format!("{name}: inputs did not load"));
+                    continue;
+                }
+            };
+            let pb = match g.put(bb) {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("  {name:<22} could not load inputs: {e:#}");
+                    OVER.lock()
+                        .unwrap()
+                        .push(format!("{name}: inputs did not load"));
+                    continue;
+                }
+            };
+            let f: F5 = g.inst.get_typed_func(&mut g.store, name).unwrap();
+            let t = Instant::now();
+            let r = f.call(
+                &mut g.store,
+                (po, pa, first.len() as i32, pb, bb.len() as i32),
+            );
+            report(name, r, t, &mut g);
+        }
+    }
+}
+
+/// `live`: a fetched v1 room (RIVER_V1_STATE, RIVER_V1_OWNER base58)
+/// converted as the corpus converts it (every record a legacy record, the
+/// owner not converting). Validate and summarize the whole state; merge it
+/// with itself; update a state holding only its configuration with it (a
+/// peer joining: every record checked).
+fn live(engine: &Engine, module: &Module) {
+    use river_core::room_state::ChatRoomStateV1;
+    use river_core::room_state_v2::convert::{legacy_configuration, legacy_records};
+    use river_core::room_state_v2::encoding::Key;
+    use river_core::room_state_v2::{normalize, Verifier};
+    let path = std::env::var("RIVER_V1_STATE").expect("RIVER_V1_STATE");
+    let v1: ChatRoomStateV1 =
+        ciborium::de::from_reader(&std::fs::read(&path).unwrap()[..]).unwrap();
+    let b = bs58::decode(std::env::var("RIVER_V1_OWNER").expect("RIVER_V1_OWNER"))
+        .into_vec()
+        .unwrap();
+    let o = Bytes32(b.try_into().unwrap());
+    let k: Key = o;
+    let mut recs = vec![legacy_configuration(&k, &v1)];
+    recs.extend(legacy_records(&k, &v1).records);
+    let full = normalize(&k, recs.clone(), &mut Verifier::new()).0;
+    let held = normalize(&k, recs[..1].to_vec(), &mut Verifier::new()).0;
+    let (fb, hb) = (full.to_bytes(), held.to_bytes());
+    println!(
+        "live ({path}): {} records, {} signatures, {} bytes; held for the update: {} records",
+        full.records.len(),
+        full.records.iter().map(signatures).sum::<usize>(),
+        fb.len(),
+        held.records.len()
+    );
+    run(engine, module, &o, &fb, &fb, &hb);
 }
