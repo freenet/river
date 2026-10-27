@@ -14,11 +14,12 @@ pub const EPOCH_2026_SECS: u64 = 1_767_225_600;
 /// Sized from the WASM measurement (`tools/room-state-v2-measure`) so that
 /// `validate_state`, an update and the merge of two largest states each stay
 /// within 2.5 s on nova under freenet-core's engine settings (the signature
-/// and hash crates at opt-level 3): 500 members, of whom at most 300 hold
+/// and hash crates at opt-level 3): 450 members, of whom at most 300 hold
 /// legacy (migrated v1) links, since legacy records cost more to decode;
 /// the per-member counts (links, child quotas, blobs) at 4/3 of the members.
 /// 800 members were asked for; with 300 legacy members the largest mixed
-/// state's update and merge exceeded 2.5 s from 550 members up (2026-10-26).
+/// state's update and merge exceeded 2.5 s from 550 members up, and at 500
+/// in one run of five (2.57 s), on 2026-10-26.
 /// The design's
 /// placeholder ceilings took over 60 s and did not fit in the 256 MiB
 /// contract memory. Raising them needs signature verification cheaper than
@@ -26,9 +27,9 @@ pub const EPOCH_2026_SECS: u64 = 1_767_225_600;
 /// and the measurement tool's `check` mode.
 pub mod ceiling {
     #[cfg(not(river_v2_wide_ceilings))]
-    pub const MAX_MEMBERS: u32 = 500;
+    pub const MAX_MEMBERS: u32 = 450;
     #[cfg(not(river_v2_wide_ceilings))]
-    pub const MAX_LINKS: u32 = 667;
+    pub const MAX_LINKS: u32 = 600;
     /// Legacy links `f` admits, counted in L2's admission order. Not a
     /// configuration value: the bound every migrated room shares.
     pub const MAX_LEGACY_LINKS: u32 = 300;
@@ -41,7 +42,7 @@ pub mod ceiling {
     pub const MAX_LINKS: u32 = 6_000;
     pub const MAX_LINKS_PER_MEMBER: u32 = 4;
     #[cfg(not(river_v2_wide_ceilings))]
-    pub const MAX_CHILDREN_PER_LINK: u32 = 667;
+    pub const MAX_CHILDREN_PER_LINK: u32 = 600;
     #[cfg(river_v2_wide_ceilings)]
     pub const MAX_CHILDREN_PER_LINK: u32 = 6_000;
     pub const MAX_CHAIN_DEPTH: u32 = 8;
@@ -51,7 +52,7 @@ pub mod ceiling {
     pub const MAX_MEMBER_BANS: u32 = 50;
     pub const MAX_BANS_PER_ISSUER: u32 = 10;
     #[cfg(not(river_v2_wide_ceilings))]
-    pub const MAX_SECRET_BLOBS: u32 = 667;
+    pub const MAX_SECRET_BLOBS: u32 = 600;
     #[cfg(river_v2_wide_ceilings)]
     pub const MAX_SECRET_BLOBS: u32 = 6_000;
     pub const MAX_SECRET_VERSIONS: u32 = 32;

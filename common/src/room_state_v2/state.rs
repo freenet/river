@@ -25,7 +25,7 @@ pub const MAX_RECORD_BYTES: [usize; 24] = [
     7_200,  // Configuration
     5_200,  // LegacyConfiguration
     80,     // Clock
-    23_000, // Checkpoint (keep list of max_links digests)
+    21_000, // Checkpoint (keep list of max_links digests)
     120,    // Upgrade
     37_000, // Roster batch (1,000 entries)
     80,     // SecretVersion
