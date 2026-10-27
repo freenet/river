@@ -149,3 +149,36 @@ median, load average 12 to 30 (the larger counts ran under the heaviest load):
 A room of v2 records stays under 2.5 s to about 800 members; a room whose
 member-dependent records are all legacy v1 records (the worst case a migrated
 room can reach) to about 300.
+
+## 450 members, at most 300 legacy, 2026-10-26
+
+Ian asked for 800 members with at most 300 legacy (migrated) members.
+`legacy` is now the mixed worst case: 300 members joined by legacy links with
+legacy activity, the rest by v2 links, and every member-dependent record a
+legacy v1 record. `lmembersN` is that shape at N members (with
+`--cfg river_v2_wide_ceilings`). Five runs, minimum to maximum, at load
+average 4 to 7:
+
+| members (300 legacy) | signatures | validate | update | merge |
+|---|---|---|---|---|
+| 300 | 3,354 | 1.40-1.44 | 1.94-2.26 | 1.80-1.93 |
+| 400 | 4,224 | 1.49-1.76 | 2.02-2.35 | 2.01-2.41 |
+| 450 | 4,654 | 1.72-1.77 | 2.16-2.24 | 2.20-2.33 |
+| 500 | 5,089 | 1.83-1.95 | 2.27-2.32 | 2.33-2.47 |
+| 550 | 5,524 | 2.13-2.45 | 2.63-3.68 | 2.67-3.09 |
+| 600 | 5,954 | 2.12-2.34 | 2.54-2.71 | 2.70-4.12 |
+
+All-v2 800 members: validate 2.23-2.40, update 1.86-1.94, merge 2.43-2.58.
+
+At the shipped 500 the check failed once in five (merge 2.57 s), so the
+member ceiling is 450 (links, child quotas and blobs 600). The check at 450,
+load average about 6:
+
+| state | signatures | validate | update | merge |
+|---|---|---|---|---|
+| ceilings | 5,242 | 1.36-1.46 s | 1.12-1.20 s | 1.47-1.54 s |
+| legacy (mixed) | 4,642 | 1.65-1.82 s | 2.09-2.30 s | 2.13-2.40 s |
+| official | 1,858 | 0.49-0.51 s | 0.41-0.44 s | 0.52-0.57 s |
+
+`CHECK_SECS=2.5`: passed. The legacy content bounds (decision m) stay: the
+mixed case has no room for larger legacy messages.
