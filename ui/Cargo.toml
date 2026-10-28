@@ -109,10 +109,11 @@ freenet-stdlib = { workspace = true, features = ["net"] }
 # Sans-IO backward-probe decision driver (freenet/river#398 phase 2), the
 # delegate-secret migration walk (freenet/river#398 phase 3), and the 0.7
 # completeness journal (freenet/river#763). The `ui` default profile exposes
-# the probe/driver surface; its stdlib dep unifies with the workspace's 0.8.x.
+# the probe/driver surface; its stdlib dep unifies with the workspace's 0.12.x.
 #
-# 0.7.0 was published from freenet-migrate main ff457290, the commit River's
-# real-node rehearsal ran against (freenet/freenet-migrate#43).
+# 0.8 is the freenet-stdlib 0.12 line (freenet/freenet-migrate#51): the same
+# code as 0.7.0 (published from ff457290, the commit River's #763 real-node
+# rehearsal ran against, freenet/freenet-migrate#43) built on stdlib 0.12.
 freenet-migrate = "0.8"
 
 futures = "0.3.30"
