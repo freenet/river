@@ -259,3 +259,9 @@ version = "V37"
 description = "Before the cleanup merge-law change: last generation whose ban cap evicted over the uncapped set and whose member, message and DM caps ran in the field applies"
 date = "2026-10-19"
 code_hash = "8bfd9bcd37db0a2b5961dfec711d47f84178a0e45bc558c234d826c698c36e05"
+
+[[entry]]
+version = "V38"
+description = "Before the freenet-stdlib 0.8.5 -> 0.12.1 upgrade: last room-contract generation built against stdlib 0.8.5"
+date = "2026-10-27"
+code_hash = "fa9e59e87532bc9681e8fef903f6d35a1207c25a0f0d8cca2c92e2f31761a4f9"
