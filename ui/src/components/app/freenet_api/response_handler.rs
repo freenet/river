@@ -2790,6 +2790,7 @@ pub(crate) fn outbound_delegate_msg_kind(m: &OutboundDelegateMsg) -> &'static st
         OutboundDelegateMsg::UpdateContractRequest(_) => "UpdateContractRequest",
         OutboundDelegateMsg::SubscribeContractRequest(_) => "SubscribeContractRequest",
         OutboundDelegateMsg::SendDelegateMessage(_) => "SendDelegateMessage",
+        OutboundDelegateMsg::UnsubscribeContractRequest(_) => "UnsubscribeContractRequest",
     }
 }
 

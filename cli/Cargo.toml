@@ -1,6 +1,6 @@
 [package]
 name = "riverctl"
-version = "0.2.24"
+version = "0.2.25"
 edition = "2021"
 authors = ["Freenet Project"]
 description = "Command-line interface for River decentralized chat on Freenet"
@@ -50,7 +50,7 @@ dialoguer = "0.11"
 atty = "0.2"
 
 # Internal dependencies
-river-core = { version = "=0.3.1", path = "../common", features = ["ecies", "ecies-randomized", "migration", "mentions", "own-purges"] }
+river-core = { version = "=0.4.0", path = "../common", features = ["ecies", "ecies-randomized", "migration", "mentions", "own-purges"] }
 freenet-stdlib = { workspace = true, features = ["net"] }
 freenet-scaffold = "0.2.2"
 # Sans-IO backward-probe decision driver (freenet/river#398 phase 2b): drives
@@ -62,7 +62,7 @@ freenet-scaffold = "0.2.2"
 # its room-contract key at runtime), and it is the release that stopped a probe
 # timeout reading as a definitive absence. That distinction is load-bearing
 # here, because absence is the ONLY answer that may unlock a baked-in key.
-freenet-migrate = "0.6"
+freenet-migrate = "0.8"
 
 # Serialization (for contract state)
 ciborium = "0.2.2"
