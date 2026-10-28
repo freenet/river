@@ -570,7 +570,7 @@ skill covers the call-site swap, the dual-running period and the parity test.
 - **Wrong hash algorithm**: BLAKE3 not SHA256 for CodeHash
 - **Forgetting migration**: Users lose all room data
 - **Computing key AFTER changes**: Must run `add-migration` BEFORE changes alter the WASM
-- **Not republishing riverctl**: Use `cargo make publish-all` when the room-contract WASM changes (riverctl does not embed the chat delegate)
+- **Not republishing riverctl**: when the room-contract WASM changes, release riverctl too (riverctl does not embed the chat delegate). Bump `cli/Cargo.toml` (and river-core, if it changed) in the PR, then after the UI publish push the `riverctl-v<version>` tag, which publishes river-core before riverctl. Do NOT use `cargo make publish-all` for that: it bumps riverctl a second time, commits on local `main`, and `cargo publish`es riverctl without river-core, which fails whenever riverctl pins a river-core version crates.io does not have yet
 - **Parameters file**: Always use `published-contract/webapp.parameters` (committed) — determines contract ID
 
 ## Contract ID

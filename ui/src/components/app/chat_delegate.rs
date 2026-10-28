@@ -523,8 +523,9 @@ const CHAT_DELEGATE_NONCE_KEY: &str = "river_chat_delegate_nonce_v1";
 /// stdlib pre-0.8, ~April 2026, before #4143/#4144); every release from ~0.2.60
 /// onward ignores it. There is no protocol-version handshake and the
 /// `RegisterDelegate` bincode layout is byte-identical from stdlib v0.1.22
-/// through 0.8.3 (verified for freenet/river#394), so a stdlib-0.8 River client
-/// CAN connect to and register a delegate on such an ancient node — the residual
+/// through 0.8.3 (verified for freenet/river#394), and still through 0.12.1
+/// (stdlib 0.9.0 removed only the last `DelegateRequest` variant), so a River
+/// client CAN connect to and register a delegate on such an ancient node — the residual
 /// is reachable at the protocol level, NOT gated out by wire incompatibility. In
 /// practice it needs a very old, non-auto-updated peer that the live ~0.2.9x
 /// fleet almost certainly no longer contains. For that residual node the
