@@ -113,7 +113,7 @@ freenet-stdlib = { workspace = true, features = ["net"] }
 #
 # 0.7.0 was published from freenet-migrate main ff457290, the commit River's
 # real-node rehearsal ran against (freenet/freenet-migrate#43).
-freenet-migrate = "0.7"
+freenet-migrate = "0.8"
 
 futures = "0.3.30"
 futures-timer = "3.0.3"

@@ -6701,12 +6701,16 @@ mod tests {
     /// caps decided after removals): the delegate links the room-state code
     /// it changes, and the river-core 0.3.0 -> 0.3.1 bump moves it
     /// regardless. V37 (`0fc3625e…`) is the outgoing generation.
+    ///
+    /// Updated for V38 (freenet-stdlib 0.8.5 -> 0.12.1, river-core 0.3.1 ->
+    /// 0.4.0): the delegate is rebuilt against the new stdlib. V38
+    /// (`da47cbd9…`) is the outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "da47cbd9e5264828b80d229a292e23e05951737844cd289c8f53e99bf55e0848",
+            "b703ec558d52c0901cc438a548b8cc5d802c1016076e2a07df256c5e06b8e056",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
