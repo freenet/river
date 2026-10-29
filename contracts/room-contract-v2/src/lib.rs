@@ -192,15 +192,30 @@ impl ContractInterface for Contract {
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         let owner = owner(&parameters)?;
-        let s = held(&state)?;
-        let mut records: Vec<Record> = vec![];
-        for update in data {
-            records.extend(item_records(update)?);
-        }
+        let mut s = held(&state)?;
+        let items: Vec<Vec<Record>> = data
+            .into_iter()
+            .map(item_records)
+            .collect::<Result<_, _>>()?;
         // The same record in several items counts once.
         let mut seen = HashSet::new();
-        records.retain(|r| seen.insert(r.digest()));
-        let s = apply_delta(&owner, &s, records, &mut Verifier::new()).map_err(refused)?;
+        let union: Vec<Record> = items
+            .iter()
+            .flatten()
+            .filter(|r| seen.insert(r.digest()))
+            .cloned()
+            .collect();
+        let mut v = Verifier::new();
+        if within_kind_counts(&union) {
+            // One run of `f` over the held state and every item.
+            s = apply_delta(&owner, &s, union, &mut v).map_err(refused)?;
+        } else {
+            // Items from several peers can hold more together than one
+            // valid state; each is bounded on its own, so apply them in turn.
+            for records in items {
+                s = apply_delta(&owner, &s, records, &mut v).map_err(refused)?;
+            }
+        }
         Ok(UpdateModification::valid(state_bytes(&s).into()))
     }
 
@@ -629,15 +644,13 @@ mod tests {
             update(&st(&small()), vec![delta_of(&records)]),
             Err(ContractError::InvalidUpdateWithInfo { .. })
         ));
-        // Each item is bounded on its own, before the union.
+        // Each item is bounded on its own: two items that hold more together
+        // than one valid state are applied in turn, each within the bound.
         let half = records.len() / 2;
         let ok = update(
             &empty(),
             vec![delta_of(&records[..half]), delta_of(&records[half..])],
         );
-        assert!(
-            matches!(ok, Err(ContractError::InvalidUpdateWithInfo { .. })),
-            "{ok:?}"
-        );
+        assert!(matches!(&ok, Ok(b) if b.is_empty()), "{ok:?}");
     }
 }
