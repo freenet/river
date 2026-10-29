@@ -12,7 +12,6 @@ use super::encoding::{legacy_id, verify_bytes, Key, Sig};
 use super::fastcbor;
 use super::records::{Legacy, Record};
 use crate::room_state::ban::AuthorizedUserBan;
-use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use crate::room_state::direct_messages::{
     build_direct_message_signed_bytes, build_recipient_purges_signed_bytes,
     AuthorizedDirectMessage, AuthorizedRecipientPurges, PurgeToken,
@@ -21,7 +20,6 @@ use crate::room_state::member::{AuthorizedMember, MemberId};
 use crate::room_state::member_info::AuthorizedMemberInfo;
 use crate::room_state::message::{AuthorizedMessageV1, RoomMessageBody};
 use crate::room_state::secret::AuthorizedEncryptedSecretForMember;
-use crate::room_state::ChatRoomParametersV1;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::util::FastHash;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,7 +60,6 @@ pub struct V1Sig {
 }
 
 enum Inner {
-    Configuration(Configuration),
     Member(crate::room_state::member::Member),
     Ban(crate::room_state::ban::UserBan),
     Message(crate::room_state::message::MessageV1),
@@ -80,7 +77,6 @@ impl V1Sig {
     pub fn verify(&self, owner: &Key, signer: &Key) -> bool {
         let owner_vk = || VerifyingKey::from_bytes(&owner.0).ok();
         let msg = match &self.inner {
-            Inner::Configuration(x) => fastcbor::to_vec(x),
             Inner::Member(x) => fastcbor::to_vec(x),
             Inner::Ban(x) => fastcbor::to_vec(x),
             Inner::Message(x) => fastcbor::to_vec(x),
@@ -109,34 +105,6 @@ impl V1Sig {
         };
         verify_bytes(signer, &msg, &sig_of(&self.sig))
     }
-}
-
-pub struct LegacyConfig {
-    pub v1: Option<V1Sig>,
-    pub configuration: Configuration,
-    pub sig: Sig,
-}
-
-pub fn decode_config(owner: &Key, l: &Legacy) -> Option<LegacyConfig> {
-    if l.signer != *owner {
-        return None;
-    }
-    let v1: AuthorizedConfigurationV1 = fastcbor::from_canonical(&l.v1.0)?;
-    let vk = VerifyingKey::from_bytes(&owner.0).ok()?;
-    let params = ChatRoomParametersV1 { owner: vk };
-    v1.configuration.check_values(&params).ok()?;
-    let d = &v1.configuration.display;
-    if !sealed_v1_ok(&d.name) || !d.description.as_ref().is_none_or(sealed_v1_ok) {
-        return None;
-    }
-    Some(LegacyConfig {
-        sig: sig_of(&v1.signature),
-        configuration: v1.configuration.clone(),
-        v1: Some(V1Sig {
-            inner: Inner::Configuration(v1.configuration),
-            sig: v1.signature,
-        }),
-    })
 }
 
 pub struct LegacyLinkView {
@@ -328,10 +296,6 @@ fn strict<T: serde::Serialize>(signer: &Key, inner: &T, sig: &ed25519_dalek::Sig
 pub fn verify(owner: &Key, rec: &Record) -> bool {
     let decoded = || -> Option<bool> {
         Some(match rec {
-            Record::LegacyConfiguration(l) => {
-                let v1: AuthorizedConfigurationV1 = fastcbor::from_canonical(&l.v1.0)?;
-                strict(&l.signer, &v1.configuration, &v1.signature)
-            }
             Record::LegacyLink(l) => {
                 let v1: AuthorizedMember = fastcbor::from_canonical(&l.v1.0)?;
                 strict(&l.signer, &v1.member, &v1.signature)

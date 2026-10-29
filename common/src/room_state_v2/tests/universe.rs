@@ -69,7 +69,7 @@ impl Universe {
 
     fn trusted_verifier(&self) -> Verifier {
         let mut v = Verifier::new();
-        v.trust(self.digests.iter().copied());
+        v.trust(&self.owner, self.digests.iter().copied());
         v
     }
 

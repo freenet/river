@@ -23,7 +23,7 @@ pub type Summary = BTreeMap<Kind, BTreeSet<Digest>>;
 /// largest record of each kind the retention function keeps.
 pub const MAX_RECORD_BYTES: [usize; 24] = [
     7_200,  // Configuration
-    5_200,  // LegacyConfiguration
+    0,      // (tag 1, reserved)
     80,     // Clock
     19_000, // Checkpoint (keep list of max_links digests)
     120,    // Upgrade
@@ -42,49 +42,86 @@ pub const MAX_RECORD_BYTES: [usize; 24] = [
     2_500,  // LegacyMessage
     4_300,  // DirectMessage
     5_500,  // LegacyDirectMessage
-    3_600,  // Purge
-    3_700,  // LegacyPurge
+    17_200, // Purge (1,000 tokens)
+    17_400, // LegacyPurge (1,000 tokens)
     700,    // SecretBlob
     1_450,  // LegacySecretBlob
 ];
 
-/// The byte ceiling of a state: for each group of kinds that share a cap,
-/// the cap ceiling times the group's largest record. `f` enforces every cap,
-/// so it never emits a state above this.
-pub fn max_state_bytes() -> usize {
+/// Groups of kinds that share a cap, with the most records of those kinds a
+/// state `f` emits can hold. Every count is a cap `f` enforces whatever the
+/// configuration (a configuration's caps are within the ceilings).
+fn kind_groups() -> [(&'static [usize], usize); 18] {
     use ceiling::*;
-    let largest = |ks: &[usize]| ks.iter().map(|&k| MAX_RECORD_BYTES[k]).max().unwrap();
     let members = MAX_MEMBERS as usize + 1;
-    let groups: [(&[usize], usize); 16] = [
-        (&[0, 1], 1),
+    let legacy = super::retain::legacy_link_cap() as usize;
+    [
+        (&[0], 1),
+        (&[1], 0),
         (&[2], 1),
         (&[3], 1),
         (&[4], 1),
+        (&[5], ROSTER_BATCHES),
         (&[6], MAX_SECRET_VERSIONS as usize),
         (
             &[7, 8],
             (MAX_OWNER_BANS + MAX_DEPUTY_BANS + MAX_MEMBER_BANS) as usize,
         ),
         (&[9, 10], MAX_LINKS as usize),
-        (&[11], MAX_LINKS as usize),
-        // Legacy activity counts only for keys with a legacy link.
-        (&[12], MAX_LEGACY_LINKS as usize),
+        (&[10], legacy),
+        // One activity record per linked key; a legacy one only for a key
+        // with an admitted legacy link.
+        (&[11, 12], MAX_LINKS as usize),
+        (&[12], legacy),
         (&[13], RESTORE_REQUESTS),
+        // One member info and one purge envelope per kept key.
         (&[14, 15], members),
         (&[16, 17], MAX_RECENT_MESSAGES as usize),
         (&[18, 19], MAX_DIRECT_MESSAGES as usize),
         (&[20, 21], members),
         (&[22, 23], MAX_SECRET_BLOBS as usize),
-        // Roster batches are bounded by their entries, below.
-        (&[5], 0),
-    ];
+    ]
+}
+
+/// Whether `records` hold no more of any kind than a state `f` emits can.
+/// Checked before decoding any legacy record or checking any signature, so
+/// an incoming state or delta costs at most what the largest valid state
+/// does. A delta generated from a valid state is a subset of one, so this
+/// never refuses an honest update.
+pub fn within_kind_counts(records: &[Record]) -> bool {
+    let mut n = [0usize; 24];
+    for r in records {
+        n[r.kind() as usize] += 1;
+    }
+    kind_groups()
+        .iter()
+        .all(|(ks, max)| ks.iter().map(|&k| n[k]).sum::<usize>() <= *max)
+}
+
+/// The byte ceiling of a state: each group's cap times its largest record,
+/// with the activity group split so a legacy activity record (larger) is
+/// counted only up to the legacy link cap. `f` enforces every cap, so it
+/// never emits a state above this.
+pub fn max_state_bytes() -> usize {
+    let largest = |ks: &[usize]| ks.iter().map(|&k| MAX_RECORD_BYTES[k]).max().unwrap_or(0);
+    let mut total = 0;
+    for (ks, n) in kind_groups() {
+        if ks == [11, 12] {
+            let legacy = super::retain::legacy_link_cap() as usize;
+            total += MAX_RECORD_BYTES[11] * (n - legacy.min(n)) + largest(ks) * legacy.min(n);
+        } else if ks == [10] || ks == [12] || ks == [5] {
+            // [10] and [12] are sub-limits of groups counted above; the
+            // roster is bounded by its entries, below.
+        } else {
+            total += largest(ks) * n;
+        }
+    }
     // A roster entry is 36 bytes; a batch adds its header and signature.
     let roster_entries: usize = super::records::LEGACY_KINDS
         .iter()
         .map(|k| super::retain::roster_ceiling(*k))
         .sum();
-    let roster = roster_entries * 36 + ROSTER_BATCHES * 100;
-    groups.iter().map(|(ks, n)| largest(ks) * n).sum::<usize>() + roster + 16
+    total + roster_entries * 36 + ceiling::ROSTER_BATCHES * 100 + 16
 }
 
 /// Why `validate_state` refused.
@@ -96,8 +133,10 @@ pub enum Invalid {
     NotSortedUnique,
     /// `f(S) != S`: the number of records `f` drops.
     NotAFixpoint(usize),
-    /// A record whose signature fails (contract-boundary rule for deltas).
+    /// A record whose signature fails.
     BadSignature(Digest),
+    /// More records of some kind than a valid state holds.
+    TooManyRecords,
 }
 
 impl RoomStateV2 {
@@ -175,8 +214,10 @@ pub fn merge(owner: &Key, a: &RoomStateV2, b: &RoomStateV2, v: &mut Verifier) ->
 }
 
 /// `validate_state`: canonical encoding within the byte ceiling, sorted
-/// without duplicates, version 2, and `f(S) == S`. Every per-record rule is
-/// a filter or cap inside `f`, so `f` never emits a state this refuses.
+/// without duplicates, version 2, no more records of a kind than `f` keeps,
+/// and `f(S) == S`. Every per-record rule is a filter or cap inside `f`, so
+/// `f` never emits a state this refuses. Signature checks stop at the first
+/// failure: a fixpoint has none.
 pub fn validate_state(owner: &Key, bytes: &[u8], v: &mut Verifier) -> Result<RoomStateV2, Invalid> {
     if bytes.len() > max_state_bytes() {
         return Err(Invalid::TooLarge(bytes.len()));
@@ -189,7 +230,10 @@ pub fn validate_state(owner: &Key, bytes: &[u8], v: &mut Verifier) -> Result<Roo
     if !digests.windows(2).all(|w| w[0] < w[1]) {
         return Err(Invalid::NotSortedUnique);
     }
-    let r = retain(owner, &s.records, v);
+    if !within_kind_counts(&s.records) {
+        return Err(Invalid::TooManyRecords);
+    }
+    let r = refusing(v, |v| retain(owner, &s.records, v))?;
     let dropped = r.keep.iter().filter(|k| !**k).count();
     if dropped > 0 {
         return Err(Invalid::NotAFixpoint(dropped));
@@ -197,34 +241,39 @@ pub fn validate_state(owner: &Key, bytes: &[u8], v: &mut Verifier) -> Result<Roo
     Ok(s)
 }
 
+/// Runs `run` with `v` stopping at the first failed signature check, and
+/// refuses if one failed.
+fn refusing<T>(v: &mut Verifier, run: impl FnOnce(&mut Verifier) -> T) -> Result<T, Invalid> {
+    v.set_abort(true);
+    v.reset_failure();
+    let out = run(v);
+    v.set_abort(false);
+    match v.failed.take() {
+        Some(d) => Err(Invalid::BadSignature(d)),
+        None => Ok(out),
+    }
+}
+
 /// `apply_delta(S, D) = f(S ∪ D)` at the contract boundary. `state` is a
 /// state this peer validated, so its records are trusted. The delta is
-/// refused if it holds a record whose signature fails (no valid state or
-/// generated delta holds one); records already held are not checked again.
+/// refused if it holds more records of a kind than a valid state can
+/// (before any signature is checked), or if a signature `f` checks fails
+/// (decision (n)); records `f` drops without examining them are dropped
+/// unchecked. Records already held are not checked again.
 pub fn apply_delta(
     owner: &Key,
     state: &RoomStateV2,
     delta: Vec<Record>,
     v: &mut Verifier,
 ) -> Result<RoomStateV2, Invalid> {
-    let held: HashSet<Digest> = state.digests().into_iter().collect();
-    v.trust(held.iter().copied());
-    let new: Vec<(Digest, Record)> = delta
-        .into_iter()
-        .map(|r| (r.digest(), r))
-        .filter(|(d, _)| !held.contains(d))
-        .collect();
-    let mut all = state.records.clone();
-    all.extend(new.iter().map(|(_, r)| r.clone()));
-    let out = normalize(owner, all, v).0;
-    // `f` has checked every record it keeps (memoized); check the rest, so
-    // the refusal covers every new record without checking any twice.
-    for (d, r) in &new {
-        if !v.ok(owner, r, d) {
-            return Err(Invalid::BadSignature(*d));
-        }
+    if !within_kind_counts(&delta) {
+        return Err(Invalid::TooManyRecords);
     }
-    Ok(out)
+    let held: HashSet<Digest> = state.digests().into_iter().collect();
+    v.trust(owner, held.iter().copied());
+    let mut all = state.records.clone();
+    all.extend(delta.into_iter().filter(|r| !held.contains(&r.digest())));
+    refusing(v, |v| normalize(owner, all, v).0)
 }
 
 /// Whether a record's signature verifies, without the rest of the state.

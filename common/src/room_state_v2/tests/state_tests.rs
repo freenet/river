@@ -71,7 +71,7 @@ fn validate_refuses_what_f_would_change() {
         validate_state(&o, &t.to_bytes(), &mut Verifier::new()),
         Err(Invalid::WrongVersion(1))
     );
-    // A record with a broken signature is not a fixpoint (f drops it).
+    // A record with a broken signature: refused at the failed check.
     let mut t = s.clone();
     let i = t
         .records
@@ -82,9 +82,15 @@ fn validate_refuses_what_f_would_change() {
         m.sig = Sig([0; 64]);
     }
     let t = RoomStateV2::from_records(t.records);
+    let d = t.records[t
+        .records
+        .iter()
+        .position(|r| matches!(r, Record::Message(m) if m.sig == Sig([0; 64])))
+        .unwrap()]
+    .digest();
     assert_eq!(
         validate_state(&o, &t.to_bytes(), &mut Verifier::new()),
-        Err(Invalid::NotAFixpoint(1))
+        Err(Invalid::BadSignature(d))
     );
     // Non-canonical bytes.
     let mut bytes = s.to_bytes();
@@ -211,14 +217,18 @@ fn largest_state_at_the_ceilings() {
 }
 
 /// The live-state conversion report: reads the v1 state at RIVER_V1_STATE
-/// (CBOR, as a node's GET returns it), converts it both ways (the owner
-/// converting first, with its records trusted since its key is not here,
-/// and the owner never converting), and prints what survives `f`.
+/// (CBOR, as a node's GET returns it) and converts it on the owner's path,
+/// with its records trusted since its key is not here. The owner confirms
+/// as deputies the candidates listed by the member that lists the most (the
+/// Invite Bot; RIVER_V1_BOT, base58, names it instead) and protects that
+/// member. Prints what survives `f` and the conversion report.
 #[test]
 #[ignore = "reads RIVER_V1_STATE; run by hand against a fetched live state"]
 fn convert_live_v1_state() {
     use crate::room_state::ChatRoomStateV1;
-    use crate::room_state_v2::convert::{legacy_configuration, legacy_records, owner_payloads};
+    use crate::room_state_v2::convert::{
+        add_unconverted, deputy_candidates, legacy_records, owner_payloads,
+    };
     use crate::room_state_v2::legacy;
     use crate::room_state_v2::retain::retain;
     use std::collections::BTreeMap;
@@ -243,99 +253,78 @@ fn convert_live_v1_state() {
         .map(|r| r.kind())
         .collect();
     println!("verify_strict failures by kind: {strict_fail:?}");
-    let v1_members: Vec<Key> = v1
-        .members
-        .members
-        .iter()
-        .map(|m| Key::from(&m.member.member_vk))
-        .collect();
-    let report = |label: &str, owner_recs: Vec<Record>, trusted: bool| {
-        let n = owner_recs.len();
-        let mut all = owner_recs;
-        all.extend(conv.records.iter().cloned());
-        let mut v = Verifier::new();
-        if trusted {
-            v.trust(all[..n].iter().map(|r| r.digest()));
+    let cands = deputy_candidates(&o, &v1);
+    let bot = match std::env::var("RIVER_V1_BOT") {
+        Ok(b) => crate::room_state_v2::encoding::Bytes32(
+            bs58::decode(b).into_vec().unwrap().try_into().unwrap(),
+        ),
+        Err(_) => {
+            let mut n: BTreeMap<Key, usize> = BTreeMap::new();
+            for c in &cands {
+                for k in c.listed_by.iter().filter(|k| **k != o) {
+                    *n.entry(*k).or_default() += 1;
+                }
+            }
+            n.into_iter().max_by_key(|(_, n)| *n).unwrap().0
         }
-        let r = retain(&o, &all, &mut v);
-        let mut tally: BTreeMap<u8, (usize, usize)> = BTreeMap::new();
-        for (rec, k) in all.iter().zip(&r.keep) {
-            let e = tally.entry(rec.kind()).or_default();
-            e.0 += 1;
-            e.1 += *k as usize;
-        }
-        let lost: Vec<&Key> = v1_members
-            .iter()
-            .filter(|k| r.members.binary_search(k).is_err())
-            .collect();
-        println!(
-            "== {label}: {} members kept, {} v1 members lost",
-            r.members.len(),
-            lost.len()
-        );
-        for (k, (n, kept)) in tally {
-            println!(
-                "   kind {k:2}: {n:4} in, {kept:4} kept, {:4} dropped",
-                n - kept
-            );
-        }
-        println!(
-            "   deputies {}; config {:?}",
-            r.config.deputies.len(),
-            (
-                r.config.max_members,
-                r.config.max_owner_bans,
-                r.config.max_deputy_bans,
-                r.config.max_bans_per_deputy,
-                r.config.max_member_bans
-            )
-        );
-        (r, all, lost.len())
     };
+    let deputies: Vec<Key> = cands
+        .iter()
+        .filter(|c| c.listed_by.contains(&bot))
+        .map(|c| c.key)
+        .collect();
+    println!(
+        "deputy candidates: {}; confirmed (listed by the bot {}): {}",
+        cands.len(),
+        bs58::encode(bot.0).into_string(),
+        deputies.len()
+    );
     let clock = ((std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
         - crate::room_state_v2::config::EPOCH_2026_SECS)
         / 3600) as u32;
-    let p = owner_payloads(&o, &v1, &conv.records, clock);
+    let c = owner_payloads(&o, &v1, &conv.records, clock, &deputies, &[bot]).unwrap();
+    let mut report = c.report.clone();
+    add_unconverted(&mut report, &conv.unconverted);
+    for (kind, kr) in &report.kinds {
+        println!(
+            "   {kind:?}: {} in, {} kept, dropped {:?}",
+            kr.total, kr.kept, kr.dropped
+        );
+    }
     let stand_in = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
-    let (_, _, lost_a) = report(
-        "owner converts (owner records trusted)",
-        p.sign(&stand_in),
-        true,
+    let owner_recs = c.payloads.sign(&stand_in);
+    let n = owner_recs.len();
+    let mut all = owner_recs;
+    all.extend(conv.records.iter().cloned());
+    let mut v = Verifier::new();
+    v.trust(&o, all[..n].iter().map(|r| r.digest()));
+    let r = retain(&o, &all, &mut v);
+    let v1_members: Vec<Key> = v1
+        .members
+        .members
+        .iter()
+        .map(|m| Key::from(&m.member.member_vk))
+        .collect();
+    let lost: Vec<&Key> = v1_members
+        .iter()
+        .filter(|k| r.members.binary_search(k).is_err())
+        .collect();
+    println!(
+        "owner converts: {} members kept, {} v1 members lost; deputies {}; protected {}",
+        r.members.len(),
+        lost.len(),
+        r.config.deputies.len(),
+        r.config.protected.len()
     );
-    let (r, all, lost_b) = report(
-        "owner never converts (v1 configuration, window open)",
-        vec![legacy_configuration(&o, &v1)],
-        false,
-    );
-    // The dropped records of the second path, by signer.
-    let members: std::collections::HashSet<Key> = r.members.iter().copied().collect();
-    let mut by_signer: BTreeMap<(u8, String), usize> = BTreeMap::new();
-    for (rec, k) in all.iter().zip(&r.keep) {
-        if *k {
-            continue;
-        }
-        let signer = match rec {
-            Record::LegacyBan(l) | Record::LegacyActivity(l) | Record::LegacyMemberInfo(l) => {
-                l.signer
-            }
-            _ => continue,
-        };
-        let who = if signer == o {
-            "owner".to_string()
-        } else if members.contains(&signer) {
-            format!("member {:?}", signer)
-        } else {
-            "not a member".to_string()
-        };
-        *by_signer.entry((rec.kind(), who)).or_default() += 1;
-    }
-    for ((k, who), n) in by_signer {
-        println!("   dropped kind {k}: {n} signed by {who}");
-    }
-    assert_eq!((lost_a, lost_b), (0, 0), "v1 members lost");
+    assert!(lost.is_empty(), "v1 members lost");
+    assert_eq!(r.config.deputies, {
+        let mut d = deputies.clone();
+        d.sort();
+        d
+    });
 }
 
 fn v1_owner(v1: &crate::room_state::ChatRoomStateV1) -> ed25519_dalek::VerifyingKey {

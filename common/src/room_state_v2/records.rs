@@ -344,8 +344,8 @@ compact_enum! {
     /// A v2 state record.
     pub enum Record {
         0 => Configuration(Signed<ConfigurationV2>),
-        /// A v1 owner configuration; used only while no v2 one is valid.
-        1 => LegacyConfiguration(Legacy),
+        // Tag 1 is reserved: it held a v1 owner configuration while rooms
+        // whose owner never converts were to migrate (dropped, decision (p)).
         2 => Clock(Signed<ClockP>),
         3 => Checkpoint(Signed<CheckpointP>),
         4 => Upgrade(Signed<UpgradeP>),
@@ -378,7 +378,6 @@ impl Record {
     pub fn kind(&self) -> Kind {
         match self {
             Record::Configuration(_) => 0,
-            Record::LegacyConfiguration(_) => 1,
             Record::Clock(_) => 2,
             Record::Checkpoint(_) => 3,
             Record::Upgrade(_) => 4,

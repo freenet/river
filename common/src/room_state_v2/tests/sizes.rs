@@ -3,14 +3,13 @@
 //! v1 byte vectors encode as CBOR arrays, so a byte of 0xff costs two.
 
 use crate::room_state::ban::{AuthorizedUserBan, UserBan};
-use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use crate::room_state::direct_messages::{
     sign_direct_message, sign_recipient_purges, PurgeToken, RecipientPurges,
 };
 use crate::room_state::member::{AuthorizedMember, Member, MemberId};
 use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
-use crate::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
+use crate::room_state::privacy::SealedBytes;
 use crate::room_state::secret::{AuthorizedEncryptedSecretForMember, EncryptedSecretForMemberV1};
 use crate::room_state_v2::config::ceiling;
 use crate::room_state_v2::encoding::{to_cbor, ByteBuf, Key};
@@ -51,32 +50,6 @@ fn legacy_record_size_ceilings_hold() {
     let mid = MemberId::from(&m.verifying_key());
     let big = |n: usize| vec![0xffu8; n];
     let t = UNIX_EPOCH + Duration::from_secs(u32::MAX as u64 * 4);
-
-    let cfg = Configuration {
-        owner_member_id: oid,
-        display: RoomDisplayMetadata {
-            name: SealedBytes::public(big(ceiling::MAX_ROOM_NAME as usize)),
-            description: Some(SealedBytes::public(big(
-                ceiling::MAX_ROOM_DESCRIPTION as usize
-            ))),
-        },
-        max_room_name: ceiling::MAX_ROOM_NAME as usize,
-        max_room_description: ceiling::MAX_ROOM_DESCRIPTION as usize,
-        max_recent_messages: usize::MAX,
-        max_user_bans: usize::MAX,
-        max_message_size: usize::MAX,
-        max_nickname_size: usize::MAX,
-        max_members: usize::MAX,
-        max_direct_messages: Some(usize::MAX),
-        configuration_version: u32::MAX,
-        ..Configuration::default()
-    };
-    let l = wrap(
-        &owner,
-        to_cbor(&AuthorizedConfigurationV1::new(cfg, &owner)),
-    );
-    assert!(legacy::decode_config(&o, &l).is_some());
-    check("LegacyConfiguration", Record::LegacyConfiguration(l));
 
     let ban = UserBan {
         owner_member_id: oid,

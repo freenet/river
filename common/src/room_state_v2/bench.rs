@@ -595,10 +595,29 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
         payload: p,
     }));
 
-    // Roster batches attesting digests (no legacy record is present).
+    // Roster batches at every kind's ceiling. Links: the legacy links
+    // present (the roster's link count is part of the legacy link cap), the
+    // rest digests of no record.
     let mut entries: Vec<RosterEntry> = vec![];
+    let real_links: Vec<Digest> = links
+        .iter()
+        .filter(|(l, _)| matches!(l, Record::LegacyLink(_)))
+        .map(|(l, _)| l.digest())
+        .take(super::retain::roster_ceiling(LegacyKind::Link))
+        .collect();
+    for d in &real_links {
+        entries.push(RosterEntry {
+            kind: LegacyKind::Link,
+            digest: *d,
+        });
+    }
     for kind in LEGACY_KINDS {
-        for j in 0..super::retain::roster_ceiling(kind) as u32 {
+        let skip = if kind == LegacyKind::Link {
+            real_links.len()
+        } else {
+            0
+        };
+        for j in 0..(super::retain::roster_ceiling(kind) - skip) as u32 {
             let mut d = [0u8; 32];
             d[0] = kind as u8;
             d[1..5].copy_from_slice(&j.to_le_bytes());

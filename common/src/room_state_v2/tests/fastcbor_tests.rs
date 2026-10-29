@@ -6,7 +6,6 @@
 //! intact is still refused.
 
 use crate::room_state::ban::AuthorizedUserBan;
-use crate::room_state::configuration::AuthorizedConfigurationV1;
 use crate::room_state::direct_messages::{AuthorizedDirectMessage, AuthorizedRecipientPurges};
 use crate::room_state::member::AuthorizedMember;
 use crate::room_state::member_info::AuthorizedMemberInfo;
@@ -90,8 +89,7 @@ fn entries(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
 fn with_v1(r: &Record, bytes: Vec<u8>) -> Record {
     let mut r = r.clone();
     match &mut r {
-        Record::LegacyConfiguration(l)
-        | Record::LegacyLink(l)
+        Record::LegacyLink(l)
         | Record::LegacyBan(l)
         | Record::LegacyActivity(l)
         | Record::LegacyMessage(l)
@@ -111,8 +109,7 @@ fn lenient<A: DeserializeOwned>(b: &[u8]) -> bool {
 
 fn with_bytes(r: &Record) -> Vec<u8> {
     match r {
-        Record::LegacyConfiguration(l)
-        | Record::LegacyLink(l)
+        Record::LegacyLink(l)
         | Record::LegacyBan(l)
         | Record::LegacyActivity(l)
         | Record::LegacyMessage(l)
@@ -142,7 +139,6 @@ fn old_verify<A: DeserializeOwned + Serialize, I: Serialize>(
 fn kept_verify(o: &Key, r: &Record) -> Option<bool> {
     use crate::room_state_v2::legacy::*;
     let (v1, l) = match r {
-        Record::LegacyConfiguration(l) => (decode_config(o, l)?.v1, l),
         Record::LegacyLink(l) => (decode_link(o, l)?.v1, l),
         Record::LegacyBan(l) => (decode_ban(o, l)?.v1, l),
         Record::LegacyActivity(l) | Record::LegacyMessage(l) => (decode_message(o, l)?.v1, l),
@@ -163,11 +159,6 @@ fn kept_verify(o: &Key, r: &Record) -> Option<bool> {
 pub fn check_signed(o: &Key, r: &Record) -> bool {
     use crate::room_state_v2::legacy;
     let (l, old, lenient) = match r {
-        Record::LegacyConfiguration(l) => (
-            l,
-            old_verify::<AuthorizedConfigurationV1, _>(l, |a| (&a.configuration, &a.signature)),
-            lenient::<AuthorizedConfigurationV1> as fn(&[u8]) -> bool,
-        ),
         Record::LegacyLink(l) => (
             l,
             old_verify::<AuthorizedMember, _>(l, |a| (&a.member, &a.signature)),
@@ -236,7 +227,6 @@ pub fn check_signed(o: &Key, r: &Record) -> bool {
 /// Checks one legacy record's v1 bytes; returns its kind.
 pub fn check_legacy(r: &Record) -> Option<u8> {
     match r {
-        Record::LegacyConfiguration(l) => same::<AuthorizedConfigurationV1>(&l.v1.0),
         Record::LegacyLink(l) => same::<AuthorizedMember>(&l.v1.0),
         Record::LegacyBan(l) => same::<AuthorizedUserBan>(&l.v1.0),
         Record::LegacyActivity(l) | Record::LegacyMessage(l) => {
@@ -287,9 +277,6 @@ fn fastcbor_matches_ciborium_on_generated_v1_records() {
         check_legacy(&r);
         check_signed(&o, &r);
     }
-    let c = crate::room_state_v2::convert::legacy_configuration(&o, &v1);
-    check_legacy(&c);
-    check_signed(&o, &c);
     let _ = to_cbor(&0u8);
     // Every legacy kind but the configuration (checked just above).
     assert_eq!(
@@ -317,12 +304,9 @@ fn fastcbor_matches_ciborium_on_a_live_room() {
         check_legacy(r);
         verified += check_signed(&o, r) as usize;
     }
-    let c = crate::room_state_v2::convert::legacy_configuration(&o, &v1);
-    check_legacy(&c);
-    verified += check_signed(&o, &c) as usize;
     println!(
         "{} live v1 records encode and decode identically; {verified} verify, as on the ciborium path",
-        recs.len() + 1
+        recs.len()
     );
 }
 
@@ -359,8 +343,7 @@ fn one_per_kind() -> Vec<Record> {
 fn check_kind(r: &Record) -> Option<u8> {
     matches!(
         r,
-        Record::LegacyConfiguration(_)
-            | Record::LegacyLink(_)
+        Record::LegacyLink(_)
             | Record::LegacyBan(_)
             | Record::LegacyActivity(_)
             | Record::LegacyMessage(_)
@@ -396,7 +379,6 @@ fn kinds_agree_on(b: &[u8], r: &Record) -> (bool, bool) {
         };
     }
     match r {
-        Record::LegacyConfiguration(_) => both!(AuthorizedConfigurationV1),
         Record::LegacyLink(_) => both!(AuthorizedMember),
         Record::LegacyBan(_) => both!(AuthorizedUserBan),
         Record::LegacyActivity(_) | Record::LegacyMessage(_) => both!(AuthorizedMessageV1),
@@ -639,7 +621,6 @@ fn agree<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(b: &[u8]
 
 fn agree_record(r: &Record, b: &[u8]) {
     match r {
-        Record::LegacyConfiguration(_) => agree::<AuthorizedConfigurationV1>(b),
         Record::LegacyLink(_) => agree::<AuthorizedMember>(b),
         Record::LegacyBan(_) => agree::<AuthorizedUserBan>(b),
         Record::LegacyActivity(_) | Record::LegacyMessage(_) => agree::<AuthorizedMessageV1>(b),

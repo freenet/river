@@ -27,19 +27,22 @@
 //! should read as deliberate. Every one is lawful by construction (it reads
 //! only the record's own bytes and the layers above it).
 //!
-//! - **(a) Legacy configuration.** A room whose owner never signs a v2
-//!   configuration still needs its v1 settings, so the owner's v1
-//!   configuration is carried as [`Record::LegacyConfiguration`] at L1. It
-//!   counts only while no valid v2 configuration exists, and maps to v2 by
-//!   [`ConfigurationV2::from_v1`]. Without either, the defaults apply.
+//! - **(a) Owner-only migration.** A room migrates only when its owner
+//!   converts: signs a v2 configuration (and the v1 upgrade pointer). Legacy
+//!   records count only in a state holding a valid v2 configuration (window
+//!   open, or rostered after it closes); otherwise the room stays on v1.
+//!   There is no v1 configuration record (record tag 1 is reserved) and no
+//!   path for a room whose owner never converts (Ian, 2026-10-28). A state
+//!   without a configuration holds v2 records under the defaults.
 //! - **(b) Window-close time.** Legacy times are capped at the hour the
 //!   legacy window closed. That hour is a field of the closing configuration
 //!   (`legacy_window_closed_at`), so the cap is fixed by L1. While the window
 //!   is open the cap is `Clock + 24h`; with the window open and no `Clock`,
 //!   legacy times are uncapped, as v2 times are without a `Clock`.
-//! - **(c) Chain depth.** `max_chain_depth` limits accepted links only.
-//!   Legacy links are limited by the depth ceiling, so a migrated room keeps
-//!   every v1 member however deep its invite chain.
+//! - **(c) Chain depth.** `max_chain_depth` limits accepted links only. A
+//!   legacy link is admitted at any depth (v1 had no depth limit), so a
+//!   migrated room keeps every v1 member however deep its invite chain; the
+//!   legacy link cap bounds their number, and so the work.
 //! - **(d) Member-ban issuer key.** A v2 member ban names its issuing link
 //!   and that link's member key, and is valid only if the two agree. The
 //!   signature can then be checked without the rest of the state, which the
@@ -59,13 +62,30 @@
 //!   recipient's 64-bit id), and it is dropped if the purge envelope of any
 //!   kept key matching that id lists its token. Two keys match one id only
 //!   in crafted states.
-//! - **(i) Ceilings v1 never had.** v1 bounded neither the message cap, nor
-//!   message size, nor the DM cap, nor room name or description length; the
-//!   ceilings in [`config::ceiling`] set them.
+//! - **(i) Ceilings, and what they cost a migrated room.** v1 bounded
+//!   neither the message cap, nor message size, nor the DM cap, nor room
+//!   name or description length; the ceilings in [`config::ceiling`] set
+//!   them. Where a ceiling is below what a v1 room may hold, the excess is
+//!   dropped at migration (the conversion report counts it): more than 400
+//!   members or 300 legacy links (decision (q)); more than 200 messages or
+//!   300 DMs (the oldest go); more than 534 secret blobs (the oldest
+//!   versions' go first, so a member on a new device cannot read the oldest
+//!   messages); more than 256 secret versions (messages and blobs under the
+//!   oldest go); v1 ban counts above 250 owner, 250 deputy (150 per deputy)
+//!   or 50 member bans (the oldest go); nicknames over 100 bytes; and v1's
+//!   values of `max_recent_messages`, `max_message_size`,
+//!   `max_nickname_size`, `max_room_name`, `max_room_description` above the
+//!   ceilings are clamped (a v1 room name or description longer than the v2
+//!   ceiling refuses the conversion, [`convert::ConvertError`]). Purge
+//!   envelopes keep v1's 1,000 tokens.
 //! - **(j) Restore requests.** A restore request is valid if its embedded
 //!   chain verifies and ends at an admitted link or the owner. Whether its
 //!   first link is in fact retired is not checked: a request for a link that
-//!   is not retired confers nothing.
+//!   is not retired confers nothing. At most 10 are kept (the design: 1,000;
+//!   each carries up to 25 signatures), and at most
+//!   [`config::ceiling::RESTORES_PER_MEMBER`] of those whose chain ends
+//!   under one member, so a member signing chains of its own keys cannot
+//!   take every slot.
 //! - **(k) Strict signatures everywhere.** Legacy v1 records are checked with
 //!   `verify_strict`, as v2 records are, though v1 used `verify`. A v1 record
 //!   whose signature only the lenient check accepts is dropped.
@@ -81,37 +101,55 @@
 //!   exceeds the 2.5 s timing bound. A migrated room therefore loses v1
 //!   messages over 1,000 bytes and DMs over 2,560 (none in the Official room
 //!   on 2026-10-26), an exception to keeping every v1 record.
-//! - **(n) Delta refusal.** [`apply_delta`] refuses a delta holding a record
-//!   whose signature fails. It checks after running `f`, memoized by digest,
-//!   so a record `f` already verified is not decoded or checked again.
-//! - **(o) Migrated quotas.** [`ConfigurationV2::from_v1`], which decides a
-//!   migrated room's configuration (the owner's starting point, and the
-//!   configuration of a room whose owner never converts), sets the link
+//! - **(n) Refusal at the contract boundary.** An incoming state or delta
+//!   holding more records of a kind than a valid state can hold is refused
+//!   before any legacy record is decoded or any signature checked
+//!   ([`state::within_kind_counts`]; the contract also refuses one larger
+//!   than [`max_state_bytes`] before decoding it). [`validate_state`] and
+//!   [`apply_delta`] then refuse at the first signature check that fails:
+//!   a fixpoint has none, and a generated delta has none. A record `f`
+//!   drops without examining it is dropped unchecked, so the signature
+//!   checks of one call are at most the records kept plus one.
+//! - **(o) Migrated quotas.** [`ConfigurationV2::from_v1`], the starting
+//!   point of the configuration a converting owner signs, sets the link
 //!   quotas and the depth limit to their ceilings. v1 had neither, so a v1
 //!   inviter's children are never dropped by a quota v1 could not have
-//!   known about. This matters most for a room whose owner never converts:
-//!   its legacy links are unrostered, and unrostered links count against
-//!   quotas.
-//! - **(p) Owner-appointed v1 deputies.** v1 keeps deputy lists in member
-//!   info: the owner's own list is owner-appointed, every other list is
-//!   member-appointed, and the v1 configuration names none. In a room with
-//!   no valid v2 configuration, L1 also chooses the owner's own legacy member
-//!   info (highest version, ties by lower signature; window open or
-//!   rostered) and keeps it, and its deputy list names deputies by v1 id: a
-//!   key whose id it lists, and that no owner ban targets, is a deputy at
-//!   L1c, and a deputy ban may not target it. Member-appointed lists confer
-//!   nothing (decision Q6). L1 keeps the record it read even when L5 prefers
-//!   another owner member info, which tiny family U7 pins.
+//!   known about.
+//! - **(p) No migration without the owner.** See (a): a v1 member info's
+//!   deputy list confers nothing in v2, and v1 deputies become v2 deputies
+//!   only as (r) says.
 //! - **(q) Legacy links capped at 300.** L2 admits at most
-//!   [`config::ceiling::MAX_LEGACY_LINKS`] legacy links, rostered or not,
-//!   counted in its admission order (depth, parent position, rostered legacy
-//!   first, seq, digest), which is also the member ranking's depth-first
-//!   order. It is one more group limit of L2's greedy chooser, reading only
-//!   the links' own fields and shallower links, so it is lawful as the total
-//!   cap is. A legacy activity record counts only for a key with an admitted
-//!   legacy link, so their number is bounded too. Legacy records cost more to
-//!   decode, and this is what lets the member ceiling exceed 300.
-//!
+//!   [`config::ceiling::MAX_LEGACY_LINKS`] legacy links. Rostered ones (the
+//!   owner attested them) are admitted ahead of every other link at their
+//!   depth, against the roster's own count; unrostered ones, minted while
+//!   the window is open, share only what the roster leaves (the cap less
+//!   the roster's link count, an L1 value), so they can never displace an
+//!   attested link. Each is a group limit of L2's greedy chooser over the
+//!   links' own fields, the roster and shallower links, so it is lawful as
+//!   the total cap is. Which 300 a larger room keeps is the owner's choice:
+//!   [`convert::owner_payloads`] rosters the best ranked by depth and then
+//!   newest v1 message (the member ranking), keeping each one's chain to
+//!   the owner. Unrostered links within their share are admitted in BFS
+//!   position order, not by activity: L2 cannot read activity (L2b). A
+//!   roster entry for a link not present still holds its share. A legacy
+//!   activity record counts only for a key with an admitted legacy link,
+//!   so their number is bounded too. Legacy records cost more to decode,
+//!   and this is what lets the member ceiling exceed 300.
+//! - **(r) Deputies at migration.** The converting owner confirms the
+//!   deputy list. [`convert::deputy_candidates`] proposes the owner's own v1
+//!   deputies and those listed by current, unbanned members (who acted only
+//!   in that member's subtree in v1, and would act room wide in v2), each
+//!   with who listed it; the v2 configuration holds only the keys the owner
+//!   passes in, and a `protected` list the owner chooses (a deputy ban
+//!   cannot target a protected key; the Invite Bot belongs there). Nothing
+//!   is promoted automatically (Ian, 2026-10-28).
+//! - **(s) Roster budget.** The roster counts distinct attested records per
+//!   kind, so attesting a record again costs nothing, against twice the
+//!   kind's cap (links: the legacy link cap), so the owner can attest what
+//!   the room holds at conversion and again what it holds when the window
+//!   closes. Records written during the window beyond that are lost when it
+//!   closes.
+
 //! Not yet wired into the room contract; compiled only for tests and under
 //! the `room-state-v2` feature, so the deployed contract's WASM is unchanged.
 
@@ -121,6 +159,7 @@ pub mod convert;
 pub mod encoding;
 pub mod fastcbor;
 pub mod legacy;
+pub mod official_shaped;
 pub mod records;
 pub mod retain;
 pub mod state;

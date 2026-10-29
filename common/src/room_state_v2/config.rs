@@ -54,7 +54,7 @@ pub mod ceiling {
     pub const MAX_SECRET_BLOBS: u32 = 534;
     #[cfg(river_v2_wide_ceilings)]
     pub const MAX_SECRET_BLOBS: u32 = 6_000;
-    pub const MAX_SECRET_VERSIONS: u32 = 32;
+    pub const MAX_SECRET_VERSIONS: u32 = 256;
     pub const MAX_RECENT_MESSAGES: u32 = 200;
     pub const MAX_MESSAGE_SIZE: u32 = 2_000;
     pub const MAX_DIRECT_MESSAGES: u32 = 300;
@@ -67,13 +67,20 @@ pub mod ceiling {
     pub const DMS_PER_PAIR: usize = 100;
     /// v1 allowed 32 KiB.
     pub const DM_CIPHERTEXT: usize = 4_096;
-    /// v1 allowed 1,000.
-    pub const PURGE_TOKENS: usize = 200;
+    /// As v1 (`MAX_PURGED_TOMBSTONES_PER_RECIPIENT`).
+    pub const PURGE_TOKENS: usize = 1_000;
+    /// A legacy purge envelope's tokens, as v1.
+    pub const LEGACY_PURGE_TOKENS: usize = 1_000;
     pub const SECRET_BLOB_CIPHERTEXT: usize = 512;
     pub const BAN_REASON: usize = 256;
     pub const ROSTER_BATCHES: usize = 1_000;
     pub const ROSTER_BATCH_ENTRIES: usize = 1_000;
+    /// Restore requests carry chains of up to `MAX_CHAIN_DEPTH` links of
+    /// three signatures each, so 10 (the design: 1,000) keeps their checks
+    /// within the timing bound.
     pub const RESTORE_REQUESTS: usize = 10;
+    /// Restore requests attached to one member (see `retain`).
+    pub const RESTORES_PER_MEMBER: usize = 2;
     /// Legacy v1 records encode byte vectors as CBOR arrays, which cost
     /// about four times as much to decode in WASM as a v2 byte string, so the
     /// legacy kinds that carry content have smaller bounds than their v2

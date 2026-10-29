@@ -112,6 +112,54 @@ impl Out {
     }
 }
 
+thread_local! {
+    /// Records every verifier these helpers make trusts: owner records signed
+    /// by a stand-in for an owner whose key is not here.
+    static TRUSTED: std::cell::RefCell<Option<(Key, Vec<crate::room_state_v2::encoding::Digest>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn trust_in_this_thread(o: Key, d: Vec<crate::room_state_v2::encoding::Digest>) {
+    TRUSTED.with(|t| *t.borrow_mut() = Some((o, d)));
+}
+
+fn ver() -> Verifier {
+    let mut v = Verifier::new();
+    TRUSTED.with(|t| {
+        if let Some((o, d)) = &*t.borrow() {
+            v.trust(o, d.iter().copied());
+        }
+    });
+    v
+}
+
+/// The Official-shaped room converted by its owner (the bot's deputies
+/// confirmed, the bot protected), and histories of it.
+fn official_corpus(root: &Path) {
+    use crate::room_state_v2::convert::{legacy_records, owner_payloads};
+    let f = crate::room_state_v2::official_shaped::official_shaped(1, 1.0);
+    let ovk = f.owner.verifying_key();
+    let o = Key::from(&ovk);
+    let legacy = legacy_records(&o, &f.v1).records;
+    let deputies: Vec<Key> = f.deputies.iter().map(Key::from).collect();
+    let p = owner_payloads(
+        &o,
+        &f.v1,
+        &legacy,
+        24 * 300,
+        &deputies,
+        &[Key::from(&f.bot)],
+    )
+    .unwrap()
+    .payloads;
+    let mut recs = p.sign(&f.owner);
+    recs.extend(legacy);
+    let mut out = Out::new(root, "official", ovk);
+    let full = normalize(&o, recs.clone(), &mut ver()).0;
+    out.state(&full);
+    histories(&mut out, &o, &recs, 1, 24);
+}
+
 /// `f` of a random subset of `recs` (each kept with probability p/1000).
 fn subset(o: &Key, recs: &[Record], rng: &mut Rng, p: u64) -> RoomStateV2 {
     let pick: Vec<Record> = recs
@@ -119,7 +167,7 @@ fn subset(o: &Key, recs: &[Record], rng: &mut Rng, p: u64) -> RoomStateV2 {
         .filter(|_| rng.below(1000) < p)
         .cloned()
         .collect();
-    normalize(o, pick, &mut Verifier::new()).0
+    normalize(o, pick, &mut ver()).0
 }
 
 /// States that are histories of one record universe: subsets of it (peers
@@ -135,7 +183,7 @@ fn histories(out: &mut Out, o: &Key, recs: &[Record], seed: u64, n: usize) {
     }
     for i in 0..states.len().min(12) {
         let j = (i * 7 + 3) % states.len();
-        let m = merge(o, &states[i], &states[j], &mut Verifier::new());
+        let m = merge(o, &states[i], &states[j], &mut ver());
         out.transition(&states[i], &m);
     }
     // Deltas as a peer computes them (from a sender's state against a
@@ -150,8 +198,7 @@ fn histories(out: &mut Out, o: &Key, recs: &[Record], seed: u64, n: usize) {
                 continue;
             };
             let result =
-                crate::room_state_v2::apply_delta(o, receiver, d.clone(), &mut Verifier::new())
-                    .unwrap();
+                crate::room_state_v2::apply_delta(o, receiver, d.clone(), &mut ver()).unwrap();
             let db = to_cbor(&d);
             out.bundle.deltas.push(db.clone());
             out.bundle.transitions.push(Transition {
@@ -170,26 +217,8 @@ fn histories(out: &mut Out, o: &Key, recs: &[Record], seed: u64, n: usize) {
 fn write_fdev_corpora() {
     let root = PathBuf::from(std::env::var("RIVER_V2_CORPUS").unwrap());
 
-    // (i) The Official room converted (owner never converts: its records are
-    // all real), and histories of it.
-    if let (Ok(path), Ok(owner_b58)) = (
-        std::env::var("RIVER_V1_STATE"),
-        std::env::var("RIVER_V1_OWNER"),
-    ) {
-        use crate::room_state::ChatRoomStateV1;
-        use crate::room_state_v2::convert::{legacy_configuration, legacy_records};
-        let v1: ChatRoomStateV1 =
-            ciborium::de::from_reader(&std::fs::read(path).unwrap()[..]).unwrap();
-        let b = bs58::decode(owner_b58).into_vec().unwrap();
-        let ovk = ed25519_dalek::VerifyingKey::from_bytes(&b.try_into().unwrap()).unwrap();
-        let o = Key::from(&ovk);
-        let mut recs = vec![legacy_configuration(&o, &v1)];
-        recs.extend(legacy_records(&o, &v1).records);
-        let mut out = Out::new(&root, "official", ovk);
-        let full = normalize(&o, recs.clone(), &mut Verifier::new()).0;
-        out.state(&full);
-        histories(&mut out, &o, &recs, 1, 24);
-    }
+    // (i) The Official-shaped room, converted by its owner.
+    official_corpus(&root);
 
     // (ii) Synthetic rooms whose owner key is known.
     // The largest valid states at the ceilings (v2 and legacy-heavy), two
@@ -224,7 +253,7 @@ fn write_fdev_corpora() {
         histories(&mut out, &ok, &b.recs, 100 + fi, 10);
 
         // Adversarial inputs from the same universe.
-        let s = normalize(&ok, b.recs.clone(), &mut Verifier::new()).0;
+        let s = normalize(&ok, b.recs.clone(), &mut ver()).0;
         if s.records.len() < 3 {
             continue;
         }
@@ -251,7 +280,7 @@ fn write_fdev_corpora() {
         adv.state(&RoomStateV2::from_records(replay.clone()));
         // ... and the valid states it should merge with.
         adv.state(&s);
-        adv.state(&normalize(&ok, replay, &mut Verifier::new()).0);
+        adv.state(&normalize(&ok, replay, &mut ver()).0);
     }
     println!("wrote corpora to {}", root.display());
 }
@@ -263,7 +292,7 @@ fn write_fdev_corpora() {
 fn delta_pairs_heal(o: &Key, states: &[RoomStateV2]) -> (usize, usize, usize) {
     let (mut pairs, mut differ, mut healed) = (0, 0, 0);
     let ap = |s: &RoomStateV2, d: &Vec<Record>| {
-        crate::room_state_v2::apply_delta(o, s, d.clone(), &mut Verifier::new()).unwrap()
+        crate::room_state_v2::apply_delta(o, s, d.clone(), &mut ver()).unwrap()
     };
     for base in states {
         let sum = base.summarize();
@@ -277,12 +306,12 @@ fn delta_pairs_heal(o: &Key, states: &[RoomStateV2]) -> (usize, usize, usize) {
                     continue;
                 }
                 differ += 1;
-                let mut conv = merge(o, &l, &r, &mut Verifier::new());
-                assert_eq!(conv, merge(o, &r, &l, &mut Verifier::new()));
+                let mut conv = merge(o, &l, &r, &mut ver());
+                assert_eq!(conv, merge(o, &r, &l, &mut ver()));
                 for _ in 0..4 {
                     let before = conv.clone();
                     for input in [&l, &r, base] {
-                        conv = merge(o, &conv, input, &mut Verifier::new());
+                        conv = merge(o, &conv, input, &mut ver());
                     }
                     for d in [&ds[x], &ds[y]] {
                         conv = ap(&conv, d);
@@ -293,7 +322,7 @@ fn delta_pairs_heal(o: &Key, states: &[RoomStateV2]) -> (usize, usize, usize) {
                 }
                 let fixed = [&l, &r, base]
                     .iter()
-                    .all(|s| merge(o, &conv, s, &mut Verifier::new()) == conv);
+                    .all(|s| merge(o, &conv, s, &mut ver()) == conv);
                 healed += fixed as usize;
             }
         }
@@ -337,7 +366,7 @@ fn delta_permutation_pairs_heal() {
 #[ignore = "reads RIVER_V1_STATE and RIVER_V1_OWNER"]
 fn delta_permutation_pairs_heal_on_live_room() {
     use crate::room_state::ChatRoomStateV1;
-    use crate::room_state_v2::convert::{legacy_configuration, legacy_records};
+    use crate::room_state_v2::convert::{legacy_records, owner_payloads};
     let v1: ChatRoomStateV1 = ciborium::de::from_reader(
         &std::fs::read(std::env::var("RIVER_V1_STATE").unwrap()).unwrap()[..],
     )
@@ -346,8 +375,15 @@ fn delta_permutation_pairs_heal_on_live_room() {
         .into_vec()
         .unwrap();
     let o = crate::room_state_v2::encoding::Bytes32(b.try_into().unwrap());
-    let mut recs = vec![legacy_configuration(&o, &v1)];
-    recs.extend(legacy_records(&o, &v1).records);
+    // The owner's records, signed by a stand-in and trusted (its key is not
+    // here); no deputies confirmed.
+    let legacy = legacy_records(&o, &v1).records;
+    let p = owner_payloads(&o, &v1, &legacy, 1, &[], &[])
+        .unwrap()
+        .payloads;
+    let mut recs = p.sign(&ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]));
+    trust_in_this_thread(o, recs.iter().map(|r| r.digest()).collect());
+    recs.extend(legacy);
     let mut rng = Rng(1);
     let states: Vec<RoomStateV2> = (0..12)
         .map(|i| subset(&o, &recs, &mut rng, 300 + (i as u64 * 677) % 650))

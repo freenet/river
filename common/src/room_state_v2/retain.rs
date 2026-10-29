@@ -25,12 +25,20 @@ use crate::room_state::message::RoomMessageBody;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
-/// Memoized signature checks, keyed by record digest.
+/// Memoized signature checks, keyed by record digest, for one room owner.
 #[derive(Default)]
 pub struct Verifier {
     verified: HashSet<Digest>,
+    /// The owner the memo holds checks for: signing bytes include the owner,
+    /// so a check under one owner says nothing under another.
+    owner: Option<Key>,
     /// Signature checks actually run (memo misses), for measurement.
     pub checks: usize,
+    /// Stop checking after the first failure: every later check fails
+    /// without running. For callers that refuse on any failure.
+    abort: bool,
+    /// The first record whose check failed, since [`Self::reset_failure`].
+    pub failed: Option<Digest>,
 }
 
 impl Verifier {
@@ -38,26 +46,54 @@ impl Verifier {
         Self::default()
     }
 
+    /// Binds the memo to `owner`, clearing it if it held another owner's.
+    pub fn bind(&mut self, owner: &Key) {
+        if self.owner != Some(*owner) {
+            if self.owner.is_some() {
+                self.verified.clear();
+            }
+            self.owner = Some(*owner);
+        }
+    }
+
     /// Marks records as already verified (records of a state this peer
-    /// validated before).
-    pub fn trust(&mut self, digests: impl IntoIterator<Item = Digest>) {
+    /// validated before), for `owner`.
+    pub fn trust(&mut self, owner: &Key, digests: impl IntoIterator<Item = Digest>) {
+        self.bind(owner);
         self.verified.extend(digests);
     }
 
+    /// Whether later checks stop at the first failure.
+    pub fn set_abort(&mut self, abort: bool) {
+        self.abort = abort;
+    }
+
+    /// Forgets the recorded failure.
+    pub fn reset_failure(&mut self) {
+        self.failed = None;
+    }
+
     pub fn ok(&mut self, owner: &Key, rec: &Record, digest: &Digest) -> bool {
+        self.bind(owner);
         self.ok_with(digest, || signature_ok(owner, rec))
     }
 
     /// As [`Self::ok`], with the check supplied (a legacy record's v1
-    /// signature, from its structural decode).
+    /// signature, from its structural decode). The caller has bound the
+    /// owner.
     pub fn ok_with(&mut self, digest: &Digest, check: impl FnOnce() -> bool) -> bool {
         if self.verified.contains(digest) {
             return true;
+        }
+        if self.abort && self.failed.is_some() {
+            return false;
         }
         self.checks += 1;
         let ok = check();
         if ok {
             self.verified.insert(*digest);
+        } else if self.failed.is_none() {
+            self.failed = Some(*digest);
         }
         ok
     }
@@ -115,6 +151,10 @@ pub fn signature_ok(owner: &Key, rec: &Record) -> bool {
             verify_payload(tag::ACTIVITY, o, &s.payload, &s.payload.member, &s.sig)
         }
         Record::Restore(s) => {
+            // `f` never keeps a longer chain; refuse it before verifying any.
+            if s.payload.chain.len() > ceiling::MAX_CHAIN_DEPTH as usize {
+                return false;
+            }
             let Some(first) = s.payload.chain.first().and_then(|c| chain_member(o, c)) else {
                 return false;
             };
@@ -138,8 +178,7 @@ pub fn signature_ok(owner: &Key, rec: &Record) -> bool {
             &s.sig,
         ),
         Record::Purge(s) => verify_payload(tag::PURGE, o, &s.payload, &s.payload.recipient, &s.sig),
-        Record::LegacyConfiguration(_)
-        | Record::LegacyBan(_)
+        Record::LegacyBan(_)
         | Record::LegacyLink(_)
         | Record::LegacyActivity(_)
         | Record::LegacyMemberInfo(_)
@@ -150,12 +189,18 @@ pub fn signature_ok(owner: &Key, rec: &Record) -> bool {
     }
 }
 
-/// How many of each attested kind the roster may list: that kind's cap
-/// ceiling.
+/// How many distinct records of each attested kind the roster may list.
+/// Links: the legacy link cap, which the roster's count is part of (L2).
+/// The rest: twice the kind's cap ceiling, so the owner can attest what the
+/// room holds at conversion and again what it holds when the window closes
+/// (records written during the window are new digests).
 pub fn roster_ceiling(k: LegacyKind) -> usize {
     use ceiling::*;
-    (match k {
-        LegacyKind::Link => MAX_LEGACY_LINKS,
+    if k == LegacyKind::Link {
+        return legacy_link_cap() as usize;
+    }
+    2 * (match k {
+        LegacyKind::Link => unreachable!(),
         LegacyKind::Ban => MAX_OWNER_BANS + MAX_DEPUTY_BANS + MAX_MEMBER_BANS,
         LegacyKind::Activity => MAX_LEGACY_LINKS,
         LegacyKind::MemberInfo => MAX_MEMBERS + 1,
@@ -164,6 +209,30 @@ pub fn roster_ceiling(k: LegacyKind) -> usize {
         LegacyKind::Purge => MAX_MEMBERS + 1,
         LegacyKind::SecretBlob => MAX_SECRET_BLOBS,
     }) as usize
+}
+
+/// The legacy link cap: [`ceiling::MAX_LEGACY_LINKS`], or a smaller value
+/// tests set to make it bind in small universes.
+pub fn legacy_link_cap() -> u32 {
+    #[cfg(test)]
+    if let Some(n) = test_cap::get() {
+        return n;
+    }
+    ceiling::MAX_LEGACY_LINKS
+}
+
+/// A test override of the legacy link cap (per thread).
+#[cfg(test)]
+pub(crate) mod test_cap {
+    thread_local! {
+        static CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+    pub fn get() -> Option<u32> {
+        CAP.with(|c| c.get())
+    }
+    pub fn set(n: Option<u32>) {
+        CAP.with(|c| c.set(n))
+    }
 }
 
 /// What `f` decided, beyond the kept set: the layer outputs tests inspect.
@@ -214,8 +283,7 @@ impl Ctx<'_> {
         match self.pending.get_mut().remove(&i) {
             Some(v1) => {
                 let signer = match rec {
-                    Record::LegacyConfiguration(l)
-                    | Record::LegacyBan(l)
+                    Record::LegacyBan(l)
                     | Record::LegacyLink(l)
                     | Record::LegacyActivity(l)
                     | Record::LegacyMemberInfo(l)
@@ -319,6 +387,7 @@ pub fn retain_refs(
     digests: Vec<Digest>,
     v: &mut Verifier,
 ) -> Retained {
+    v.bind(owner);
     let mut by_kind = vec![vec![]; 24];
     for (i, r) in recs.iter().enumerate() {
         by_kind[r.kind() as usize].push(i);
@@ -359,34 +428,10 @@ pub fn retain_refs(
             break;
         }
     }
+    // Legacy records count only in a room whose owner has converted, that
+    // is, signed a valid v2 configuration (decision (p)). Without one the
+    // defaults apply to v2 records alone.
     let v2_configured = config.is_some();
-    if config.is_none() {
-        // No valid v2 configuration: the highest valid v1 one, or defaults.
-        let mut cands: Vec<(Reverse<u32>, Sig, usize, ConfigurationV2)> = c
-            .kind(1)
-            .into_iter()
-            .filter_map(|i| match &recs[i] {
-                Record::LegacyConfiguration(l) => legacy::decode_config(&owner, l).map(|mut v| {
-                    c.hold(i, &mut v.v1);
-                    (
-                        Reverse(v.configuration.configuration_version),
-                        v.sig,
-                        i,
-                        ConfigurationV2::from_v1(&v.configuration),
-                    )
-                }),
-                _ => None,
-            })
-            .collect();
-        cands.sort_by_key(|a| (a.0, a.1, a.2));
-        for (_, _, i, cfg) in cands {
-            if c.ok(i) {
-                c.keep[i] = true;
-                config = Some(cfg);
-                break;
-            }
-        }
-    }
     let cfg = config.unwrap_or_else(|| ConfigurationV2::defaults(200));
 
     // Clock: the maximum, ties by lower signature bytes.
@@ -462,8 +507,8 @@ pub fn retain_refs(
     }
 
     // Legacy roster: batches by (seq, digest); a batch that would take any
-    // kind it lists past that kind's ceiling is skipped whole; at most
-    // `ROSTER_BATCHES` kept.
+    // kind past that kind's ceiling of distinct attested records is skipped
+    // whole; at most `ROSTER_BATCHES` kept.
     let mut cands: Vec<(u32, Digest, usize)> = c
         .kind(5)
         .into_iter()
@@ -492,9 +537,12 @@ pub fn retain_refs(
         let Record::Roster(s) = &recs[i] else {
             unreachable!()
         };
+        // Entries already attested by a kept batch cost nothing again.
         let mut add: HashMap<LegacyKind, usize> = HashMap::new();
         for e in &s.payload.batch {
-            *add.entry(e.kind).or_default() += 1;
+            if !roster.contains(&(e.kind, e.digest)) {
+                *add.entry(e.kind).or_default() += 1;
+            }
         }
         if add
             .iter()
@@ -512,8 +560,9 @@ pub fn retain_refs(
         batches += 1;
         c.keep[i] = true;
     }
-    let legacy_ok =
-        |kind: LegacyKind, d: &Digest| cfg.legacy_window_open || roster.contains(&(kind, *d));
+    let legacy_ok = |kind: LegacyKind, d: &Digest| {
+        v2_configured && (cfg.legacy_window_open || roster.contains(&(kind, *d)))
+    };
     let rostered = |kind: LegacyKind, d: &Digest| roster.contains(&(kind, *d));
 
     // Secret versions: one per version, the newest `max_secret_versions`.
@@ -536,34 +585,6 @@ pub fn retain_refs(
         }
         versions.insert(ver);
         c.keep[i] = true;
-    }
-
-    // The owner's v1 member info, when no v2 configuration exists: its
-    // deputy list is the room's owner-appointed deputies. Highest version,
-    // ties by lower signature; kept, since L1c reads it.
-    let mut v1_owner_deputies: HashSet<i64> = HashSet::new();
-    if !v2_configured {
-        let mut cands: Vec<(Reverse<u32>, Sig, usize, Vec<i64>)> = vec![];
-        for i in c.kind(15) {
-            let Record::LegacyMemberInfo(l) = &recs[i] else {
-                continue;
-            };
-            if l.signer != owner || !legacy_ok(LegacyKind::MemberInfo, &c.digests[i]) {
-                continue;
-            }
-            if let Some(mut v) = legacy::decode_member_info(&owner, l) {
-                c.hold(i, &mut v.v1);
-                cands.push((Reverse(v.version), v.sig, i, v.deputies));
-            }
-        }
-        cands.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
-        for (_, _, i, d) in cands {
-            if c.ok(i) {
-                c.keep[i] = true;
-                v1_owner_deputies = d.into_iter().collect();
-                break;
-            }
-        }
     }
 
     // ---------------------------------------------------------------- L1b
@@ -595,7 +616,8 @@ pub fn retain_refs(
         if !matches!(b.issuer, Issuer::Owner(())) || !reason_ok(b) || !time.ref_ok(b.clock_ref) {
             continue;
         }
-        if b.target == BanTarget::Key(owner) {
+        // A v1 id target is for legacy bans only.
+        if b.target == BanTarget::Key(owner) || matches!(b.target, BanTarget::LegacyId(_)) {
             continue;
         }
         ob.push(BanCand {
@@ -648,20 +670,7 @@ pub fn retain_refs(
         .copied()
         .filter(|k| *k != owner && !banned_keys.contains(k) && !banned_ids.contains(&legacy_id(k)))
         .collect();
-    // In a room with no v2 configuration, the owner's own v1 deputy list
-    // (owner-appointed, by v1 id) names deputies too.
-    let owner_deputy_ids: HashSet<i64> = v1_owner_deputies
-        .iter()
-        .copied()
-        .filter(|x| *x != legacy_id(&owner) && !banned_ids.contains(x))
-        .collect();
-    let owner_banned_keys = banned_keys.clone();
-    let deputies = |k: &Key| {
-        deputy_keys.contains(k)
-            || (*k != owner
-                && owner_deputy_ids.contains(&legacy_id(k))
-                && !owner_banned_keys.contains(k))
-    };
+    let deputies = |k: &Key| deputy_keys.contains(k);
     let shielded: Vec<Key> = cfg
         .protected
         .iter()
@@ -669,13 +678,9 @@ pub fn retain_refs(
         .copied()
         .chain(std::iter::once(owner))
         .collect();
-    let shielded_ids: HashSet<i64> = shielded
-        .iter()
-        .map(legacy_id)
-        .chain(v1_owner_deputies.iter().copied())
-        .collect();
+    let shielded_ids: HashSet<i64> = shielded.iter().map(legacy_id).collect();
     let target_ok_for_deputy = |t: &TargetView| match t {
-        TargetView::Key(k) => !shielded.contains(k) && !v1_owner_deputies.contains(&legacy_id(k)),
+        TargetView::Key(k) => !shielded.contains(k),
         TargetView::Inv(..) => false,
         TargetView::Id(x) => !shielded_ids.contains(x),
     };
@@ -687,7 +692,11 @@ pub fn retain_refs(
             continue;
         };
         let t = TargetView::of(&b.target);
-        if !deputies(&d) || !reason_ok(b) || !time.ref_ok(b.clock_ref) || !target_ok_for_deputy(&t)
+        if !deputies(&d)
+            || !reason_ok(b)
+            || !time.ref_ok(b.clock_ref)
+            || !target_ok_for_deputy(&t)
+            || matches!(t, TargetView::Id(_))
         {
             continue;
         }
@@ -836,18 +845,28 @@ pub fn retain_refs(
     let mut canonical: HashMap<Key, usize> = HashMap::new();
     let mut children: HashMap<Option<usize>, u32> = HashMap::new();
     let mut per_member: HashMap<Key, u32> = HashMap::new();
-    let mut legacy_admitted = 0u32;
+    // Legacy links: at most MAX_LEGACY_LINKS in all. Rostered ones (the
+    // owner attested them) have the roster's own count; unrostered ones,
+    // minted while the window is open, share what the roster leaves, so they
+    // can never displace an attested link (decision (q)).
+    let legacy_cap = legacy_link_cap();
+    let rostered_listed = roster_counts.get(&LegacyKind::Link).copied().unwrap_or(0) as u32;
+    let unrostered_budget = legacy_cap.saturating_sub(rostered_listed);
+    let mut rostered_admitted = 0u32;
+    let mut unrostered_admitted = 0u32;
     let mut frontier: Vec<usize> = vec![]; // admitted at depth d-1, in position order
-    for depth in 1..=ceiling::MAX_CHAIN_DEPTH {
-        // (parent position + 1 or 0 for the owner, rostered legacy first,
+                                           // Accepted links stop at `max_chain_depth`; legacy links (v1 had no
+                                           // depth limit) go as deep as their chains, bounded by their count.
+    for depth in 1u32.. {
+        // (rostered legacy first, parent position + 1 or 0 for the owner,
         // seq, link digest), candidate, parent
-        let mut cands: Vec<((u32, u8, u32, Digest), usize, Option<usize>)> = vec![];
+        let mut cands: Vec<((u8, u32, u32, Digest), usize, Option<usize>)> = vec![];
         let accepted_ok_here = depth <= cfg.max_chain_depth;
         let push = |j: usize, parent: Option<usize>, cands: &mut Vec<_>| {
             let l = &lc[j];
             let pp = parent.map_or(0, |p| p as u32 + 1);
             let first = if l.legacy && l.rostered { 0 } else { 1 };
-            cands.push(((pp, first, l.seq, c.digests[l.rec]), j, parent));
+            cands.push(((first, pp, l.seq, c.digests[l.rec]), j, parent));
         };
         if depth == 1 {
             if accepted_ok_here {
@@ -894,11 +913,17 @@ pub fn retain_refs(
             }
             let l = &lc[j];
             let exempt = l.legacy && l.rostered;
-            // At most MAX_LEGACY_LINKS legacy links, rostered or not, in the
-            // same admission order as every other L2 limit: a group limit of
-            // the greedy chooser over the links' own fields and shallower
-            // links, so it is lawful as the total cap is.
-            if l.legacy && legacy_admitted >= ceiling::MAX_LEGACY_LINKS {
+            // The legacy link budgets, in the same admission order as every
+            // other L2 limit: group limits of the greedy chooser over the
+            // links' own fields, the roster (L1) and shallower links, so
+            // they are lawful as the total cap is.
+            if l.legacy
+                && (if l.rostered {
+                    rostered_admitted >= legacy_cap
+                } else {
+                    unrostered_admitted >= unrostered_budget
+                })
+            {
                 continue;
             }
             if !exempt {
@@ -915,7 +940,13 @@ pub fn retain_refs(
             if !c.ok(l.rec) {
                 continue;
             }
-            legacy_admitted += l.legacy as u32;
+            if l.legacy {
+                if l.rostered {
+                    rostered_admitted += 1;
+                } else {
+                    unrostered_admitted += 1;
+                }
+            }
             if !exempt {
                 *children.entry(parent).or_default() += 1;
                 *per_member.entry(l.member).or_default() += 1;
@@ -1008,7 +1039,12 @@ pub fn retain_refs(
     };
 
     // Restore requests. Reads: L1, L2.
-    let mut rr: Vec<(Reverse<u32>, Digest, Digest, usize)> = vec![];
+    // Each request attaches to the room where its chain ends: the owner, or
+    // an admitted member (its inviter there). A member can sign a chain of
+    // its own keys under its own link, so requests attached to one member
+    // share `RESTORES_PER_MEMBER` slots; requests attached to the owner
+    // (whose invitations only the owner signs) share the rest.
+    let mut rr: Vec<(Reverse<u32>, Digest, Digest, Option<Key>, usize)> = vec![];
     for i in c.kind(13) {
         let Record::Restore(s) = &recs[i] else {
             continue;
@@ -1025,8 +1061,16 @@ pub fn retain_refs(
             ChainLink::Legacy(l) => Record::LegacyLink(l.clone()).digest(),
         };
         let mut ok = true;
+        let mut attach: Option<Key> = None;
         for (n, cl) in p.chain.iter().enumerate() {
             let next = p.chain.get(n + 1);
+            if next.is_none() {
+                attach = match cl {
+                    ChainLink::Accepted(a) => Some(a.invitation.payload.inviter),
+                    ChainLink::Legacy(l) => Some(l.signer),
+                }
+                .filter(|k| *k != owner);
+            }
             ok &= match cl {
                 ChainLink::Accepted(a) => {
                     let inv = &a.invitation.payload;
@@ -1057,18 +1101,26 @@ pub fn retain_refs(
                 Reverse(time.eff_hours(p.hours, p.clock_ref)),
                 c.digests[i],
                 digest_of_link(&p.chain[0]),
+                attach,
                 i,
             ));
         }
     }
     rr.sort();
     let mut restored: HashSet<Digest> = HashSet::new();
-    for (_, _, link, i) in rr {
+    let mut per_attach: HashMap<Key, usize> = HashMap::new();
+    for (_, _, link, attach, i) in rr {
         if restored.len() >= ceiling::RESTORE_REQUESTS {
             break;
         }
-        if restored.contains(&link) || !c.ok(i) {
+        let full = attach.is_some_and(|k| {
+            per_attach.get(&k).copied().unwrap_or(0) >= ceiling::RESTORES_PER_MEMBER
+        });
+        if full || restored.contains(&link) || !c.ok(i) {
             continue;
+        }
+        if let Some(k) = attach {
+            *per_attach.entry(k).or_default() += 1;
         }
         restored.insert(link);
         c.keep[i] = true;
@@ -1278,7 +1330,9 @@ pub fn retain_refs(
         }
         if let Some(mut v) = legacy::decode_member_info(&owner, l) {
             c.hold(i, &mut v.v1);
-            if kept.contains(&v.member) && v.declared_len <= cfg.max_nickname_size as usize {
+            // v1 bounded nicknames only by a client rule, so a legacy one is
+            // held to the ceiling rather than to the room's configured size.
+            if kept.contains(&v.member) && v.declared_len <= ceiling::MAX_NICKNAME_SIZE as usize {
                 mi.push((v.member, Reverse(v.version), v.sig, i));
             }
         }
@@ -1362,7 +1416,7 @@ pub fn retain_refs(
         }
         if let Some(mut v) = legacy::decode_purge(&owner, l) {
             c.hold(i, &mut v.v1);
-            if v.tokens.len() > ceiling::PURGE_TOKENS {
+            if v.tokens.len() > ceiling::LEGACY_PURGE_TOKENS {
                 continue;
             }
             // Applies to every kept key its 64-bit id matches.
