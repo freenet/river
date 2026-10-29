@@ -331,9 +331,16 @@ fn oshaped(engine: &Engine, module: &Module) {
     let k = Key::from(&f.owner.verifying_key());
     let legacy = legacy_records(&k, &f.v1).records;
     let deputies: Vec<Key> = f.deputies.iter().map(Key::from).collect();
-    let p = owner_payloads(&k, &f.v1, &legacy, 24 * 300, &deputies, &[Key::from(&f.bot)])
-        .unwrap()
-        .payloads;
+    let p = owner_payloads(
+        &k,
+        &f.v1,
+        &legacy,
+        24 * 300,
+        &deputies,
+        &[Key::from(&f.bot)],
+    )
+    .unwrap()
+    .payloads;
     let owner_recs = p.sign(&f.owner);
     let mut recs = owner_recs.clone();
     recs.extend(legacy);
