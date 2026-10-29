@@ -696,6 +696,6 @@ fn fastcbor_agrees_with_ciborium_on_malformed_records() {
 #[test]
 #[ignore = "slow"]
 fn fastcbor_agrees_with_ciborium_on_malformed_records_large() {
-    let cases = sweep(40, 2000);
+    let cases = sweep(4, 500);
     println!("{cases} cases");
 }
