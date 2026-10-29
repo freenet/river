@@ -91,7 +91,12 @@ impl Out {
         self.states += 1;
     }
     fn state(&mut self, s: &RoomStateV2) {
-        self.state_bytes(s.to_bytes());
+        // The contract's one form of the state with no records.
+        if s.records.is_empty() {
+            self.state_bytes(vec![]);
+        } else {
+            self.state_bytes(s.to_bytes());
+        }
     }
     fn transition(&mut self, base: &RoomStateV2, result: &RoomStateV2) {
         self.bundle.transitions.push(Transition {

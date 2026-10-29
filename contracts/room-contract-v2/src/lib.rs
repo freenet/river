@@ -180,6 +180,9 @@ impl ContractInterface for Contract {
         let owner = owner(&parameters)?;
         Ok(
             match v2state::validate_state(&owner, state.as_ref(), &mut Verifier::new()) {
+                // The state with no records has one form, the empty bytes
+                // (what `update_state` returns for it), so merge(S, S) == S.
+                Ok(s) if s.records.is_empty() => ValidateResult::Invalid,
                 Ok(_) => ValidateResult::Valid,
                 Err(_) => ValidateResult::Invalid,
             },
@@ -356,11 +359,19 @@ mod tests {
     fn empty_state_summary_and_delta_are_consistent() {
         let none = RoomStateV2::from_records(vec![]);
         let encoded_none = State::from(to_cbor(&none));
+        // Only the empty bytes are a valid stored form of the state with no
+        // records; the encoded one is still read as no records elsewhere.
+        assert_eq!(
+            C::validate_state(params(), encoded_none.clone(), RelatedContracts::default()).unwrap(),
+            ValidateResult::Invalid
+        );
         for s in [empty(), encoded_none] {
-            assert_eq!(
-                C::validate_state(params(), s.clone(), RelatedContracts::default()).unwrap(),
-                ValidateResult::Valid
-            );
+            if s.as_ref().is_empty() {
+                assert_eq!(
+                    C::validate_state(params(), s.clone(), RelatedContracts::default()).unwrap(),
+                    ValidateResult::Valid
+                );
+            }
             assert!(C::summarize_state(params(), s.clone())
                 .unwrap()
                 .as_ref()
