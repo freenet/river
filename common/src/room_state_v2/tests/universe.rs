@@ -40,6 +40,16 @@ impl Universe {
     /// As [`Self::new`], with `f` run under the legacy link cap `cap`
     /// (`retain::test_cap`, set on whichever thread computes `f`).
     pub fn with_cap(name: &str, b: Builder, mutant: Mutant, cap: Option<u32>) -> Universe {
+        Self::build(name, b, mutant, cap, true)
+    }
+
+    /// As [`Self::with_cap`], memoizing `f` instead of precomputing it for
+    /// every subset, for callers that evaluate few subsets.
+    pub fn lazy(name: &str, b: Builder, cap: Option<u32>) -> Universe {
+        Self::build(name, b, Mutant::None, cap, false)
+    }
+
+    fn build(name: &str, b: Builder, mutant: Mutant, cap: Option<u32>, table: bool) -> Universe {
         let o = owner();
         for (r, n) in b.recs.iter().zip(&b.names) {
             assert!(signature_ok(&o, r), "builder signed {n} wrongly");
@@ -57,7 +67,7 @@ impl Universe {
             cap,
             table: None,
         };
-        if u.recs.len() <= 20 {
+        if table && u.recs.len() <= 20 {
             u.table = Some(u.build_table());
         }
         u
