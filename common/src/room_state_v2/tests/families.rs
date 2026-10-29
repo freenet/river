@@ -135,6 +135,71 @@ pub fn u6(base: Cfg, v1: Cfg) -> Builder {
     b.finish()
 }
 
+/// Not in the model: a legacy-heavy room for the legacy link cap. A v1
+/// chain three deep (G1 <- owner, G2 <- k1, G3 <- k2), a second root (G4), a
+/// legacy link under an accepted link (G6 <- k5), two roster batches (G1;
+/// G3, whose chain runs through the unrostered G2), legacy activity for the
+/// chain's members and a legacy member ban by k1.
+pub fn u7(base: Cfg, v1: Cfg) -> Builder {
+    let mut b = Builder::new();
+    b.leg("G1", 1, 0);
+    b.leg("G2", 2, 1);
+    b.leg("G3", 3, 2);
+    b.leg("G4", 4, 0);
+    b.invitation(1, "O", 1, 0);
+    b.acc("A5", 1, 5);
+    b.leg("G6", 6, 5);
+    b.roster(1, &["G1"]);
+    b.roster(2, &["G3"]);
+    b.legacy_msg(2, 2, true);
+    b.legacy_msg(3, 6, true);
+    b.mban("L4", "G1", T::Key(4), 5, 0, true);
+    b.clock(3);
+    b.cfg(0, base);
+    b.cfg(1, v1);
+    b.finish()
+}
+
+/// The families with legacy links, for the legacy link cap. U7's
+/// configurations: the window open in the base (every legacy link counts)
+/// and closed in v1 (only rostered ones), then the reverse with tighter
+/// quotas, which rostered links are exempt from.
+pub fn legacy_families() -> Vec<Family> {
+    let mut v: Vec<Family> = tiny_families()
+        .into_iter()
+        .filter(|f| f.0.starts_with("U1") || f.0.starts_with("U6"))
+        .collect();
+    v.push((
+        "U7 legacy chain",
+        u7,
+        with(|c| {
+            c.window_open = true;
+            c.max_members = 5;
+        }),
+        with(|c| {
+            c.window_open = false;
+            c.max_members = 4;
+            c.closed_at = 4;
+        }),
+    ));
+    v.push((
+        "U7 legacy chain",
+        u7,
+        with(|c| {
+            c.window_open = false;
+            c.max_members = 3;
+            c.closed_at = 1;
+        }),
+        with(|c| {
+            c.window_open = true;
+            c.max_members = 5;
+            c.owner_children = 1;
+            c.max_children = 1;
+        }),
+    ));
+    v
+}
+
 pub type Family = (&'static str, fn(Cfg, Cfg) -> Builder, Cfg, Cfg);
 
 /// The model's nine tiny families, with the model's configurations.
@@ -291,6 +356,7 @@ pub fn rand_cfg(rng: &mut Rng, keys: usize) -> Cfg {
         private: false,
         max_versions: 2,
         max_blobs: 2,
+        closed_at: 0,
     }
 }
 
@@ -512,6 +578,34 @@ pub fn rand_universe_l5(rng: &mut Rng, keys: usize, c0: Cfg, v1: Cfg, v2: Cfg) -
         .collect();
     if !legacy.is_empty() && rng.below(2) == 0 {
         b.roster_indexes(7, &legacy);
+    }
+    b
+}
+
+/// Not in the model: [`rand_universe_l5`] plus 2-4 more legacy links, each
+/// invited by the owner or by the member of an earlier legacy link (so v1
+/// chains several deep), some rostered, with legacy activity for some of
+/// their members. For the legacy link cap.
+pub fn rand_universe_legacy(rng: &mut Rng, keys: usize, c0: Cfg, v1: Cfg, v2: Cfg) -> Builder {
+    let mut b = rand_universe_l5(rng, keys, c0, v1, v2);
+    let mut members = vec![0usize];
+    let mut idx = vec![];
+    for n in 0..2 + rng.below(3) as usize {
+        let inviter = members[rng.below(members.len() as u64) as usize];
+        let mut k = 1 + rng.below(keys as u64) as usize;
+        if k == inviter {
+            k = k % keys + 1;
+        }
+        b.leg(&format!("H{n}"), k, inviter);
+        idx.push(b.recs.len() - 1);
+        members.push(k);
+        if rng.below(2) == 0 {
+            b.legacy_msg(k, rng.below(9) as u32, true);
+        }
+    }
+    let pick: Vec<usize> = idx.iter().copied().filter(|_| rng.below(2) == 0).collect();
+    if !pick.is_empty() {
+        b.roster_indexes(8, &pick);
     }
     b
 }

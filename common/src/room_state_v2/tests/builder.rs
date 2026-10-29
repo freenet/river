@@ -63,6 +63,10 @@ pub struct Cfg {
     pub private: bool,
     pub max_versions: u32,
     pub max_blobs: u32,
+    /// Not in the model: the hour the legacy window closed
+    /// (`legacy_window_closed_at`), which caps legacy times while the
+    /// window is closed.
+    pub closed_at: u32,
 }
 
 pub fn base() -> Cfg {
@@ -87,6 +91,7 @@ pub fn base() -> Cfg {
         private: false,
         max_versions: 2,
         max_blobs: 2,
+        closed_at: 0,
     }
 }
 
@@ -122,6 +127,7 @@ impl Cfg {
         c.deputies = keys_of(self.deputies);
         c.protected = keys_of(self.protected);
         c.legacy_window_open = self.window_open;
+        c.legacy_window_closed_at = self.closed_at;
         c.member_ban_activity_window = self.ban_window;
         c.privacy_mode = self.private as u8;
         if self.private {

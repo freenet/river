@@ -7,7 +7,7 @@ use super::harness::{bits, LawModel, S};
 use crate::room_state_v2::encoding::{Digest, Key};
 use crate::room_state_v2::records::Record;
 use crate::room_state_v2::retain::mutant::{self, Mutant};
-use crate::room_state_v2::retain::{retain_refs, signature_ok, Verifier};
+use crate::room_state_v2::retain::{retain_refs, signature_ok, test_cap, Verifier};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,11 +27,19 @@ pub struct Universe {
     digests: Vec<Digest>,
     pub names: Vec<String>,
     mutant: Mutant,
+    /// The legacy link cap `f` runs under (`None`: the ceiling).
+    cap: Option<u32>,
     table: Option<Vec<u32>>,
 }
 
 impl Universe {
     pub fn new(name: &str, b: Builder, mutant: Mutant) -> Universe {
+        Self::with_cap(name, b, mutant, None)
+    }
+
+    /// As [`Self::new`], with `f` run under the legacy link cap `cap`
+    /// (`retain::test_cap`, set on whichever thread computes `f`).
+    pub fn with_cap(name: &str, b: Builder, mutant: Mutant, cap: Option<u32>) -> Universe {
         let o = owner();
         for (r, n) in b.recs.iter().zip(&b.names) {
             assert!(signature_ok(&o, r), "builder signed {n} wrongly");
@@ -46,6 +54,7 @@ impl Universe {
             digests,
             names: b.names,
             mutant,
+            cap,
             table: None,
         };
         if u.recs.len() <= 20 {
@@ -56,11 +65,13 @@ impl Universe {
 
     fn compute(&self, s: S, v: &mut Verifier) -> S {
         mutant::set(self.mutant);
+        test_cap::set(self.cap);
         let idx: Vec<usize> = bits(s).collect();
         let refs: Vec<&Record> = idx.iter().map(|&i| &self.recs[i]).collect();
         let ds: Vec<Digest> = idx.iter().map(|&i| self.digests[i]).collect();
         let r = retain_refs(&self.owner, &refs, ds, v);
         mutant::set(Mutant::None);
+        test_cap::set(None);
         idx.iter()
             .zip(r.keep.iter())
             .filter(|(_, k)| **k)
