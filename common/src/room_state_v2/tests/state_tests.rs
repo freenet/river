@@ -350,3 +350,28 @@ fn legacy_links_are_capped() {
     assert_eq!(count(12), MAX_LEGACY_LINKS as usize);
     assert!(dropped >= 14, "{dropped}");
 }
+
+/// The v1 state format the live contract holds is the one this build
+/// reads: a fetched state (RIVER_V1_STATE) decodes, re-encodes to the same
+/// bytes, and passes this build's v1 `verify`.
+#[test]
+#[ignore = "reads RIVER_V1_STATE; run by hand against a fetched live state"]
+fn the_live_v1_state_format_round_trips() {
+    use crate::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+    use freenet_scaffold::ComposableState;
+    let bytes = std::fs::read(std::env::var("RIVER_V1_STATE").unwrap()).unwrap();
+    let v1: ChatRoomStateV1 = ciborium::de::from_reader(&bytes[..]).unwrap();
+    let mut again = vec![];
+    ciborium::ser::into_writer(&v1, &mut again).unwrap();
+    assert_eq!(again, bytes, "the v1 state does not re-encode to its bytes");
+    let params = ChatRoomParametersV1 {
+        owner: v1_owner(&v1),
+    };
+    v1.verify(&v1, &params).unwrap();
+    println!(
+        "{} bytes round-trip and verify: {} members, {} messages",
+        bytes.len(),
+        v1.members.members.len(),
+        v1.recent_messages.messages.len()
+    );
+}
