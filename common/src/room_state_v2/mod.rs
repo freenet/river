@@ -38,7 +38,10 @@
 //!   legacy window closed. That hour is a field of the closing configuration
 //!   (`legacy_window_closed_at`), so the cap is fixed by L1. While the window
 //!   is open the cap is `Clock + 24h`; with the window open and no `Clock`,
-//!   legacy times are uncapped, as v2 times are without a `Clock`.
+//!   legacy times are uncapped, as v2 times are without a `Clock` (a member
+//!   could then pin the newest slots with far-future times, as in v1). A
+//!   converting owner signs a `Clock` with its configuration, so a migrated
+//!   room has one from the start.
 //! - **(c) Chain depth.** `max_chain_depth` limits accepted links only. A
 //!   legacy link is admitted at any depth (v1 had no depth limit), so a
 //!   migrated room keeps every v1 member however deep its invite chain; the
@@ -61,7 +64,10 @@
 //! - **(h) Legacy DM pairs.** A legacy DM's per-pair group is (sender,
 //!   recipient's 64-bit id), and it is dropped if the purge envelope of any
 //!   kept key matching that id lists its token. Two keys match one id only
-//!   in crafted states.
+//!   in crafted states. v1 ids (here and in legacy ban targets) are
+//!   `fast_hash`, a polynomial hash: a key colliding with a chosen member's
+//!   id costs about 2^64 key generations, a colliding pair of one's own
+//!   keys about 2^32. v2 records name keys, never ids.
 //! - **(i) Ceilings, and what they cost a migrated room.** v1 bounded
 //!   neither the message cap, nor message size, nor the DM cap, nor room
 //!   name or description length; the ceilings in [`config::ceiling`] set
@@ -100,7 +106,10 @@
 //!   slow to decode in WASM; at the v2 bounds the largest legacy-heavy state
 //!   exceeds the 2.5 s timing bound. A migrated room therefore loses v1
 //!   messages over 1,000 bytes and DMs over 2,560 (none in the Official room
-//!   on 2026-10-26), an exception to keeping every v1 record.
+//!   on 2026-10-26), an exception to keeping every v1 record. A legacy
+//!   activity record is held to the 1,000 bytes only, not to the room's
+//!   `max_message_size`: it stands for the member's activity, not a message
+//!   shown.
 //! - **(n) Refusal at the contract boundary.** An incoming state or delta
 //!   holding more records of a kind than a valid state can hold is refused
 //!   before any legacy record is decoded or any signature checked

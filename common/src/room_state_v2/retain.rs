@@ -461,7 +461,10 @@ pub fn retain_refs(
         },
     };
 
-    // Link checkpoint: highest version, ties by lower signature bytes.
+    // Link checkpoint: highest version, ties by lower signature bytes. One
+    // keeping more links than the configuration's `max_links` is not valid,
+    // so lowering `max_links` below a checkpoint's list drops that
+    // checkpoint (and its retirements) until the owner signs a smaller one.
     let mut cands: Vec<(Reverse<u32>, Sig, usize)> = c
         .kind(3)
         .into_iter()
