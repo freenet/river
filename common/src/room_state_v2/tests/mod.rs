@@ -2,6 +2,7 @@
 //! and random universes, ported), mutants as negative tests, and unit tests
 //! of encoding, validation, summaries and deltas.
 
+mod bounds_tests;
 mod builder;
 mod convert_tests;
 mod corpus;
