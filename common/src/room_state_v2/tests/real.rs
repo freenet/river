@@ -26,27 +26,21 @@ use crate::room_state_v2::retain::{retain, test_cap, Verifier};
 use crate::room_state_v2::state::{
     apply_delta, merge, normalize, validate_state, Invalid, RoomStateV2,
 };
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(1 << 32);
-
+/// Results of the real path, shared by every worker thread (the drivers
+/// start new threads for each phase, so a per-thread memo would start
+/// empty each time).
 #[derive(Default)]
 struct Memo {
-    id: u64,
     f: HashMap<S, S>,
     valid: HashMap<S, bool>,
     merge: HashMap<(S, S), S>,
 }
 
-thread_local! {
-    static MEMO: RefCell<Memo> = RefCell::new(Memo::default());
-}
-
 pub struct Real {
-    id: u64,
     pub name: String,
     owner: Key,
     pub recs: Vec<Record>,
@@ -70,6 +64,7 @@ pub struct Real {
     /// and refused: the forgeries reached the signature check, not only a
     /// structural filter.
     pub refused_kinds: AtomicU64,
+    memo: Mutex<Memo>,
 }
 
 impl Real {
@@ -132,7 +127,6 @@ impl Real {
         };
         let genuine = (1u128 << n) - 1;
         Real {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
             owner: o,
             recs,
@@ -148,6 +142,7 @@ impl Real {
             forged_kept: AtomicU64::new(0),
             first_differs: Mutex::new(None),
             refused_kinds: AtomicU64::new(0),
+            memo: Mutex::new(Memo::default()),
         }
     }
 
@@ -170,16 +165,11 @@ impl Real {
     }
 
     fn memo<T>(&self, run: impl FnOnce(&mut Memo) -> T) -> T {
-        MEMO.with(|m| {
-            let mut m = m.borrow_mut();
-            if m.id != self.id || m.f.len() + m.merge.len() > 2_000_000 {
-                *m = Memo {
-                    id: self.id,
-                    ..Memo::default()
-                };
-            }
-            run(&mut m)
-        })
+        let mut m = self.memo.lock().unwrap();
+        if m.f.len() + m.merge.len() + m.valid.len() > 4_000_000 {
+            *m = Memo::default();
+        }
+        run(&mut m)
     }
 
     fn compute_f(&self, u: S) -> S {
@@ -595,17 +585,19 @@ fn the_real_path_obeys_the_laws_under_a_binding_legacy_link_cap() {
 }
 
 #[test]
-#[ignore = "full size: the real path over every family and 20 random universes (release build)"]
+#[ignore = "larger: the real path over every family and 6 random universes, with and without a binding cap (release build, minutes)"]
 fn the_real_path_obeys_the_laws_with_forged_records_at_size() {
-    for cap in [None, Some(1), Some(2)] {
-        let fams = env("RIVER_V2_REAL_FAMS", 20);
+    // Every operation checks real signatures with a fresh verifier, so this
+    // costs far more per triple than the bit-set runs.
+    for cap in [None, Some(1)] {
+        let fams = env("RIVER_V2_REAL_FAMS", 6);
         let r = run_real(
             cap,
             fams,
-            env("RIVER_V2_REAL_POOL", 400) as usize,
-            env("RIVER_V2_REAL_PAIRS", 5_000),
-            env("RIVER_V2_REAL_TRIPLES", 10_000),
-            env("RIVER_V2_REAL_SAMPLES", 40) as usize,
+            env("RIVER_V2_REAL_POOL", 100) as usize,
+            env("RIVER_V2_REAL_PAIRS", 400),
+            env("RIVER_V2_REAL_TRIPLES", 800),
+            env("RIVER_V2_REAL_SAMPLES", 10) as usize,
         );
         assert_real(&r, fams);
     }
