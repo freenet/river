@@ -195,6 +195,10 @@ fn main() {
                 oshaped(&engine, &module);
                 continue;
             }
+            "adv" => {
+                adversarial(&engine, &module);
+                continue;
+            }
             n => Caps::ceilings().scaled(n.parse().unwrap()),
         };
         let t = Instant::now();
@@ -344,4 +348,32 @@ fn oshaped(engine: &Engine, module: &Module) {
         held.records.len()
     );
     run(engine, module, &k, &fb, &fb, &hb);
+}
+
+/// `adv`: the worst adversarial update found: the held state is the largest
+/// mixed legacy state, the update every record of the other variant except
+/// the owner's (configuration, clock, checkpoint, upgrade, roster, secret
+/// versions). It holds as many records of each kind as a valid state, each
+/// decoded, and `f` drops almost all of them without a signature check
+/// (their members are not admitted). Only update and merge are meaningful.
+fn adversarial(engine: &Engine, module: &Module) {
+    let caps = Caps::ceilings_legacy();
+    let (a, _) = largest_state(caps, 0);
+    let (b, _) = largest_state(caps, 1);
+    let o = Bytes32(owner_key().verifying_key().to_bytes());
+    let junk = river_core::room_state_v2::RoomStateV2::from_records(
+        b.records
+            .into_iter()
+            .filter(|r| !matches!(r.kind(), 0 | 2 | 3 | 4 | 5 | 6))
+            .collect(),
+    );
+    let (ab, jb) = (a.to_bytes(), junk.to_bytes());
+    println!(
+        "adv: held {} records ({} bytes); update {} records ({} bytes)",
+        a.records.len(),
+        ab.len(),
+        junk.records.len(),
+        jb.len()
+    );
+    run(engine, module, &o, &ab, &jb, &ab);
 }
