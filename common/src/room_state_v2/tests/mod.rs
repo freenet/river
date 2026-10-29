@@ -11,6 +11,7 @@ mod fastcbor_tests;
 mod harness;
 mod laws;
 mod mechanisms;
+mod selftest;
 mod sizes;
 mod state_tests;
 mod universe;

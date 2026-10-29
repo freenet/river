@@ -35,6 +35,11 @@ pub trait LawModel: Sync {
     fn merge(&self, a: S, b: S) -> S {
         self.f(a | b)
     }
+    /// For a model with a delta path: whether `apply_delta(A, delta(B,
+    /// summary(A)))` equals `merge(A, B)`. `None`: no delta path.
+    fn delta_ok(&self, _a: S, _b: S) -> Option<bool> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -123,6 +128,8 @@ pub struct Counts {
     pub cycle: u64,
     pub redelivery: u64,
     pub out_of_passes: u64,
+    pub delta_checked: u64,
+    pub delta_fail: u64,
     pub first_absorb: Option<(S, S)>,
     pub first_assoc: Option<(S, S, S, Verdict)>,
 }
@@ -165,6 +172,12 @@ impl Counts {
                 self.first_absorb = Some((a, b));
             }
         }
+        if let Some(ok) = m.delta_ok(a, b) {
+            self.delta_checked += 1;
+            if !ok {
+                self.delta_fail += 1;
+            }
+        }
     }
     pub fn merge_from(&mut self, o: &Counts) {
         self.raw_idem_checked += o.raw_idem_checked;
@@ -182,6 +195,8 @@ impl Counts {
         self.cycle += o.cycle;
         self.redelivery += o.redelivery;
         self.out_of_passes += o.out_of_passes;
+        self.delta_checked += o.delta_checked;
+        self.delta_fail += o.delta_fail;
         if self.first_absorb.is_none() {
             self.first_absorb = o.first_absorb;
         }
@@ -191,6 +206,7 @@ impl Counts {
     }
     pub fn bad(&self) -> bool {
         self.absorb_fail + self.raw_idem_fail + self.emitted_invalid + self.comm_fail > 0
+            || self.delta_fail > 0
             || self.invalid_grouping + self.not_converged + self.cycle + self.redelivery > 0
     }
 }
@@ -218,7 +234,23 @@ impl Rng {
     }
 }
 
+thread_local! {
+    /// A worker count set by a test on its own thread (see [`with_threads`]).
+    static THREADS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `run` with the drivers called from this thread using `n` workers.
+pub fn with_threads<T>(n: usize, run: impl FnOnce() -> T) -> T {
+    THREADS.with(|t| t.set(Some(n)));
+    let out = run();
+    THREADS.with(|t| t.set(None));
+    out
+}
+
 pub fn threads() -> usize {
+    if let Some(n) = THREADS.with(|t| t.get()) {
+        return n;
+    }
     std::env::var("RIVER_V2_LAW_THREADS")
         .ok()
         .and_then(|x| x.parse().ok())
@@ -303,29 +335,64 @@ pub fn exhaustive<M: LawModel>(m: &M, triple_sample: Option<u64>) -> Counts {
     }
     if let Some(n) = triple_sample {
         if !valid.is_empty() {
-            let parts: Vec<Counts> = std::thread::scope(|sc| {
-                let hs: Vec<_> = (0..nt)
-                    .map(|t| {
-                        let valid = &valid;
-                        sc.spawn(move || {
-                            let mut rng = Rng(0x5eed ^ (t + 1).wrapping_mul(0x9e37_79b9));
-                            let mut c = Counts::default();
-                            let pick =
-                                |rng: &mut Rng| valid[rng.below(valid.len() as u64) as usize];
-                            for _ in 0..n / nt {
-                                let (a, b, cc) = (pick(&mut rng), pick(&mut rng), pick(&mut rng));
-                                c.add_triple(assoc(m, a, b, cc), (a, b, cc));
-                            }
-                            c
-                        })
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            for p in &parts {
-                c.merge_from(p);
-            }
+            let valid = &valid;
+            let parts = chunked(
+                n,
+                |k| 0x5eed ^ (k + 1).wrapping_mul(0x9e37_79b9),
+                |rng, count| {
+                    let mut c = Counts::default();
+                    let pick = |rng: &mut Rng| valid[rng.below(valid.len() as u64) as usize];
+                    for _ in 0..count {
+                        let (a, b, cc) = (pick(rng), pick(rng), pick(rng));
+                        c.add_triple(assoc(m, a, b, cc), (a, b, cc));
+                    }
+                    c
+                },
+            );
+            c.merge_from(&parts);
         }
+    }
+    c
+}
+
+/// The number of chunks sampled work is split into. Fixed, so which pairs
+/// and triples are drawn depends only on the seed, not on the thread count.
+pub const CHUNKS: u64 = 64;
+
+/// Runs `work` over [`CHUNKS`] chunks that share `total` items, chunk `k`
+/// drawing from `Rng(seed(k))`, on [`threads`] workers; merges the chunks'
+/// counts in chunk order.
+pub fn chunked(
+    total: u64,
+    seed: impl Fn(u64) -> u64 + Sync,
+    work: impl Fn(&mut Rng, u64) -> Counts + Sync,
+) -> Counts {
+    let next = AtomicU64::new(0);
+    let mut parts: Vec<(u64, Counts)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads())
+            .map(|_| {
+                let (next, seed, work) = (&next, &seed, &work);
+                sc.spawn(move || {
+                    let mut out = vec![];
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= CHUNKS {
+                            break;
+                        }
+                        let count = total / CHUNKS + u64::from(k < total % CHUNKS);
+                        let mut rng = Rng(seed(k));
+                        out.push((k, work(&mut rng, count)));
+                    }
+                    out
+                })
+            })
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    parts.sort_by_key(|p| p.0);
+    let mut c = Counts::default();
+    for (_, p) in &parts {
+        c.merge_from(p);
     }
     c
 }
@@ -354,32 +421,36 @@ pub fn random<M: LawModel>(m: &M, seed: u64, pool_n: usize, pairs: u64, triples:
     if pool.is_empty() {
         return c;
     }
-    let nt = threads() as u64;
-    let parts: Vec<Counts> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt)
-            .map(|t| {
-                let pool = &pool;
-                sc.spawn(move || {
-                    let mut rng = Rng(seed ^ (t + 1).wrapping_mul(0x1234_5678_9abc_def1));
-                    let mut c = Counts::default();
-                    let pick = |rng: &mut Rng| pool[rng.below(pool.len() as u64) as usize];
-                    for _ in 0..pairs / nt {
-                        let (a, b) = (pick(&mut rng), pick(&mut rng));
-                        c.add_pair(m, a, b);
-                    }
-                    for _ in 0..triples / nt {
-                        let (a, b, cc) = (pick(&mut rng), pick(&mut rng), pick(&mut rng));
-                        c.add_triple(assoc(m, a, b, cc), (a, b, cc));
-                    }
-                    c
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    for p in &parts {
-        c.merge_from(p);
-    }
+    let pool = &pool;
+    let pick = |rng: &mut Rng| pool[rng.below(pool.len() as u64) as usize];
+    // Pairs and triples are split over the chunks separately, so each total
+    // is exact.
+    let pc = chunked(
+        pairs,
+        |k| seed ^ (k + 1).wrapping_mul(0x1234_5678_9abc_def1),
+        |rng, count| {
+            let mut c = Counts::default();
+            for _ in 0..count {
+                let (a, b) = (pick(rng), pick(rng));
+                c.add_pair(m, a, b);
+            }
+            c
+        },
+    );
+    let tc = chunked(
+        triples,
+        |k| !seed ^ (k + 1).wrapping_mul(0x1234_5678_9abc_def1),
+        |rng, count| {
+            let mut c = Counts::default();
+            for _ in 0..count {
+                let (a, b, cc) = (pick(rng), pick(rng), pick(rng));
+                c.add_triple(assoc(m, a, b, cc), (a, b, cc));
+            }
+            c
+        },
+    );
+    c.merge_from(&pc);
+    c.merge_from(&tc);
     c
 }
 
@@ -445,7 +516,7 @@ pub fn minimize_pair<M: LawModel>(m: &M, (mut a, mut b): (S, S)) -> (S, S) {
 
 pub fn row(label: &str, cfgdesc: &str, c: &Counts) -> String {
     format!(
-        "| {label} | {cfgdesc} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+        "| {label} | {cfgdesc} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{} |",
         c.states,
         c.raw_idem_fail,
         c.raw_idem_checked,
@@ -461,10 +532,12 @@ pub fn row(label: &str, cfgdesc: &str, c: &Counts) -> String {
         c.cycle,
         c.redelivery,
         c.not_converged + c.out_of_passes,
+        c.delta_fail,
+        c.delta_checked,
     )
 }
 
-pub const HEADER: &str = "| model | config | valid states | f not idempotent on raw sets | pairs | comm fail | absorb fail (either dir) | merge emits invalid | triples | inconclusive (invalid intermediate) | strict assoc fail | healed | invalid grouping | cycle | redelivery | not-converged + out-of-passes |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|";
+pub const HEADER: &str = "| model | config | valid states | f not idempotent on raw sets | pairs | comm fail | absorb fail (either dir) | merge emits invalid | triples | inconclusive (invalid intermediate) | strict assoc fail | healed | invalid grouping | cycle | redelivery | not-converged + out-of-passes | delta path differs / checked |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|";
 
 pub fn report_failures<M: LawModel>(m: &M, c: &Counts) {
     if let Some(p) = c.first_absorb {
