@@ -6,10 +6,11 @@
 
 use super::builder::owner;
 use super::families::{
-    legacy_families, rand_cfg, rand_universe, rand_universe_l5, rand_universe_legacy,
-    tiny_families,
+    legacy_families, rand_cfg, rand_universe, rand_universe_l5, rand_universe_legacy, tiny_families,
 };
-use super::harness::{bits, exhaustive, random, report_failures, row, Counts, LawModel, Rng, HEADER, S};
+use super::harness::{
+    bits, exhaustive, random, report_failures, row, Counts, LawModel, Rng, HEADER, S,
+};
 use super::universe::Universe;
 use crate::room_state_v2::retain::mutant::Mutant;
 
@@ -71,7 +72,12 @@ pub fn rand_family(seed0: u64, fi: u64, gen: Gen) -> super::builder::Builder {
 
 /// As [`rand_family`], with every configuration's window-close hour set to
 /// `closed` when given.
-fn rand_family_closed(seed0: u64, fi: u64, gen: Gen, closed: Option<u32>) -> super::builder::Builder {
+fn rand_family_closed(
+    seed0: u64,
+    fi: u64,
+    gen: Gen,
+    closed: Option<u32>,
+) -> super::builder::Builder {
     let mut rng = Rng(seed0 * 100_000 + fi);
     let keys = 4 + rng.below(2) as usize;
     let mut close = Rng(seed0 * 100_000 + fi + (1 << 40));
@@ -153,7 +159,11 @@ fn assert_powered(r: &RandomRun) {
         r.min_states, r.tot.states, r.fams, r.pool
     );
     assert!(r.fams > 0, "no universes ran");
-    assert!(r.min_states >= 10, "a universe yielded only {} valid states", r.min_states);
+    assert!(
+        r.min_states >= 10,
+        "a universe yielded only {} valid states",
+        r.min_states
+    );
     assert!(
         r.tot.states * 2 >= r.fams * r.pool as u64,
         "{} valid states over {} universes",
@@ -162,7 +172,10 @@ fn assert_powered(r: &RandomRun) {
     );
     assert!(r.tot.pairs >= 100 * r.fams, "{} pairs", r.tot.pairs);
     assert!(r.tot.triples >= 100 * r.fams, "{} triples", r.tot.triples);
-    assert!(r.tot.strict_fail > 0, "no triple failed strict associativity");
+    assert!(
+        r.tot.strict_fail > 0,
+        "no triple failed strict associativity"
+    );
     assert!(r.tot.healed > 0, "no triple healed");
 }
 
@@ -252,7 +265,11 @@ fn random_universes_obey_the_laws_at_model_size() {
 
 /// The counts of the families whose name contains `family`, summed.
 fn counts_of(r: &[(String, Counts)], family: &str) -> Counts {
-    let v: Vec<(String, Counts)> = r.iter().filter(|(n, _)| n.contains(family)).cloned().collect();
+    let v: Vec<(String, Counts)> = r
+        .iter()
+        .filter(|(n, _)| n.contains(family))
+        .cloned()
+        .collect();
     assert!(!v.is_empty(), "no family {family} ran");
     total(&v)
 }
@@ -448,7 +465,10 @@ fn run_capped(cap: u32, triples: u64, fams: u64, pool: usize, pairs: u64, rtripl
         t.merge_from(&c);
     }
     assert!(!t.bad(), "a law failed under the legacy link cap {cap}");
-    assert!(bound_tiny > 0, "the cap of {cap} never bound in a tiny family");
+    assert!(
+        bound_tiny > 0,
+        "the cap of {cap} never bound in a tiny family"
+    );
     let r = run_random(
         Mutant::None,
         Gen::Legacy,
@@ -465,13 +485,20 @@ fn run_capped(cap: u32, triples: u64, fams: u64, pool: usize, pairs: u64, rtripl
     let seed0 = env("RIVER_V2_SEED", 36);
     let mut bound_random = 0;
     for (fi, m) in r.universes.iter().enumerate() {
-        let free = Universe::new("free", rand_family(seed0, fi as u64, Gen::Legacy), Mutant::None);
+        let free = Universe::new(
+            "free",
+            rand_family(seed0, fi as u64, Gen::Legacy),
+            Mutant::None,
+        );
         let mut rng = Rng(fi as u64 + 77);
         let n = m.n();
         bound_random += bound(m, &free, cap, (0..300).map(|_| rng.subset(n, 700)));
     }
     println!("random subsets where the cap of {cap} bound: {bound_random}");
-    assert!(bound_random > 0, "the cap of {cap} never bound in a random universe");
+    assert!(
+        bound_random > 0,
+        "the cap of {cap} never bound in a random universe"
+    );
 }
 
 #[test]

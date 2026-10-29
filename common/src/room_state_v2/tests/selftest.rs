@@ -77,7 +77,10 @@ fn a_cyclic_merge_is_reported_as_a_cycle() {
     let c = exhaustive(&m, None);
     assert_eq!(c.states, 3);
     assert!(c.cycle > 0, "no cycle counted");
-    assert_eq!(c.comm_fail + c.absorb_fail + c.redelivery + c.not_converged, 0);
+    assert_eq!(
+        c.comm_fail + c.absorb_fail + c.redelivery + c.not_converged,
+        0
+    );
     assert!(c.bad());
 }
 
@@ -125,7 +128,13 @@ fn sampled_triples_do_not_depend_on_the_thread_count() {
     };
     let run = |t: usize| {
         let c = with_threads(t, || exhaustive(&m, Some(1_001)));
-        (c.triples, c.strict_fail, c.cycle, c.inconclusive, c.first_assoc)
+        (
+            c.triples,
+            c.strict_fail,
+            c.cycle,
+            c.inconclusive,
+            c.first_assoc,
+        )
     };
     let one = run(1);
     assert_eq!(one.0, 1_001);

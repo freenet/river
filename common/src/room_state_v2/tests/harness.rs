@@ -2,7 +2,6 @@
 //! the verifier's heal rule for associativity, the counts, and the
 //! exhaustive and random drivers. A state is a bit set over a universe of
 //! records; `f` is the real retention function (see `universe.rs`).
-#![allow(dead_code)]
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 

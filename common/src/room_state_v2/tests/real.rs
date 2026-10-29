@@ -76,7 +76,13 @@ impl Real {
     /// The universe of `b` plus, for up to `per_kind` records of each kind
     /// (chosen by `rng`), every forgery of the record, as long as the whole
     /// fits in 128 records.
-    pub fn new(name: &str, mut b: Builder, cap: Option<u32>, per_kind: usize, rng: &mut Rng) -> Real {
+    pub fn new(
+        name: &str,
+        mut b: Builder,
+        cap: Option<u32>,
+        per_kind: usize,
+        rng: &mut Rng,
+    ) -> Real {
         let o = owner();
         // A generator can build one record twice (equal fields sign alike);
         // a state holds it once, so the universe does too.
@@ -306,11 +312,19 @@ fn forged_checks(m: &Real, pool: &[S], n: usize, rng: &mut Rng) -> (u64, u64) {
     for &j in &forged {
         checks += 2;
         if m.f(m.genuine | bit(j)) != all {
-            fail("f changed", format!("all genuine and {}", m.names[j]), &mut fails);
+            fail(
+                "f changed",
+                format!("all genuine and {}", m.names[j]),
+                &mut fails,
+            );
         }
         let without = m.genuine & !bit(m.origin[&j]);
         if m.f(without | bit(j)) != m.f(without) {
-            fail("f changed", format!("{} in place of its original", m.names[j]), &mut fails);
+            fail(
+                "f changed",
+                format!("{} in place of its original", m.names[j]),
+                &mut fails,
+            );
         }
     }
     for _ in 0..n {
@@ -408,11 +422,7 @@ fn run_model(
         "{}",
         row(
             &m.name,
-            &format!(
-                "{} recs ({} forged)",
-                m.recs.len(),
-                m.forged.count_ones()
-            ),
+            &format!("{} recs ({} forged)", m.recs.len(), m.forged.count_ones()),
             &c
         )
     );
@@ -446,7 +456,14 @@ fn run_model(
 /// The real path over the tiny families, the legacy families (under the
 /// legacy link cap `cap`, when set) and `fams` random legacy-heavy
 /// universes.
-fn run_real(cap: Option<u32>, fams: u64, pool: usize, pairs: u64, triples: u64, samples: usize) -> Run {
+fn run_real(
+    cap: Option<u32>,
+    fams: u64,
+    pool: usize,
+    pairs: u64,
+    triples: u64,
+    samples: usize,
+) -> Run {
     let _ = owner();
     println!("{HEADER}");
     let mut out = Run {
@@ -463,12 +480,29 @@ fn run_real(cap: Option<u32>, fams: u64, pool: usize, pairs: u64, triples: u64, 
     let fam: Vec<_> = if cap.is_some() {
         legacy_families()
     } else {
-        tiny_families().into_iter().chain(legacy_families()).collect()
+        tiny_families()
+            .into_iter()
+            .chain(legacy_families())
+            .collect()
     };
     for (fi, (name, ub, base, v1)) in fam.into_iter().enumerate() {
         let mut rng = Rng(fi as u64 + 1);
-        let m = Real::new(&format!("real {cap:?} / {name}"), ub(base, v1), cap, 2, &mut rng);
-        run_model(&m, 1000 + fi as u64, pool, pairs, triples, samples, &mut out);
+        let m = Real::new(
+            &format!("real {cap:?} / {name}"),
+            ub(base, v1),
+            cap,
+            2,
+            &mut rng,
+        );
+        run_model(
+            &m,
+            1000 + fi as u64,
+            pool,
+            pairs,
+            triples,
+            samples,
+            &mut out,
+        );
     }
     let seed0 = env("RIVER_V2_SEED", 36);
     for fi in 0..fams {
@@ -503,13 +537,32 @@ fn assert_real(r: &Run, fams: u64) {
     assert_eq!(r.unclean, 0, "the real f differs from the universe's");
     assert_eq!(r.forged_fails, 0, "a forged record changed an outcome");
     assert!(r.models as u64 > fams, "too few models ran");
-    assert!(r.min_pool >= 10, "a model yielded only {} states", r.min_pool);
-    assert!(r.forged >= 10 * r.models as u64, "{} forged records", r.forged);
+    assert!(
+        r.min_pool >= 10,
+        "a model yielded only {} states",
+        r.min_pool
+    );
+    assert!(
+        r.forged >= 10 * r.models as u64,
+        "{} forged records",
+        r.forged
+    );
     assert!(r.forged_checks > 0);
-    assert!(r.counts.pairs >= 50 * r.models as u64, "{} pairs", r.counts.pairs);
+    assert!(
+        r.counts.pairs >= 50 * r.models as u64,
+        "{} pairs",
+        r.counts.pairs
+    );
     assert_eq!(r.counts.delta_checked, r.counts.pairs);
-    assert!(r.counts.triples >= 50 * r.models as u64, "{} triples", r.counts.triples);
-    assert!(r.counts.strict_fail > 0, "no triple failed strict associativity");
+    assert!(
+        r.counts.triples >= 50 * r.models as u64,
+        "{} triples",
+        r.counts.triples
+    );
+    assert!(
+        r.counts.strict_fail > 0,
+        "no triple failed strict associativity"
+    );
     assert!(r.counts.healed > 0, "no triple healed");
 }
 
@@ -557,4 +610,3 @@ fn the_real_path_obeys_the_laws_with_forged_records_at_size() {
         assert_real(&r, fams);
     }
 }
-

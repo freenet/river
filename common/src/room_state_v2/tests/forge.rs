@@ -182,4 +182,3 @@ pub fn forgeries(o: &Key, r: &Record) -> Vec<(String, Record)> {
         }
     }
 }
-
