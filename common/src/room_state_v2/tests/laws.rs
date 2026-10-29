@@ -66,13 +66,19 @@ pub struct RandomRun {
 /// The configurations and universe of random family `fi`. The window-close
 /// hour comes from its own generator, so adding it changed no other draw.
 pub fn rand_family(seed0: u64, fi: u64, gen: Gen) -> super::builder::Builder {
+    rand_family_closed(seed0, fi, gen, None)
+}
+
+/// As [`rand_family`], with every configuration's window-close hour set to
+/// `closed` when given.
+fn rand_family_closed(seed0: u64, fi: u64, gen: Gen, closed: Option<u32>) -> super::builder::Builder {
     let mut rng = Rng(seed0 * 100_000 + fi);
     let keys = 4 + rng.below(2) as usize;
     let mut close = Rng(seed0 * 100_000 + fi + (1 << 40));
     let mut cfg = |rng: &mut Rng| {
         let mut c = rand_cfg(rng, keys);
         // Legacy times in the generators run from 0 to about 40 hours.
-        c.closed_at = close.below(48) as u32;
+        c.closed_at = closed.unwrap_or(close.below(48) as u32);
         c
     };
     let (c0, v1, v2) = (cfg(&mut rng), cfg(&mut rng), cfg(&mut rng));
@@ -244,47 +250,61 @@ fn random_universes_obey_the_laws_at_model_size() {
 // ---- mutants: each makes a lower step delete or hide something an upper
 // step read, and the harness must catch it where the model caught it.
 
-fn detected_in(r: &[(String, Counts)], family: &str) -> bool {
-    r.iter().any(|(n, c)| n.contains(family) && c.bad())
+/// The counts of the families whose name contains `family`, summed.
+fn counts_of(r: &[(String, Counts)], family: &str) -> Counts {
+    let v: Vec<(String, Counts)> = r.iter().filter(|(n, _)| n.contains(family)).cloned().collect();
+    assert!(!v.is_empty(), "no family {family} ran");
+    total(&v)
 }
 
+// Each mutant is caught by the laws it breaks: the assertions name the
+// counts that must go non-zero, not only that some count did.
+
+/// Bans read a record (the issuer's message) the message cap can delete:
+/// `f` is not idempotent, a merge emits a state `f` would change, and
+/// absorption fails.
 #[test]
 fn mutant_ban_reading_issuer_messages_is_caught() {
     let r = run_tiny(Mutant::PresenceMsgBans, Some(20_000), Some("U4"));
-    assert!(detected_in(&r, "U4"));
+    let c = counts_of(&r, "U4");
+    assert!(c.raw_idem_fail > 0, "raw idempotence");
+    assert!(c.emitted_invalid > 0, "emitted validity");
+    assert!(c.absorb_fail > 0, "absorption");
+    assert!(c.bad());
 }
 
+/// Members kept only while a message needs them: absorption fails, and
+/// associativity fails in a way the heal rule cannot repair (a cycle).
 #[test]
 fn mutant_upward_retention_is_caught() {
     let r = run_tiny(Mutant::UpwardRetention, Some(20_000), Some("U5"));
-    assert!(detected_in(&r, "U5"));
+    let c = counts_of(&r, "U5");
+    assert!(c.absorb_fail > 0, "absorption");
+    assert!(c.cycle > 0, "associativity (cycle)");
+    assert!(c.bad());
 }
 
+/// A link whose parent is absent admitted as a root: absorption fails and
+/// associativity cycles.
 #[test]
 fn mutant_no_self_containment_is_caught() {
     let r = run_tiny(Mutant::NoSelfContained, Some(20_000), Some("U1"));
-    assert!(detected_in(&r, "U1"));
+    let c = counts_of(&r, "U1");
+    assert!(c.absorb_fail > 0, "absorption");
+    assert!(c.cycle > 0, "associativity (cycle)");
+    assert!(c.bad());
 }
 
+/// A link sweep after the member cap: `f` is not idempotent, a merge emits
+/// a state `f` would change, and absorption fails.
 #[test]
 fn mutant_link_sweep_after_member_cap_is_caught() {
-    let r = run_tiny(Mutant::SweepAfterL4, Some(20_000), None);
-    let detected = if r.iter().any(|(_, c)| c.bad()) {
-        1
-    } else {
-        run_random(
-            Mutant::SweepAfterL4,
-            Gen::Model,
-            None,
-            12,
-            300,
-            1_000,
-            3_000,
-            false,
-        )
-        .detected
-    };
-    assert!(detected > 0);
+    let r = run_tiny(Mutant::SweepAfterL4, Some(20_000), Some("U1"));
+    let c = counts_of(&r, "U1");
+    assert!(c.raw_idem_fail > 0, "raw idempotence");
+    assert!(c.emitted_invalid > 0, "emitted validity");
+    assert!(c.absorb_fail > 0, "absorption");
+    assert!(c.bad());
 }
 
 #[test]
@@ -322,11 +342,38 @@ fn extended_random_universes_obey_the_laws_at_model_size() {
     assert_powered(&r);
 }
 
+/// The window-close hour matters in the legacy-heavy random universes (the
+/// ones the cap and real-path runs use): with it set to 0
+/// (every legacy time capped at the epoch), `f` keeps a different set for
+/// some subsets, so closed-window legacy time capping is exercised.
+#[test]
+fn the_window_close_hour_changes_outcomes() {
+    let mut differ = 0;
+    for fi in 0..12 {
+        let m = Universe::new("drawn", rand_family(36, fi, Gen::Legacy), Mutant::None);
+        let z = Universe::new(
+            "zero",
+            rand_family_closed(36, fi, Gen::Legacy, Some(0)),
+            Mutant::None,
+        );
+        assert_eq!(m.n(), z.n());
+        let mut r = Rng(fi + 5);
+        for _ in 0..300 {
+            let s = r.subset(m.n(), 700);
+            // The two universes name their records alike.
+            if m.show(m.f(s)) != z.show(z.f(s)) {
+                differ += 1;
+            }
+        }
+    }
+    println!("subsets where the window-close hour changed f: {differ}");
+    assert!(differ > 0);
+}
+
 /// The extended universes are not vacuous: across f of random subsets, every
 /// record kind they add survives in some state.
 #[test]
 fn extended_universes_keep_every_kind_they_add() {
-    use super::harness::{bits, LawModel};
     let mut seen = [0u32; 24];
     for fi in 0..12 {
         let mut rng = Rng(36 * 100_000 + fi);

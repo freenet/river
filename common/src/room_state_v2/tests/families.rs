@@ -584,8 +584,9 @@ pub fn rand_universe_l5(rng: &mut Rng, keys: usize, c0: Cfg, v1: Cfg, v2: Cfg) -
 
 /// Not in the model: [`rand_universe_l5`] plus 2-4 more legacy links, each
 /// invited by the owner or by the member of an earlier legacy link (so v1
-/// chains several deep), some rostered, with legacy activity for some of
-/// their members. For the legacy link cap.
+/// chains several deep), with legacy activity for some of their members, a
+/// v1 message by each and some v1 owner bans, some of all of these
+/// rostered. For the legacy link cap and closed-window time capping.
 pub fn rand_universe_legacy(rng: &mut Rng, keys: usize, c0: Cfg, v1: Cfg, v2: Cfg) -> Builder {
     let mut b = rand_universe_l5(rng, keys, c0, v1, v2);
     let mut members = vec![0usize];
@@ -601,6 +602,16 @@ pub fn rand_universe_legacy(rng: &mut Rng, keys: usize, c0: Cfg, v1: Cfg, v2: Cf
         members.push(k);
         if rng.below(2) == 0 {
             b.legacy_msg(k, rng.below(9) as u32, true);
+        }
+        // A v1 message by the new member and a v1 owner ban, at times on
+        // either side of the window-close hour (0 to 47), so closed-window
+        // capping changes their order against v2 records.
+        b.legacy_msg(k, rng.below(48) as u32, false);
+        idx.push(b.recs.len() - 1);
+        if rng.below(2) == 0 {
+            let t = super::builder::T::Keys(1 << (1 + rng.below(keys as u64)));
+            b.oban(&format!("OH{n}"), t, rng.below(48) as u32, 0);
+            idx.push(b.recs.len() - 1);
         }
     }
     let pick: Vec<usize> = idx.iter().copied().filter(|_| rng.below(2) == 0).collect();
