@@ -160,14 +160,15 @@ pub fn u7(base: Cfg, v1: Cfg) -> Builder {
     b.finish()
 }
 
-/// The families with legacy links, for the legacy link cap. U7's
+/// The families where the legacy link cap can bind (U6 at cap 1, U7 at
+/// caps 1 and 2; U1 has one legacy link, so no cap binds there). U7's
 /// configurations: the window open in the base (every legacy link counts)
 /// and closed in v1 (only rostered ones), then the reverse with tighter
 /// quotas, which rostered links are exempt from.
 pub fn legacy_families() -> Vec<Family> {
     let mut v: Vec<Family> = tiny_families()
         .into_iter()
-        .filter(|f| f.0.starts_with("U1") || f.0.starts_with("U6"))
+        .filter(|f| f.0.starts_with("U6"))
         .collect();
     v.push((
         "U7 legacy chain",
