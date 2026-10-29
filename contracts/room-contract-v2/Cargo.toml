@@ -16,7 +16,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 ciborium = "0.2.2"
-freenet-stdlib = { version = "0.8.5", features = ["contract"] }
+freenet-stdlib = { version = "0.12.1", features = ["contract"] }
 river-core = { path = "../../common", features = ["room-state-v2"] }
 
 [dev-dependencies]
