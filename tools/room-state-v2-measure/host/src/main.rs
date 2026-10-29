@@ -6,7 +6,7 @@
 //! reservation and one-page guard, an 8 MiB wasm stack, epoch interruption
 //! on, fuel off. Usage: `host <guest.wasm> <spec>...`, a spec being a divisor of the
 //! ceilings (1 = the ceilings), `official`, `ceilings`, `legacy`, `membersN`,
-//! `lmembersN[:L]` (see `Caps`) or `live` (see [`live`]). With `CHECK_SECS=s`,
+//! `lmembersN[:L]` (see `Caps`) or `oshaped` (see [`oshaped`]). With `CHECK_SECS=s`,
 //! exits non-zero if any validate, update or merge call fails or takes longer
 //! than `s` seconds (the local check of the ceilings: `CHECK_SECS=2.5 host
 //! guest.wasm ceilings legacy`). `REPS=n`
@@ -191,8 +191,8 @@ fn main() {
                     ..Caps::members(m)
                 }
             }
-            "live" => {
-                live(&engine, &module);
+            "oshaped" => {
+                oshaped(&engine, &module);
                 continue;
             }
             n => Caps::ceilings().scaled(n.parse().unwrap()),
@@ -313,35 +313,35 @@ fn run(engine: &Engine, module: &Module, o: &Bytes32, ab: &[u8], bb: &[u8], held
     }
 }
 
-/// `live`: a fetched v1 room (RIVER_V1_STATE, RIVER_V1_OWNER base58)
-/// converted as the corpus converts it (every record a legacy record, the
-/// owner not converting). Validate and summarize the whole state; merge it
-/// with itself; update a state holding only its configuration with it (a
-/// peer joining: every record checked).
-fn live(engine: &Engine, module: &Module) {
-    use river_core::room_state::ChatRoomStateV1;
-    use river_core::room_state_v2::convert::{legacy_configuration, legacy_records};
+/// `oshaped`: the Official-shaped v1 room (`official_shaped(1, 1.0)`, real
+/// signatures) converted by its owner, the bot's deputies confirmed and the
+/// bot protected. Validate and summarize the whole state; merge it with
+/// itself; update a state holding only the owner's records with it (a peer
+/// joining: every legacy record checked).
+fn oshaped(engine: &Engine, module: &Module) {
+    use river_core::room_state_v2::convert::{legacy_records, owner_payloads};
     use river_core::room_state_v2::encoding::Key;
+    use river_core::room_state_v2::official_shaped::official_shaped;
     use river_core::room_state_v2::{normalize, Verifier};
-    let path = std::env::var("RIVER_V1_STATE").expect("RIVER_V1_STATE");
-    let v1: ChatRoomStateV1 =
-        ciborium::de::from_reader(&std::fs::read(&path).unwrap()[..]).unwrap();
-    let b = bs58::decode(std::env::var("RIVER_V1_OWNER").expect("RIVER_V1_OWNER"))
-        .into_vec()
-        .unwrap();
-    let o = Bytes32(b.try_into().unwrap());
-    let k: Key = o;
-    let mut recs = vec![legacy_configuration(&k, &v1)];
-    recs.extend(legacy_records(&k, &v1).records);
-    let full = normalize(&k, recs.clone(), &mut Verifier::new()).0;
-    let held = normalize(&k, recs[..1].to_vec(), &mut Verifier::new()).0;
+    let f = official_shaped(1, 1.0);
+    let k = Key::from(&f.owner.verifying_key());
+    let legacy = legacy_records(&k, &f.v1).records;
+    let deputies: Vec<Key> = f.deputies.iter().map(Key::from).collect();
+    let p = owner_payloads(&k, &f.v1, &legacy, 24 * 300, &deputies, &[Key::from(&f.bot)])
+        .unwrap()
+        .payloads;
+    let owner_recs = p.sign(&f.owner);
+    let mut recs = owner_recs.clone();
+    recs.extend(legacy);
+    let full = normalize(&k, recs, &mut Verifier::new()).0;
+    let held = normalize(&k, owner_recs, &mut Verifier::new()).0;
     let (fb, hb) = (full.to_bytes(), held.to_bytes());
     println!(
-        "live ({path}): {} records, {} signatures, {} bytes; held for the update: {} records",
+        "oshaped: {} records, {} signatures, {} bytes; held for the update: {} records",
         full.records.len(),
         full.records.iter().map(signatures).sum::<usize>(),
         fb.len(),
         held.records.len()
     );
-    run(engine, module, &o, &fb, &fb, &hb);
+    run(engine, module, &k, &fb, &fb, &hb);
 }

@@ -134,7 +134,7 @@ pub extern "C" fn hash_n(p: *const u8, n: usize) -> i64 {
 pub extern "C" fn validate_no_signatures(o: *const u8, p: *const u8, n: usize) -> i64 {
     let Some(s) = decode(p, n) else { return -1 };
     let mut v = Verifier::new();
-    v.trust(s.digests());
+    v.trust(&owner(o), s.digests());
     let r = match validate_state(&owner(o), slice(p, n), &mut v) {
         Ok(s) => s.records.len() as i64,
         Err(_) => -1,

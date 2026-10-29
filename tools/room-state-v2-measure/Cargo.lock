@@ -923,8 +923,6 @@ name = "host"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "bs58",
- "ciborium",
  "river-core",
  "wasmtime",
 ]
