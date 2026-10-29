@@ -2,7 +2,6 @@
 //! rule, encoding determinism, and the size bounds.
 
 use crate::room_state_v2::bench::{largest_state, owner_key, Caps};
-use crate::room_state_v2::config::ceiling;
 use crate::room_state_v2::encoding::{to_cbor, Bytes32, Key, Sig};
 use crate::room_state_v2::records::{Record, Signed};
 use crate::room_state_v2::state::{
@@ -212,7 +211,6 @@ fn largest_state_at_the_ceilings() {
         assert!(validate_state(&o, &bytes, &mut v).is_ok());
         let m = merge(&o, &s, &s1, &mut Verifier::new());
         assert!(validate_state(&o, &m.to_bytes(), &mut Verifier::new()).is_ok());
-        let _ = ceiling::MAX_LINKS;
     }
 }
 

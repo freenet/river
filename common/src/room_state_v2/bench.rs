@@ -209,12 +209,17 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
     let clock_hours: u32 = 24 * 300;
     let mut recs: Vec<Record> = vec![];
 
-    // Deputies: enough to hold every deputy ban at the per-deputy limit.
+    // Deputies: the most a configuration holds; the first `n_dep` (enough
+    // to hold every deputy ban at the per-deputy limit) issue bans.
     let n_dep = caps
         .max_deputy_bans
         .div_ceil(caps.max_bans_per_deputy)
         .min(ceiling::AUTHORITY_KEYS as u32);
-    let mut deputies: Vec<Key> = (0..n_dep).map(|i| k(&sk(1, 0, i))).collect();
+    let mut issuing: Vec<Key> = (0..n_dep).map(|i| k(&sk(1, 0, i))).collect();
+    issuing.sort();
+    let mut deputies: Vec<Key> = (0..ceiling::AUTHORITY_KEYS as u32)
+        .map(|i| k(&sk(1, 0, i)))
+        .collect();
     deputies.sort();
     let mut protected: Vec<Key> = (0..ceiling::AUTHORITY_KEYS as u32)
         .map(|i| k(&sk(2, 0, i)))
@@ -258,7 +263,7 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
     cfg.legacy_window_open = caps.legacy;
     cfg.legacy_window_closed_at = clock_hours;
     let mut exceptions: Vec<(Digest, u32)> = (0..ceiling::CHILD_EXCEPTIONS as u32)
-        .map(|i| (Bytes32([i as u8; 32]), 1))
+        .map(|i| (Bytes32([i as u8; 32]), ceiling::MAX_CHILDREN_PER_LINK))
         .collect();
     exceptions.sort();
     exceptions.dedup_by(|a, b| a.0 == b.0);
@@ -306,15 +311,15 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
         }
     }
     for i in 0..caps.max_deputy_bans {
-        let d = (i / caps.max_bans_per_deputy) as usize % deputies.len().max(1);
+        let d = (i / caps.max_bans_per_deputy) as usize % issuing.len().max(1);
         let dsk = (0..n_dep)
             .map(|j| sk(1, 0, j))
-            .find(|s| k(s) == deputies[d])
+            .find(|s| k(s) == issuing[d])
             .unwrap();
         recs.push(ban(
             &o,
             &dsk,
-            Issuer::Deputy(deputies[d]),
+            Issuer::Deputy(issuing[d]),
             k(&sk(4, v, i)),
             i,
             v,

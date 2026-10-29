@@ -18,20 +18,20 @@ compact_struct! {
 pub type Summary = BTreeMap<Kind, BTreeSet<Digest>>;
 
 /// Largest encoded size of one record of each kind, pinned by
-/// `tests::sizes::legacy_record_size_ceilings_hold` and
-/// `tests::state_tests::largest_state_at_the_ceilings`, which build the
-/// largest record of each kind the retention function keeps.
+/// `tests::sizes::{v2,legacy}_record_size_ceilings_hold`, which build the
+/// largest record of each kind the retention function keeps, and
+/// `tests::state_tests::largest_state_at_the_ceilings`.
 pub const MAX_RECORD_BYTES: [usize; 24] = [
-    7_200,  // Configuration
+    9_300,  // Configuration (64 deputies, 64 protected, 64 exceptions)
     0,      // (tag 1, reserved)
     80,     // Clock
     19_000, // Checkpoint (keep list of max_links digests)
     120,    // Upgrade
     37_000, // Roster batch (1,000 entries)
     80,     // SecretVersion
-    460,    // Ban
+    500,    // Ban
     320,    // LegacyBan
-    360,    // Link
+    400,    // Link (a link parent, the largest seq and clock)
     300,    // LegacyLink
     120,    // Activity
     2_500,  // LegacyActivity (a v1 message)

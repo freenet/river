@@ -1,6 +1,8 @@
-//! The largest record of each legacy kind `f` can keep, against
-//! `MAX_RECORD_BYTES` (the v2 kinds are covered by the largest-state test).
-//! v1 byte vectors encode as CBOR arrays, so a byte of 0xff costs two.
+//! The largest record of each kind `f` can keep, against `MAX_RECORD_BYTES`:
+//! every field at the largest value a kept record can carry (integers at
+//! their maximum, lists and byte strings at their ceilings, the larger enum
+//! variant). v1 byte vectors encode as CBOR arrays, so a byte of 0xff costs
+//! two.
 
 use crate::room_state::ban::{AuthorizedUserBan, UserBan};
 use crate::room_state::direct_messages::{
@@ -149,4 +151,255 @@ fn legacy_record_size_ceilings_hold() {
     );
     assert!(legacy::decode_blob(&o, &l).is_some());
     check("LegacySecretBlob", Record::LegacySecretBlob(l));
+}
+
+#[test]
+fn v2_record_size_ceilings_hold() {
+    use crate::room_state_v2::config::ConfigurationV2;
+    use crate::room_state_v2::encoding::{Bytes32, Nonce12, Sig, Token16};
+    use crate::room_state_v2::records::*;
+    let o = Key::from(&sk(1).verifying_key());
+    let sig = Sig([0xff; 64]);
+    let key = |i: u32| {
+        let mut b = [0xffu8; 32];
+        b[..4].copy_from_slice(&i.to_be_bytes());
+        Bytes32(b)
+    };
+    let buf = |n: usize| ByteBuf(vec![0xff; n]);
+    let private = |declared: usize| {
+        Sealed::Private(SealedPrivate {
+            ciphertext: buf(declared + AEAD_TAG),
+            nonce: Nonce12([0xff; 12]),
+            secret_version: u32::MAX,
+            declared_len: declared as u32,
+        })
+    };
+
+    // Configuration: every cap at its ceiling, the longest name and
+    // description (sealed), 64 deputies, 64 protected keys and 64 child
+    // exceptions at the largest quota.
+    use ceiling::*;
+    let mut c = ConfigurationV2::defaults(MAX_MEMBERS);
+    c.version = u32::MAX;
+    c.privacy_mode = 1;
+    c.max_room_name = MAX_ROOM_NAME;
+    c.max_room_description = MAX_ROOM_DESCRIPTION;
+    c.display_name = private(MAX_ROOM_NAME as usize);
+    c.display_description = Some(private(MAX_ROOM_DESCRIPTION as usize));
+    c.max_recent_messages = MAX_RECENT_MESSAGES;
+    c.max_message_size = MAX_MESSAGE_SIZE;
+    c.max_nickname_size = MAX_NICKNAME_SIZE;
+    c.max_direct_messages = MAX_DIRECT_MESSAGES;
+    c.max_chain_depth = MAX_CHAIN_DEPTH;
+    c.max_links = MAX_LINKS;
+    c.max_links_per_member = MAX_LINKS_PER_MEMBER;
+    c.max_children_per_link = MAX_CHILDREN_PER_LINK;
+    c.max_owner_children = MAX_CHILDREN_PER_LINK;
+    c.child_exceptions = (0..CHILD_EXCEPTIONS as u32)
+        .map(|i| (key(i), MAX_CHILDREN_PER_LINK))
+        .collect();
+    c.max_owner_bans = MAX_OWNER_BANS;
+    c.max_deputy_bans = MAX_DEPUTY_BANS;
+    c.max_bans_per_deputy = MAX_BANS_PER_DEPUTY;
+    c.max_member_bans = MAX_MEMBER_BANS;
+    c.max_bans_per_issuer = MAX_BANS_PER_ISSUER;
+    c.deputies = (0..AUTHORITY_KEYS as u32).map(key).collect();
+    c.protected = (0..AUTHORITY_KEYS as u32).map(|i| key(i + 1000)).collect();
+    c.max_secret_versions = MAX_SECRET_VERSIONS;
+    c.max_secret_blobs = MAX_SECRET_BLOBS;
+    c.legacy_window_closed_at = u32::MAX;
+    c.link_retention = u32::MAX;
+    c.member_ban_activity_window = u32::MAX;
+    assert!(c.check(&o));
+    check(
+        "Configuration",
+        Record::Configuration(Signed { payload: c, sig }),
+    );
+
+    check(
+        "Clock",
+        Record::Clock(Signed {
+            payload: ClockP { hours: u32::MAX },
+            sig,
+        }),
+    );
+    check(
+        "Checkpoint",
+        Record::Checkpoint(Signed {
+            payload: CheckpointP {
+                version: u32::MAX,
+                retire_before: u32::MAX,
+                keep: (0..MAX_LINKS).map(key).collect(),
+            },
+            sig,
+        }),
+    );
+    check(
+        "Upgrade",
+        Record::Upgrade(Signed {
+            payload: UpgradeP {
+                version: u32::MAX,
+                new_address: key(0),
+            },
+            sig,
+        }),
+    );
+    check(
+        "Roster",
+        Record::Roster(Signed {
+            payload: RosterP {
+                seq: u32::MAX,
+                batch: (0..ROSTER_BATCH_ENTRIES as u32)
+                    .map(|i| RosterEntry {
+                        kind: LegacyKind::SecretBlob,
+                        digest: key(i),
+                    })
+                    .collect(),
+            },
+            sig,
+        }),
+    );
+    check(
+        "SecretVersion",
+        Record::SecretVersion(Signed {
+            payload: SecretVersionP {
+                version: u32::MAX,
+                cipher: u8::MAX,
+            },
+            sig,
+        }),
+    );
+    check(
+        "Ban",
+        Record::Ban(Signed {
+            payload: BanP {
+                target: BanTarget::Invitation(InvitationTarget {
+                    invitation: key(1),
+                    inviter: key(2),
+                }),
+                issuer: Issuer::Member(MemberIssuer {
+                    link: key(3),
+                    key: key(4),
+                }),
+                time: u64::MAX,
+                clock_ref: u32::MAX,
+                reason: buf(BAN_REASON),
+            },
+            sig,
+        }),
+    );
+    let link = |i: u32| AcceptedLink {
+        invitation: Signed {
+            payload: InvitationP {
+                inviter: key(i),
+                invite_key: key(i + 1),
+                parent: Parent::Link(key(i + 2)),
+                seq: u32::MAX,
+                clock: u32::MAX,
+            },
+            sig,
+        },
+        acceptance: AcceptanceP {
+            invitation: key(i + 3),
+            member: key(i + 4),
+        },
+        invite_key_sig: sig,
+        member_sig: sig,
+    };
+    check("Link", Record::Link(link(0)));
+    check(
+        "Activity",
+        Record::Activity(Signed {
+            payload: ActivityP {
+                member: key(0),
+                hours: u32::MAX,
+            },
+            sig,
+        }),
+    );
+    check(
+        "Restore",
+        Record::Restore(Signed {
+            payload: RestoreP {
+                chain: (0..MAX_CHAIN_DEPTH)
+                    .map(|i| ChainLink::Accepted(link(i * 10)))
+                    .collect(),
+                hours: u32::MAX,
+                clock_ref: u32::MAX,
+            },
+            sig,
+        }),
+    );
+    check(
+        "MemberInfo",
+        Record::MemberInfo(Signed {
+            payload: MemberInfoP {
+                member: key(0),
+                version: u32::MAX,
+                nickname: private(MAX_NICKNAME_SIZE as usize),
+            },
+            sig,
+        }),
+    );
+    check(
+        "Message",
+        Record::Message(Signed {
+            payload: MessageP {
+                author: key(0),
+                time: u64::MAX,
+                clock_ref: u32::MAX,
+                body: MessageBody::Private(PrivateBody {
+                    content_type: u32::MAX,
+                    content_version: u32::MAX,
+                    ciphertext: buf(MAX_MESSAGE_SIZE as usize),
+                    nonce: Nonce12([0xff; 12]),
+                    secret_version: u32::MAX,
+                }),
+            },
+            sig,
+        }),
+    );
+    check(
+        "DirectMessage",
+        Record::DirectMessage(Signed {
+            payload: DirectMessageP {
+                sender: key(0),
+                recipient: key(1),
+                time: u64::MAX,
+                clock_ref: u32::MAX,
+                ciphertext: buf(DM_CIPHERTEXT),
+            },
+            sig,
+        }),
+    );
+    check(
+        "Purge",
+        Record::Purge(Signed {
+            payload: PurgeP {
+                recipient: key(0),
+                version: u64::MAX,
+                purged: (0..PURGE_TOKENS as u32)
+                    .map(|i| {
+                        let mut t = [0xffu8; 16];
+                        t[..4].copy_from_slice(&i.to_be_bytes());
+                        Token16(t)
+                    })
+                    .collect(),
+            },
+            sig,
+        }),
+    );
+    check(
+        "SecretBlob",
+        Record::SecretBlob(Signed {
+            payload: SecretBlobP {
+                recipient: key(0),
+                version: u32::MAX,
+                ciphertext: buf(SECRET_BLOB_CIPHERTEXT),
+                nonce: Nonce12([0xff; 12]),
+                ephemeral_key: key(1),
+            },
+            sig,
+        }),
+    );
 }
