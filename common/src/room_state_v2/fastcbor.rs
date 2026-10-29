@@ -326,7 +326,11 @@ impl ser::SerializeStructVariant for &mut Encoder<'_> {
 
 /// Decodes `bytes` as a `T` whose re-encoding is exactly `bytes`.
 pub fn from_canonical<T: Serialize + de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
-    let mut d = Decoder { b: bytes, i: 0 };
+    let mut d = Decoder {
+        b: bytes,
+        i: 0,
+        depth: 0,
+    };
     let v = T::deserialize(&mut d).ok()?;
     if d.i != bytes.len() {
         return None;
@@ -334,9 +338,14 @@ pub fn from_canonical<T: Serialize + de::DeserializeOwned>(bytes: &[u8]) -> Opti
     (to_vec(&v) == bytes).then_some(v)
 }
 
+/// The deepest nesting of arrays and maps accepted, as in ciborium.
+const MAX_DEPTH: u32 = 256;
+
 struct Decoder<'de> {
     b: &'de [u8],
     i: usize,
+    /// Arrays and maps currently open.
+    depth: u32,
 }
 
 // Errors are built lazily (`ok_or_else`): `peek` and `head` run once per
@@ -398,6 +407,15 @@ impl<'de> Decoder<'de> {
         Ok((major, v))
     }
 
+    /// Opens an array or map; fails past `MAX_DEPTH`.
+    fn enter(&mut self) -> Result<(), Error> {
+        if self.depth >= MAX_DEPTH {
+            return err("nesting too deep");
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     fn slice(&mut self, n: u64) -> Result<&'de [u8], Error> {
         let n = usize::try_from(n).map_err(|_| Error("length".into()))?;
         let s = self
@@ -444,8 +462,18 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
                 let s = self.slice(a)?;
                 v.visit_borrowed_str(std::str::from_utf8(s).map_err(|_| Error("utf-8".into()))?)
             }
-            4 => v.visit_seq(Seq { d: self, left: a }),
-            5 => v.visit_map(Map { d: self, left: a }),
+            4 => {
+                self.enter()?;
+                let r = v.visit_seq(Seq { d: self, left: a });
+                self.depth -= 1;
+                r
+            }
+            5 => {
+                self.enter()?;
+                let r = v.visit_map(Map { d: self, left: a });
+                self.depth -= 1;
+                r
+            }
             _ => err("tags are not supported"),
         }
     }
@@ -486,7 +514,10 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
                 if n != 1 {
                     return err("an enum is a one-entry map");
                 }
-                v.visit_enum(Enum { d: self })
+                self.enter()?;
+                let r = v.visit_enum(Enum { d: self });
+                self.depth -= 1;
+                r
             }
             _ => err("expected an enum"),
         }
@@ -507,10 +538,18 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
         self.deserialize_seq(v)
     }
 
+    // An unknown field. `from_canonical` refuses a record whose re-encoding
+    // differs from its input, and a skipped field is never re-encoded, so
+    // no accepted input has one. Refusing here also keeps a hostile skipped
+    // value from being walked.
+    fn deserialize_ignored_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Error> {
+        err("unknown field")
+    }
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
         bytes byte_buf unit unit_struct tuple_struct map struct
-        identifier ignored_any
+        identifier
     }
 }
 
