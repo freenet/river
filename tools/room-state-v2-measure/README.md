@@ -263,3 +263,33 @@ validate 1.75-1.88 s and merge 2.15-2.19 s, legacy validate 1.59-1.61 s and
 merge 1.99-2.18 s. Under heavier load the check fails: at load average 10
 to 11 (0.380 ms per signature) `adv` merged in 2.25-2.64 s, and at 13 to 18
 (0.432 ms) `ceilings` merged in 2.14-4.21 s and validated in 1.94-4.03 s.
+
+## Costlier inputs and the update pipeline, 2026-10-30
+
+After the round of rules that bound links, restores, roster batches and
+record counts before decoding. Five runs each, minimum to maximum, load
+average falling from 14 to 3 over the run (`verify_strict` 0.218 ms per
+signature); memory is the guest's peak:
+
+| state or input | validate | update | merge | memory |
+|---|---|---|---|---|
+| ceilings (3,756 records, 5,064 signatures, 4.51 MB) | 1.28-1.33 s | 0.73-0.78 s | 1.39-1.43 s | 34 MiB |
+| legacy (6.07 MB) | 1.31-1.36 s | 0.99-1.02 s | 1.53-1.65 s | 46 MiB |
+| mixed: v2 links, legacy content (5.42 MB) | 1.37-1.45 s | 0.92-0.93 s | 1.59-1.63 s | 42 MiB |
+| official | 0.46-0.50 s | 0.24-0.26 s | 0.48-0.51 s | 10 MiB |
+| oshaped | 0.33-0.35 s | 0.34-0.36 s | 0.34-0.35 s | 8 MiB |
+| adv | | 0.97-1.13 s | 1.52-1.58 s | 46 MiB |
+| slack: mixed + 300 legacy DMs over the bound (6.78 MB) | | 0.77-0.83 s | 1.83-2.15 s | 48 MiB |
+| purgejunk: mixed + 392 legacy envelopes of 1,000 tokens (6.76 MB) | | 0.50-0.53 s | 1.56-1.62 s | 58 MiB |
+
+The update pipeline, one ordinary post on a full state (apply, validate
+the result, summarize it, and the delta back to a subscriber holding the
+old state, in one call): ceilings 1.54-1.64 s, legacy 1.71-1.81 s, mixed
+1.79-1.89 s. `get_state_delta` of one variant against the other's summary
+(the largest delta a subscriber can be sent): 0.06-0.12 s. freenet-core
+makes the apply and the validate two calls, each held to 5 s.
+
+`CHECK_SECS=2.5`: passed. The slowest single call is the slack merge at
+2.15 s: a device three times slower would take about 6.5 s, 1.3 times
+freenet-core's 5 s limit. The largest guest memory is 58 MiB, against the
+256 MiB the engine allows.
