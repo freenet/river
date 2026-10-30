@@ -847,16 +847,16 @@ pub fn retain_refs(
             continue;
         };
         let d = c.digests[i];
+        // The window and the roster first: a legacy link that cannot count
+        // is never decoded.
+        if !legacy_ok(LegacyKind::Link, &d) {
+            continue;
+        }
         let Some(mut v) = legacy::decode_link(&owner, l) else {
             continue;
         };
         c.hold(i, &mut v.v1);
-        if v.member == owner
-            || v.member == v.inviter
-            || key_banned(&v.member)
-            || !legacy_ok(LegacyKind::Link, &d)
-            || retired(0, &d)
-        {
+        if v.member == owner || v.member == v.inviter || key_banned(&v.member) || retired(0, &d) {
             continue;
         }
         lc.push(LinkCand {
@@ -957,6 +957,11 @@ pub fn retain_refs(
             }
             let l = &lc[j];
             let exempt = l.legacy && l.rostered;
+            // Only the links the owner rosters go deeper than
+            // `max_chain_depth` (decision (c)).
+            if !exempt && !accepted_ok_here {
+                continue;
+            }
             // The legacy link budgets, in the same admission order as every
             // other L2 limit: group limits of the greedy chooser over the
             // links' own fields, the roster (L1) and shallower links, so

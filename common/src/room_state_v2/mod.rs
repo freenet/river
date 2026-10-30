@@ -42,10 +42,16 @@
 //!   could then pin the newest slots with far-future times, as in v1). A
 //!   converting owner signs a `Clock` with its configuration, so a migrated
 //!   room has one from the start.
-//! - **(c) Chain depth.** `max_chain_depth` limits accepted links only. A
-//!   legacy link is admitted at any depth (v1 had no depth limit), so a
-//!   migrated room keeps every v1 member however deep its invite chain; the
-//!   legacy link cap bounds their number, and so the work.
+//! - **(c) Chain depth.** `max_chain_depth` limits every link but a
+//!   rostered legacy one. A legacy link the owner rosters is admitted at any
+//!   depth (v1 had no depth limit), so a migrated room keeps every member
+//!   the owner attests however deep its invite chain; the legacy link cap
+//!   bounds their number, and so the work. An unrostered legacy link (one
+//!   minted while the window is open) is held to the depth limit, so the
+//!   roster that closes the window can only attest links within it. A
+//!   legacy member deeper than the limit cannot invite, and a restore chain
+//!   is at most `MAX_CHAIN_DEPTH` links, so a retired legacy member whose
+//!   chain back to an admitted link is longer cannot be restored.
 //! - **(d) Member-ban issuer key.** A v2 member ban names its issuing link
 //!   and that link's member key, and is valid only if the two agree. The
 //!   signature can then be checked without the rest of the state, which the

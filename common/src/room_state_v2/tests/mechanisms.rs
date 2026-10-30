@@ -152,3 +152,35 @@ fn invitations_cannot_push_a_rostered_legacy_link_out() {
     assert_eq!(others, 2);
     assert!(kept(&all, "A4") && kept(&all, "C5"));
 }
+
+/// Decision (c): a rostered legacy chain is kept below the depth limit; an
+/// unrostered one stops at it.
+#[test]
+fn only_rostered_legacy_links_go_below_the_depth_limit() {
+    let build = |rostered: bool| {
+        let cfg = super::builder::with(|c| {
+            c.window_open = true;
+            c.max_members = 7;
+            c.max_depth = 2;
+        });
+        let mut b = super::builder::Builder::new();
+        let names = ["G1", "G2", "G3", "G4", "G5", "G6", "G7"];
+        for (n, name) in names.iter().enumerate() {
+            b.leg(name, n + 1, n);
+        }
+        if rostered {
+            b.roster(1, &names);
+        }
+        b.cfg(0, cfg);
+        b.finish()
+    };
+    let all = f_without(&build(true), &[]);
+    for g in ["G1", "G2", "G3", "G4", "G5", "G6", "G7"] {
+        assert!(kept(&all, g), "rostered {g} at depth past the limit");
+    }
+    let open = f_without(&build(false), &[]);
+    assert!(kept(&open, "G1") && kept(&open, "G2"));
+    for g in ["G3", "G4", "G5", "G6", "G7"] {
+        assert!(!kept(&open, g), "unrostered {g} below the depth limit");
+    }
+}
