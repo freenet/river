@@ -1253,3 +1253,33 @@ fn many_small_records_are_refused_before_they_are_decoded() {
         Some(false)
     );
 }
+
+// ------------------------------------------------ 8. the purge budget pin
+
+/// The purge token budget is 80,200 (decision (t)), the largest state's
+/// envelopes spend all of it, and that state stays within
+/// `max_state_bytes`, which stays within freenet-core's 50 MiB state limit.
+/// Raising the budget fails here, not only in a byte count that reads the
+/// same constant.
+#[test]
+fn the_purge_token_budget_is_pinned_and_fits() {
+    use crate::room_state_v2::retain::purge_token_budget;
+    assert_eq!(ceiling::PURGE_TOKEN_BUDGET, 80_200);
+    assert_eq!(purge_token_budget(), 80_200);
+    let (s, dropped) = largest_state(Caps::ceilings(), 0);
+    assert_eq!(dropped, 0);
+    let tokens: usize = s
+        .records
+        .iter()
+        .map(|r| match r {
+            Record::Purge(p) => p.payload.purged.len(),
+            _ => 0,
+        })
+        .sum();
+    assert!(
+        tokens <= 80_200 && tokens > 80_200 - 1_000,
+        "{tokens} tokens"
+    );
+    assert!(s.to_bytes().len() <= max_state_bytes());
+    assert!(max_state_bytes() <= 50 * 1024 * 1024);
+}
