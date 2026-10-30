@@ -409,3 +409,32 @@ fn delta_permutation_pairs_heal_on_live_room() {
     println!("delta pairs {p}, orders differ {d}, healed {h}");
     assert_eq!(d, h);
 }
+
+/// The same over the ceilings corpus's histories: the largest states at the
+/// ceilings (v2 and legacy-heavy), where every cap is full. Every record's
+/// signature is trusted (the builder signed them; this is about the caps).
+#[test]
+#[ignore = "the largest states; minutes in a release build"]
+fn delta_permutation_pairs_heal_at_the_ceilings() {
+    let o = Key::from(&owner_key().verifying_key());
+    let mut tot = (0, 0, 0);
+    for caps in [Caps::ceilings(), Caps::ceilings_legacy()] {
+        let (a, _) = largest_state(caps, 0);
+        let (b, _) = largest_state(caps, 1);
+        let mut all = a.records.clone();
+        all.extend(b.records.iter().cloned());
+        trust_in_this_thread(o, all.iter().map(|r| r.digest()).collect());
+        let mut rng = Rng(2 + caps.legacy as u64);
+        let states: Vec<RoomStateV2> = (0..8)
+            .map(|i| subset(&o, &all, &mut rng, 300 + (i as u64 * 677) % 650))
+            .collect();
+        let (p, d, h) = delta_pairs_heal(&o, &states);
+        println!(
+            "legacy {}: delta pairs {p}, orders differ {d}, healed {h}",
+            caps.legacy
+        );
+        tot = (tot.0 + p, tot.1 + d, tot.2 + h);
+    }
+    assert!(tot.1 > 0, "no pair exercised a cap");
+    assert_eq!(tot.1, tot.2);
+}
