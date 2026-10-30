@@ -200,7 +200,13 @@ fn histories(out: &mut Out, o: &Key, recs: &[Record], seed: u64, n: usize) {
     for i in 0..states.len().min(10) {
         out.bundle.summaries.push(to_cbor(&states[i].summarize()));
         for k in 1..=2 {
-            let j = (i + k * 5) % states.len();
+            // Two senders other than the receiver, so the receiver's two
+            // deltas share its base (with 10 states, i + 10 is i itself).
+            let n = states.len();
+            let j = match (i + k * 5) % n {
+                j if j == i => (i + 1) % n,
+                j => j,
+            };
             let (sender, receiver) = (&states[j], &states[i]);
             let Some(d) = sender.delta(&receiver.summarize()) else {
                 continue;
