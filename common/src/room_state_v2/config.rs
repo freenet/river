@@ -81,7 +81,11 @@ pub mod ceiling {
     pub const PURGE_TOKEN_BYTES: usize = 18;
     pub const SECRET_BLOB_CIPHERTEXT: usize = 512;
     pub const BAN_REASON: usize = 256;
-    pub const ROSTER_BATCHES: usize = 1_000;
+    /// Roster batches kept. The distinct entries the roster may hold
+    /// (`retain::roster_ceiling`, 5,672 at the ceilings) fill 6 batches of
+    /// 1,000, attested at conversion and again at window close, so 32
+    /// leaves room for partial batches.
+    pub const ROSTER_BATCHES: usize = 32;
     pub const ROSTER_BATCH_ENTRIES: usize = 1_000;
     /// Restore requests carry chains of up to `MAX_CHAIN_DEPTH` links of
     /// three signatures each, so 10 (the design: 1,000) keeps their checks

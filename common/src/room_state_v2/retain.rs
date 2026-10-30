@@ -211,6 +211,16 @@ pub fn roster_ceiling(k: LegacyKind) -> usize {
     }) as usize
 }
 
+/// Entries of all kept roster batches together, repeats included: twice
+/// the distinct entries the roster may hold, so the owner can list what the
+/// room holds at conversion and all of it again at window close.
+pub fn roster_entry_budget() -> usize {
+    2 * super::records::LEGACY_KINDS
+        .iter()
+        .map(|k| roster_ceiling(*k))
+        .sum::<usize>()
+}
+
 /// The legacy link cap: [`ceiling::MAX_LEGACY_LINKS`], or a smaller value
 /// tests set to make it bind in small universes.
 pub fn legacy_link_cap() -> u32 {
@@ -528,8 +538,9 @@ pub fn retain_refs(
     }
 
     // Legacy roster: batches by (seq, digest); a batch that would take any
-    // kind past that kind's ceiling of distinct attested records is skipped
-    // whole; at most `ROSTER_BATCHES` kept.
+    // kind past that kind's ceiling of distinct attested records, or the
+    // kept batches' entries (repeats included) past `roster_entry_budget`,
+    // is skipped whole; at most `ROSTER_BATCHES` kept.
     let mut cands: Vec<(u32, Digest, usize)> = c
         .kind(5)
         .into_iter()
@@ -551,6 +562,8 @@ pub fn retain_refs(
     let mut roster: HashSet<(LegacyKind, Digest)> = HashSet::new();
     let mut roster_counts: HashMap<LegacyKind, usize> = HashMap::new();
     let mut batches = 0;
+    let mut entries = 0usize;
+    let entry_budget = roster_entry_budget();
     for (_, _, i) in cands {
         if batches >= ceiling::ROSTER_BATCHES {
             break;
@@ -558,6 +571,9 @@ pub fn retain_refs(
         let Record::Roster(s) = &recs[i] else {
             unreachable!()
         };
+        if entries + s.payload.batch.len() > entry_budget {
+            continue;
+        }
         // Entries already attested by a kept batch cost nothing again.
         let mut add: HashMap<LegacyKind, usize> = HashMap::new();
         for e in &s.payload.batch {
@@ -578,6 +594,7 @@ pub fn retain_refs(
             *roster_counts.entry(k).or_default() += n;
         }
         roster.extend(s.payload.batch.iter().map(|e| (e.kind, e.digest)));
+        entries += s.payload.batch.len();
         batches += 1;
         c.keep[i] = true;
     }

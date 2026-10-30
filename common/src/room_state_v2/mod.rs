@@ -160,11 +160,14 @@
 //!   cannot target a protected key; the Invite Bot belongs there). Nothing
 //!   is promoted automatically (Ian, 2026-10-28).
 //! - **(s) Roster budget.** The roster counts distinct attested records per
-//!   kind, so attesting a record again costs nothing, against twice the
-//!   kind's cap (links: the legacy link cap), so the owner can attest what
-//!   the room holds at conversion and again what it holds when the window
-//!   closes. Records written during the window beyond that are lost when it
-//!   closes.
+//!   kind, so attesting a record again costs nothing against that kind's
+//!   ceiling: twice the kind's cap (links: the legacy link cap), so the
+//!   owner can attest what the room holds at conversion and again what it
+//!   holds when the window closes. Records written during the window beyond
+//!   that are lost when it closes. Separately, the entries of all kept
+//!   batches, repeats included, are held to twice the distinct ceilings
+//!   together, and at most 32 batches are kept, so repeats cost bytes and
+//!   signatures that `max_state_bytes` counts.
 //! - **(t) Purge token budget.** A purge envelope holds up to 1,000 tokens,
 //!   as in v1, and the envelopes kept hold at most
 //!   [`config::ceiling::PURGE_TOKEN_BUDGET`] (80,200, 200 per member at the

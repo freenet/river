@@ -121,12 +121,9 @@ pub fn max_state_bytes() -> usize {
             total += largest(ks) * n;
         }
     }
-    // A roster entry is 36 bytes; a batch adds its header and signature.
-    let roster_entries: usize = super::records::LEGACY_KINDS
-        .iter()
-        .map(|k| super::retain::roster_ceiling(*k))
-        .sum();
-    total + roster_entries * 36 + ceiling::ROSTER_BATCHES * 100 + 16
+    // A roster entry is 36 bytes, repeats across batches included; a batch
+    // adds its header and signature.
+    total + super::retain::roster_entry_budget() * 36 + ceiling::ROSTER_BATCHES * 100 + 16
 }
 
 /// Why `validate_state` refused.

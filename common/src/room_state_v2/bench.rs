@@ -636,10 +636,32 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
         }
     }
     entries.sort_by_key(|e| (e.kind, e.digest));
-    for (seq, batch) in entries.chunks(ceiling::ROSTER_BATCH_ENTRIES).enumerate() {
+    let mut batches: Vec<Vec<RosterEntry>> = entries
+        .chunks(ceiling::ROSTER_BATCH_ENTRIES)
+        .map(|b| b.to_vec())
+        .collect();
+    // Then the rest of the entry budget as repeats, spread over every batch
+    // left, so the roster holds the most entries and signatures it can.
+    let left = super::retain::roster_entry_budget()
+        - entries.len().min(super::retain::roster_entry_budget());
+    let slots = ceiling::ROSTER_BATCHES.saturating_sub(batches.len());
+    if slots > 0 && left > 0 && !entries.is_empty() {
+        let per = left.div_ceil(slots).min(ceiling::ROSTER_BATCH_ENTRIES);
+        let mut repeats = entries.iter().cycle().take(left);
+        for _ in 0..slots {
+            let mut b: Vec<RosterEntry> = repeats.by_ref().take(per).cloned().collect();
+            if b.is_empty() {
+                break;
+            }
+            b.sort_by_key(|e| (e.kind, e.digest));
+            b.dedup();
+            batches.push(b);
+        }
+    }
+    for (seq, batch) in batches.into_iter().enumerate() {
         let p = RosterP {
             seq: seq as u32,
-            batch: batch.to_vec(),
+            batch,
         };
         recs.push(Record::Roster(Signed {
             sig: sign_payload(tag::ROSTER, &o, &p, &osk),

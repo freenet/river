@@ -1113,3 +1113,67 @@ fn keys_a_member_admits_share_its_subtree_s_restore_slots() {
     );
     assert!(validate(&state.to_bytes()).0.is_ok());
 }
+
+// ------------------------------------------------------- 6. roster batches
+
+/// Batches that only repeat attested entries still count against the
+/// roster's entry budget and batch count, so `f` never emits a state over
+/// `max_state_bytes` (decision (s)).
+#[test]
+fn repeated_roster_entries_count_and_the_result_validates_at_the_ceilings() {
+    use crate::room_state_v2::retain::roster_entry_budget;
+    let o = owner();
+    let osk = owner_key();
+    let (s, dropped) = largest_state(Caps::ceilings_legacy(), 0);
+    assert_eq!(dropped, 0);
+    let held: Vec<RosterEntry> = s
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Roster(b) => Some(b.payload.batch.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(!held.is_empty());
+    // Every held entry again, as many times as fits twice over, in batches
+    // of 1,000 that only repeat.
+    let mut recs = s.records.clone();
+    let mut seq = 1_000u32;
+    for _ in 0..(2 * roster_entry_budget() / held.len() + 1) {
+        for chunk in held.chunks(ceiling::ROSTER_BATCH_ENTRIES) {
+            let mut batch = chunk.to_vec();
+            batch.sort_by_key(|e| (e.kind, e.digest));
+            recs.push(Record::Roster(signed(
+                tag::ROSTER,
+                RosterP { seq, batch },
+                &osk,
+            )));
+            seq += 1;
+        }
+    }
+    let (out, _) = normalize(&o, recs, &mut Verifier::new());
+    let batches: Vec<&RosterP> = out
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Roster(b) => Some(&b.payload),
+            _ => None,
+        })
+        .collect();
+    let entries: usize = batches.iter().map(|b| b.batch.len()).sum();
+    assert!(
+        batches.len() <= ceiling::ROSTER_BATCHES,
+        "{} batches",
+        batches.len()
+    );
+    assert!(entries <= roster_entry_budget(), "{entries} entries");
+    let bytes = out.to_bytes();
+    assert!(
+        bytes.len() <= max_state_bytes(),
+        "{} > {}",
+        bytes.len(),
+        max_state_bytes()
+    );
+    assert!(validate(&bytes).0.is_ok());
+}
