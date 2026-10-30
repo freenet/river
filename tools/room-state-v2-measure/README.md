@@ -28,11 +28,13 @@ A spec is `ceilings` (every cap at its ceiling, all v2 records), `legacy` (the
 same with owner bans, activity, member info, messages, DMs, purges and blobs as
 legacy v1 records), `official` (the Official room's contents in v2 records),
 `membersN` / `lmembersN` / `lmembersN:L` (see "How many members fit"; `L` is
-the number of legacy links, default `min(N, MAX_LEGACY_LINKS)`), `live` (a
-fetched v1 room, `RIVER_V1_STATE` and `RIVER_V1_OWNER` in base58, converted
-as the corpus converts it: validate it, merge it with itself, and update a
-state holding only its configuration with it), or a divisor `d` of the
-ceilings.
+the number of legacy links, default `min(N, MAX_LEGACY_LINKS)`), `oshaped`
+(the Official-shaped v1 room converted by its owner: validate it, merge it
+with itself, and update a state holding only the owner's records with it),
+`adv` (the largest mixed legacy state updated with every non-owner record of
+the other variant; only update and merge are meaningful), or a divisor `d` of
+the ceilings. The `live` spec of the 2026-10-26 and 2026-10-27 results below
+(a fetched v1 room, converted without its owner) was replaced by `oshaped`.
 
 `ONLY=<call>` runs one call (`validate_state`, `update_with_state`, ...).
 To profile, build the guest with `--profile guest-prof` (function names
