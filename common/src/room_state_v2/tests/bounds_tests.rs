@@ -668,7 +668,14 @@ fn reserved_and_unknown_record_tags_cannot_decode() {
         }
         b.push(0x00);
         let (r, checks) = validate(&b);
-        assert_eq!(r, Err(Invalid::NotCanonical), "tag {tag}");
+        // Tag 1 is a known, reserved kind, which a state holds none of: the
+        // count refuses it before any decode. The others are not kinds.
+        let want = if tag == 1 {
+            Invalid::TooManyRecords
+        } else {
+            Invalid::NotCanonical
+        };
+        assert_eq!(r, Err(want), "tag {tag}");
         assert_eq!(checks, 0);
     }
 }
@@ -1176,4 +1183,73 @@ fn repeated_roster_entries_count_and_the_result_validates_at_the_ceilings() {
         max_state_bytes()
     );
     assert!(validate(&bytes).0.is_ok());
+}
+
+// ------------------------------------------- 7. counts before any decode
+
+/// CBOR array header for `n` items.
+fn array_header(n: usize) -> Vec<u8> {
+    let mut h = vec![];
+    match n {
+        0..=23 => h.push(0x80 | n as u8),
+        24..=0xff => h.extend([0x98, n as u8]),
+        0x100..=0xffff => {
+            h.push(0x99);
+            h.extend((n as u16).to_be_bytes());
+        }
+        _ => {
+            h.push(0x9a);
+            h.extend((n as u32).to_be_bytes());
+        }
+    }
+    h
+}
+
+#[test]
+fn the_encoded_count_agrees_with_the_decoded_one() {
+    use crate::room_state_v2::encoding::to_cbor;
+    use crate::room_state_v2::state::within_kind_counts_encoded;
+    for caps in [
+        Caps::ceilings().scaled(20),
+        Caps::ceilings_legacy().scaled(20),
+    ] {
+        let (s, _) = largest_state(caps, 0);
+        assert_eq!(within_kind_counts_encoded(&s.to_bytes(), true), Some(true));
+        assert_eq!(
+            within_kind_counts_encoded(&to_cbor(&s.records), false),
+            Some(true)
+        );
+        // One record too many of a capped kind.
+        let mut over = s.records.clone();
+        for i in 0..=ceiling::MAX_LINKS {
+            over.push(activity(&skey(9, i), 1));
+        }
+        assert!(!within_kind_counts(&over));
+        assert_eq!(
+            within_kind_counts_encoded(&to_cbor(&over), false),
+            Some(false)
+        );
+    }
+    // Not the shape: no answer, so the full decode refuses it.
+    assert_eq!(within_kind_counts_encoded(&[0xa0], false), None);
+    assert_eq!(within_kind_counts_encoded(&[0x9f, 0xff], false), None);
+}
+
+/// Many records of a capped kind are refused from their tags alone: these
+/// "clock records" carry a payload that does not decode as one, so a
+/// refusal for their number shows nothing was decoded.
+#[test]
+fn many_small_records_are_refused_before_they_are_decoded() {
+    let n = 50_000;
+    let mut delta = array_header(n);
+    for _ in 0..n {
+        delta.extend([0x82, 0x02, 0x00]);
+    }
+    let mut state = vec![0x82, 0x02];
+    state.extend(&delta);
+    assert_eq!(validate(&state).0, Err(Invalid::TooManyRecords));
+    assert_eq!(
+        crate::room_state_v2::state::within_kind_counts_encoded(&delta, false),
+        Some(false)
+    );
 }

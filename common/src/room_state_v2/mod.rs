@@ -113,9 +113,10 @@
 //!   shown.
 //! - **(n) Refusal at the contract boundary.** An incoming state or delta
 //!   holding more records of a kind than a valid state can hold is refused
-//!   before any legacy record is decoded or any signature checked
-//!   ([`state::within_kind_counts`]; the contract also refuses one larger
-//!   than [`max_state_bytes`] before decoding it). [`validate_state`] and
+//!   before any record is decoded: the kinds are counted from the encoded
+//!   bytes, reading each record's tag and skipping the rest
+//!   ([`state::within_kind_counts_encoded`]; the contract also refuses one
+//!   larger than [`max_state_bytes`] before reading it). [`validate_state`] and
 //!   [`apply_delta`] then refuse at the first signature check that fails:
 //!   a fixpoint has none, and a generated delta has none. A record `f`
 //!   drops without examining it is dropped unchecked, so the signature

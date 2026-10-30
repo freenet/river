@@ -22,7 +22,9 @@ use river_core::room_state::ChatRoomParametersV1;
 use river_core::room_state_v2::config::ceiling;
 use river_core::room_state_v2::encoding::{from_cbor_canonical, to_cbor, Key};
 use river_core::room_state_v2::records::Record;
-use river_core::room_state_v2::state::{within_kind_counts, Invalid, Summary, STATE_VERSION};
+use river_core::room_state_v2::state::{
+    within_kind_counts, within_kind_counts_encoded, Invalid, Summary, STATE_VERSION,
+};
 use river_core::room_state_v2::{
     apply_delta, max_state_bytes, state as v2state, RoomStateV2, Verifier,
 };
@@ -81,6 +83,9 @@ fn decode_state(bytes: &[u8], what: &str) -> Result<Vec<Record>, ContractError> 
     if bytes.len() > max_state_bytes() {
         return Err(too_large(what, bytes.len(), max_state_bytes()));
     }
+    if within_kind_counts_encoded(bytes, true) == Some(false) {
+        return Err(refused(Invalid::TooManyRecords));
+    }
     let s: RoomStateV2 = from_cbor_canonical(bytes)
         .ok_or_else(|| ContractError::Deser(format!("{what} is not a canonical v2 room state")))?;
     if s.version != STATE_VERSION {
@@ -96,6 +101,9 @@ fn decode_delta(bytes: &[u8]) -> Result<Vec<Record>, ContractError> {
     }
     if bytes.len() > max_state_bytes() {
         return Err(too_large("delta", bytes.len(), max_state_bytes()));
+    }
+    if within_kind_counts_encoded(bytes, false) == Some(false) {
+        return Err(refused(Invalid::TooManyRecords));
     }
     from_cbor_canonical(bytes)
         .ok_or_else(|| ContractError::Deser("delta is not a canonical record list".into()))
@@ -694,6 +702,28 @@ mod tests {
             matches!(r, Err(ContractError::InvalidUpdateWithInfo { .. })),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn many_small_records_are_refused_before_they_are_decoded() {
+        // 50,000 "clock records" whose payload does not decode as one: the
+        // refusal names their number, so nothing was decoded.
+        let n: u32 = 50_000;
+        let mut delta = vec![0x9a];
+        delta.extend(n.to_be_bytes());
+        for _ in 0..n {
+            delta.extend([0x82, 0x02, 0x00]);
+        }
+        let r = update(
+            &st(&small()),
+            vec![UpdateData::Delta(StateDelta::from(delta))],
+        );
+        match r {
+            Err(ContractError::InvalidUpdateWithInfo { reason }) => {
+                assert!(reason.contains("TooManyRecords"), "{reason}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

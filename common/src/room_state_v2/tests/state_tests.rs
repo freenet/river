@@ -56,9 +56,13 @@ fn validate_refuses_what_f_would_change() {
         validate_state(&o, &t.to_bytes(), &mut Verifier::new()),
         Err(Invalid::NotSortedUnique)
     );
-    // Duplicate.
+    // Duplicate, in place of another record of its kind, so the kind
+    // counts stay as they were (a count over its cap is refused first).
     let mut t = s.clone();
-    t.records.insert(1, t.records[0].clone());
+    let i = (0..t.records.len() - 1)
+        .find(|&i| t.records[i].kind() == t.records[i + 1].kind())
+        .unwrap();
+    t.records[i + 1] = t.records[i].clone();
     assert_eq!(
         validate_state(&o, &t.to_bytes(), &mut Verifier::new()),
         Err(Invalid::NotSortedUnique)

@@ -93,9 +93,106 @@ pub fn within_kind_counts(records: &[Record]) -> bool {
     for r in records {
         n[r.kind() as usize] += 1;
     }
+    counts_within(&n)
+}
+
+fn counts_within(n: &[usize; 24]) -> bool {
     kind_groups()
         .iter()
         .all(|(ks, max)| ks.iter().map(|&k| n[k]).sum::<usize>() <= *max)
+}
+
+/// As [`within_kind_counts`], read from the encoded bytes of a state
+/// (`state`) or a delta without decoding any record: each record's kind
+/// tag is read and the rest of it skipped. So a state or delta of many
+/// small records is refused before it is decoded, which is the largest
+/// allocation an input can cause. `None`: the bytes are not a well-formed
+/// definite-length encoding of that shape (the full decode refuses them).
+pub fn within_kind_counts_encoded(bytes: &[u8], state: bool) -> Option<bool> {
+    let mut r = Scan { b: bytes, at: 0 };
+    if state {
+        if r.header()? != (4, 2) {
+            return None;
+        }
+        r.skip()?; // the version
+    }
+    let (major, n) = r.header()?;
+    if major != 4 || n > bytes.len() as u64 {
+        return None;
+    }
+    let mut counts = [0usize; 24];
+    for _ in 0..n {
+        if r.header()? != (4, 2) {
+            return None;
+        }
+        let (major, tag) = r.header()?;
+        if major != 0 || tag >= 24 {
+            return None;
+        }
+        counts[tag as usize] += 1;
+        r.skip()?;
+    }
+    Some(counts_within(&counts))
+}
+
+/// A cursor over definite-length CBOR.
+struct Scan<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl Scan<'_> {
+    fn byte(&mut self) -> Option<u8> {
+        let x = *self.b.get(self.at)?;
+        self.at += 1;
+        Some(x)
+    }
+
+    /// An item's major type and argument (indefinite lengths refused).
+    fn header(&mut self) -> Option<(u8, u64)> {
+        let x = self.byte()?;
+        let (major, info) = (x >> 5, x & 0x1f);
+        let arg = match info {
+            0..=23 => info as u64,
+            24..=27 => {
+                let mut v = 0u64;
+                for _ in 0..(1usize << (info - 24)) {
+                    v = (v << 8) | self.byte()? as u64;
+                }
+                v
+            }
+            _ => return None,
+        };
+        Some((major, arg))
+    }
+
+    /// Skips one item, nested items included, without recursion: every
+    /// pending item takes at least one byte, so more pending than bytes
+    /// left is malformed.
+    fn skip(&mut self) -> Option<()> {
+        let mut pending: u64 = 1;
+        while pending > 0 {
+            pending -= 1;
+            let (major, arg) = self.header()?;
+            match major {
+                2 | 3 => {
+                    let end = self.at.checked_add(usize::try_from(arg).ok()?)?;
+                    if end > self.b.len() {
+                        return None;
+                    }
+                    self.at = end;
+                }
+                4 => pending = pending.checked_add(arg)?,
+                5 => pending = pending.checked_add(arg.checked_mul(2)?)?,
+                6 => pending += 1,
+                _ => {}
+            }
+            if pending > (self.b.len() - self.at) as u64 {
+                return None;
+            }
+        }
+        Some(())
+    }
 }
 
 /// The byte ceiling of a state: each group's cap times its largest record,
@@ -223,6 +320,9 @@ pub fn merge(owner: &Key, a: &RoomStateV2, b: &RoomStateV2, v: &mut Verifier) ->
 pub fn validate_state(owner: &Key, bytes: &[u8], v: &mut Verifier) -> Result<RoomStateV2, Invalid> {
     if bytes.len() > max_state_bytes() {
         return Err(Invalid::TooLarge(bytes.len()));
+    }
+    if within_kind_counts_encoded(bytes, true) == Some(false) {
+        return Err(Invalid::TooManyRecords);
     }
     let s: RoomStateV2 = from_cbor_canonical(bytes).ok_or(Invalid::NotCanonical)?;
     if s.version != STATE_VERSION {
