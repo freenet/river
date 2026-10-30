@@ -57,6 +57,12 @@ impl Universe {
         Self::build(name, b, Mutant::None, cap, None, false)
     }
 
+    /// As [`Self::lazy`], with `f` also run under the purge token budget
+    /// `purge` (`None`: the ceiling).
+    pub fn lazy_with(name: &str, b: Builder, cap: Option<u32>, purge: Option<usize>) -> Universe {
+        Self::build(name, b, Mutant::None, cap, purge, false)
+    }
+
     fn build(
         name: &str,
         b: Builder,

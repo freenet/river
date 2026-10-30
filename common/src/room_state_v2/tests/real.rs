@@ -18,7 +18,7 @@ use super::builder::{owner, Builder};
 use super::families::{legacy_families, tiny_families};
 use super::forge::forgeries;
 use super::harness::{bit, bits, random, report_failures, row, Counts, LawModel, Rng, HEADER, S};
-use super::laws::{rand_family, Gen};
+use super::laws::{purge_family, rand_family, Gen};
 use super::universe::Universe;
 use crate::room_state_v2::encoding::{Digest, Key};
 use crate::room_state_v2::records::Record;
@@ -54,6 +54,8 @@ pub struct Real {
     pub origin: HashMap<usize, usize>,
     pub u: Universe,
     cap: Option<u32>,
+    /// The purge token budget `f` runs under (`None`: the ceiling).
+    purge: Option<usize>,
     /// `f` calls checked against the universe, and those that disagreed.
     pub f_checked: AtomicU64,
     pub f_differs: AtomicU64,
@@ -75,6 +77,7 @@ impl Real {
         name: &str,
         mut b: Builder,
         cap: Option<u32>,
+        purge: Option<usize>,
         per_kind: usize,
         rng: &mut Rng,
     ) -> Real {
@@ -89,7 +92,7 @@ impl Real {
             .unzip();
         b.recs = recs;
         b.names = names;
-        let u = Universe::lazy(name, b, cap);
+        let u = Universe::lazy_with(name, b, cap, purge);
         let mut recs = u.recs.clone();
         let mut names = u.names.clone();
         let n = recs.len();
@@ -137,6 +140,7 @@ impl Real {
             origin,
             u,
             cap,
+            purge,
             f_checked: AtomicU64::new(0),
             f_differs: AtomicU64::new(0),
             forged_kept: AtomicU64::new(0),
@@ -156,11 +160,13 @@ impl Real {
             .fold(0, |acc, r| acc | bit(self.index[&r.digest()]))
     }
 
-    /// Runs `run` under this model's legacy link cap.
+    /// Runs `run` under this model's legacy link cap and purge budget.
     fn capped<T>(&self, run: impl FnOnce() -> T) -> T {
         test_cap::set(self.cap);
+        test_cap::set_purge(self.purge);
         let out = run();
         test_cap::set(None);
+        test_cap::set_purge(None);
         out
     }
 
@@ -448,6 +454,7 @@ fn run_model(
 /// universes.
 fn run_real(
     cap: Option<u32>,
+    purge: Option<usize>,
     fams: u64,
     pool: usize,
     pairs: u64,
@@ -467,7 +474,11 @@ fn run_real(
         forged_kinds: 0,
         refused_kinds: 0,
     };
-    let fam: Vec<_> = if cap.is_some() {
+    // Under a purge budget only the random universes, which hold purge
+    // envelopes (the tiny families hold none).
+    let fam: Vec<_> = if purge.is_some() {
+        vec![]
+    } else if cap.is_some() {
         legacy_families()
     } else {
         tiny_families()
@@ -481,6 +492,7 @@ fn run_real(
             &format!("real {cap:?} / {name}"),
             ub(base, v1),
             cap,
+            None,
             2,
             &mut rng,
         );
@@ -496,9 +508,13 @@ fn run_real(
     }
     let seed0 = env("RIVER_V2_SEED", 36);
     for fi in 0..fams {
-        let b = rand_family(seed0, fi, Gen::Legacy);
+        let b = match purge {
+            Some(_) => purge_family(seed0, fi),
+            None => rand_family(seed0, fi, Gen::Legacy),
+        };
         let mut rng = Rng(seed0 + fi);
-        let m = Real::new(&format!("real {cap:?} / univ{fi}"), b, cap, 1, &mut rng);
+        let label = format!("real {cap:?} purge {purge:?} / univ{fi}");
+        let m = Real::new(&label, b, cap, purge, 1, &mut rng);
         run_model(&m, seed0 * 31 + fi, pool, pairs, triples, samples, &mut out);
     }
     println!(
@@ -561,6 +577,7 @@ fn the_real_path_obeys_the_laws_with_forged_records() {
     let fams = env("RIVER_V2_REAL_FAMS", 2);
     let r = run_real(
         None,
+        None,
         fams,
         env("RIVER_V2_REAL_POOL", 40) as usize,
         env("RIVER_V2_REAL_PAIRS", 64),
@@ -575,6 +592,7 @@ fn the_real_path_obeys_the_laws_under_a_binding_legacy_link_cap() {
     let fams = env("RIVER_V2_REAL_FAMS", 1);
     let r = run_real(
         Some(1),
+        None,
         fams,
         env("RIVER_V2_REAL_POOL", 40) as usize,
         env("RIVER_V2_REAL_PAIRS", 64),
@@ -593,6 +611,7 @@ fn the_real_path_obeys_the_laws_with_forged_records_at_size() {
         let fams = env("RIVER_V2_REAL_FAMS", 6);
         let r = run_real(
             cap,
+            None,
             fams,
             env("RIVER_V2_REAL_POOL", 100) as usize,
             env("RIVER_V2_REAL_PAIRS", 400),
@@ -611,4 +630,25 @@ fn the_real_path_obeys_the_laws_with_forged_records_at_size() {
             "kinds never refused at a signature check: {unseen:b}"
         );
     }
+}
+
+/// The real path under a binding purge budget (2 tokens), over universes
+/// whose purge envelopes it refuses: the laws hold, f keeps no forged
+/// record and agrees with the universe's f.
+#[test]
+fn the_real_path_obeys_the_laws_under_a_binding_purge_budget() {
+    let fams = env("RIVER_V2_REAL_FAMS", 3);
+    let r = run_real(
+        None,
+        Some(2),
+        fams,
+        env("RIVER_V2_REAL_POOL", 40) as usize,
+        env("RIVER_V2_REAL_PAIRS", 64),
+        env("RIVER_V2_REAL_TRIPLES", 64),
+        env("RIVER_V2_REAL_SAMPLES", 2) as usize,
+    );
+    assert!(!r.counts.bad(), "a law failed on the real path");
+    assert_eq!(r.unclean, 0, "the real f differs from the universe's");
+    assert_eq!(r.forged_fails, 0, "a forged record changed an outcome");
+    assert!(r.models as u64 == fams && r.counts.pairs > 0);
 }
