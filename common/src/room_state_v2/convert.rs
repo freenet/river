@@ -251,12 +251,16 @@ pub struct DeputyCandidate {
     /// The keys whose v1 deputy list names it: the owner (appointed room
     /// wide in v1) or a member (appointed for that member's subtree in v1).
     pub listed_by: Vec<Key>,
-    /// The v1 bans it issued. If the owner declines it, they carry over as
-    /// member bans, which act only in its own invite subtree.
+    /// The v1 bans it issued. If the owner declines it, at most
+    /// `max_bans_per_issuer` (10) carry over, as member bans, which act only
+    /// in its own invite subtree.
     pub v1_bans: usize,
-    /// Of those, the bans whose target is outside its own subtree: what
-    /// declining it un-bans.
+    /// Of those, the bans whose target the room knows and is outside its own
+    /// subtree: what declining it un-bans.
     pub bans_outside_subtree: usize,
+    /// The bans whose target the room holds no record of, so it cannot tell
+    /// whose subtree they are in.
+    pub bans_on_unknown_keys: usize,
 }
 
 /// The deputies to propose to the converting owner: every current, unbanned
@@ -264,7 +268,18 @@ pub struct DeputyCandidate {
 /// current, unbanned member. v2 deputies act room wide, so none is made one
 /// without the owner's confirmation (decision (r)).
 pub fn deputy_candidates(owner: &Key, v1: &ChatRoomStateV1) -> Vec<DeputyCandidate> {
-    let banned: BTreeSet<MemberId> = v1.bans.0.iter().map(|b| b.ban.banned_user).collect();
+    // The bans v1 enforces, not every ban it stores: v1 keeps bans that take
+    // no effect, and one of those must not hide a deputy from the owner.
+    let banned: std::collections::HashSet<MemberId> =
+        match ed25519_dalek::VerifyingKey::from_bytes(&owner.0) {
+            Ok(vk) => v1.members.banned_member_ids(
+                &v1.ban_evidence,
+                &v1.bans,
+                &v1.member_info,
+                &crate::room_state::ChatRoomParametersV1 { owner: vk },
+            ),
+            Err(_) => Default::default(),
+        };
     let members: HashMap<MemberId, Key> = v1
         .members
         .members
@@ -295,6 +310,7 @@ pub fn deputy_candidates(owner: &Key, v1: &ChatRoomStateV1) -> Vec<DeputyCandida
         .members
         .members
         .iter()
+        .chain(v1.ban_evidence.members.iter())
         .map(|m| (m.member.id(), m.member.invited_by))
         .collect();
     let under = |target: MemberId, issuer: MemberId| {
@@ -322,7 +338,11 @@ pub fn deputy_candidates(owner: &Key, v1: &ChatRoomStateV1) -> Vec<DeputyCandida
                 key,
                 listed_by: by.into_iter().collect(),
                 v1_bans: issued.len(),
-                bans_outside_subtree: issued.iter().filter(|t| !under(**t, id)).count(),
+                bans_outside_subtree: issued
+                    .iter()
+                    .filter(|t| inviter.contains_key(t) && !under(**t, id))
+                    .count(),
+                bans_on_unknown_keys: issued.iter().filter(|t| !inviter.contains_key(t)).count(),
             }
         })
         .collect()
@@ -368,18 +388,21 @@ pub fn owner_configuration(
     c.display_name = sealed(&cfg.display.name);
     c.display_description = cfg.display.description.as_ref().map(sealed);
     c.legacy_window_open = true;
+    // Blobs cost little and a dropped one leaves a member unable to read: a
+    // converted room keeps as many as the ceiling allows.
+    c.max_secret_blobs = MAX_SECRET_BLOBS;
     let name = c.display_name.declared_len();
     if name > c.max_room_name as usize {
         return Err(ConvertError::NameTooLong {
             len: name,
-            max: MAX_ROOM_NAME as usize,
+            max: c.max_room_name as usize,
         });
     }
     if let Some(d) = &c.display_description {
         if d.declared_len() > c.max_room_description as usize {
             return Err(ConvertError::DescriptionTooLong {
                 len: d.declared_len(),
-                max: MAX_ROOM_DESCRIPTION as usize,
+                max: c.max_room_description as usize,
             });
         }
     }
@@ -652,13 +675,17 @@ pub fn owner_payloads(
     v.trust(owner, all[..n_owner].iter().map(|r| r.digest()));
     let kept = retain(owner, &all, &mut v);
     let member_ids: BTreeSet<i64> = kept.members.iter().map(legacy_id).collect();
-    // v1 deputies the owner did not confirm: their bans carry over as member
-    // bans, acting only in their own subtree.
-    let declined: BTreeSet<Key> = deputy_candidates(owner, v1)
-        .into_iter()
-        .map(|c| c.key)
-        .filter(|k| !configuration.deputies.contains(k))
+    // v1 deputies the owner did not confirm, from every v1 deputy list:
+    // their bans carry over as member bans, acting only in their own subtree.
+    let listed: BTreeSet<i64> = v1
+        .member_info
+        .member_info
+        .iter()
+        .flat_map(|i| i.member_info.deputies.iter().map(|d| d.0 .0))
         .collect();
+    let declined = |k: &Key| {
+        listed.contains(&legacy_id(k)) && *k != *owner && !configuration.deputies.contains(k)
+    };
     let mut by_kind: HashMap<LegacyKind, Vec<RosterEntry>> = HashMap::new();
     let mut report = ConversionReport::default();
     for (r, k) in all[n_owner..].iter().zip(kept.keep[n_owner..].iter()) {
@@ -669,7 +696,7 @@ pub fn owner_payloads(
         e.total += 1;
         if *k {
             match r {
-                Record::LegacyBan(l) if declined.contains(&l.signer) => e.narrowed += 1,
+                Record::LegacyBan(l) if declined(&l.signer) => e.narrowed += 1,
                 _ => e.kept += 1,
             }
             by_kind.entry(kind).or_default().push(RosterEntry {
@@ -704,23 +731,59 @@ pub fn owner_payloads(
     })
 }
 
+/// What closing the window would attest, for the owner's client to show
+/// before it signs: a link attested here becomes permanent and exempt from
+/// the link quotas.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClosingReport {
+    /// New roster entries per kind.
+    pub attested: std::collections::BTreeMap<LegacyKind, usize>,
+    /// The links not attested before, per inviter.
+    pub new_links: std::collections::BTreeMap<Key, usize>,
+}
+
+/// What the owner signs to close the window, and what it attests.
+#[derive(Debug, Clone)]
+pub struct Closing {
+    pub payloads: OwnerPayloads,
+    pub report: ClosingReport,
+}
+
+/// Why the window cannot be closed as asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosingError {
+    /// The state holds no configuration.
+    NoConfiguration,
+    /// The window is already closed.
+    AlreadyClosed,
+    /// This many legacy records the state holds would be lost: their roster
+    /// batches do not fit the roster's limits, and unattested records go
+    /// when the window closes, for good.
+    WouldLose(usize),
+}
+
 /// The owner's records that close the legacy window of `held` (a valid
 /// state) at `clock_hours`: its configuration at the next version with the
 /// window closed at that hour, a `Clock` at it, and roster batches
 /// attesting every legacy record `held` holds that no held batch attests
 /// yet (decision (s)). After it, only attested legacy records count, so a
-/// legacy record written later is dropped. `None` if `held` has no
-/// configuration or its window is already closed.
+/// legacy record written later is dropped. Refuses if a record `held` holds
+/// would not survive the result.
 pub fn closing_payloads(
+    owner: &Key,
     held: &super::state::RoomStateV2,
     clock_hours: u32,
-) -> Option<OwnerPayloads> {
-    let mut configuration = held.records.iter().find_map(|r| match r {
-        Record::Configuration(s) => Some(s.payload.clone()),
-        _ => None,
-    })?;
+) -> Result<Closing, ClosingError> {
+    let mut configuration = held
+        .records
+        .iter()
+        .find_map(|r| match r {
+            Record::Configuration(s) => Some(s.payload.clone()),
+            _ => None,
+        })
+        .ok_or(ClosingError::NoConfiguration)?;
     if !configuration.legacy_window_open {
-        return None;
+        return Err(ClosingError::AlreadyClosed);
     }
     configuration.version += 1;
     configuration.legacy_window_open = false;
@@ -733,6 +796,7 @@ pub fn closing_payloads(
             attested.extend(b.payload.batch.iter().map(|e| (e.kind, e.digest)));
         }
     }
+    let mut report = ClosingReport::default();
     let mut by_kind: std::collections::BTreeMap<LegacyKind, Vec<RosterEntry>> = Default::default();
     for r in &held.records {
         if let Some(kind) = r.legacy_kind() {
@@ -742,6 +806,10 @@ pub fn closing_payloads(
                     .entry(kind)
                     .or_default()
                     .push(RosterEntry { kind, digest });
+                *report.attested.entry(kind).or_default() += 1;
+                if let Record::LegacyLink(l) = r {
+                    *report.new_links.entry(l.signer).or_default() += 1;
+                }
             }
         }
     }
@@ -751,12 +819,29 @@ pub fn closing_payloads(
         let seq = next_seq + roster.len() as u32;
         roster.extend(batches(kind, entries, seq));
     }
-    Some(OwnerPayloads {
+    let payloads = OwnerPayloads {
         configuration,
         clock: ClockP { hours: clock_hours },
         secret_versions: vec![],
         roster,
-    })
+    };
+    // Whether the batches fit: `f` of the result, with these records and the
+    // held ones trusted. The owner's real signatures come later.
+    let mut all = payloads.sign(&SigningKey::from_bytes(&[0x42; 32]));
+    let n_new = all.len();
+    all.extend(held.records.iter().cloned());
+    let mut v = Verifier::new();
+    v.trust(owner, all.iter().map(|r| r.digest()));
+    let kept = retain(owner, &all, &mut v);
+    let lost = all[n_new..]
+        .iter()
+        .zip(&kept.keep[n_new..])
+        .filter(|(r, k)| r.legacy_kind().is_some() && !**k)
+        .count();
+    if lost > 0 {
+        return Err(ClosingError::WouldLose(lost));
+    }
+    Ok(Closing { payloads, report })
 }
 
 /// Roster batches of one kind, numbered from `seq`.

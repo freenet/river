@@ -438,7 +438,11 @@ fn the_report_shows_narrowed_bans_clamps_and_unreachable_links() {
         .find(|c| c.key == key(1))
         .unwrap();
     // k1's bans: a non-member (51) and k4, neither under k1.
-    assert_eq!((k1.v1_bans, k1.bans_outside_subtree), (2, 2));
+    // k1's bans: a key the room holds no record of (51), and k4, not under k1.
+    assert_eq!(
+        (k1.v1_bans, k1.bans_outside_subtree, k1.bans_on_unknown_keys),
+        (2, 1, 1)
+    );
 
     let conv = legacy_records(&o, &v1);
     let report = |deputies: &[Key]| {
@@ -488,7 +492,6 @@ fn blobs_beyond_the_blob_cap_are_reported() {
     let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
     let mut cfg = v1.configuration.configuration.clone();
     cfg.privacy_mode = PrivacyMode::Private;
-    cfg.max_members = 3;
     cfg.display.name = SealedBytes::Private {
         ciphertext: vec![1; 20],
         nonce: [0; 12],
@@ -496,9 +499,9 @@ fn blobs_beyond_the_blob_cap_are_reported() {
         declared_len_bytes: 4,
     };
     v1.configuration = AuthorizedConfigurationV1::new(cfg, &sk(0));
-    // Five versions, a blob for each of the three members at each: 15
-    // blobs against a cap of 4 x max_members = 12.
-    for v in 0..5u32 {
+    // 179 versions, a blob for each of the three members at each: 537 blobs
+    // against the cap of 534, whatever the room's member limit.
+    for v in 0..179u32 {
         let r = SecretVersionRecordV1 {
             version: v,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
@@ -524,10 +527,10 @@ fn blobs_beyond_the_blob_cap_are_reported() {
     let o = key(0);
     let conv = legacy_records(&o, &v1);
     let c = owner_payloads(&o, &v1, &conv.records, 1, &[key(1)], &[], &[]).unwrap();
-    assert_eq!(c.payloads.configuration.max_secret_blobs, 12);
+    assert_eq!(c.payloads.configuration.max_secret_blobs, 534);
     let blobs = &c.report.kinds[&LegacyKind::SecretBlob];
-    assert_eq!(blobs.total, 15, "{blobs:?}");
-    assert_eq!(blobs.kept, 12, "{blobs:?}");
+    assert_eq!(blobs.total, 537, "{blobs:?}");
+    assert_eq!(blobs.kept, 534, "{blobs:?}");
     assert_eq!(
         blobs.dropped.get(&DropReason::SecretBlobCap),
         Some(&3),
@@ -679,7 +682,7 @@ fn a_conversion_of_two_generations_keeps_the_records_of_both() {
 /// record stays, and a legacy record written after the close is dropped.
 #[test]
 fn closing_the_window_attests_what_the_room_holds() {
-    use crate::room_state_v2::convert::closing_payloads;
+    use crate::room_state_v2::convert::{closing_payloads, ClosingError};
     let v1 = v1_room();
     let o = key(0);
     let conv = legacy_records(&o, &v1);
@@ -728,18 +731,26 @@ fn closing_the_window_attests_what_the_room_holds() {
     };
     let n_during = held_legacy(&during);
 
-    let close = closing_payloads(&during, 2).unwrap();
+    let close = closing_payloads(&o, &during, 2).unwrap();
     assert!(
-        !close.roster.is_empty(),
+        !close.payloads.roster.is_empty(),
         "the window's records need attesting"
     );
+    // The report names what it attests: k4's link, under k1, and the two
+    // window messages with k4's activity.
+    assert_eq!(close.report.new_links.get(&key(1)), Some(&1));
+    assert_eq!(close.report.attested[&LegacyKind::Message], 2);
+    let close = close.payloads;
     let mut recs = during.records.clone();
     recs.extend(close.sign(&sk(0)));
     let (closed, r) = normalize(&o, recs, &mut Verifier::new());
     assert!(r.members.contains(&key(4)), "an attested window join stays");
     assert_eq!(held_legacy(&closed), n_during, "nothing attested is lost");
     assert!(validate_state(&o, &closed.to_bytes(), &mut Verifier::new()).is_ok());
-    assert!(closing_payloads(&closed, 3).is_none(), "already closed");
+    assert_eq!(
+        closing_payloads(&o, &closed, 3).unwrap_err(),
+        ClosingError::AlreadyClosed
+    );
 
     // A legacy record written after the close is not attested.
     let mut after = later.clone();
@@ -778,7 +789,7 @@ fn at_the_link_cap_a_window_join_cannot_be_attested() {
     recs.extend(legacy_records(&o, &later).records);
     let (during, r) = normalize(&o, recs, &mut Verifier::new());
     assert!(!r.members.contains(&key(4)), "no unrostered share is left");
-    let close = closing_payloads(&during, 2).unwrap();
+    let close = closing_payloads(&o, &during, 2).unwrap().payloads;
     let mut recs = during.records.clone();
     recs.extend(close.sign(&sk(0)));
     let (_, r) = normalize(&o, recs, &mut Verifier::new());
@@ -890,4 +901,74 @@ fn the_invite_bot_admits_past_the_default_with_an_exception() {
         owner_configuration(&o, &f.v1, &[], &[], &[(key(9), 100)]),
         Err(ConvertError::ChildExceptionWithoutLink(_))
     ));
+}
+
+/// A closing whose batches do not fit the roster's limits is refused, not
+/// signed: the records it fails to attest would go when the window closes.
+#[test]
+fn a_closing_that_would_lose_records_is_refused() {
+    use crate::room_state_v2::convert::{closing_payloads, ClosingError};
+    use crate::room_state_v2::retain::test_cap;
+    let v1 = v1_room();
+    let o = key(0);
+    let conv = legacy_records(&o, &v1);
+    let mut recs = payloads(&v1, &conv.records, &[key(1)]).sign(&sk(0));
+    recs.extend(conv.records.iter().cloned());
+    let (opened, _) = normalize(&o, recs, &mut Verifier::new());
+    let batches = opened
+        .records
+        .iter()
+        .filter(|r| matches!(r, Record::Roster(_)))
+        .count();
+    // A record written during the window, to attest.
+    let mut later = v1.clone();
+    later
+        .recent_messages
+        .messages
+        .push(AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: id(0),
+                author: id(2),
+                time: UNIX_EPOCH + Duration::from_secs(1_800_000_000 + 7 * 3600),
+                content: RoomMessageBody::public("window".into()),
+            },
+            &sk(2),
+        ));
+    let mut recs = opened.records.clone();
+    recs.extend(legacy_records(&o, &later).records);
+    let (during, _) = normalize(&o, recs, &mut Verifier::new());
+    // No batch left for the closing's.
+    test_cap::set_limits(test_cap::Limits {
+        roster_batches: Some(batches),
+        ..Default::default()
+    });
+    let r = closing_payloads(&o, &during, 2);
+    test_cap::set_limits(test_cap::Limits::default());
+    assert!(
+        matches!(r, Err(ClosingError::WouldLose(n)) if n >= 1),
+        "{r:?}"
+    );
+}
+
+/// A ban that takes no effect does not hide a deputy from the owner, and a
+/// deputy's bans are reported narrowed from the v1 lists themselves.
+#[test]
+fn an_inert_ban_does_not_hide_a_deputy() {
+    let mut v1 = v1_room();
+    let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    // k2 stores a ban on deputy k1, outside its authority: v1 keeps it and
+    // it takes no effect.
+    let b = UserBan {
+        owner_member_id: id(0),
+        banned_at: t,
+        banned_user: id(1),
+    };
+    v1.bans.0.push(AuthorizedUserBan::new(b, id(2), &sk(2)));
+    let o = key(0);
+    let cands = deputy_candidates(&o, &v1);
+    assert!(cands.iter().any(|c| c.key == key(1)), "{cands:?}");
+    // Declined, its ban on a non-member is narrowed in the report.
+    let conv = legacy_records(&o, &v1);
+    let c = owner_payloads(&o, &v1, &conv.records, 1, &[], &[], &[]).unwrap();
+    assert!(c.report.kinds[&LegacyKind::Ban].narrowed >= 1);
 }

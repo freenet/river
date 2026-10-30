@@ -215,10 +215,23 @@ pub fn roster_ceiling(k: LegacyKind) -> usize {
 /// the distinct entries the roster may hold, so the owner can list what the
 /// room holds at conversion and all of it again at window close.
 pub fn roster_entry_budget() -> usize {
+    #[cfg(test)]
+    if let Some(n) = test_cap::limits().roster_entries {
+        return n;
+    }
     2 * super::records::LEGACY_KINDS
         .iter()
         .map(|k| roster_ceiling(*k))
         .sum::<usize>()
+}
+
+/// Roster batches kept ([`ceiling::ROSTER_BATCHES`], or a value tests set).
+pub fn roster_batches() -> usize {
+    #[cfg(test)]
+    if let Some(n) = test_cap::limits().roster_batches {
+        return n;
+    }
+    ceiling::ROSTER_BATCHES
 }
 
 /// The legacy link cap: [`ceiling::MAX_LEGACY_LINKS`], or a smaller value
@@ -647,7 +660,7 @@ pub fn retain_refs(
     let mut entries = 0usize;
     let entry_budget = roster_entry_budget();
     for (_, _, i) in cands {
-        if batches >= ceiling::ROSTER_BATCHES {
+        if batches >= roster_batches() {
             break;
         }
         let Record::Roster(s) = &recs[i] else {

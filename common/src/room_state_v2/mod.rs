@@ -188,10 +188,12 @@
 //!   passes in, and a `protected` list the owner chooses (a deputy ban
 //!   cannot target a protected key; the Invite Bot belongs there). Nothing
 //!   is promoted automatically (Ian, 2026-10-28). The bans of a v1 deputy
-//!   the owner declines carry over as member bans, which act only in its
-//!   own invite subtree: each candidate shows how many of its v1 bans reach
-//!   outside it (what declining un-bans), and the conversion report counts
-//!   such bans as narrowed, not kept. The report also lists configuration
+//!   the owner declines carry over as member bans, at most 10 of them, which
+//!   act only in its own invite subtree: each candidate shows how many of its
+//!   v1 bans reach outside it (what declining un-bans) and how many name keys
+//!   the room holds no record of, and the conversion report counts such bans
+//!   as narrowed, not kept. A v1 ban that takes no effect does not hide a
+//!   candidate. The report also lists configuration
 //!   values lowered to the ceilings, secret versions beyond the cap, blobs
 //!   beyond the blob cap, and links whose v1 chain does not reach the owner.
 //! - **(s) Roster budget.** The roster counts distinct attested records per
@@ -199,7 +201,14 @@
 //!   ceiling: twice the kind's cap (links: the legacy link cap), so the
 //!   owner can attest what the room holds at conversion and again what it
 //!   holds when the window closes. Records written during the window beyond
-//!   that are lost when it closes. Separately, the entries of all kept
+//!   that are lost when it closes. [`convert::closing_payloads`] attests what
+//!   the state holds, without the v1 merge the design's step 3 runs first:
+//!   `f` has already decided those records, and a v1 merge would add only
+//!   v1's own caps, which a converted room no longer holds. It returns a
+//!   report (new links per inviter: an attested link is permanent, exempt
+//!   from the quotas, and holds its roster slot even once its member leaves)
+//!   and refuses if its batches would not fit, since what is not attested
+//!   goes for good. Separately, the entries of all kept
 //!   batches, repeats included, are held to twice the distinct ceilings
 //!   together, and at most 32 batches are kept, so repeats cost bytes and
 //!   signatures that `max_state_bytes` counts.
