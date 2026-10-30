@@ -12,6 +12,7 @@ mod forge;
 mod harness;
 mod laws;
 mod mechanisms;
+mod pins;
 mod real;
 mod selftest;
 mod sizes;

@@ -184,3 +184,155 @@ fn only_rostered_legacy_links_go_below_the_depth_limit() {
         assert!(!kept(&open, g), "unrostered {g} below the depth limit");
     }
 }
+
+fn count_kept(r: &(Retained, Vec<String>), prefix: &str) -> usize {
+    r.1.iter()
+        .zip(&r.0.keep)
+        .filter(|(n, k)| n.starts_with(prefix) && **k)
+        .count()
+}
+
+/// The per-deputy and per-issuer ban limits, the secret version cap, the
+/// per-pair DM limit: each over by one keeps exactly the limit.
+#[test]
+fn per_issuer_limits_and_the_version_cap_bind() {
+    use super::builder::{with, Builder, T};
+    // A deputy's two bans under a per-deputy limit of one: the newer stays.
+    let mut b = Builder::new();
+    for (inv, k, seq) in [(1u8, 3usize, 1u32), (2, 4, 2), (3, 5, 3)] {
+        b.invitation(inv, "O", seq, 0);
+        b.acc(&format!("A{k}"), inv, k);
+    }
+    b.dban("D3", 4, T::Key(3), 2, 0);
+    b.dban("D5", 4, T::Key(5), 3, 0);
+    b.cfg(
+        0,
+        with(|c| {
+            c.max_members = 5;
+            c.deputies = 1 << 4;
+            c.max_deputy_bans = 3;
+            c.max_per_deputy = 1;
+        }),
+    );
+    let r = f_without(&b.finish(), &[]);
+    assert!(kept(&r, "D5") && !kept(&r, "D3"), "per-deputy limit");
+
+    // A member's two bans in its subtree under a per-issuer limit of one.
+    let mut b = Builder::new();
+    b.invitation(1, "O", 1, 0);
+    b.acc("A1", 1, 1);
+    for (inv, k) in [(2u8, 2usize), (3, 3)] {
+        b.invitation(inv, "A1", inv as u32, 0);
+        b.acc(&format!("A{k}"), inv, k);
+    }
+    b.act(1, 1);
+    b.clock(2);
+    b.mban("M2", "A1", T::Key(2), 1, 0, false);
+    b.mban("M3", "A1", T::Key(3), 2, 0, false);
+    b.cfg(
+        0,
+        with(|c| {
+            c.max_members = 5;
+            c.max_member_bans = 3;
+            c.max_per_issuer = 1;
+            c.ban_window = 100;
+        }),
+    );
+    let r = f_without(&b.finish(), &[]);
+    assert_eq!(count_kept(&r, "M"), 1, "per-issuer limit");
+
+    // Two secret versions under a cap of one: the newer stays.
+    let mut b = Builder::new();
+    b.secret_version(1);
+    b.secret_version(2);
+    b.cfg(
+        0,
+        with(|c| {
+            c.private = true;
+            c.max_versions = 1;
+        }),
+    );
+    let r = f_without(&b.finish(), &[]);
+    assert!(
+        kept(&r, "secret v2") && !kept(&r, "secret v1"),
+        "version cap"
+    );
+
+    // One more DM between a pair than the per-pair limit.
+    let per_pair = crate::room_state_v2::config::ceiling::DMS_PER_PAIR;
+    let mut b = Builder::new();
+    for (inv, k) in [(1u8, 1usize), (2, 2)] {
+        b.invitation(inv, "O", inv as u32, 0);
+        b.acc(&format!("A{k}"), inv, k);
+    }
+    for t in 0..=per_pair as u32 {
+        b.dm(1, 2, t, 0);
+    }
+    b.cfg(0, with(|c| c.max_dms = 300));
+    let r = f_without(&b.finish(), &[]);
+    assert_eq!(count_kept(&r, "dm("), per_pair, "per-pair limit");
+}
+
+/// Rostered legacy links come first at their depth, so their children rank
+/// ahead of other links' children for what the budgets leave.
+#[test]
+fn rostered_links_rank_first_at_their_depth() {
+    use crate::room_state_v2::records::Record;
+    // An accepted link at depth 1 whose digest sorts before the rostered
+    // legacy link's, so only the rostered-first rule puts G1 first.
+    let mut tried = 0;
+    // The invitation id sets the one-time key, and so the link's digest.
+    for ia in 10u8..40 {
+        let mut b = super::builder::Builder::new();
+        b.leg("G1", 1, 0);
+        b.roster(1, &["G1"]);
+        b.invitation(ia, "O", 0, 0);
+        b.acc("A", ia, 2);
+        // One child each, at depth 2; one slot left for them.
+        b.invitation(2, "G1", 0, 0);
+        b.acc("CG", 2, 3);
+        b.invitation(3, "A", 0, 0);
+        b.acc("CA", 3, 4);
+        b.cfg(
+            0,
+            super::builder::with(|c| {
+                c.window_open = true;
+                c.max_members = 7;
+                c.max_links = 3;
+                c.max_children = 9;
+            }),
+        );
+        let b = b.finish();
+        let digest = |name: &str| {
+            let i = b.names.iter().position(|n| n.starts_with(name)).unwrap();
+            Record::digest(&b.recs[i])
+        };
+        if digest("A[") > digest("G1") {
+            continue;
+        }
+        tried += 1;
+        let r = f_without(&b, &[]);
+        assert!(kept(&r, "G1") && kept(&r, "A["));
+        assert!(kept(&r, "CG") && !kept(&r, "CA"), "invitation {ia}");
+    }
+    assert!(tried > 0, "no key put the accepted link first by digest");
+}
+
+/// A record's time counts at most 48 hours past the clock it names, so a
+/// far-future message does not outrank a later-referenced one.
+#[test]
+fn a_far_future_time_is_clamped_to_its_clock_reference() {
+    let mut b = super::builder::Builder::new();
+    for (inv, k) in [(1u8, 1usize), (2, 2)] {
+        b.invitation(inv, "O", inv as u32, 0);
+        b.acc(&format!("A{k}"), inv, k);
+    }
+    b.clock(20);
+    // k1: hour 1,000 against clock 1 (counts as hour 49); k2: hour 60
+    // against clock 20 (counts as 60).
+    b.msg(1, 1_000, 1);
+    b.msg(2, 60, 20);
+    b.cfg(0, super::builder::with(|c| c.max_msgs = 1));
+    let r = f_without(&b.finish(), &[]);
+    assert!(kept(&r, "msg(k2") && !kept(&r, "msg(k1"));
+}
