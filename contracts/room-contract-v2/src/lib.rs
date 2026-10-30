@@ -143,9 +143,16 @@ fn item_records(update: UpdateData) -> Result<Vec<Record>, ContractError> {
         UpdateData::State(s) => state(&s),
         UpdateData::Delta(d) => delta(&d),
         UpdateData::StateAndDelta { state: s, delta: d } => {
-            let mut r = state(&s)?;
-            r.extend(delta(&d)?);
-            Ok(r)
+            // A delta usually repeats records of its state: the union counts
+            // each record once.
+            let mut r = decode_state(s.as_ref(), "update")?;
+            let mut seen: HashSet<_> = r.iter().map(|x| x.digest()).collect();
+            r.extend(
+                decode_delta(d.as_ref())?
+                    .into_iter()
+                    .filter(|x| seen.insert(x.digest())),
+            );
+            bounded(r)
         }
         // The state part belongs to another contract and is ignored, as
         // `RelatedState` is; the delta is this contract's.
@@ -154,6 +161,12 @@ fn item_records(update: UpdateData) -> Result<Vec<Record>, ContractError> {
         _ => Err(ContractError::InvalidUpdate),
     }
 }
+
+/// The most update items applied in turn when together they hold more than
+/// one valid state. freenet-core passes one item per `update_state` call
+/// (a state or a delta, plus related-contract items), so this bounds only
+/// what another host might send; two is the merge the timing check measures.
+const MAX_ITEMS_IN_TURN: usize = 2;
 
 /// A state's bytes: empty for no records.
 fn state_bytes(s: &RoomStateV2) -> Vec<u8> {
@@ -212,12 +225,15 @@ impl ContractInterface for Contract {
         if within_kind_counts(&union) {
             // One run of `f` over the held state and every item.
             s = apply_delta(&owner, &s, union, &mut v).map_err(refused)?;
-        } else {
-            // Items from several peers can hold more together than one
-            // valid state; each is bounded on its own, so apply them in turn.
+        } else if items.len() <= MAX_ITEMS_IN_TURN {
+            // Items that hold more together than one valid state are applied
+            // in turn, each bounded on its own; at most `MAX_ITEMS_IN_TURN`,
+            // so one call costs at most that many runs of `f`.
             for records in items {
                 s = apply_delta(&owner, &s, records, &mut v).map_err(refused)?;
             }
+        } else {
+            return Err(refused(Invalid::TooManyRecords));
         }
         Ok(UpdateModification::valid(state_bytes(&s).into()))
     }
@@ -663,5 +679,35 @@ mod tests {
             vec![delta_of(&records[..half]), delta_of(&records[half..])],
         );
         assert!(matches!(&ok, Ok(b) if b.is_empty()), "{ok:?}");
+        // At most two items in turn: a third is refused, not a third run.
+        let third = records.len() / 3;
+        let r = update(
+            &empty(),
+            vec![
+                delta_of(&records[..third]),
+                delta_of(&records[third..2 * third]),
+                delta_of(&records[2 * third..]),
+                delta_of(&records[..1]),
+            ],
+        );
+        assert!(
+            matches!(r, Err(ContractError::InvalidUpdateWithInfo { .. })),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_state_and_delta_whose_delta_repeats_its_state_is_not_refused() {
+        // A state part at the activity count, and a delta repeating all of
+        // it: together twice the count, but each record once.
+        let records: Vec<Record> = (0..ceiling::MAX_LINKS).map(activity).collect();
+        let part = RoomStateV2::from_records(records.clone());
+        let item = UpdateData::StateAndDelta {
+            state: st(&part),
+            delta: StateDelta::from(to_cbor(&records)),
+        };
+        let held = st(&small());
+        let got = update(&held, vec![item]);
+        assert_eq!(got.unwrap(), held.as_ref().to_vec());
     }
 }
