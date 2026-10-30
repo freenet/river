@@ -92,12 +92,16 @@ impl Out {
     }
     fn state(&mut self, s: &RoomStateV2) {
         // The state with no records is trivial, and fdev reads its one form
-        // (empty bytes) as no input: leave it out.
+        // (empty bytes) as no input: leave it out, as a state and as either
+        // end of a transition.
         if !s.records.is_empty() {
             self.state_bytes(s.to_bytes());
         }
     }
     fn transition(&mut self, base: &RoomStateV2, result: &RoomStateV2) {
+        if base.records.is_empty() || result.records.is_empty() {
+            return;
+        }
         self.bundle.transitions.push(Transition {
             base_state: base.to_bytes(),
             delta: None,
@@ -205,6 +209,9 @@ fn histories(out: &mut Out, o: &Key, recs: &[Record], seed: u64, n: usize) {
                 crate::room_state_v2::apply_delta(o, receiver, d.clone(), &mut ver()).unwrap();
             let db = to_cbor(&d);
             out.bundle.deltas.push(db.clone());
+            if receiver.records.is_empty() || result.records.is_empty() {
+                continue;
+            }
             out.bundle.transitions.push(Transition {
                 base_state: receiver.to_bytes(),
                 delta: Some(db),
