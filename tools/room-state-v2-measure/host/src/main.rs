@@ -627,8 +627,8 @@ fn purge_junk(engine: &Engine, module: &Module) {
 
 /// `purgecheck`: the ceilings state updated with, and merged with, the same
 /// state built with every purge envelope at 1,000 tokens (401 of them, five
-/// times the budget): each recipient's candidate is checked, then most are
-/// refused by the budget (the extra checks of decision (t)).
+/// times the budget): the budget refuses most of them, each recipient
+/// falling back to the envelope within its reserve (decision (t)).
 fn purge_check(engine: &Engine, module: &Module) {
     use river_core::room_state_v2::bench::largest_records_over_purge_budget;
     let caps = Caps::ceilings();

@@ -31,6 +31,9 @@ pub struct Universe {
     cap: Option<u32>,
     /// The purge token budget `f` runs under (`None`: the ceiling).
     purge: Option<usize>,
+    /// The purge tokens reserved per kept key (`None`: derived from the
+    /// budget).
+    reserve: Option<usize>,
     table: Option<Vec<u32>>,
 }
 
@@ -47,8 +50,18 @@ impl Universe {
 
     /// As [`Self::new`], with `f` run under the purge token budget `budget`
     /// (`retain::test_cap`, set on whichever thread computes `f`).
-    pub fn with_purge_budget(name: &str, b: Builder, budget: usize) -> Universe {
-        Self::build(name, b, Mutant::None, None, Some(budget), true)
+    pub fn with_purge_budget(
+        name: &str,
+        b: Builder,
+        budget: usize,
+        reserve: Option<usize>,
+    ) -> Universe {
+        let mut u = Self::build(name, b, Mutant::None, None, Some(budget), false);
+        u.reserve = reserve;
+        if u.recs.len() <= 20 {
+            u.table = Some(u.build_table());
+        }
+        u
     }
 
     /// As [`Self::with_cap`], memoizing `f` instead of precomputing it for
@@ -83,6 +96,7 @@ impl Universe {
             mutant,
             cap,
             purge,
+            reserve: None,
             table: None,
         };
         if table && u.recs.len() <= 20 {
@@ -95,6 +109,7 @@ impl Universe {
         mutant::set(self.mutant);
         test_cap::set(self.cap);
         test_cap::set_purge(self.purge);
+        test_cap::set_reserve(self.reserve);
         let idx: Vec<usize> = bits(s).collect();
         let refs: Vec<&Record> = idx.iter().map(|&i| &self.recs[i]).collect();
         let ds: Vec<Digest> = idx.iter().map(|&i| self.digests[i]).collect();
@@ -102,6 +117,7 @@ impl Universe {
         mutant::set(Mutant::None);
         test_cap::set(None);
         test_cap::set_purge(None);
+        test_cap::set_reserve(None);
         idx.iter()
             .zip(r.keep.iter())
             .filter(|(_, k)| **k)

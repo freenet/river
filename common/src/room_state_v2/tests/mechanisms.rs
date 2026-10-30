@@ -99,41 +99,49 @@ fn purge_room(purges: &[(usize, u64, usize)]) -> super::builder::Builder {
     b.finish()
 }
 
-fn under_budget(b: &super::builder::Builder, budget: usize) -> (Retained, Vec<String>) {
+fn under_budget(
+    b: &super::builder::Builder,
+    budget: usize,
+    reserve: usize,
+) -> (Retained, Vec<String>) {
     use crate::room_state_v2::retain::test_cap;
     test_cap::set_purge(Some(budget));
+    test_cap::set_reserve(Some(reserve));
     let r = f_without(b, &[]);
     test_cap::set_purge(None);
+    test_cap::set_reserve(None);
     r
 }
 
-/// The room-wide purge token budget (decision (t)): envelopes are admitted
-/// smallest first, so the largest is refused and the rest fit; a refused
-/// recipient keeps none, never an older envelope in its place.
+/// The room-wide purge token budget (decision (t)), with 1 token reserved
+/// for each of the 5 kept keys and a pool of 1: an envelope within the
+/// reserve always fits; one beyond it draws on the pool, and a recipient
+/// whose newest envelope does not fit falls back to its next older one.
 #[test]
-fn the_largest_purge_envelope_is_refused_and_the_rest_fit() {
-    // k2: 1 token, k3: 2 tokens, k4: 3 tokens (newest), over an older
-    // 1-token envelope of k4's.
+fn purge_envelopes_within_the_reserve_fit_and_the_rest_share_the_pool() {
+    // k2: 1 token; k3: 2 tokens (1 from the pool); k4: 3 tokens (2 from
+    // the pool, which has 1) over an older 1-token envelope.
     let b = purge_room(&[(2, 1, 1), (3, 1, 2), (4, 2, 3), (4, 1, 1)]);
-    let r = under_budget(&b, 3);
+    let r = under_budget(&b, 6, 1);
     assert!(kept(&r, "purge(k2") && kept(&r, "purge(k3"));
-    assert!(!kept(&r, "purge(k4"), "neither of k4's envelopes is kept");
+    assert!(kept(&r, "purge(k4 v1") && !kept(&r, "purge(k4 v2"));
     // A budget that fits everything keeps each recipient's newest.
-    let r = under_budget(&b, 6);
+    let r = under_budget(&b, 11, 1);
     assert!(kept(&r, "purge(k4 v2") && !kept(&r, "purge(k4 v1"));
 }
 
-/// A recipient whose key sorts first gains nothing: its large envelope is
-/// refused in favour of smaller ones of higher keys.
+/// A recipient whose key sorts first gains nothing over envelopes within
+/// the reserve: its large envelope is refused, theirs are kept.
 #[test]
 fn a_low_key_with_a_large_purge_envelope_does_not_displace_smaller_ones() {
     use super::builder::key;
-    // The recipient among k2..k4 whose key sorts lowest holds the 3-token
-    // envelope; the other two hold 1 and 2 tokens.
+    // The recipient among k2..k4 whose key sorts lowest holds a 3-token
+    // envelope; the others hold 1 token each. Budget 5, 1 reserved for each
+    // of the 5 kept keys: no pool.
     let mut rs = [2usize, 3, 4];
     rs.sort_by_key(|&r| key(r));
-    let b = purge_room(&[(rs[0], 1, 3), (rs[1], 1, 1), (rs[2], 1, 2)]);
-    let r = under_budget(&b, 3);
+    let b = purge_room(&[(rs[0], 1, 3), (rs[1], 1, 1), (rs[2], 1, 1)]);
+    let r = under_budget(&b, 5, 1);
     assert!(
         !kept(&r, &format!("purge(k{}", rs[0])),
         "the low key's large envelope"

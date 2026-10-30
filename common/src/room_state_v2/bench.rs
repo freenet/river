@@ -213,8 +213,7 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
 
 /// The records of [`largest_state`] as built, not normalized, with every
 /// purge envelope at `caps.purge_tokens` regardless of the room-wide budget:
-/// most of them do not fit it, and each recipient's is checked before the
-/// budget refuses it (the extra checks of decision (t)).
+/// most of them do not fit it (decision (t)).
 pub fn largest_records_over_purge_budget(caps: Caps, v: u8) -> Vec<Record> {
     build(caps, v, false)
 }
@@ -541,10 +540,13 @@ fn build(caps: Caps, v: u8, budgeted: bool) -> Vec<Record> {
         .take(caps.purges)
         .enumerate()
     {
-        // Within the room-wide token budget, shared by every envelope.
+        // Within the room-wide budget: each kept key's reserve, plus an even
+        // share of the pool the reservations leave (decision (t)).
         let per = if budgeted {
-            caps.purge_tokens
-                .min(super::retain::purge_token_budget() / caps.purges.max(1))
+            let reserve = super::retain::purge_token_reserve();
+            let kept = caps.max_members as usize + 1;
+            let pool = super::retain::purge_token_budget().saturating_sub(reserve * kept);
+            caps.purge_tokens.min(reserve + pool / caps.purges.max(1))
         } else {
             caps.purge_tokens
         };

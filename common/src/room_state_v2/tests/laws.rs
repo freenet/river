@@ -614,7 +614,18 @@ pub(super) fn purge_family(seed0: u64, fi: u64) -> super::builder::Builder {
     b
 }
 
-fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: u64) {
+/// The budget/reserve pairs the purge laws run under: a reserve of 0 (each
+/// envelope draws all its tokens from the pool), and a reserve of 1 token
+/// per kept key (the 4 to 6 keys of a universe) with a pool of 0 to 3.
+const PURGE_RUNS: [(usize, usize); 4] = [(1, 0), (2, 0), (6, 1), (7, 1)];
+
+fn run_purge_budget(
+    (budget, reserve): (usize, usize),
+    fams: u64,
+    pool: usize,
+    pairs: u64,
+    triples: u64,
+) {
     println!("{HEADER}");
     let seed0 = env("RIVER_V2_SEED", 36);
     let mut tot = Counts::default();
@@ -622,12 +633,14 @@ fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: 
     let mut over = 0u64;
     let mut older = 0u64;
     let mut refusals = 0u64;
-    let mut out_of_order = 0u64;
+    let mut reserved_refused = 0u64;
+    let label = format!("purge budget {budget} reserve {reserve}");
     for fi in 0..fams {
         let m = Universe::with_purge_budget(
-            &format!("purge budget {budget} / univ{fi}"),
+            &format!("{label} / univ{fi}"),
             purge_family(seed0, fi),
             budget,
+            Some(reserve),
         );
         let free = Universe::new("free", purge_family(seed0, fi), Mutant::None);
         let c = random(&m, seed0 * 7919 + fi, pool, pairs, triples);
@@ -645,53 +658,42 @@ fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: 
             over += (tokens(&m, fb) > budget) as u64;
             bound_n += (purges(&m, fb) < purges(&free, ff) || fb != ff) as u64;
             older += kept_older(&m, fb, ff) as u64;
-            // The budget binds on the largest envelopes: every one kept is
-            // no larger than any one refused.
-            let r = refused(&m, fb, ff);
-            refusals += !r.is_empty() as u64;
-            if let Some(smallest) = r.iter().map(|&j| tokens(&m, 1u128 << j)).min() {
-                out_of_order += bits(fb)
-                    .filter(|&i| purge_recipient(&m, i).is_some())
-                    .any(|i| tokens(&m, 1u128 << i) > smallest)
-                    as u64;
-            }
+            refusals += !refused(&m, fb, ff).is_empty() as u64;
+            // A recipient's newest envelope within the reserve is always
+            // kept.
+            reserved_refused += bits(ff)
+                .filter(|&j| purge_recipient(&m, j).is_some())
+                .filter(|&j| tokens(&m, 1u128 << j) <= reserve)
+                .any(|j| fb & (1u128 << j) == 0) as u64;
         }
     }
+    println!("{}", row(&format!("{label} TOTAL"), "random", &tot));
+    println!("random subsets where the {label} decided f: {bound_n}");
     println!(
-        "{}",
-        row(&format!("purge budget {budget} TOTAL"), "random", &tot)
+        "  ... kept a recipient's older envelope: {older}; kept none for a recipient: {refusals}"
     );
-    println!("random subsets where the purge budget of {budget} decided f: {bound_n}");
-    println!("random subsets where it refused a recipient's envelope: {refusals}");
-    assert!(
-        !tot.bad(),
-        "a law failed under the purge token budget {budget}"
-    );
+    assert!(!tot.bad(), "a law failed under the {label}");
     assert_eq!(over, 0, "a kept set went over the purge token budget");
     assert!(tot.states >= fams * 2 && tot.pairs > 0 && tot.strict_fail > 0);
     assert!(
         bound_n > 0,
-        "the purge budget of {budget} never decided f in a random universe"
+        "the {label} never decided f in a random universe"
     );
     assert!(
-        refusals > 0,
-        "the purge budget of {budget} never refused an envelope"
+        older > 0,
+        "the {label} never fell back to an older envelope"
     );
     assert_eq!(
-        older, 0,
-        "an older envelope was kept in place of a refused one"
-    );
-    assert_eq!(
-        out_of_order, 0,
-        "an envelope larger than a refused one was kept"
+        reserved_refused, 0,
+        "an envelope within the reserve was refused"
     );
 }
 
 #[test]
 fn the_laws_hold_where_the_purge_token_budget_binds() {
-    for budget in [1, 2] {
+    for run in PURGE_RUNS {
         run_purge_budget(
-            budget,
+            run,
             env("RIVER_V2_FAMS", 4),
             env("RIVER_V2_POOL", 300) as usize,
             env("RIVER_V2_PAIRS", 1_500),
@@ -703,9 +705,9 @@ fn the_laws_hold_where_the_purge_token_budget_binds() {
 #[test]
 #[ignore = "full size: the purge token budget at 1 and 2 over 40 universes (release build)"]
 fn the_laws_hold_where_the_purge_token_budget_binds_at_model_size() {
-    for budget in [1, 2] {
+    for run in PURGE_RUNS {
         run_purge_budget(
-            budget,
+            run,
             env("RIVER_V2_FAMS", 40),
             env("RIVER_V2_POOL", 5_000) as usize,
             env("RIVER_V2_PAIRS", 200_000),

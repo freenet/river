@@ -241,6 +241,16 @@ pub fn purge_token_budget() -> usize {
     ceiling::PURGE_TOKEN_BUDGET
 }
 
+/// The purge tokens each kept key has to itself: the budget shared over the
+/// most keys a state keeps (200 at the ceilings), or a value tests set.
+pub fn purge_token_reserve() -> usize {
+    #[cfg(test)]
+    if let Some(n) = test_cap::reserve() {
+        return n;
+    }
+    purge_token_budget() / (ceiling::MAX_MEMBERS as usize + 1)
+}
+
 /// Test overrides of the legacy link cap and the purge token budget (per
 /// thread).
 #[cfg(test)]
@@ -248,6 +258,7 @@ pub(crate) mod test_cap {
     thread_local! {
         static CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
         static PURGE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+        static RESERVE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     }
     pub fn get() -> Option<u32> {
         CAP.with(|c| c.get())
@@ -260,6 +271,12 @@ pub(crate) mod test_cap {
     }
     pub fn set_purge(n: Option<usize>) {
         PURGE.with(|c| c.set(n))
+    }
+    pub fn reserve() -> Option<usize> {
+        RESERVE.with(|c| c.get())
+    }
+    pub fn set_reserve(n: Option<usize>) {
+        RESERVE.with(|c| c.set(n))
     }
 }
 
@@ -1491,33 +1508,29 @@ pub fn retain_refs(
             legacy_tokens.insert(i, v.tokens);
         }
     }
-    // Per recipient, its newest envelope whose signature checks; then those
-    // admitted across recipients by (token count, key) within a budget of
-    // tokens across all kept envelopes, so the budget binds on the largest
-    // envelopes and a key ground to sort low gains nothing. A recipient
-    // whose envelope does not fit keeps none (decision (t)).
+    // Each kept key has `purge_token_reserve()` tokens of the budget to
+    // itself; only the tokens of an envelope beyond that draw on the pool
+    // the reservations leave. Recipients in key order, newest envelope first:
+    // one whose extra tokens do not fit the pool left is skipped and the
+    // recipient's next older envelope is tried (decision (t)).
     pe.sort();
-    let mut newest: Vec<(usize, Key, usize)> = vec![];
+    let reserve = purge_token_reserve();
+    let budget = purge_token_budget();
+    let mut pool = budget.saturating_sub(reserve * kept.len());
+    let mut purged: HashMap<Key, HashSet<[u8; 16]>> = HashMap::new();
     for (k, _, _, i) in pe {
-        if newest.last().is_some_and(|x| x.1 == k) || !c.ok(i) {
+        if purged.contains_key(&k) {
             continue;
         }
         let n = match &recs[i] {
             Record::Purge(s) => s.payload.purged.len(),
             _ => legacy_tokens[&i].len(),
         };
-        newest.push((n, k, i));
-    }
-    newest.sort();
-    let budget = purge_token_budget();
-    let mut spent = 0usize;
-    let mut purged: HashMap<Key, HashSet<[u8; 16]>> = HashMap::new();
-    for (n, k, i) in newest {
-        if spent + n > budget {
-            // Every later envelope is at least as large.
-            break;
+        let extra = n.saturating_sub(reserve);
+        if extra > pool || !c.ok(i) {
+            continue;
         }
-        spent += n;
+        pool -= extra;
         let tokens: HashSet<[u8; 16]> = match &recs[i] {
             Record::Purge(s) => s.payload.purged.iter().map(|t| t.0).collect(),
             _ => legacy_tokens[&i].iter().copied().collect(),

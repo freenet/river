@@ -126,8 +126,7 @@
 //!   [`apply_delta`] then refuse at the first signature check that fails:
 //!   a fixpoint has none, and a generated delta has none. A record `f`
 //!   drops without examining it is dropped unchecked, so the signature
-//!   checks of one call are at most the records kept plus one, plus the
-//!   purge recipients whose envelope does not fit the budget (t).
+//!   checks of one call are at most the records kept plus one.
 //! - **(o) Migrated quotas.** [`ConfigurationV2::from_v1`], the starting
 //!   point of the configuration a converting owner signs, keeps the default
 //!   link quotas (2 links per member, 50 children per link) and sets
@@ -184,22 +183,23 @@
 //!   signatures that `max_state_bytes` counts.
 //! - **(t) Purge token budget.** A purge envelope holds up to 1,000 tokens,
 //!   as in v1, and the envelopes kept hold at most
-//!   [`config::ceiling::PURGE_TOKEN_BUDGET`] (80,200, 200 per member at the
-//!   member ceiling) together (Ian, 2026-10-29). For each recipient the
-//!   newest envelope whose signature checks is its candidate; candidates
-//!   are admitted by (token count, recipient key) within the budget, so the
-//!   budget binds on the largest envelopes and a key ground to sort low
-//!   gains nothing. A recipient whose envelope does not fit keeps none: an
-//!   older envelope is never kept in its place (a valid state holds one
-//!   envelope per recipient, so there would be none to fall back to). A
-//!   group limit of the greedy chooser over the envelopes' own fields and
-//!   L4, so it is lawful as the other caps are. The candidates' signatures
-//!   are checked before the budget is applied, so the checks of one call
-//!   are at most the records kept plus the recipients whose envelope does
-//!   not fit (at most `MAX_MEMBERS + 1`), plus one. 1,000 tokens for every
-//!   member would double the largest state and add about 0.5 s to the worst
-//!   merge; real rooms are far below the budget (the Official room: 19
-//!   envelopes of 1 to 40 tokens).
+//!   [`config::ceiling::PURGE_TOKEN_BUDGET`] (80,200) together (Ian,
+//!   2026-10-29). Each kept key has the budget's share at the member ceiling
+//!   (80,200 / 401 = 200 tokens) to itself, so an envelope of up to 200
+//!   tokens always fits; only the tokens of an envelope beyond that draw on
+//!   the pool the reservations leave (the budget less 200 per kept key, an
+//!   L4 value). Recipients are taken in key order, each recipient's newest
+//!   envelope first; one whose extra tokens do not fit the pool left is
+//!   skipped and the recipient's next older envelope is tried. A key ground
+//!   to sort low can take only pool space, never an envelope within the
+//!   reserve. A group limit of the greedy chooser over the envelopes' own
+//!   fields and L4, so it is lawful as the other caps are. (Admitting
+//!   envelopes smallest first with no fallback was tried and is not lawful:
+//!   dropping a refused newest envelope lets the older one it superseded
+//!   return on the next merge.) In a full room (401 kept keys) the shared
+//!   pool is 0, so envelopes are in effect 200 tokens per recipient; in a
+//!   room of about 170 kept keys (the Official room) the pool is about
+//!   46,000 tokens, and that room holds 19 envelopes of 1 to 40 tokens.
 
 //! Not yet wired into the room contract; compiled only for tests and under
 //! the `room-state-v2` feature, so the deployed contract's WASM is unchanged.
