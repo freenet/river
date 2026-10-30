@@ -342,30 +342,57 @@ fn universes_corpora(root: &Path) {
 /// varied hours, so the corpus holds states with the window closed and
 /// legacy records (rostered ones count, legacy times capped at the close).
 fn windowed_corpus(root: &Path) {
-    use super::families::rand_universe_legacy;
     let ok = builder_owner();
     let mut out = Out::new(root, "windowed", sk(0).verifying_key());
     for fi in 0..6 {
-        let mut rng = Rng(37 * 100_000 + fi);
-        let keys = 4 + rng.below(2) as usize;
-        let cfg = |rng: &mut Rng, open: bool| {
-            let mut c = rand_cfg(rng, keys);
-            c.window_open = open;
-            c.closed_at = rng.below(48) as u32;
-            c
-        };
-        let (c0, v1, v2) = (
-            cfg(&mut rng, true),
-            cfg(&mut rng, false),
-            cfg(&mut rng, false),
-        );
-        let b = rand_universe_legacy(&mut rng, keys, c0, v1, v2);
-        histories(&mut out, &ok, &b.recs, 200 + fi, 10);
+        histories(&mut out, &ok, &windowed_universe(fi).recs, 200 + fi, 10);
     }
     assert!(
         out.closed_with_legacy > 0,
         "no state with the window closed and a legacy record"
     );
+}
+
+/// The windowed corpus's universe `fi`.
+fn windowed_universe(fi: u64) -> super::builder::Builder {
+    use super::families::rand_universe_legacy;
+    let mut rng = Rng(37 * 100_000 + fi);
+    let keys = 4 + rng.below(2) as usize;
+    let cfg = |rng: &mut Rng, open: bool| {
+        let mut c = rand_cfg(rng, keys);
+        c.window_open = open;
+        c.closed_at = rng.below(48) as u32;
+        c
+    };
+    let (c0, v1, v2) = (
+        cfg(&mut rng, true),
+        cfg(&mut rng, false),
+        cfg(&mut rng, false),
+    );
+    rand_universe_legacy(&mut rng, keys, c0, v1, v2)
+}
+
+/// The same heal check as [`delta_permutation_pairs_heal`] over the windowed
+/// corpus's histories (closed windows, legacy records).
+#[test]
+fn delta_permutation_pairs_heal_in_the_windowed_corpus() {
+    let ok = builder_owner();
+    let mut tot = (0, 0, 0);
+    for fi in 0..6 {
+        let b = windowed_universe(fi);
+        let mut srng = Rng(200 + fi);
+        let states: Vec<RoomStateV2> = (0..10)
+            .map(|i| subset(&ok, &b.recs, &mut srng, 300 + (i as u64 * 677) % 650))
+            .collect();
+        let (p, d, h) = delta_pairs_heal(&ok, &states);
+        tot = (tot.0 + p, tot.1 + d, tot.2 + h);
+    }
+    println!(
+        "delta pairs {}, orders differ {}, healed {}",
+        tot.0, tot.1, tot.2
+    );
+    assert!(tot.1 > 0, "no pair exercised a cap");
+    assert_eq!(tot.1, tot.2);
 }
 
 /// The corpus writers check what they write: every state validates (but
