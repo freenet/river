@@ -4,7 +4,7 @@
 //! miss: a greedy rule whose choice changes when the record it dropped is
 //! absent next time.
 
-use super::builder::{with, Builder};
+use super::builder::{with, Builder, T};
 use super::harness::{exhaustive, report_failures, row, Counts, LawModel, HEADER, S};
 use super::universe::Universe;
 use crate::room_state_v2::retain::mutant::Mutant;
@@ -14,6 +14,9 @@ struct RuleFamily {
     name: &'static str,
     build: fn() -> Builder,
     limits: Limits,
+    /// Whether its limits must change `f` somewhere (a family for a rule
+    /// with no test limit has none to change).
+    binds: bool,
 }
 
 /// k1 holds a child exception, so its children k2 and k3 are subtree roots.
@@ -53,17 +56,59 @@ fn subtrees() -> Builder {
     b.finish()
 }
 
+/// A rostered legacy chain k1-k2-k3-k4, and an unrostered link for k3 from
+/// a shallower member, with a ban through it. The rule that a member with a
+/// rostered link admits no unrostered one must read the rostered chain back
+/// to the owner, not the presence of a rostered link: a broken chain's link
+/// is dropped, and a later merge could not tell.
+fn forged_link() -> Builder {
+    let cfg = with(|c| {
+        c.window_open = true;
+        c.max_members = 7;
+        c.max_member_bans = 3;
+        c.max_per_issuer = 3;
+        c.ban_window = 100;
+    });
+    let mut b = Builder::new();
+    b.leg("G1", 1, 0);
+    b.leg("G2", 2, 1);
+    b.leg("G3", 3, 2);
+    b.leg("G4", 4, 3);
+    b.roster(1, &["G1", "G2", "G3", "G4"]);
+    b.invitation(1, "O", 1, 0);
+    b.acc("A5", 1, 5);
+    b.leg("F3", 3, 5);
+    b.leg("F2", 2, 5);
+    b.act(5, 1);
+    b.clock(2);
+    b.mban("M3", "A5", T::Key(3), 1, 0, false);
+    // A ban that breaks the rostered chain: G3 then stays in a state's raw
+    // records but is not admitted, and must not block F3.
+    b.oban("O2", T::Key(2), 1, 0);
+    b.cfg(0, cfg);
+    b.finish()
+}
+
 fn families() -> Vec<RuleFamily> {
-    vec![RuleFamily {
-        name: "subtrees",
-        build: subtrees,
-        limits: Limits {
-            subtree_links: Some(2),
-            subtree_restores: Some(1),
-            restores: Some(3),
-            ..Limits::default()
+    vec![
+        RuleFamily {
+            name: "subtrees",
+            build: subtrees,
+            limits: Limits {
+                subtree_links: Some(2),
+                subtree_restores: Some(1),
+                restores: Some(3),
+                ..Limits::default()
+            },
+            binds: true,
         },
-    }]
+        RuleFamily {
+            name: "forged link",
+            build: forged_link,
+            limits: Limits::default(),
+            binds: false,
+        },
+    ]
 }
 
 /// Runs every family; each must bind: `f` under its limits differs from `f`
@@ -89,7 +134,11 @@ fn run_all(triples: Option<u64>) {
             .filter(|&s| m.f(s) != free.f(s))
             .count();
         println!("  subsets where its limits decided f: {bound}");
-        assert!(bound > 0, "the limits of {} never bound", fam.name);
+        assert!(
+            !fam.binds || bound > 0,
+            "the limits of {} never bound",
+            fam.name
+        );
     }
 }
 

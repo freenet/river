@@ -960,6 +960,23 @@ pub fn retain_refs(
             acc_children.entry(l.parent).or_default().push(j);
         }
     }
+    // Members the owner attests through a chain of rostered legacy links back
+    // to the owner: all of those links are admitted below, whatever else the
+    // state holds. Such a member admits no unrostered legacy link, so a v1
+    // record minted for it cannot take over its subtree. It is the attested
+    // chain that decides, not the presence of a rostered link: a rostered link
+    // that is not admitted leaves nothing behind for a later merge to read.
+    let mut attested: HashSet<Key> = HashSet::new();
+    let mut to_visit: Vec<Key> = vec![owner];
+    while let Some(k) = to_visit.pop() {
+        for &j in leg_children.get(&k).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let l = &lc[j];
+            if l.rostered && !attested.contains(&l.member) && c.ok(l.rec) {
+                attested.insert(l.member);
+                to_visit.push(l.member);
+            }
+        }
+    }
     let mut adm: Vec<Adm> = vec![];
     let mut adm_by_digest: HashMap<Digest, usize> = HashMap::new();
     let mut canonical: HashMap<Key, usize> = HashMap::new();
@@ -1041,6 +1058,9 @@ pub fn retain_refs(
             }
             let l = &lc[j];
             let exempt = l.legacy && l.rostered;
+            if l.legacy && !l.rostered && attested.contains(&l.member) {
+                continue;
+            }
             // Only the links the owner rosters go deeper than
             // `max_chain_depth` (decision (c)).
             if !exempt && !accepted_ok_here {

@@ -470,3 +470,43 @@ fn one_subtree_cannot_take_more_than_its_limit_of_links() {
         "the exception's children are their own roots"
     );
 }
+
+/// A member cannot move an attested member's subtree under itself: while
+/// the window is open it can mint a v1 member record naming a rostered
+/// member, but a member with a rostered link admits no unrostered legacy
+/// link, so the forged link never becomes the canonical one and a ban
+/// through it reaches nobody.
+#[test]
+fn a_forged_link_cannot_take_over_a_rostered_members_subtree() {
+    let cfg = super::builder::with(|c| {
+        c.window_open = true;
+        c.max_members = 7;
+        c.max_member_bans = 3;
+        c.max_per_issuer = 3;
+        c.ban_window = 100;
+    });
+    let mut b = super::builder::Builder::new();
+    b.leg("G1", 1, 0);
+    b.leg("G2", 2, 1);
+    b.leg("G3", 3, 2);
+    b.leg("G4", 4, 3);
+    b.roster(1, &["G1", "G2", "G3", "G4"]);
+    // k5, at depth 1, mints a link for k3 (real depth 3) and bans k3.
+    b.invitation(1, "O", 1, 0);
+    b.acc("A5", 1, 5);
+    b.leg("F3", 3, 5);
+    b.act(5, 1);
+    b.clock(2);
+    b.mban("M3", "A5", super::builder::T::Key(3), 1, 0, false);
+    b.cfg(0, cfg);
+    let b = b.finish();
+    let r = f_without(&b, &[]);
+    assert!(!kept(&r, "F3"), "the forged link is not admitted");
+    assert!(kept(&r, "G4"), "the rostered child stays");
+    assert!(r.0.members.contains(&super::builder::key(4)));
+    // Without a rostered link for k3 the same record counts: the rule reads
+    // the roster, and a link for a key the owner has not attested is what the
+    // window is for.
+    let without = f_without(&b, &["G3"]);
+    assert!(kept(&without, "F3"));
+}

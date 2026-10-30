@@ -171,7 +171,13 @@
 //!   roster entry for a link not present still holds its share. A legacy
 //!   activity record counts only for a key with an admitted legacy link,
 //!   so their number is bounded too. Legacy records cost more to decode,
-//!   and this is what lets the member ceiling exceed 300.
+//!   and this is what lets the member ceiling exceed 300. A member the
+//!   owner attests through a chain of rostered links back to the owner
+//!   admits no unrostered legacy link, so a v1 record another member mints
+//!   for it cannot take over its subtree. The rule reads that chain, not
+//!   the presence of a rostered link, so it stays lawful where a ban breaks
+//!   the chain. A member with no attested chain is not protected this way
+//!   while the window is open.
 //! - **(r) Deputies at migration.** The converting owner confirms the
 //!   deputy list. [`convert::deputy_candidates`] proposes the owner's own v1
 //!   deputies and those listed by current, unbanned members (who acted only
