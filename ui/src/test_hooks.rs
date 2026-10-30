@@ -42,6 +42,10 @@ thread_local! {
     /// Message group renders since `takeMessageGroupRenders` last read them.
     static MESSAGE_GROUP_RENDERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static FORGE_NEXT_SEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Invite-via-DM sends waiting for `releaseInviteSends`; `None` while
+    /// sends are not held.
+    static HELD_INVITE_SENDS: std::cell::RefCell<Option<Vec<futures::channel::oneshot::Sender<()>>>> =
+        const { std::cell::RefCell::new(None) };
     /// Runs of a `showToast` action since `takeToastActionRuns` last read them.
     static TOAST_ACTION_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The load worker `setRoomsLoadStateKeepingRooms("migrating")` holds open
@@ -60,6 +64,21 @@ pub fn forge_if_requested(signature: ed25519_dalek::Signature) -> ed25519_dalek:
     let mut bytes = signature.to_bytes();
     bytes[0] ^= 1;
     ed25519_dalek::Signature::from_bytes(&bytes)
+}
+
+/// Waits while `holdInviteSends` holds invite-via-DM sends. Called by the
+/// picker before it signs and sends.
+pub async fn invite_send_gate() {
+    let waiting = HELD_INVITE_SENDS.with(|held| {
+        held.borrow_mut().as_mut().map(|senders| {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            senders.push(tx);
+            rx
+        })
+    });
+    if let Some(rx) = waiting {
+        let _ = rx.await;
+    }
 }
 
 /// Counts one render of a message group, for `takeMessageGroupRenders`: a
@@ -480,6 +499,37 @@ pub fn install_test_hooks() {
         "setDescriptionClickWaitMs",
         Closure::<dyn FnMut(u32)>::new(move |ms: u32| {
             crate::components::conversation::set_description_click_wait_ms(u64::from(ms));
+        })
+        .into_js_value(),
+    );
+
+    set_hook(
+        "holdInviteSends",
+        Closure::<dyn FnMut()>::new(move || {
+            HELD_INVITE_SENDS.with(|held| {
+                held.borrow_mut().get_or_insert_with(Vec::new);
+            });
+        })
+        .into_js_value(),
+    );
+
+    set_hook(
+        "releaseInviteSends",
+        Closure::<dyn FnMut()>::new(move || {
+            let senders = HELD_INVITE_SENDS.with(|held| held.borrow_mut().take());
+            for tx in senders.into_iter().flatten() {
+                let _ = tx.send(());
+            }
+        })
+        .into_js_value(),
+    );
+
+    set_hook(
+        "setInvitePickerWatchdogMs",
+        Closure::<dyn FnMut(u32)>::new(move |ms: u32| {
+            crate::components::direct_messages::invite_via_dm_picker_modal::set_watchdog_ms_override(
+                u64::from(ms),
+            );
         })
         .into_js_value(),
     );

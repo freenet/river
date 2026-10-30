@@ -19,7 +19,7 @@
 //! back as unread on every page load.
 
 mod dm_thread_modal;
-mod invite_via_dm_picker_modal;
+pub(crate) mod invite_via_dm_picker_modal;
 
 pub use dm_thread_modal::DmThreadModal;
 pub use invite_via_dm_picker_modal::InviteViaDmPickerModal;

@@ -41,6 +41,11 @@ type RiverTestHooks = {
   setDescriptionClickWaitMs(ms: number): void;
   // Message group renders since the last call (the count restarts at 0).
   takeMessageGroupRenders(): number;
+  // Invite-via-DM sends wait before signing until releaseInviteSends.
+  holdInviteSends(): void;
+  releaseInviteSends(): void;
+  // How long the invite picker waits for a send before closing itself.
+  setInvitePickerWatchdogMs(ms: number): void;
   // The app toast, with an action button when actionLabel is given.
   showToast(message: string, actionLabel: string | null): void;
   // Runs of a showToast action since the last call (the count restarts at 0).
