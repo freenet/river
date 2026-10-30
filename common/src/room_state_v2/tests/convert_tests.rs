@@ -526,3 +526,141 @@ fn blobs_beyond_the_blob_cap_are_reported() {
         "{blobs:?}"
     );
 }
+
+/// Past the legacy link cap (a cap of 2, injected): the owner rosters the
+/// best ranked links (depth, then newest message), and the report gives
+/// every drop its reason.
+#[test]
+fn conversion_past_the_caps_reports_every_drop_reason() {
+    use crate::room_state_v2::convert::add_unconverted;
+    use crate::room_state_v2::encoding::ByteBuf;
+    use crate::room_state_v2::records::{Legacy, RosterEntry};
+    use crate::room_state_v2::retain::test_cap;
+    let mut v1 = v1_room();
+    let t = |h: u64| UNIX_EPOCH + Duration::from_secs(1_800_000_000 + h * 3600);
+    // A message over the legacy content bound.
+    let m = MessageV1 {
+        room_owner: id(0),
+        author: id(3),
+        time: t(1),
+        content: RoomMessageBody::public("x".repeat(1_001)),
+    };
+    v1.recent_messages
+        .messages
+        .push(AuthorizedMessageV1::new(m, &sk(3)));
+    // A ban by a key the state does not hold.
+    let b = UserBan {
+        owner_member_id: id(0),
+        banned_at: t(5),
+        banned_user: id(53),
+    };
+    v1.bans.0.push(AuthorizedUserBan::new(b, id(60), &sk(60)));
+    let o = key(0);
+    let conv = legacy_records(&o, &v1);
+    assert_eq!(conv.unconverted.len(), 1);
+    let mut legacy = conv.records.clone();
+    // A legacy record whose v1 bytes do not decode.
+    legacy.push(Record::LegacyMessage(Legacy {
+        signer: key(1),
+        v1: ByteBuf(vec![0x82, 0x01]),
+    }));
+
+    test_cap::set(Some(2));
+    let c = owner_payloads(&o, &v1, &legacy, 1, &[key(1)], &[]);
+    test_cap::set(None);
+    let c = c.unwrap();
+    let mut report = c.report;
+    add_unconverted(&mut report, &conv.unconverted);
+
+    // k1 (depth 1) and k2 (depth 2, newest message) are rostered; k3
+    // (depth 2, an older message) is beyond the cap.
+    let link_digest = |m: u8| {
+        legacy
+            .iter()
+            .find(|r| match r {
+                Record::LegacyLink(l) => crate::room_state_v2::legacy::decode_link(&o, l)
+                    .is_some_and(|v| v.member == key(m)),
+                _ => false,
+            })
+            .unwrap()
+            .digest()
+    };
+    let rostered: Vec<RosterEntry> = c
+        .payloads
+        .roster
+        .iter()
+        .flat_map(|b| b.batch.clone())
+        .filter(|e| e.kind == LegacyKind::Link)
+        .collect();
+    let has = |m: u8| rostered.iter().any(|e| e.digest == link_digest(m));
+    assert!(has(1) && has(2) && !has(3), "the cap keeps k1 and k2");
+    let links = &report.kinds[&LegacyKind::Link];
+    assert_eq!(
+        links.dropped.get(&DropReason::LegacyLinkCap),
+        Some(&1),
+        "{links:?}"
+    );
+    let msgs = &report.kinds[&LegacyKind::Message];
+    assert_eq!(
+        msgs.dropped.get(&DropReason::TooLarge),
+        Some(&1),
+        "{msgs:?}"
+    );
+    assert_eq!(
+        msgs.dropped.get(&DropReason::Undecodable),
+        Some(&1),
+        "{msgs:?}"
+    );
+    let bans = &report.kinds[&LegacyKind::Ban];
+    assert_eq!(
+        bans.dropped.get(&DropReason::MissingSigner),
+        Some(&1),
+        "{bans:?}"
+    );
+}
+
+/// Two v1 generations of one room hold different records (writes that
+/// reached one and not the other). Record digests do not depend on the
+/// contract, so converting the union keeps both generations' records once.
+#[test]
+fn a_conversion_of_two_generations_keeps_the_records_of_both() {
+    let a = v1_room();
+    let mut b = a.clone();
+    let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000 + 9 * 3600);
+    let only = |author: u8, text: &str| {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: id(0),
+                author: id(author),
+                time: t,
+                content: RoomMessageBody::public(text.into()),
+            },
+            &sk(author),
+        )
+    };
+    let mut a = a;
+    a.recent_messages.messages.push(only(1, "only in a"));
+    b.recent_messages.messages.push(only(3, "only in b"));
+    let o = key(0);
+    let mut union = legacy_records(&o, &a).records;
+    let mut seen: std::collections::HashSet<_> = union.iter().map(|r| r.digest()).collect();
+    union.extend(
+        legacy_records(&o, &b)
+            .records
+            .into_iter()
+            .filter(|r| seen.insert(r.digest())),
+    );
+    let c = owner_payloads(&o, &a, &union, 1, &[key(1)], &[]).unwrap();
+    let msgs = &c.report.kinds[&LegacyKind::Message];
+    assert_eq!((msgs.total, msgs.kept), (6, 6), "{msgs:?}");
+    let mut recs = c.payloads.sign(&sk(0));
+    recs.extend(union);
+    let (s, _) = normalize(&o, recs, &mut Verifier::new());
+    let kept_msgs = s
+        .records
+        .iter()
+        .filter(|r| matches!(r, Record::LegacyMessage(_)))
+        .count();
+    assert_eq!(kept_msgs, 6);
+    assert!(validate_state(&o, &s.to_bytes(), &mut Verifier::new()).is_ok());
+}
