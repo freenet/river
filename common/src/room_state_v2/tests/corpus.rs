@@ -24,6 +24,13 @@ struct Out {
     transitions: usize,
     params: Vec<u8>,
     bundle: Bundle,
+    /// The room owner, to check what is written.
+    owner: Key,
+    /// Whether every state written must validate (all but the adversarial
+    /// corpus).
+    check: bool,
+    /// States written with the legacy window closed and a legacy record.
+    closed_with_legacy: usize,
 }
 
 /// freenet-core's `conformance::bundle::ReplayBundle`, field for field, so
@@ -83,9 +90,30 @@ impl Out {
             transitions: 0,
             params: to_cbor(&p),
             bundle: Bundle::default(),
+            owner: Key::from(&owner),
+            check: true,
+            closed_with_legacy: 0,
         }
     }
+    /// A corpus of states `validate_state` refuses.
+    fn unchecked(mut self) -> Out {
+        self.check = false;
+        self
+    }
     fn state_bytes(&mut self, bytes: Vec<u8>) {
+        if self.check {
+            let s = crate::room_state_v2::validate_state(&self.owner, &bytes, &mut ver())
+                .unwrap_or_else(|e| {
+                    panic!("{}: a corpus state is invalid: {e:?}", self.dir.display())
+                });
+            let closed = s
+                .records
+                .iter()
+                .any(|r| matches!(r, Record::Configuration(c) if !c.payload.legacy_window_open));
+            if closed && s.records.iter().any(|r| r.legacy_kind().is_some()) {
+                self.closed_with_legacy += 1;
+            }
+        }
         self.bundle.states.push(bytes.clone());
         std::fs::write(self.dir.join(format!("s{:03}.cbor", self.states)), bytes).unwrap();
         self.states += 1;
@@ -99,7 +127,9 @@ impl Out {
         }
     }
     fn transition(&mut self, base: &RoomStateV2, result: &RoomStateV2) {
-        if base.records.is_empty() || result.records.is_empty() {
+        // A step that changes nothing, or from or to the empty state, says
+        // nothing about a path.
+        if base.records.is_empty() || result.records.is_empty() || base == result {
             return;
         }
         self.bundle.transitions.push(Transition {
@@ -215,7 +245,7 @@ fn histories(out: &mut Out, o: &Key, recs: &[Record], seed: u64, n: usize) {
                 crate::room_state_v2::apply_delta(o, receiver, d.clone(), &mut ver()).unwrap();
             let db = to_cbor(&d);
             out.bundle.deltas.push(db.clone());
-            if receiver.records.is_empty() || result.records.is_empty() {
+            if receiver.records.is_empty() || result.records.is_empty() || *receiver == result {
                 continue;
             }
             out.bundle.transitions.push(Transition {
@@ -253,11 +283,17 @@ fn write_fdev_corpora() {
         histories(&mut out, &bok, &all, 2 + caps.legacy as u64, 8);
     }
 
-    // Random universes with every record kind (owner key k0 of the
-    // builder), several histories each.
+    universes_corpora(&root);
+    windowed_corpus(&root);
+    println!("wrote corpora to {}", root.display());
+}
+
+/// Random universes with every record kind (owner key k0 of the builder),
+/// several histories each, and adversarial inputs from them.
+fn universes_corpora(root: &Path) {
     let ok = builder_owner();
-    let mut out = Out::new(&root, "universes", sk(0).verifying_key());
-    let mut adv = Out::new(&root, "adversarial", sk(0).verifying_key());
+    let mut out = Out::new(root, "universes", sk(0).verifying_key());
+    let mut adv = Out::new(root, "adversarial", sk(0).verifying_key()).unchecked();
     for fi in 0..6 {
         let mut rng = Rng(36 * 100_000 + fi);
         let keys = 4 + rng.below(2) as usize;
@@ -299,7 +335,49 @@ fn write_fdev_corpora() {
         adv.state(&s);
         adv.state(&normalize(&ok, replay, &mut ver()).0);
     }
-    println!("wrote corpora to {}", root.display());
+    assert!(out.transitions >= 20, "{} transitions", out.transitions);
+}
+
+/// Legacy-heavy random universes whose configurations close the window at
+/// varied hours, so the corpus holds states with the window closed and
+/// legacy records (rostered ones count, legacy times capped at the close).
+fn windowed_corpus(root: &Path) {
+    use super::families::rand_universe_legacy;
+    let ok = builder_owner();
+    let mut out = Out::new(root, "windowed", sk(0).verifying_key());
+    for fi in 0..6 {
+        let mut rng = Rng(37 * 100_000 + fi);
+        let keys = 4 + rng.below(2) as usize;
+        let cfg = |rng: &mut Rng, open: bool| {
+            let mut c = rand_cfg(rng, keys);
+            c.window_open = open;
+            c.closed_at = rng.below(48) as u32;
+            c
+        };
+        let (c0, v1, v2) = (
+            cfg(&mut rng, true),
+            cfg(&mut rng, false),
+            cfg(&mut rng, false),
+        );
+        let b = rand_universe_legacy(&mut rng, keys, c0, v1, v2);
+        histories(&mut out, &ok, &b.recs, 200 + fi, 10);
+    }
+    assert!(
+        out.closed_with_legacy > 0,
+        "no state with the window closed and a legacy record"
+    );
+}
+
+/// The corpus writers check what they write: every state validates (but
+/// the adversarial ones), every transition changes its base, enough
+/// transitions are written, and a state with the window closed and legacy
+/// records exists.
+#[test]
+fn the_corpora_check_themselves() {
+    let root = std::env::temp_dir().join(format!("river-v2-corpus-{}", std::process::id()));
+    universes_corpora(&root);
+    windowed_corpus(&root);
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 /// For every receiver and pair of deltas computed against its summary, the
