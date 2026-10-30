@@ -326,10 +326,20 @@ impl ser::SerializeStructVariant for &mut Encoder<'_> {
 
 /// Decodes `bytes` as a `T` whose re-encoding is exactly `bytes`.
 pub fn from_canonical<T: Serialize + de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+    from_canonical_within(bytes, u64::MAX)
+}
+
+/// As [`from_canonical`], refusing at its header any array or byte string
+/// longer than `max_seq` elements, so a hostile one is never walked.
+pub fn from_canonical_within<T: Serialize + de::DeserializeOwned>(
+    bytes: &[u8],
+    max_seq: u64,
+) -> Option<T> {
     let mut d = Decoder {
         b: bytes,
         i: 0,
         depth: 0,
+        max_seq,
     };
     let v = T::deserialize(&mut d).ok()?;
     if d.i != bytes.len() {
@@ -346,6 +356,8 @@ struct Decoder<'de> {
     i: usize,
     /// Arrays and maps currently open.
     depth: u32,
+    /// The most elements an array or byte string may hold.
+    max_seq: u64,
 }
 
 // Errors are built lazily (`ok_or_else`): `peek` and `head` run once per
@@ -404,6 +416,9 @@ impl<'de> Decoder<'de> {
             }
             _ => return err("indefinite length or reserved header"),
         };
+        if (major == 2 || major == 4) && v > self.max_seq {
+            return err("array too long");
+        }
         Ok((major, v))
     }
 

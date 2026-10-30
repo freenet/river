@@ -1283,3 +1283,122 @@ fn the_purge_token_budget_is_pinned_and_fits() {
     assert!(s.to_bytes().len() <= max_state_bytes());
     assert!(max_state_bytes() <= 50 * 1024 * 1024);
 }
+
+// --------------------------------------- 9. bounds before anything is decoded
+
+/// A truncated tail does not get an input past the encoded count: the scan
+/// stops at the first group over its count, and an input it cannot read is
+/// refused without a full decode.
+#[test]
+fn a_malformed_tail_does_not_skip_the_encoded_count() {
+    use crate::room_state_v2::state::within_kind_counts_encoded;
+    let n = 50_000;
+    let mut delta = array_header(n);
+    for _ in 0..n - 1 {
+        delta.extend([0x82, 0x02, 0x00]);
+    }
+    delta.extend([0x82, 0x02]); // cut off
+    assert_eq!(within_kind_counts_encoded(&delta, false), Some(false));
+    let mut state = vec![0x82, 0x02];
+    state.extend(&delta);
+    assert_eq!(validate(&state).0, Err(Invalid::TooManyRecords));
+    // Well within the counts, and cut off: refused as not canonical.
+    let mut short = array_header(2);
+    short.extend([0x82, 0x02, 0x00, 0x82, 0x02]);
+    assert_eq!(within_kind_counts_encoded(&short, false), None);
+    let mut state = vec![0x82, 0x02];
+    state.extend(&short);
+    assert_eq!(validate(&state).0, Err(Invalid::NotCanonical));
+}
+
+/// Counts alone do not bound bytes: a purge group within its count but over
+/// the room-wide token budget's bytes is refused from the encoded bytes.
+#[test]
+fn a_group_over_its_bytes_is_refused_within_its_count() {
+    use crate::room_state_v2::encoding::{to_cbor, Token16};
+    use crate::room_state_v2::state::{within_kind_bytes, within_kind_counts_encoded};
+    let envelopes: Vec<Record> = (0..ceiling::MAX_MEMBERS)
+        .map(|i| {
+            let k = skey(10, i);
+            let p = PurgeP {
+                recipient: kof(&k),
+                version: 1,
+                purged: (0..ceiling::PURGE_TOKENS as u32)
+                    .map(|t| {
+                        let mut b = [0u8; 16];
+                        b[..4].copy_from_slice(&t.to_le_bytes());
+                        Token16(b)
+                    })
+                    .collect(),
+            };
+            Record::Purge(signed(tag::PURGE, p, &k))
+        })
+        .collect();
+    assert!(within_kind_counts(&envelopes));
+    assert!(!within_kind_bytes(&envelopes));
+    assert_eq!(
+        within_kind_counts_encoded(&to_cbor(&envelopes), false),
+        Some(false)
+    );
+    // A valid state at the ceilings is within every group's bytes.
+    let (s, _) = largest_state(Caps::ceilings_legacy(), 0);
+    assert!(within_kind_bytes(&s.records));
+    assert_eq!(within_kind_counts_encoded(&s.to_bytes(), true), Some(true));
+}
+
+/// A legacy record's arrays are limited at their headers, per kind: over the
+/// limit the record does not decode, and the report still calls it too
+/// large, not undecodable.
+#[test]
+fn a_legacy_array_over_its_limit_is_refused_at_its_header() {
+    use crate::room_state::direct_messages::{sign_direct_message, sign_recipient_purges};
+    use crate::room_state::direct_messages::{PurgeToken, RecipientPurges};
+    use crate::room_state::member::MemberId;
+    use crate::room_state_v2::encoding::to_cbor;
+    use crate::room_state_v2::legacy::{decode_dm, decode_purge, decodes_past_the_limits};
+    let o = owner();
+    let osk = owner_key();
+    let ovk = osk.verifying_key();
+    let m = skey(11, 0);
+    let wrap = |v1: Vec<u8>, k: &SigningKey| Legacy {
+        signer: kof(k),
+        v1: ByteBuf(v1),
+    };
+    let dm = |n: usize| {
+        let d = sign_direct_message(
+            &m,
+            MemberId::from(&m.verifying_key()),
+            MemberId::from(&ovk),
+            &ovk,
+            1_800_000_000,
+            vec![1u8; n],
+        )
+        .unwrap();
+        wrap(to_cbor(&d), &m)
+    };
+    assert!(decode_dm(&o, &dm(ceiling::LEGACY_DM_CIPHERTEXT)).is_some());
+    let big = dm(ceiling::LEGACY_DM_CIPHERTEXT + 1);
+    assert!(decode_dm(&o, &big).is_none());
+    assert!(decodes_past_the_limits(&Record::LegacyDirectMessage(big)));
+    let purge = |n: usize| {
+        let p = sign_recipient_purges(
+            &m,
+            MemberId::from(&m.verifying_key()),
+            &ovk,
+            RecipientPurges {
+                version: 1,
+                purged: (0..n as u32)
+                    .map(|t| {
+                        let mut b = [0u8; 16];
+                        b[..4].copy_from_slice(&t.to_le_bytes());
+                        PurgeToken(b)
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        wrap(to_cbor(&p), &m)
+    };
+    assert!(decode_purge(&o, &purge(ceiling::LEGACY_PURGE_TOKENS)).is_some());
+    assert!(decode_purge(&o, &purge(ceiling::LEGACY_PURGE_TOKENS + 1)).is_none());
+}

@@ -811,6 +811,7 @@ fn drop_reason(
         _ => None,
     };
     match large {
+        None if decodes_past_the_limits(r) => DropReason::TooLarge,
         None => DropReason::Undecodable,
         Some(_) if !verify(owner, r) => DropReason::Signature,
         Some(true) => DropReason::TooLarge,

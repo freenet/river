@@ -83,11 +83,37 @@ fn kind_groups() -> [(&'static [usize], usize); 18] {
     ]
 }
 
+/// The most bytes a group's records can take in a state `f` emits: its count
+/// times its largest record, with the activity group split so a legacy
+/// activity record (larger) is counted only up to the legacy link cap, and
+/// the purge envelopes bounded by the room-wide token budget. `None`: a
+/// sub-limit of a group that has its own line.
+fn group_byte_limit(ks: &[usize], n: usize) -> Option<usize> {
+    let largest = |ks: &[usize]| ks.iter().map(|&k| MAX_RECORD_BYTES[k]).max().unwrap_or(0);
+    if ks == [11, 12] {
+        let legacy = super::retain::legacy_link_cap() as usize;
+        Some(MAX_RECORD_BYTES[11] * (n - legacy.min(n)) + largest(ks) * legacy.min(n))
+    } else if ks == [20, 21] {
+        Some(
+            n * ceiling::PURGE_ENVELOPE_BYTES
+                + super::retain::purge_token_budget() * ceiling::PURGE_TOKEN_BYTES,
+        )
+    } else if ks == [10] || ks == [12] {
+        None
+    } else if ks == [5] {
+        // A roster entry is 36 bytes, repeats across batches included; a
+        // batch adds its header and signature.
+        Some(super::retain::roster_entry_budget() * 36 + n * 100)
+    } else {
+        Some(largest(ks) * n)
+    }
+}
+
 /// Whether `records` hold no more of any kind than a state `f` emits can.
-/// Checked before decoding any legacy record or checking any signature, so
-/// an incoming state or delta costs at most what the largest valid state
-/// does. A delta generated from a valid state is a subset of one, so this
-/// never refuses an honest update.
+/// Checked before decoding any legacy record or checking any signature.
+/// A delta generated from a valid state is a subset of one, so this never
+/// refuses an honest update. Counts alone do not bound bytes: see
+/// [`within_kind_bytes`] and [`within_kind_counts_encoded`].
 pub fn within_kind_counts(records: &[Record]) -> bool {
     let mut n = [0usize; 24];
     for r in records {
@@ -102,12 +128,26 @@ fn counts_within(n: &[usize; 24]) -> bool {
         .all(|(ks, max)| ks.iter().map(|&k| n[k]).sum::<usize>() <= *max)
 }
 
-/// As [`within_kind_counts`], read from the encoded bytes of a state
-/// (`state`) or a delta without decoding any record: each record's kind
-/// tag is read and the rest of it skipped. So a state or delta of many
-/// small records is refused before it is decoded, which is the largest
-/// allocation an input can cause. `None`: the bytes are not a well-formed
-/// definite-length encoding of that shape (the full decode refuses them).
+/// Whether `records` take no more bytes per kind group than a state `f`
+/// emits can.
+pub fn within_kind_bytes(records: &[Record]) -> bool {
+    let mut bytes = [0usize; 24];
+    for r in records {
+        bytes[r.kind() as usize] += super::encoding::to_cbor(r).len();
+    }
+    kind_groups().iter().all(|(ks, max)| {
+        group_byte_limit(ks, *max).is_none_or(|l| ks.iter().map(|&k| bytes[k]).sum::<usize>() <= l)
+    })
+}
+
+/// [`within_kind_counts`] and [`within_kind_bytes`], read from the encoded
+/// bytes of a state (`state`) or a delta without decoding any record: each
+/// record's kind tag is read and the rest of it skipped, and the scan stops
+/// at the first group over its count or bytes. So an input of many small
+/// records is refused before the decode that is the largest allocation it
+/// can cause, and an input of records too large for their kinds before they
+/// are walked. `None`: the bytes are not a well-formed definite-length
+/// encoding of that shape; callers refuse those too, without decoding.
 pub fn within_kind_counts_encoded(bytes: &[u8], state: bool) -> Option<bool> {
     let mut r = Scan { b: bytes, at: 0 };
     if state {
@@ -120,8 +160,15 @@ pub fn within_kind_counts_encoded(bytes: &[u8], state: bool) -> Option<bool> {
     if major != 4 || n > bytes.len() as u64 {
         return None;
     }
+    let groups = kind_groups();
+    let limits: Vec<Option<usize>> = groups
+        .iter()
+        .map(|(ks, max)| group_byte_limit(ks, *max))
+        .collect();
     let mut counts = [0usize; 24];
+    let mut sizes = [0usize; 24];
     for _ in 0..n {
+        let start = r.at;
         if r.header()? != (4, 2) {
             return None;
         }
@@ -129,10 +176,20 @@ pub fn within_kind_counts_encoded(bytes: &[u8], state: bool) -> Option<bool> {
         if major != 0 || tag >= 24 {
             return None;
         }
-        counts[tag as usize] += 1;
+        let tag = tag as usize;
         r.skip()?;
+        counts[tag] += 1;
+        sizes[tag] += r.at - start;
+        for (g, (ks, max)) in groups.iter().enumerate() {
+            if ks.contains(&tag)
+                && (ks.iter().map(|&k| counts[k]).sum::<usize>() > *max
+                    || limits[g].is_some_and(|l| ks.iter().map(|&k| sizes[k]).sum::<usize>() > l))
+            {
+                return Some(false);
+            }
+        }
     }
-    Some(counts_within(&counts))
+    Some(true)
 }
 
 /// A cursor over definite-length CBOR.
@@ -195,32 +252,14 @@ impl Scan<'_> {
     }
 }
 
-/// The byte ceiling of a state: each group's cap times its largest record,
-/// with the activity group split so a legacy activity record (larger) is
-/// counted only up to the legacy link cap. `f` enforces every cap, so it
-/// never emits a state above this.
+/// The byte ceiling of a state: every group's line. `f` enforces every cap,
+/// so it never emits a state above this.
 pub fn max_state_bytes() -> usize {
-    let largest = |ks: &[usize]| ks.iter().map(|&k| MAX_RECORD_BYTES[k]).max().unwrap_or(0);
-    let mut total = 0;
-    for (ks, n) in kind_groups() {
-        if ks == [11, 12] {
-            let legacy = super::retain::legacy_link_cap() as usize;
-            total += MAX_RECORD_BYTES[11] * (n - legacy.min(n)) + largest(ks) * legacy.min(n);
-        } else if ks == [20, 21] {
-            // Purge envelopes: each one's overhead, plus the room-wide token
-            // budget.
-            total += n * ceiling::PURGE_ENVELOPE_BYTES
-                + super::retain::purge_token_budget() * ceiling::PURGE_TOKEN_BYTES;
-        } else if ks == [10] || ks == [12] || ks == [5] {
-            // [10] and [12] are sub-limits of groups counted above; the
-            // roster is bounded by its entries, below.
-        } else {
-            total += largest(ks) * n;
-        }
-    }
-    // A roster entry is 36 bytes, repeats across batches included; a batch
-    // adds its header and signature.
-    total + super::retain::roster_entry_budget() * 36 + ceiling::ROSTER_BATCHES * 100 + 16
+    kind_groups()
+        .iter()
+        .filter_map(|(ks, n)| group_byte_limit(ks, *n))
+        .sum::<usize>()
+        + 16
 }
 
 /// Why `validate_state` refused.
@@ -321,8 +360,10 @@ pub fn validate_state(owner: &Key, bytes: &[u8], v: &mut Verifier) -> Result<Roo
     if bytes.len() > max_state_bytes() {
         return Err(Invalid::TooLarge(bytes.len()));
     }
-    if within_kind_counts_encoded(bytes, true) == Some(false) {
-        return Err(Invalid::TooManyRecords);
+    match within_kind_counts_encoded(bytes, true) {
+        Some(true) => {}
+        Some(false) => return Err(Invalid::TooManyRecords),
+        None => return Err(Invalid::NotCanonical),
     }
     let s: RoomStateV2 = from_cbor_canonical(bytes).ok_or(Invalid::NotCanonical)?;
     if s.version != STATE_VERSION {

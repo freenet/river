@@ -23,7 +23,8 @@ use river_core::room_state_v2::config::ceiling;
 use river_core::room_state_v2::encoding::{from_cbor_canonical, to_cbor, Key};
 use river_core::room_state_v2::records::Record;
 use river_core::room_state_v2::state::{
-    within_kind_counts, within_kind_counts_encoded, Invalid, Summary, STATE_VERSION,
+    within_kind_bytes, within_kind_counts, within_kind_counts_encoded, Invalid, Summary,
+    STATE_VERSION,
 };
 use river_core::room_state_v2::{
     apply_delta, max_state_bytes, state as v2state, RoomStateV2, Verifier,
@@ -83,8 +84,14 @@ fn decode_state(bytes: &[u8], what: &str) -> Result<Vec<Record>, ContractError> 
     if bytes.len() > max_state_bytes() {
         return Err(too_large(what, bytes.len(), max_state_bytes()));
     }
-    if within_kind_counts_encoded(bytes, true) == Some(false) {
-        return Err(refused(Invalid::TooManyRecords));
+    match within_kind_counts_encoded(bytes, true) {
+        Some(true) => {}
+        Some(false) => return Err(refused(Invalid::TooManyRecords)),
+        None => {
+            return Err(ContractError::Deser(format!(
+                "{what} is not a canonical v2 room state"
+            )))
+        }
     }
     let s: RoomStateV2 = from_cbor_canonical(bytes)
         .ok_or_else(|| ContractError::Deser(format!("{what} is not a canonical v2 room state")))?;
@@ -102,8 +109,14 @@ fn decode_delta(bytes: &[u8]) -> Result<Vec<Record>, ContractError> {
     if bytes.len() > max_state_bytes() {
         return Err(too_large("delta", bytes.len(), max_state_bytes()));
     }
-    if within_kind_counts_encoded(bytes, false) == Some(false) {
-        return Err(refused(Invalid::TooManyRecords));
+    match within_kind_counts_encoded(bytes, false) {
+        Some(true) => {}
+        Some(false) => return Err(refused(Invalid::TooManyRecords)),
+        None => {
+            return Err(ContractError::Deser(
+                "delta is not a canonical record list".into(),
+            ))
+        }
     }
     from_cbor_canonical(bytes)
         .ok_or_else(|| ContractError::Deser("delta is not a canonical record list".into()))
@@ -136,8 +149,9 @@ fn held(state: &State) -> Result<RoomStateV2, ContractError> {
     )?))
 }
 
-/// The records of one update item, each part bounded on its own.
-fn item_records(update: UpdateData) -> Result<Vec<Record>, ContractError> {
+/// The record lists of one update item, each bounded on its own: a
+/// `StateAndDelta` is its two parts.
+fn item_records(update: UpdateData) -> Result<Vec<Vec<Record>>, ContractError> {
     let bounded = |records: Vec<Record>| {
         if within_kind_counts(&records) {
             Ok(records)
@@ -148,32 +162,22 @@ fn item_records(update: UpdateData) -> Result<Vec<Record>, ContractError> {
     let state = |s: &State| bounded(decode_state(s.as_ref(), "update")?);
     let delta = |d: &StateDelta| bounded(decode_delta(d.as_ref())?);
     match update {
-        UpdateData::State(s) => state(&s),
-        UpdateData::Delta(d) => delta(&d),
-        UpdateData::StateAndDelta { state: s, delta: d } => {
-            // A delta usually repeats records of its state: the union counts
-            // each record once.
-            let mut r = decode_state(s.as_ref(), "update")?;
-            let mut seen: HashSet<_> = r.iter().map(|x| x.digest()).collect();
-            r.extend(
-                decode_delta(d.as_ref())?
-                    .into_iter()
-                    .filter(|x| seen.insert(x.digest())),
-            );
-            bounded(r)
-        }
+        UpdateData::State(s) => Ok(vec![state(&s)?]),
+        UpdateData::Delta(d) => Ok(vec![delta(&d)?]),
+        UpdateData::StateAndDelta { state: s, delta: d } => Ok(vec![state(&s)?, delta(&d)?]),
         // The state part belongs to another contract and is ignored, as
         // `RelatedState` is; the delta is this contract's.
         UpdateData::RelatedState { .. } => Ok(vec![]),
-        UpdateData::RelatedStateAndDelta { delta: d, .. } => delta(&d),
+        UpdateData::RelatedStateAndDelta { delta: d, .. } => Ok(vec![delta(&d)?]),
         _ => Err(ContractError::InvalidUpdate),
     }
 }
 
-/// The most update items applied in turn when together they hold more than
-/// one valid state. freenet-core passes one item per `update_state` call
-/// (a state or a delta, plus related-contract items), so this bounds only
-/// what another host might send; two is the merge the timing check measures.
+/// The most non-empty record lists applied in turn when together they hold
+/// more than one valid state: two lists, two runs of `f`, each at most what
+/// the timing check measures for one. freenet-core passes one item per
+/// `update_state` call (a state or a delta, plus related-contract items that
+/// carry no records here), so this bounds only what another host might send.
 const MAX_ITEMS_IN_TURN: usize = 2;
 
 /// A state's bytes: empty for no records.
@@ -216,11 +220,13 @@ impl ContractInterface for Contract {
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         let owner = owner(&parameters)?;
+        // Bound what arrives before decoding what is held.
+        let mut items: Vec<Vec<Record>> = vec![];
+        for item in data {
+            items.extend(item_records(item)?);
+        }
+        items.retain(|r| !r.is_empty());
         let mut s = held(&state)?;
-        let items: Vec<Vec<Record>> = data
-            .into_iter()
-            .map(item_records)
-            .collect::<Result<_, _>>()?;
         // The same record in several items counts once.
         let mut seen = HashSet::new();
         let union: Vec<Record> = items
@@ -230,7 +236,7 @@ impl ContractInterface for Contract {
             .cloned()
             .collect();
         let mut v = Verifier::new();
-        if within_kind_counts(&union) {
+        if within_kind_counts(&union) && within_kind_bytes(&union) {
             // One run of `f` over the held state and every item.
             s = apply_delta(&owner, &s, union, &mut v).map_err(refused)?;
         } else if items.len() <= MAX_ITEMS_IN_TURN {
@@ -724,6 +730,56 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn incoming_data_is_bounded_before_the_held_state_is_decoded() {
+        // Held bytes that do not decode: an oversized delta is refused for
+        // its size, so the held state was never read.
+        let junk = State::from(vec![0xffu8; 16]);
+        let big = UpdateData::Delta(StateDelta::from(vec![0xffu8; max_state_bytes() + 1]));
+        match update(&junk, vec![big]) {
+            Err(ContractError::InvalidUpdateWithInfo { reason }) => {
+                assert!(reason.contains("delta is"), "{reason}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_full_state_and_one_new_record_are_applied_in_turn() {
+        // A state part at the activity count and a delta with one more: over
+        // the count together, so two runs of `f`, not a refusal.
+        let records: Vec<Record> = (0..ceiling::MAX_LINKS + 1).map(activity).collect();
+        let (full, one) = records.split_at(ceiling::MAX_LINKS as usize);
+        let part = RoomStateV2::from_records(full.to_vec());
+        let item = UpdateData::StateAndDelta {
+            state: st(&part),
+            delta: StateDelta::from(to_cbor(&one.to_vec())),
+        };
+        let held = st(&small());
+        assert_eq!(update(&held, vec![item]).unwrap(), held.as_ref().to_vec());
+    }
+
+    #[test]
+    fn items_with_no_records_do_not_count_towards_the_items_in_turn() {
+        let n = ceiling::MAX_LINKS + 1;
+        let records: Vec<Record> = (0..n).map(activity).collect();
+        let half = records.len() / 2;
+        let related = UpdateData::RelatedState {
+            related_to: ContractInstanceId::new([3; 32]),
+            state: empty(),
+        };
+        let ok = update(
+            &empty(),
+            vec![
+                delta_of(&records[..half]),
+                delta_of(&records[half..]),
+                related,
+                delta_of(&[]),
+            ],
+        );
+        assert!(ok.is_ok(), "{ok:?}");
     }
 
     #[test]

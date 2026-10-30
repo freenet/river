@@ -8,6 +8,9 @@
 //! `decode_*` checks everything but the signature; `verify` checks the
 //! signature, so `f` can verify lazily in admission order.
 
+use super::config::ceiling::{
+    LEGACY_DM_CIPHERTEXT, LEGACY_MESSAGE_SIZE, LEGACY_PURGE_TOKENS, SECRET_BLOB_CIPHERTEXT,
+};
 use super::encoding::{legacy_id, verify_bytes, Key, Sig};
 use super::fastcbor;
 use super::records::{Legacy, Record};
@@ -107,6 +110,39 @@ impl V1Sig {
     }
 }
 
+/// The longest array a legacy record may hold, per kind, refused at the
+/// array's header before it is walked. A v1 signature is 64 elements. A
+/// record over its kind's content bound (decision (m)) was dropped by `f`
+/// anyway, after decoding it element by element. Member info also holds a
+/// deputy list, and its nickname is over the bound well before this.
+const SIGNATURE_ELEMENTS: u64 = 64;
+const MEMBER_INFO_ELEMENTS: u64 = 1_000;
+
+/// Whether a legacy record is well formed apart from the array limits above:
+/// the conversion report tells "too large" from "undecodable" with it.
+pub fn decodes_past_the_limits(r: &Record) -> bool {
+    match r {
+        Record::LegacyLink(l) => fastcbor::from_canonical::<AuthorizedMember>(&l.v1.0).is_some(),
+        Record::LegacyBan(l) => fastcbor::from_canonical::<AuthorizedUserBan>(&l.v1.0).is_some(),
+        Record::LegacyActivity(l) | Record::LegacyMessage(l) => {
+            fastcbor::from_canonical::<AuthorizedMessageV1>(&l.v1.0).is_some()
+        }
+        Record::LegacyMemberInfo(l) => {
+            fastcbor::from_canonical::<AuthorizedMemberInfo>(&l.v1.0).is_some()
+        }
+        Record::LegacyDirectMessage(l) => {
+            fastcbor::from_canonical::<AuthorizedDirectMessage>(&l.v1.0).is_some()
+        }
+        Record::LegacyPurge(l) => {
+            fastcbor::from_canonical::<AuthorizedRecipientPurges>(&l.v1.0).is_some()
+        }
+        Record::LegacySecretBlob(l) => {
+            fastcbor::from_canonical::<AuthorizedEncryptedSecretForMember>(&l.v1.0).is_some()
+        }
+        _ => false,
+    }
+}
+
 pub struct LegacyLinkView {
     pub v1: Option<V1Sig>,
     pub member: Key,
@@ -114,7 +150,7 @@ pub struct LegacyLinkView {
 }
 
 pub fn decode_link(owner: &Key, l: &Legacy) -> Option<LegacyLinkView> {
-    let v1: AuthorizedMember = fastcbor::from_canonical(&l.v1.0)?;
+    let v1: AuthorizedMember = fastcbor::from_canonical_within(&l.v1.0, SIGNATURE_ELEMENTS)?;
     let m = &v1.member;
     if m.owner_member_id != id(owner) || m.invited_by != id(&l.signer) {
         return None;
@@ -136,7 +172,7 @@ pub struct LegacyBanView {
 }
 
 pub fn decode_ban(owner: &Key, l: &Legacy) -> Option<LegacyBanView> {
-    let v1: AuthorizedUserBan = fastcbor::from_canonical(&l.v1.0)?;
+    let v1: AuthorizedUserBan = fastcbor::from_canonical_within(&l.v1.0, SIGNATURE_ELEMENTS)?;
     if v1.ban.owner_member_id != id(owner) || v1.banned_by != id(&l.signer) {
         return None;
     }
@@ -159,7 +195,8 @@ pub struct LegacyMessageView {
 }
 
 pub fn decode_message(owner: &Key, l: &Legacy) -> Option<LegacyMessageView> {
-    let v1: AuthorizedMessageV1 = fastcbor::from_canonical(&l.v1.0)?;
+    let v1: AuthorizedMessageV1 =
+        fastcbor::from_canonical_within(&l.v1.0, LEGACY_MESSAGE_SIZE as u64)?;
     if v1.message.room_owner != id(owner) || v1.message.author != id(&l.signer) {
         return None;
     }
@@ -186,7 +223,7 @@ pub struct LegacyMemberInfoView {
 }
 
 pub fn decode_member_info(_owner: &Key, l: &Legacy) -> Option<LegacyMemberInfoView> {
-    let v1: AuthorizedMemberInfo = fastcbor::from_canonical(&l.v1.0)?;
+    let v1: AuthorizedMemberInfo = fastcbor::from_canonical_within(&l.v1.0, MEMBER_INFO_ELEMENTS)?;
     if v1.member_info.member_id != id(&l.signer)
         || v1.member_info.deputies.len() > crate::room_state::member_info::MAX_DEPUTIES
         || !sealed_v1_ok(&v1.member_info.preferred_nickname)
@@ -218,7 +255,8 @@ pub struct LegacyDmView {
 }
 
 pub fn decode_dm(_owner: &Key, l: &Legacy) -> Option<LegacyDmView> {
-    let v1: AuthorizedDirectMessage = fastcbor::from_canonical(&l.v1.0)?;
+    let v1: AuthorizedDirectMessage =
+        fastcbor::from_canonical_within(&l.v1.0, LEGACY_DM_CIPHERTEXT as u64)?;
     if v1.message.sender != id(&l.signer) {
         return None;
     }
@@ -246,7 +284,8 @@ pub struct LegacyPurgeView {
 }
 
 pub fn decode_purge(_owner: &Key, l: &Legacy) -> Option<LegacyPurgeView> {
-    let v1: AuthorizedRecipientPurges = fastcbor::from_canonical(&l.v1.0)?;
+    let v1: AuthorizedRecipientPurges =
+        fastcbor::from_canonical_within(&l.v1.0, LEGACY_PURGE_TOKENS as u64)?;
     if v1.recipient_id != id(&l.signer) || v1.state.version == 0 {
         return None;
     }
@@ -274,7 +313,8 @@ pub fn decode_blob(owner: &Key, l: &Legacy) -> Option<LegacyBlobView> {
     if l.signer != *owner {
         return None;
     }
-    let v1: AuthorizedEncryptedSecretForMember = fastcbor::from_canonical(&l.v1.0)?;
+    let v1: AuthorizedEncryptedSecretForMember =
+        fastcbor::from_canonical_within(&l.v1.0, SECRET_BLOB_CIPHERTEXT as u64)?;
     Some(LegacyBlobView {
         sig: sig_of(&v1.owner_signature),
         recipient_id: v1.secret.member_id.0 .0,
