@@ -516,3 +516,81 @@ fn delta_permutation_pairs_heal_at_the_ceilings() {
     assert!(tot.1 > 0, "no pair exercised a cap");
     assert_eq!(tot.1, tot.2);
 }
+
+/// The merge laws on states at the ceilings, where every cap binds at
+/// once: for the largest states (v2 and legacy-heavy, two variants each)
+/// and histories of their union, every pair commutes, merges to a state
+/// that validates and absorbs a repeat of either side, and every triple
+/// associates or heals. Signatures are trusted (the builder signed every
+/// record; this is about the caps).
+#[test]
+#[ignore = "the largest states; minutes in a release build"]
+fn the_laws_hold_at_the_ceilings() {
+    use crate::room_state_v2::validate_state;
+    let o = Key::from(&owner_key().verifying_key());
+    let (mut pairs, mut triples, mut strict, mut healed) = (0, 0, 0, 0);
+    for caps in [Caps::ceilings(), Caps::ceilings_legacy()] {
+        let (a, _) = largest_state(caps, 0);
+        let (b, _) = largest_state(caps, 1);
+        let mut all = a.records.clone();
+        all.extend(b.records.iter().cloned());
+        trust_in_this_thread(o, all.iter().map(|r| r.digest()).collect());
+        let mut rng = Rng(5 + caps.legacy as u64);
+        let mut states = vec![a.clone(), b.clone()];
+        states.extend((0..6).map(|i| subset(&o, &all, &mut rng, 300 + (i as u64 * 677) % 650)));
+        let m = |x: &RoomStateV2, y: &RoomStateV2| merge(&o, x, y, &mut ver());
+        for i in 0..states.len() {
+            for j in i + 1..states.len() {
+                let (x, y) = (&states[i], &states[j]);
+                let xy = m(x, y);
+                assert_eq!(xy, m(y, x), "commutativity {i} {j}");
+                assert!(
+                    validate_state(&o, &xy.to_bytes(), &mut ver()).is_ok(),
+                    "validity {i} {j}"
+                );
+                assert_eq!(m(&xy, y), xy, "absorption {i} {j}");
+                assert_eq!(m(&xy, x), xy, "absorption {j} {i}");
+                pairs += 1;
+            }
+        }
+        for i in 0..states.len() {
+            for j in 0..states.len() {
+                for k in 0..states.len() {
+                    if i == j || j == k || i == k {
+                        continue;
+                    }
+                    let (x, y, z) = (&states[i], &states[j], &states[k]);
+                    let l = m(&m(x, y), z);
+                    let r = m(x, &m(y, z));
+                    triples += 1;
+                    if l == r {
+                        continue;
+                    }
+                    strict += 1;
+                    // Heal: merge the two groupings, then every input
+                    // again, until nothing changes; the result must then
+                    // absorb every input and grouping.
+                    let mut c = m(&l, &r);
+                    for _ in 0..4 {
+                        let before = c.clone();
+                        for s in [x, y, z, &l, &r] {
+                            c = m(&c, s);
+                        }
+                        if c == before {
+                            break;
+                        }
+                    }
+                    assert!(
+                        [x, y, z, &l, &r].iter().all(|s| m(&c, s) == c),
+                        "triple {i} {j} {k} does not heal"
+                    );
+                    healed += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "pairs {pairs}, triples {triples}, not strictly associative {strict}, healed {healed}"
+    );
+    assert!(pairs > 0 && triples > 0);
+}
