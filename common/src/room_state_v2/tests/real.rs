@@ -600,5 +600,15 @@ fn the_real_path_obeys_the_laws_with_forged_records_at_size() {
             env("RIVER_V2_REAL_SAMPLES", 10) as usize,
         );
         assert_real(&r, fams);
+        // Every kind is forged, and every kind's forgery was refused at its
+        // signature check somewhere, so no kind's check can be removed
+        // unseen.
+        let all: u64 = ((1u64 << 24) - 1) & !(1 << 1);
+        assert_eq!(r.forged_kinds, all, "a kind was never forged");
+        let unseen = r.forged_kinds & !r.refused_kinds;
+        assert_eq!(
+            unseen, 0,
+            "kinds never refused at a signature check: {unseen:b}"
+        );
     }
 }

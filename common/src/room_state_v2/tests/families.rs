@@ -580,6 +580,15 @@ pub fn rand_universe_l5(rng: &mut Rng, keys: usize, c0: Cfg, v1: Cfg, v2: Cfg) -
     if !legacy.is_empty() && rng.below(2) == 0 {
         b.roster_indexes(7, &legacy);
     }
+    // Upgrade pointers: up to two versions, the second sometimes at the
+    // same version as the first (a tie the signature decides). Drawn from
+    // their own generator, so the rest of every universe is unchanged.
+    let mut up = Rng(rng.0 ^ 0x5eed_0004);
+    let n_up = up.below(3) as u32;
+    for v in 1..=n_up {
+        let version = if v == 2 && up.below(2) == 0 { 1 } else { v };
+        b.upgrade(version, v as u8);
+    }
     b
 }
 

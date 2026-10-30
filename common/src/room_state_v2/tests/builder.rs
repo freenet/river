@@ -14,7 +14,9 @@ use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody
 use crate::room_state::secret::{AuthorizedEncryptedSecretForMember, EncryptedSecretForMemberV1};
 use crate::room_state_v2::config::{ConfigurationV2, EPOCH_2026_SECS};
 use crate::room_state_v2::encoding::Token16;
-use crate::room_state_v2::encoding::{sign_payload, to_cbor, ByteBuf, Digest, Key, Nonce12, Sig};
+use crate::room_state_v2::encoding::{
+    sign_payload, to_cbor, ByteBuf, Bytes32, Digest, Key, Nonce12, Sig,
+};
 use crate::room_state_v2::records::*;
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
@@ -524,6 +526,18 @@ impl Builder {
             payload: p,
         });
         self.push(format!("info(k{member} v{version})"), None, r);
+    }
+
+    pub fn upgrade(&mut self, version: u32, address: u8) {
+        let p = UpgradeP {
+            version,
+            new_address: Bytes32([address; 32]),
+        };
+        let r = Record::Upgrade(Signed {
+            sig: sign_payload(tag::UPGRADE, &owner(), &p, &sk(0)),
+            payload: p,
+        });
+        self.push(format!("upgrade v{version} @{address}"), None, r);
     }
 
     pub fn secret_version(&mut self, version: u32) {

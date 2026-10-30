@@ -415,9 +415,10 @@ fn extended_universes_keep_every_kind_they_add() {
         }
     }
     println!("kept per kind: {seen:?}");
-    // Every kind but the legacy configuration and the upgrade pointer.
+    // Every kind but the reserved tag 1 and the configuration (kind 0,
+    // which every universe holds).
     for k in [
-        2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
     ] {
         assert!(seen[k] > 0, "kind {k} never survives");
     }
