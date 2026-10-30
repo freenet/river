@@ -468,10 +468,11 @@ fn from_v1_clamps_each_value_to_its_ceiling() {
     assert_eq!(c.max_deputy_bans, MAX_DEPUTY_BANS);
     assert_eq!(c.max_bans_per_deputy, MAX_BANS_PER_DEPUTY);
     assert_eq!(c.max_member_bans, MAX_MEMBER_BANS);
-    // Decision (o): link quotas and depth at their ceilings.
+    // Decision (o): the default link quotas; the total and the depth at
+    // their ceilings.
     assert_eq!(c.max_links, MAX_LINKS);
-    assert_eq!(c.max_links_per_member, MAX_LINKS_PER_MEMBER);
-    assert_eq!(c.max_children_per_link, MAX_CHILDREN_PER_LINK);
+    assert_eq!(c.max_links_per_member, 2);
+    assert_eq!(c.max_children_per_link, 50);
     assert_eq!(c.max_chain_depth, MAX_CHAIN_DEPTH);
     assert!(
         c.check(&owner()),

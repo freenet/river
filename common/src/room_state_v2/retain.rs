@@ -873,8 +873,14 @@ pub fn retain_refs(
     let legacy_cap = legacy_link_cap();
     let rostered_listed = roster_counts.get(&LegacyKind::Link).copied().unwrap_or(0) as u32;
     let unrostered_budget = legacy_cap.saturating_sub(rostered_listed);
+    // Every link but a rostered legacy one (accepted links and unrostered
+    // legacy links) shares what `max_links` leaves after the roster's link
+    // count, so no link, at any depth, can push an attested legacy link out
+    // through the total cap (decision (o)).
+    let other_budget = cfg.max_links.saturating_sub(rostered_listed);
     let mut rostered_admitted = 0u32;
     let mut unrostered_admitted = 0u32;
+    let mut other_admitted = 0u32;
     let mut frontier: Vec<usize> = vec![]; // admitted at depth d-1, in position order
                                            // Accepted links stop at `max_chain_depth`; legacy links (v1 had no
                                            // depth limit) go as deep as their chains, bounded by their count.
@@ -947,6 +953,9 @@ pub fn retain_refs(
             {
                 continue;
             }
+            if !exempt && other_admitted >= other_budget {
+                continue;
+            }
             if !exempt {
                 let quota = match parent {
                     None => cfg.max_owner_children,
@@ -969,6 +978,7 @@ pub fn retain_refs(
                 }
             }
             if !exempt {
+                other_admitted += 1;
                 *children.entry(parent).or_default() += 1;
                 *per_member.entry(l.member).or_default() += 1;
             }

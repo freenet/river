@@ -114,3 +114,41 @@ fn a_purge_envelope_over_the_budget_falls_back_to_the_older_one() {
     assert!(!kept(&none, "purge(k3"));
     assert!(kept(&none, "dm(k1,k3") && kept(&none, "dm(k2,k3"));
 }
+
+/// Decision (o): every link but a rostered legacy one shares `max_links`
+/// less the roster's link count, so a member minting invitations cannot
+/// push an attested legacy link out through the total cap, at any depth.
+#[test]
+fn invitations_cannot_push_a_rostered_legacy_link_out() {
+    let cfg = super::builder::with(|c| {
+        c.window_open = true;
+        c.max_members = 7;
+        c.max_links = 5;
+        c.max_children = 9;
+        c.max_depth = 8;
+    });
+    let mut b = super::builder::Builder::new();
+    b.leg("G1", 1, 0);
+    b.leg("G2", 2, 1);
+    b.leg("G3", 3, 2);
+    b.roster(1, &["G1", "G2", "G3"]);
+    b.invitation(1, "O", 1, 0);
+    b.acc("A4", 1, 4);
+    for (inv, k) in [(2u8, 5usize), (3, 6), (4, 7)] {
+        b.invitation(inv, "A4", inv as u32, 0);
+        b.acc(&format!("C{k}"), inv, k);
+    }
+    b.cfg(0, cfg);
+    let b = b.finish();
+    let all = f_without(&b, &[]);
+    for g in ["G1", "G2", "G3"] {
+        assert!(kept(&all, g), "{g} was pushed out");
+    }
+    // Two slots are left for the other links: A4 and its first child.
+    let others = ["A4", "C5", "C6", "C7"]
+        .iter()
+        .filter(|n| kept(&all, n))
+        .count();
+    assert_eq!(others, 2);
+    assert!(kept(&all, "A4") && kept(&all, "C5"));
+}

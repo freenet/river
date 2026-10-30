@@ -120,10 +120,16 @@
 //!   drops without examining it is dropped unchecked, so the signature
 //!   checks of one call are at most the records kept plus one.
 //! - **(o) Migrated quotas.** [`ConfigurationV2::from_v1`], the starting
-//!   point of the configuration a converting owner signs, sets the link
-//!   quotas and the depth limit to their ceilings. v1 had neither, so a v1
-//!   inviter's children are never dropped by a quota v1 could not have
-//!   known about.
+//!   point of the configuration a converting owner signs, keeps the default
+//!   link quotas (2 links per member, 50 children per link) and sets
+//!   `max_links` and the depth limit to their ceilings. The links the owner
+//!   rosters are exempt from the quotas, so v1's tree is kept whatever its
+//!   shape, and the quotas bound only links made after the conversion. Every
+//!   link but a rostered legacy one shares `max_links` less the roster's
+//!   link count (an L1 value), so no link at any depth can push an attested
+//!   legacy link out through the total cap. A group limit of L2's greedy
+//!   chooser, lawful as the total cap is. A roster entry for a link not
+//!   present still holds its slot.
 //! - **(p) No migration without the owner.** See (a): a v1 member info's
 //!   deputy list confers nothing in v2, and v1 deputies become v2 deputies
 //!   only as (r) says.
