@@ -158,7 +158,13 @@
 //!   with who listed it; the v2 configuration holds only the keys the owner
 //!   passes in, and a `protected` list the owner chooses (a deputy ban
 //!   cannot target a protected key; the Invite Bot belongs there). Nothing
-//!   is promoted automatically (Ian, 2026-10-28).
+//!   is promoted automatically (Ian, 2026-10-28). The bans of a v1 deputy
+//!   the owner declines carry over as member bans, which act only in its
+//!   own invite subtree: each candidate shows how many of its v1 bans reach
+//!   outside it (what declining un-bans), and the conversion report counts
+//!   such bans as narrowed, not kept. The report also lists configuration
+//!   values lowered to the ceilings, secret versions beyond the cap, blobs
+//!   beyond the blob cap, and links whose v1 chain does not reach the owner.
 //! - **(s) Roster budget.** The roster counts distinct attested records per
 //!   kind, so attesting a record again costs nothing against that kind's
 //!   ceiling: twice the kind's cap (links: the legacy link cap), so the

@@ -251,6 +251,12 @@ pub struct DeputyCandidate {
     /// The keys whose v1 deputy list names it: the owner (appointed room
     /// wide in v1) or a member (appointed for that member's subtree in v1).
     pub listed_by: Vec<Key>,
+    /// The v1 bans it issued. If the owner declines it, they carry over as
+    /// member bans, which act only in its own invite subtree.
+    pub v1_bans: usize,
+    /// Of those, the bans whose target is outside its own subtree: what
+    /// declining it un-bans.
+    pub bans_outside_subtree: usize,
 }
 
 /// The deputies to propose to the converting owner: every current, unbanned
@@ -283,10 +289,41 @@ pub fn deputy_candidates(owner: &Key, v1: &ChatRoomStateV1) -> Vec<DeputyCandida
             }
         }
     }
+    // The v1 invite tree, to tell which bans reach outside an issuer's own
+    // subtree.
+    let inviter: HashMap<MemberId, MemberId> = v1
+        .members
+        .members
+        .iter()
+        .map(|m| (m.member.id(), m.member.invited_by))
+        .collect();
+    let under = |target: MemberId, issuer: MemberId| {
+        let mut cur = target;
+        for _ in 0..=inviter.len() {
+            match inviter.get(&cur) {
+                Some(&p) if p == issuer => return true,
+                Some(&p) => cur = p,
+                None => return false,
+            }
+        }
+        false
+    };
     out.into_iter()
-        .map(|(key, by)| DeputyCandidate {
-            key,
-            listed_by: by.into_iter().collect(),
+        .map(|(key, by)| {
+            let id = MemberId(freenet_scaffold::util::FastHash(legacy_id(&key)));
+            let issued: Vec<MemberId> = v1
+                .bans
+                .0
+                .iter()
+                .filter(|b| b.banned_by == id)
+                .map(|b| b.ban.banned_user)
+                .collect();
+            DeputyCandidate {
+                key,
+                listed_by: by.into_iter().collect(),
+                v1_bans: issued.len(),
+                bans_outside_subtree: issued.iter().filter(|t| !under(**t, id)).count(),
+            }
         })
         .collect()
 }
@@ -371,6 +408,12 @@ pub enum DropReason {
     TooLarge,
     /// A legacy link beyond the 300 the owner rosters (decision (q)).
     LegacyLinkCap,
+    /// A legacy link whose v1 invite chain does not reach the owner.
+    NoChainToOwner,
+    /// A secret blob for a member who stays, beyond the blob cap (the
+    /// oldest versions go first) or for a version not carried over: that
+    /// member cannot read messages sealed under its version.
+    SecretBlobCap,
     /// Not kept by retention: a cap, a ban, membership, an invite chain
     /// that no longer reaches the owner, or a newer record superseding it.
     Retention,
@@ -381,14 +424,31 @@ pub enum DropReason {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KindReport {
     pub total: usize,
+    /// Carried over with the effect they had in v1.
     pub kept: usize,
+    /// Carried over with a narrower effect: bans by a v1 deputy the owner
+    /// did not confirm, which act only in the issuer's own subtree.
+    pub narrowed: usize,
     pub dropped: std::collections::BTreeMap<DropReason, usize>,
+}
+
+/// A v1 configuration value lowered to its v2 ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clamp {
+    pub field: &'static str,
+    pub v1: u64,
+    pub v2: u64,
 }
 
 /// What a conversion keeps, for the owner's client to show before it signs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConversionReport {
     pub kinds: std::collections::BTreeMap<LegacyKind, KindReport>,
+    /// Configuration values lowered to their v2 ceilings.
+    pub clamps: Vec<Clamp>,
+    /// v1 secret versions beyond the newest `max_secret_versions`, which do
+    /// not carry over (nor do the messages sealed under them).
+    pub secret_versions_dropped: usize,
 }
 
 /// The owner's records and what they keep.
@@ -402,7 +462,11 @@ pub struct Conversion {
 /// member cap ranks members (depth, then the newest v1 message, then link
 /// digest), and only links whose inviter is the owner or an inviter whose
 /// own link is chosen.
-fn ranked_legacy_links(owner: &Key, v1: &ChatRoomStateV1, legacy: &[Record]) -> BTreeSet<Digest> {
+fn ranked_legacy_links(
+    owner: &Key,
+    v1: &ChatRoomStateV1,
+    legacy: &[Record],
+) -> (BTreeSet<Digest>, BTreeSet<Digest>) {
     let mut by_member: HashMap<Key, (Key, Digest)> = HashMap::new();
     for r in legacy {
         if let Record::LegacyLink(l) = r {
@@ -471,6 +535,7 @@ fn ranked_legacy_links(owner: &Key, v1: &ChatRoomStateV1, legacy: &[Record]) -> 
         }
     }
     ranked.sort();
+    let reachable: BTreeSet<Digest> = ranked.iter().map(|r| r.2).collect();
     let cap = super::retain::legacy_link_cap() as usize;
     let mut chosen_members: BTreeSet<Key> = BTreeSet::new();
     let mut out = BTreeSet::new();
@@ -483,7 +548,7 @@ fn ranked_legacy_links(owner: &Key, v1: &ChatRoomStateV1, legacy: &[Record]) -> 
             out.insert(d);
         }
     }
-    out
+    (out, reachable)
 }
 
 /// The owner's records for `v1` at `clock_hours`, with the deputies and
@@ -513,7 +578,7 @@ pub fn owner_payloads(
             cipher: 0,
         })
         .collect();
-    let links = ranked_legacy_links(owner, v1, legacy);
+    let (links, reachable) = ranked_legacy_links(owner, v1, legacy);
     // Decide which legacy records survive with the owner's records and the
     // chosen links rostered. The owner's records are signed later; here
     // they are trusted.
@@ -540,6 +605,14 @@ pub fn owner_payloads(
     let mut v = Verifier::new();
     v.trust(owner, all[..n_owner].iter().map(|r| r.digest()));
     let kept = retain(owner, &all, &mut v);
+    let member_ids: BTreeSet<i64> = kept.members.iter().map(legacy_id).collect();
+    // v1 deputies the owner did not confirm: their bans carry over as member
+    // bans, acting only in their own subtree.
+    let declined: BTreeSet<Key> = deputy_candidates(owner, v1)
+        .into_iter()
+        .map(|c| c.key)
+        .filter(|k| !configuration.deputies.contains(k))
+        .collect();
     let mut by_kind: HashMap<LegacyKind, Vec<RosterEntry>> = HashMap::new();
     let mut report = ConversionReport::default();
     for (r, k) in all[n_owner..].iter().zip(kept.keep[n_owner..].iter()) {
@@ -549,15 +622,23 @@ pub fn owner_payloads(
         let e = report.kinds.entry(kind).or_default();
         e.total += 1;
         if *k {
-            e.kept += 1;
+            match r {
+                Record::LegacyBan(l) if declined.contains(&l.signer) => e.narrowed += 1,
+                _ => e.kept += 1,
+            }
             by_kind.entry(kind).or_default().push(RosterEntry {
                 kind,
                 digest: r.digest(),
             });
         } else {
-            *e.dropped.entry(drop_reason(owner, r, &links)).or_default() += 1;
+            let why = drop_reason(owner, r, &links, &reachable, &member_ids);
+            *e.dropped.entry(why).or_default() += 1;
         }
     }
+    report.clamps = clamps(&v1.configuration.configuration, &configuration);
+    report.secret_versions_dropped = secret_versions
+        .len()
+        .saturating_sub(configuration.max_secret_versions as usize);
     let mut roster = vec![];
     for kind in LEGACY_KINDS {
         let mut entries = by_kind.remove(&kind).unwrap_or_default();
@@ -598,7 +679,13 @@ pub fn add_unconverted(report: &mut ConversionReport, unconverted: &[Unconverted
 }
 
 /// Why `f` dropped a legacy record, as far as its own bytes tell.
-fn drop_reason(owner: &Key, r: &Record, chosen_links: &BTreeSet<Digest>) -> DropReason {
+fn drop_reason(
+    owner: &Key,
+    r: &Record,
+    chosen_links: &BTreeSet<Digest>,
+    reachable: &BTreeSet<Digest>,
+    member_ids: &BTreeSet<i64>,
+) -> DropReason {
     use super::config::ceiling::*;
     use super::legacy::*;
     let large = match r {
@@ -625,11 +712,78 @@ fn drop_reason(owner: &Key, r: &Record, chosen_links: &BTreeSet<Digest>) -> Drop
         None => DropReason::Undecodable,
         Some(_) if !verify(owner, r) => DropReason::Signature,
         Some(true) => DropReason::TooLarge,
+        Some(false) if matches!(r, Record::LegacyLink(_)) && !reachable.contains(&r.digest()) => {
+            DropReason::NoChainToOwner
+        }
         Some(false)
             if matches!(r, Record::LegacyLink(_)) && !chosen_links.contains(&r.digest()) =>
         {
             DropReason::LegacyLinkCap
         }
+        Some(false)
+            if matches!(r, Record::LegacySecretBlob(l)
+                if decode_blob(owner, l).is_some_and(|v| member_ids.contains(&v.recipient_id))) =>
+        {
+            DropReason::SecretBlobCap
+        }
         Some(false) => DropReason::Retention,
     }
+}
+
+/// The configuration values `from_v1` lowered to their v2 ceilings.
+fn clamps(v1: &crate::room_state::configuration::Configuration, c: &ConfigurationV2) -> Vec<Clamp> {
+    let pairs: [(&'static str, usize, u32); 11] = [
+        ("max_members", v1.max_members, c.max_members),
+        (
+            "max_recent_messages",
+            v1.max_recent_messages,
+            c.max_recent_messages,
+        ),
+        ("max_message_size", v1.max_message_size, c.max_message_size),
+        (
+            "max_nickname_size",
+            v1.max_nickname_size,
+            c.max_nickname_size,
+        ),
+        ("max_room_name", v1.max_room_name, c.max_room_name),
+        (
+            "max_room_description",
+            v1.max_room_description,
+            c.max_room_description,
+        ),
+        (
+            "max_direct_messages",
+            v1.effective_max_direct_messages(),
+            c.max_direct_messages,
+        ),
+        (
+            "max_user_bans (owner bans)",
+            v1.max_user_bans,
+            c.max_owner_bans,
+        ),
+        (
+            "max_user_bans (deputy bans)",
+            v1.max_user_bans,
+            c.max_deputy_bans,
+        ),
+        (
+            "max_user_bans (per deputy)",
+            v1.max_user_bans,
+            c.max_bans_per_deputy,
+        ),
+        (
+            "max_user_bans (member bans)",
+            v1.max_user_bans,
+            c.max_member_bans,
+        ),
+    ];
+    pairs
+        .into_iter()
+        .filter(|(_, a, b)| *a as u64 > *b as u64)
+        .map(|(field, a, b)| Clamp {
+            field,
+            v1: a as u64,
+            v2: b as u64,
+        })
+        .collect()
 }

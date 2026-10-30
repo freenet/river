@@ -380,3 +380,149 @@ fn the_official_shaped_room_converts_whole() {
     // Every record checked once.
     assert_eq!(v.checks, s.records.len());
 }
+
+/// What the owner sees before signing: what declining a v1 deputy costs
+/// (its bans carry over narrowed to its own subtree), configuration values
+/// lowered to the v2 ceilings, secret versions beyond the v2 cap, and links
+/// whose v1 chain does not reach the owner.
+#[test]
+fn the_report_shows_narrowed_bans_clamps_and_unreachable_links() {
+    use crate::room_state::privacy::RoomCipherSpec;
+    use crate::room_state::secret::{AuthorizedSecretVersionRecord, SecretVersionRecordV1};
+    let mut v1 = v1_room();
+    let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    // k4, invited by the owner, is outside deputy k1's subtree; k1 bans it.
+    let member = |m: u8, by: u8| {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: id(0),
+                invited_by: id(by),
+                member_vk: sk(m).verifying_key(),
+            },
+            &sk(by),
+        )
+    };
+    v1.members.members.push(member(4, 0));
+    let b = UserBan {
+        owner_member_id: id(0),
+        banned_at: t,
+        banned_user: id(4),
+    };
+    v1.bans.0.push(AuthorizedUserBan::new(b, id(1), &sk(1)));
+    // k6 invited by k5, which the room holds only as ban evidence: no
+    // chain to the owner.
+    v1.ban_evidence.members.push(member(5, 0));
+    v1.members.members.push(member(6, 5));
+    // 258 secret versions, two more than v2 keeps.
+    for v in 0..258u32 {
+        let r = SecretVersionRecordV1 {
+            version: v,
+            cipher_spec: RoomCipherSpec::Aes256Gcm,
+            created_at: t,
+        };
+        v1.secrets
+            .versions
+            .push(AuthorizedSecretVersionRecord::new(r, &sk(0)));
+    }
+    let o = key(0);
+    let k1 = deputy_candidates(&o, &v1)
+        .into_iter()
+        .find(|c| c.key == key(1))
+        .unwrap();
+    // k1's bans: a non-member (51) and k4, neither under k1.
+    assert_eq!((k1.v1_bans, k1.bans_outside_subtree), (2, 2));
+
+    let conv = legacy_records(&o, &v1);
+    let report = |deputies: &[Key]| {
+        owner_payloads(&o, &v1, &conv.records, 1, deputies, &[])
+            .unwrap()
+            .report
+    };
+    let declined = report(&[]);
+    let bans = &declined.kinds[&LegacyKind::Ban];
+    assert_eq!(bans.narrowed, 2, "{bans:?}");
+    assert_eq!(
+        bans.kept + bans.narrowed + bans.dropped.values().sum::<usize>(),
+        bans.total
+    );
+    let confirmed = report(&[key(1)]);
+    assert_eq!(confirmed.kinds[&LegacyKind::Ban].narrowed, 0);
+
+    assert!(
+        confirmed
+            .clamps
+            .iter()
+            .any(|c| c.field == "max_members" && c.v1 == 2000 && c.v2 == 400),
+        "{:?}",
+        confirmed.clamps
+    );
+    assert_eq!(confirmed.secret_versions_dropped, 2);
+    let links = &confirmed.kinds[&LegacyKind::Link];
+    assert_eq!(
+        links.dropped.get(&DropReason::NoChainToOwner),
+        Some(&1),
+        "{links:?}"
+    );
+    assert_eq!(links.dropped.get(&DropReason::LegacyLinkCap), None);
+}
+
+/// A private room's blobs beyond the blob cap (the oldest versions first)
+/// are reported as such, not as ordinary retention: those members cannot
+/// read messages sealed under the dropped versions.
+#[test]
+fn blobs_beyond_the_blob_cap_are_reported() {
+    use crate::room_state::privacy::{PrivacyMode, RoomCipherSpec};
+    use crate::room_state::secret::{
+        AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord,
+        EncryptedSecretForMemberV1, SecretVersionRecordV1,
+    };
+    let mut v1 = v1_room();
+    let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let mut cfg = v1.configuration.configuration.clone();
+    cfg.privacy_mode = PrivacyMode::Private;
+    cfg.max_members = 3;
+    cfg.display.name = SealedBytes::Private {
+        ciphertext: vec![1; 20],
+        nonce: [0; 12],
+        secret_version: 0,
+        declared_len_bytes: 4,
+    };
+    v1.configuration = AuthorizedConfigurationV1::new(cfg, &sk(0));
+    // Five versions, a blob for each of the three members at each: 15
+    // blobs against a cap of 4 x max_members = 12.
+    for v in 0..5u32 {
+        let r = SecretVersionRecordV1 {
+            version: v,
+            cipher_spec: RoomCipherSpec::Aes256Gcm,
+            created_at: t,
+        };
+        v1.secrets
+            .versions
+            .push(AuthorizedSecretVersionRecord::new(r, &sk(0)));
+        for m in 1..=3u8 {
+            let b = EncryptedSecretForMemberV1 {
+                member_id: id(m),
+                secret_version: v,
+                ciphertext: vec![m; 48],
+                nonce: [v as u8; 12],
+                sender_ephemeral_public_key: [7; 32],
+                provider: id(0),
+            };
+            v1.secrets
+                .encrypted_secrets
+                .push(AuthorizedEncryptedSecretForMember::new(b, &sk(0)));
+        }
+    }
+    let o = key(0);
+    let conv = legacy_records(&o, &v1);
+    let c = owner_payloads(&o, &v1, &conv.records, 1, &[key(1)], &[]).unwrap();
+    assert_eq!(c.payloads.configuration.max_secret_blobs, 12);
+    let blobs = &c.report.kinds[&LegacyKind::SecretBlob];
+    assert_eq!(blobs.total, 15, "{blobs:?}");
+    assert_eq!(blobs.kept, 12, "{blobs:?}");
+    assert_eq!(
+        blobs.dropped.get(&DropReason::SecretBlobCap),
+        Some(&3),
+        "{blobs:?}"
+    );
+}
