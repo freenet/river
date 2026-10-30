@@ -358,6 +358,7 @@ pub fn rand_cfg(rng: &mut Rng, keys: usize) -> Cfg {
         max_versions: 2,
         max_blobs: 2,
         closed_at: 0,
+        except: "",
     }
 }
 

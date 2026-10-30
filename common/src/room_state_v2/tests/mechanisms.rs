@@ -371,3 +371,102 @@ fn a_far_future_time_is_clamped_to_its_clock_reference() {
     let r = f_without(&b.finish(), &[]);
     assert!(kept(&r, "msg(k2") && !kept(&r, "msg(k1"));
 }
+
+/// In a room with one subtree-shaped root (the Invite Bot, holding a child
+/// exception), one member signing restore requests under itself takes only
+/// its own subtree's slots, and an honest member's request for its rostered
+/// link stays, though its hours are the lowest.
+#[test]
+fn one_member_cannot_block_restores_under_a_transparent_link() {
+    use crate::room_state_v2::retain::test_cap;
+    let cfg = super::builder::with(|c| {
+        c.window_open = true;
+        c.max_members = 7;
+        c.max_children = 9;
+        c.max_depth = 8;
+        c.except = "G1";
+    });
+    let mut b = super::builder::Builder::new();
+    b.leg("G1", 1, 0);
+    b.leg("G2", 2, 1);
+    b.leg("G3", 3, 1);
+    b.roster(1, &["G1", "G2", "G3"]);
+    for (inv, k) in [(1u8, 4usize), (2, 5), (3, 6)] {
+        b.invitation(inv, "G3", inv as u32, 0);
+        b.acc(&format!("C{k}"), inv, k);
+    }
+    b.restore("C4", 100);
+    b.restore("C5", 101);
+    b.restore("C6", 102);
+    b.restore("G2", 1);
+    b.cfg(0, cfg);
+    let b = b.finish();
+    let all = f_without(&b, &[]);
+    assert!(kept(&all, "restore(G2"), "the honest request stays");
+    let attacker = ["restore(C4", "restore(C5", "restore(C6"];
+    let n = attacker.iter().filter(|a| kept(&all, a)).count();
+    assert_eq!(n, 2, "the member's subtree has its two slots");
+    // With one slot in all, the rostered request is the one kept.
+    test_cap::set_limits(test_cap::Limits {
+        restores: Some(1),
+        ..Default::default()
+    });
+    let one = f_without(&b, &[]);
+    test_cap::set_limits(test_cap::Limits::default());
+    assert!(kept(&one, "restore(G2"));
+    assert_eq!(attacker.iter().filter(|a| kept(&one, a)).count(), 0);
+}
+
+/// One member cannot take the room's link slots: links other than rostered
+/// ones are limited per subtree, and a child of a link holding an exception
+/// starts its own subtree.
+#[test]
+fn one_subtree_cannot_take_more_than_its_limit_of_links() {
+    use crate::room_state_v2::retain::test_cap;
+    let cfg = |except: &'static str| {
+        super::builder::with(|c| {
+            c.max_members = 7;
+            c.max_children = 9;
+            c.max_depth = 8;
+            c.max_links = 9;
+            c.except = except;
+        })
+    };
+    let build = |except: &'static str| {
+        let mut b = super::builder::Builder::new();
+        b.invitation(1, "O", 1, 0);
+        b.acc("A1", 1, 1);
+        b.invitation(2, "A1", 1, 0);
+        b.acc("A2", 2, 2);
+        b.invitation(3, "A2", 1, 0);
+        b.acc("A3", 3, 3);
+        b.invitation(4, "A3", 1, 0);
+        b.acc("A4", 4, 4);
+        b.invitation(5, "A1", 2, 0);
+        b.acc("A5", 5, 5);
+        b.cfg(0, cfg(except));
+        b.finish()
+    };
+    test_cap::set_limits(test_cap::Limits {
+        subtree_links: Some(3),
+        ..Default::default()
+    });
+    // A1 is the root: it, A2 and the next by depth; the rest are refused.
+    let plain = f_without(&build(""), &[]);
+    // A1 transparent: A2 and A5 are roots, A2's subtree holds A2, A3, A4.
+    let except = f_without(&build("A1"), &[]);
+    test_cap::set_limits(test_cap::Limits::default());
+    let n = |r: &(Retained, Vec<String>)| {
+        ["A1", "A2", "A3", "A4", "A5"]
+            .iter()
+            .filter(|x| kept(r, x))
+            .count()
+    };
+    assert_eq!(n(&plain), 3);
+    assert!(kept(&plain, "A1") && kept(&plain, "A2") && kept(&plain, "A5"));
+    assert_eq!(
+        n(&except),
+        5,
+        "the exception's children are their own roots"
+    );
+}

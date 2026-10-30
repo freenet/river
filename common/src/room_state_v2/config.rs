@@ -91,9 +91,12 @@ pub mod ceiling {
     /// three signatures each, so 10 (the design: 1,000) keeps their checks
     /// within the timing bound.
     pub const RESTORE_REQUESTS: usize = 10;
-    /// Restore requests attached within the subtree of one of the owner's
-    /// direct invitees (see `retain`).
+    /// Restore requests attached within one subtree (see `retain`).
     pub const RESTORES_PER_SUBTREE: usize = 2;
+    /// Links other than rostered legacy ones within one subtree: a root is
+    /// one of the owner's direct invitees, or a child of a link holding a
+    /// child exception. Bounds what one member can force the room to check.
+    pub const MAX_LINKS_PER_SUBTREE: u32 = 100;
     /// Legacy v1 records encode byte vectors as CBOR arrays, which cost
     /// about four times as much to decode in WASM as a v2 byte string, so the
     /// legacy kinds that carry content have smaller bounds than their v2
@@ -296,6 +299,13 @@ impl ConfigurationV2 {
                 .child_exceptions
                 .iter()
                 .all(|(_, q)| *q <= MAX_CHILDREN_PER_LINK)
+    }
+
+    /// Whether the owner set a child limit for this link.
+    pub fn has_child_exception(&self, link: &Digest) -> bool {
+        self.child_exceptions
+            .binary_search_by(|(d, _)| d.cmp(link))
+            .is_ok()
     }
 
     pub fn child_quota(&self, link: &Digest) -> u32 {

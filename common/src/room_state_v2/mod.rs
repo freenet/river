@@ -96,9 +96,13 @@
 //!   is not retired confers nothing. At most 10 are kept (the design: 1,000;
 //!   each carries up to 25 signatures), and at most
 //!   [`config::ceiling::RESTORES_PER_SUBTREE`] of those whose chain ends
-//!   anywhere in the subtree of one of the owner's direct invitees, so a
-//!   member signing chains of its own keys, or admitting keys of its own to
-//!   sign them, cannot take every slot. The subtree root is read from L2.
+//!   anywhere in one subtree, so a member signing chains of its own keys, or
+//!   admitting keys of its own to sign them, cannot take every slot. A
+//!   subtree's root is one of the owner's direct invitees, except that a
+//!   link holding a child exception (the Invite Bot's) is transparent: its
+//!   children are the roots, and a chain ending at it is its own subtree.
+//!   Requests whose first link the owner rosters rank ahead of the others,
+//!   which no one else can make. Both read only L1 and L2.
 //! - **(k) Strict signatures everywhere.** Legacy v1 records are checked with
 //!   `verify_strict`, as v2 records are, though v1 used `verify`. A v1 record
 //!   whose signature only the lenient check accepts is dropped.
@@ -139,7 +143,10 @@
 //!   `MAX_CHILDREN_PER_LINK` (534; the design's 4,000 predates the small
 //!   ceilings), and the conversion report shows every inviter whose limit
 //!   is an exception or which already has the default's number of children.
-//!   Every
+//!   Links other than rostered ones are also limited to
+//!   [`config::ceiling::MAX_LINKS_PER_SUBTREE`] (100) per subtree (see (j)
+//!   for the subtree), so one member cannot take the room's link slots or
+//!   force most of its signature checks. Every
 //!   link but a rostered legacy one shares `max_links` less the roster's
 //!   link count (an L1 value), so no link at any depth can push an attested
 //!   legacy link out through the total cap. A group limit of L2's greedy

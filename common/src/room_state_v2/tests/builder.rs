@@ -69,6 +69,9 @@ pub struct Cfg {
     /// (`legacy_window_closed_at`), which caps legacy times while the
     /// window is closed.
     pub closed_at: u32,
+    /// Not in the model: the link (by builder name) holding a child
+    /// exception of 9, if any.
+    pub except: &'static str,
 }
 
 pub fn base() -> Cfg {
@@ -94,6 +97,7 @@ pub fn base() -> Cfg {
         max_versions: 2,
         max_blobs: 2,
         closed_at: 0,
+        except: "",
     }
 }
 
@@ -287,7 +291,10 @@ impl Builder {
     }
 
     pub fn cfg(&mut self, version: u32, cfg: Cfg) {
-        let p = cfg.to_v2(version);
+        let mut p = cfg.to_v2(version);
+        if !cfg.except.is_empty() {
+            p.child_exceptions = vec![(self.recs[self.map[cfg.except]].digest(), 9)];
+        }
         let r = Record::Configuration(Signed {
             sig: sign_payload(tag::CONFIGURATION, &owner(), &p, &sk(0)),
             payload: p,

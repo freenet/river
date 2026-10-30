@@ -7,7 +7,8 @@ use super::harness::{bits, LawModel, S};
 use crate::room_state_v2::encoding::{Digest, Key};
 use crate::room_state_v2::records::Record;
 use crate::room_state_v2::retain::mutant::{self, Mutant};
-use crate::room_state_v2::retain::{retain_refs, signature_ok, test_cap, Verifier};
+use crate::room_state_v2::retain::test_cap::{self, Limits};
+use crate::room_state_v2::retain::{retain_refs, signature_ok, Verifier};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,13 +28,8 @@ pub struct Universe {
     digests: Vec<Digest>,
     pub names: Vec<String>,
     mutant: Mutant,
-    /// The legacy link cap `f` runs under (`None`: the ceiling).
-    cap: Option<u32>,
-    /// The purge token budget `f` runs under (`None`: the ceiling).
-    purge: Option<usize>,
-    /// The purge tokens reserved per kept key (`None`: derived from the
-    /// budget).
-    reserve: Option<usize>,
+    /// The limits `f` runs under (`None`: the ceilings).
+    limits: Limits,
     table: Option<Vec<u32>>,
 }
 
@@ -45,41 +41,26 @@ impl Universe {
     /// As [`Self::new`], with `f` run under the legacy link cap `cap`
     /// (`retain::test_cap`, set on whichever thread computes `f`).
     pub fn with_cap(name: &str, b: Builder, mutant: Mutant, cap: Option<u32>) -> Universe {
-        Self::build(name, b, mutant, cap, None, true)
+        let limits = Limits {
+            cap,
+            ..Limits::default()
+        };
+        Self::build(name, b, mutant, limits, true)
     }
 
-    /// As [`Self::new`], with `f` run under the purge token budget `budget`
+    /// As [`Self::new`], with `f` run under `limits`
     /// (`retain::test_cap`, set on whichever thread computes `f`).
-    pub fn with_purge_budget(
-        name: &str,
-        b: Builder,
-        budget: usize,
-        reserve: Option<usize>,
-    ) -> Universe {
-        let mut u = Self::build(name, b, Mutant::None, None, Some(budget), false);
-        u.reserve = reserve;
-        if u.recs.len() <= 20 {
-            u.table = Some(u.build_table());
-        }
-        u
+    pub fn with_limits(name: &str, b: Builder, limits: Limits) -> Universe {
+        Self::build(name, b, Mutant::None, limits, true)
     }
 
-    /// As [`Self::with_cap`], memoizing `f` instead of precomputing it for
+    /// As [`Self::with_limits`], memoizing `f` instead of precomputing it for
     /// every subset, for callers that evaluate few subsets.
-    /// `purge` is the purge token budget `f` runs under (`None`: the
-    /// ceiling).
-    pub fn lazy_with(name: &str, b: Builder, cap: Option<u32>, purge: Option<usize>) -> Universe {
-        Self::build(name, b, Mutant::None, cap, purge, false)
+    pub fn lazy_with(name: &str, b: Builder, limits: Limits) -> Universe {
+        Self::build(name, b, Mutant::None, limits, false)
     }
 
-    fn build(
-        name: &str,
-        b: Builder,
-        mutant: Mutant,
-        cap: Option<u32>,
-        purge: Option<usize>,
-        table: bool,
-    ) -> Universe {
+    fn build(name: &str, b: Builder, mutant: Mutant, limits: Limits, table: bool) -> Universe {
         let o = owner();
         for (r, n) in b.recs.iter().zip(&b.names) {
             assert!(signature_ok(&o, r), "builder signed {n} wrongly");
@@ -94,9 +75,7 @@ impl Universe {
             digests,
             names: b.names,
             mutant,
-            cap,
-            purge,
-            reserve: None,
+            limits,
             table: None,
         };
         if table && u.recs.len() <= 20 {
@@ -107,17 +86,13 @@ impl Universe {
 
     fn compute(&self, s: S, v: &mut Verifier) -> S {
         mutant::set(self.mutant);
-        test_cap::set(self.cap);
-        test_cap::set_purge(self.purge);
-        test_cap::set_reserve(self.reserve);
+        test_cap::set_limits(self.limits);
         let idx: Vec<usize> = bits(s).collect();
         let refs: Vec<&Record> = idx.iter().map(|&i| &self.recs[i]).collect();
         let ds: Vec<Digest> = idx.iter().map(|&i| self.digests[i]).collect();
         let r = retain_refs(&self.owner, &refs, ds, v);
         mutant::set(Mutant::None);
-        test_cap::set(None);
-        test_cap::set_purge(None);
-        test_cap::set_reserve(None);
+        test_cap::set_limits(Limits::default());
         idx.iter()
             .zip(r.keep.iter())
             .filter(|(_, k)| **k)

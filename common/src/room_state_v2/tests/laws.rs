@@ -13,6 +13,7 @@ use super::harness::{
 };
 use super::universe::Universe;
 use crate::room_state_v2::retain::mutant::Mutant;
+use crate::room_state_v2::retain::test_cap::Limits;
 
 fn env(name: &str, d: u64) -> u64 {
     std::env::var(name)
@@ -636,11 +637,14 @@ fn run_purge_budget(
     let mut reserved_refused = 0u64;
     let label = format!("purge budget {budget} reserve {reserve}");
     for fi in 0..fams {
-        let m = Universe::with_purge_budget(
+        let m = Universe::with_limits(
             &format!("{label} / univ{fi}"),
             purge_family(seed0, fi),
-            budget,
-            Some(reserve),
+            Limits {
+                purge: Some(budget),
+                reserve: Some(reserve),
+                ..Limits::default()
+            },
         );
         let free = Universe::new("free", purge_family(seed0, fi), Mutant::None);
         let c = random(&m, seed0 * 7919 + fi, pool, pairs, triples);

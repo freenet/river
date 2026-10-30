@@ -251,32 +251,93 @@ pub fn purge_token_reserve() -> usize {
     purge_token_budget() / (ceiling::MAX_MEMBERS as usize + 1)
 }
 
-/// Test overrides of the legacy link cap and the purge token budget (per
-/// thread).
+/// Links other than rostered legacy ones in one subtree
+/// ([`ceiling::MAX_LINKS_PER_SUBTREE`], or a value tests set).
+pub fn links_per_subtree() -> u32 {
+    #[cfg(test)]
+    if let Some(n) = test_cap::limits().subtree_links {
+        return n;
+    }
+    ceiling::MAX_LINKS_PER_SUBTREE
+}
+
+/// Restore requests kept ([`ceiling::RESTORE_REQUESTS`], or a value tests
+/// set).
+pub fn restore_requests() -> usize {
+    #[cfg(test)]
+    if let Some(n) = test_cap::limits().restores {
+        return n;
+    }
+    ceiling::RESTORE_REQUESTS
+}
+
+/// Restore requests attached in one subtree
+/// ([`ceiling::RESTORES_PER_SUBTREE`], or a value tests set).
+pub fn restores_per_subtree() -> usize {
+    #[cfg(test)]
+    if let Some(n) = test_cap::limits().subtree_restores {
+        return n;
+    }
+    ceiling::RESTORES_PER_SUBTREE
+}
+
+/// Test overrides of the limits `f` reads, small enough to bind in small
+/// universes (per thread).
 #[cfg(test)]
 pub(crate) mod test_cap {
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Limits {
+        pub cap: Option<u32>,
+        pub purge: Option<usize>,
+        pub reserve: Option<usize>,
+        pub subtree_links: Option<u32>,
+        pub subtree_restores: Option<usize>,
+        pub restores: Option<usize>,
+        pub roster_entries: Option<usize>,
+        pub roster_batches: Option<usize>,
+    }
     thread_local! {
-        static CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
-        static PURGE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-        static RESERVE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+        static LIMITS: std::cell::Cell<Limits> = const {
+            std::cell::Cell::new(Limits {
+                cap: None,
+                purge: None,
+                reserve: None,
+                subtree_links: None,
+                subtree_restores: None,
+                restores: None,
+                roster_entries: None,
+                roster_batches: None,
+            })
+        };
+    }
+    pub fn limits() -> Limits {
+        LIMITS.with(|c| c.get())
+    }
+    pub fn set_limits(l: Limits) {
+        LIMITS.with(|c| c.set(l))
+    }
+    fn update(f: impl FnOnce(&mut Limits)) {
+        let mut l = limits();
+        f(&mut l);
+        set_limits(l);
     }
     pub fn get() -> Option<u32> {
-        CAP.with(|c| c.get())
+        limits().cap
     }
     pub fn set(n: Option<u32>) {
-        CAP.with(|c| c.set(n))
+        update(|l| l.cap = n)
     }
     pub fn purge() -> Option<usize> {
-        PURGE.with(|c| c.get())
+        limits().purge
     }
     pub fn set_purge(n: Option<usize>) {
-        PURGE.with(|c| c.set(n))
+        update(|l| l.purge = n)
     }
     pub fn reserve() -> Option<usize> {
-        RESERVE.with(|c| c.get())
+        limits().reserve
     }
     pub fn set_reserve(n: Option<usize>) {
-        RESERVE.with(|c| c.set(n))
+        update(|l| l.reserve = n)
     }
 }
 
@@ -391,6 +452,10 @@ struct Adm {
     member: Key,
     depth: u32,
     parent: Option<usize>,
+    /// The subtree it counts in: the admitted index of its root. `None`: a
+    /// link holding a child exception, with only such links above it, is
+    /// transparent, and its children are roots.
+    root: Option<usize>,
 }
 
 fn admissible_v1(body: &RoomMessageBody, private: bool, versions: &HashSet<u32>) -> bool {
@@ -915,6 +980,8 @@ pub fn retain_refs(
     let mut rostered_admitted = 0u32;
     let mut unrostered_admitted = 0u32;
     let mut other_admitted = 0u32;
+    let subtree_limit = links_per_subtree();
+    let mut per_subtree: HashMap<usize, u32> = HashMap::new();
     let mut frontier: Vec<usize> = vec![]; // admitted at depth d-1, in position order
                                            // Accepted links stop at `max_chain_depth`; legacy links (v1 had no
                                            // depth limit) go as deep as their chains, bounded by their count.
@@ -995,6 +1062,19 @@ pub fn retain_refs(
             if !exempt && other_admitted >= other_budget {
                 continue;
             }
+            // The subtree this link would count in, and whether it is full:
+            // one member cannot take the room's link slots (decision (o)).
+            let a = adm.len();
+            let root = match parent.and_then(|p| adm[p].root) {
+                Some(r) => Some(r),
+                None if cfg.has_child_exception(&c.digests[l.rec]) => None,
+                None => Some(a),
+            };
+            if !exempt
+                && root.is_some_and(|r| per_subtree.get(&r).copied().unwrap_or(0) >= subtree_limit)
+            {
+                continue;
+            }
             if !exempt {
                 let quota = match parent {
                     None => cfg.max_owner_children,
@@ -1020,8 +1100,10 @@ pub fn retain_refs(
                 other_admitted += 1;
                 *children.entry(parent).or_default() += 1;
                 *per_member.entry(l.member).or_default() += 1;
+                if let Some(r) = root {
+                    *per_subtree.entry(r).or_default() += 1;
+                }
             }
-            let a = adm.len();
             adm_by_digest.insert(c.digests[l.rec], a);
             adm.push(Adm {
                 rec: l.rec,
@@ -1029,6 +1111,7 @@ pub fn retain_refs(
                 member: l.member,
                 depth,
                 parent,
+                root,
             });
             c.keep[l.rec] = true;
             next.push(a);
@@ -1112,17 +1195,13 @@ pub fn retain_refs(
     // Each request attaches to the room where its chain ends: the owner, or
     // an admitted link (its inviter's link there). A member can sign chains
     // of its own keys under its own link, and admit keys of its own to do the
-    // same, so requests attached anywhere in the subtree of one of the
-    // owner's direct invitees share `RESTORES_PER_SUBTREE` slots; requests
-    // attached to the owner (whose invitations only the owner signs) share
-    // the rest.
-    let subtree_root = |mut a: usize| {
-        while let Some(p) = adm[a].parent {
-            a = p;
-        }
-        adm[a].digest
-    };
-    let mut rr: Vec<(Reverse<u32>, Digest, Digest, Option<Digest>, usize)> = vec![];
+    // same, so requests attached anywhere in one subtree share
+    // `restores_per_subtree()` slots. A chain ending at a transparent link
+    // (the Invite Bot's) would itself be a root, so it is its own subtree.
+    // Requests attached to the owner (whose invitations only the owner signs)
+    // share the rest. Requests whose first link the owner rosters come first:
+    // no one else can make such a request.
+    let mut rr: Vec<(bool, Reverse<u32>, Digest, Digest, Option<Digest>, usize)> = vec![];
     for i in c.kind(13) {
         let Record::Restore(s) = &recs[i] else {
             continue;
@@ -1151,7 +1230,10 @@ pub fn retain_refs(
                     },
                     ChainLink::Legacy(l) => canonical.get(&l.signer).copied(),
                 };
-                attach = at.map(subtree_root);
+                attach = at.map(|a| match adm[a].root {
+                    Some(r) => adm[r].digest,
+                    None => digest_of_link(cl),
+                });
             }
             ok &= match cl {
                 ChainLink::Accepted(a) => {
@@ -1179,10 +1261,12 @@ pub fn retain_refs(
             };
         }
         if ok {
+            let first = digest_of_link(&p.chain[0]);
             rr.push((
+                !rostered(LegacyKind::Link, &first),
                 Reverse(time.eff_hours(p.hours, p.clock_ref)),
                 c.digests[i],
-                digest_of_link(&p.chain[0]),
+                first,
                 attach,
                 i,
             ));
@@ -1191,13 +1275,12 @@ pub fn retain_refs(
     rr.sort();
     let mut restored: HashSet<Digest> = HashSet::new();
     let mut per_attach: HashMap<Digest, usize> = HashMap::new();
-    for (_, _, link, attach, i) in rr {
-        if restored.len() >= ceiling::RESTORE_REQUESTS {
+    let per_subtree = restores_per_subtree();
+    for (_, _, _, link, attach, i) in rr {
+        if restored.len() >= restore_requests() {
             break;
         }
-        let full = attach.is_some_and(|k| {
-            per_attach.get(&k).copied().unwrap_or(0) >= ceiling::RESTORES_PER_SUBTREE
-        });
+        let full = attach.is_some_and(|k| per_attach.get(&k).copied().unwrap_or(0) >= per_subtree);
         if full || restored.contains(&link) || !c.ok(i) {
             continue;
         }

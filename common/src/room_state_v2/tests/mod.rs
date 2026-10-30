@@ -14,6 +14,7 @@ mod laws;
 mod mechanisms;
 mod pins;
 mod real;
+mod rule_families;
 mod selftest;
 mod sizes;
 mod state_tests;

@@ -92,7 +92,15 @@ impl Real {
             .unzip();
         b.recs = recs;
         b.names = names;
-        let u = Universe::lazy_with(name, b, cap, purge);
+        let u = Universe::lazy_with(
+            name,
+            b,
+            test_cap::Limits {
+                cap,
+                purge,
+                ..Default::default()
+            },
+        );
         let mut recs = u.recs.clone();
         let mut names = u.names.clone();
         let n = recs.len();
