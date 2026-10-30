@@ -628,3 +628,38 @@ fn legacy_restore_requests_share_their_subtree_s_slots() {
     assert!(kept(&r, "restore(G3"), "the later hours first");
     assert!(!kept(&r, "restore(G2"), "the subtree's one slot is taken");
 }
+
+/// Once the window closes, a legacy record's time is held to the close: a
+/// rostered legacy ban with a later time ranks below a v2 ban before it.
+#[test]
+fn legacy_times_are_capped_at_the_window_s_close() {
+    use super::builder::{with, Builder, T};
+    let build = |closed_at: u32| {
+        let mut b = Builder::new();
+        b.leg("G1", 1, 0);
+        b.roster(1, &["G1", "LATE"]);
+        b.invitation(2, "O", 2, 0);
+        b.acc("A2", 2, 2);
+        b.invitation(3, "O", 3, 0);
+        b.acc("A3", 3, 3);
+        b.clock(20);
+        b.act(2, 20);
+        b.mban("LATE", "G1", T::Key(3), 50, 0, true);
+        b.mban("EARLY", "A2", T::Key(3), 10, 10, false);
+        b.cfg(
+            0,
+            with(|c| {
+                c.window_open = false;
+                c.closed_at = closed_at;
+                c.max_members = 5;
+                c.max_member_bans = 1;
+                c.ban_window = 200;
+            }),
+        );
+        b.finish()
+    };
+    let r = f_without(&build(4), &[]);
+    assert!(kept(&r, "EARLY") && !kept(&r, "LATE"), "capped at hour 4");
+    let r = f_without(&build(40), &[]);
+    assert!(kept(&r, "LATE") && !kept(&r, "EARLY"), "capped at hour 40");
+}

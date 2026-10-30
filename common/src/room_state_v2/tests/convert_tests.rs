@@ -741,6 +741,20 @@ fn closing_the_window_attests_what_the_room_holds() {
     assert_eq!(close.report.new_links.get(&key(1)), Some(&1));
     assert_eq!(close.report.attested[&LegacyKind::Message], 2);
     let close = close.payloads;
+    // Its batches number on from the conversion's, and the close is at the
+    // hour asked for.
+    let held_seq = during
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Roster(b) => Some(b.payload.seq),
+            _ => None,
+        })
+        .max()
+        .unwrap();
+    assert!(close.roster.iter().all(|b| b.seq > held_seq));
+    assert_eq!(close.configuration.legacy_window_closed_at, 2);
+    assert_eq!(close.clock.hours, 2);
     let mut recs = during.records.clone();
     recs.extend(close.sign(&sk(0)));
     let (closed, r) = normalize(&o, recs, &mut Verifier::new());
@@ -971,4 +985,56 @@ fn an_inert_ban_does_not_hide_a_deputy() {
     let conv = legacy_records(&o, &v1);
     let c = owner_payloads(&o, &v1, &conv.records, 1, &[], &[], &[]).unwrap();
     assert!(c.report.kinds[&LegacyKind::Ban].narrowed >= 1);
+}
+
+/// Two generations holding different links for one member: the roster takes
+/// the lowest digest, whichever order they arrive in.
+#[test]
+fn two_links_for_one_member_roster_the_lowest_digest_in_any_order() {
+    let v1 = v1_room();
+    let o = key(0);
+    let with_link = |inviter: u8| {
+        let mut g = v1.clone();
+        g.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: id(0),
+                invited_by: id(inviter),
+                member_vk: sk(4).verifying_key(),
+            },
+            &sk(inviter),
+        ));
+        g
+    };
+    let a = legacy_records(&o, &with_link(1)).records;
+    let b = legacy_records(&o, &with_link(2)).records;
+    let k4_links = |recs: &[Record]| -> Vec<_> {
+        recs.iter()
+            .filter(|r| match r {
+                Record::LegacyLink(l) => l.signer == key(1) || l.signer == key(2),
+                _ => false,
+            })
+            .map(|r| r.digest())
+            .collect()
+    };
+    let in_only = |x: &[Record], y: &[Record]| {
+        let ys = k4_links(y);
+        k4_links(x).into_iter().find(|d| !ys.contains(d)).unwrap()
+    };
+    let (da, db) = (in_only(&a, &b), in_only(&b, &a));
+    let (low, high) = (da.min(db), da.max(db));
+    let rostered = |first: &[Record], second: &[Record]| {
+        let mut all = first.to_vec();
+        all.extend(second.iter().cloned());
+        let p = payloads(&v1, &all, &[]);
+        p.roster
+            .iter()
+            .flat_map(|b| b.batch.iter())
+            .filter(|e| e.kind == LegacyKind::Link)
+            .map(|e| e.digest)
+            .collect::<Vec<_>>()
+    };
+    for r in [rostered(&a, &b), rostered(&b, &a)] {
+        assert!(r.contains(&low), "the lowest digest is rostered");
+        assert!(!r.contains(&high), "the other link is not");
+    }
 }

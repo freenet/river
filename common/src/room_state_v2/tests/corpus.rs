@@ -10,7 +10,7 @@
 
 use super::builder::{owner as builder_owner, sk};
 use super::families::{rand_cfg, rand_universe_l5};
-use super::harness::Rng;
+use super::harness::{heal_with, Rng, Verdict};
 use crate::room_state::ChatRoomParametersV1;
 use crate::room_state_v2::bench::{largest_state, owner_key, Caps};
 use crate::room_state_v2::encoding::{to_cbor, Key};
@@ -31,6 +31,8 @@ struct Out {
     check: bool,
     /// States written with the legacy window closed and a legacy record.
     closed_with_legacy: usize,
+    /// The bytes of every state written: a state appears once.
+    seen: std::collections::HashSet<Vec<u8>>,
 }
 
 /// freenet-core's `conformance::bundle::ReplayBundle`, field for field, so
@@ -93,6 +95,7 @@ impl Out {
             owner: Key::from(&owner),
             check: true,
             closed_with_legacy: 0,
+            seen: Default::default(),
         }
     }
     /// A corpus of states `validate_state` refuses.
@@ -101,6 +104,9 @@ impl Out {
         self
     }
     fn state_bytes(&mut self, bytes: Vec<u8>) {
+        if !self.seen.insert(bytes.clone()) {
+            return;
+        }
         if self.check {
             let s = crate::room_state_v2::validate_state(&self.owner, &bytes, &mut ver())
                 .unwrap_or_else(|e| {
@@ -402,10 +408,32 @@ fn delta_permutation_pairs_heal_in_the_windowed_corpus() {
 /// records exists.
 #[test]
 fn the_corpora_check_themselves() {
-    let root = std::env::temp_dir().join(format!("river-v2-corpus-{}", std::process::id()));
-    universes_corpora(&root);
-    windowed_corpus(&root);
-    std::fs::remove_dir_all(&root).unwrap();
+    /// Removes the directory on the way out, a failed check included.
+    struct Temp(PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = Temp(std::env::temp_dir().join(format!("river-v2-corpus-{}", std::process::id())));
+    universes_corpora(&root.0);
+    windowed_corpus(&root.0);
+    // Enough distinct, non-trivial states to be a corpus at all.
+    for name in ["universes", "windowed"] {
+        let mut sizes: Vec<u64> = std::fs::read_dir(root.0.join(name))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with('s'))
+            .map(|e| e.metadata().unwrap().len())
+            .collect();
+        sizes.sort();
+        assert!(sizes.len() >= 20, "{name}: {} states", sizes.len());
+        assert!(
+            sizes[sizes.len() / 2] >= 300,
+            "{name}: median state {} bytes",
+            sizes[sizes.len() / 2]
+        );
+    }
 }
 
 /// For every receiver and pair of deltas computed against its summary, the
@@ -429,24 +457,13 @@ fn delta_pairs_heal(o: &Key, states: &[RoomStateV2]) -> (usize, usize, usize) {
                     continue;
                 }
                 differ += 1;
-                let mut conv = merge(o, &l, &r, &mut ver());
-                assert_eq!(conv, merge(o, &r, &l, &mut ver()));
-                for _ in 0..4 {
-                    let before = conv.clone();
-                    for input in [&l, &r, base] {
-                        conv = merge(o, &conv, input, &mut ver());
-                    }
-                    for d in [&ds[x], &ds[y]] {
-                        conv = ap(&conv, d);
-                    }
-                    if conv == before {
-                        break;
-                    }
-                }
-                let fixed = [&l, &r, base]
-                    .iter()
-                    .all(|s| merge(o, &conv, s, &mut ver()) == conv);
-                healed += fixed as usize;
+                let verdict = heal_with(
+                    |a: &RoomStateV2, b: &RoomStateV2| merge(o, a, b, &mut ver()),
+                    l,
+                    r,
+                    std::slice::from_ref(base),
+                );
+                healed += (verdict == Verdict::Healed) as usize;
             }
         }
     }

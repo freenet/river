@@ -611,6 +611,9 @@ fn ranked_legacy_links(
         if out.len() >= cap {
             break;
         }
+        // Always true: one link per member, sorted by depth, so an inviter
+        // is taken before its invitees unless the cap ended the loop. It
+        // states that a rostered link's inviter is rostered.
         if inv == *owner || chosen_members.contains(&inv) {
             chosen_members.insert(m);
             out.insert(d);

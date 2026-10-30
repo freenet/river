@@ -1396,6 +1396,42 @@ fn a_roster_batch_over_its_entry_limit_is_dropped() {
     assert!(!run(batch(ceiling::ROSTER_BATCH_ENTRIES + 1, 1)));
 }
 
+/// A batch repeating attested entries costs its kind's ceiling nothing, but a
+/// batch with one new entry past the ceiling is dropped whole.
+#[test]
+fn repeated_entries_cost_a_kind_s_ceiling_nothing_and_new_ones_stop_at_it() {
+    use crate::room_state_v2::retain::roster_ceiling;
+    let o = owner();
+    let osk = owner_key();
+    let cap = roster_ceiling(LegacyKind::Message);
+    let batch = |from: usize, n: usize, seq: u32| {
+        let mut b: Vec<RosterEntry> = (from..from + n)
+            .map(|i| {
+                let mut d = [0u8; 32];
+                d[..4].copy_from_slice(&(i as u32).to_be_bytes());
+                RosterEntry {
+                    kind: LegacyKind::Message,
+                    digest: Bytes32(d),
+                }
+            })
+            .collect();
+        b.sort_by_key(|e| (e.kind, e.digest));
+        Record::Roster(signed(tag::ROSTER, RosterP { seq, batch: b }, &osk))
+    };
+    let first = batch(0, cap, 1);
+    let repeat = batch(0, cap, 2);
+    let one_more = batch(cap, 1, 3);
+    let recs = vec![
+        config_record(&valid_config(1)),
+        first.clone(),
+        repeat.clone(),
+        one_more.clone(),
+    ];
+    let (out, _) = normalize(&o, recs, &mut Verifier::new());
+    assert!(out.records.contains(&first) && out.records.contains(&repeat));
+    assert!(!out.records.contains(&one_more));
+}
+
 /// Every kind group, one record over its count, is refused without decoding.
 #[test]
 fn every_kind_group_over_its_count_is_refused() {

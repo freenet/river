@@ -56,24 +56,37 @@ pub enum Verdict {
 pub const MAX_HEAL_PASSES: usize = 4;
 
 pub fn heal<M: LawModel>(m: &M, l: S, r: S, inputs: [S; 3]) -> Verdict {
-    let mut conv = m.merge(l, r);
-    if m.merge(r, l) != conv {
+    heal_with(|a, b| m.merge(*a, *b), l, r, &inputs)
+}
+
+/// The healing check over any state type: merge the two results, then
+/// re-merge every input until nothing changes, refusing a state met twice
+/// and a merge that an immediate redelivery changes.
+pub fn heal_with<T: Clone + PartialEq>(
+    merge: impl Fn(&T, &T) -> T,
+    l: T,
+    r: T,
+    inputs: &[T],
+) -> Verdict {
+    let mut conv = merge(&l, &r);
+    if merge(&r, &l) != conv {
         return Verdict::NotConverged;
     }
-    let absorbed = [l, r, inputs[0], inputs[1], inputs[2]];
-    let mut seen = HashSet::new();
-    seen.insert(conv);
+    let mut absorbed = vec![l, r];
+    absorbed.extend(inputs.iter().cloned());
+    let mut seen = vec![conv.clone()];
     for _ in 0..MAX_HEAL_PASSES {
         let mut changed = false;
-        for &o in &absorbed {
-            let next = m.merge(conv, o);
+        for o in &absorbed {
+            let next = merge(&conv, o);
             if next != conv {
-                if m.merge(next, o) != next {
+                if merge(&next, o) != next {
                     return Verdict::Redelivery;
                 }
-                if !seen.insert(next) {
+                if seen.contains(&next) {
                     return Verdict::Cycle;
                 }
+                seen.push(next.clone());
                 conv = next;
                 changed = true;
             }

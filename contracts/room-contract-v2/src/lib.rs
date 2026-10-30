@@ -693,7 +693,8 @@ mod tests {
             vec![delta_of(&records[..half]), delta_of(&records[half..])],
         );
         assert!(matches!(&ok, Ok(b) if b.is_empty()), "{ok:?}");
-        // At most two items in turn: a third is refused, not a third run.
+        // Exactly three lists that do not fit together: refused, not a third
+        // run.
         let third = records.len() / 3;
         let r = update(
             &empty(),
@@ -701,13 +702,42 @@ mod tests {
                 delta_of(&records[..third]),
                 delta_of(&records[third..2 * third]),
                 delta_of(&records[2 * third..]),
-                delta_of(&records[..1]),
             ],
         );
         assert!(
             matches!(r, Err(ContractError::InvalidUpdateWithInfo { .. })),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn lists_that_repeat_each_other_are_one_run_however_many() {
+        // Three lists, each at the activity count and all the same: their
+        // union fits, so no refusal.
+        let records: Vec<Record> = (0..ceiling::MAX_LINKS).map(activity).collect();
+        let ok = update(
+            &empty(),
+            vec![delta_of(&records), delta_of(&records), delta_of(&records)],
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    #[test]
+    fn lists_applied_in_turn_give_the_state_they_hold_in_either_order() {
+        // Each list is a whole state plus activity for keys with no link; the
+        // union is over the activity count, so they are applied in turn.
+        let s = small();
+        let pad: Vec<Record> = (0..ceiling::MAX_LINKS).map(activity).collect();
+        let half = pad.len() / 2;
+        let list = |p: &[Record]| {
+            let mut r = s.records.clone();
+            r.extend(p.iter().cloned());
+            delta_of(&r)
+        };
+        let (a, b) = (list(&pad[..half]), list(&pad[half..]));
+        let want = st(&s).as_ref().to_vec();
+        assert_eq!(update(&empty(), vec![a.clone(), b.clone()]).unwrap(), want);
+        assert_eq!(update(&empty(), vec![b, a]).unwrap(), want);
     }
 
     #[test]
