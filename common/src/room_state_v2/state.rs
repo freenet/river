@@ -51,7 +51,7 @@ pub const MAX_RECORD_BYTES: [usize; 24] = [
 /// Groups of kinds that share a cap, with the most records of those kinds a
 /// state `f` emits can hold. Every count is a cap `f` enforces whatever the
 /// configuration (a configuration's caps are within the ceilings).
-fn kind_groups() -> [(&'static [usize], usize); 18] {
+pub(crate) fn kind_groups() -> [(&'static [usize], usize); 18] {
     use ceiling::*;
     let members = MAX_MEMBERS as usize + 1;
     let legacy = super::retain::legacy_link_cap() as usize;
@@ -122,7 +122,7 @@ pub fn within_kind_counts(records: &[Record]) -> bool {
     counts_within(&n)
 }
 
-fn counts_within(n: &[usize; 24]) -> bool {
+pub(crate) fn counts_within(n: &[usize; 24]) -> bool {
     kind_groups()
         .iter()
         .all(|(ks, max)| ks.iter().map(|&k| n[k]).sum::<usize>() <= *max)

@@ -1121,6 +1121,144 @@ fn keys_a_member_admits_share_its_subtree_s_restore_slots() {
     assert!(validate(&state.to_bytes()).0.is_ok());
 }
 
+/// Requests attached anywhere under one owner's child share its slots, however
+/// deep the link they attach to.
+#[test]
+fn requests_attached_deep_in_a_subtree_share_its_slots() {
+    let o = owner();
+    let osk = owner_key();
+    let m = skey(9, 0);
+    let m_link = link(&osk, Parent::Owner(()), 0, &m, true);
+    let m_digest = Record::Link(m_link.clone()).digest();
+    let a = skey(9, 1);
+    let a_link = link(&m, Parent::Link(m_digest), 1, &a, true);
+    let a_digest = Record::Link(a_link.clone()).digest();
+    let d = skey(9, 2);
+    let d_link = link(&a, Parent::Link(a_digest), 2, &d, true);
+    let d_digest = Record::Link(d_link.clone()).digest();
+    let mut recs = vec![
+        Record::Link(m_link),
+        Record::Link(a_link),
+        Record::Link(d_link),
+    ];
+    let mut reqs = vec![];
+    for (i, (by, digest)) in [
+        (&a, a_digest),
+        (&a, a_digest),
+        (&d, d_digest),
+        (&d, d_digest),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let x = skey(9, 10 + i as u32);
+        let fake = link(by, Parent::Link(digest), 50 + i as u32, &x, true);
+        let r = restore(vec![fake], 100 + i as u32, &x);
+        reqs.push(r.clone());
+        recs.push(r);
+    }
+    let (state, _) = normalize(&o, recs, &mut Verifier::new());
+    let kept = reqs.iter().filter(|r| state.records.contains(r)).count();
+    assert_eq!(kept, ceiling::RESTORES_PER_SUBTREE);
+}
+
+/// Requests attached to the owner have no slots of their own: five of the
+/// owner's children, each using its share with later hours, take all ten.
+/// Recorded in the accepted residuals; this pins the rule as it stands.
+#[test]
+fn five_subtrees_can_fill_the_restore_slots_before_an_owner_attached_request() {
+    let o = owner();
+    let osk = owner_key();
+    let mut recs = vec![];
+    for s in 0..5u32 {
+        let m = skey(12, s);
+        let m_link = link(&osk, Parent::Owner(()), s, &m, true);
+        let digest = Record::Link(m_link.clone()).digest();
+        recs.push(Record::Link(m_link));
+        for r in 0..2u32 {
+            let x = skey(12, 100 + s * 10 + r);
+            let fake = link(&m, Parent::Link(digest), 50 + r, &x, true);
+            recs.push(restore(vec![fake], 100 + s * 10 + r, &x));
+        }
+    }
+    let y = skey(12, 99);
+    let owner_req = restore(vec![link(&osk, Parent::Owner(()), 77, &y, true)], 1, &y);
+    recs.push(owner_req.clone());
+    let (state, _) = normalize(&o, recs, &mut Verifier::new());
+    let kept = state
+        .records
+        .iter()
+        .filter(|r| matches!(r, Record::Restore(_)))
+        .count();
+    assert_eq!(kept, ceiling::RESTORE_REQUESTS);
+    assert!(!state.records.contains(&owner_req));
+}
+
+/// A request's hours are held to 48 past its clock reference when requests
+/// compete for a subtree's slots.
+#[test]
+fn a_far_future_restore_time_is_clamped_to_its_clock_reference() {
+    let o = owner();
+    let osk = owner_key();
+    let m = skey(15, 0);
+    let m_link = link(&osk, Parent::Owner(()), 0, &m, true);
+    let digest = Record::Link(m_link.clone()).digest();
+    let clock = Record::Clock(signed(tag::CLOCK, ClockP { hours: 100 }, &osk));
+    let mut recs = vec![Record::Link(m_link), clock];
+    let request = |i: u32, hours: u32, clock_ref: u32| {
+        let x = skey(15, 10 + i);
+        let fake = link(&m, Parent::Link(digest), 50 + i, &x, true);
+        Record::Restore(signed(
+            tag::RESTORE,
+            RestoreP {
+                chain: vec![ChainLink::Accepted(fake)],
+                hours,
+                clock_ref,
+            },
+            &x,
+        ))
+    };
+    let far = request(0, 5_000, 0);
+    let near = [request(1, 90, 90), request(2, 91, 90)];
+    recs.push(far.clone());
+    recs.extend(near.iter().cloned());
+    let (state, _) = normalize(&o, recs, &mut Verifier::new());
+    assert!(near.iter().all(|r| state.records.contains(r)));
+    assert!(!state.records.contains(&far));
+}
+
+/// Each way a restore chain's links can fail to connect: each request is
+/// refused, and the same chain connected correctly is kept.
+#[test]
+fn a_restore_chain_whose_links_do_not_connect_is_refused() {
+    let o = owner();
+    let osk = owner_key();
+    let y = skey(13, 0);
+    let y_link = link(&osk, Parent::Owner(()), 0, &y, true);
+    let y_digest = Record::Link(y_link.clone()).digest();
+    let z = skey(13, 1);
+    let x = skey(13, 2);
+    let runs = |chain: Vec<AcceptedLink>| {
+        let r = restore(chain, 1, &x);
+        let (s, _) = normalize(&o, vec![r.clone()], &mut Verifier::new());
+        s.records.contains(&r)
+    };
+    let good = link(&y, Parent::Link(y_digest), 1, &x, true);
+    assert!(runs(vec![good, y_link.clone()]), "the connected chain");
+    // A link naming the owner as parent cannot have a link above it.
+    let owner_parent = link(&osk, Parent::Owner(()), 2, &x, true);
+    assert!(
+        !runs(vec![owner_parent, y_link.clone()]),
+        "owner, then more"
+    );
+    // A parent digest other than the next link's.
+    let wrong = link(&y, Parent::Link(Bytes32([9; 32])), 3, &x, true);
+    assert!(!runs(vec![wrong, y_link.clone()]), "wrong parent digest");
+    // An inviter other than the next link's member.
+    let other = link(&z, Parent::Link(y_digest), 4, &x, true);
+    assert!(!runs(vec![other, y_link.clone()]), "wrong inviter");
+}
+
 // ------------------------------------------------------- 6. roster batches
 
 /// Batches that only repeat attested entries still count against the
@@ -1183,6 +1321,150 @@ fn repeated_roster_entries_count_and_the_result_validates_at_the_ceilings() {
         max_state_bytes()
     );
     assert!(validate(&bytes).0.is_ok());
+}
+
+/// The batch count holds on its own: one-entry batches never reach the entry
+/// budget, and only the first `ROSTER_BATCHES` by seq are kept.
+#[test]
+fn one_entry_roster_batches_stop_at_the_batch_limit() {
+    let o = owner();
+    let osk = owner_key();
+    let mut recs = vec![config_record(&valid_config(1))];
+    for seq in 0..40u32 {
+        let e = RosterEntry {
+            kind: LegacyKind::Message,
+            digest: Bytes32([seq as u8; 32]),
+        };
+        recs.push(Record::Roster(signed(
+            tag::ROSTER,
+            RosterP {
+                seq,
+                batch: vec![e],
+            },
+            &osk,
+        )));
+    }
+    let (out, _) = normalize(&o, recs, &mut Verifier::new());
+    let mut seqs: Vec<u32> = out
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Roster(b) => Some(b.payload.seq),
+            _ => None,
+        })
+        .collect();
+    seqs.sort();
+    assert_eq!(
+        seqs,
+        (0..ceiling::ROSTER_BATCHES as u32).collect::<Vec<_>>()
+    );
+    assert!(validate(&out.to_bytes()).0.is_ok());
+}
+
+/// A batch over the per-batch limit is dropped whole, and one at it is kept.
+#[test]
+fn a_roster_batch_over_its_entry_limit_is_dropped() {
+    let o = owner();
+    let osk = owner_key();
+    let batch = |n: usize, seq: u32| {
+        // Three kinds, so no kind's own ceiling binds first.
+        let mut b: Vec<RosterEntry> = (0..n)
+            .map(|i| RosterEntry {
+                kind: [
+                    LegacyKind::Message,
+                    LegacyKind::DirectMessage,
+                    LegacyKind::SecretBlob,
+                ][i % 3],
+                digest: {
+                    let mut d = [seq as u8; 32];
+                    d[..4].copy_from_slice(&(i as u32).to_be_bytes());
+                    Bytes32(d)
+                },
+            })
+            .collect();
+        b.sort_by_key(|e| (e.kind, e.digest));
+        Record::Roster(signed(tag::ROSTER, RosterP { seq, batch: b }, &osk))
+    };
+    let run = |b: Record| {
+        let recs = vec![config_record(&valid_config(1)), b.clone()];
+        normalize(&o, recs, &mut Verifier::new())
+            .0
+            .records
+            .contains(&b)
+    };
+    assert!(run(batch(ceiling::ROSTER_BATCH_ENTRIES, 1)));
+    assert!(!run(batch(ceiling::ROSTER_BATCH_ENTRIES + 1, 1)));
+}
+
+/// Every kind group, one record over its count, is refused without decoding.
+#[test]
+fn every_kind_group_over_its_count_is_refused() {
+    use crate::room_state_v2::state::{counts_within, kind_groups};
+    for (ks, max) in kind_groups() {
+        let mut counts = [0usize; 24];
+        counts[ks[0]] = max;
+        assert!(counts_within(&counts), "{ks:?} at {max}");
+        counts[ks[0]] = max + 1;
+        assert!(!counts_within(&counts), "{ks:?} at {}", max + 1);
+    }
+}
+
+/// The purge reserve and pool at the real constants, with 200 members and
+/// the owner kept: reserve 200, pool 40,000. A low key's 1,000 tokens take 800
+/// of the pool, 197 recipients with 399 take 199 each until it runs out, and
+/// a 200-token envelope with the highest key is kept whatever others hold.
+#[test]
+fn the_purge_budget_at_the_real_constants() {
+    use crate::room_state_v2::encoding::Token16;
+    use crate::room_state_v2::retain::purge_token_reserve;
+    assert_eq!(ceiling::PURGE_TOKEN_BUDGET, 80_200);
+    assert_eq!(purge_token_reserve(), 200);
+    assert_eq!(80_200 - 399 * 201, 1, "399 tokens each fit 201 kept keys");
+    let o = owner();
+    let osk = owner_key();
+    let mut cfg = valid_config(1);
+    cfg.max_members = 400;
+    cfg.max_links = 400;
+    cfg.max_owner_children = 400;
+    let mut members: Vec<SigningKey> = (0..200).map(|i| skey(14, i)).collect();
+    members.sort_by_key(kof);
+    let mut recs = vec![config_record(&cfg)];
+    let mut envelopes = vec![];
+    for (i, m) in members.iter().enumerate() {
+        recs.push(Record::Link(link(
+            &osk,
+            Parent::Owner(()),
+            i as u32,
+            m,
+            true,
+        )));
+        let n = match i {
+            0 => 1_000,
+            199 => 200,
+            _ => 399,
+        };
+        let p = PurgeP {
+            recipient: kof(m),
+            version: 1,
+            purged: (0..n as u32)
+                .map(|t| {
+                    let mut b = [0u8; 16];
+                    b[..4].copy_from_slice(&t.to_be_bytes());
+                    Token16(b)
+                })
+                .collect(),
+        };
+        let r = Record::Purge(signed(tag::PURGE, p, m));
+        envelopes.push(r.clone());
+        recs.push(r);
+    }
+    let (out, _) = normalize(&o, recs, &mut Verifier::new());
+    let held = |i: usize| out.records.contains(&envelopes[i]);
+    assert!(held(0), "the lowest key takes what it asks from the pool");
+    assert!(held(199), "within the reserve");
+    // Pool 40,000 - 800 = 39,200, at 199 each: 196 of the 198, in key order.
+    assert!((1..=196).all(held));
+    assert!(!(197..=198).any(held));
 }
 
 // ------------------------------------------- 7. counts before any decode

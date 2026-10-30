@@ -537,3 +537,94 @@ fn rostered_members_rank_first_for_the_member_cap() {
     want.sort();
     assert_eq!(r.0.members, want);
 }
+
+/// Tokens beyond the reserve go to recipients in key order: of two whose
+/// extra tokens compete for a pool that fits one, the lower key wins.
+#[test]
+fn the_purge_pool_goes_in_key_order() {
+    use super::builder::key;
+    let mut rs = [2usize, 3];
+    rs.sort_by_key(|&r| key(r));
+    let b = purge_room(&[(rs[0], 1, 2), (rs[1], 1, 2)]);
+    // 5 kept keys, reserve 1, pool 1.
+    let r = under_budget(&b, 6, 1);
+    assert!(kept(&r, &format!("purge(k{}", rs[0])));
+    assert!(!kept(&r, &format!("purge(k{}", rs[1])));
+}
+
+/// One activity record beyond the clock's 24-hour allowance does not count.
+#[test]
+fn activity_more_than_a_day_past_the_clock_is_dropped() {
+    let mut b = super::builder::Builder::new();
+    b.invitation(1, "O", 1, 0);
+    b.acc("A1", 1, 1);
+    b.invitation(2, "O", 2, 0);
+    b.acc("A2", 2, 2);
+    b.clock(10);
+    b.act(1, 34);
+    b.act(2, 35);
+    b.cfg(0, super::builder::with(|c| c.max_members = 5));
+    let b = b.finish();
+    let r = f_without(&b, &[]);
+    assert!(kept(&r, "act(k1@34)"));
+    assert!(!kept(&r, "act(k2@35)"));
+}
+
+/// A member ban's time is held to 48 hours past its clock reference when
+/// bans compete: a far-future time does not win a ban slot.
+#[test]
+fn a_far_future_member_ban_time_is_clamped_to_its_clock_reference() {
+    let mut b = super::builder::Builder::new();
+    for (i, k) in [(1u8, 1usize), (2, 2), (3, 3)] {
+        b.invitation(i, "O", i as u32, 0);
+        b.acc(&format!("A{k}"), i, k);
+    }
+    b.clock(100);
+    b.act(1, 100);
+    b.act(2, 100);
+    b.mban("FAR", "A1", super::builder::T::Key(3), 5_000, 0, false);
+    b.mban("NEAR", "A2", super::builder::T::Key(3), 90, 90, false);
+    b.cfg(
+        0,
+        super::builder::with(|c| {
+            c.max_members = 5;
+            c.max_member_bans = 1;
+            c.ban_window = 200;
+        }),
+    );
+    let b = b.finish();
+    let r = f_without(&b, &[]);
+    assert!(kept(&r, "NEAR") && !kept(&r, "FAR"));
+}
+
+/// Legacy restore requests attach to the canonical link of the signer's
+/// inviter, so they share that subtree's slots as v2 ones do.
+#[test]
+fn legacy_restore_requests_share_their_subtree_s_slots() {
+    use crate::room_state_v2::retain::test_cap::{self, Limits};
+    let mut b = super::builder::Builder::new();
+    b.leg("G1", 1, 0);
+    b.leg("G2", 2, 1);
+    b.leg("G3", 3, 1);
+    b.roster(1, &["G1"]);
+    b.restore("G2", 1);
+    b.restore("G3", 2);
+    b.cfg(
+        0,
+        super::builder::with(|c| {
+            c.window_open = false;
+            c.max_members = 5;
+        }),
+    );
+    let b = b.finish();
+    let r = f_without(&b, &[]);
+    assert!(kept(&r, "restore(G2") && kept(&r, "restore(G3"));
+    test_cap::set_limits(Limits {
+        subtree_restores: Some(1),
+        ..Limits::default()
+    });
+    let r = f_without(&b, &[]);
+    test_cap::set_limits(Limits::default());
+    assert!(kept(&r, "restore(G3"), "the later hours first");
+    assert!(!kept(&r, "restore(G2"), "the subtree's one slot is taken");
+}

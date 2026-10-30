@@ -55,7 +55,7 @@ pub struct Real {
     pub u: Universe,
     cap: Option<u32>,
     /// The purge token budget `f` runs under (`None`: the ceiling).
-    purge: Option<usize>,
+    purge: Option<(usize, usize)>,
     /// `f` calls checked against the universe, and those that disagreed.
     pub f_checked: AtomicU64,
     pub f_differs: AtomicU64,
@@ -77,7 +77,7 @@ impl Real {
         name: &str,
         mut b: Builder,
         cap: Option<u32>,
-        purge: Option<usize>,
+        purge: Option<(usize, usize)>,
         per_kind: usize,
         rng: &mut Rng,
     ) -> Real {
@@ -97,7 +97,8 @@ impl Real {
             b,
             test_cap::Limits {
                 cap,
-                purge,
+                purge: purge.map(|p| p.0),
+                reserve: purge.map(|p| p.1),
                 ..Default::default()
             },
         );
@@ -171,10 +172,12 @@ impl Real {
     /// Runs `run` under this model's legacy link cap and purge budget.
     fn capped<T>(&self, run: impl FnOnce() -> T) -> T {
         test_cap::set(self.cap);
-        test_cap::set_purge(self.purge);
+        test_cap::set_purge(self.purge.map(|p| p.0));
+        test_cap::set_reserve(self.purge.map(|p| p.1));
         let out = run();
         test_cap::set(None);
         test_cap::set_purge(None);
+        test_cap::set_reserve(None);
         out
     }
 
@@ -462,7 +465,7 @@ fn run_model(
 /// universes.
 fn run_real(
     cap: Option<u32>,
-    purge: Option<usize>,
+    purge: Option<(usize, usize)>,
     fams: u64,
     pool: usize,
     pairs: u64,
@@ -515,6 +518,18 @@ fn run_real(
         );
     }
     let seed0 = env("RIVER_V2_SEED", 36);
+    if purge.is_some() {
+        let mut rng = Rng(seed0);
+        let m = Real::new(
+            "real purge rule family",
+            super::rule_families::purge(),
+            cap,
+            purge,
+            1,
+            &mut rng,
+        );
+        run_model(&m, seed0 * 31, pool, pairs, triples, samples, &mut out);
+    }
     for fi in 0..fams {
         let b = match purge {
             Some(_) => purge_family(seed0, fi),
@@ -645,10 +660,32 @@ fn the_real_path_obeys_the_laws_with_forged_records_at_size() {
 /// record and agrees with the universe's f.
 #[test]
 fn the_real_path_obeys_the_laws_under_a_binding_purge_budget() {
+    real_path_under_a_purge_budget(2, 0);
+}
+
+/// The budget and reserve of decision (t), scaled to the universes' kept
+/// keys, so an envelope within the reserve and one drawing on the pool both
+/// pass through `normalize`, `merge` and `apply_delta`.
+#[test]
+fn the_real_path_obeys_the_laws_under_a_purge_reserve() {
+    real_path_under_a_purge_budget(4, 1);
+}
+
+fn real_path_under_a_purge_budget(budget: usize, reserve: usize) {
     let fams = env("RIVER_V2_REAL_FAMS", 3);
+    // The budget decides something on the rule family this run includes.
+    let b = super::rule_families::purge();
+    let unlimited = retain(&owner(), &b.recs, &mut Verifier::new()).keep;
+    test_cap::set_purge(Some(budget));
+    test_cap::set_reserve(Some(reserve));
+    let limited = retain(&owner(), &b.recs, &mut Verifier::new()).keep;
+    test_cap::set_purge(None);
+    test_cap::set_reserve(None);
+    let binds = limited != unlimited;
+    assert!(binds, "budget {budget}, reserve {reserve} decided nothing");
     let r = run_real(
         None,
-        Some(2),
+        Some((budget, reserve)),
         fams,
         env("RIVER_V2_REAL_POOL", 40) as usize,
         env("RIVER_V2_REAL_PAIRS", 64),
@@ -658,5 +695,5 @@ fn the_real_path_obeys_the_laws_under_a_binding_purge_budget() {
     assert!(!r.counts.bad(), "a law failed on the real path");
     assert_eq!(r.unclean, 0, "the real f differs from the universe's");
     assert_eq!(r.forged_fails, 0, "a forged record changed an outcome");
-    assert!(r.models as u64 == fams && r.counts.pairs > 0);
+    assert!(r.models as u64 == fams + 1 && r.counts.pairs > 0);
 }

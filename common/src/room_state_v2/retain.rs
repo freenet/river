@@ -1085,6 +1085,8 @@ pub fn retain_refs(
             // they are lawful as the total cap is.
             if l.legacy
                 && (if l.rostered {
+                    // Cannot bind: the roster holds at most `legacy_cap` link
+                    // entries (`roster_ceiling`). It states the cap here.
                     rostered_admitted >= legacy_cap
                 } else {
                     unrostered_admitted >= unrostered_budget

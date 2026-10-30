@@ -119,7 +119,7 @@ fn member_cap() -> Builder {
 
 /// Three members, three DMs, and envelopes of 0 to 3 tokens at two versions
 /// (v2 and legacy), so a newer envelope can be refused and an older one kept.
-fn purge() -> Builder {
+pub(super) fn purge() -> Builder {
     let mut b = Builder::new();
     for (i, k) in [(1u8, 1usize), (2, 2), (3, 3)] {
         b.invitation(i, "O", i as u32, 0);
