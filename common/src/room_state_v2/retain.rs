@@ -1431,9 +1431,29 @@ pub fn retain_refs(
             best.entry(adm[a].member).or_insert(a);
         }
     }
+    // Members with a rostered link come first, at their own depth: a member
+    // the owner attests cannot lose its entry to keys it did not attest.
+    let attested_member: HashSet<Key> = adm
+        .iter()
+        .enumerate()
+        .filter(|(a, l)| {
+            !removed[*a]
+                && matches!(recs[l.rec], Record::LegacyLink(_))
+                && rostered(LegacyKind::Link, &l.digest)
+        })
+        .map(|(_, l)| l.member)
+        .collect();
+    const NOT_ROSTERED: u32 = 1 << 20;
     let mut cands: Vec<(u32, Reverse<u32>, usize, Key)> = best
         .iter()
-        .map(|(k, &a)| (adm[a].depth, Reverse(rank_act(k)), a, *k))
+        .map(|(k, &a)| {
+            let tier = if attested_member.contains(k) {
+                0
+            } else {
+                NOT_ROSTERED
+            };
+            (tier + adm[a].depth, Reverse(rank_act(k)), a, *k)
+        })
         .collect();
     cands.sort();
     #[cfg(test)]

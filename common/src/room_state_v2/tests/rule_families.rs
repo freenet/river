@@ -89,6 +89,34 @@ fn forged_link() -> Builder {
     b.finish()
 }
 
+/// A rostered chain and shallower, more active members, under a member cap
+/// below their number: rostered members take the slots first.
+fn member_cap() -> Builder {
+    let cfg = |n| {
+        with(|c| {
+            c.window_open = true;
+            c.max_members = n;
+        })
+    };
+    let mut b = Builder::new();
+    b.leg("G1", 1, 0);
+    b.leg("G2", 2, 1);
+    b.leg("G3", 3, 2);
+    b.roster(1, &["G1", "G2", "G3"]);
+    for (inv, k) in [(1u8, 4usize), (2, 5)] {
+        b.invitation(inv, "O", inv as u32, 0);
+        b.acc(&format!("A{k}"), inv, k);
+        b.act(k, 5);
+    }
+    b.act(3, 1);
+    b.msg(3, 1, 0);
+    b.msg(4, 2, 0);
+    b.oban("O2", T::Key(2), 1, 0);
+    b.cfg(0, cfg(2));
+    b.cfg(1, cfg(3));
+    b.finish()
+}
+
 fn families() -> Vec<RuleFamily> {
     vec![
         RuleFamily {
@@ -101,6 +129,12 @@ fn families() -> Vec<RuleFamily> {
                 ..Limits::default()
             },
             binds: true,
+        },
+        RuleFamily {
+            name: "member cap",
+            build: member_cap,
+            limits: Limits::default(),
+            binds: false,
         },
         RuleFamily {
             name: "forged link",

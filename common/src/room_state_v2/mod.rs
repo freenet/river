@@ -177,7 +177,9 @@
 //!   for it cannot take over its subtree. The rule reads that chain, not
 //!   the presence of a rostered link, so it stays lawful where a ban breaks
 //!   the chain. A member with no attested chain is not protected this way
-//!   while the window is open.
+//!   while the window is open. A member with a rostered link ranks ahead of
+//!   every other for the member cap, at its own depth, so it cannot lose its
+//!   entry to keys the owner did not attest.
 //! - **(r) Deputies at migration.** The converting owner confirms the
 //!   deputy list. [`convert::deputy_candidates`] proposes the owner's own v1
 //!   deputies and those listed by current, unbanned members (who acted only

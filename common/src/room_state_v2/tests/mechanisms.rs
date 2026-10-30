@@ -510,3 +510,30 @@ fn a_forged_link_cannot_take_over_a_rostered_members_subtree() {
     let without = f_without(&b, &["G3"]);
     assert!(kept(&without, "F3"));
 }
+
+/// Member slots: a member with a rostered link ranks ahead of any other,
+/// however shallow and active, so a member the owner attests cannot lose its
+/// entry (and with it its messages, DMs and blobs) to new keys.
+#[test]
+fn rostered_members_rank_first_for_the_member_cap() {
+    use super::builder::key;
+    let cfg = super::builder::with(|c| {
+        c.window_open = true;
+        c.max_members = 3;
+    });
+    let mut b = super::builder::Builder::new();
+    b.leg("G1", 1, 0);
+    b.leg("G2", 2, 1);
+    b.leg("G3", 3, 2);
+    b.roster(1, &["G1", "G2", "G3"]);
+    for (inv, k) in [(1u8, 4usize), (2, 5), (3, 6)] {
+        b.invitation(inv, "O", inv as u32, 0);
+        b.acc(&format!("A{k}"), inv, k);
+        b.act(k, 5);
+    }
+    b.cfg(0, cfg);
+    let r = f_without(&b.finish(), &[]);
+    let mut want = vec![key(1), key(2), key(3)];
+    want.sort();
+    assert_eq!(r.0.members, want);
+}
