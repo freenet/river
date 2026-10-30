@@ -1491,23 +1491,31 @@ pub fn retain_refs(
             legacy_tokens.insert(i, v.tokens);
         }
     }
-    // Admitted per recipient in key order, newest first, within a budget of
-    // tokens across all kept envelopes: an envelope that does not fit is
-    // skipped and the recipient's next older one is tried (decision (t)).
+    // Per recipient, its newest envelope whose signature checks; then those
+    // admitted across recipients by (token count, key) within a budget of
+    // tokens across all kept envelopes, so the budget binds on the largest
+    // envelopes and a key ground to sort low gains nothing. A recipient
+    // whose envelope does not fit keeps none (decision (t)).
     pe.sort();
-    let budget = purge_token_budget();
-    let mut spent = 0usize;
-    let mut purged: HashMap<Key, HashSet<[u8; 16]>> = HashMap::new();
+    let mut newest: Vec<(usize, Key, usize)> = vec![];
     for (k, _, _, i) in pe {
-        if purged.contains_key(&k) {
+        if newest.last().is_some_and(|x| x.1 == k) || !c.ok(i) {
             continue;
         }
         let n = match &recs[i] {
             Record::Purge(s) => s.payload.purged.len(),
             _ => legacy_tokens[&i].len(),
         };
-        if spent + n > budget || !c.ok(i) {
-            continue;
+        newest.push((n, k, i));
+    }
+    newest.sort();
+    let budget = purge_token_budget();
+    let mut spent = 0usize;
+    let mut purged: HashMap<Key, HashSet<[u8; 16]>> = HashMap::new();
+    for (n, k, i) in newest {
+        if spent + n > budget {
+            // Every later envelope is at least as large.
+            break;
         }
         spent += n;
         let tokens: HashSet<[u8; 16]> = match &recs[i] {

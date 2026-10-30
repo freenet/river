@@ -1005,9 +1005,13 @@ fn delta_cost_is_bounded(caps: Caps) {
     let (b, _) = largest_state(caps, 1);
     let mut v = Verifier::new();
     let next = apply_delta(&o, &a, b.records.clone(), &mut v).unwrap();
+    // Decision (n): the records kept, plus the purge recipients whose
+    // envelope was checked and did not fit the budget (decision (t): at most
+    // one per kept key, MAX_MEMBERS + 1), plus one.
+    let purge_bound = ceiling::MAX_MEMBERS as usize + 1;
     assert!(
-        v.checks <= next.records.len() + 1,
-        "checks {} > kept {} + 1",
+        v.checks <= next.records.len() + purge_bound + 1,
+        "checks {} > kept {} + {purge_bound} + 1",
         v.checks,
         next.records.len()
     );
@@ -1021,14 +1025,15 @@ fn delta_cost_is_bounded(caps: Caps) {
 }
 
 #[test]
-fn applying_the_second_variant_costs_at_most_the_kept_records_plus_one_scaled() {
+fn applying_the_second_variant_costs_at_most_the_kept_records_plus_the_purge_bound_scaled() {
     delta_cost_is_bounded(Caps::ceilings().scaled(400));
     delta_cost_is_bounded(Caps::ceilings_legacy().scaled(400));
 }
 
 #[test]
 #[ignore = "builds and verifies the full ceiling states (slow in debug); the scaled test covers CI"]
-fn applying_the_second_variant_costs_at_most_the_kept_records_plus_one_at_the_ceilings() {
+fn applying_the_second_variant_costs_at_most_the_kept_records_plus_the_purge_bound_at_the_ceilings()
+{
     delta_cost_is_bounded(Caps::ceilings());
     delta_cost_is_bounded(Caps::ceilings_legacy());
 }

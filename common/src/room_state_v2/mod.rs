@@ -126,7 +126,8 @@
 //!   [`apply_delta`] then refuse at the first signature check that fails:
 //!   a fixpoint has none, and a generated delta has none. A record `f`
 //!   drops without examining it is dropped unchecked, so the signature
-//!   checks of one call are at most the records kept plus one.
+//!   checks of one call are at most the records kept plus one, plus the
+//!   purge recipients whose envelope does not fit the budget (t).
 //! - **(o) Migrated quotas.** [`ConfigurationV2::from_v1`], the starting
 //!   point of the configuration a converting owner signs, keeps the default
 //!   link quotas (2 links per member, 50 children per link) and sets
@@ -184,14 +185,21 @@
 //! - **(t) Purge token budget.** A purge envelope holds up to 1,000 tokens,
 //!   as in v1, and the envelopes kept hold at most
 //!   [`config::ceiling::PURGE_TOKEN_BUDGET`] (80,200, 200 per member at the
-//!   member ceiling) together. Envelopes are admitted per recipient in key
-//!   order, newest first; one that does not fit the budget left is skipped
-//!   and the recipient's next older envelope is tried. A group limit of the
-//!   greedy chooser over the envelopes' own fields and L4, so it is lawful
-//!   as the other caps are. 1,000 tokens for every member would double the
-//!   largest state and add about 0.5 s to the worst merge; real rooms are
-//!   far below the budget (the Official room: 19 envelopes of 1 to 40
-//!   tokens). Ian, 2026-10-29.
+//!   member ceiling) together (Ian, 2026-10-29). For each recipient the
+//!   newest envelope whose signature checks is its candidate; candidates
+//!   are admitted by (token count, recipient key) within the budget, so the
+//!   budget binds on the largest envelopes and a key ground to sort low
+//!   gains nothing. A recipient whose envelope does not fit keeps none: an
+//!   older envelope is never kept in its place (a valid state holds one
+//!   envelope per recipient, so there would be none to fall back to). A
+//!   group limit of the greedy chooser over the envelopes' own fields and
+//!   L4, so it is lawful as the other caps are. The candidates' signatures
+//!   are checked before the budget is applied, so the checks of one call
+//!   are at most the records kept plus the recipients whose envelope does
+//!   not fit (at most `MAX_MEMBERS + 1`), plus one. 1,000 tokens for every
+//!   member would double the largest state and add about 0.5 s to the worst
+//!   merge; real rooms are far below the budget (the Official room: 19
+//!   envelopes of 1 to 40 tokens).
 
 //! Not yet wired into the room contract; compiled only for tests and under
 //! the `room-state-v2` feature, so the deployed contract's WASM is unchanged.

@@ -53,12 +53,8 @@ impl Universe {
 
     /// As [`Self::with_cap`], memoizing `f` instead of precomputing it for
     /// every subset, for callers that evaluate few subsets.
-    pub fn lazy(name: &str, b: Builder, cap: Option<u32>) -> Universe {
-        Self::build(name, b, Mutant::None, cap, None, false)
-    }
-
-    /// As [`Self::lazy`], with `f` also run under the purge token budget
-    /// `purge` (`None`: the ceiling).
+    /// `purge` is the purge token budget `f` runs under (`None`: the
+    /// ceiling).
     pub fn lazy_with(name: &str, b: Builder, cap: Option<u32>, purge: Option<usize>) -> Universe {
         Self::build(name, b, Mutant::None, cap, purge, false)
     }

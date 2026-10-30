@@ -567,21 +567,32 @@ fn purge_recipient(m: &Universe, i: usize) -> Option<usize> {
     rest.split(' ').next()?.parse().ok()
 }
 
-/// Whether the budget made `f` fall back: for some recipient, `capped`
-/// keeps an envelope other than the one `free` keeps for it (the newest
-/// valid one).
-fn fell_back(capped: &Universe, fb: S, ff: S) -> bool {
+/// Whether `capped` keeps, for some recipient, an envelope other than the
+/// one `free` keeps for it (its newest valid one): the budget may refuse a
+/// recipient's envelope, never keep an older one in its place.
+fn kept_older(capped: &Universe, fb: S, ff: S) -> bool {
     bits(fb).any(|i| {
         let r = purge_recipient(capped, i);
         r.is_some() && bits(ff).any(|j| j != i && purge_recipient(capped, j) == r)
     })
 }
 
+/// The envelopes `free` keeps whose recipient `capped` keeps none for: the
+/// ones the budget refused.
+fn refused(capped: &Universe, fb: S, ff: S) -> Vec<usize> {
+    bits(ff)
+        .filter(|&j| {
+            let r = purge_recipient(capped, j);
+            r.is_some() && !bits(fb).any(|i| purge_recipient(capped, i) == r)
+        })
+        .collect()
+}
+
 /// A random L5 universe plus, for one recipient, three more DMs to it and a
 /// newer envelope (2 or 3 of their tokens) over an older one (0 or 1), v2 or
 /// legacy each: under a budget of 1 or 2 the newer one often does not fit,
-/// and the older one is kept in its place.
-fn purge_family(seed0: u64, fi: u64) -> super::builder::Builder {
+/// and the recipient then keeps none.
+pub(super) fn purge_family(seed0: u64, fi: u64) -> super::builder::Builder {
     let mut b = rand_family(seed0, fi, Gen::L5);
     let mut rng = Rng(seed0 * 31 + fi);
     let r = 1 + rng.below(4) as usize;
@@ -609,7 +620,9 @@ fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: 
     let mut tot = Counts::default();
     let mut bound_n = 0u64;
     let mut over = 0u64;
-    let mut fallback = 0u64;
+    let mut older = 0u64;
+    let mut refusals = 0u64;
+    let mut out_of_order = 0u64;
     for fi in 0..fams {
         let m = Universe::with_purge_budget(
             &format!("purge budget {budget} / univ{fi}"),
@@ -631,7 +644,17 @@ fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: 
             // Never over the budget; and it decided the outcome somewhere.
             over += (tokens(&m, fb) > budget) as u64;
             bound_n += (purges(&m, fb) < purges(&free, ff) || fb != ff) as u64;
-            fallback += fell_back(&m, fb, ff) as u64;
+            older += kept_older(&m, fb, ff) as u64;
+            // The budget binds on the largest envelopes: every one kept is
+            // no larger than any one refused.
+            let r = refused(&m, fb, ff);
+            refusals += !r.is_empty() as u64;
+            if let Some(smallest) = r.iter().map(|&j| tokens(&m, 1u128 << j)).min() {
+                out_of_order += bits(fb)
+                    .filter(|&i| purge_recipient(&m, i).is_some())
+                    .any(|i| tokens(&m, 1u128 << i) > smallest)
+                    as u64;
+            }
         }
     }
     println!(
@@ -639,7 +662,7 @@ fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: 
         row(&format!("purge budget {budget} TOTAL"), "random", &tot)
     );
     println!("random subsets where the purge budget of {budget} decided f: {bound_n}");
-    println!("random subsets where it kept a recipient's older envelope: {fallback}");
+    println!("random subsets where it refused a recipient's envelope: {refusals}");
     assert!(
         !tot.bad(),
         "a law failed under the purge token budget {budget}"
@@ -651,8 +674,16 @@ fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: 
         "the purge budget of {budget} never decided f in a random universe"
     );
     assert!(
-        fallback > 0,
-        "the purge budget of {budget} never made f keep a recipient's older envelope"
+        refusals > 0,
+        "the purge budget of {budget} never refused an envelope"
+    );
+    assert_eq!(
+        older, 0,
+        "an older envelope was kept in place of a refused one"
+    );
+    assert_eq!(
+        out_of_order, 0,
+        "an envelope larger than a refused one was kept"
     );
 }
 

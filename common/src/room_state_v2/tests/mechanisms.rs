@@ -72,47 +72,74 @@ fn the_clock_lapses_an_inactive_issuers_member_ban() {
     assert!(kept(&all, "L3") && kept(&no_clock8, "L3"));
 }
 
-/// The room-wide purge token budget (decision (t)): a recipient's newest
-/// envelope that does not fit the budget left is skipped, and its next older
-/// envelope that fits is kept in its place.
-#[test]
-fn a_purge_envelope_over_the_budget_falls_back_to_the_older_one() {
-    use crate::room_state_v2::retain::test_cap;
-    let cfg = super::builder::with(|c| c.max_dms = 2);
+/// Members k1 to k4, three DMs among them (their tokens make envelopes of
+/// 1 to 3 tokens), and the envelopes `purges` lists: (recipient, version,
+/// how many of the DMs' tokens).
+fn purge_room(purges: &[(usize, u64, usize)]) -> super::builder::Builder {
     let mut b = super::builder::Builder::new();
-    for (i, k) in [(1u8, 1usize), (2, 2), (3, 3)] {
+    for (i, k) in [(1u8, 1usize), (2, 2), (3, 3), (4, 4)] {
         b.invitation(i, "O", i as u32, 0);
         b.acc(&format!("A{k}"), i, k);
+        b.act(k, 1);
     }
-    b.act(1, 1);
-    b.act(2, 1);
-    b.act(3, 1);
-    b.dm(1, 3, 1, 0);
+    b.dm(1, 2, 1, 0);
     b.dm(2, 3, 2, 0);
+    b.dm(3, 4, 3, 0);
     let dms = b.dm_indexes();
-    b.purge(3, 2, &dms);
-    b.purge(3, 1, &dms[..1]);
-    b.cfg(0, cfg);
-    let b = b.finish();
-    let run = |budget: Option<usize>| {
-        test_cap::set_purge(budget);
-        let r = f_without(&b, &[]);
-        test_cap::set_purge(None);
-        r
-    };
-    // Without a binding budget the newest envelope (both DMs) is kept.
-    let free = run(None);
-    assert!(kept(&free, "purge(k3 v2") && !kept(&free, "purge(k3 v1"));
-    assert!(!kept(&free, "dm(k1,k3") && !kept(&free, "dm(k2,k3"));
-    // With one token left, the two-token envelope does not fit: the older
-    // one-token envelope is kept, and only its DM is purged.
-    let one = run(Some(1));
-    assert!(!kept(&one, "purge(k3 v2") && kept(&one, "purge(k3 v1"));
-    assert!(!kept(&one, "dm(k1,k3") && kept(&one, "dm(k2,k3"));
-    // With none, neither fits and both DMs stay.
-    let none = run(Some(0));
-    assert!(!kept(&none, "purge(k3"));
-    assert!(kept(&none, "dm(k1,k3") && kept(&none, "dm(k2,k3"));
+    for &(r, v, n) in purges {
+        b.purge(r, v, &dms[..n]);
+    }
+    b.cfg(
+        0,
+        super::builder::with(|c| {
+            c.max_dms = 3;
+            c.max_members = 5;
+        }),
+    );
+    b.finish()
+}
+
+fn under_budget(b: &super::builder::Builder, budget: usize) -> (Retained, Vec<String>) {
+    use crate::room_state_v2::retain::test_cap;
+    test_cap::set_purge(Some(budget));
+    let r = f_without(b, &[]);
+    test_cap::set_purge(None);
+    r
+}
+
+/// The room-wide purge token budget (decision (t)): envelopes are admitted
+/// smallest first, so the largest is refused and the rest fit; a refused
+/// recipient keeps none, never an older envelope in its place.
+#[test]
+fn the_largest_purge_envelope_is_refused_and_the_rest_fit() {
+    // k2: 1 token, k3: 2 tokens, k4: 3 tokens (newest), over an older
+    // 1-token envelope of k4's.
+    let b = purge_room(&[(2, 1, 1), (3, 1, 2), (4, 2, 3), (4, 1, 1)]);
+    let r = under_budget(&b, 3);
+    assert!(kept(&r, "purge(k2") && kept(&r, "purge(k3"));
+    assert!(!kept(&r, "purge(k4"), "neither of k4's envelopes is kept");
+    // A budget that fits everything keeps each recipient's newest.
+    let r = under_budget(&b, 6);
+    assert!(kept(&r, "purge(k4 v2") && !kept(&r, "purge(k4 v1"));
+}
+
+/// A recipient whose key sorts first gains nothing: its large envelope is
+/// refused in favour of smaller ones of higher keys.
+#[test]
+fn a_low_key_with_a_large_purge_envelope_does_not_displace_smaller_ones() {
+    use super::builder::key;
+    // The recipient among k2..k4 whose key sorts lowest holds the 3-token
+    // envelope; the other two hold 1 and 2 tokens.
+    let mut rs = [2usize, 3, 4];
+    rs.sort_by_key(|&r| key(r));
+    let b = purge_room(&[(rs[0], 1, 3), (rs[1], 1, 1), (rs[2], 1, 2)]);
+    let r = under_budget(&b, 3);
+    assert!(
+        !kept(&r, &format!("purge(k{}", rs[0])),
+        "the low key's large envelope"
+    );
+    assert!(kept(&r, &format!("purge(k{}", rs[1])));
+    assert!(kept(&r, &format!("purge(k{}", rs[2])));
 }
 
 /// Decision (o): every link but a rostered legacy one shares `max_links`
