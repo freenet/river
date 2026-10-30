@@ -240,3 +240,26 @@ against 1.529 s. The codec's cost is serde walking each v1 byte vector
 element by element (decode, and the re-encode the canonical check needs),
 not the second encode of the signed field or its allocation. The code is on
 the branch `exp/room-state-v2-signed-span`.
+
+## The purge token budget, 2026-10-30
+
+With 1,000-token purge envelopes in a room-wide budget of 80,200 tokens
+(decision (t)), the largest states are 4.30 MB (`ceilings`) and 5.86 MB
+(`legacy`), against 9.76 MB and 11.32 MB with 1,000 tokens in every envelope
+and no budget (2026-10-29). Five runs each, minimum to maximum, load average
+5.3 to 5.9 (`verify_strict` 0.250 ms per signature):
+
+| state | records | signatures | bytes | validate | update | merge |
+|---|---|---|---|---|---|---|
+| ceilings | 3,730 | 5,038 | 4.30 MB | 1.37-1.48 s | 0.79-0.86 s | 1.53-1.57 s |
+| legacy | 3,730 | 4,438 | 5.86 MB | 1.45-1.51 s | 1.13-1.31 s | 1.75-1.78 s |
+| official | 1,438 | 1,860 | 0.97 MB | 0.49-0.55 s | 0.25-0.27 s | 0.52-0.59 s |
+| oshaped | 1,326 | 1,326 | 0.86 MB | 0.38-0.39 s | 0.39-0.40 s | 0.39-0.40 s |
+| adv | 3,730 held, 3,464 in the update | | 5.86 MB | | 1.10-1.15 s | 1.72-1.77 s |
+
+`CHECK_SECS=2.5` on all five: passed. Before the budget, at
+load average about 6 (2026-10-29, `verify_strict` 0.235 ms): ceilings
+validate 1.75-1.88 s and merge 2.15-2.19 s, legacy validate 1.59-1.61 s and
+merge 1.99-2.18 s. Under heavier load the check fails: at load average 10
+to 11 (0.380 ms per signature) `adv` merged in 2.25-2.64 s, and at 13 to 18
+(0.432 ms) `ceilings` merged in 2.14-4.21 s and validated in 1.94-4.03 s.
