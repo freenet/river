@@ -117,8 +117,119 @@ fn member_cap() -> Builder {
     b.finish()
 }
 
+/// Three members, three DMs, and envelopes of 0 to 3 tokens at two versions
+/// (v2 and legacy), so a newer envelope can be refused and an older one kept.
+fn purge() -> Builder {
+    let mut b = Builder::new();
+    for (i, k) in [(1u8, 1usize), (2, 2), (3, 3)] {
+        b.invitation(i, "O", i as u32, 0);
+        b.acc(&format!("A{k}"), i, k);
+    }
+    b.dm(1, 2, 1, 0);
+    b.dm(2, 3, 2, 0);
+    b.dm(3, 1, 3, 0);
+    let dms = b.dm_indexes();
+    b.purge(1, 2, &dms);
+    b.purge(1, 1, &dms[..1]);
+    b.purge(2, 1, &dms[..2]);
+    b.legacy_purge(3, 2, &dms);
+    b.legacy_purge(3, 1, &[]);
+    b.cfg(
+        0,
+        with(|c| {
+            c.window_open = true;
+            c.max_dms = 3;
+            c.max_members = 3;
+        }),
+    );
+    b.finish()
+}
+
+/// A rostered chain under a `max_links` that leaves one or two slots for
+/// other links, which a member at depth 1 and its children compete for.
+fn link_reservation() -> Builder {
+    let cfg = |n| {
+        with(|c| {
+            c.window_open = true;
+            c.max_members = 7;
+            c.max_children = 9;
+            c.max_depth = 8;
+            c.max_links = n;
+        })
+    };
+    let mut b = Builder::new();
+    b.leg("G1", 1, 0);
+    b.leg("G2", 2, 1);
+    b.leg("G3", 3, 2);
+    b.roster(1, &["G1", "G2", "G3"]);
+    b.invitation(1, "O", 1, 0);
+    b.acc("A4", 1, 4);
+    b.invitation(2, "A4", 1, 0);
+    b.acc("C5", 2, 5);
+    b.invitation(3, "A4", 2, 0);
+    b.acc("C6", 3, 6);
+    b.leg("U7", 7, 4);
+    b.cfg(0, cfg(4));
+    b.cfg(1, cfg(5));
+    b.finish()
+}
+
+/// Roster batches that repeat entries and overrun the batch and entry limits,
+/// with the window closed so what the roster holds decides what counts.
+fn roster_budget() -> Builder {
+    let cfg = with(|c| {
+        c.window_open = false;
+        c.max_members = 5;
+    });
+    let mut b = Builder::new();
+    b.leg("G1", 1, 0);
+    b.leg("G2", 2, 0);
+    b.leg("G3", 3, 0);
+    b.leg("G4", 4, 0);
+    b.roster(1, &["G1", "G2"]);
+    b.roster(2, &["G2", "G3"]);
+    b.roster(3, &["G3"]);
+    b.roster(4, &["G4"]);
+    b.cfg(0, cfg);
+    b.finish()
+}
+
+fn purge_family(budget: usize, reserve: usize) -> RuleFamily {
+    RuleFamily {
+        name: Box::leak(format!("purge {budget}/{reserve}").into_boxed_str()),
+        build: purge,
+        limits: Limits {
+            purge: Some(budget),
+            reserve: Some(reserve),
+            ..Limits::default()
+        },
+        binds: true,
+    }
+}
+
 fn families() -> Vec<RuleFamily> {
     vec![
+        purge_family(1, 0),
+        purge_family(2, 0),
+        purge_family(4, 1),
+        purge_family(5, 1),
+        purge_family(6, 1),
+        RuleFamily {
+            name: "link reservation",
+            build: link_reservation,
+            limits: Limits::default(),
+            binds: false,
+        },
+        RuleFamily {
+            name: "roster budget",
+            build: roster_budget,
+            limits: Limits {
+                roster_batches: Some(3),
+                roster_entries: Some(4),
+                ..Limits::default()
+            },
+            binds: true,
+        },
         RuleFamily {
             name: "subtrees",
             build: subtrees,
