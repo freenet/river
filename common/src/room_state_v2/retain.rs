@@ -221,17 +221,35 @@ pub fn legacy_link_cap() -> u32 {
     ceiling::MAX_LEGACY_LINKS
 }
 
-/// A test override of the legacy link cap (per thread).
+/// The room-wide purge token budget: [`ceiling::PURGE_TOKEN_BUDGET`], or a
+/// smaller value tests set to make it bind in small universes.
+pub fn purge_token_budget() -> usize {
+    #[cfg(test)]
+    if let Some(n) = test_cap::purge() {
+        return n;
+    }
+    ceiling::PURGE_TOKEN_BUDGET
+}
+
+/// Test overrides of the legacy link cap and the purge token budget (per
+/// thread).
 #[cfg(test)]
 pub(crate) mod test_cap {
     thread_local! {
         static CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+        static PURGE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     }
     pub fn get() -> Option<u32> {
         CAP.with(|c| c.get())
     }
     pub fn set(n: Option<u32>) {
         CAP.with(|c| c.set(n))
+    }
+    pub fn purge() -> Option<usize> {
+        PURGE.with(|c| c.get())
+    }
+    pub fn set_purge(n: Option<usize>) {
+        PURGE.with(|c| c.set(n))
     }
 }
 
@@ -1429,12 +1447,25 @@ pub fn retain_refs(
             legacy_tokens.insert(i, v.tokens);
         }
     }
+    // Admitted per recipient in key order, newest first, within a budget of
+    // tokens across all kept envelopes: an envelope that does not fit is
+    // skipped and the recipient's next older one is tried (decision (t)).
     pe.sort();
+    let budget = purge_token_budget();
+    let mut spent = 0usize;
     let mut purged: HashMap<Key, HashSet<[u8; 16]>> = HashMap::new();
     for (k, _, _, i) in pe {
-        if purged.contains_key(&k) || !c.ok(i) {
+        if purged.contains_key(&k) {
             continue;
         }
+        let n = match &recs[i] {
+            Record::Purge(s) => s.payload.purged.len(),
+            _ => legacy_tokens[&i].len(),
+        };
+        if spent + n > budget || !c.ok(i) {
+            continue;
+        }
+        spent += n;
         let tokens: HashSet<[u8; 16]> = match &recs[i] {
             Record::Purge(s) => s.payload.purged.iter().map(|t| t.0).collect(),
             _ => legacy_tokens[&i].iter().copied().collect(),

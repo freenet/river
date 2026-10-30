@@ -83,7 +83,7 @@
 //!   `max_nickname_size`, `max_room_name`, `max_room_description` above the
 //!   ceilings are clamped (a v1 room name or description longer than the v2
 //!   ceiling refuses the conversion, [`convert::ConvertError`]). Purge
-//!   envelopes keep v1's 1,000 tokens.
+//!   envelopes keep v1's 1,000 tokens, within a room-wide budget (t).
 //! - **(j) Restore requests.** A restore request is valid if its embedded
 //!   chain verifies and ends at an admitted link or the owner. Whether its
 //!   first link is in fact retired is not checked: a request for a link that
@@ -158,6 +158,17 @@
 //!   the room holds at conversion and again what it holds when the window
 //!   closes. Records written during the window beyond that are lost when it
 //!   closes.
+//! - **(t) Purge token budget.** A purge envelope holds up to 1,000 tokens,
+//!   as in v1, and the envelopes kept hold at most
+//!   [`config::ceiling::PURGE_TOKEN_BUDGET`] (80,200, 200 per member at the
+//!   member ceiling) together. Envelopes are admitted per recipient in key
+//!   order, newest first; one that does not fit the budget left is skipped
+//!   and the recipient's next older envelope is tried. A group limit of the
+//!   greedy chooser over the envelopes' own fields and L4, so it is lawful
+//!   as the other caps are. 1,000 tokens for every member would double the
+//!   largest state and add about 0.5 s to the worst merge; real rooms are
+//!   far below the budget (the Official room: 19 envelopes of 1 to 40
+//!   tokens). Ian, 2026-10-29.
 
 //! Not yet wired into the room contract; compiled only for tests and under
 //! the `room-state-v2` feature, so the deployed contract's WASM is unchanged.

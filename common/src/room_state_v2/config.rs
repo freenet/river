@@ -71,6 +71,14 @@ pub mod ceiling {
     pub const PURGE_TOKENS: usize = 1_000;
     /// A legacy purge envelope's tokens, as v1.
     pub const LEGACY_PURGE_TOKENS: usize = 1_000;
+    /// Tokens of all kept purge envelopes together (v2 and legacy): 200 per
+    /// member at the member ceiling, so 1,000-token envelopes cost no more
+    /// than 200-token ones did (decision (t)).
+    pub const PURGE_TOKEN_BUDGET: usize = 80_200;
+    /// A purge envelope's bytes besides its tokens, and per token (pinned by
+    /// `tests::sizes`).
+    pub const PURGE_ENVELOPE_BYTES: usize = 400;
+    pub const PURGE_TOKEN_BYTES: usize = 18;
     pub const SECRET_BLOB_CIPHERTEXT: usize = 512;
     pub const BAN_REASON: usize = 256;
     pub const ROSTER_BATCHES: usize = 1_000;

@@ -91,10 +91,9 @@ impl Out {
         self.states += 1;
     }
     fn state(&mut self, s: &RoomStateV2) {
-        // The contract's one form of the state with no records.
-        if s.records.is_empty() {
-            self.state_bytes(vec![]);
-        } else {
+        // The state with no records is trivial, and fdev reads its one form
+        // (empty bytes) as no input: leave it out.
+        if !s.records.is_empty() {
             self.state_bytes(s.to_bytes());
         }
     }

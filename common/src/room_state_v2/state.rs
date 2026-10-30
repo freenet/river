@@ -109,6 +109,11 @@ pub fn max_state_bytes() -> usize {
         if ks == [11, 12] {
             let legacy = super::retain::legacy_link_cap() as usize;
             total += MAX_RECORD_BYTES[11] * (n - legacy.min(n)) + largest(ks) * legacy.min(n);
+        } else if ks == [20, 21] {
+            // Purge envelopes: each one's overhead, plus the room-wide token
+            // budget.
+            total += n * ceiling::PURGE_ENVELOPE_BYTES
+                + super::retain::purge_token_budget() * ceiling::PURGE_TOKEN_BYTES;
         } else if ks == [10] || ks == [12] || ks == [5] {
             // [10] and [12] are sub-limits of groups counted above; the
             // roster is bounded by its entries, below.

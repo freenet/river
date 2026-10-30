@@ -525,7 +525,11 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
         .take(caps.purges)
         .enumerate()
     {
-        let mut purged: Vec<Token16> = (0..caps.purge_tokens as u32)
+        // Within the room-wide token budget, shared by every envelope.
+        let per = caps
+            .purge_tokens
+            .min(super::retain::purge_token_budget() / caps.purges.max(1));
+        let mut purged: Vec<Token16> = (0..per as u32)
             .map(|t| {
                 let mut b = [0u8; 16];
                 b[..4].copy_from_slice(&t.to_le_bytes());

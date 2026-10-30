@@ -403,3 +403,46 @@ fn v2_record_size_ceilings_hold() {
         }),
     );
 }
+
+/// The purge envelope byte model the byte ceiling uses (overhead plus a
+/// size per token, `ceiling::PURGE_ENVELOPE_BYTES` and `PURGE_TOKEN_BYTES`)
+/// holds for v2 and legacy envelopes at every token count.
+#[test]
+fn purge_envelope_bytes_follow_the_token_model() {
+    use crate::room_state_v2::encoding::{Bytes32, Sig, Token16};
+    use crate::room_state_v2::records::{PurgeP, Signed};
+    let owner = sk(1);
+    let m = sk(2);
+    let mid = MemberId::from(&m.verifying_key());
+    let bound = |n: usize| ceiling::PURGE_ENVELOPE_BYTES + n * ceiling::PURGE_TOKEN_BYTES;
+    for n in [0usize, 1, 23, 24, 255, 256, 1_000] {
+        let token = |i: usize| {
+            let mut b = [0xffu8; 16];
+            b[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            b
+        };
+        let v2 = Record::Purge(Signed {
+            payload: PurgeP {
+                recipient: Bytes32([0xff; 32]),
+                version: u64::MAX,
+                purged: (0..n).map(|i| Token16(token(i))).collect(),
+            },
+            sig: Sig([0xff; 64]),
+        });
+        let purges = RecipientPurges {
+            version: u64::MAX,
+            purged: (0..n).map(|i| PurgeToken(token(i))).collect(),
+        };
+        let p = sign_recipient_purges(&m, mid, &owner.verifying_key(), purges).unwrap();
+        let legacy = Record::LegacyPurge(wrap(&m, to_cbor(&p)));
+        for r in [v2, legacy] {
+            let len = to_cbor(&r).len();
+            assert!(
+                len <= bound(n),
+                "kind {} with {n} tokens: {len} > {}",
+                r.kind(),
+                bound(n)
+            );
+        }
+    }
+}

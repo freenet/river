@@ -534,3 +534,97 @@ fn the_laws_hold_where_the_legacy_link_cap_binds_at_model_size() {
         );
     }
 }
+
+// ---- the room-wide purge token budget (decision (t)), at budgets small
+// enough to bind in the random universes' purge envelopes.
+
+fn purges(m: &Universe, s: S) -> usize {
+    bits(s)
+        .filter(|&i| matches!(m.recs[i].kind(), 20 | 21))
+        .count()
+}
+
+fn tokens(m: &Universe, s: S) -> usize {
+    use crate::room_state_v2::records::Record;
+    bits(s)
+        .map(|i| match &m.recs[i] {
+            Record::Purge(p) => p.payload.purged.len(),
+            Record::LegacyPurge(l) => crate::room_state_v2::legacy::decode_purge(&owner(), l)
+                .map_or(0, |v| v.tokens.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: u64) {
+    println!("{HEADER}");
+    let seed0 = env("RIVER_V2_SEED", 36);
+    let mut tot = Counts::default();
+    let mut bound_n = 0u64;
+    let mut over = 0u64;
+    for fi in 0..fams {
+        let m = Universe::with_purge_budget(
+            &format!("purge budget {budget} / univ{fi}"),
+            rand_family(seed0, fi, Gen::L5),
+            budget,
+        );
+        let free = Universe::new("free", rand_family(seed0, fi, Gen::L5), Mutant::None);
+        let c = random(&m, seed0 * 7919 + fi, pool, pairs, triples);
+        if c.bad() {
+            println!("{}", row(&m.name, &format!("{} recs", m.recs.len()), &c));
+            report_failures(&m, &c);
+        }
+        tot.states += c.states;
+        tot.merge_from(&c);
+        let mut rng = Rng(fi + 91);
+        for _ in 0..300 {
+            let s = rng.subset(m.n(), 700);
+            let (fb, ff) = (m.f(s), free.f(s));
+            // Never over the budget; and it decided the outcome somewhere.
+            over += (tokens(&m, fb) > budget) as u64;
+            bound_n += (purges(&m, fb) < purges(&free, ff) || fb != ff) as u64;
+        }
+    }
+    println!(
+        "{}",
+        row(&format!("purge budget {budget} TOTAL"), "random", &tot)
+    );
+    println!("random subsets where the purge budget of {budget} decided f: {bound_n}");
+    assert!(
+        !tot.bad(),
+        "a law failed under the purge token budget {budget}"
+    );
+    assert_eq!(over, 0, "a kept set went over the purge token budget");
+    assert!(tot.states >= fams * 2 && tot.pairs > 0 && tot.strict_fail > 0);
+    assert!(
+        bound_n > 0,
+        "the purge budget of {budget} never decided f in a random universe"
+    );
+}
+
+#[test]
+fn the_laws_hold_where_the_purge_token_budget_binds() {
+    for budget in [1, 2] {
+        run_purge_budget(
+            budget,
+            env("RIVER_V2_FAMS", 4),
+            env("RIVER_V2_POOL", 300) as usize,
+            env("RIVER_V2_PAIRS", 1_500),
+            env("RIVER_V2_RTRIPLES", 3_000),
+        );
+    }
+}
+
+#[test]
+#[ignore = "full size: the purge token budget at 1 and 2 over 40 universes (release build)"]
+fn the_laws_hold_where_the_purge_token_budget_binds_at_model_size() {
+    for budget in [1, 2] {
+        run_purge_budget(
+            budget,
+            env("RIVER_V2_FAMS", 40),
+            env("RIVER_V2_POOL", 5_000) as usize,
+            env("RIVER_V2_PAIRS", 200_000),
+            env("RIVER_V2_RTRIPLES", 1_000_000),
+        );
+    }
+}
