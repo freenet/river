@@ -293,3 +293,28 @@ makes the apply and the validate two calls, each held to 5 s.
 2.15 s: a device three times slower would take about 6.5 s, 1.3 times
 freenet-core's 5 s limit. The largest guest memory is 58 MiB, against the
 256 MiB the engine allows.
+
+## With the purge reserve, 2026-10-30
+
+At d96cda2c4 (each kept key reserves 200 purge tokens, the rest share a
+pool). Five runs each, load average 7 to 8 (`verify_strict` 0.284 ms per
+signature, against 0.218 ms in the quiet run above):
+
+| state or input | validate | update | merge | memory |
+|---|---|---|---|---|
+| ceilings | 1.37-1.46 s | 0.81-0.84 s | 1.51-1.58 s | 34 MiB |
+| legacy | 1.41-1.49 s | 1.08-1.16 s | 1.70-1.81 s | 46 MiB |
+| mixed | 1.46-1.64 s | 0.98-1.07 s | 1.73-1.89 s | 42 MiB |
+| official | 0.48-0.51 s | 0.26-0.28 s | 0.51-0.55 s | 10 MiB |
+| oshaped | 0.35-0.39 s | 0.37-0.52 s | 0.38-0.43 s | 8 MiB |
+| adv | | 1.10-1.32 s | 1.71-2.06 s | 46 MiB |
+| slack | | 0.86-0.94 s | 2.07-2.44 s | 48 MiB |
+| purgejunk | | 0.57-0.58 s | 1.75-2.22 s | 58 MiB |
+| purgecheck: every envelope at 1,000 tokens (9.96 MB) | | 0.70-0.88 s | 1.86-2.76 s | 53 MiB |
+
+The update pipeline (one post): ceilings 1.74-2.56 s, legacy 1.81-2.17 s,
+mixed 1.86-2.01 s; `get_state_delta` 0.07-0.19 s.
+
+`CHECK_SECS=2.5`: failed at this load, on two runs: the purgecheck merge
+(2.76 s; its input is larger than a valid state or delta can be, so the
+contract would refuse it for size first) and one ceilings pipeline (2.56 s).
