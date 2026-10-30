@@ -657,6 +657,61 @@ pub fn owner_payloads(
     })
 }
 
+/// The owner's records that close the legacy window of `held` (a valid
+/// state) at `clock_hours`: its configuration at the next version with the
+/// window closed at that hour, a `Clock` at it, and roster batches
+/// attesting every legacy record `held` holds that no held batch attests
+/// yet (decision (s)). After it, only attested legacy records count, so a
+/// legacy record written later is dropped. `None` if `held` has no
+/// configuration or its window is already closed.
+pub fn closing_payloads(
+    held: &super::state::RoomStateV2,
+    clock_hours: u32,
+) -> Option<OwnerPayloads> {
+    let mut configuration = held.records.iter().find_map(|r| match r {
+        Record::Configuration(s) => Some(s.payload.clone()),
+        _ => None,
+    })?;
+    if !configuration.legacy_window_open {
+        return None;
+    }
+    configuration.version += 1;
+    configuration.legacy_window_open = false;
+    configuration.legacy_window_closed_at = clock_hours;
+    let mut attested: BTreeSet<(LegacyKind, Digest)> = BTreeSet::new();
+    let mut next_seq = 0u32;
+    for r in &held.records {
+        if let Record::Roster(b) = r {
+            next_seq = next_seq.max(b.payload.seq + 1);
+            attested.extend(b.payload.batch.iter().map(|e| (e.kind, e.digest)));
+        }
+    }
+    let mut by_kind: std::collections::BTreeMap<LegacyKind, Vec<RosterEntry>> = Default::default();
+    for r in &held.records {
+        if let Some(kind) = r.legacy_kind() {
+            let digest = r.digest();
+            if !attested.contains(&(kind, digest)) {
+                by_kind
+                    .entry(kind)
+                    .or_default()
+                    .push(RosterEntry { kind, digest });
+            }
+        }
+    }
+    let mut roster = vec![];
+    for (kind, mut entries) in by_kind {
+        entries.sort_by_key(|e| e.digest);
+        let seq = next_seq + roster.len() as u32;
+        roster.extend(batches(kind, entries, seq));
+    }
+    Some(OwnerPayloads {
+        configuration,
+        clock: ClockP { hours: clock_hours },
+        secret_versions: vec![],
+        roster,
+    })
+}
+
 /// Roster batches of one kind, numbered from `seq`.
 fn batches(_kind: LegacyKind, entries: Vec<RosterEntry>, seq: u32) -> Vec<RosterP> {
     entries

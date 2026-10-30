@@ -664,3 +664,117 @@ fn a_conversion_of_two_generations_keeps_the_records_of_both() {
     assert_eq!(kept_msgs, 6);
     assert!(validate_state(&o, &s.to_bytes(), &mut Verifier::new()).is_ok());
 }
+
+/// The window closes end to end: the owner converts; during the window a
+/// new v1 member joins under k1 and posts, and k2 posts; the owner closes
+/// the window with a roster of what the room then holds. Every attested
+/// record stays, and a legacy record written after the close is dropped.
+#[test]
+fn closing_the_window_attests_what_the_room_holds() {
+    use crate::room_state_v2::convert::closing_payloads;
+    let v1 = v1_room();
+    let o = key(0);
+    let conv = legacy_records(&o, &v1);
+    let p = payloads(&v1, &conv.records, &[key(1)]);
+    let mut recs = p.sign(&sk(0));
+    recs.extend(conv.records.iter().cloned());
+    let (opened, _) = normalize(&o, recs, &mut Verifier::new());
+
+    // Written to v1 during the window, merged in as legacy records.
+    let mut later = v1.clone();
+    later.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: id(0),
+            invited_by: id(1),
+            member_vk: sk(4).verifying_key(),
+        },
+        &sk(1),
+    ));
+    let t = |h: u64| UNIX_EPOCH + Duration::from_secs(1_800_000_000 + h * 3600);
+    let msg = |a: u8, h: u64| {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: id(0),
+                author: id(a),
+                time: t(h),
+                content: RoomMessageBody::public(format!("window {a} {h}")),
+            },
+            &sk(a),
+        )
+    };
+    later.recent_messages.messages.push(msg(4, 6));
+    later.recent_messages.messages.push(msg(2, 7));
+    let window_recs = legacy_records(&o, &later).records;
+    let mut recs = opened.records.clone();
+    recs.extend(window_recs.iter().cloned());
+    let (during, r) = normalize(&o, recs, &mut Verifier::new());
+    assert!(
+        r.members.contains(&key(4)),
+        "a window join counts while open"
+    );
+    let held_legacy = |s: &crate::room_state_v2::RoomStateV2| {
+        s.records
+            .iter()
+            .filter(|r| r.legacy_kind().is_some())
+            .count()
+    };
+    let n_during = held_legacy(&during);
+
+    let close = closing_payloads(&during, 2).unwrap();
+    assert!(
+        !close.roster.is_empty(),
+        "the window's records need attesting"
+    );
+    let mut recs = during.records.clone();
+    recs.extend(close.sign(&sk(0)));
+    let (closed, r) = normalize(&o, recs, &mut Verifier::new());
+    assert!(r.members.contains(&key(4)), "an attested window join stays");
+    assert_eq!(held_legacy(&closed), n_during, "nothing attested is lost");
+    assert!(validate_state(&o, &closed.to_bytes(), &mut Verifier::new()).is_ok());
+    assert!(closing_payloads(&closed, 3).is_none(), "already closed");
+
+    // A legacy record written after the close is not attested.
+    let mut after = later.clone();
+    after.recent_messages.messages.push(msg(2, 8));
+    let mut recs = closed.records.clone();
+    recs.extend(legacy_records(&o, &after).records);
+    let (s, _) = normalize(&o, recs, &mut Verifier::new());
+    assert_eq!(s, closed, "an unattested record does not count");
+}
+
+/// At the legacy link cap, the conversion roster holds every link slot, so
+/// a v1 member joining during the window cannot be attested at close and
+/// is dropped (the link roster ceiling is the cap; other kinds have twice
+/// their cap).
+#[test]
+fn at_the_link_cap_a_window_join_cannot_be_attested() {
+    use crate::room_state_v2::convert::closing_payloads;
+    use crate::room_state_v2::retain::test_cap;
+    test_cap::set(Some(3));
+    let v1 = v1_room();
+    let o = key(0);
+    let conv = legacy_records(&o, &v1);
+    let mut recs = payloads(&v1, &conv.records, &[key(1)]).sign(&sk(0));
+    recs.extend(conv.records.iter().cloned());
+    let (opened, _) = normalize(&o, recs, &mut Verifier::new());
+    let mut later = v1.clone();
+    later.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: id(0),
+            invited_by: id(1),
+            member_vk: sk(4).verifying_key(),
+        },
+        &sk(1),
+    ));
+    let mut recs = opened.records.clone();
+    recs.extend(legacy_records(&o, &later).records);
+    let (during, r) = normalize(&o, recs, &mut Verifier::new());
+    assert!(!r.members.contains(&key(4)), "no unrostered share is left");
+    let close = closing_payloads(&during, 2).unwrap();
+    let mut recs = during.records.clone();
+    recs.extend(close.sign(&sk(0)));
+    let (_, r) = normalize(&o, recs, &mut Verifier::new());
+    test_cap::set(None);
+    assert_eq!(r.members.len(), 3);
+    assert!(!r.members.contains(&key(4)));
+}
