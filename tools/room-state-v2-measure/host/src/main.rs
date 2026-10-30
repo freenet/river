@@ -199,6 +199,23 @@ fn main() {
                 adversarial(&engine, &module);
                 continue;
             }
+            "mixed" => Caps {
+                legacy: true,
+                legacy_links: 0,
+                ..Caps::ceilings()
+            },
+            "pipeline" => {
+                pipeline(&engine, &module);
+                continue;
+            }
+            "slack" => {
+                slack(&engine, &module);
+                continue;
+            }
+            "purgejunk" => {
+                purge_junk(&engine, &module);
+                continue;
+            }
             n => Caps::ceilings().scaled(n.parse().unwrap()),
         };
         let t = Instant::now();
@@ -380,6 +397,225 @@ fn adversarial(engine: &Engine, module: &Module) {
         a.records.len(),
         ab.len(),
         junk.records.len(),
+        jb.len()
+    );
+    run(engine, module, &o, &ab, &jb, &ab);
+}
+
+/// The states the costlier specs start from: every cap full with v2 links
+/// (`ceilings`), with 300 legacy links and legacy content (`legacy`), and
+/// with v2 links and legacy content (`mixed`: the most signatures and most
+/// v1 decoding together).
+fn bases() -> Vec<(&'static str, Caps)> {
+    vec![
+        ("ceilings", Caps::ceilings()),
+        ("legacy", Caps::ceilings_legacy()),
+        (
+            "mixed",
+            Caps {
+                legacy: true,
+                legacy_links: 0,
+                ..Caps::ceilings()
+            },
+        ),
+    ]
+}
+
+/// A new owner message, newer than every message `s` holds, of the room's
+/// privacy: the one-record delta of an ordinary post.
+fn owner_post(s: &river_core::room_state_v2::RoomStateV2) -> Vec<u8> {
+    use river_core::room_state_v2::config::EPOCH_2026_SECS;
+    use river_core::room_state_v2::encoding::{sign_payload, to_cbor, ByteBuf, Key, Nonce12};
+    use river_core::room_state_v2::records::*;
+    let osk = owner_key();
+    let o = Key::from(&osk.verifying_key());
+    let clock = s
+        .records
+        .iter()
+        .find_map(|r| match r {
+            Record::Clock(c) => Some(c.payload.hours),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let private = s
+        .records
+        .iter()
+        .any(|r| matches!(r, Record::Configuration(c) if c.payload.privacy_mode == 1));
+    let body = if private {
+        MessageBody::Private(PrivateBody {
+            content_type: 1,
+            content_version: 1,
+            ciphertext: ByteBuf(vec![0xab; 1_000]),
+            nonce: Nonce12([9; 12]),
+            secret_version: 1,
+        })
+    } else {
+        MessageBody::Public(PublicBody {
+            content_type: 1,
+            content_version: 1,
+            data: ByteBuf(vec![0xab; 1_000]),
+        })
+    };
+    let p = MessageP {
+        author: o,
+        time: EPOCH_2026_SECS + clock as u64 * 3600 + 1_800,
+        clock_ref: clock,
+        body,
+    };
+    to_cbor(&vec![Record::Message(Signed {
+        sig: sign_payload(tag::MESSAGE, &o, &p, &osk),
+        payload: p,
+    })])
+}
+
+/// `pipeline`: one ordinary post on a full state, as freenet-core handles
+/// it: apply, validate the result, summarize it, and the delta back to a
+/// subscriber holding the old state (guest `pipeline`), timed together; and
+/// `get_state_delta` of one variant against the other's summary (the
+/// largest delta a subscriber can be sent).
+fn pipeline(engine: &Engine, module: &Module) {
+    use river_core::room_state_v2::encoding::to_cbor;
+    let o = Bytes32(owner_key().verifying_key().to_bytes());
+    let reps: usize = std::env::var("REPS")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(1);
+    for (name, caps) in bases() {
+        let (a, _) = largest_state(caps, 0);
+        let (b, _) = largest_state(caps, 1);
+        let (ab, post) = (a.to_bytes(), owner_post(&a));
+        let (bb, sa) = (b.to_bytes(), to_cbor(&a.summarize()));
+        println!(
+            "pipeline {name}: held {} records ({} bytes); a one-record delta of {} bytes",
+            a.records.len(),
+            ab.len(),
+            post.len()
+        );
+        for _ in 0..reps {
+            type F5 = TypedFunc<(i32, i32, i32, i32, i32), i64>;
+            type F4 = TypedFunc<(i32, i32, i32, i32), i64>;
+            let mut g = Guest::new(engine, module);
+            let (po, pa, pd) = (
+                g.put(&o.0).unwrap(),
+                g.put(&ab).unwrap(),
+                g.put(&post).unwrap(),
+            );
+            let f: F5 = g.inst.get_typed_func(&mut g.store, "pipeline").unwrap();
+            let t = Instant::now();
+            let r = f.call(
+                &mut g.store,
+                (po, pa, ab.len() as i32, pd, post.len() as i32),
+            );
+            report("update+validate+summ", r, t, &mut g);
+
+            let mut g = Guest::new(engine, module);
+            let (pb, ps) = (g.put(&bb).unwrap(), g.put(&sa).unwrap());
+            let f: F4 = g.inst.get_typed_func(&mut g.store, "state_delta").unwrap();
+            let t = Instant::now();
+            let r = f.call(&mut g.store, (pb, bb.len() as i32, ps, sa.len() as i32));
+            report("get_state_delta", r, t, &mut g);
+        }
+    }
+}
+
+/// The most bytes a delta may carry, less a margin for its encoding.
+fn delta_budget() -> usize {
+    river_core::room_state_v2::max_state_bytes() - 4_096
+}
+
+/// `slack`: the `mixed` state updated with legacy DMs over the content
+/// bound, filling the delta's byte allowance: the window is open, so each
+/// is decoded (element by element, as v1 encodes bytes) before its size
+/// drops it, with no signature check.
+fn slack(engine: &Engine, module: &Module) {
+    use river_core::room_state::direct_messages::sign_direct_message;
+    use river_core::room_state::member::MemberId;
+    use river_core::room_state_v2::encoding::{to_cbor, ByteBuf, Key};
+    use river_core::room_state_v2::records::{Legacy, Record};
+    let (_, caps) = bases().remove(2);
+    let (a, _) = largest_state(caps, 0);
+    let osk = owner_key();
+    let ovk = osk.verifying_key();
+    let other = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]).verifying_key();
+    let n = river_core::room_state_v2::config::ceiling::MAX_DIRECT_MESSAGES as usize;
+    let len = delta_budget() / n - 200;
+    let junk: Vec<Record> = (0..n)
+        .map(|i| {
+            let dm = sign_direct_message(
+                &osk,
+                MemberId::from(&ovk),
+                MemberId::from(&other),
+                &ovk,
+                1_800_000_000 + i as u64,
+                vec![1u8; len],
+            )
+            .unwrap();
+            Record::LegacyDirectMessage(Legacy {
+                signer: Key::from(&ovk),
+                v1: ByteBuf(to_cbor(&dm)),
+            })
+        })
+        .collect();
+    let jb = river_core::room_state_v2::RoomStateV2::from_records(junk).to_bytes();
+    let ab = a.to_bytes();
+    let o = Bytes32(ovk.to_bytes());
+    println!(
+        "slack: held {} records ({} bytes); update {n} legacy DMs of {len} bytes ({} bytes)",
+        a.records.len(),
+        ab.len(),
+        jb.len()
+    );
+    run(engine, module, &o, &ab, &jb, &ab);
+}
+
+/// `purgejunk`: the `mixed` state updated with legacy purge envelopes of
+/// 1,000 tokens each, as many as the delta's bytes allow: each is decoded
+/// before its recipient is looked at.
+fn purge_junk(engine: &Engine, module: &Module) {
+    use river_core::room_state::direct_messages::{
+        sign_recipient_purges, PurgeToken, RecipientPurges,
+    };
+    use river_core::room_state::member::MemberId;
+    use river_core::room_state_v2::encoding::{to_cbor, ByteBuf, Key};
+    use river_core::room_state_v2::records::{Legacy, Record};
+    let (_, caps) = bases().remove(2);
+    let (a, _) = largest_state(caps, 0);
+    let osk = owner_key();
+    let ovk = osk.verifying_key();
+    let one = |v: u64| {
+        let p = sign_recipient_purges(
+            &osk,
+            MemberId::from(&ovk),
+            &ovk,
+            RecipientPurges {
+                version: v,
+                purged: (0..1_000u32)
+                    .map(|t| {
+                        let mut b = [0xffu8; 16];
+                        b[..4].copy_from_slice(&t.to_le_bytes());
+                        b[4..12].copy_from_slice(&v.to_le_bytes());
+                        PurgeToken(b)
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        Record::LegacyPurge(Legacy {
+            signer: Key::from(&ovk),
+            v1: ByteBuf(to_cbor(&p)),
+        })
+    };
+    let size = to_cbor(&one(1)).len();
+    let n = (delta_budget() / size)
+        .min(river_core::room_state_v2::config::ceiling::MAX_MEMBERS as usize + 1);
+    let junk: Vec<Record> = (1..=n as u64).map(one).collect();
+    let jb = river_core::room_state_v2::RoomStateV2::from_records(junk).to_bytes();
+    let ab = a.to_bytes();
+    let o = Bytes32(ovk.to_bytes());
+    println!(
+        "purgejunk: held {} records ({} bytes); update {n} legacy purge envelopes of 1,000 tokens ({} bytes)",
+        a.records.len(),
+        ab.len(),
         jb.len()
     );
     run(engine, module, &o, &ab, &jb, &ab);

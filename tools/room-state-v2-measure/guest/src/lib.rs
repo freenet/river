@@ -142,3 +142,46 @@ pub extern "C" fn validate_no_signatures(o: *const u8, p: *const u8, n: usize) -
     CHECKS.with(|c| c.set(v.checks as i64));
     r
 }
+
+/// What freenet-core runs for one update: `apply_delta` of `delta` (a CBOR
+/// record list) on the held state, then `validate_state` of the result
+/// (core validates every `update_state` output, with a fresh verifier),
+/// then `summarize_state` of it and `get_state_delta` against the held
+/// state's summary (once per subscriber). The result's record count.
+#[no_mangle]
+pub extern "C" fn pipeline(o: *const u8, a: *const u8, an: usize, d: *const u8, dn: usize) -> i64 {
+    use river_core::room_state_v2::encoding::to_cbor;
+    let (Some(held), Some(delta)) = (decode(a, an), from_cbor_canonical(slice(d, dn))) else {
+        return -1;
+    };
+    let owner = owner(o);
+    let mut v = Verifier::new();
+    let Ok(next) = apply_delta(&owner, &held, delta, &mut v) else {
+        return -2;
+    };
+    let bytes = next.to_bytes();
+    let mut v2 = Verifier::new();
+    if validate_state(&owner, &bytes, &mut v2).is_err() {
+        return -3;
+    }
+    let summary = to_cbor(&next.summarize());
+    let back = next.delta(&held.summarize()).map(|d| to_cbor(&d).len());
+    CHECKS.with(|c| c.set((v.checks + v2.checks) as i64));
+    (next.records.len() + summary.len().min(1) + back.unwrap_or(0).min(1)) as i64
+}
+
+/// `get_state_delta`: the delta from the state at `p` against the summary
+/// bytes at `q`; its encoded length.
+#[no_mangle]
+pub extern "C" fn state_delta(p: *const u8, n: usize, q: *const u8, qn: usize) -> i64 {
+    use river_core::room_state_v2::encoding::to_cbor;
+    use river_core::room_state_v2::state::Summary;
+    let Some(s) = decode(p, n) else { return -1 };
+    let Some(summary) = from_cbor_canonical::<Summary>(slice(q, qn)) else {
+        return -1;
+    };
+    match s.delta(&summary) {
+        Some(d) => to_cbor(&d).len() as i64,
+        None => 0,
+    }
+}

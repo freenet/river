@@ -923,6 +923,7 @@ name = "host"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek",
  "river-core",
  "wasmtime",
 ]

@@ -9,3 +9,4 @@ river-core = { path = "../../../common", features = ["room-state-v2"] }
 # The wasmtime freenet-core's Cargo.lock resolves (47.0.3 at c86c91e1d).
 wasmtime = { version = "=47.0.3", default-features = false, features = ["async", "cranelift", "runtime", "std", "parallel-compilation"] }
 anyhow = "1"
+ed25519-dalek = { version = "2.1.1", default-features = false }
