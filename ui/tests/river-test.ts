@@ -41,6 +41,12 @@ type RiverTestHooks = {
   setDescriptionClickWaitMs(ms: number): void;
   // Message group renders since the last call (the count restarts at 0).
   takeMessageGroupRenders(): number;
+  // The app toast, with an action button when actionLabel is given.
+  showToast(message: string, actionLabel: string | null): void;
+  // Runs of a showToast action since the last call (the count restarts at 0).
+  takeToastActionRuns(): number;
+  // The generation-update banner: "manual" (Reload), "countdown" (Reload, Not now) or none.
+  showUpdateNotice(kind: "manual" | "countdown" | null): void;
 };
 
 // One hook per round trip.

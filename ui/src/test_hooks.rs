@@ -42,6 +42,8 @@ thread_local! {
     /// Message group renders since `takeMessageGroupRenders` last read them.
     static MESSAGE_GROUP_RENDERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static FORGE_NEXT_SEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Runs of a `showToast` action since `takeToastActionRuns` last read them.
+    static TOAST_ACTION_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The load worker `setRoomsLoadStateKeepingRooms("migrating")` holds open
     /// (until the next call, or `releaseHeldLoadWorker`).
     static HELD_LOAD_WORKER: std::cell::RefCell<
@@ -478,6 +480,43 @@ pub fn install_test_hooks() {
         "setDescriptionClickWaitMs",
         Closure::<dyn FnMut(u32)>::new(move |ms: u32| {
             crate::components::conversation::set_description_click_wait_ms(u64::from(ms));
+        })
+        .into_js_value(),
+    );
+
+    set_hook(
+        "showToast",
+        Closure::<dyn FnMut(String, Option<String>)>::new(
+            move |message: String, action_label: Option<String>| {
+                let action = action_label.map(|label| {
+                    crate::components::toast::ToastAction::new(label, || {
+                        TOAST_ACTION_RUNS.with(|n| n.set(n.get() + 1));
+                    })
+                });
+                crate::components::toast::show_toast(message, action);
+            },
+        )
+        .into_js_value(),
+    );
+
+    set_hook(
+        "takeToastActionRuns",
+        Closure::<dyn FnMut() -> u32>::new(move || TOAST_ACTION_RUNS.with(|n| n.replace(0)))
+            .into_js_value(),
+    );
+
+    // The update banner, without the generation watch: what a re-key shows.
+    set_hook(
+        "showUpdateNotice",
+        Closure::<dyn FnMut(Option<String>)>::new(move |kind: Option<String>| {
+            use crate::components::app::freenet_api::generation_watch::{Notice, UPDATE_NOTICE};
+            let notice = match kind.as_deref() {
+                None => None,
+                Some("manual") => Some(Notice::Manual),
+                Some("countdown") => Some(Notice::Countdown { secs: 600 }),
+                Some(other) => wasm_bindgen::throw_str(&format!("unknown update notice {other:?}")),
+            };
+            crate::util::defer(move || *UPDATE_NOTICE.write() = notice);
         })
         .into_js_value(),
     );

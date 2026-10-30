@@ -9,6 +9,7 @@ pub mod members;
 pub mod mention_click_interceptor;
 pub mod room_list;
 pub mod scroll_to_latest;
+pub mod toast;
 
 /// Tree-wide audit for freenet/river#564: every EDITABLE form control that
 /// binds `value:` must also handle `oninput`.
