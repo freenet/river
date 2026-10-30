@@ -1055,13 +1055,61 @@ fn a_member_cannot_take_more_than_its_share_of_restore_slots() {
     let count = |set: &[Record]| set.iter().filter(|r| state.records.contains(r)).count();
     let kept_member = count(&member_requests);
     assert!(
-        kept_member <= ceiling::RESTORES_PER_MEMBER,
+        kept_member <= ceiling::RESTORES_PER_SUBTREE,
         "kept {kept_member} of one member's requests"
     );
-    assert_eq!(kept_member, ceiling::RESTORES_PER_MEMBER);
+    assert_eq!(kept_member, ceiling::RESTORES_PER_SUBTREE);
     assert!(
         state.records.contains(&owner_req),
         "the owner-attached request still has a slot"
+    );
+    assert!(validate(&state.to_bytes()).0.is_ok());
+}
+
+#[test]
+fn keys_a_member_admits_share_its_subtree_s_restore_slots() {
+    let o = owner();
+    let osk = owner_key();
+    let m = skey(8, 0);
+    let m_link = link(&osk, Parent::Owner(()), 0, &m, true);
+    let m_digest = Record::Link(m_link.clone()).digest();
+    let mut recs = vec![Record::Link(m_link), activity(&m, 1)];
+    // Four keys the member admits, each signing two requests for fake links
+    // of its own keys under its own link, later hours first.
+    let mut sybil_requests = vec![];
+    for s in 0..4u32 {
+        let k = skey(8, 1 + s);
+        let k_link = link(&m, Parent::Link(m_digest), s, &k, true);
+        let k_digest = Record::Link(k_link.clone()).digest();
+        recs.push(Record::Link(k_link));
+        recs.push(activity(&k, 1));
+        for r in 0..2u32 {
+            let x = skey(8, 100 + s * 10 + r);
+            let fake = link(&k, Parent::Link(k_digest), 50 + r, &x, true);
+            let req = restore(vec![fake], 200 + s * 10 + r, &x);
+            sybil_requests.push(req.clone());
+            recs.push(req);
+        }
+    }
+    // Another of the owner's invitees, with one request under its link.
+    let n = skey(8, 50);
+    let n_link = link(&osk, Parent::Owner(()), 1, &n, true);
+    let n_digest = Record::Link(n_link.clone()).digest();
+    recs.push(Record::Link(n_link));
+    recs.push(activity(&n, 1));
+    let z = skey(8, 51);
+    let n_req = restore(vec![link(&n, Parent::Link(n_digest), 9, &z, true)], 1, &z);
+    recs.push(n_req.clone());
+
+    let (state, _) = normalize(&o, recs, &mut Verifier::new());
+    let kept = sybil_requests
+        .iter()
+        .filter(|r| state.records.contains(r))
+        .count();
+    assert_eq!(kept, ceiling::RESTORES_PER_SUBTREE, "one subtree's share");
+    assert!(
+        state.records.contains(&n_req),
+        "another subtree's request keeps a slot"
     );
     assert!(validate(&state.to_bytes()).0.is_ok());
 }

@@ -87,8 +87,9 @@ pub mod ceiling {
     /// three signatures each, so 10 (the design: 1,000) keeps their checks
     /// within the timing bound.
     pub const RESTORE_REQUESTS: usize = 10;
-    /// Restore requests attached to one member (see `retain`).
-    pub const RESTORES_PER_MEMBER: usize = 2;
+    /// Restore requests attached within the subtree of one of the owner's
+    /// direct invitees (see `retain`).
+    pub const RESTORES_PER_SUBTREE: usize = 2;
     /// Legacy v1 records encode byte vectors as CBOR arrays, which cost
     /// about four times as much to decode in WASM as a v2 byte string, so the
     /// legacy kinds that carry content have smaller bounds than their v2

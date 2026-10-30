@@ -1071,11 +1071,19 @@ pub fn retain_refs(
 
     // Restore requests. Reads: L1, L2.
     // Each request attaches to the room where its chain ends: the owner, or
-    // an admitted member (its inviter there). A member can sign a chain of
-    // its own keys under its own link, so requests attached to one member
-    // share `RESTORES_PER_MEMBER` slots; requests attached to the owner
-    // (whose invitations only the owner signs) share the rest.
-    let mut rr: Vec<(Reverse<u32>, Digest, Digest, Option<Key>, usize)> = vec![];
+    // an admitted link (its inviter's link there). A member can sign chains
+    // of its own keys under its own link, and admit keys of its own to do the
+    // same, so requests attached anywhere in the subtree of one of the
+    // owner's direct invitees share `RESTORES_PER_SUBTREE` slots; requests
+    // attached to the owner (whose invitations only the owner signs) share
+    // the rest.
+    let subtree_root = |mut a: usize| {
+        while let Some(p) = adm[a].parent {
+            a = p;
+        }
+        adm[a].digest
+    };
+    let mut rr: Vec<(Reverse<u32>, Digest, Digest, Option<Digest>, usize)> = vec![];
     for i in c.kind(13) {
         let Record::Restore(s) = &recs[i] else {
             continue;
@@ -1092,15 +1100,19 @@ pub fn retain_refs(
             ChainLink::Legacy(l) => Record::LegacyLink(l.clone()).digest(),
         };
         let mut ok = true;
-        let mut attach: Option<Key> = None;
+        let mut attach: Option<Digest> = None;
         for (n, cl) in p.chain.iter().enumerate() {
             let next = p.chain.get(n + 1);
             if next.is_none() {
-                attach = match cl {
-                    ChainLink::Accepted(a) => Some(a.invitation.payload.inviter),
-                    ChainLink::Legacy(l) => Some(l.signer),
-                }
-                .filter(|k| *k != owner);
+                // The admitted link the chain ends under (None: the owner).
+                let at = match cl {
+                    ChainLink::Accepted(a) => match &a.invitation.payload.parent {
+                        Parent::Link(d) => adm_by_digest.get(d).copied(),
+                        Parent::Owner(()) => None,
+                    },
+                    ChainLink::Legacy(l) => canonical.get(&l.signer).copied(),
+                };
+                attach = at.map(subtree_root);
             }
             ok &= match cl {
                 ChainLink::Accepted(a) => {
@@ -1139,13 +1151,13 @@ pub fn retain_refs(
     }
     rr.sort();
     let mut restored: HashSet<Digest> = HashSet::new();
-    let mut per_attach: HashMap<Key, usize> = HashMap::new();
+    let mut per_attach: HashMap<Digest, usize> = HashMap::new();
     for (_, _, link, attach, i) in rr {
         if restored.len() >= ceiling::RESTORE_REQUESTS {
             break;
         }
         let full = attach.is_some_and(|k| {
-            per_attach.get(&k).copied().unwrap_or(0) >= ceiling::RESTORES_PER_MEMBER
+            per_attach.get(&k).copied().unwrap_or(0) >= ceiling::RESTORES_PER_SUBTREE
         });
         if full || restored.contains(&link) || !c.ok(i) {
             continue;

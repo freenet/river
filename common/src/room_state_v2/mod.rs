@@ -89,9 +89,10 @@
 //!   first link is in fact retired is not checked: a request for a link that
 //!   is not retired confers nothing. At most 10 are kept (the design: 1,000;
 //!   each carries up to 25 signatures), and at most
-//!   [`config::ceiling::RESTORES_PER_MEMBER`] of those whose chain ends
-//!   under one member, so a member signing chains of its own keys cannot
-//!   take every slot.
+//!   [`config::ceiling::RESTORES_PER_SUBTREE`] of those whose chain ends
+//!   anywhere in the subtree of one of the owner's direct invitees, so a
+//!   member signing chains of its own keys, or admitting keys of its own to
+//!   sign them, cannot take every slot. The subtree root is read from L2.
 //! - **(k) Strict signatures everywhere.** Legacy v1 records are checked with
 //!   `verify_strict`, as v2 records are, though v1 used `verify`. A v1 record
 //!   whose signature only the lenient check accepts is dropped.
