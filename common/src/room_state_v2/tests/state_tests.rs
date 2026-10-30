@@ -287,7 +287,7 @@ fn convert_live_v1_state() {
         .as_secs()
         - crate::room_state_v2::config::EPOCH_2026_SECS)
         / 3600) as u32;
-    let c = owner_payloads(&o, &v1, &conv.records, clock, &deputies, &[bot]).unwrap();
+    let c = owner_payloads(&o, &v1, &conv.records, clock, &deputies, &[bot], &[]).unwrap();
     let mut report = c.report.clone();
     add_unconverted(&mut report, &conv.unconverted);
     for (kind, kr) in &report.kinds {

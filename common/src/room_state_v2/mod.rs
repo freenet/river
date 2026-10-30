@@ -132,7 +132,14 @@
 //!   link quotas (2 links per member, 50 children per link) and sets
 //!   `max_links` and the depth limit to their ceilings. The links the owner
 //!   rosters are exempt from the quotas, so v1's tree is kept whatever its
-//!   shape, and the quotas bound only links made after the conversion. Every
+//!   shape, and the quotas bound links it does not attest: those made after
+//!   the conversion, and v1 joins during the window. A member that must go
+//!   on inviting (the Invite Bot) needs the owner's exception:
+//!   [`convert::owner_configuration`] takes them, up to the ceiling
+//!   `MAX_CHILDREN_PER_LINK` (534; the design's 4,000 predates the small
+//!   ceilings), and the conversion report shows every inviter whose limit
+//!   is an exception or which already has the default's number of children.
+//!   Every
 //!   link but a rostered legacy one shares `max_links` less the roster's
 //!   link count (an L1 value), so no link at any depth can push an attested
 //!   legacy link out through the total cap. A group limit of L2's greedy

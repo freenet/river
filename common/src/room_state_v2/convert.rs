@@ -339,6 +339,8 @@ pub enum ConvertError {
     TooManyAuthorityKeys,
     /// The owner was listed as a deputy.
     OwnerAsDeputy,
+    /// A child exception names a key with no v1 link in the room.
+    ChildExceptionWithoutLink(Key),
     /// The configuration fails [`ConfigurationV2::check`] for another reason.
     InvalidConfiguration,
 }
@@ -346,14 +348,18 @@ pub enum ConvertError {
 /// The owner's v2 configuration for `v1`: [`ConfigurationV2::from_v1`],
 /// version 1, the v1 room name and description, the legacy window open, and
 /// exactly the `deputies` and `protected` keys the owner confirmed (deputy
-/// bans cannot target a protected key; put the Invite Bot there). A v1 name
-/// or description longer than v2 allows is an error, never truncated: a
-/// private one is sealed and cannot be.
+/// bans cannot target a protected key; put the Invite Bot there), and the
+/// `child_exceptions` the owner confirmed: a member's limit on new children
+/// in place of `max_children_per_link`, recorded on its v1 link (the Invite
+/// Bot needs one to go on admitting members, up to
+/// `MAX_CHILDREN_PER_LINK`). A v1 name or description longer than v2 allows
+/// is an error, never truncated: a private one is sealed and cannot be.
 pub fn owner_configuration(
     owner: &Key,
     v1: &ChatRoomStateV1,
     deputies: &[Key],
     protected: &[Key],
+    child_exceptions: &[(Key, u32)],
 ) -> Result<ConfigurationV2, ConvertError> {
     use super::config::ceiling::*;
     let cfg = &v1.configuration.configuration;
@@ -388,6 +394,28 @@ pub fn owner_configuration(
     }
     if c.deputies.len() > AUTHORITY_KEYS || c.protected.len() > AUTHORITY_KEYS {
         return Err(ConvertError::TooManyAuthorityKeys);
+    }
+    if !child_exceptions.is_empty() {
+        let links: Vec<(Key, Digest)> = legacy_records(owner, v1)
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                Record::LegacyLink(l) => {
+                    super::legacy::decode_link(owner, l).map(|v| (v.member, r.digest()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut resolved: Vec<(Digest, u32)> = vec![];
+        for (k, limit) in child_exceptions {
+            let before = resolved.len();
+            resolved.extend(links.iter().filter(|l| l.0 == *k).map(|l| (l.1, *limit)));
+            if resolved.len() == before {
+                return Err(ConvertError::ChildExceptionWithoutLink(*k));
+            }
+        }
+        resolved.sort();
+        c.child_exceptions = resolved;
     }
     if !c.check(owner) {
         return Err(ConvertError::InvalidConfiguration);
@@ -432,6 +460,19 @@ pub struct KindReport {
     pub dropped: std::collections::BTreeMap<DropReason, usize>,
 }
 
+/// A v1 inviter's limit on new children after the conversion. Its children
+/// the owner rosters are exempt and do not count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildLimit {
+    pub inviter: Key,
+    /// Its children in the v1 room.
+    pub v1_children: usize,
+    /// How many more it can admit.
+    pub limit: u32,
+    /// Whether the owner set this limit; otherwise it is the default.
+    pub exception: bool,
+}
+
 /// A v1 configuration value lowered to its v2 ceiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clamp {
@@ -446,6 +487,10 @@ pub struct ConversionReport {
     pub kinds: std::collections::BTreeMap<LegacyKind, KindReport>,
     /// Configuration values lowered to their v2 ceilings.
     pub clamps: Vec<Clamp>,
+    /// Every inviter with an owner-set limit, and every v1 inviter that had
+    /// at least the default limit's number of children without one (it may
+    /// run out of room to invite).
+    pub child_limits: Vec<ChildLimit>,
     /// v1 secret versions beyond the newest `max_secret_versions`, which do
     /// not carry over (nor do the messages sealed under them).
     pub secret_versions_dropped: usize,
@@ -566,8 +611,9 @@ pub fn owner_payloads(
     clock_hours: u32,
     deputies: &[Key],
     protected: &[Key],
+    child_exceptions: &[(Key, u32)],
 ) -> Result<Conversion, ConvertError> {
-    let configuration = owner_configuration(owner, v1, deputies, protected)?;
+    let configuration = owner_configuration(owner, v1, deputies, protected, child_exceptions)?;
     let clock = ClockP { hours: clock_hours };
     let secret_versions: Vec<SecretVersionP> = v1
         .secrets
@@ -636,6 +682,7 @@ pub fn owner_payloads(
         }
     }
     report.clamps = clamps(&v1.configuration.configuration, &configuration);
+    report.child_limits = child_limits(owner, legacy, &configuration, child_exceptions);
     report.secret_versions_dropped = secret_versions
         .len()
         .saturating_sub(configuration.max_secret_versions as usize);
@@ -783,6 +830,46 @@ fn drop_reason(
         }
         Some(false) => DropReason::Retention,
     }
+}
+
+/// See [`ConversionReport::child_limits`].
+fn child_limits(
+    owner: &Key,
+    legacy: &[Record],
+    c: &ConfigurationV2,
+    exceptions: &[(Key, u32)],
+) -> Vec<ChildLimit> {
+    let mut children: std::collections::BTreeMap<Key, usize> = Default::default();
+    for r in legacy {
+        if let Record::LegacyLink(l) = r {
+            if let Some(v) = super::legacy::decode_link(owner, l) {
+                if v.inviter != *owner {
+                    *children.entry(v.inviter).or_default() += 1;
+                }
+            }
+        }
+    }
+    let mut out: Vec<ChildLimit> = exceptions
+        .iter()
+        .map(|(k, limit)| ChildLimit {
+            inviter: *k,
+            v1_children: children.get(k).copied().unwrap_or(0),
+            limit: *limit,
+            exception: true,
+        })
+        .collect();
+    for (k, n) in &children {
+        if *n >= c.max_children_per_link as usize && !exceptions.iter().any(|e| e.0 == *k) {
+            out.push(ChildLimit {
+                inviter: *k,
+                v1_children: *n,
+                limit: c.max_children_per_link,
+                exception: false,
+            });
+        }
+    }
+    out.sort_by_key(|l| l.inviter);
+    out
 }
 
 /// The configuration values `from_v1` lowered to their v2 ceilings.

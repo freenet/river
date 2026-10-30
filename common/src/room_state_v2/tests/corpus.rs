@@ -187,6 +187,7 @@ fn official_corpus(root: &Path) {
         24 * 300,
         &deputies,
         &[Key::from(&f.bot)],
+        &[],
     )
     .unwrap()
     .payloads;
@@ -500,7 +501,7 @@ fn delta_permutation_pairs_heal_on_live_room() {
     // The owner's records, signed by a stand-in and trusted (its key is not
     // here); no deputies confirmed.
     let legacy = legacy_records(&o, &v1).records;
-    let p = owner_payloads(&o, &v1, &legacy, 1, &[], &[])
+    let p = owner_payloads(&o, &v1, &legacy, 1, &[], &[], &[])
         .unwrap()
         .payloads;
     let mut recs = p.sign(&ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]));

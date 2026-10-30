@@ -39,6 +39,8 @@ pub struct OfficialShaped {
     pub v1: ChatRoomStateV1,
     /// The member that invites most members and appoints the deputies.
     pub bot: VerifyingKey,
+    /// Its signing key.
+    pub bot_key: SigningKey,
     /// The bot's deputies (members), in key order.
     pub deputies: Vec<VerifyingKey>,
 }
@@ -337,6 +339,7 @@ pub fn official_shaped(seed: u64, scale: f64) -> OfficialShaped {
     }
 
     OfficialShaped {
+        bot_key: bot.sk.clone(),
         bot: bot.vk,
         deputies: deputies.iter().map(|d| d.vk).collect(),
         owner: owner.sk,

@@ -124,7 +124,7 @@ fn key(i: u8) -> Key {
 
 /// The owner's payloads with `deputies` confirmed and nothing protected.
 fn payloads(v1: &ChatRoomStateV1, legacy: &[Record], deputies: &[Key]) -> OwnerPayloads {
-    owner_payloads(&key(0), v1, legacy, 1, deputies, &[])
+    owner_payloads(&key(0), v1, legacy, 1, deputies, &[], &[])
         .unwrap()
         .payloads
 }
@@ -139,7 +139,7 @@ fn conversion_keeps_every_member_and_record() {
     let clock = 1;
     // The owner converts, confirming k1 (its own v1 deputy): every legacy
     // record attested, all kept, and the report says so.
-    let c = owner_payloads(&o, &v1, &conv.records, clock, &[members[0]], &[]).unwrap();
+    let c = owner_payloads(&o, &v1, &conv.records, clock, &[members[0]], &[], &[]).unwrap();
     let p = c.payloads;
     assert_eq!(p.configuration.deputies, vec![members[0]]);
     for (kind, kr) in &c.report.kinds {
@@ -208,9 +208,17 @@ fn conversion_keeps_every_member_and_record() {
 fn a_record_signed_by_another_key_is_dropped() {
     let mut v1 = v1_room();
     let o = key(0);
-    let before = owner_payloads(&o, &v1, &legacy_records(&o, &v1).records, 1, &[key(1)], &[])
-        .unwrap()
-        .report;
+    let before = owner_payloads(
+        &o,
+        &v1,
+        &legacy_records(&o, &v1).records,
+        1,
+        &[key(1)],
+        &[],
+        &[],
+    )
+    .unwrap()
+    .report;
     assert_eq!(before.kinds[&LegacyKind::Message].kept, 4);
     // A message whose signature is k3's while it claims k2 as author.
     let m = MessageV1 {
@@ -223,7 +231,7 @@ fn a_record_signed_by_another_key_is_dropped() {
     forged.message.author = id(2);
     v1.recent_messages.messages.push(forged);
     let conv = legacy_records(&o, &v1);
-    let c = owner_payloads(&o, &v1, &conv.records, 1, &[key(1)], &[]).unwrap();
+    let c = owner_payloads(&o, &v1, &conv.records, 1, &[key(1)], &[], &[]).unwrap();
     let msgs = &c.report.kinds[&LegacyKind::Message];
     assert_eq!((msgs.total, msgs.kept), (5, 4));
     assert_eq!(msgs.dropped.get(&DropReason::Signature), Some(&1));
@@ -290,7 +298,7 @@ fn deputies_are_proposed_and_only_confirmed_ones_act() {
     let (_, r) = normalize(&o, recs, &mut Verifier::new());
     assert!(r.members.contains(&k4));
     // Confirmed, with k4 protected: a deputy ban cannot target it.
-    let mut recs = owner_payloads(&o, &v1, &conv.records, 1, &[key(1)], &[k4])
+    let mut recs = owner_payloads(&o, &v1, &conv.records, 1, &[key(1)], &[k4], &[])
         .unwrap()
         .payloads
         .sign(&sk(0));
@@ -304,12 +312,12 @@ fn an_unconvertible_configuration_is_an_error() {
     let o = key(0);
     let mut v1 = v1_room();
     assert_eq!(
-        owner_configuration(&o, &v1, &[o], &[]),
+        owner_configuration(&o, &v1, &[o], &[], &[]),
         Err(ConvertError::OwnerAsDeputy)
     );
     let many: Vec<Key> = (0..65u8).map(|i| key(i + 10)).collect();
     assert_eq!(
-        owner_configuration(&o, &v1, &many, &[]),
+        owner_configuration(&o, &v1, &many, &[], &[]),
         Err(ConvertError::TooManyAuthorityKeys)
     );
     // A v1 name longer than v2 allows is refused, never truncated.
@@ -318,7 +326,7 @@ fn an_unconvertible_configuration_is_an_error() {
     cfg.display.name = SealedBytes::public(vec![b'x'; 201]);
     v1.configuration = AuthorizedConfigurationV1::new(cfg.clone(), &sk(0));
     assert_eq!(
-        owner_configuration(&o, &v1, &[], &[]),
+        owner_configuration(&o, &v1, &[], &[], &[]),
         Err(ConvertError::NameTooLong { len: 201, max: 200 })
     );
     cfg.display.name = SealedBytes::public(vec![b'x'; 200]);
@@ -326,7 +334,7 @@ fn an_unconvertible_configuration_is_an_error() {
     cfg.display.description = Some(SealedBytes::public(vec![b'y'; 2_001]));
     v1.configuration = AuthorizedConfigurationV1::new(cfg, &sk(0));
     assert_eq!(
-        owner_configuration(&o, &v1, &[], &[]),
+        owner_configuration(&o, &v1, &[], &[], &[]),
         Err(ConvertError::DescriptionTooLong {
             len: 2_001,
             max: 2_000
@@ -360,7 +368,7 @@ fn the_official_shaped_room_converts_whole() {
             d
         }
     );
-    let c = owner_payloads(&o, &f.v1, &conv.records, 24 * 300, &deputies, &[bot]).unwrap();
+    let c = owner_payloads(&o, &f.v1, &conv.records, 24 * 300, &deputies, &[bot], &[]).unwrap();
     // Only the member info of the 20 banned former members (held in v1 as
     // ban evidence) does not carry over: v2 keeps member info for members.
     for (kind, kr) in &c.report.kinds {
@@ -434,7 +442,7 @@ fn the_report_shows_narrowed_bans_clamps_and_unreachable_links() {
 
     let conv = legacy_records(&o, &v1);
     let report = |deputies: &[Key]| {
-        owner_payloads(&o, &v1, &conv.records, 1, deputies, &[])
+        owner_payloads(&o, &v1, &conv.records, 1, deputies, &[], &[])
             .unwrap()
             .report
     };
@@ -515,7 +523,7 @@ fn blobs_beyond_the_blob_cap_are_reported() {
     }
     let o = key(0);
     let conv = legacy_records(&o, &v1);
-    let c = owner_payloads(&o, &v1, &conv.records, 1, &[key(1)], &[]).unwrap();
+    let c = owner_payloads(&o, &v1, &conv.records, 1, &[key(1)], &[], &[]).unwrap();
     assert_eq!(c.payloads.configuration.max_secret_blobs, 12);
     let blobs = &c.report.kinds[&LegacyKind::SecretBlob];
     assert_eq!(blobs.total, 15, "{blobs:?}");
@@ -566,7 +574,7 @@ fn conversion_past_the_caps_reports_every_drop_reason() {
     }));
 
     test_cap::set(Some(2));
-    let c = owner_payloads(&o, &v1, &legacy, 1, &[key(1)], &[]);
+    let c = owner_payloads(&o, &v1, &legacy, 1, &[key(1)], &[], &[]);
     test_cap::set(None);
     let c = c.unwrap();
     let mut report = c.report;
@@ -650,7 +658,7 @@ fn a_conversion_of_two_generations_keeps_the_records_of_both() {
             .into_iter()
             .filter(|r| seen.insert(r.digest())),
     );
-    let c = owner_payloads(&o, &a, &union, 1, &[key(1)], &[]).unwrap();
+    let c = owner_payloads(&o, &a, &union, 1, &[key(1)], &[], &[]).unwrap();
     let msgs = &c.report.kinds[&LegacyKind::Message];
     assert_eq!((msgs.total, msgs.kept), (6, 6), "{msgs:?}");
     let mut recs = c.payloads.sign(&sk(0));
@@ -777,4 +785,109 @@ fn at_the_link_cap_a_window_join_cannot_be_attested() {
     test_cap::set(None);
     assert_eq!(r.members.len(), 3);
     assert!(!r.members.contains(&key(4)));
+}
+
+/// The Invite Bot's room to invite after a conversion: 50 new children by
+/// default, and the owner's exception raises it. The report says which limit
+/// applies. Rostered v1 children do not count against either.
+#[test]
+fn the_invite_bot_admits_past_the_default_with_an_exception() {
+    use crate::room_state_v2::encoding::{digest_of, sign_payload};
+    use crate::room_state_v2::official_shaped::official_shaped;
+    use crate::room_state_v2::records::{
+        tag, AcceptanceP, AcceptedLink, InvitationP, Parent, Signed,
+    };
+    let f = official_shaped(1, 1.0);
+    let o = Key::from(&f.owner.verifying_key());
+    let bot = Key::from(&f.bot);
+    let conv = legacy_records(&o, &f.v1);
+    let deputies: Vec<Key> = f.deputies.iter().map(Key::from).collect();
+    let bot_link =
+        conv.records
+            .iter()
+            .find(|r| match r {
+                Record::LegacyLink(l) => crate::room_state_v2::legacy::decode_link(&o, l)
+                    .is_some_and(|v| v.member == bot),
+                _ => false,
+            })
+            .unwrap()
+            .digest();
+    let new_links: Vec<Record> = (0..60u32)
+        .map(|i| {
+            let mut seed = [0x61u8; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            let member = SigningKey::from_bytes(&seed);
+            seed[4] = 0x62;
+            let k0 = SigningKey::from_bytes(&seed);
+            let ip = InvitationP {
+                inviter: bot,
+                invite_key: Key::from(&k0.verifying_key()),
+                parent: Parent::Link(bot_link),
+                seq: 1_000 + i,
+                clock: 0,
+            };
+            let invitation = Signed {
+                sig: sign_payload(tag::INVITATION, &o, &ip, &f.bot_key),
+                payload: ip,
+            };
+            let acceptance = AcceptanceP {
+                invitation: digest_of(&invitation),
+                member: Key::from(&member.verifying_key()),
+            };
+            Record::Link(AcceptedLink {
+                invite_key_sig: sign_payload(tag::ACCEPTANCE, &o, &acceptance, &k0),
+                member_sig: sign_payload(tag::ACCEPTANCE, &o, &acceptance, &member),
+                invitation,
+                acceptance,
+            })
+        })
+        .collect();
+    let kept_new = |exceptions: &[(Key, u32)]| {
+        let c = owner_payloads(
+            &o,
+            &f.v1,
+            &conv.records,
+            24 * 300,
+            &deputies,
+            &[bot],
+            exceptions,
+        )
+        .unwrap();
+        let mut recs = c.payloads.sign(&f.owner);
+        recs.extend(conv.records.iter().cloned());
+        recs.extend(new_links.iter().cloned());
+        let (s, _) = normalize(&o, recs, &mut Verifier::new());
+        assert!(validate_state(&o, &s.to_bytes(), &mut Verifier::new()).is_ok());
+        let n = s
+            .records
+            .iter()
+            .filter(|r| matches!(r, Record::Link(_)))
+            .count();
+        (n, c.report)
+    };
+    // The default: 50 more, and the report warns the bot has more children
+    // than that already.
+    let (n, report) = kept_new(&[]);
+    assert_eq!(n, 50);
+    let l = report
+        .child_limits
+        .iter()
+        .find(|l| l.inviter == bot)
+        .unwrap();
+    assert_eq!((l.limit, l.exception), (50, false));
+    assert!(l.v1_children >= 50);
+    // The owner's exception, at the ceiling.
+    let (n, report) = kept_new(&[(bot, 534)]);
+    assert_eq!(n, 60);
+    let l = report
+        .child_limits
+        .iter()
+        .find(|l| l.inviter == bot)
+        .unwrap();
+    assert_eq!((l.limit, l.exception), (534, true));
+    // A key with no link cannot have one.
+    assert!(matches!(
+        owner_configuration(&o, &f.v1, &[], &[], &[(key(9), 100)]),
+        Err(ConvertError::ChildExceptionWithoutLink(_))
+    ));
 }

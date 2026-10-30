@@ -359,6 +359,7 @@ fn oshaped(engine: &Engine, module: &Module) {
         24 * 300,
         &deputies,
         &[Key::from(&f.bot)],
+        &[],
     )
     .unwrap()
     .payloads;
