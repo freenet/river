@@ -10,3 +10,7 @@ river-core = { path = "../../../common", features = ["room-state-v2"] }
 wasmtime = { version = "=47.0.3", default-features = false, features = ["async", "cranelift", "runtime", "std", "parallel-compilation"] }
 anyhow = "1"
 ed25519-dalek = { version = "2.1.1", default-features = false }
+# The contract's own interface, to call the built contract as freenet-core does.
+freenet-stdlib = { version = "0.12.1" }
+bincode = "1"
+ciborium = "0.2.2"

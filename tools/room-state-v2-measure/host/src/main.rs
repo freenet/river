@@ -10,7 +10,10 @@
 //! exits non-zero if any validate, update or merge call fails or takes longer
 //! than `s` seconds (the local check of the ceilings: `CHECK_SECS=2.5 host
 //! guest.wasm ceilings legacy`). `REPS=n`
-//! repeats each call and reports every run.
+//! repeats each call and reports every run. A call on an input the contract
+//! refuses at its boundary is reported as such and does not count for the
+//! check. The `contract` spec times the built contract (`CONTRACT_WASM=<path>`)
+//! as freenet-core calls it. The load average is printed with every call.
 
 use river_core::room_state_v2::bench::{largest_state, owner_key, Caps};
 use river_core::room_state_v2::encoding::Bytes32;
@@ -22,6 +25,8 @@ const PAGE: u64 = 65536;
 
 struct Host {
     limits: StoreLimits,
+    /// What did not fit a contract buffer, by buffer: bytes and cursor.
+    pending: std::collections::HashMap<i64, (Vec<u8>, usize)>,
 }
 
 fn engine() -> Engine {
@@ -63,6 +68,7 @@ impl Guest {
                 limits: StoreLimitsBuilder::new()
                     .memory_size((PAGES * PAGE) as usize)
                     .build(),
+                pending: Default::default(),
             },
         );
         store.limiter(|h| &mut h.limits);
@@ -90,6 +96,38 @@ impl Guest {
     }
 }
 
+/// Whether the contract refuses the current spec's input at its boundary:
+/// calls on it are reported, and are not part of the check.
+static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Prints whether the contract's boundary checks accept `bytes` (a state or
+/// a delta), and notes a refusal for the check.
+fn boundary(what: &str, bytes: &[u8], state: bool) -> bool {
+    use river_core::room_state_v2::{max_state_bytes, state::within_kind_counts_encoded};
+    use std::sync::atomic::Ordering;
+    let ok =
+        bytes.len() <= max_state_bytes() && within_kind_counts_encoded(bytes, state) == Some(true);
+    if !ok {
+        REFUSED.store(true, Ordering::Relaxed);
+    }
+    println!(
+        "  {what}: {} bytes, the contract {}",
+        bytes.len(),
+        if ok {
+            "accepts it"
+        } else {
+            "REFUSES it at its boundary; these calls are for comparison only"
+        }
+    );
+    ok
+}
+
+fn load() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .map(|l| l.split(' ').take(3).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default()
+}
+
 /// Calls that took longer than `CHECK_SECS`, when it is set.
 static OVER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -98,8 +136,9 @@ fn report(label: &str, r: Result<i64>, t: Instant, g: &mut Guest) {
     let limit: Option<f64> = std::env::var("CHECK_SECS")
         .ok()
         .and_then(|x| x.parse().ok());
+    let refused = REFUSED.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(l) = limit {
-        if label != "validate, no signatures" && label != "summarize_state" {
+        if !refused && label != "validate, no signatures" && label != "summarize_state" {
             if r.is_err() {
                 OVER.lock().unwrap().push(format!("{label}: failed"));
             } else if el.as_secs_f64() > l {
@@ -111,10 +150,11 @@ fn report(label: &str, r: Result<i64>, t: Instant, g: &mut Guest) {
     }
     match r {
         Ok(n) => println!(
-            "  {label:<22} {:>9.3} s  result {n:>7}  sig checks {:>7}  memory {} MiB",
+            "  {label:<22} {:>9.3} s  result {n:>7}  sig checks {:>7}  memory {} MiB  load {}",
             el.as_secs_f64(),
             g.checks(),
-            g.mem.data_size(&g.store) >> 20
+            g.mem.data_size(&g.store) >> 20,
+            load()
         ),
         Err(e) => println!("  {label:<22} {:>9.3} s  FAILED: {e:#}", el.as_secs_f64()),
     }
@@ -169,6 +209,7 @@ fn main() {
         );
     }
     for d in specs {
+        REFUSED.store(false, std::sync::atomic::Ordering::Relaxed);
         let caps = match d.as_str() {
             "official" => Caps::official_room(),
             "ceilings" => Caps::ceilings(),
@@ -220,6 +261,14 @@ fn main() {
                 purge_check(&engine, &module);
                 continue;
             }
+            "outrank" => {
+                outrank(&engine, &module);
+                continue;
+            }
+            "contract" => {
+                contract(&engine);
+                continue;
+            }
             n => Caps::ceilings().scaled(n.parse().unwrap()),
         };
         let t = Instant::now();
@@ -235,6 +284,8 @@ fn main() {
             bb.len(),
             t.elapsed().as_secs_f64()
         );
+        boundary("state", &ab, true);
+        boundary("variant 2", &bb, true);
         run(&engine, &module, &o, &ab, &bb, &ab);
     }
     let over = OVER.lock().unwrap();
@@ -523,18 +574,29 @@ fn pipeline(engine: &Engine, module: &Module) {
     }
 }
 
-/// The most bytes a delta may carry, less a margin for its encoding.
-fn delta_budget() -> usize {
-    river_core::room_state_v2::max_state_bytes() - 4_096
+/// `records` less as many from the end as the contract's boundary needs.
+fn within_boundary(mut records: Vec<river_core::room_state_v2::Record>) -> Vec<u8> {
+    use river_core::room_state_v2::{
+        max_state_bytes, state::within_kind_counts_encoded, RoomStateV2,
+    };
+    loop {
+        let bytes = RoomStateV2::from_records(records.clone()).to_bytes();
+        if bytes.len() <= max_state_bytes()
+            && within_kind_counts_encoded(&bytes, true) == Some(true)
+        {
+            return bytes;
+        }
+        records.pop().expect("nothing fits");
+    }
 }
 
-/// `slack`: the `mixed` state updated with legacy DMs over the content
-/// bound, filling the delta's byte allowance: the window is open, so each
-/// is decoded (element by element, as v1 encodes bytes) before its size
-/// drops it, with no signature check.
+/// `slack`: the `mixed` state updated with legacy DMs at the content bound,
+/// as many as the DM group's bytes allow: the window is open, so each is
+/// decoded (element by element, as v1 encodes bytes) with no signature check.
 fn slack(engine: &Engine, module: &Module) {
     use river_core::room_state::direct_messages::sign_direct_message;
     use river_core::room_state::member::MemberId;
+    use river_core::room_state_v2::config::ceiling;
     use river_core::room_state_v2::encoding::{to_cbor, ByteBuf, Key};
     use river_core::room_state_v2::records::{Legacy, Record};
     let (_, caps) = bases().remove(2);
@@ -542,8 +604,8 @@ fn slack(engine: &Engine, module: &Module) {
     let osk = owner_key();
     let ovk = osk.verifying_key();
     let other = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]).verifying_key();
-    let n = river_core::room_state_v2::config::ceiling::MAX_DIRECT_MESSAGES as usize;
-    let len = delta_budget() / n - 200;
+    let n = ceiling::MAX_DIRECT_MESSAGES as usize;
+    let len = ceiling::LEGACY_DM_CIPHERTEXT;
     let junk: Vec<Record> = (0..n)
         .map(|i| {
             let dm = sign_direct_message(
@@ -561,21 +623,22 @@ fn slack(engine: &Engine, module: &Module) {
             })
         })
         .collect();
-    let jb = river_core::room_state_v2::RoomStateV2::from_records(junk).to_bytes();
+    let jb = within_boundary(junk);
     let ab = a.to_bytes();
     let o = Bytes32(ovk.to_bytes());
     println!(
-        "slack: held {} records ({} bytes); update {n} legacy DMs of {len} bytes ({} bytes)",
+        "slack: held {} records ({} bytes); update legacy DMs of {len} bytes ({} bytes)",
         a.records.len(),
         ab.len(),
         jb.len()
     );
+    boundary("update", &jb, true);
     run(engine, module, &o, &ab, &jb, &ab);
 }
 
 /// `purgejunk`: the `mixed` state updated with legacy purge envelopes of
-/// 1,000 tokens each, as many as the delta's bytes allow: each is decoded
-/// before its recipient is looked at.
+/// 1,000 tokens each, as many as the purge group's bytes allow: each is
+/// decoded before its recipient is looked at.
 fn purge_junk(engine: &Engine, module: &Module) {
     use river_core::room_state::direct_messages::{
         sign_recipient_purges, PurgeToken, RecipientPurges,
@@ -610,20 +673,283 @@ fn purge_junk(engine: &Engine, module: &Module) {
             v1: ByteBuf(to_cbor(&p)),
         })
     };
-    let size = to_cbor(&one(1)).len();
-    let n = (delta_budget() / size)
-        .min(river_core::room_state_v2::config::ceiling::MAX_MEMBERS as usize + 1);
-    let junk: Vec<Record> = (1..=n as u64).map(one).collect();
-    let jb = river_core::room_state_v2::RoomStateV2::from_records(junk).to_bytes();
+    let n = river_core::room_state_v2::config::ceiling::MAX_MEMBERS as u64 + 1;
+    let junk: Vec<Record> = (1..=n).map(one).collect();
+    let jb = within_boundary(junk);
     let ab = a.to_bytes();
     let o = Bytes32(ovk.to_bytes());
     println!(
-        "purgejunk: held {} records ({} bytes); update {n} legacy purge envelopes of 1,000 tokens ({} bytes)",
+        "purgejunk: held {} records ({} bytes); update legacy purge envelopes of 1,000 tokens ({} bytes)",
         a.records.len(),
         ab.len(),
         jb.len()
     );
+    boundary("update", &jb, true);
     run(engine, module, &o, &ab, &jb, &ab);
+}
+
+/// `outrank`: the delta one member can force on a full room: held the older
+/// `mixed` variant, updated with every record of the newer one not signed by
+/// the owner, which outrank what is held wherever times decide, so they are
+/// checked and kept. The guest's signature count shows how many it reached.
+fn outrank(engine: &Engine, module: &Module) {
+    let (_, caps) = bases().remove(2);
+    let (held, _) = largest_state(caps, 1);
+    let (newer, _) = largest_state(caps, 0);
+    let o = Bytes32(owner_key().verifying_key().to_bytes());
+    let delta = river_core::room_state_v2::RoomStateV2::from_records(
+        newer
+            .records
+            .into_iter()
+            .filter(|r| !matches!(r.kind(), 0 | 2 | 3 | 4 | 5 | 6))
+            .collect(),
+    );
+    let (hb, db) = (held.to_bytes(), delta.to_bytes());
+    println!(
+        "outrank: held {} records ({} bytes); update {} records ({} bytes)",
+        held.records.len(),
+        hb.len(),
+        delta.records.len(),
+        db.len()
+    );
+    boundary("update", &db, true);
+    run(engine, module, &o, &hb, &db, &hb);
+}
+
+/// The built contract, called as freenet-core calls it (`Runtime` in
+/// `crates/core/src/wasm_runtime`): a fresh instance per call, `__frnt_set_id`,
+/// each argument in a buffer of at most 64 KiB behind a 4-byte length, the
+/// rest handed over through `__frnt__fill_buffer`.
+struct Contract {
+    store: Store<Host>,
+    inst: Instance,
+    mem: Memory,
+}
+
+const STREAMING_BUF_CAP: usize = 64 * 1024;
+
+impl Contract {
+    fn new(engine: &Engine, module: &Module) -> Contract {
+        let mut store = Store::new(
+            engine,
+            Host {
+                limits: StoreLimitsBuilder::new()
+                    .memory_size((PAGES * PAGE) as usize)
+                    .build(),
+                pending: Default::default(),
+            },
+        );
+        store.limiter(|h| &mut h.limits);
+        store.set_epoch_deadline(u64::MAX / 2);
+        let mut linker = Linker::new(engine);
+        linker
+            .func_wrap(
+                "freenet_contract_io",
+                "__frnt__fill_buffer",
+                |mut caller: Caller<'_, Host>, _id: i64, buf: i64| -> u32 {
+                    let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                    let Some((data, cursor)) = caller.data_mut().pending.remove(&buf) else {
+                        return 0;
+                    };
+                    let b = buf as usize;
+                    let word = |caller: &Caller<'_, Host>, at: usize, n: usize| {
+                        let mut w = [0u8; 8];
+                        mem.read(caller, at, &mut w[..n]).unwrap();
+                        u64::from_le_bytes(w) as usize
+                    };
+                    let start = word(&caller, b, 8);
+                    let capacity = word(&caller, b + 8, 4);
+                    let read = word(&caller, b + 16, 8);
+                    let write = word(&caller, b + 24, 8);
+                    let n = capacity.min(data.len() - cursor);
+                    mem.write(&mut caller, start, &data[cursor..cursor + n])
+                        .unwrap();
+                    mem.write(&mut caller, read, &0u32.to_le_bytes()).unwrap();
+                    mem.write(&mut caller, write, &(n as u32).to_le_bytes())
+                        .unwrap();
+                    if cursor + n < data.len() {
+                        caller.data_mut().pending.insert(buf, (data, cursor + n));
+                    }
+                    n as u32
+                },
+            )
+            .unwrap();
+        let inst = linker.instantiate(&mut store, module).unwrap();
+        let set_id: TypedFunc<i64, ()> = inst.get_typed_func(&mut store, "__frnt_set_id").unwrap();
+        set_id.call(&mut store, 1).unwrap();
+        let mem = inst.get_memory(&mut store, "memory").unwrap();
+        Contract { store, inst, mem }
+    }
+
+    fn buffer(&mut self, data: &[u8]) -> i64 {
+        let init: TypedFunc<u32, i64> = self
+            .inst
+            .get_typed_func(&mut self.store, "__frnt__initiate_buffer")
+            .unwrap();
+        let cap = STREAMING_BUF_CAP.min(data.len() + 4);
+        let ptr = init.call(&mut self.store, cap as u32).unwrap();
+        let word = |c: &mut Contract, at: usize| {
+            let mut w = [0u8; 8];
+            c.mem.read(&c.store, at, &mut w).unwrap();
+            u64::from_le_bytes(w) as usize
+        };
+        let b = ptr as usize;
+        let start = word(self, b);
+        let write = word(self, b + 24);
+        let first = data.len().min(cap - 4);
+        let mut chunk = (data.len() as u32).to_le_bytes().to_vec();
+        chunk.extend(&data[..first]);
+        self.mem.write(&mut self.store, start, &chunk).unwrap();
+        self.mem
+            .write(&mut self.store, write, &(chunk.len() as u32).to_le_bytes())
+            .unwrap();
+        if first < data.len() {
+            self.store
+                .data_mut()
+                .pending
+                .insert(ptr, (data[first..].to_vec(), 0));
+        }
+        ptr
+    }
+
+    /// Calls `name` with three arguments, or two when `c` is `None`: the
+    /// elapsed seconds and the result's bincode bytes.
+    fn call(&mut self, name: &str, a: &[u8], b: &[u8], c: Option<&[u8]>) -> (f64, Vec<u8>) {
+        let (pa, pb) = (self.buffer(a), self.buffer(b));
+        let t;
+        let raw = if let Some(c) = c {
+            let pc = self.buffer(c);
+            let f: TypedFunc<(i64, i64, i64), i64> =
+                self.inst.get_typed_func(&mut self.store, name).unwrap();
+            t = Instant::now();
+            f.call(&mut self.store, (pa, pb, pc)).unwrap()
+        } else {
+            let f: TypedFunc<(i64, i64), i64> =
+                self.inst.get_typed_func(&mut self.store, name).unwrap();
+            t = Instant::now();
+            f.call(&mut self.store, (pa, pb)).unwrap()
+        };
+        let el = t.elapsed().as_secs_f64();
+        let mut head = [0u8; 16];
+        self.mem.read(&self.store, raw as usize, &mut head).unwrap();
+        let ptr = u64::from_le_bytes(head[..8].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes(head[12..16].try_into().unwrap()) as usize;
+        let mut out = vec![0u8; size];
+        self.mem.read(&self.store, ptr, &mut out).unwrap();
+        (el, out)
+    }
+}
+
+/// `contract`: the built contract at each base state and at about 300 members
+/// and 400 links. `validate_state`; an ordinary post by delta; the
+/// state-carrying update core makes (validate the incoming state, update,
+/// validate the result: three calls, each with its own 5 s); the delta one
+/// member can force; `summarize_state`; `get_state_delta`.
+fn contract(engine: &Engine) {
+    use freenet_stdlib::prelude::{
+        ContractError, RelatedContracts, State, StateDelta, UpdateData, UpdateModification,
+        ValidateResult,
+    };
+    use river_core::room_state_v2::encoding::to_cbor;
+    let path = std::env::var("CONTRACT_WASM").expect("CONTRACT_WASM=<room_contract_v2.wasm>");
+    let module = Module::from_file(engine, &path).unwrap();
+    let mut params = vec![];
+    ciborium::ser::into_writer(
+        &river_core::room_state::ChatRoomParametersV1 {
+            owner: owner_key().verifying_key(),
+        },
+        &mut params,
+    )
+    .unwrap();
+    let related = bincode::serialize(&RelatedContracts::default()).unwrap();
+    let reps: usize = std::env::var("REPS")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(1);
+    let say = |label: &str, el: f64, note: &str| {
+        println!("  {label:<30} {el:>7.3} s  {note}  load {}", load());
+    };
+    let validate = |state: &[u8]| {
+        let mut c = Contract::new(engine, &module);
+        let (el, out) = c.call("validate_state", &params, state, Some(&related));
+        let r: Result<ValidateResult, ContractError> = bincode::deserialize(&out).unwrap();
+        (el, format!("{r:?}"))
+    };
+    let update = |state: &[u8], item: UpdateData<'static>| {
+        let mut c = Contract::new(engine, &module);
+        let data = bincode::serialize(&vec![item]).unwrap();
+        let (el, out) = c.call("update_state", &params, state, Some(&data));
+        let r: Result<UpdateModification<'_>, ContractError> = bincode::deserialize(&out).unwrap();
+        (el, r.map(|m| m.new_state.map(|s| s.as_ref().to_vec())))
+    };
+    let mut cases = bases();
+    cases.push((
+        "300 members, 400 links",
+        Caps {
+            max_links: 400,
+            max_owner_children: 400,
+            max_secret_blobs: 400,
+            ..Caps::members(300)
+        },
+    ));
+    for (name, caps) in cases {
+        let (a, _) = largest_state(caps, 0);
+        let (b, _) = largest_state(caps, 1);
+        let (ab, bb, post) = (a.to_bytes(), b.to_bytes(), owner_post(&a));
+        println!(
+            "contract {name}: {} records, {} signatures, {} bytes",
+            a.records.len(),
+            a.records.iter().map(signatures).sum::<usize>(),
+            ab.len()
+        );
+        boundary("state", &ab, true);
+        boundary("variant 2", &bb, true);
+        let delta = river_core::room_state_v2::RoomStateV2::from_records(
+            a.records
+                .iter()
+                .filter(|r| !matches!(r.kind(), 0 | 2 | 3 | 4 | 5 | 6))
+                .cloned()
+                .collect(),
+        );
+        let db = to_cbor(&delta.records);
+        boundary("member delta", &db, false);
+        for _ in 0..reps {
+            let (el, note) = validate(&ab);
+            say("validate_state", el, &note);
+            let (el, r) = update(&ab, UpdateData::Delta(StateDelta::from(post.clone())));
+            say(
+                "update_state, one post",
+                el,
+                &format!("ok {}", matches!(r, Ok(Some(_)))),
+            );
+            // A state-carrying update: the incoming state, then the result.
+            let (v1, n1) = validate(&bb);
+            let (u, r) = update(&ab, UpdateData::State(State::from(bb.clone())));
+            let result = r.unwrap().expect("a new state");
+            let (v2, n2) = validate(&result);
+            say("  validate incoming", v1, &n1);
+            say("  update_state, a state", u, "");
+            say("  validate result", v2, &n2);
+            say("state-carrying, three calls", v1 + u + v2, "sum");
+            // Held the older variant, every member-signed record of the
+            // newer as a delta.
+            let (el, r) = update(&bb, UpdateData::Delta(StateDelta::from(db.clone())));
+            say(
+                "update_state, member delta",
+                el,
+                &format!("ok {}", matches!(r, Ok(Some(_)))),
+            );
+            let mut c = Contract::new(engine, &module);
+            let (el, summary) = c.call("summarize_state", &params, &ab, None);
+            say("summarize_state", el, "");
+            let r: Result<freenet_stdlib::prelude::StateSummary<'_>, ContractError> =
+                bincode::deserialize(&summary).unwrap();
+            let summary = r.unwrap().as_ref().to_vec();
+            let mut c = Contract::new(engine, &module);
+            let (el, _) = c.call("get_state_delta", &params, &bb, Some(&summary));
+            say("get_state_delta", el, "");
+        }
+    }
 }
 
 /// `purgecheck`: the ceilings state updated with, and merged with, the same
@@ -646,5 +972,6 @@ fn purge_check(engine: &Engine, module: &Module) {
         over.records.len(),
         ob.len()
     );
+    boundary("update", &ob, true);
     run(engine, module, &o, &ab, &ob, &ab);
 }
