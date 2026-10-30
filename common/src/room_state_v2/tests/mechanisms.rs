@@ -71,3 +71,46 @@ fn the_clock_lapses_an_inactive_issuers_member_ban() {
     // The legacy member ban is exempt from the activity condition.
     assert!(kept(&all, "L3") && kept(&no_clock8, "L3"));
 }
+
+/// The room-wide purge token budget (decision (t)): a recipient's newest
+/// envelope that does not fit the budget left is skipped, and its next older
+/// envelope that fits is kept in its place.
+#[test]
+fn a_purge_envelope_over_the_budget_falls_back_to_the_older_one() {
+    use crate::room_state_v2::retain::test_cap;
+    let cfg = super::builder::with(|c| c.max_dms = 2);
+    let mut b = super::builder::Builder::new();
+    for (i, k) in [(1u8, 1usize), (2, 2), (3, 3)] {
+        b.invitation(i, "O", i as u32, 0);
+        b.acc(&format!("A{k}"), i, k);
+    }
+    b.act(1, 1);
+    b.act(2, 1);
+    b.act(3, 1);
+    b.dm(1, 3, 1, 0);
+    b.dm(2, 3, 2, 0);
+    let dms = b.dm_indexes();
+    b.purge(3, 2, &dms);
+    b.purge(3, 1, &dms[..1]);
+    b.cfg(0, cfg);
+    let b = b.finish();
+    let run = |budget: Option<usize>| {
+        test_cap::set_purge(budget);
+        let r = f_without(&b, &[]);
+        test_cap::set_purge(None);
+        r
+    };
+    // Without a binding budget the newest envelope (both DMs) is kept.
+    let free = run(None);
+    assert!(kept(&free, "purge(k3 v2") && !kept(&free, "purge(k3 v1"));
+    assert!(!kept(&free, "dm(k1,k3") && !kept(&free, "dm(k2,k3"));
+    // With one token left, the two-token envelope does not fit: the older
+    // one-token envelope is kept, and only its DM is purged.
+    let one = run(Some(1));
+    assert!(!kept(&one, "purge(k3 v2") && kept(&one, "purge(k3 v1"));
+    assert!(!kept(&one, "dm(k1,k3") && kept(&one, "dm(k2,k3"));
+    // With none, neither fits and both DMs stay.
+    let none = run(Some(0));
+    assert!(!kept(&none, "purge(k3"));
+    assert!(kept(&none, "dm(k1,k3") && kept(&none, "dm(k2,k3"));
+}

@@ -556,19 +556,66 @@ fn tokens(m: &Universe, s: S) -> usize {
         .sum()
 }
 
+/// The recipient of the purge envelope at record index `i` (v2 or legacy),
+/// read from the builder's name for it (`purge(k3 ...)`, `lpurge(k3 ...)`).
+fn purge_recipient(m: &Universe, i: usize) -> Option<usize> {
+    let n = &m.names[i];
+    let rest = n
+        .strip_prefix("purge(k")
+        .or_else(|| n.strip_prefix("lpurge(k"))?;
+    rest.split(' ').next()?.parse().ok()
+}
+
+/// Whether the budget made `f` fall back: for some recipient, `capped`
+/// keeps an envelope other than the one `free` keeps for it (the newest
+/// valid one).
+fn fell_back(capped: &Universe, fb: S, ff: S) -> bool {
+    bits(fb).any(|i| {
+        let r = purge_recipient(capped, i);
+        r.is_some() && bits(ff).any(|j| j != i && purge_recipient(capped, j) == r)
+    })
+}
+
+/// A random L5 universe plus, for one recipient, three more DMs to it and a
+/// newer envelope (2 or 3 of their tokens) over an older one (0 or 1), v2 or
+/// legacy each: under a budget of 1 or 2 the newer one often does not fit,
+/// and the older one is kept in its place.
+fn purge_family(seed0: u64, fi: u64) -> super::builder::Builder {
+    let mut b = rand_family(seed0, fi, Gen::L5);
+    let mut rng = Rng(seed0 * 31 + fi);
+    let r = 1 + rng.below(4) as usize;
+    let a = r % 4 + 1;
+    let first = b.dm_indexes().len();
+    for t in 0..3 {
+        b.dm(a, r, 20 + t * 3, 0);
+    }
+    let dms = b.dm_indexes();
+    let newer = &dms[first..first + 2 + rng.below(2) as usize];
+    let older = &dms[first..first + rng.below(2) as usize];
+    for (version, picked) in [(4, newer), (3, older)] {
+        if rng.below(2) == 0 {
+            b.purge(r, version, picked);
+        } else {
+            b.legacy_purge(r, version, picked);
+        }
+    }
+    b
+}
+
 fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: u64) {
     println!("{HEADER}");
     let seed0 = env("RIVER_V2_SEED", 36);
     let mut tot = Counts::default();
     let mut bound_n = 0u64;
     let mut over = 0u64;
+    let mut fallback = 0u64;
     for fi in 0..fams {
         let m = Universe::with_purge_budget(
             &format!("purge budget {budget} / univ{fi}"),
-            rand_family(seed0, fi, Gen::L5),
+            purge_family(seed0, fi),
             budget,
         );
-        let free = Universe::new("free", rand_family(seed0, fi, Gen::L5), Mutant::None);
+        let free = Universe::new("free", purge_family(seed0, fi), Mutant::None);
         let c = random(&m, seed0 * 7919 + fi, pool, pairs, triples);
         if c.bad() {
             println!("{}", row(&m.name, &format!("{} recs", m.recs.len()), &c));
@@ -583,6 +630,7 @@ fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: 
             // Never over the budget; and it decided the outcome somewhere.
             over += (tokens(&m, fb) > budget) as u64;
             bound_n += (purges(&m, fb) < purges(&free, ff) || fb != ff) as u64;
+            fallback += fell_back(&m, fb, ff) as u64;
         }
     }
     println!(
@@ -590,6 +638,7 @@ fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: 
         row(&format!("purge budget {budget} TOTAL"), "random", &tot)
     );
     println!("random subsets where the purge budget of {budget} decided f: {bound_n}");
+    println!("random subsets where it kept a recipient's older envelope: {fallback}");
     assert!(
         !tot.bad(),
         "a law failed under the purge token budget {budget}"
@@ -599,6 +648,10 @@ fn run_purge_budget(budget: usize, fams: u64, pool: usize, pairs: u64, triples: 
     assert!(
         bound_n > 0,
         "the purge budget of {budget} never decided f in a random universe"
+    );
+    assert!(
+        fallback > 0,
+        "the purge budget of {budget} never made f keep a recipient's older envelope"
     );
 }
 
