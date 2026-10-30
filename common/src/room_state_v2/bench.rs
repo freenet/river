@@ -204,6 +204,22 @@ fn bytes(n: usize, fill: u8) -> ByteBuf {
 /// `f` normalizes it, and the number of records `f` dropped (0 when the
 /// build is a valid state as built).
 pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
+    let recs = build(caps, v, true);
+    let n = recs.len();
+    let (s, _) = normalize(&k(&owner_key()), recs, &mut Verifier::new());
+    let dropped = n - s.records.len();
+    (s, dropped)
+}
+
+/// The records of [`largest_state`] as built, not normalized, with every
+/// purge envelope at `caps.purge_tokens` regardless of the room-wide budget:
+/// most of them do not fit it, and each recipient's is checked before the
+/// budget refuses it (the extra checks of decision (t)).
+pub fn largest_records_over_purge_budget(caps: Caps, v: u8) -> Vec<Record> {
+    build(caps, v, false)
+}
+
+fn build(caps: Caps, v: u8, budgeted: bool) -> Vec<Record> {
     let osk = owner_key();
     let o = k(&osk);
     let clock_hours: u32 = 24 * 300;
@@ -526,9 +542,12 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
         .enumerate()
     {
         // Within the room-wide token budget, shared by every envelope.
-        let per = caps
-            .purge_tokens
-            .min(super::retain::purge_token_budget() / caps.purges.max(1));
+        let per = if budgeted {
+            caps.purge_tokens
+                .min(super::retain::purge_token_budget() / caps.purges.max(1))
+        } else {
+            caps.purge_tokens
+        };
         let mut purged: Vec<Token16> = (0..per as u32)
             .map(|t| {
                 let mut b = [0u8; 16];
@@ -669,10 +688,7 @@ pub fn largest_state(caps: Caps, v: u8) -> (RoomStateV2, usize) {
         }));
     }
 
-    let n = recs.len();
-    let (s, _) = normalize(&o, recs, &mut Verifier::new());
-    let dropped = n - s.records.len();
-    (s, dropped)
+    recs
 }
 
 fn id(s: &SigningKey) -> MemberId {

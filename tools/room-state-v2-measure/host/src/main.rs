@@ -216,6 +216,10 @@ fn main() {
                 purge_junk(&engine, &module);
                 continue;
             }
+            "purgecheck" => {
+                purge_check(&engine, &module);
+                continue;
+            }
             n => Caps::ceilings().scaled(n.parse().unwrap()),
         };
         let t = Instant::now();
@@ -619,4 +623,27 @@ fn purge_junk(engine: &Engine, module: &Module) {
         jb.len()
     );
     run(engine, module, &o, &ab, &jb, &ab);
+}
+
+/// `purgecheck`: the ceilings state updated with, and merged with, the same
+/// state built with every purge envelope at 1,000 tokens (401 of them, five
+/// times the budget): each recipient's candidate is checked, then most are
+/// refused by the budget (the extra checks of decision (t)).
+fn purge_check(engine: &Engine, module: &Module) {
+    use river_core::room_state_v2::bench::largest_records_over_purge_budget;
+    let caps = Caps::ceilings();
+    let (a, _) = largest_state(caps, 0);
+    let over = river_core::room_state_v2::RoomStateV2::from_records(
+        largest_records_over_purge_budget(caps, 0),
+    );
+    let (ab, ob) = (a.to_bytes(), over.to_bytes());
+    let o = Bytes32(owner_key().verifying_key().to_bytes());
+    println!(
+        "purgecheck: held {} records ({} bytes); update {} records ({} bytes)",
+        a.records.len(),
+        ab.len(),
+        over.records.len(),
+        ob.len()
+    );
+    run(engine, module, &o, &ab, &ob, &ab);
 }
