@@ -226,6 +226,21 @@ jobs:
       # `ecies-randomized` enables `ecies` transitively.
       run: cargo test -p river-core --lib --features ecies-randomized,migration,mentions
 
+    - name: Test room state v2 (laws at CI size, rule families, real path)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Behind its own feature, so neither river-core lib step above compiles
+      # it. The model-size runs are in room-state-v2-laws.yml.
+      run: cargo test -p river-core --lib --features room-state-v2 room_state_v2
+
+    - name: Test room-contract-v2
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target-room-contract-v2
+      # Its own workspace, so `cargo test -p` from the root cannot reach it.
+      run: cargo test --locked --manifest-path contracts/room-contract-v2/Cargo.toml
+
     - name: Test river-ui (UI crate unit tests)
       env:
         RUST_MIN_STACK: 8388608

@@ -642,17 +642,35 @@ fn the_real_path_obeys_the_laws_with_forged_records_at_size() {
             env("RIVER_V2_REAL_SAMPLES", 10) as usize,
         );
         assert_real(&r, fams);
-        // Every kind is forged, and every kind's forgery was refused at its
-        // signature check somewhere, so no kind's check can be removed
-        // unseen.
-        let all: u64 = ((1u64 << 24) - 1) & !(1 << 1);
-        assert_eq!(r.forged_kinds, all, "a kind was never forged");
-        let unseen = r.forged_kinds & !r.refused_kinds;
-        assert_eq!(
-            unseen, 0,
-            "kinds never refused at a signature check: {unseen:b}"
-        );
+        assert_every_kind_forged_and_refused(&r);
     }
+}
+
+/// Every kind is forged, and every kind's forgery was refused at its
+/// signature check somewhere, so no kind's check can be removed unseen.
+fn assert_every_kind_forged_and_refused(r: &Run) {
+    let all: u64 = ((1u64 << 24) - 1) & !(1 << 1);
+    assert_eq!(r.forged_kinds, all, "a kind was never forged");
+    let unseen = r.forged_kinds & !r.refused_kinds;
+    assert_eq!(
+        unseen, 0,
+        "kinds never refused at a signature check: {unseen:b}"
+    );
+}
+
+/// The coverage assertion of the larger run, at a size for every pull request.
+#[test]
+fn the_forgeries_cover_every_kind_and_reach_every_signature_check() {
+    let r = run_real(
+        None,
+        None,
+        env("RIVER_V2_REAL_FAMS", 6),
+        env("RIVER_V2_REAL_POOL", 20) as usize,
+        env("RIVER_V2_REAL_PAIRS", 16),
+        env("RIVER_V2_REAL_TRIPLES", 16),
+        env("RIVER_V2_REAL_SAMPLES", 4) as usize,
+    );
+    assert_every_kind_forged_and_refused(&r);
 }
 
 /// The real path under a binding purge budget (2 tokens), over universes
