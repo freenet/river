@@ -1013,8 +1013,8 @@ pub fn retain_refs(
     let subtree_limit = links_per_subtree();
     let mut per_subtree: HashMap<usize, u32> = HashMap::new();
     let mut frontier: Vec<usize> = vec![]; // admitted at depth d-1, in position order
-                                           // Accepted links stop at `max_chain_depth`; legacy links (v1 had no
-                                           // depth limit) go as deep as their chains, bounded by their count.
+                                           // Links stop at `max_chain_depth`, but rostered legacy ones (v1 had no
+                                           // depth limit), which go as deep as their chains, bounded by their count.
     for depth in 1u32.. {
         // (rostered legacy first, parent position + 1 or 0 for the owner,
         // seq, link digest), candidate, parent

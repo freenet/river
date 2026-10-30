@@ -89,7 +89,7 @@
 //!   `max_nickname_size`, `max_room_name`, `max_room_description` above the
 //!   ceilings are clamped (a v1 room name or description longer than the v2
 //!   ceiling refuses the conversion, [`convert::ConvertError`]). Purge
-//!   envelopes keep v1's 1,000 tokens, within a room-wide budget (t).
+//!   envelopes keep v1's 1,000 tokens while the room's pool has room (t).
 //! - **(j) Restore requests.** A restore request is valid if its embedded
 //!   chain verifies and ends at an admitted link or the owner. Whether its
 //!   first link is in fact retired is not checked: a request for a link that
@@ -227,7 +227,15 @@
 //!   fields and L4, so it is lawful as the other caps are. (Admitting
 //!   envelopes smallest first with no fallback was tried and is not lawful:
 //!   dropping a refused newest envelope lets the older one it superseded
-//!   return on the next merge.) In a full room (401 kept keys) the shared
+//!   return on the next merge.) A stored state holds one envelope per
+//!   recipient, so "next older" means one still held when the newer arrives:
+//!   an envelope over the pool with none older is refused and the recipient
+//!   keeps none, at every peer, and that is permanent until the recipient
+//!   signs again; no signal reaches the recipient, so a client should keep
+//!   its envelope within the reserve. Anyone holding a recipient's older
+//!   envelope within the reserve can replay it once the pool is exhausted,
+//!   undoing later purges. Within the pool a low key goes first. In a full
+//!   room (401 kept keys) the shared
 //!   pool is 0, so envelopes are in effect 200 tokens per recipient; in a
 //!   room of about 170 kept keys (the Official room) the pool is about
 //!   46,000 tokens, and that room holds 19 envelopes of 1 to 40 tokens.
