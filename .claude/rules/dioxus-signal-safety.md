@@ -75,10 +75,14 @@ signal that failed.
 Still read an infallible signal before the fallible one where you can. It
 costs nothing and leaves a backup if the nudge channel is ever broken.
 
-`signal_guard`'s pin test enforces the ordering for the memos it lists, but
-it only scans `use_memo(` bodies in an explicit file list — it cannot see
-effects, helper functions, or unlisted files. Do not treat a green pin as
-proof your new site is covered.
+`signal_guard`'s pin tests scan the `use_memo(` and `use_effect(` bodies in
+the files listed in `GUARDED_MEMO_SITES` and `GUARDED_EFFECT_SITES`. In
+every body that calls `try_read(` they check that `signal_guard::anchor`
+comes before the first one and that `schedule_nudge` appears at least as
+often as `try_read(`, and they pin the exact number of such bodies. That is
+a count, not a proof that each nudge sits on its read's failure branch. They
+do not see unlisted files, or a fallible read made inside a helper the body
+calls. Do not treat a green pin as proof your new site is covered.
 
 What actually holds a borrow across a recompute is **not diagnosed**. The
 explanation this file used to give (a write's Drop firing notifications that
