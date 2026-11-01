@@ -62,7 +62,7 @@ freenet-scaffold = "0.2.2"
 # its room-contract key at runtime), and it is the release that stopped a probe
 # timeout reading as a definitive absence. That distinction is load-bearing
 # here, because absence is the ONLY answer that may unlock a baked-in key.
-freenet-migrate = "0.6"
+freenet-migrate = "0.7"
 
 # Serialization (for contract state)
 ciborium = "0.2.2"
