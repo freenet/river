@@ -318,3 +318,49 @@ mixed 1.86-2.01 s; `get_state_delta` 0.07-0.19 s.
 `CHECK_SECS=2.5`: failed at this load, on two runs: the purgecheck merge
 (2.76 s; its input is larger than a valid state or delta can be, so the
 contract would refuse it for size first) and one ceilings pipeline (2.56 s).
+
+## The built contract, 2026-11-02
+
+At de0f73e16. Three runs each, load average 3 to 6 on 16 cores, with one
+fdev process running, so not an idle machine (`verify_strict` 0.232-0.254 ms
+per signature). The `contract` spec runs the built `room_contract_v2.wasm`
+through the calls freenet-core makes; freenet-core gives each call its own
+5 s:
+
+| state | validate | one post | state update | state-carrying, three calls | member delta | summarize | delta |
+|---|---|---|---|---|---|---|---|
+| ceilings | 1.39-1.72 s | 0.26-0.27 s | 0.91-0.94 s | 3.66-4.09 s | 0.81-1.13 s | 0.16 s | 0.17-0.18 s |
+| legacy | 1.40-1.71 s | 0.38-0.41 s | 1.17-1.25 s | 4.00-4.48 s | 1.04-1.11 s | 0.09-0.10 s | 0.11-0.12 s |
+| mixed | 1.45-1.66 s | 0.36-0.39 s | 1.09-1.42 s | 4.06-4.53 s | 0.99-1.00 s | 0.09-0.10 s | 0.10-0.11 s |
+| 300 members, 400 links (4,194 signatures) | 1.10-1.28 s | 0.25-0.26 s | 0.81-0.86 s | 3.15-3.30 s | 0.74-0.99 s | 0.15 s | 0.16-0.18 s |
+
+The validate column covers `validate_state` and both validations of the
+state-carrying update. The three calls are validate incoming, update, and
+validate result.
+
+The guest, on inputs the contract accepts: `merge_untrusted` ceilings
+1.44-1.79 s, legacy 1.60-1.71 s, mixed 1.62-1.73 s, `outrank` 1.63-1.72 s,
+`slack` 1.47-1.61 s, `purgejunk` 1.55-1.86 s. Pipeline, one post: ceilings
+1.53-1.56 s, legacy 1.76-2.03 s, mixed 1.73-1.79 s. Largest guest memory
+55 MiB. `purgecheck` is refused at the contract's boundary, so its calls are
+printed for comparison only and the check ignores them.
+
+`CHECK_SECS=2.5`: passed on `ceilings legacy mixed`. An earlier run at load
+18 to 31 failed it, so load changes this result: that run's 2.53-2.83 s are
+not the contract's cost.
+
+`outrank` reached 1,328 signature checks in one update, which does not reach
+the bound of 3,538 for one member, so that bound is still unmeasured.
+
+**All figures for a slower device below are assumptions.** No real device has
+been measured; the factor of 3 is a guess at a phone or a small VM. Taking the
+slowest single contract call and multiplying:
+
+| case | slowest call here | at 3x | against 5 s |
+|---|---|---|---|
+| as built | 1.72 s | 5.2 s | just over; a typical run (1.5 s) is 4.5 s |
+| 300 members, 400 links | 1.28 s | 3.8 s | under |
+| 10x cheaper signature checks (freenet-core #6000) | 0.4-0.7 s | 1.2-2.2 s | under |
+
+The last row removes nine tenths of about 1.1 s of signature checks (3,756 at
+the measured `verify_strict` cost); it is derived and has not been run.
