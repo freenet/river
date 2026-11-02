@@ -8,5 +8,5 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-river-core = { path = "../../../common", features = ["room-state-v2"] }
+river-core = { path = "../../../common", features = ["room-state-v2-client"] }
 blake3 = "1"

@@ -85,6 +85,11 @@ own-purges = []
 # Room state v2 (common/src/room_state_v2/), not yet wired into the room
 # contract. Off for every WASM build, so their bytes (and keys) do not change.
 room-state-v2 = []
+# Client and tool modules of room state v2 (convert, bench, official_shaped).
+# The room contract must NOT enable this: it keeps them out of
+# room_contract_v2.wasm, so editing them cannot move the contract's key. The
+# key is pinned by contracts/room-contract-v2/wasm.blake3.
+room-state-v2-client = ["room-state-v2"]
 
 [build-dependencies]
 # Parses legacy_room_contracts.toml, validates every hash, and generates the

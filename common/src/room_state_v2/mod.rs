@@ -242,13 +242,21 @@
 
 //! Not yet wired into the room contract; compiled only for tests and under
 //! the `room-state-v2` feature, so the deployed contract's WASM is unchanged.
+//! `convert`, `bench` and `official_shaped` need the `room-state-v2-client`
+//! feature (or tests); the v2 contract does not enable it.
 
+// Client and tool modules. Gated so they are not compiled into the contract's
+// WASM: the contract enables only `room-state-v2`, and the key pin in
+// contracts/room-contract-v2/wasm.blake3 fails CI if its bytes move.
+#[cfg(any(feature = "room-state-v2-client", test))]
 pub mod bench;
 pub mod config;
+#[cfg(any(feature = "room-state-v2-client", test))]
 pub mod convert;
 pub mod encoding;
 pub mod fastcbor;
 pub mod legacy;
+#[cfg(any(feature = "room-state-v2-client", test))]
 pub mod official_shaped;
 pub mod records;
 pub mod retain;

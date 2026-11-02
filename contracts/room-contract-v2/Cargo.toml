@@ -20,6 +20,9 @@ freenet-stdlib = { version = "0.12.1", features = ["contract"] }
 river-core = { path = "../../common", features = ["room-state-v2"] }
 
 [dev-dependencies]
+# Tests use bench. Dev-dependency features apply only when building tests (the
+# resolver 2 default for edition 2021), so the cdylib build never sees them.
+river-core = { path = "../../common", features = ["room-state-v2-client"] }
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 
 [features]
