@@ -496,6 +496,24 @@ pub struct ChildLimit {
     pub exception: bool,
 }
 
+/// A room is flagged when at most this percent of `max_members` is left
+/// for members who join after the conversion.
+pub const FEW_SLOTS_PERCENT: u32 = 25;
+
+/// How many member slots the roster leaves free for later members. A
+/// rostered member ranks ahead of every unrostered one for the member cap
+/// and never leaves on its own, so only `max_members - rostered` slots remain
+/// for new members until the owner bans someone or raises `max_members`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberSlots {
+    /// Members the roster attests (legacy links rostered).
+    pub rostered: usize,
+    /// The converted room's `max_members`.
+    pub max_members: u32,
+    /// At most [`FEW_SLOTS_PERCENT`] percent of `max_members` is left.
+    pub few_left: bool,
+}
+
 /// A v1 configuration value lowered to its v2 ceiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clamp {
@@ -514,6 +532,8 @@ pub struct ConversionReport {
     /// at least the default limit's number of children without one (it may
     /// run out of room to invite).
     pub child_limits: Vec<ChildLimit>,
+    /// Rostered members against `max_members`.
+    pub member_slots: MemberSlots,
     /// v1 secret versions beyond the newest `max_secret_versions`, which do
     /// not carry over (nor do the messages sealed under them).
     pub secret_versions_dropped: usize,
@@ -713,6 +733,13 @@ pub fn owner_payloads(
     }
     report.clamps = clamps(&v1.configuration.configuration, &configuration);
     report.child_limits = child_limits(owner, legacy, &configuration, child_exceptions);
+    let rostered = links.len();
+    let left = (configuration.max_members as usize).saturating_sub(rostered);
+    report.member_slots = MemberSlots {
+        rostered,
+        max_members: configuration.max_members,
+        few_left: left * 100 <= configuration.max_members as usize * FEW_SLOTS_PERCENT as usize,
+    };
     report.secret_versions_dropped = secret_versions
         .len()
         .saturating_sub(configuration.max_secret_versions as usize);

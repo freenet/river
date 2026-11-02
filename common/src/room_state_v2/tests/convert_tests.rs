@@ -1038,3 +1038,36 @@ fn two_links_for_one_member_roster_the_lowest_digest_in_any_order() {
         assert!(!r.contains(&high), "the other link is not");
     }
 }
+
+/// The report shows how many member slots the roster leaves: rostered
+/// members rank ahead of new ones, so a room converted near its member cap
+/// has few slots for anyone who joins later.
+#[test]
+fn the_report_shows_the_member_slots_the_roster_leaves() {
+    let o = key(0);
+    let report = |max: usize| {
+        let mut v1 = v1_room();
+        let cfg = Configuration {
+            owner_member_id: id(0),
+            configuration_version: 3,
+            max_members: max,
+            max_user_bans: 400,
+            ..Configuration::default()
+        };
+        v1.configuration = AuthorizedConfigurationV1::new(cfg, &sk(0));
+        let conv = legacy_records(&o, &v1);
+        owner_payloads(&o, &v1, &conv.records, 1, &[], &[], &[])
+            .unwrap()
+            .report
+    };
+    // Three members rostered against 400: plenty left.
+    let roomy = report(2000).member_slots;
+    assert_eq!((roomy.rostered, roomy.max_members), (3, 400));
+    assert!(!roomy.few_left);
+    // Against a cap of 4, one slot is left.
+    let tight = report(4).member_slots;
+    assert_eq!((tight.rostered, tight.max_members), (3, 4));
+    assert!(tight.few_left);
+    // At the cap, none.
+    assert!(report(3).member_slots.few_left);
+}
