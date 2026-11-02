@@ -514,6 +514,26 @@ pub struct MemberSlots {
     pub few_left: bool,
 }
 
+/// A root is flagged when it holds at least this percent of the room's links.
+pub const NEARLY_ALL_PERCENT: u32 = 90;
+
+/// One member the owner invited directly (a root), with the links under it,
+/// its own included. New unrostered links under a root count together
+/// against one limit of new links for the whole subtree
+/// (`MAX_LINKS_PER_SUBTREE`), unless the root has a child exception.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootSubtree {
+    pub root: Key,
+    /// Links in the v1 room under this root, its own included.
+    pub links: usize,
+    /// Whether the owner set a child exception for this root.
+    pub exception: bool,
+    /// Not an exception, and holds at least [`NEARLY_ALL_PERCENT`] percent of
+    /// the room's links: the subtree limit then acts as a limit on the whole
+    /// room's new links. The owner can set an exception for this root.
+    pub holds_nearly_all: bool,
+}
+
 /// A v1 configuration value lowered to its v2 ceiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clamp {
@@ -532,6 +552,8 @@ pub struct ConversionReport {
     /// at least the default limit's number of children without one (it may
     /// run out of room to invite).
     pub child_limits: Vec<ChildLimit>,
+    /// Every root with its subtree's link count, by key.
+    pub roots: Vec<RootSubtree>,
     /// Rostered members against `max_members`.
     pub member_slots: MemberSlots,
     /// v1 secret versions beyond the newest `max_secret_versions`, which do
@@ -740,6 +762,7 @@ pub fn owner_payloads(
         max_members: configuration.max_members,
         few_left: left * 100 <= configuration.max_members as usize * FEW_SLOTS_PERCENT as usize,
     };
+    report.roots = root_subtrees(owner, legacy, child_exceptions);
     report.secret_versions_dropped = secret_versions
         .len()
         .saturating_sub(configuration.max_secret_versions as usize);
@@ -946,6 +969,52 @@ fn drop_reason(
         }
         Some(false) => DropReason::Retention,
     }
+}
+
+/// See [`ConversionReport::roots`]. Only links with a chain to the owner count.
+fn root_subtrees(owner: &Key, legacy: &[Record], exceptions: &[(Key, u32)]) -> Vec<RootSubtree> {
+    let mut inviter: HashMap<Key, (Digest, Key)> = HashMap::new();
+    for r in legacy {
+        if let Record::LegacyLink(l) = r {
+            if let Some(v) = super::legacy::decode_link(owner, l) {
+                let d = r.digest();
+                let e = inviter.entry(v.member).or_insert((d, v.inviter));
+                if d < e.0 {
+                    *e = (d, v.inviter);
+                }
+            }
+        }
+    }
+    let root_of = |m: &Key| -> Option<Key> {
+        let mut cur = *m;
+        for _ in 0..=inviter.len() {
+            let up = inviter.get(&cur)?.1;
+            if up == *owner {
+                return Some(cur);
+            }
+            cur = up;
+        }
+        None
+    };
+    let mut count: std::collections::BTreeMap<Key, usize> = Default::default();
+    for m in inviter.keys() {
+        if let Some(root) = root_of(m) {
+            *count.entry(root).or_default() += 1;
+        }
+    }
+    let total: usize = count.values().sum();
+    count
+        .into_iter()
+        .map(|(root, links)| {
+            let exception = exceptions.iter().any(|e| e.0 == root);
+            RootSubtree {
+                root,
+                links,
+                exception,
+                holds_nearly_all: !exception && links * 100 >= total * NEARLY_ALL_PERCENT as usize,
+            }
+        })
+        .collect()
 }
 
 /// See [`ConversionReport::child_limits`].

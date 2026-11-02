@@ -1071,3 +1071,51 @@ fn the_report_shows_the_member_slots_the_roster_leaves() {
     // At the cap, none.
     assert!(report(3).member_slots.few_left);
 }
+
+/// The report lists every root with its subtree's link count, and flags a
+/// non-exception root that holds nearly all links: the limit on new links per
+/// subtree is then the whole room's limit. An exception removes the flag.
+#[test]
+fn the_report_lists_every_root_and_flags_one_that_holds_nearly_all() {
+    let o = key(0);
+    let member = |m: u8, by: u8| {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: id(0),
+                invited_by: id(by),
+                member_vk: sk(m).verifying_key(),
+            },
+            &sk(by),
+        )
+    };
+    let report = |v1: &ChatRoomStateV1, exceptions: &[(Key, u32)]| {
+        let conv = legacy_records(&o, v1);
+        owner_payloads(&o, v1, &conv.records, 1, &[], &[], exceptions)
+            .unwrap()
+            .report
+    };
+    // k1 is the only root, with k2 and k3 under it.
+    let one = v1_room();
+    let r = report(&one, &[]).roots;
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!((r[0].root, r[0].links, r[0].exception), (key(1), 3, false));
+    assert!(r[0].holds_nearly_all);
+    // An exception for it removes the flag and is shown.
+    let r = report(&one, &[(key(1), 534)]).roots;
+    assert_eq!((r[0].links, r[0].exception), (3, true));
+    assert!(!r[0].holds_nearly_all);
+    // A second root with four links of its own: k1 holds 3 of 8.
+    let mut two = v1_room();
+    two.members.members.push(member(4, 0));
+    for m in 5..=8 {
+        two.members
+            .members
+            .push(member(m, if m == 5 { 4 } else { 5 }));
+    }
+    let r = report(&two, &[]).roots;
+    let by: Vec<(Key, usize)> = r.iter().map(|x| (x.root, x.links)).collect();
+    let mut want = vec![(key(1), 3), (key(4), 5)];
+    want.sort();
+    assert_eq!(by, want);
+    assert!(r.iter().all(|x| !x.holds_nearly_all), "{r:?}");
+}
