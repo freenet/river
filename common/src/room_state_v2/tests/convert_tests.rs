@@ -1119,3 +1119,23 @@ fn the_report_lists_every_root_and_flags_one_that_holds_nearly_all() {
     assert_eq!(by, want);
     assert!(r.iter().all(|x| !x.holds_nearly_all), "{r:?}");
 }
+
+/// An empty `protected` or `child_exceptions` list is not an error, so the
+/// report must show it: nothing else says the Invite Bot can be banned by a
+/// deputy or stops admitting members after the default limit.
+#[test]
+fn the_report_shows_when_no_protected_key_or_child_exception_was_set() {
+    let o = key(0);
+    let v1 = v1_room();
+    let conv = legacy_records(&o, &v1);
+    let report = |protected: &[Key], exceptions: &[(Key, u32)]| {
+        owner_payloads(&o, &v1, &conv.records, 1, &[], protected, exceptions)
+            .unwrap()
+            .report
+    };
+    let none = report(&[], &[]);
+    assert_eq!((none.protected_keys, none.child_exceptions_set), (0, 0));
+    // Duplicates count once, as the configuration stores them.
+    let some = report(&[key(2), key(2), key(3)], &[(key(1), 100)]);
+    assert_eq!((some.protected_keys, some.child_exceptions_set), (2, 1));
+}

@@ -552,6 +552,12 @@ pub struct ConversionReport {
     /// at least the default limit's number of children without one (it may
     /// run out of room to invite).
     pub child_limits: Vec<ChildLimit>,
+    /// Keys the owner marked protected from deputy bans. Zero means none:
+    /// a deputy can ban any member, the Invite Bot included.
+    pub protected_keys: usize,
+    /// Child exceptions the owner set. Zero means none: every inviter,
+    /// the Invite Bot included, can admit only `max_children_per_link` more.
+    pub child_exceptions_set: usize,
     /// Every root with its subtree's link count, by key.
     pub roots: Vec<RootSubtree>,
     /// Rostered members against `max_members`.
@@ -762,6 +768,8 @@ pub fn owner_payloads(
         max_members: configuration.max_members,
         few_left: left * 100 <= configuration.max_members as usize * FEW_SLOTS_PERCENT as usize,
     };
+    report.protected_keys = configuration.protected.len();
+    report.child_exceptions_set = configuration.child_exceptions.len();
     report.roots = root_subtrees(owner, legacy, child_exceptions);
     report.secret_versions_dropped = secret_versions
         .len()
