@@ -1,0 +1,53 @@
+# The v2 room contract: River's room state v2 (river-core's room_state_v2)
+# behind the contract interface. A new contract with a new key; the deployed
+# room contract (../room-contract) is untouched. Its own workspace, so the
+# `room-state-v2` feature it enables on river-core can never be unified into
+# a build of the deployed contract or the chat delegate.
+[workspace]
+
+[package]
+name = "room-contract-v2"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ciborium = "0.2.2"
+freenet-stdlib = { version = "0.12.1", features = ["contract"] }
+river-core = { path = "../../common", features = ["room-state-v2"] }
+
+[dev-dependencies]
+# Tests use bench. Dev-dependency features apply only when building tests (the
+# resolver 2 default for edition 2021), so the cdylib build never sees them.
+river-core = { path = "../../common", features = ["room-state-v2-client"] }
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+
+[profile.release]
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+[profile.release.package."*"]
+opt-level = 'z'
+
+# The signature and hash crates at opt-level 3: signature checks dominate
+# validate and merge, and this makes them about 1.5x faster in freenet-core's
+# engine. Only this crate's own workspace sees these overrides, so the
+# deployed contract's and the delegate's builds are unchanged.
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+[profile.release.package.ed25519-dalek]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.blake3]
+opt-level = 3
