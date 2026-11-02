@@ -168,7 +168,7 @@ pub struct Builder {
     inv_digest: HashMap<u8, (Digest, Key)>,
     fix: Vec<(usize, u32, u32, Vec<String>)>,
     fix_roster: Vec<(usize, u32, Vec<String>)>,
-    fix_restore: Vec<(usize, String, u32)>,
+    fix_restore: Vec<(usize, Vec<String>, u32)>,
 }
 
 impl Builder {
@@ -456,15 +456,22 @@ impl Builder {
     }
 
     pub fn restore(&mut self, link: &str, hours: u32) {
+        self.restore_chain(&[link], hours);
+    }
+
+    /// A restore request over a chain of links (retired link first), signed
+    /// by the member of its first link.
+    pub fn restore_chain(&mut self, links: &[&str], hours: u32) {
         let i = self.push(
-            format!("restore({link}@{hours})"),
+            format!("restore({}@{hours})", links.join(">")),
             None,
             Record::Clock(Signed {
                 payload: ClockP { hours: 0 },
                 sig: Sig([0; 64]),
             }),
         );
-        self.fix_restore.push((i, link.to_string(), hours));
+        self.fix_restore
+            .push((i, links.iter().map(|s| s.to_string()).collect(), hours));
     }
 
     pub fn roster(&mut self, seq: u32, links: &[&str]) {
@@ -811,16 +818,18 @@ impl Builder {
                 payload: p,
             });
         }
-        for (i, link, hours) in std::mem::take(&mut self.fix_restore) {
-            let l = self.map[&link];
-            let member = self.link_member(l);
-            let cl = match &self.recs[l] {
-                Record::Link(a) => ChainLink::Accepted(a.clone()),
-                Record::LegacyLink(x) => ChainLink::Legacy(x.clone()),
-                _ => unreachable!(),
-            };
+        for (i, links, hours) in std::mem::take(&mut self.fix_restore) {
+            let member = self.link_member(self.map[&links[0]]);
+            let chain = links
+                .iter()
+                .map(|link| match &self.recs[self.map[link]] {
+                    Record::Link(a) => ChainLink::Accepted(a.clone()),
+                    Record::LegacyLink(x) => ChainLink::Legacy(x.clone()),
+                    _ => unreachable!(),
+                })
+                .collect();
             let p = RestoreP {
-                chain: vec![cl],
+                chain,
                 hours,
                 clock_ref: 0,
             };

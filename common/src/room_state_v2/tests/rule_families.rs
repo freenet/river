@@ -297,3 +297,64 @@ fn the_rule_families_obey_the_laws() {
 fn the_rule_families_obey_the_laws_exhaustively() {
     run_all(None);
 }
+
+/// Two restore requests that share a first link but end in different
+/// subtrees (a legacy chain is matched by member key, so one member's link
+/// can be the first link of both). The rule keeps one request per first link
+/// and at most `subtree_restores` per subtree: two independent limits, so
+/// grouping decides which request is dropped before the other limit is
+/// reached. Strict associativity fails here and the merge heals.
+fn shared_first_link() -> Builder {
+    let mut b = Builder::new();
+    b.invitation(1, "O", 1, 0);
+    b.acc("RX", 1, 1);
+    b.invitation(2, "O", 2, 0);
+    b.acc("RY", 2, 2);
+    // k3 holds a link under each root; k4's link is under k3's.
+    b.leg("G1", 3, 1);
+    b.leg("G2", 3, 2);
+    b.leg("F", 4, 3);
+    // Two other members in subtree X.
+    b.leg("C1", 5, 1);
+    b.leg("C2", 6, 1);
+    b.restore_chain(&["F", "G1"], 5);
+    b.restore_chain(&["F", "G2"], 4);
+    b.restore("C1", 9);
+    b.restore("C2", 8);
+    b.cfg(
+        0,
+        with(|c| {
+            c.max_members = 7;
+            c.max_children = 9;
+            c.max_depth = 8;
+            c.window_open = true;
+        }),
+    );
+    b.finish()
+}
+
+#[test]
+fn restores_sharing_a_first_link_fail_strict_associativity_and_heal() {
+    use super::harness::{assoc, Verdict};
+    let limits = Limits {
+        subtree_restores: Some(2),
+        restores: Some(10),
+        ..Limits::default()
+    };
+    let u = Universe::with_limits("shared first link", shared_first_link(), limits);
+    let at = |name: &str| {
+        let i = u.names.iter().position(|n| n.starts_with(name)).unwrap();
+        (1 as S) << i
+    };
+    let restores: S = u
+        .names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.starts_with("restore("))
+        .fold(0, |m, (i, _)| m | (1 << i));
+    let base = (((1 as S) << u.n()) - 1) & !restores;
+    let (a, b) = (at("restore(F>G1"), at("restore(F>G2"));
+    let c = at("restore(C1") | at("restore(C2");
+    let (a, b, c) = (a | base, b | base, c | base);
+    assert_eq!(assoc(&u, a, b, c), Verdict::Healed);
+}

@@ -974,8 +974,8 @@ pub fn retain_refs(
         }
     }
     // Members the owner attests through a chain of rostered legacy links back
-    // to the owner: all of those links are admitted below, whatever else the
-    // state holds. Such a member admits no unrostered legacy link, so a v1
+    // to the owner: those links are admitted below, up to `max_links`, whatever
+    // else the state holds. Such a member admits no unrostered legacy link, so a v1
     // record minted for it cannot take over its subtree. It is the attested
     // chain that decides, not the presence of a rostered link: a rostered link
     // that is not admitted leaves nothing behind for a later merge to read.
