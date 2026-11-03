@@ -2293,9 +2293,9 @@ mod tests {
     }
 
     /// Sending from the picker must scroll an open thread to the new message,
-    /// like the composer's own send. The picker's success banner is torn down
-    /// in the same defer block that closes it, so it renders for zero frames —
-    /// without the bump there is NO feedback at all for a scrolled-up user.
+    /// like the composer's own send. The app-wide toast confirms the send;
+    /// bumping `OUTBOUND_SENDS` is what scrolls an open thread to the
+    /// invitation, so a reader scrolled up in it sees what was sent.
     #[test]
     fn a_structured_send_bumps_the_outbound_scroll_counter() {
         let raw = include_str!("../direct_messages.rs");
@@ -2306,7 +2306,8 @@ mod tests {
         assert!(
             src.contains("dm_thread_modal::note_outbound_send(room,peer)"),
             "send_structured_dm stopped bumping the outbound scroll counter, \
-             so an invite sent from the DM thread gives no visible feedback"
+             so a thread scrolled up when an invite is sent from it stays \
+             away from the sent invitation"
         );
     }
 

@@ -39,6 +39,7 @@ use crate::components::app::ROOMS;
 use crate::components::direct_messages::{
     is_thread_hidden_for, open_dm_thread, DM_LAST_SEEN, HIDDEN_DM_THREADS,
 };
+use crate::components::toast::{show_toast, ToastAction};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fa_solid_icons::FaXmark, Icon};
 use ed25519_dalek::VerifyingKey;
@@ -46,65 +47,12 @@ use river_core::chat_delegate::HiddenDmThreadEntry;
 use river_core::room_state::member::MemberId;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Monotonic counter producing unique identity tokens for `ArchiveToast`
-/// instances. Replaces the previous "use `expires_at_ms` as identity"
-/// approach (M2 from skeptical review on PR #275) — `unix_now_ms()`
-/// collisions on rapid clicks / mobile timer coalescing produced
-/// premature auto-dismiss of a second toast by the first toast's
-/// timeout. Monotonic counter has no collision risk.
-static ARCHIVE_TOAST_TOKEN: AtomicU64 = AtomicU64::new(1);
-
-/// Per-(room, peer) "Archived — Undo" toast state. Cleared automatically
-/// when the next render after `expires_at_ms` happens (the rail re-runs
-/// on every `HIDDEN_DM_THREADS` write). Kept module-private — the rail
-/// is the only surface that creates toasts and the only surface that
-/// consumes them.
-#[derive(Clone, PartialEq, Debug)]
-struct ArchiveToast {
-    room: VerifyingKey,
-    peer: MemberId,
-    /// Display label so the toast can still render its `{peer_nickname}` after
-    /// the underlying row has disappeared from `ROOMS` (e.g. room churn).
-    peer_nickname: String,
-    /// `Date.now()`-style milliseconds at which the toast should disappear.
-    expires_at_ms: u64,
-    /// Monotonic identity token. Used by the auto-dismiss timeout to
-    /// determine "is the current toast still mine?" — see M2 fix.
-    token: u64,
-}
-
-/// Single most-recent toast. We don't queue them — back-to-back archives
-/// just refresh the toast with the most recent action, which matches
-/// Gmail/WhatsApp behaviour and keeps the UX simple.
-static ARCHIVE_TOAST: GlobalSignal<Option<ArchiveToast>> = Global::new(|| None);
-
-/// How long the "Archived — Undo" toast stays visible. ~5s matches the
-/// "destructive-undo affordance" timing used elsewhere (Gmail's archive,
-/// Signal's mark-as-unread).
-const ARCHIVE_TOAST_DURATION_MS: u64 = 5_000;
+use std::time::UNIX_EPOCH;
 
 #[component]
 pub fn DmRailSection() -> Element {
     let threads = use_memo(build_view);
     let threads_value = threads.read().clone();
-
-    // Reading the toast signal here subscribes the rail to its writes so
-    // a `set(None)` from the timeout reaction re-renders this component
-    // and the toast disappears.
-    //
-    // `try_read` (not `read`) is the repo-standard pattern (AGENTS.md
-    // "Dioxus WASM Signal Safety Rules") — on Firefox/mobile the
-    // `ARCHIVE_TOAST.write()` Drop handler fires subscriber notifications
-    // synchronously, which could re-enter this read while the write
-    // guard's RefCell borrow is still held. `try_read` returns `Err`
-    // instead of panicking; on contention we treat the toast as absent
-    // for THIS render and the next clean signal write repaints us. The
-    // P1 multi-model review finding pinned this regression — Codex
-    // flagged it before merge.
-    let toast = ARCHIVE_TOAST.try_read().ok().and_then(|g| g.clone());
 
     // Archived count for the "Archived (N)" link.
     //
@@ -127,10 +75,9 @@ pub fn DmRailSection() -> Element {
 
     let mut archived_panel_open: Signal<bool> = use_signal(|| false);
 
-    // If there's nothing to show in the rail AND no archive entries AND
-    // no active toast, render nothing — keeps the rail visually quiet on
-    // first load.
-    if threads_value.is_empty() && archived_count == 0 && toast.is_none() {
+    // If there's nothing to show in the rail AND no archive entries, render
+    // nothing — keeps the rail visually quiet on first load.
+    if threads_value.is_empty() && archived_count == 0 {
         return rsx! {};
     }
 
@@ -164,9 +111,6 @@ pub fn DmRailSection() -> Element {
                     ArchivedThreadsPanel {}
                 }
             }
-        }
-        if let Some(t) = toast.as_ref() {
-            ArchiveToastView { toast: t.clone() }
         }
     }
 }
@@ -273,25 +217,6 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
     }
 }
 
-/// Pure helper extracted from `DmRailRow`'s archive ✕ click handler so
-/// the toast bookkeeping can be unit-tested without standing up a Dioxus
-/// runtime. Returns the toast that `ARCHIVE_TOAST` would be set to, or
-/// `None` if `now_ms` was unavailable.
-fn build_archive_toast(
-    room: VerifyingKey,
-    peer: MemberId,
-    peer_nickname: &str,
-    now_ms: u64,
-) -> ArchiveToast {
-    ArchiveToast {
-        room,
-        peer,
-        peer_nickname: peer_nickname.to_string(),
-        expires_at_ms: now_ms.saturating_add(ARCHIVE_TOAST_DURATION_MS),
-        token: ARCHIVE_TOAST_TOKEN.fetch_add(1, Ordering::Relaxed),
-    }
-}
-
 /// Max timestamp of a DM the peer sent US for `(room, peer)`, read from live
 /// `ROOMS` state rather than from a rendered rail row.
 ///
@@ -390,88 +315,22 @@ pub(crate) fn archive_cutoff(row_inbound_ts: u64, live_inbound_ts: Option<u64>) 
     std::cmp::max(row_inbound_ts, live_inbound_ts.unwrap_or(0))
 }
 
-/// Wire up: archive the (room, peer) thread, schedule the toast, and
-/// schedule the auto-dismiss. Called from the ✕ rollover button.
+/// Archive the (room, peer) thread and offer Undo in the app toast. Called
+/// from the ✕ rollover button.
+///
+/// Undo is the UNCONDITIONAL `unhide_dm_thread`, an explicit user action
+/// (#526): at the moment it is clicked the thread's inbound clock is at or
+/// below the cutoff just written, so the gated form would do nothing. The
+/// Archived panel's Un-archive is the untimed way to the same thing.
 fn archive_row(room: VerifyingKey, peer: MemberId, peer_nickname: &str, row_last_inbound_ts: u64) {
     let cutoff = archive_cutoff(row_last_inbound_ts, current_last_inbound_ts(&room, peer));
-
-    let now_ms = unix_now_ms();
-    let toast = build_archive_toast(room, peer, peer_nickname, now_ms);
-    let token = toast.token;
-
-    // Order matters: write the toast BEFORE calling `hide_dm_thread`.
-    // M3 fix from the skeptical review: if we hide first and toast second,
-    // the render between the two defers (HIDDEN_DM_THREADS write fires
-    // before ARCHIVE_TOAST write) can transiently satisfy the rail's
-    // empty-state early-return — the rail unmounts and the toast write
-    // arrives at a detached component. Writing the toast first guarantees
-    // `toast.is_none()` is false at every intermediate render, so the
-    // rail stays mounted across the hide.
-    crate::util::defer(move || {
-        *ARCHIVE_TOAST.write() = Some(toast);
-    });
-
     hide_dm_thread(room, peer, cutoff);
-
-    // Auto-dismiss: wait `ARCHIVE_TOAST_DURATION_MS`, then clear the
-    // toast iff it's still the one we set. Identity is the monotonic
-    // `token`, not `expires_at_ms` — same-millisecond clicks no longer
-    // collide (M2 fix from the skeptical review).
-    crate::util::safe_spawn_local(async move {
-        crate::util::sleep(crate::util::millis(ARCHIVE_TOAST_DURATION_MS)).await;
-        crate::util::defer(move || {
-            ARCHIVE_TOAST.with_mut(|cell| {
-                if let Some(current) = cell.as_ref() {
-                    if current.token == token {
-                        *cell = None;
-                    }
-                }
-            });
-        });
-    });
-}
-
-#[component]
-fn ArchiveToastView(toast: ArchiveToast) -> Element {
-    let toast_room = toast.room;
-    let toast_peer = toast.peer;
-    let undo = move |_| {
-        unhide_dm_thread(toast_room, toast_peer);
-        crate::util::defer(move || {
-            *ARCHIVE_TOAST.write() = None;
-        });
-    };
-    let dismiss = move |_| {
-        crate::util::defer(move || {
-            *ARCHIVE_TOAST.write() = None;
-        });
-    };
-    let label = format!("Archived conversation with {}", toast.peer_nickname);
-    rsx! {
-        // Bottom-center toast. `fixed bottom-4 left-1/2 -translate-x-1/2`
-        // positions it independent of the rail's scroll/layout. `z-50`
-        // matches the modal stack so it doesn't sit underneath an open
-        // DM thread modal.
-        div {
-            class: "fixed bottom-4 left-1/2 -translate-x-1/2 z-50",
-            role: "status",
-            "aria-live": "polite",
-            div { class: "flex items-center gap-3 bg-panel text-text border border-border rounded-lg shadow-lg px-4 py-2 text-sm",
-                span { "{label}" }
-                button {
-                    class: "text-accent hover:underline font-medium",
-                    onclick: undo,
-                    "Undo"
-                }
-                button {
-                    class: "text-text-muted hover:text-text px-1",
-                    onclick: dismiss,
-                    "aria-label": "Dismiss",
-                    Icon { width: 10, height: 10, icon: FaXmark }
-                }
-            }
-        }
-    }
+    show_toast(
+        format!("Archived conversation with {peer_nickname}"),
+        Some(ToastAction::new("Undo", move || {
+            unhide_dm_thread(room, peer)
+        })),
+    );
 }
 
 #[component]
@@ -1174,13 +1033,6 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn unix_now_ms() -> u64 {
-    crate::util::get_current_system_time()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     //! Unit tests for the `DmRailSection` pure filter helper. Pin the
@@ -1263,12 +1115,10 @@ mod tests {
             .find(marker)
             .expect("archive_row must exist - this pin is targeting the wrong path");
         let rest = &src[split_at + marker.len()..];
-        // `ArchiveToastView` is the next item AFTER `archive_row`; the
-        // previously-used `build_archive_toast` is defined BEFORE it, so that
-        // bound never matched and the "segment" was the rest of the file.
+        // `ArchivedThreadsPanel` is the next item AFTER `archive_row`.
         let end = rest
-            .find("fnArchiveToastView")
-            .expect("ArchiveToastView must follow archive_row - bound is stale");
+            .find("fnArchivedThreadsPanel")
+            .expect("ArchivedThreadsPanel must follow archive_row - bound is stale");
         let seg = &rest[..end];
 
         assert!(
@@ -1390,7 +1240,7 @@ mod tests {
                 .count(),
             2,
             "exactly two unconditional unhide call sites are expected in the \
-             rail: the Undo toast and the Archived-panel Un-archive."
+             rail: the Undo toast action and the Archived-panel Un-archive."
         );
     }
 
@@ -1786,59 +1636,6 @@ mod tests {
             count_currently_archived(&hidden, &last_equal),
             1,
             "equal-ts must still count as archived (strict <=)"
-        );
-    }
-
-    /// Pin the toast helper's expiry math. A back-to-back archive
-    /// produces a NEW `expires_at_ms`, so the first auto-dismiss's
-    /// "is it still mine?" check fails and the second toast survives
-    /// its own full duration.
-    #[test]
-    fn build_archive_toast_advances_expiry_per_call() {
-        let room = sk(1).verifying_key();
-        let peer = MemberId(FastHash(11));
-        let t1 = build_archive_toast(room, peer, "alice", 1_000);
-        let t2 = build_archive_toast(room, peer, "alice", 2_000);
-        assert_eq!(t1.expires_at_ms, 1_000 + ARCHIVE_TOAST_DURATION_MS);
-        assert_eq!(t2.expires_at_ms, 2_000 + ARCHIVE_TOAST_DURATION_MS);
-        assert_ne!(
-            t1.expires_at_ms, t2.expires_at_ms,
-            "back-to-back archives must produce distinct expiries — \
-             otherwise the first auto-dismiss tick would cancel the second toast"
-        );
-    }
-
-    /// Saturation: a `now_ms` near `u64::MAX` must not overflow when
-    /// adding the duration. Defensive — `Date.now()` is far from
-    /// `u64::MAX` in practice, but pinning this prevents a future
-    /// "let's switch to nanoseconds" change from producing a wrap-around
-    /// toast that auto-dismisses instantly.
-    #[test]
-    fn build_archive_toast_saturates_on_overflow() {
-        let room = sk(1).verifying_key();
-        let peer = MemberId(FastHash(11));
-        let t = build_archive_toast(room, peer, "alice", u64::MAX);
-        assert_eq!(t.expires_at_ms, u64::MAX);
-    }
-
-    /// M2 fix from PR #275 skeptical review: two `build_archive_toast`
-    /// calls at the SAME `now_ms` must produce distinct identity tokens.
-    /// Before the fix, identity was `expires_at_ms` — same-millisecond
-    /// clicks collided and the first toast's timeout could clear the
-    /// second toast early. Tokens come from an atomic counter so
-    /// collisions are structurally impossible.
-    #[test]
-    fn build_archive_toast_same_ms_has_distinct_tokens() {
-        let room = sk(1).verifying_key();
-        let peer = MemberId(FastHash(11));
-        let t1 = build_archive_toast(room, peer, "alice", 1_000);
-        let t2 = build_archive_toast(room, peer, "alice", 1_000);
-        assert_eq!(t1.expires_at_ms, t2.expires_at_ms);
-        assert_ne!(
-            t1.token, t2.token,
-            "back-to-back archives at the same millisecond must have \
-             distinct identity tokens — the auto-dismiss timeout's \
-             'is it still mine?' check compares tokens, not expiries"
         );
     }
 

@@ -183,6 +183,10 @@ mod tests {
             "conversation.rs tab visibility",
             include_str!("../components/conversation.rs"),
         ),
+        (
+            "toast.rs banner clearance",
+            include_str!("../components/toast.rs"),
+        ),
     ];
 
     /// Body of each `<prefix>(...)` call (e.g. `use_memo(` or `use_effect(`),
@@ -312,16 +316,17 @@ mod tests {
 
     #[test]
     fn every_fallible_effect_anchors_before_its_first_try_read_and_nudges() {
-        // 12 across the 4 files; app.rs has 5, dm_thread_modal.rs 2 (the DM_DRAFT
-        // merge and the DM read rule), members.rs 1, conversation.rs 4 (the
-        // room read rule's foreground re-check, the two description overflow
-        // effects from freenet/river#718, and the member-panel toggle's
-        // reading-row restore).
+        // 13 effects across five files; app.rs has 5, dm_thread_modal.rs 2 (the
+        // DM_DRAFT merge and the DM read rule), members.rs 1, conversation.rs 4
+        // (the room read rule's foreground re-check, the two description
+        // overflow effects from freenet/river#718, and the member-panel
+        // toggle's reading-row restore), toast.rs 1 (the banner-clearance
+        // effect).
         assert_fallible_hooks_are_guarded(
             GUARDED_EFFECT_SITES,
             "use_effect(",
             "freenet/river#559",
-            12,
+            13,
         );
     }
 

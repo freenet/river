@@ -6,6 +6,7 @@ import {
   openShareInvitePicker,
   pickerHeading,
 } from "./invite-picker";
+import { callRiverTest } from "./river-test";
 
 // Smoke test for the redesigned invite-via-DM picker (PR for #252 v2,
 // structured-Invite variant).
@@ -64,6 +65,17 @@ async function readCandidateRoomNames(page: Page): Promise<string[]> {
     if (m) names.push(m[1]);
   }
   return names;
+}
+
+// Select the first destination room and return its name.
+async function pickFirstCandidate(page: Page): Promise<string> {
+  const row = page.locator('button[aria-label^="Select room"]').first();
+  const aria = (await row.getAttribute("aria-label")) || "";
+  const name = aria.match(/^Select room (.+) as the invite destination$/)?.[1];
+  expect(name, `unexpected candidate label "${aria}"`).toBeTruthy();
+  await row.click();
+  await expect(row).toHaveAttribute("aria-pressed", "true");
+  return name!;
 }
 
 test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
@@ -221,6 +233,56 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     // Belt-and-suspenders, independent of the specific room names: the
     // two candidate lists must differ once the current room changed.
     expect(candidatesFromPrivateRoom).not.toEqual(candidatesFromTeamChat);
+  });
+
+  // A sent invitation is reported in the app toast; the picker and the
+  // member-info modal close. The picker's own success banner never rendered,
+  // because the same deferred write that set it closed the picker.
+  test("a sent invitation is reported in the app toast", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openMemberInfoForFirstNonSelf(page);
+    await openShareInvitePicker(page);
+
+    const roomName = await pickFirstCandidate(page);
+    await page.getByRole("button", { name: /^send invite$/i }).click();
+
+    await expect(page.getByTestId("toast-message")).toHaveText(`Invitation to "${roomName}" sent`, {
+      timeout: 15_000,
+    });
+    await expect(pickerHeading(page)).toHaveCount(0);
+    await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
+  });
+
+  // A send still running when the picker's watchdog gives up used to complete
+  // in silence. It is reported, and it closes nothing the user has opened
+  // since: here the picker, reopened from the member-info modal.
+  test("a send that completes after the watchdog closed the picker is still reported", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await callRiverTest(page, "setInvitePickerWatchdogMs", 2_000);
+    await callRiverTest(page, "holdInviteSends");
+    await openMemberInfoForFirstNonSelf(page);
+    await openShareInvitePicker(page);
+
+    const roomName = await pickFirstCandidate(page);
+    await page.getByRole("button", { name: /^send invite$/i }).click();
+    await expect(page.getByText("Sending invite…")).toBeVisible();
+
+    // The watchdog closes the picker, saying nothing.
+    await expect(pickerHeading(page)).toHaveCount(0, { timeout: 5_000 });
+    await expect(page.getByTestId("toast")).toHaveCount(0);
+
+    await openShareInvitePicker(page);
+    await callRiverTest(page, "releaseInviteSends");
+
+    await expect(page.getByTestId("toast-message")).toHaveText(`Invitation to "${roomName}" sent`, {
+      timeout: 15_000,
+    });
+    await expect(pickerHeading(page), "a late completion must not close a newer picker").toBeVisible();
+    await expect(page.getByTestId("member-info-modal")).toBeVisible();
   });
 
   // Regression test for the per-open state reset (the `use_effect`): a

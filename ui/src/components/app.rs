@@ -682,6 +682,8 @@ pub fn App() -> Element {
         }
         DocumentTitleUpdater {}
         update_banner::UpdateBanner {}
+        // Last, so it paints above the ordinary modals and the banner.
+        crate::components::toast::ToastHost {}
     }
 }
 

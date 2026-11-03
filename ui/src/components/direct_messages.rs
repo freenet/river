@@ -19,7 +19,7 @@
 //! back as unread on every page load.
 
 mod dm_thread_modal;
-mod invite_via_dm_picker_modal;
+pub(crate) mod invite_via_dm_picker_modal;
 
 pub use dm_thread_modal::DmThreadModal;
 pub use invite_via_dm_picker_modal::InviteViaDmPickerModal;
@@ -535,14 +535,13 @@ pub async fn send_structured_dm(
                 plaintext_for_cache,
             );
             unhide_dm_thread(room, peer);
-            // Scroll an open thread to the message we just sent, exactly as
-            // the thread's own composer does. Without this, an invitation
-            // sent from the DM thread produced NO feedback at all for a user
-            // who had scrolled up: the picker's success banner lives inside
-            // the picker and is torn down in the same defer block that closes
-            // it, so it renders for zero frames, and the thread simply looked
-            // unchanged. This send adds a DM to that thread, which re-renders
-            // it — the condition `OUTBOUND_SENDS`'s docs require of any caller.
+            // The invite picker reports success with the app-wide toast. Also
+            // scroll an open thread to the DM just sent, as its own composer
+            // does, or a reader scrolled up in that thread is left away from
+            // the invitation. This send adds the DM and bumps
+            // `OUTBOUND_SENDS` in the same deferred block, so the `ROOMS`
+            // change triggers the render that observes the counter: the
+            // condition `OUTBOUND_SENDS`'s docs require of any caller.
             dm_thread_modal::note_outbound_send(room, peer);
         }
         let _ = tx.send(outcome);

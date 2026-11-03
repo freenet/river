@@ -64,6 +64,28 @@ struct CandidateRoom {
 /// is the catch-all for "something else got wedged."
 const PICKER_WATCHDOG_SECS: u64 = 15;
 
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+thread_local! {
+    /// Test-only override of [`PICKER_WATCHDOG_SECS`] in ms, set by the
+    /// `setInvitePickerWatchdogMs` hook in `test_hooks.rs`, so a spec can reach
+    /// a send completing after the watchdog without waiting 15s.
+    static WATCHDOG_MS_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub(crate) fn set_watchdog_ms_override(ms: u64) {
+    WATCHDOG_MS_OVERRIDE.with(|wait| wait.set(Some(ms)));
+}
+
+fn watchdog_wait() -> std::time::Duration {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    if let Some(ms) = WATCHDOG_MS_OVERRIDE.with(|wait| wait.get()) {
+        return std::time::Duration::from_millis(ms);
+    }
+    std::time::Duration::from_secs(PICKER_WATCHDOG_SECS)
+}
+
 /// Cap on the personal-message field. Generous because the underlying
 /// DM body cap is 32 KiB minus crypto + CBOR overhead; this is a UX cap
 /// to prevent a runaway paste, not a wire-format cap. Mirrors what the
@@ -87,7 +109,7 @@ pub fn InviteViaDmPickerModal() -> Element {
     // and panic.
     //
     // Per-open scratch state: the selected target room, the optional
-    // personal message, and the inline error / success-banner strings.
+    // personal message, and the inline error string.
     // The picker is mounted unconditionally in `app.rs` and never
     // unmounts, so these `use_signal`s are NOT dropped when the picker
     // closes — they persist across open/close cycles.
@@ -97,11 +119,10 @@ pub fn InviteViaDmPickerModal() -> Element {
     let mut selected_room: Signal<Option<(MemberId, VerifyingKey)>> = use_signal(|| None);
     let mut personal_message = use_signal(String::new);
     let mut send_error: Signal<Option<String>> = use_signal(|| None);
-    let mut last_success_label: Signal<Option<String>> = use_signal(|| None);
 
     // Reset the scratch state on every `INVITE_VIA_DM_PICKER` transition
     // (open / close / switch target) so a reopened picker doesn't show
-    // the previous pick's typed message, error, or success banner. (The
+    // the previous pick's typed message or error. (The
     // selected room is additionally session-tagged — see
     // `selected_room_value` below — so its correctness does not depend on
     // this effect's timing; the effect clears it too, as hygiene.)
@@ -120,7 +141,6 @@ pub fn InviteViaDmPickerModal() -> Element {
         selected_room.set(None);
         personal_message.set(String::new());
         send_error.set(None);
-        last_success_label.set(None);
     });
 
     // --- Early return: render nothing while the picker is closed ------
@@ -258,7 +278,6 @@ pub fn InviteViaDmPickerModal() -> Element {
         .filter(|vk| candidates_value.iter().any(|c| &c.room_vk == vk));
     let personal_message_value = personal_message.read().clone();
     let send_error_value = send_error.read().clone();
-    let last_success_label_value = last_success_label.read().clone();
     let pmessage_chars = personal_message_value.chars().count();
     let can_send = selected_room_value.is_some() && !any_pending;
 
@@ -300,7 +319,7 @@ pub fn InviteViaDmPickerModal() -> Element {
             Some(pmessage.trim().to_string())
         };
 
-        // Snapshot the room data and label for the success toast.
+        // Snapshot the room data, and its label for the sent toast.
         let Some(candidate_data) = ROOMS
             .try_read()
             .ok()
@@ -329,6 +348,8 @@ pub fn InviteViaDmPickerModal() -> Element {
 
         let candidate_label_for_task = candidate_label.clone();
         crate::util::safe_spawn_local(async move {
+            #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+            crate::test_hooks::invite_send_gate().await;
             let outcome = drive_send(current_room, target_peer, candidate_data, pmessage_opt).await;
 
             crate::util::defer(move || {
@@ -337,8 +358,8 @@ pub fn InviteViaDmPickerModal() -> Element {
                 // cleared INFLIGHT, or the user may have started a newer
                 // pick. The generation check below detects that. If this
                 // task's pick is no longer the active one, skip the
-                // picker-local UI updates (`last_success_label` /
-                // `send_error` / closing the picker) — applying them
+                // picker-local UI updates (`send_error` / closing the
+                // picker and the member modal) — applying them
                 // would clobber a newer picker session or resurrect an
                 // already-closed one — and do only the global INFLIGHT
                 // cleanup. (The component itself never unmounts, so the
@@ -356,8 +377,15 @@ pub fn InviteViaDmPickerModal() -> Element {
                             "invite-via-DM: sent invite for room {:?}",
                             candidate_room_vk
                         );
+                        // Reported either way: the DM is in local `ROOMS`
+                        // and queued for sync, including when it completes
+                        // after the watchdog closed the picker, which
+                        // otherwise left the user with no word of it.
+                        crate::components::toast::show_toast(
+                            format!("Invitation to \"{candidate_label_for_task}\" sent"),
+                            None,
+                        );
                         if still_mine {
-                            last_success_label.set(Some(candidate_label_for_task.clone()));
                             // Close the picker and the parent member-info
                             // modal — the user is done with this flow.
                             // Only when this pick is still the active one
@@ -366,12 +394,8 @@ pub fn InviteViaDmPickerModal() -> Element {
                             MEMBER_INFO_MODAL.with_mut(|m| m.member = None);
                         } else {
                             // Watchdog already fired and likely closed
-                            // the picker; the user has moved on. The
-                            // send DID succeed though — the local
-                            // ROOMS write inside `send_structured_dm`
-                            // already happened, so the network sync
-                            // queue will deliver the invite to the
-                            // recipient regardless.
+                            // the picker; the user has moved on. Leave
+                            // whatever picker or member modal is open now.
                             info!(
                                 "invite-via-DM: send completed after watchdog \
                                  fired — skipping picker-local UI updates"
@@ -500,13 +524,6 @@ pub fn InviteViaDmPickerModal() -> Element {
                     }
                     if let Some(err) = send_error_value.as_ref() {
                         div { class: "text-xs text-danger", "{err}" }
-                    }
-                    if let Some(label) = last_success_label_value.as_ref() {
-                        div { class: "text-xs text-success",
-                            "Invitation to \""
-                            span { class: "font-medium", "{label}" }
-                            "\" sent."
-                        }
                     }
                 }
                 // Footer: Send button only enabled once a room is picked
@@ -684,15 +701,14 @@ async fn drive_send(
 /// Force-closing on expiry eliminates the "open picker, but its pick
 /// already abandoned by the watchdog" state entirely: every late
 /// completion finds INFLIGHT already cleared, so the still-mine gate
-/// skips its UI updates, and the user sees a closed modal (a clear
-/// "something happened" signal) which prompts them to check the DM
-/// thread for confirmation. The trade-off is losing the user's typed
-/// personal message on timeout, which is strictly better than the prior
+/// skips its picker-local updates. A late success is still reported, in
+/// the app toast; a late failure is only logged. The trade-off is losing
+/// the user's typed personal message on timeout, which is strictly better than the prior
 /// shape (no feedback + possible duplicate sends).
 fn schedule_watchdog(my_generation: u64) {
-    use std::time::Duration;
+    let wait = watchdog_wait();
     crate::util::safe_spawn_local(async move {
-        crate::util::sleep(Duration::from_secs(PICKER_WATCHDOG_SECS)).await;
+        crate::util::sleep(wait).await;
         crate::util::defer(move || {
             let still_mine = matches!(
                 *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
@@ -702,8 +718,8 @@ fn schedule_watchdog(my_generation: u64) {
                 return;
             }
             warn!(
-                "invite-via-DM: watchdog fired after {}s; force-closing picker",
-                PICKER_WATCHDOG_SECS
+                "invite-via-DM: watchdog fired after {:?}; force-closing picker",
+                wait
             );
             clear_inflight_if_matches(my_generation);
             // Force-close the picker. See doc-comment above for why
