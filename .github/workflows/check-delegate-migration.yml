@@ -15,9 +15,13 @@ env:
 
 jobs:
   check-delegate-migration:
-    # Ubicloud, NOT a GitHub-hosted larger runner: larger runners are billed
-    # at $0.022/min even on public repos. See .github/workflows/build.yml.
-    runs-on: ubicloud-standard-8
+    # Standard GitHub-hosted runner: free on a public repo. This gate hashes a
+    # few files and installs a small tool, so an 8-vCPU Ubicloud runner bought
+    # nothing; it cost ~$1.90/month per check (~1 min x ~380 PR runs/month,
+    # Oct 2026). Do not move it to a GitHub *larger* runner label: those are
+    # billed at $0.022/min even on public repos (see build.yml). Ubicloud is
+    # the right home only for jobs that genuinely need the cores.
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
       with:
