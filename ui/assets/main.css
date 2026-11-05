@@ -631,9 +631,10 @@
  * sync banner and the rail's sync-error marker. No transition and no native
  * `title` delay: the card shows the moment its host is hovered or focused.
  *
- * The card is a child of its host. Its padding touches the host, so the
- * pointer can travel onto it (and a click on it is a click on the host)
- * without leaving the host's :hover.
+ * The card is a child of its host. A copy card's padding touches the host,
+ * so the pointer can travel onto it (and a click on it is a click on the
+ * host) without leaving the host's :hover. Other cards pass the pointer
+ * through to what they cover.
  *
  * With anchor positioning (the @supports block) the card is fixed to its host
  * (`anchor-name` / `position-anchor` are inline, one name per host) and flips

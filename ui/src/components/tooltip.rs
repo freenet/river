@@ -9,16 +9,11 @@
 //! button is hovered anywhere or has keyboard focus.
 //!
 //! The card is a child of its host. A copy card takes the pointer, so moving
-//! onto it keeps the host hovered; its padding touches the host and bridges
-//! the gap. Any other card passes pointer input through to whatever it covers
-//! (a room row's card overlaps the neighbouring rows), so it hides once the
-//! pointer leaves its source row unless that row has keyboard focus. Where CSS
-//! anchor positioning is supported it is `position: fixed`, anchored to the
-//! host, and flips to stay on screen, which also escapes a scrolling rail's
-//! clipping. Elsewhere it falls back to `position: absolute` above the host.
-//! Either way it is linked by `aria-describedby`, so the explanation does not
-//! depend on it being painted. It is shown and hidden with `display`, not
-//! `visibility`, which Gecko leaves stale on a flipped anchored card. Styles:
+//! onto it keeps the host hovered. Any other card passes pointer input through
+//! to whatever it covers (a room row's card overlaps the neighbouring rows),
+//! so it hides once the pointer leaves its source row unless that row has
+//! keyboard focus. The card is the host's `aria-describedby`, so the
+//! explanation does not depend on it being painted. Positioning and show/hide:
 //! `.tooltip-*` in `assets/main.css`.
 
 use dioxus::prelude::*;

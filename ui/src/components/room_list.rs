@@ -301,7 +301,7 @@ pub fn RoomList() -> Element {
                 // Scoped to placeholder-state rooms: a fully-synced room that
                 // later hits some other transient `Error` should not show the
                 // marker here.
-                let sync_error_msg: Option<ErrorReport> = if room_data.is_awaiting_initial_sync() {
+                let sync_error: Option<ErrorReport> = if room_data.is_awaiting_initial_sync() {
                     // Second fallible read in this memo, so it nudges too: a
                     // contended pass drops the SYNC_INFO subscription and the
                     // room's error marker silently reads as a spinner until an
@@ -320,8 +320,7 @@ pub fn RoomList() -> Element {
                 } else {
                     None
                 };
-                let awaiting_sync =
-                    room_data.is_awaiting_initial_sync() && sync_error_msg.is_none();
+                let awaiting_sync = room_data.is_awaiting_initial_sync() && sync_error.is_none();
                 let room_name = room_data.display_name();
                 let is_current = current_room_key == Some(room_key);
                 let is_private = room_data
@@ -370,7 +369,7 @@ pub fn RoomList() -> Element {
                     is_private,
                     unread,
                     unread_is_mentions,
-                    sync_error_msg,
+                    sync_error,
                 ))
             })
             .collect::<Vec<_>>()
@@ -566,7 +565,7 @@ pub fn RoomList() -> Element {
                     RoomListDisplay::List => rsx! {},
                 }
 
-                {room_items.read().iter().enumerate().map(|(idx, (room_key, room_name, is_current, awaiting_sync, is_private, unread, unread_is_mentions, sync_error_msg))| {
+                {room_items.read().iter().enumerate().map(|(idx, (room_key, room_name, is_current, awaiting_sync, is_private, unread, unread_is_mentions, sync_error))| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
                     let is_current = *is_current;
@@ -574,7 +573,7 @@ pub fn RoomList() -> Element {
                     let is_private = *is_private;
                     let unread = *unread;
                     let unread_is_mentions = *unread_is_mentions;
-                    let sync_error_msg = sync_error_msg.clone();
+                    let sync_error = sync_error.clone();
                     // Badge tooltip/accessible name — says what the number
                     // means under the room's notification mode. The
                     // mentions-mode count includes REPLIES as well as
@@ -730,7 +729,7 @@ pub fn RoomList() -> Element {
                                     }
                                     if awaiting_sync {
                                         div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
-                                    } else if let Some(report) = sync_error_msg {
+                                    } else if let Some(report) = sync_error {
                                         // Terminal sync failure for a placeholder room: the
                                         // bounded contract-absent case (freenet/river#290) or a
                                         // failed GET/PUT send. A warning marker instead of a

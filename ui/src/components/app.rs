@@ -29,6 +29,7 @@ use crate::components::room_list::receive_invitation_modal::{
 };
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
+use crate::util::BUILD_TIMESTAMP_ISO;
 use dioxus::document::{Link, Stylesheet};
 use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
@@ -258,14 +259,13 @@ fn install_wide_viewport_listener() {
 }
 
 // Build metadata from build.rs
-use crate::util::BUILD_TIMESTAMP_ISO as BUILD_TIMESTAMP;
 const GIT_COMMIT: &str = env!("GIT_COMMIT_HASH");
 
 #[component]
 pub fn App() -> Element {
     info!(
         "River UI loaded - Built: {} | Commit: {}",
-        BUILD_TIMESTAMP, GIT_COMMIT
+        BUILD_TIMESTAMP_ISO, GIT_COMMIT
     );
 
     // Capture the Dioxus runtime for use in defer()/setTimeout callbacks.
