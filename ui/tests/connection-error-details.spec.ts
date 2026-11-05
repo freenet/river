@@ -66,6 +66,11 @@ test.describe("Connection error details", () => {
     page,
   }) => {
     await open(page);
+    // Offline example data starts Disconnected with no error to explain.
+    await expect(pillLabel(page)).toHaveText("Disconnected");
+    await expect(pill(page)).toHaveJSProperty("tagName", "DIV");
+    await expect(tooltipOf(pill(page))).toHaveCount(0);
+
     await setStatus(page, "error");
 
     await expect(pillLabel(page)).toHaveText("Disconnected");
@@ -136,13 +141,6 @@ test.describe("Connection error details", () => {
     await expect(pillLabel(page)).toHaveText("Connected");
     await nextFrames(page);
     await expect(pillLabel(page)).toHaveText("Connected");
-    await expect(tooltipOf(pill(page))).toHaveCount(0);
-  });
-
-  test("offline example data invents no error to explain", async ({ page }) => {
-    await open(page);
-    await expect(pillLabel(page)).toHaveText("Disconnected");
-    await expect(pill(page)).toHaveJSProperty("tagName", "DIV");
     await expect(tooltipOf(pill(page))).toHaveCount(0);
   });
 
